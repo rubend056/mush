@@ -1,0 +1,210 @@
+//! Workspace filesystem access: safe paths, listings, reads, atomic writes.
+
+use std::fs;
+use std::io;
+use std::path::{Component, Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Directories that are never worth showing or walking into.
+const SKIP_DIRS: &[&str] = &[
+    ".git", ".mush", "target", "node_modules", ".venv", "venv", "__pycache__", ".idea", ".vscode",
+    "dist", "build", ".next", ".cache",
+];
+
+static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// A single workspace root. All agent file access goes through here, which is
+/// what keeps a runaway model inside the directory the human opened.
+#[derive(Clone, Debug)]
+pub struct Workspace {
+    root: PathBuf,
+}
+
+impl Workspace {
+    pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
+        Ok(Self { root: fs::canonicalize(root)? })
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn root_str(&self) -> String {
+        self.root.display().to_string()
+    }
+
+    /// Resolve a workspace-relative path, rejecting anything that escapes root.
+    pub fn resolve(&self, rel: &str) -> Result<PathBuf, String> {
+        let rel = rel.trim();
+        if rel.is_empty() || rel == "." || rel == "./" {
+            return Ok(self.root.clone());
+        }
+        let rel = rel.strip_prefix("./").unwrap_or(rel);
+        let path = Path::new(rel);
+        if path.is_absolute() {
+            return Err(format!("absolute paths are not allowed: {rel}"));
+        }
+        let mut out = self.root.clone();
+        for component in path.components() {
+            match component {
+                Component::Normal(part) => out.push(part),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    return Err(format!("path escapes the workspace: {rel}"))
+                }
+                _ => return Err(format!("invalid path: {rel}")),
+            }
+        }
+        Ok(out)
+    }
+
+    /// Workspace-relative display path for an absolute path.
+    pub fn rel(&self, path: &Path) -> String {
+        path.strip_prefix(&self.root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/")
+    }
+
+    pub fn exists(&self, rel: &str) -> bool {
+        self.resolve(rel).map(|p| p.exists()).unwrap_or(false)
+    }
+
+    /// List workspace-relative file paths, sorted. Hidden files and build/VCS
+    /// directories are skipped so the file pane stays useful.
+    pub fn list_files(&self, limit: usize) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![self.root.clone()];
+        while let Some(dir) = stack.pop() {
+            if out.len() >= limit {
+                break;
+            }
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(_) => continue,
+            };
+            for entry in entries.filter_map(Result::ok) {
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with('.') {
+                    continue;
+                }
+                let file_type = match entry.file_type() {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                if file_type.is_dir() {
+                    if SKIP_DIRS.contains(&name.as_str()) {
+                        continue;
+                    }
+                    stack.push(entry.path());
+                } else if file_type.is_file() {
+                    out.push(self.rel(&entry.path()));
+                    if out.len() >= limit {
+                        break;
+                    }
+                }
+            }
+        }
+        out.sort();
+        out
+    }
+
+    /// Read a text file, capping the returned bytes. Binary files are refused.
+    pub fn read_file(&self, rel: &str, cap: usize) -> Result<String, String> {
+        let path = self.resolve(rel)?;
+        let bytes = fs::read(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
+        if bytes.contains(&0) {
+            return Err(format!("{rel} looks like a binary file"));
+        }
+        let mut text = String::from_utf8_lossy(&bytes).into_owned();
+        if text.len() > cap {
+            let mut cut = cap;
+            while cut > 0 && !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            text.truncate(cut);
+            text.push_str("\n\n[mush: output truncated]");
+        }
+        Ok(text)
+    }
+
+    /// Atomically create or replace a file, creating parent directories.
+    pub fn write_file(&self, rel: &str, content: &str) -> Result<(), String> {
+        let path = self.resolve(rel)?;
+        if path == self.root {
+            return Err("refusing to write to the workspace root".to_string());
+        }
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", self.rel(parent)))?;
+        }
+        atomic_write(&path, content.as_bytes()).map_err(|e| format!("cannot write {rel}: {e}"))
+    }
+}
+
+/// Write via a same-directory temp file plus `rename`, so readers never observe
+/// a half-written file and a crash cannot corrupt the original.
+pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "file".to_string());
+    let unique = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".{name}.mush-tmp-{}-{unique}", std::process::id()));
+    let result = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&tmp);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_workspace(name: &str) -> Workspace {
+        let dir = std::env::temp_dir().join(format!("mush-test-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        Workspace::new(&dir).unwrap()
+    }
+
+    #[test]
+    fn resolve_rejects_escapes_and_absolutes() {
+        let ws = temp_workspace("resolve");
+        assert!(ws.resolve("../secret").is_err());
+        assert!(ws.resolve("a/../../b").is_err());
+        assert!(ws.resolve("/etc/passwd").is_err());
+        assert!(ws.resolve("./src/main.rs").is_ok());
+        assert_eq!(ws.resolve(".").unwrap(), ws.root());
+    }
+
+    #[test]
+    fn write_then_read_roundtrips() {
+        let ws = temp_workspace("roundtrip");
+        ws.write_file("src/lib.rs", "fn a() {}\n").unwrap();
+        assert_eq!(ws.read_file("src/lib.rs", 1024).unwrap(), "fn a() {}\n");
+        assert!(!ws.exists("src/missing.rs"));
+    }
+
+    #[test]
+    fn read_truncates_at_char_boundary() {
+        let ws = temp_workspace("truncate");
+        ws.write_file("a.txt", "éééééééééé").unwrap();
+        let text = ws.read_file("a.txt", 5).unwrap();
+        assert!(text.starts_with("é"));
+        assert!(text.ends_with("[mush: output truncated]"));
+    }
+
+    #[test]
+    fn listing_skips_hidden_and_build_dirs() {
+        let ws = temp_workspace("listing");
+        fs::create_dir_all(ws.root().join(".git")).unwrap();
+        fs::create_dir_all(ws.root().join("target")).unwrap();
+        fs::write(ws.root().join(".git/config"), "x").unwrap();
+        fs::write(ws.root().join("target/out"), "x").unwrap();
+        fs::write(ws.root().join(".hidden"), "x").unwrap();
+        fs::write(ws.root().join("main.rs"), "x").unwrap();
+        assert_eq!(ws.list_files(100), vec!["main.rs".to_string()]);
+    }
+}
