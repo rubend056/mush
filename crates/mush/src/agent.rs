@@ -29,8 +29,6 @@ use crate::http;
 
 /// Safety valve: how many model turns one run may take.
 const MAX_TURNS: usize = 24;
-/// Approximate context budget before old turns are dropped.
-const HISTORY_BUDGET: usize = 60_000;
 /// A tool that never comes back must not wedge the agent forever.
 const TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 /// How deep subagent chains may go (0 = root agent only).
@@ -240,13 +238,15 @@ fn run_loop(
         if cancel.load(Ordering::SeqCst) {
             return Err("cancelled".to_string());
         }
-        trim_history(messages);
 
         let cfg = ctx
             .cfg
             .lock()
             .map(|config| config.clone())
             .map_err(|_| "shared configuration poisoned".to_string())?;
+
+        // Keep the whole request inside the endpoint's context window.
+        trim_history(messages, cfg.history_budget());
 
         let mut request = ChatRequest {
             model: &cfg.model,
@@ -298,7 +298,7 @@ fn run_loop(
             return Err("model returned no choices".to_string());
         };
 
-        let assistant = choice.message;
+        let assistant = sanitize_tool_calls(choice.message);
         let tool_calls = assistant.tool_calls().to_vec();
         let content = assistant.text().trim().to_string();
 
@@ -436,16 +436,15 @@ fn spawn_tool(
     let id = ctx.ids.fetch_add(1, Ordering::SeqCst);
     let (child_ws, branch, note) = if isolated {
         match create_worktree(&ctx.root, id, state.branch.as_deref()) {
-            Some((path, branch)) => (
+            Ok((path, branch)) => (
                 Workspace::new(&path).map_err(|e| format!("cannot open worktree: {e}"))?,
                 Some(branch),
                 String::new(),
             ),
-            None => (
+            Err(reason) => (
                 ws.clone(),
                 None,
-                " (isolated unavailable: needs a git repo and the git binary; running in place)"
-                    .to_string(),
+                format!(" (isolated unavailable: {reason}; running in place)"),
             ),
         }
     } else {
@@ -576,24 +575,45 @@ fn control_tool(state: &mut ActorState, args: &Value) -> Result<String, String> 
 }
 
 /// A private git worktree for an isolated child: `.mush/wt/<id>` on branch
-/// `mush/<id>`, based on the parent's branch (or HEAD).
-fn create_worktree(main_root: &Path, id: u64, base_branch: Option<&str>) -> Option<(PathBuf, String)> {
+/// `mush/<id>`, based on the parent's branch (or HEAD). Returns the reason
+/// when isolation is impossible so callers can degrade transparently.
+fn create_worktree(
+    main_root: &Path,
+    id: u64,
+    base_branch: Option<&str>,
+) -> Result<(PathBuf, String), String> {
     if !main_root.join(".git").exists() {
-        return None;
+        return Err("not a git repository".to_string());
+    }
+    if base_branch.is_none() {
+        let head = Command::new("git")
+            .arg("-C")
+            .arg(main_root)
+            .args(["rev-parse", "--verify", "-q", "HEAD"])
+            .status()
+            .map_err(|_| "git binary unavailable".to_string())?;
+        if !head.success() {
+            return Err("the repo has no commits yet — commit first or drop isolated".to_string());
+        }
     }
     let worktree = main_root.join(format!(".mush/wt/{id}"));
     let branch = format!("mush/{id}");
     let base = base_branch.unwrap_or("HEAD");
-    let status = Command::new("git")
+    let output = Command::new("git")
         .arg("-C")
         .arg(main_root)
-        .args(["worktree", "add", "-b", &branch, worktree.to_str()?, base])
-        .status()
-        .ok()?;
-    if status.success() {
-        Some((worktree, branch))
+        .args(["worktree", "add", "-b", &branch, worktree.to_str().unwrap_or(""), base])
+        .output()
+        .map_err(|_| "git binary unavailable".to_string())?;
+    if output.status.success() {
+        Ok((worktree, branch))
     } else {
-        None
+        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        Err(if detail.is_empty() {
+            "git worktree add failed".to_string()
+        } else {
+            detail
+        })
     }
 }
 
@@ -743,12 +763,31 @@ fn drain<R: Read>(reader: &mut R, cap: usize) -> String {
     String::from_utf8_lossy(&kept).into_owned()
 }
 
+/// A model occasionally emits `tool_call` arguments that are not valid JSON.
+/// Sending that message back into history verbatim makes some servers reject
+/// the whole request with a parse error; rewrite invalid arguments to `{}` so
+/// the tool executor returns a clear per-call error instead.
+fn sanitize_tool_calls(mut message: Message) -> Message {
+    let Some(calls) = message.tool_calls.as_mut() else {
+        return message;
+    };
+    for call in calls {
+        // Arguments must be a JSON object; a bare string passes JSON parsing
+        // but makes servers reject the message outright.
+        if !matches!(serde_json::from_str::<Value>(&call.function.arguments), Ok(Value::Object(_))) {
+            call.function.arguments = "{}".to_string();
+        }
+    }
+    message
+}
+
 /// Drop the oldest turns until the conversation fits the budget. Trimming at a
 /// user message keeps assistant/tool pairs intact, which servers validate.
-fn trim_history(messages: &mut Vec<Message>) {
+/// The budget comes from the endpoint's context window.
+fn trim_history(messages: &mut Vec<Message>, budget: usize) {
     loop {
         let total: usize = messages.iter().map(Message::weight).sum();
-        if total <= HISTORY_BUDGET {
+        if total <= budget {
             return;
         }
         let user_indices: Vec<usize> = messages
@@ -802,6 +841,7 @@ fn arg_string(args: &Value, key: &str) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mush_core::{FunctionCall, ToolCall};
     use serde_json::json;
 
     #[test]
@@ -820,11 +860,39 @@ mod tests {
             messages.push(Message::tool(format!("call{i}"), "result"));
             messages.push(Message::user(format!("again {i}")));
         }
-        trim_history(&mut messages);
+        // Mirror the 8K-context default budget from Config::history_budget.
+        trim_history(&mut messages, 15_000);
         assert_eq!(messages[0].role, "system");
-        assert!(messages.iter().map(Message::weight).sum::<usize>() <= HISTORY_BUDGET);
+        assert!(messages.iter().map(Message::weight).sum::<usize>() <= 15_000);
         // The first kept entry must be a user message so pairs stay valid.
         assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn sanitize_repairs_invalid_tool_call_json() {
+        let mut message = Message::assistant("here you go");
+        message.tool_calls = Some(vec![
+            ToolCall {
+                id: "a".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "read_file".into(),
+                    arguments: "{\"path\": \"ok.rs\"}".into(),
+                },
+            },
+            ToolCall {
+                id: "b".into(),
+                kind: "function".into(),
+                function: FunctionCall {
+                    name: "edit_file".into(),
+                    arguments: "\"Please retry with a smaller context\"".into(),
+                },
+            },
+        ]);
+        let repaired = sanitize_tool_calls(message);
+        let calls = repaired.tool_calls();
+        assert_eq!(calls[0].function.arguments, "{\"path\": \"ok.rs\"}");
+        assert_eq!(calls[1].function.arguments, "{}");
     }
 
     #[test]

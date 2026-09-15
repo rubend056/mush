@@ -57,7 +57,9 @@ Everything can be changed at runtime from the chat — no restart:
 - `/models` — refresh the model list for the current endpoint.
 
 Resolution order on startup: **CLI flags > env vars (`MUSH_*`) > saved session
-> home config > built-in defaults**. The home config file lives at
+> home config > built-in defaults**. `MUSH_CONTEXT` sets the endpoint's
+context window in tokens (default 8192); history is trimmed to fit it, so
+requests never overflow small local models. The home config file lives at
 `$MUSH_CONFIG`, else `$XDG_CONFIG_HOME/mush/config.json`, else
 `~/.config/mush/config.json` — it is *machine-global*:
 

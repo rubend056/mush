@@ -53,6 +53,10 @@ pub struct Config {
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
+    /// The endpoint's context window in tokens. The history trimmer keeps
+    /// every request under it, reserving room for the tool schemas and the
+    /// reply. Small local models are typically 8192.
+    pub context_tokens: usize,
 }
 
 impl Config {
@@ -65,11 +69,17 @@ impl Config {
             .unwrap_or_else(|| provider.default_base_url().to_string());
         let model = std::env::var("MUSH_MODEL").unwrap_or_default();
         let api_key = std::env::var("MUSH_API_KEY").ok().filter(|s| !s.is_empty());
+        let context_tokens = std::env::var("MUSH_CONTEXT")
+            .ok()
+            .and_then(|s| s.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(8192);
         Self {
             provider,
             base_url,
             model,
             api_key,
+            context_tokens,
         }
     }
 
@@ -79,7 +89,21 @@ impl Config {
             base_url: base_url.into().trim_end_matches('/').to_string(),
             model: model.into(),
             api_key,
+            context_tokens: 8192,
         }
+    }
+
+    /// How much conversation history (in bytes) fits alongside the tool
+    /// schemas and the reply inside `context_tokens`. Rough heuristic:
+    /// ~3 bytes per token, ~800 tokens of schemas, 2048 tokens of reply.
+    pub fn history_budget(&self) -> usize {
+        const SCHEMA_TOKENS: usize = 800;
+        const REPLY_TOKENS: usize = 2048;
+        const MARGIN_TOKENS: usize = 200;
+        let tokens = self
+            .context_tokens
+            .saturating_sub(SCHEMA_TOKENS + REPLY_TOKENS + MARGIN_TOKENS);
+        tokens * 3
     }
 
     pub fn chat_url(&self) -> String {
@@ -146,6 +170,7 @@ mod tests {
             base_url: Provider::DeepSeek.default_base_url().to_string(),
             model: String::new(),
             api_key: None,
+            context_tokens: 8192,
         };
         assert_eq!(cfg.chat_url(), "https://api.deepseek.com/v1/chat/completions");
         assert_eq!(cfg.default_models(), vec!["deepseek-flash".to_string(), "deepseek-v4-pro".to_string()]);
@@ -167,5 +192,28 @@ mod tests {
     fn label_falls_back_when_no_model() {
         let cfg = Config::new("http://x:1", "", None);
         assert_eq!(cfg.label(), "no model @ http://x:1");
+    }
+
+    #[test]
+    fn history_budget_fits_the_context_window() {
+        // 8192 tokens: schema + reply reserve leaves ~15 KB of history.
+        let small = Config::new("http://x:1", "m", None);
+        assert_eq!(small.context_tokens, 8192);
+        let budget = small.history_budget();
+        assert!((15_000..=16_500).contains(&budget), "unexpected budget {budget}");
+
+        // A big window leaves a much larger budget.
+        let big = Config {
+            context_tokens: 128_000,
+            ..small.clone()
+        };
+        assert!(big.history_budget() > 300_000);
+
+        // A tiny window never undershoots below the reserve.
+        let tiny = Config {
+            context_tokens: 1024,
+            ..small
+        };
+        assert_eq!(tiny.history_budget(), 0);
     }
 }

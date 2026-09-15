@@ -300,6 +300,7 @@ mod tests {
             base_url: "https://api.deepseek.com".to_string(),
             model: String::new(),
             api_key: None,
+            context_tokens: 8192,
         };
         let response = get_json(&cfg.models_url(), cfg.api_key.as_deref()).unwrap();
         assert_eq!(response.status, 401);
