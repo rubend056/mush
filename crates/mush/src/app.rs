@@ -16,7 +16,8 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use mush_core::message::Message;
 use mush_core::{
-    git, prompt, session, userconfig, Config, Provider, Session, UserConfig, Workspace,
+    git, prompt, session, text::mask_key, userconfig, Config, Provider, Session, UserConfig,
+    Workspace,
 };
 
 use crate::agent::{self, spawn, AgentEvent, AgentMsg, RootHandle};
@@ -1406,19 +1407,6 @@ impl App {
     }
 }
 
-/// Show only the edges of a secret for confirmation without leaking it.
-fn mask_key(key: &str) -> String {
-    // Four *characters*, not four bytes: `/key aéééé` must not panic on a
-    // multi-byte boundary (finding B2).
-    let chars: Vec<char> = key.trim().chars().collect();
-    if chars.len() <= 8 {
-        return "••••".to_string();
-    }
-    let first: String = chars[..4].iter().collect();
-    let last: String = chars[chars.len() - 4..].iter().collect();
-    format!("{first}…{last}")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1843,15 +1831,6 @@ mod tests {
                 .unwrap_or_else(|error| panic!("draw failed at {width}x{height}: {error}"));
             app.focus = Focus::Chat;
         }
-    }
-
-    /// Showing the edges of an API key must count characters: slicing four
-    /// bytes of a multi-byte key panicked (finding B2).
-    #[test]
-    fn masking_a_key_never_splits_a_character() {
-        assert_eq!(mask_key("short"), "••••");
-        assert_eq!(mask_key("aéééééééé"), "aééé…éééé");
-        assert_eq!(mask_key(&"é".repeat(9)), "éééé…éééé");
     }
 
     /// A status that arrives after the run ended must not put a finished agent
