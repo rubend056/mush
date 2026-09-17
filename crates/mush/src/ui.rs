@@ -200,16 +200,21 @@ fn agent_line(app: &App, node: &AgentNode, width: usize) -> String {
     } else {
         " "
     };
-    let waiting = app
-        .tree
-        .agents
-        .iter()
-        .any(|n| n.parent == Some(node.id) && n.phase.is_busy());
-    let head = format!(
-        "{indent}{marker}{} #{:<3}",
-        phase_glyph(&node.phase, waiting),
-        node.id
+    let waiting = app.tree.busy_children(node.id);
+    // Two facts, two marks: `glyph · id` is this agent's own phase, and `⏸N`
+    // counts the children that are working. The old row derived the glyph from
+    // "has live children", so a busy agent wore `⏸` and its own work vanished
+    // from the screen (finding U1).
+    let mut head = format!(
+        "{indent}{marker}{glyph} #{id}",
+        id = node.id,
+        glyph = phase_glyph(&node.phase),
     );
+    if waiting > 0 {
+        // R4's `⏸`, owned by the children it is about: the parent's own state
+        // stays in the glyph, and this says how much it has out.
+        head.push_str(&format!(" ⏸{waiting}"));
+    }
 
     let mut tail = Vec::new();
     let activity = phase_detail(node);
@@ -309,10 +314,16 @@ fn agent_detail(node: &AgentNode) -> Vec<String> {
     }
 }
 
-/// The glyph is derived from the phase and the tree, never stored: an agent is
-/// `·` until it does something, `✓` only when a run finished, `⏸` when it is
-/// busy *because* its children are, and `⊘` while a cancel is in flight.
-fn phase_glyph(phase: &Phase, waiting_on_children: bool) -> &'static str {
+/// The glyph is derived from the agent's own phase, never stored and never
+/// borrowed from the tree: `·` until it does something, `◐` while its own run is
+/// in flight, `⊘` while a cancel is in flight and after it lands, `✓` only when
+/// a run finished, `✗` when it failed.
+///
+/// Waiting on children is a *different fact* from working and is drawn as a
+/// different mark (`agent_line`'s `⏸N`), because a parent that is mid-turn with
+/// children running is working, not paused — the row that said `⏸` about it was
+/// claiming a park that never happened (finding U1).
+fn phase_glyph(phase: &Phase) -> &'static str {
     match phase {
         Phase::Failed(_) => "✗",
         // `⊘` while a cancel is in flight and after it lands: a stopped agent
@@ -320,13 +331,7 @@ fn phase_glyph(phase: &Phase, waiting_on_children: bool) -> &'static str {
         Phase::Cancelling | Phase::Stopped => "⊘",
         Phase::Idle => "·",
         Phase::Done => "✓",
-        Phase::Thinking | Phase::Activity(_) => {
-            if waiting_on_children {
-                "⏸"
-            } else {
-                "◐"
-            }
-        }
+        Phase::Thinking | Phase::Activity(_) => "◐",
     }
 }
 
@@ -654,21 +659,20 @@ mod tests {
     }
 
     /// A row's glyph is the whole status vocabulary in one character; it must
-    /// never claim a run that did not happen (`·`, not `✓`).
+    /// never claim a run that did not happen (`·`, not `✓`), and it is a
+    /// function of the agent's *own* phase only — an agent that is working is
+    /// `◐` even while its children work, because "waiting on children" is a
+    /// fact about the children, drawn as its own mark (finding U1).
     #[test]
     fn glyphs_are_truthful() {
-        assert_eq!(phase_glyph(&Phase::Idle, false), "·");
-        assert_eq!(phase_glyph(&Phase::Thinking, false), "◐");
-        assert_eq!(phase_glyph(&Phase::Thinking, true), "⏸");
-        assert_eq!(
-            phase_glyph(&Phase::Activity("edit_file a.rs".into()), true),
-            "⏸"
-        );
-        assert_eq!(phase_glyph(&Phase::Cancelling, false), "⊘");
-        assert_eq!(phase_glyph(&Phase::Done, false), "✓");
-        assert_eq!(phase_glyph(&Phase::Failed("boom".into()), false), "✗");
+        assert_eq!(phase_glyph(&Phase::Idle), "·");
+        assert_eq!(phase_glyph(&Phase::Thinking), "◐");
+        assert_eq!(phase_glyph(&Phase::Activity("edit_file a.rs".into())), "◐");
+        assert_eq!(phase_glyph(&Phase::Cancelling), "⊘");
+        assert_eq!(phase_glyph(&Phase::Done), "✓");
+        assert_eq!(phase_glyph(&Phase::Failed("boom".into())), "✗");
         // A stopped agent is not a finished one, and must not borrow the tick.
-        assert_eq!(phase_glyph(&Phase::Stopped, false), "⊘");
+        assert_eq!(phase_glyph(&Phase::Stopped), "⊘");
     }
 
     /// The detail line carries the age of the *phase*, so a slow model looks

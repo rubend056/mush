@@ -3908,6 +3908,65 @@ mod tests {
         );
     }
 
+    /// A working agent with working children is drawn working, and the children
+    /// are a second mark rather than a replacement glyph (finding U1).
+    ///
+    /// The row used to derive its glyph from "has live children", so an agent
+    /// mid-turn with children running wore `⏸` — "paused" about the one agent
+    /// the human was watching work. The glyph is now a function of the agent's
+    /// own phase and `⏸N` carries the children, so neither fact hides the other.
+    #[test]
+    fn a_working_agent_with_working_children_is_not_drawn_paused() {
+        let (mut app, _rx) = test_app("waiting-glyph");
+        let conversation = app.tree.conversation();
+        // The root is mid-turn, and two of its children are working.
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Running {
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        });
+        for id in [1u64, 2u64] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId::ROOT,
+                event: AgentEvent::Spawned {
+                    child: id,
+                    parent: 0,
+                    brief: format!("child {id}"),
+                    depth: 1,
+                    branch: None,
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+        }
+
+        let rows = screen(&mut app, 120, 32);
+        let root_row = rows
+            .iter()
+            .find(|row| row.contains("#0"))
+            .expect("the root has a row")
+            .clone();
+        assert!(
+            root_row.contains("◐ #0"),
+            "a working agent is `◐`, never `⏸`: {root_row}"
+        );
+        assert!(
+            root_row.contains("⏸2"),
+            "and its two working children are still on the row: {root_row}"
+        );
+
+        // A child with no children of its own wears the plain running glyph.
+        let child_row = rows
+            .iter()
+            .find(|row| row.contains("#1"))
+            .expect("the child has a row")
+            .clone();
+        assert!(child_row.contains("◐ #1"), "{child_row}");
+        assert!(!child_row.contains("⏸"), "{child_row}");
+    }
+
     /// Busy agents are named with their age: a model that has thought for two
     /// minutes should look different from one that has thought for a second.
     #[test]

@@ -72,6 +72,13 @@ class Handler(BaseHTTPRequestHandler):
         joined = "\n".join(m.get("content") or "" for m in messages)
         system = messages[0].get("content") or "" if messages else ""
 
+        # A SLOWCHAIN root asks for the chain with a leaf that holds its reply
+        # open. The flag is on the server because every agent talks to the same
+        # one, and the sleep is on the depth-2 branch below because that is the
+        # leaf: it keeps a parent and its child both at work for long enough to
+        # photograph the tree (used by scripts/screen.py for finding U1).
+        if "SLOWCHAIN" in joined:
+            self.server.slow_chain = True
         if "Summarize everything important" in joined:
             # Context compaction: reply with a summary instead of a scripted turn.
             reply = {"role": "assistant",
@@ -100,6 +107,10 @@ class Handler(BaseHTTPRequestHandler):
 
             if is_subagent and depth2:
                 # Grandchild (chain scenario only): the leaf that actually writes.
+                # In the SLOWCHAIN scenario it is held at work, so the parent
+                # parked in `wait_agents` and its child are busy together.
+                if getattr(self.server, "slow_chain", False):
+                    time.sleep(3)
                 if "wrote deep.txt" in joined:
                     reply = {"role": "assistant", "content": "created deep.txt"}
                 else:

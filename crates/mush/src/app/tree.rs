@@ -551,6 +551,20 @@ impl AgentTree {
         self.agents.iter().any(|node| node.phase.is_busy())
     }
 
+    /// How many of `id`'s own children have work in flight.
+    ///
+    /// One derivation, read by the row's `⏸N` mark and by the pane title's
+    /// count, because "this agent has children working" is one fact and two
+    /// copies of it are two things that can disagree (finding U1). It is about
+    /// the children, never about the parent's own phase: a working agent whose
+    /// children work is still working.
+    pub fn busy_children(&self, id: AgentId) -> usize {
+        self.agents
+            .iter()
+            .filter(|node| node.parent == Some(id) && node.phase.is_busy())
+            .count()
+    }
+
     /// Show one agent's transcript, if it is in the tree.
     pub fn focus(&mut self, id: AgentId) -> bool {
         if !self.has(id) {
