@@ -172,6 +172,21 @@ transcript passes three quarters of the budget the agent asks the model to
 summarize everything important and continues from `system + summary`. That is
 what lets a long task survive a small context window.
 
+`/compact` is the same fold, asked for by hand instead of triggered by the
+window — one routine, so the two cannot disagree about the summary message or
+about what a fold costs. It goes to the focused agent's mailbox. An idle agent
+folds at once and nothing else happens: no run is started, because there is
+nothing to answer — the summary *is* the result, and the `Compact` event the UI
+already mirrors keeps the pane, the session file and the meter in step. Mid-run
+the request parks like a nudge and is honoured at the next message boundary,
+never between an assistant's tool calls and their results.
+
+A transcript that is already `system + one message` is refused, with "nothing to
+compact" on the transcript and nothing on the wire: folding it would cost a
+request and can only re-summarize the summary. The refusal is said out loud
+because a human typed a command — silence there is indistinguishable from a
+fold that quietly failed. Anything longer is folded exactly as asked.
+
 ---
 
 ## 4. The message box
@@ -189,7 +204,7 @@ elided, and the cursor is always on screen.
 |---|---|
 | anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit · `Ctrl-N` new chat · `Ctrl-C` cancel running agents (reaches a model that is still thinking) · `Ctrl-P` model picker |
 | agents | `j`/`k`, arrows, `g`/`G`, `Enter` focus a row, `c` cancel that agent, `Esc` back to the root |
-| chat | typing, `Enter` send, `←`/`→`/`Home`/`End`, `Backspace`/`Delete`, `↑`/`↓`/`PgUp`/`PgDn` scroll, `Esc` clear · `/new` `/help` `/quit` · `/model` and `/provider` open a picker |
+| chat | typing, `Enter` send, `←`/`→`/`Home`/`End`, `Backspace`/`Delete`, `↑`/`↓`/`PgUp`/`PgDn` scroll, `Esc` clear · `/new` `/help` `/quit` · `/model` and `/provider` open a picker · `/compact` folds the focused agent's conversation (§3) |
 
 ---
 
