@@ -2816,24 +2816,50 @@ mod tests {
     }
 
     /// A transcript that fills the (tiny, configured) context window must be
-    /// folded into a summary — not dropped — and the run continues from it.
+    /// folded into a summary — not dropped — and the run continues from it,
+    /// with the task still worth doing: the isolated child does the work it was
+    /// asked for before the fold.
     #[test]
-    #[ignore = "needs python3 + git; spawns a local mock model server"]
     fn compaction_folds_overflowing_history_into_a_summary() {
-        use std::fs;
-
-        const PORT: u16 = 18_733;
-        let mock = start_mock(PORT);
         let root = init_git_repo("compact");
+        let summary =
+            "the task was to create iso.txt via an isolated subagent; nothing is done yet";
+        let scripted = Arc::new(
+            Scripted::new()
+                // The compaction ask carries the instruction, the transcript
+                // search works without a server's help.
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary)
+                .when(|asked: &Asked| asked.depth() == Some(1) && !asked.saw("wrote iso.txt"))
+                .calls(vec![tool_call(
+                    "c1",
+                    "write_file",
+                    json!({ "path": "iso.txt", "content": "isolated work" }),
+                )])
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .says("created iso.txt in my worktree")
+                .when(|asked: &Asked| asked.saw("#1 done"))
+                .says("done")
+                .when(|asked: &Asked| asked.saw("spawned agent"))
+                .says("child left running — I will handle its result when it finishes")
+                // The first thing the run does after the fold: the task again.
+                .calls(vec![tool_call(
+                    "c0",
+                    "spawn_agent",
+                    json!({
+                        "brief": "create a file called iso.txt containing exactly: isolated work",
+                        "isolated": true
+                    }),
+                )]),
+        );
 
-        let mut cfg = Config::new(format!("http://127.0.0.1:{PORT}"), "mock", None);
+        let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
         // Tight window: the reserve scales with it, so the budget is 3 * (ctx
         // - ctx/2) = 6000 bytes.
         cfg.context_tokens = 4_000;
         let budget = cfg.history_budget();
-
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let root_tx = spawn(cfg, tx, root.clone()).tx;
+        let root_tx = spawn_scripted(cfg, tx, root.clone(), scripted.clone()).tx;
 
         // History above 3/4 of the budget but still fitting: compaction must
         // trigger instead of trimming. Built until it crosses the line, so the
@@ -2858,99 +2884,107 @@ mod tests {
         );
         root_tx.send(AgentMsg::Run(messages)).unwrap();
 
-        // Expect a Compact event, then the run continuing (the mock resumes
-        // the DEFAULT scenario from the summary and spawns the iso child).
-        let mut compact = 0usize;
-        let mut done = 0usize;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while (compact == 0 || done == 0) && Instant::now() < deadline {
-            while let Ok(msg) = rx.try_recv() {
-                if let Msg::Agent { event, .. } = msg {
-                    if matches!(event, AgentEvent::Compact { .. }) {
-                        compact += 1;
-                    }
-                    if matches!(event, AgentEvent::Done) {
-                        done += 1;
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        let iso = root.join(".mush/wt/1/iso.txt");
-        let iso_ok =
-            iso.exists() && fs::read_to_string(&iso).ok().as_deref() == Some("isolated work");
-
-        stop_mock(mock);
-        let _ = fs::remove_dir_all(&root);
-        assert!(compact >= 1, "history must be compacted into a summary");
-        assert!(done >= 1, "the run must finish after compaction");
+        // The root's run and the child's, in either order: whether the child
+        // finished before the root's next message boundary is a race the test
+        // does not care about.
+        let mut seen = Watched::default();
         assert!(
-            iso_ok,
-            "the task must survive compaction (iso.txt in the worktree)"
+            seen.wait(&rx, WAIT, |seen| seen.done >= 2),
+            "the run must finish, and the child with it: {seen:?}"
         );
+        assert_eq!(seen.errors, Vec::<String>::new());
+        assert_eq!(
+            seen.summaries,
+            vec![summary.to_string()],
+            "the overflowing history must be folded into a summary, once"
+        );
+
+        // “The run continues from it” means the next request is the task again,
+        // and it is built from the summary alone — not from the history that no
+        // longer fits.
+        let asked = scripted.asked();
+        assert_eq!(
+            asked[0].messages.last().map(Message::text),
+            Some(COMPACT_INSTRUCTION),
+            "the first request is the summary ask"
+        );
+        assert_eq!(
+            asked[1].messages.len(),
+            2,
+            "system + the summary, nothing else: {:?}",
+            asked[1].messages
+        );
+        assert_eq!(
+            asked[1].messages[1].text(),
+            prompt::compaction_message(summary)
+        );
+        // …and the work survives the fold: the child was asked afterwards.
+        assert_eq!(
+            fs::read_to_string(root.join(".mush/wt/1/iso.txt"))
+                .ok()
+                .as_deref(),
+            Some("isolated work")
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The human types while the model is answering: the nudge must land after
     /// that reply and be answered, never silently swallowed when the run would
-    /// otherwise end. The mock holds its first reply open — writing a marker,
-    /// so the nudge is provably in flight — and answers "steered" only once it
-    /// receives the nudge.
+    /// otherwise end. The first reply is held open, so the nudge is provably in
+    /// flight — no sleep, and no marker file to poll for.
     #[test]
-    #[ignore = "needs python3; spawns a local mock model server"]
     fn a_nudge_that_arrives_mid_reply_is_answered() {
-        use std::fs;
+        let root = scratch_dir("steer");
+        let gate = Arc::new(Gate::new());
+        let scripted = Arc::new(
+            Scripted::new()
+                .held(gate.clone())
+                .says("first reply")
+                .says("steered"),
+        );
 
-        const PORT: u16 = 18_734;
-        let root = std::env::temp_dir().join(format!("mush-steer-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let marker = root.join("in-flight");
-        let mock = start_mock_with(PORT, &[marker.to_str().unwrap()]);
-
-        let cfg = Config::new(format!("http://127.0.0.1:{PORT}"), "mock", None);
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let root_tx = spawn(cfg, tx, root.clone()).tx;
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            tx,
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("STEER: answer this, then whatever else I say".to_string()),
+            ]))
+            .unwrap();
 
-        let messages = vec![
-            Message::system("you are mush"),
-            Message::user("STEER: answer this, then whatever else I say".to_string()),
-        ];
-        root_tx.send(AgentMsg::Run(messages)).unwrap();
-
-        // Only nudge once the mock has the reply in hand.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !marker.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(marker.exists(), "the first request never reached the mock");
+        // The reply is in flight: the human types while the model answers.
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the first request never reached the model"
+        );
         root_tx
             .send(AgentMsg::Nudge("STEERME".to_string()))
             .unwrap();
+        gate.release();
 
-        let (mut first, mut steered) = (false, false);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !(first && steered) && Instant::now() < deadline {
-            while let Ok(msg) = rx.try_recv() {
-                if let Msg::Agent {
-                    event: AgentEvent::Message(message),
-                    ..
-                } = msg
-                {
-                    match message.text().trim() {
-                        "first reply" => first = true,
-                        "steered" => steered = true,
-                        _ => {}
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        stop_mock(mock);
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&rx, WAIT, |seen| seen.done > 0),
+            "the run must finish: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+        assert_eq!(
+            seen.replies,
+            vec!["first reply".to_string(), "steered".to_string()],
+            "the first reply arrives, and the nudge is answered after it"
+        );
+        // Answered *because* the model was given it: the second request carries
+        // the nudge, so it is not a reply to the same words again.
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 2, "one turn for the reply, one for the nudge");
+        assert!(asked[1].saw("STEERME"), "{:?}", asked[1].messages);
         let _ = fs::remove_dir_all(&root);
-        assert!(first, "the first reply should arrive while the nudge waits");
-        assert!(steered, "the nudge must be answered, not swallowed");
     }
 
     /// Hitting the turn limit must end with a summary, not a bare `stopped
