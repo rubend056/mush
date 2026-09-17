@@ -76,7 +76,11 @@ pub enum AgentEvent {
     },
     /// A run began — including one the UI did not ask for, because an idle
     /// agent was woken by a child's result. Keeps `busy` and the tree honest.
-    Running,
+    /// `cancel` is this run's flag, and the UI keeps a clone: it is the one the
+    /// HTTP reader polls, so a Stop reaches a model call that has not answered.
+    Running {
+        cancel: Arc<AtomicBool>,
+    },
     Status(String),
     Message(Message),
     Resync,
@@ -228,8 +232,15 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         ready = false;
         let cancel = Arc::new(AtomicBool::new(false));
         // Say so up front: the UI did not necessarily ask for this run (a nap
-        // ends with a wake-up), and the tree must show it running.
-        actor.ctx.emit(actor.id, AgentEvent::Running);
+        // ends with a wake-up), and the tree must show it running. The flag
+        // travels with the event so the human can stop a run that is blocked
+        // waiting for a model reply.
+        actor.ctx.emit(
+            actor.id,
+            AgentEvent::Running {
+                cancel: cancel.clone(),
+            },
+        );
         actor.ctx.live.fetch_add(1, Ordering::SeqCst);
         let result = run_loop(&actor, &mut state, &mut transcript, &cancel);
         actor.ctx.live.fetch_sub(1, Ordering::SeqCst);
@@ -446,8 +457,12 @@ fn run_loop(
             Err(error) => return Err(format!("could not encode request: {error}")),
         };
 
-        let response = match http::post_json(&cfg.chat_url(), &body, cfg.api_key.as_deref()) {
+        let response = match http::post_json(&cfg.chat_url(), &body, cfg.api_key.as_deref(), cancel)
+        {
             Ok(response) => response,
+            // The reader stops the moment the human cancels; that is a
+            // cancellation, not a failure to reach the endpoint.
+            Err(_) if cancel.load(Ordering::SeqCst) => return Err(CANCELLED.to_string()),
             Err(error) => {
                 return Err(format!("cannot reach {}: {error}", cfg.base_url));
             }
@@ -649,8 +664,10 @@ fn compact_history(
         Ok(body) => body,
         Err(error) => return Err(format!("could not encode request: {error}")),
     };
-    let response = match http::post_json(&cfg.chat_url(), &body, cfg.api_key.as_deref()) {
+    let response = match http::post_json(&cfg.chat_url(), &body, cfg.api_key.as_deref(), cancel) {
         Ok(response) => response,
+        // A cancelled run is already ending; do not report a network failure.
+        Err(_) if cancel.load(Ordering::SeqCst) => return Err(CANCELLED.to_string()),
         // The run will fail on its real request anyway; surface it.
         Err(error) => return Err(format!("cannot reach {}: {error}", cfg.base_url)),
     };

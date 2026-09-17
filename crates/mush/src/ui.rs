@@ -75,8 +75,12 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
 /// `▶` marks the focused agent (whose chat the bottom pane shows).
 fn agent_item(app: &App, node: &AgentNode, width: usize) -> ListItem<'static> {
     let indent = "  ".repeat(node.depth);
+    // The cancel state comes second: a Stop is on its way, so "running"
+    // would be a lie even though the actor has not stopped yet.
     let glyph = if node.error.is_some() {
         "✗"
+    } else if node.cancelling {
+        "⊘"
     } else if node.running {
         if app
             .agents
@@ -93,7 +97,9 @@ fn agent_item(app: &App, node: &AgentNode, width: usize) -> ListItem<'static> {
     let marker = if app.focused == node.id { "▶" } else { " " };
     let mut text = format!("{indent}{marker}{glyph} #{:<3}", node.id);
     if width > text.chars().count() + 1 {
-        let detail = if node.running {
+        let detail = if node.cancelling {
+            "cancelling…".to_string()
+        } else if node.running {
             node.last.clone()
         } else {
             node.summary.clone().unwrap_or_default()

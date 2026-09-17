@@ -192,7 +192,7 @@ the smallest thing that is genuinely usable.
 
 | Context | Keys |
 |---|---|
-| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit · `Ctrl-S` save · `Ctrl-R` reload · `Ctrl-N` new chat · `Ctrl-C` cancel running agents |
+| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit · `Ctrl-S` save · `Ctrl-R` reload · `Ctrl-N` new chat · `Ctrl-C` cancel running agents (reaches a model that is still thinking) |
 | agents | `j`/`k`, arrows, `g`/`G`, `Enter` focus a row, `c` cancel that agent, `Esc` back to the root |
 | editor (normal) | `i` `a` `I` `A` `o` `O` insert · `hjkl`/arrows · `0` `$` `g` `G` · `Ctrl-D`/`Ctrl-U` · `x` delete |
 | editor (insert) | typing, `Enter`, `Backspace`, `Delete`, arrows, `Esc` to normal |
@@ -259,8 +259,8 @@ are computed in `App`.
   chat and hides an empty editor; the present three panes at 80×20 and up; a
   capped, centred transcript (≈110 cols) on very wide terminals.
 - **R4 — Truthful glyphs.** `·` idle/never ran, `◐` running, `⏸` waiting on
-  children, `✓` finished, `✗` failed, `⑂` isolated, with a legend in the pane
-  title.
+  children, `⊘` a cancel in flight, `✓` finished, `✗` failed, `⑔` isolated, with
+  a legend in the pane title.
 
 ```
 ┌ agents · 2 running · Σ +324 −40 ────────────┐
@@ -334,6 +334,13 @@ actor holds a handle to its own mailbox, so it can never infer that everyone
 else let go — it has to be told. Every event carries the conversation it
 belongs to, so an actor that is still finishing a request when the human starts
 a new chat cannot write into it.
+
+A `Stop` has two halves, because one of them cannot wait for a mailbox: the
+message reaches the actor, and the flag it sets is *shared with the UI* when the
+run starts (`AgentEvent::Running`). The HTTP reader polls that flag between
+short socket slices, so Ctrl-C interrupts a model that has not answered yet —
+the mailbox alone would be read only after the reply. The row shows `⊘` while
+the cancel is in flight, and a fresh run clears it.
 
 ---
 
@@ -490,7 +497,10 @@ to version, audit, and wait for.
 An unreachable endpoint cannot hang startup: connections are bounded by a 5 s
 `connect_timeout`, and the model list by a 10 s read timeout — after which the
 editor opens and reports no model. A chat completion, by contrast, may take as
-long as the model needs.
+long as the model needs: one 10-minute deadline bounds the whole request, while
+the socket itself is read in 200 ms slices so the reader can notice a
+cancellation. Ctrl-C therefore stops a model that has not answered instead of
+waiting for its reply, and a wedged endpoint still cannot pin a thread forever.
 
 Rules: no full-buffer scan per frame, no redraw without a state change, no
 allocation in the input path beyond the edit itself, and no subprocess inside
@@ -558,14 +568,18 @@ later one.
   termination guard, compaction, tool-execution semantics (list filtering,
   unique-match edits), tool-pair repair, argument validation, shell-command
   timeout, cancellation, output cap and runaway-writer limit, URL/status-line
-  parsing, the model-list timeout, config precedence, schema/prompt invariants,
+  parsing, the model-list timeout, cancelling a chat request mid-wait and the
+  request deadline (plus the slow-but-alive body the slices must not mistake for
+  one), config precedence, schema/prompt invariants,
   word wrapping, column slicing, the actor mailbox (parked nudges, Stop vs
   Shutdown, completion delivery), and the `/new`, Ctrl-C, stale-event, and
   steering-echo state transitions.
 - **End-to-end (pty).** `scripts/smoke.py` drives the real binary over a
   pseudo-terminal with the pty as its controlling terminal (so window size and
   SIGWINCH behave as they do in a terminal). Scenarios: agent (needs a model),
-  editor (needs a model), resize (needs nothing).
+  editor (needs a model), resize (needs nothing), cancel (needs nothing — a
+  socket that accepts the chat request and never answers must be abandoned by a
+  single Ctrl-C, which is only observable from outside the process).
 - **Deterministic orchestration.** `cargo test -- --ignored` starts
   `scripts/mock_llm.py` and runs a root → child → grandchild chain, an isolated
   child whose run must commit its worktree (the test then merges it, removes the
@@ -575,8 +589,8 @@ later one.
 - **Live.** Two `#[ignore]`d tests talk to the configured endpoint (one of them
   proves the TLS path), so the default suite stays green offline.
 - **The checks.** `cargo fmt --all --check`, `cargo clippy --all-targets --
-  -D warnings`, the unit tests, and the pty resize scenario are the whole gate;
-  they run anywhere rust and python3 do, so any CI can call them.
+  -D warnings`, the unit tests, and the pty resize and cancel scenarios are the
+  whole gate; they run anywhere rust and python3 do, so any CI can call them.
 - **Screen review.** The UI audit drove the real binary over a pty at 200×50 down
   to 30×8 with a scripted model and photographed the result. The defects it found
   (ten, §4.5) were invisible to unit tests and obvious in the pictures; repeat it
@@ -590,6 +604,7 @@ Run it:
 cargo test                 # offline, fast
 cargo test -- --ignored    # scripted mock model + a live-endpoint check
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --resize
+python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
 ```
 
 ---

@@ -95,11 +95,14 @@ tend to flatten the chain and do the leaf work themselves. Prefer a capable
 model for orchestration.
 
 The **agents** pane shows the whole tree: depth by indentation, `◐` running,
-`⏸` waiting on children, `✓` done (with its final summary), `✗` failed,
-branch suffix for isolated agents. Enter on a row focuses that agent — the
-chat below switches to its transcript and typing nudges it. `Esc` returns to
-the root, `c` cancels the selected agent, `Ctrl-C` cancels everything that is
-running (an idle agent is left alone — it has nothing to cancel).
+`⏸` waiting on children, `⊘` a cancel in flight, `✓` done (with its final
+summary), `✗` failed, branch suffix for isolated agents. Enter on a row focuses
+that agent — the chat below switches to its transcript and typing nudges it.
+`Esc` returns to the root, `c` cancels the selected agent, `Ctrl-C` cancels
+everything that is running (an idle agent is left alone — it has nothing to
+cancel). A cancel reaches the model call itself: the request is read in short
+slices, so Ctrl-C stops a model that has not answered instead of waiting for its
+reply.
 
 `isolated: true` gives a child its own git worktree
 (`.mush/wt/<id>` on branch `mush/<id>`), so parallel agents edit real files
@@ -136,7 +139,7 @@ trimming only cuts in when the model itself cannot produce a summary.
 | `Ctrl-P` | model picker |
 | `Ctrl-S` / `Ctrl-R` | save / reload the open file |
 | `Ctrl-N` | new chat (stops every agent, restarts the root) |
-| `Ctrl-C` | cancel running agents — an idle root is left alone |
+| `Ctrl-C` | cancel running agents — an idle root is left alone, and a cancel reaches a model that is still thinking |
 | `Ctrl-Q` | quit (twice if there are unsaved changes) |
 
 Chat commands: `/provider`, `/model`, `/url`, `/key`, `/models`, `/open`,
@@ -174,10 +177,13 @@ cargo test -- --ignored       # live endpoint tests, plus isolated_subagent,
                               # scripts/mock_llm.py)
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke           # needs a model
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --resize  # needs none
+python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel  # needs none
 ```
 
-The last scenario drives the real binary over a pty and resizes it; it verifies
-the app repaints on its own, with no keystroke.
+The last two drive the real binary over a pty without a model: one resizes it and
+verifies it repaints on its own, the other points it at a socket that accepts the
+request and never answers, and checks that a single `Ctrl-C` frees the agent to
+work again instead of waiting for a reply that never comes.
 
 ## Development
 

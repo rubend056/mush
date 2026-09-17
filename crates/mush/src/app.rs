@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crossbeam_channel::Sender;
@@ -93,6 +94,9 @@ pub struct AgentNode {
     pub depth: usize,
     pub brief: String,
     pub running: bool,
+    /// A Stop is on its way and the actor has not yielded yet. The row says so
+    /// instead of looking like work that is still going somewhere.
+    pub cancelling: bool,
     pub last: String,
     pub branch: Option<String>,
     pub summary: Option<String>,
@@ -342,6 +346,10 @@ pub struct App {
     pub agent_msgs: HashMap<u64, Vec<Message>>,
     /// Steering handles: one mailbox per agent, keyed by id.
     pub agent_tx: HashMap<u64, Sender<AgentMsg>>,
+    /// Each running agent's cancellation flag. The HTTP reader polls it, so a
+    /// Ctrl-C stops a model call that has not answered yet — the mailbox alone
+    /// cannot: the actor is blocked inside the request.
+    pub agent_cancel: HashMap<u64, Arc<AtomicBool>>,
     /// Shared with the agent actors so runtime config changes apply everywhere.
     pub cfg_shared: Arc<Mutex<Config>>,
     /// The UI event channel, needed to respawn the root actor on /new.
@@ -389,6 +397,7 @@ impl App {
                 depth: 0,
                 brief: "you (root agent)".to_string(),
                 running: false,
+                cancelling: false,
                 last: String::new(),
                 branch: None,
                 summary: None,
@@ -398,6 +407,7 @@ impl App {
             focused: 0,
             agent_msgs: HashMap::new(),
             agent_tx: HashMap::from([(0, root.tx)]),
+            agent_cancel: HashMap::new(),
             cfg_shared: root.cfg,
             ui_tx,
             conversation: root.conversation,
@@ -471,6 +481,7 @@ impl App {
                 depth: 1,
                 brief: "leftover worktree".to_string(),
                 running: false,
+                cancelling: false,
                 last: String::new(),
                 branch: Some(full),
                 summary: Some("found on startup".to_string()),
@@ -533,6 +544,7 @@ impl App {
                     depth,
                     brief,
                     running: true,
+                    cancelling: false,
                     last: "spawned".to_string(),
                     branch,
                     summary: None,
@@ -540,14 +552,18 @@ impl App {
                 });
                 self.busy = true;
             }
-            AgentEvent::Running => {
+            AgentEvent::Running { cancel } => {
                 // A run started, possibly one the UI did not ask for (an idle
                 // agent woken by a child's result). Mark it so `busy`, the
                 // spinner, and Ctrl-C agree with the actor.
                 if let Some(node) = self.agent_node_mut(id) {
                     node.running = true;
+                    node.cancelling = false;
                     node.error = None;
                 }
+                // Keep the run's flag: a Stop must be able to reach a model
+                // call that is still waiting, not just the actor's mailbox.
+                self.agent_cancel.insert(id, cancel);
                 self.recompute_busy();
             }
             AgentEvent::Status(status) => {
@@ -571,11 +587,13 @@ impl App {
                 let cancelled = error == agent::CANCELLED;
                 if let Some(node) = self.agent_node_mut(id) {
                     node.running = false;
+                    node.cancelling = false;
                     // A cancellation is the human's doing, not a failure.
                     if !cancelled {
                         node.error = Some(error.clone());
                     }
                 }
+                self.agent_cancel.remove(&id);
                 if cancelled {
                     if id == self.focused || id == 0 {
                         self.status = "cancelled".to_string();
@@ -590,10 +608,12 @@ impl App {
                 let summary = self.last_assistant_text(id);
                 if let Some(node) = self.agent_node_mut(id) {
                     node.running = false;
+                    node.cancelling = false;
                     if node.summary.is_none() {
                         node.summary = summary;
                     }
                 }
+                self.agent_cancel.remove(&id);
                 self.recompute_busy();
             }
             AgentEvent::Resync => self.resync_from_disk(),
@@ -1155,6 +1175,7 @@ impl App {
         self.cfg_shared = root.cfg.clone();
         self.conversation = root.conversation;
         self.agent_tx = HashMap::from([(0, root.tx)]);
+        self.agent_cancel.clear();
         self.agent_msgs.clear();
         // Running agents vanish with the old conversation; worktrees they left
         // behind are still reviewable (they are re-listed below).
@@ -1164,6 +1185,7 @@ impl App {
             depth: 0,
             brief: "you (root agent)".to_string(),
             running: false,
+            cancelling: false,
             last: String::new(),
             branch: None,
             summary: None,
@@ -1264,19 +1286,39 @@ impl App {
         self.should_quit = true;
     }
 
+    /// Ask one agent's current run to stop: flip the flag its in-flight model
+    /// call polls, and leave a Stop in the mailbox for everything else (a
+    /// parked wait, a shell command, the next message boundary).
+    fn stop_agent(&mut self, id: u64) -> bool {
+        if let Some(flag) = self.agent_cancel.get(&id) {
+            flag.store(true, Ordering::SeqCst);
+        }
+        self.agent_tx
+            .get(&id)
+            .map(|tx| tx.send(AgentMsg::Stop).is_ok())
+            .unwrap_or(false)
+    }
+
     /// Cancel the work that is actually running. An idle agent has nothing to
     /// cancel, and stopping it would kill the root for good (it only comes back
     /// with `/new`), so Ctrl-C leaves idle agents alone.
     fn interrupt(&mut self) {
+        let targets: Vec<u64> = self
+            .agents
+            .iter()
+            .filter(|node| node.running)
+            .map(|node| node.id)
+            .collect();
         let mut stopped = 0usize;
-        for node in &self.agents {
-            if !node.running {
+        for id in targets {
+            if !self.stop_agent(id) {
                 continue;
             }
-            if let Some(tx) = self.agent_tx.get(&node.id) {
-                if tx.send(AgentMsg::Stop).is_ok() {
-                    stopped += 1;
-                }
+            stopped += 1;
+            // Say so immediately: the actor may be mid-request, and a row that
+            // keeps spinning looks like the Stop was never heard.
+            if let Some(node) = self.agent_node_mut(id) {
+                node.cancelling = true;
             }
         }
         self.status = if stopped > 0 {
@@ -1329,8 +1371,10 @@ impl App {
                         self.status = format!("agent #{id} is not running");
                         return;
                     }
-                    if let Some(tx) = self.agent_tx.get(&id) {
-                        let _ = tx.send(AgentMsg::Stop);
+                    if self.stop_agent(id) {
+                        if let Some(node) = self.agent_node_mut(id) {
+                            node.cancelling = true;
+                        }
                         self.status = format!("stopping agent #{id}…");
                     }
                 }
@@ -1625,6 +1669,42 @@ mod tests {
         app.busy = true;
         app.interrupt();
         assert!(app.status.starts_with("cancelling"), "{}", app.status);
+        assert!(
+            app.agents[0].cancelling,
+            "the row must show that a cancel is in flight"
+        );
+    }
+
+    /// The cancel mark lasts exactly as long as the cancel does: the actor
+    /// acknowledges by ending the run, and a fresh run clears it too.
+    #[test]
+    fn a_cancel_mark_clears_when_the_actor_yields() {
+        let (mut app, _rx) = test_app("cancel-mark");
+        let conversation = app.conversation;
+        app.agents[0].running = true;
+        app.interrupt();
+        assert!(app.agents[0].cancelling);
+
+        app.update(Msg::Agent {
+            conversation,
+            id: 0,
+            event: AgentEvent::Error(agent::CANCELLED.to_string()),
+        });
+        assert!(!app.agents[0].cancelling, "the actor has stopped");
+
+        app.agents[0].running = true;
+        app.interrupt();
+        app.update(Msg::Agent {
+            conversation,
+            id: 0,
+            event: AgentEvent::Running {
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        });
+        assert!(
+            !app.agents[0].cancelling,
+            "a new run is not a cancelled one"
+        );
     }
 
     #[test]

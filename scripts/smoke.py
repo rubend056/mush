@@ -7,9 +7,9 @@ makes them the only test that covers the whole path — keys, agent loop, tool
 round-trip through the UI thread, atomic writes, and session persistence.
 
 Usage:
-    python3 scripts/smoke.py [BINARY] [WORKDIR] [--agent|--editor|--resize]
+    python3 scripts/smoke.py [BINARY] [WORKDIR] [--agent|--editor|--resize|--cancel]
 
-The resize scenario needs no model endpoint; the others do.
+The resize and cancel scenarios need no model endpoint; the others do.
 
 Defaults to ./target/debug/mush and a fresh directory under /tmp.
 Requires a reachable model endpoint (see the MUSH_URL / MUSH_MODEL variables).
@@ -22,10 +22,12 @@ import pathlib
 import pty
 import select
 import signal
+import socket
 import struct
 import subprocess
 import sys
 import termios
+import threading
 import time
 
 
@@ -242,6 +244,90 @@ def scenario_editor(binary: str, root: pathlib.Path) -> bool:
     return all(results)
 
 
+def scenario_cancel(binary: str, root: pathlib.Path) -> bool:
+    """Ctrl-C must stop a model call that has not answered yet.
+
+    The endpoint accepts the first chat request and then says nothing for thirty
+    seconds — the shape of a reasoning model thinking, only ruder. The proof is
+    behavioural: after Ctrl-C the agent must be free to send the *next* request
+    while the first socket is still being held. Without cancellation reaching the
+    reader, the actor would sit in that read for thirty seconds and no second
+    request could exist. The model list is answered, or startup itself would
+    block on this socket before the TUI enters raw mode.
+    """
+    print(f"\n== cancel == {root}")
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(4)
+    port = listener.getsockname()[1]
+
+    second_request = threading.Event()
+    state = {"chats": 0}
+
+    def reply(connection, payload: bytes):
+        connection.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload
+        )
+        connection.close()
+
+    def handle(connection):
+        request = connection.recv(4096)
+        if b"/models" in request:
+            reply(connection, b'{"object":"list","data":[{"id":"probe"}]}')
+            return
+        state["chats"] += 1
+        if state["chats"] == 1:
+            time.sleep(30)  # a model that never answers
+            connection.close()
+        else:
+            second_request.set()
+            reply(
+                connection,
+                b'{"choices":[{"message":{"role":"assistant",'
+                b'"content":"answered the second request"},"finish_reason":"stop"}]}',
+            )
+
+    def endpoint():
+        # One thread per connection: the first chat is held for thirty seconds,
+        # and the accept loop has to stay free to receive the second one.
+        while True:
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=handle, args=(connection,), daemon=True).start()
+
+    threading.Thread(target=endpoint, daemon=True).start()
+    env = {
+        "MUSH_URL": f"http://127.0.0.1:{port}",
+        "MUSH_PROVIDER": "custom",
+        "MUSH_MODEL": "probe",
+    }
+    tui = Tui(binary, root, rows=24, cols=100, env_extra=env)
+    tui.pump(1.5)
+
+    tui.send("a question that will not be answered\r", settle=0.6)
+    started = time.time()
+    tui.send("\x03", 0.5)  # Ctrl-C, once
+    tui.send("a question that will\r", settle=0.3)
+
+    landed = second_request.wait(timeout=6.0)
+    took = time.time() - started
+
+    exit_code = tui.close()
+    results = [
+        check("one Ctrl-C frees the agent to work again", landed, f"{took:.2f}s"),
+        check("it lands in a moment, not at the deadline", landed and took < 3, f"{took:.2f}s"),
+        check("the endpoint saw exactly two chats", state["chats"] == 2, str(state["chats"])),
+        check("clean exit", exit_code == 0, f"exit {exit_code}"),
+    ]
+    if not all(results):
+        print(tui.tail())
+    return all(results)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="mush end-to-end smoke tests")
     parser.add_argument("binary", nargs="?", default="target/debug/mush")
@@ -249,6 +335,7 @@ def main() -> int:
     parser.add_argument("--agent", action="store_true", help="run only the agent scenario")
     parser.add_argument("--editor", action="store_true", help="run only the editor scenario")
     parser.add_argument("--resize", action="store_true", help="run only the resize scenario")
+    parser.add_argument("--cancel", action="store_true", help="run only the cancel scenario")
     args = parser.parse_args()
 
     binary = str(pathlib.Path(args.binary).resolve())
@@ -256,7 +343,7 @@ def main() -> int:
         print(f"binary not found: {binary}", file=sys.stderr)
         return 2
 
-    both = not (args.agent or args.editor or args.resize)
+    both = not (args.agent or args.editor or args.resize or args.cancel)
     base = pathlib.Path(args.workdir)
     passed = True
     if both or args.agent:
@@ -265,6 +352,8 @@ def main() -> int:
         passed &= scenario_editor(binary, base / "editor")
     if both or args.resize:
         passed &= scenario_resize(binary, base / "resize")
+    if both or args.cancel:
+        passed &= scenario_cancel(binary, base / "cancel")
 
     print("\n" + ("all scenarios passed" if passed else "scenario failures"))
     return 0 if passed else 1

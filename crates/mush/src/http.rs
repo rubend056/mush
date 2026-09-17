@@ -4,24 +4,37 @@
 //! would be overkill. This handles exactly what we need: one request per
 //! connection, with `Content-Length` or chunked responses, over plain HTTP or
 //! TLS (rustls). Keeping it in-tree means no framework and no runtime to debug.
+//!
+//! A chat request can be *watched*: the socket is read in short slices and the
+//! caller's cancellation flag is polled between them, so Ctrl-C interrupts a
+//! model that is still thinking instead of waiting for its reply.
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mush_core::Config;
 
 /// Fail fast when the endpoint is unreachable, rather than inheriting the
 /// operating system's multi-minute connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// A chat completion may legitimately take minutes on a slow local model.
+/// A chat completion may legitimately take minutes on a slow local model. The
+/// deadline bounds one whole request; it is no longer a per-read timeout.
 const CHAT_READ_TIMEOUT: Duration = Duration::from_secs(600);
 /// Listing models must never freeze the caller: the UI thread does this when
 /// `/model`, `/url`, or `/key` runs, and a stalled endpoint should just fall
 /// back to the provider's known list.
 const LIST_READ_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long one socket read waits before the reader checks for a cancellation.
+/// Short enough that a Stop lands promptly, long enough that a silent endpoint
+/// costs a handful of wake-ups per second, not a spin.
+const READ_SLICE: Duration = Duration::from_millis(200);
+/// A request body is small; a write that blocks this long is a dead endpoint.
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 
+#[derive(Debug)]
 pub struct Response {
     pub status: u16,
     pub body: String,
@@ -34,11 +47,26 @@ trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
 pub fn get_json(url: &str, api_key: Option<&str>, read_timeout: Duration) -> io::Result<Response> {
-    request("GET", url, None, api_key, read_timeout)
+    request("GET", url, None, api_key, read_timeout, None)
 }
 
-pub fn post_json(url: &str, body: &str, api_key: Option<&str>) -> io::Result<Response> {
-    request("POST", url, Some(body), api_key, CHAT_READ_TIMEOUT)
+/// POST a chat completion. `cancel` is polled while the socket waits, so a Stop
+/// reaches a model that has not answered yet — the difference between Ctrl-C
+/// working in a moment and Ctrl-C working after the reply.
+pub fn post_json(
+    url: &str,
+    body: &str,
+    api_key: Option<&str>,
+    cancel: &AtomicBool,
+) -> io::Result<Response> {
+    request(
+        "POST",
+        url,
+        Some(body),
+        api_key,
+        CHAT_READ_TIMEOUT,
+        Some(cancel),
+    )
 }
 
 /// List model ids advertised by the endpoint. Falls back to the provider's
@@ -76,7 +104,13 @@ fn request(
     body: Option<&str>,
     api_key: Option<&str>,
     read_timeout: Duration,
+    cancel: Option<&AtomicBool>,
 ) -> io::Result<Response> {
+    let watch = Watch::new(cancel, read_timeout);
+    // A Stop that arrived before the request did: do not pay for a call the
+    // human already cancelled.
+    watch.check()?;
+
     let (host, port, path, tls) = parse_url(url)?;
     let mut stream = connect(&host, port, tls, read_timeout)?;
 
@@ -102,18 +136,12 @@ fn request(
 
     let mut reader = BufReader::new(stream);
 
-    let mut status_line = String::new();
-    reader.read_line(&mut status_line)?;
+    let status_line = read_line(&mut reader, &watch)?.unwrap_or_default();
     let status = parse_status(&status_line)?;
 
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
-    loop {
-        let mut line = String::new();
-        if reader.read_line(&mut line)? == 0 {
-            break;
-        }
-        let line = line.trim_end();
+    while let Some(line) = read_line(&mut reader, &watch)? {
         if line.is_empty() {
             break;
         }
@@ -126,18 +154,140 @@ fn request(
     }
 
     let body = if chunked {
-        read_chunked(&mut reader)?
+        read_chunked(&mut reader, &watch)?
     } else if let Some(len) = content_length {
-        let mut buf = vec![0u8; len];
-        reader.read_exact(&mut buf)?;
-        String::from_utf8_lossy(&buf).into_owned()
+        String::from_utf8_lossy(&read_exact(&mut reader, len, &watch)?).into_owned()
     } else {
-        let mut buf = Vec::new();
-        reader.read_to_end(&mut buf)?;
-        String::from_utf8_lossy(&buf).into_owned()
+        String::from_utf8_lossy(&read_to_end(&mut reader, &watch)?).into_owned()
     };
 
     Ok(Response { status, body })
+}
+
+/// A cancellation flag and a deadline, threaded through one request's reads.
+///
+/// The socket is given [`READ_SLICE`] as its read timeout, so every read wakes
+/// up quickly; `check` is what turns those wake-ups into a decision — keep
+/// waiting, or stop because the human asked us to.
+struct Watch<'a> {
+    cancel: Option<&'a AtomicBool>,
+    deadline: Instant,
+}
+
+impl<'a> Watch<'a> {
+    fn new(cancel: Option<&'a AtomicBool>, timeout: Duration) -> Self {
+        Self {
+            cancel,
+            deadline: Instant::now() + timeout,
+        }
+    }
+
+    fn cancelled(&self) -> bool {
+        self.cancel
+            .map(|flag| flag.load(Ordering::SeqCst))
+            .unwrap_or(false)
+    }
+
+    /// A read timed out: keep waiting unless the human cancelled or the
+    /// endpoint has been silent for longer than the whole request may take.
+    fn check(&self) -> io::Result<()> {
+        if self.cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "request cancelled",
+            ));
+        }
+        if Instant::now() >= self.deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "the endpoint stopped responding",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Only the short read slice is expected to time out; anything else is real.
+fn is_timeout(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+    )
+}
+
+/// One bufferful from the socket, retrying the read slices. `Ok(None)` is EOF.
+///
+/// Everything below reads through `fill_buf`/`consume` rather than
+/// `read_line`/`read_exact`: a timeout leaves the buffer untouched, so the
+/// retry cannot lose a half-read line — which is exactly what a cancellation
+/// arriving mid-body would otherwise do.
+fn fill<'b, R: BufRead>(reader: &'b mut R, watch: &Watch) -> io::Result<Option<&'b [u8]>> {
+    loop {
+        match reader.fill_buf() {
+            Ok([]) => return Ok(None),
+            Ok(buffer) => return Ok(Some(buffer)),
+            Err(error) if is_timeout(&error) => watch.check()?,
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// A line without its terminator, or `None` at end of stream.
+fn read_line<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<Option<String>> {
+    let mut line = Vec::new();
+    loop {
+        let Some(chunk) = fill(reader, watch)? else {
+            if line.is_empty() {
+                return Ok(None);
+            }
+            break;
+        };
+        let take = chunk
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map(|index| index + 1)
+            .unwrap_or(chunk.len());
+        line.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+        if line.ends_with(b"\n") {
+            break;
+        }
+    }
+    while line
+        .last()
+        .is_some_and(|byte| *byte == b'\n' || *byte == b'\r')
+    {
+        line.pop();
+    }
+    Ok(Some(String::from_utf8_lossy(&line).into_owned()))
+}
+
+/// Exactly `len` bytes, or an error if the body ends early.
+fn read_exact<R: BufRead>(reader: &mut R, len: usize, watch: &Watch) -> io::Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(len.min(64 * 1024));
+    while out.len() < len {
+        let Some(chunk) = fill(reader, watch)? else {
+            return Err(io::Error::new(
+                io::ErrorKind::UnexpectedEof,
+                "the body ended before its Content-Length",
+            ));
+        };
+        let take = (len - out.len()).min(chunk.len());
+        out.extend_from_slice(&chunk[..take]);
+        reader.consume(take);
+    }
+    Ok(out)
+}
+
+/// Everything up to end of stream.
+fn read_to_end<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<Vec<u8>> {
+    let mut out = Vec::new();
+    while let Some(chunk) = fill(reader, watch)? {
+        out.extend_from_slice(chunk);
+        let take = chunk.len();
+        reader.consume(take);
+    }
+    Ok(out)
 }
 
 fn connect(
@@ -156,14 +306,19 @@ fn connect(
             }
         };
         // Liveness guards, not UX timers: a stalled endpoint must not pin a
-        // thread (and, for the model list, the whole TUI) forever.
-        stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+        // thread (and, for the model list, the whole TUI) forever. During
+        // setup the socket gets the whole budget — a TLS handshake is a
+        // conversation, not a read — and only then the short slice that lets a
+        // cancellation land while the model thinks.
+        stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
         stream.set_read_timeout(Some(read_timeout))?;
-        return if tls {
-            tls_connect(host, stream).map(|stream| Box::new(stream) as Box<dyn ReadWrite>)
-        } else {
-            Ok(Box::new(stream))
-        };
+        if tls {
+            let stream = tls_connect(host, stream)?;
+            stream.sock.set_read_timeout(Some(READ_SLICE))?;
+            return Ok(Box::new(stream));
+        }
+        stream.set_read_timeout(Some(READ_SLICE))?;
+        return Ok(Box::new(stream));
     }
     Err(last_error.unwrap_or_else(|| {
         io::Error::new(
@@ -240,11 +395,10 @@ fn parse_status(line: &str) -> io::Result<u16> {
         })
 }
 
-fn read_chunked<R: BufRead>(reader: &mut R) -> io::Result<String> {
+fn read_chunked<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<String> {
     let mut out = Vec::new();
     loop {
-        let mut size_line = String::new();
-        reader.read_line(&mut size_line)?;
+        let size_line = read_line(reader, watch)?.unwrap_or_default();
         let size_field = size_line.trim().split(';').next().unwrap_or("0").trim();
         let size = usize::from_str_radix(size_field, 16).map_err(|_| {
             io::Error::new(
@@ -255,11 +409,8 @@ fn read_chunked<R: BufRead>(reader: &mut R) -> io::Result<String> {
         if size == 0 {
             break;
         }
-        let mut chunk = vec![0u8; size];
-        reader.read_exact(&mut chunk)?;
-        out.extend_from_slice(&chunk);
-        let mut crlf = [0u8; 2];
-        reader.read_exact(&mut crlf)?;
+        out.extend_from_slice(&read_exact(reader, size, watch)?);
+        let _crlf = read_exact(reader, 2, watch)?;
     }
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
@@ -302,35 +453,104 @@ mod tests {
         assert!(parse_status("garbage").is_err());
     }
 
+    /// An endpoint that accepts one connection and then says nothing — the
+    /// "model is still thinking" shape.
+    fn silent_endpoint() -> u16 {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((connection, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(30));
+                drop(connection);
+            }
+        });
+        port
+    }
+
     /// An endpoint that accepts the connection and then says nothing must
     /// time out, not wedge the caller: this is what keeps a stalled
     /// `/v1/models` from freezing the TUI.
     #[test]
     fn a_silent_endpoint_times_out() {
+        let url = format!("http://127.0.0.1:{}/v1/models", silent_endpoint());
+        let started = Instant::now();
+        let error = get_json(&url, None, Duration::from_millis(300)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A Stop has to reach a model that has not answered yet. The socket is
+    /// read in 200 ms slices, so the flag is noticed within a slice instead of
+    /// when the reply finally arrives.
+    #[test]
+    fn a_cancelled_chat_request_stops_at_once() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            setter.store(true, Ordering::SeqCst);
+        });
+
+        let url = format!("http://127.0.0.1:{}/v1/chat/completions", silent_endpoint());
+        let started = Instant::now();
+        let error = post_json(&url, "{}", None, &cancel).unwrap_err();
+        let elapsed = started.elapsed();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
+        assert!(
+            elapsed >= Duration::from_millis(250),
+            "returned before the cancel was asked for: {elapsed:?}"
+        );
+    }
+
+    /// A cancellation that arrives before the request never pays for the call.
+    #[test]
+    fn an_already_cancelled_request_is_not_sent() {
+        let cancel = AtomicBool::new(true);
+        let started = Instant::now();
+        // Port 1 is not listening: reaching the network at all would fail with
+        // a connection error, not with `Interrupted`.
+        let error = post_json(
+            "http://127.0.0.1:1/v1/chat/completions",
+            "{}",
+            None,
+            &cancel,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// The 200 ms slice must not turn a slow-but-alive body into a failure:
+    /// the endpoint dribbles its reply out over two slices' worth of silence.
+    #[test]
+    fn a_slow_body_is_not_a_timeout() {
+        use std::io::Write as _;
         use std::net::TcpListener;
 
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
-        // Accept exactly one connection and hold it open without answering.
         std::thread::spawn(move || {
-            if let Ok(connection) = listener.accept() {
-                std::thread::sleep(Duration::from_secs(30));
-                drop(connection);
+            if let Ok((mut connection, _)) = listener.accept() {
+                let mut scratch = [0u8; 1024];
+                let _ = connection.read(&mut scratch);
+                let _ = connection.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhe");
+                let _ = connection.flush();
+                std::thread::sleep(Duration::from_millis(600));
+                let _ = connection.write_all(b"llo");
             }
         });
 
-        let url = format!("http://127.0.0.1:{port}/v1/models");
-        let started = Instant::now();
-        let result = get_json(&url, None, Duration::from_millis(300));
-        assert!(
-            result.is_err(),
-            "a silent endpoint must not look like a success"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(10),
-            "took {:?}",
-            started.elapsed()
-        );
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        let response = get_json(&url, None, Duration::from_secs(5)).unwrap();
+        assert_eq!(response.status, 200);
+        assert_eq!(response.body, "hello");
     }
 
     /// Talks to the configured endpoint; run with `--ignored`.
