@@ -63,10 +63,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let bar_rows = if area.height >= 26 { 2 } else { 1 };
 
     if compact {
-        let agent_rows = (app.tree.agents.len() as u16 + 2).clamp(3, 6);
+        // Every pane's height is computed here, and every constraint is a
+        // `Length`, so the three add up to the terminal exactly and none of
+        // them can lose rows to another. The bar used to be a trailing
+        // `Length` behind a `Min(6)` chat, and at 40×10 the chat took the row
+        // the bar was owed: the frame painted the tree, the transcript and the
+        // message box, and the ` chat ` row — the focus badge, the key hint,
+        // and the only home an Info line or a command's usage error has — was
+        // simply absent.
+        // Six is the least the chat can be and still hold what it is for: a
+        // three-row transcript over a message box that has a row to type in.
+        // The box lost that row instead after the bar's floor was added, which
+        // is the same defect one pane over (§4.5's audit, defect 7).
+        let chat_min = 6;
+        let agent_rows = (app.tree.agents.len() as u16 + 2)
+            .clamp(3, 6)
+            .min(area.height.saturating_sub(bar_rows + chat_min));
+        let chat_rows = area.height - agent_rows - bar_rows;
         let rows = Layout::vertical([
             Constraint::Length(agent_rows),
-            Constraint::Min(6), // chat transcript + message box
+            Constraint::Length(chat_rows),
             Constraint::Length(bar_rows),
         ])
         .split(area);
@@ -74,7 +90,11 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_chat(frame, app, rows[1]);
         draw_status(frame, app, rows[2]);
     } else {
-        let rows = Layout::vertical([Constraint::Min(6), Constraint::Length(bar_rows)]).split(area);
+        let rows = Layout::vertical([
+            Constraint::Length(area.height - bar_rows),
+            Constraint::Length(bar_rows),
+        ])
+        .split(area);
         // On a very wide terminal the tree stops growing: past a point it is
         // empty space, and the chat is what the width belongs to.
         let agents_pane = if area.width >= 160 {

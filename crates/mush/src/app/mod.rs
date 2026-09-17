@@ -3180,6 +3180,56 @@ mod tests {
         );
     }
 
+    /// A tree bigger than its pane, which is the case the size tiers exist for:
+    /// the compact strip wants two rows more than it has agents.
+    fn crowd(app: &mut App, agents: u64) {
+        let conversation = app.tree.conversation();
+        for id in 1..=agents {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId::ROOT,
+                event: AgentEvent::Spawned {
+                    child: id,
+                    parent: 0,
+                    brief: format!("task {id}"),
+                    depth: 1,
+                    branch: None,
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+        }
+    }
+
+    /// The bar keeps a row whatever else is on screen. In compact mode it was
+    /// the trailing constraint behind a `Min(6)` chat, and at 40×10 the panes
+    /// above it took the row it was owed: the frame painted the tree, the
+    /// transcript and the message box, and the ` chat ` row — the focus badge,
+    /// the key hint, and the only home an Info line or a command's usage error
+    /// has — was simply not there.
+    #[test]
+    fn the_bar_keeps_a_row_on_the_shortest_terminals() {
+        let (mut app, _rx) = test_app("bar-floor");
+        crowd(&mut app, 3);
+        // `/diff 9` is a failure with no other home: it is not a message, so it
+        // is never in the transcript, and the row it is about does not exist.
+        run(&mut app, "/diff 9");
+        assert!(
+            text_of(&app).contains("no agent #9"),
+            "the line the bar is supposed to carry: {}",
+            text_of(&app)
+        );
+
+        for (width, height) in [(40u16, 10u16), (40, 11), (40, 12), (60, 12), (120, 12)] {
+            let rows = screen(&mut app, width, height);
+            assert_eq!(rows.len(), height as usize, "{width}x{height}");
+            let bar = rows.last().unwrap();
+            assert!(
+                bar.contains(" chat ") && bar.contains("no agent #9"),
+                "the bar is missing its only row at {width}x{height}: {rows:?}"
+            );
+        }
+    }
+
     /// `/notes` is the other half of the cap: the lines the foot ceded are read
     /// in full, oldest first, with the cursor on the newest.
     #[test]
