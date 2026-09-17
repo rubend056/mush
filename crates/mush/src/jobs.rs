@@ -44,13 +44,14 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 
 use mush_core::workspace::tail_for_model;
+use mush_core::CMD_CAP;
 
 use crate::agent::{AgentEvent, AgentMsg};
 use crate::app::{short_age, AgentId};
@@ -80,6 +81,14 @@ const JOB_LINE_TAIL: usize = 400;
 /// does not need to stay forever; what is running and what just ended is what
 /// anyone asks about.
 const JOB_HISTORY: usize = 8;
+
+/// How much of the jobs' own windows one `command_status` result carries, in
+/// total: every job's headline plus this much output, however many jobs there
+/// are. `CMD_CAP` is the per-result cap the other tools keep (`READ_CAP`,
+/// `LIST_LIMIT` are their own), and this is the same bound on the same kind of
+/// tool result — spent on the windows rather than on the list, so no job is
+/// ever dropped from a status for being old.
+pub const STATUS_WINDOW: usize = CMD_CAP;
 
 /// How often a running command is polled. Ten milliseconds is the latency
 /// between a `Stop` and a process group dying, and costs nothing while idle.
@@ -276,13 +285,15 @@ impl Live {
         }
     }
 
-    /// The end of what it has written so far.
-    fn tail(&self) -> String {
+    /// The end of what it has written so far, at most `cap` bytes of it: the
+    /// window a completion keeps is `JOB_TAIL`, and a `command_status` that
+    /// lists several jobs reads a smaller one for each (see `status_for`).
+    fn tail(&self, cap: usize) -> String {
         let Ok(job) = self.job.lock() else {
             return String::new();
         };
-        let (stdout, stderr) = job.tail(JOB_TAIL);
-        preview(&stdout, &stderr)
+        let (stdout, stderr) = job.tail(cap);
+        preview(&stdout, &stderr, cap)
     }
 }
 
@@ -369,6 +380,21 @@ impl Registry {
         })
     }
 
+    /// The registry's own bookkeeping.
+    ///
+    /// A panic elsewhere must not take the reader down with it: `live_for` runs
+    /// on every frame (`ui.rs`), so an `unwrap` here would turn one actor's
+    /// panic into a dead UI thread. A poisoned lock does not corrupt the
+    /// records — the panic was somewhere else — so the value is taken as it is.
+    /// The only alternatives are worse than the truth: a panic, or an empty
+    /// registry that says nothing is running. (The house shape for a lock whose
+    /// failure must not be fatal; see `app::settings`.)
+    fn inner(&self) -> MutexGuard<'_, Inner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// A registry with no clock of its own, no sink, and nobody to tell: for the
     /// tests that only need the type to exist (the tree's, the app's). Nothing
     /// should ever be launched in one — `launch` would work, and nothing would
@@ -427,16 +453,25 @@ impl Registry {
     /// Take the workspace-wide lock for `agent`.
     pub fn take_machine(&self, agent: u64, command: &str) -> Result<(), Held> {
         self.machine_free_for(agent)?;
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         inner.holder = Some((agent, command.to_string(), None));
         Ok(())
     }
 
-    /// Release the lock if `agent` holds it. A release from anyone else is a
-    /// no-op, so an agent cannot unlock a sibling by finishing its own work.
+    /// Release the lock if `agent` holds it *as a tool call*. A release from
+    /// anyone else is a no-op, so an agent cannot unlock a sibling by finishing
+    /// its own work.
+    ///
+    /// A holder that is a detached job is deliberately left alone. Every
+    /// foreground call ends by releasing, and a call that outlived
+    /// `CMD_DETACH_AFTER` has just handed its claim to the job it became (see
+    /// [`Registry::launch`]): clearing it would let a sibling start while the
+    /// benchmark the lock exists for still runs, contradicting §5.6 — "a
+    /// detached exclusive job holds the lock for its whole life". The job's own
+    /// end gives the machine back, in [`Registry::finish`].
     pub fn release_machine(&self, agent: u64) {
-        let mut inner = self.inner.lock().unwrap();
-        if matches!(&inner.holder, Some((holder, _, _)) if *holder == agent) {
+        let mut inner = self.inner();
+        if matches!(&inner.holder, Some((holder, _, None)) if *holder == agent) {
             inner.holder = None;
         }
     }
@@ -445,7 +480,7 @@ impl Registry {
     /// holding it when the holder is a detached job rather than a live tool
     /// call.
     pub fn held(&self) -> Option<(u64, String, Option<u64>)> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner();
         inner.holder.clone()
     }
 
@@ -454,6 +489,11 @@ impl Registry {
     /// This is the one door into the registry, so admission — the lock and the
     /// budget — is decided here under one lock: two agents cannot both be told
     /// there is room, and a job that cannot be watched is never registered.
+    ///
+    /// The job arrives already running, so a refusal has to kill it: dropping
+    /// the handle would leave the process group alive, unregistered and out of
+    /// `kill_all`'s reach. The kill happens after the registry lock is dropped,
+    /// never under it (see the module docs on lock order).
     pub fn launch(self: &Arc<Self>, launch: Launch) -> Result<u64, Refused> {
         let Launch {
             owner,
@@ -466,44 +506,61 @@ impl Registry {
             job: Arc::new(Mutex::new(job)),
             stop: Arc::new(AtomicBool::new(false)),
         };
-        let id = {
-            let mut inner = self.inner.lock().unwrap();
-            if exclusive {
-                if let Some((holder, held, _)) = &inner.holder {
-                    if *holder != owner {
-                        return Err(Refused::Machine(Held {
-                            agent: *holder,
-                            command: held.clone(),
-                        }));
+        let admitted = {
+            let mut inner = self.inner();
+            let refusal = if exclusive {
+                match &inner.holder {
+                    Some((holder, held, _)) if *holder != owner => Some(Refused::Machine(Held {
+                        agent: *holder,
+                        command: held.clone(),
+                    })),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+            .or_else(|| {
+                (inner
+                    .jobs
+                    .values()
+                    .filter(|record| record.running())
+                    .count()
+                    >= MAX_JOBS)
+                    .then_some(Refused::Budget)
+            });
+            match refusal {
+                Some(refusal) => Err(refusal),
+                None => {
+                    let id = self.ids.fetch_add(1, Ordering::SeqCst);
+                    if exclusive {
+                        inner.holder = Some((owner, command.clone(), Some(id)));
                     }
+                    inner.jobs.insert(
+                        id,
+                        Record {
+                            id,
+                            owner,
+                            command: command.clone(),
+                            started: self.clock.now(),
+                            live: Some(live.clone()),
+                            line: None,
+                            tail: String::new(),
+                        },
+                    );
+                    Ok(id)
                 }
             }
-            if inner
-                .jobs
-                .values()
-                .filter(|record| record.running())
-                .count()
-                >= MAX_JOBS
-            {
-                return Err(Refused::Budget);
+        };
+        let id = match admitted {
+            Ok(id) => id,
+            // Refuse before you own it, or kill what you refuse: this command
+            // was started before admission was asked for (the budget can be
+            // checked up to `CMD_DETACH_AFTER` after the process exists, in the
+            // auto-detach path), so it is ours to end.
+            Err(refusal) => {
+                live.kill();
+                return Err(refusal);
             }
-            let id = self.ids.fetch_add(1, Ordering::SeqCst);
-            if exclusive {
-                inner.holder = Some((owner, command.clone(), Some(id)));
-            }
-            inner.jobs.insert(
-                id,
-                Record {
-                    id,
-                    owner,
-                    command: command.clone(),
-                    started: self.clock.now(),
-                    live: Some(live.clone()),
-                    line: None,
-                    tail: String::new(),
-                },
-            );
-            id
         };
         let registry = Arc::clone(self);
         let watching = live.clone();
@@ -512,11 +569,16 @@ impl Registry {
             .name(format!("mush-job-{id}"))
             .spawn(move || watch(registry, watching, id, owner, command, started, mailbox));
         if let Err(error) = spawned {
+            // The job never ran: kill it, forget it, and hand back the lock it
+            // claimed — which `release_machine` will not do, because a job's
+            // claim is a job's to give up.
             live.kill();
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner();
             inner.jobs.remove(&id);
-            drop(inner);
-            self.release_machine(owner);
+            if matches!(&inner.holder, Some((holder, _, claimed)) if *holder == owner && *claimed == Some(id))
+            {
+                inner.holder = None;
+            }
             return Err(Refused::Thread(error.to_string()));
         }
         Ok(id)
@@ -585,10 +647,17 @@ impl Registry {
             return "no jobs".to_string();
         }
         let mut lines = Vec::new();
+        // The windows share one budget: every job's headline — what the model
+        // actually acts on — always fits, while `MAX_JOBS` running plus
+        // `JOB_HISTORY` finished jobs at a full `JOB_TAIL` each would be 32 KB
+        // of tool result, past every other cap in the tree. A status is a list
+        // to choose from, not a log to read, so a lone job still gets the whole
+        // window it always did and sixteen get a slice each.
+        let per_job = (STATUS_WINDOW / mine.len()).min(JOB_TAIL);
         for record in mine {
             let tail = match &record.live {
-                Some(live) => live.tail(),
-                None => record.tail.clone(),
+                Some(live) => live.tail(per_job),
+                None => tail_for_model(&record.tail, per_job),
             };
             let head = match (&record.live, &record.line) {
                 (Some(_), _) => {
@@ -620,7 +689,7 @@ impl Registry {
     /// own lock is held. The watch thread takes the handle lock before this one,
     /// and holding both in the other order would deadlock.
     fn jobs(&self) -> Vec<Record> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner();
         inner
             .jobs
             .values()
@@ -640,7 +709,7 @@ impl Registry {
     /// was the holder, and forget the oldest ended job if there are too many.
     /// Called from the job's own thread, which is also what tells the owner.
     fn finish(&self, id: u64, outcome: &JobOutcome, tail: String) -> Option<String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         let (started, command) = {
             let record = inner.jobs.get(&id)?;
             (record.started, record.command.clone())
@@ -683,11 +752,10 @@ impl Drop for Registry {
     /// outlives it. `App` calls `kill_all` explicitly on the way out; this
     /// catches the paths that do not (a panic inside an actor, a test).
     fn drop(&mut self) {
-        if let Ok(inner) = self.inner.lock() {
-            for record in inner.jobs.values() {
-                if let Some(live) = &record.live {
-                    live.kill();
-                }
+        let inner = self.inner();
+        for record in inner.jobs.values() {
+            if let Some(live) = &record.live {
+                live.kill();
             }
         }
     }
@@ -771,7 +839,7 @@ fn watch(
             None => registry.clock.sleep(POLL),
         }
     };
-    let mut tail = live.tail();
+    let mut tail = live.tail(JOB_TAIL);
     if !note.is_empty() {
         tail = if tail.is_empty() {
             note
@@ -799,10 +867,10 @@ fn watch(
     });
 }
 
-/// Render the two streams of a command into one window: stdout, then stderr
-/// under a heading, exactly as a foreground result reads — so the same bytes
-/// describe a command however it ended.
-fn preview(stdout: &str, stderr: &str) -> String {
+/// Render the two streams of a command into one window of at most `cap` bytes:
+/// stdout, then stderr under a heading, exactly as a foreground result reads —
+/// so the same bytes describe a command however it ended and whoever asks.
+fn preview(stdout: &str, stderr: &str, cap: usize) -> String {
     let mut out = String::new();
     if !stdout.trim().is_empty() {
         out.push_str(stdout.trim_end());
@@ -814,7 +882,7 @@ fn preview(stdout: &str, stderr: &str) -> String {
         out.push_str("--- stderr ---\n");
         out.push_str(stderr.trim_end());
     }
-    tail_for_model(&out, JOB_TAIL)
+    tail_for_model(&out, cap)
 }
 
 #[cfg(test)]
@@ -1022,6 +1090,122 @@ mod tests {
         assert_eq!(machine.kills(), 1, "the runaway writer was stopped");
     }
 
+    /// The painter path must not panic. `live_for` is called every frame, and a
+    /// panic while the registry's lock was held — by a job's thread, by a
+    /// reader — used to make the next frame's `unwrap` take the UI thread down
+    /// with it.
+    ///
+    /// A poisoned lock does not corrupt the records, so the reader gets the
+    /// truth: what is running, and who holds the machine.
+    #[test]
+    fn a_poisoned_registry_still_answers_the_painter() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let (registry, _events, _clock) = registry();
+        let (id, _mailbox) = launch(&registry, &machine, 7);
+
+        // Another thread panicking with the bookkeeping locked is exactly how a
+        // lock gets poisoned.
+        let clone = registry.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = clone.inner.lock().unwrap();
+            panic!("a thread died with the registry locked");
+        })
+        .join();
+        assert!(registry.inner.is_poisoned(), "the lock is poisoned");
+
+        let live = registry.live_for(7);
+        assert_eq!(live.len(), 1, "the painter still knows what runs");
+        assert_eq!(live[0].command, "cargo build");
+        assert_eq!(registry.running(), 1);
+        assert!(registry.has_room());
+        assert_eq!(registry.held(), None);
+        let status = registry.status_for(7);
+        assert!(status.starts_with("#c1 running "), "{status}");
+        assert!(status.ends_with("cargo build"), "{status}");
+        // Every writer too: admission, the lock, and a stop are still answered
+        // rather than panicking on the way in.
+        assert_eq!(
+            registry.stop(7, id).unwrap(),
+            "stopping job #c1",
+            "a stop is still a stop"
+        );
+        assert!(registry.machine_free_for(9).is_ok());
+        registry.kill_all();
+    }
+
+    /// `command_status` is one bounded tool result, however many jobs there
+    /// are. It used to carry the full `JOB_TAIL` window of every job: sixteen
+    /// jobs — `MAX_JOBS` running plus `JOB_HISTORY` finished — were 32 KB in
+    /// one answer, while every other tool in the tree stops at `CMD_CAP`.
+    ///
+    /// Every job keeps its headline, because what the model does with a status
+    /// is choose one to wait for or stop, and a job dropped from the list
+    /// cannot be chosen. The windows share the rest.
+    #[test]
+    fn a_status_is_one_bounded_result_however_many_jobs_there_are() {
+        let window = "0123456789".repeat(400); // 4000 bytes, past JOB_TAIL
+        let mut scripted = ScriptedMachine::new();
+        for _ in 0..MAX_JOBS {
+            scripted = scripted.runs(Script::exits(0).says("done"));
+        }
+        for _ in 0..MAX_JOBS {
+            scripted = scripted.runs(Script::hangs().says(&window));
+        }
+        let machine = Arc::new(scripted);
+        let (registry, _events, _clock) = registry();
+
+        // Eight jobs that have ended, then eight that are still running: the
+        // whole list a status can be asked for.
+        let mut ends = Vec::new();
+        for _ in 0..MAX_JOBS {
+            let (_, mailbox) = launch(&registry, &machine, 7);
+            ends.push(mailbox);
+        }
+        for mailbox in ends {
+            assert!(matches!(
+                mailbox.recv_timeout(Duration::from_secs(5)),
+                Ok(AgentMsg::CommandDone { .. })
+            ));
+        }
+        for _ in 0..MAX_JOBS {
+            launch(&registry, &machine, 7);
+        }
+
+        let status = registry.status_for(7);
+        for id in 1..=2 * MAX_JOBS as u64 {
+            assert!(
+                status.contains(&label(id)),
+                "{} is missing from a {}-byte status",
+                label(id),
+                status.len()
+            );
+        }
+        assert!(
+            status.len() <= CMD_CAP,
+            "one status must stay inside the tree's per-result cap: {} bytes",
+            status.len()
+        );
+        assert!(
+            !status.contains(&"0123456789".repeat(100)),
+            "the windows were shared, not each shown whole: {} bytes",
+            status.len()
+        );
+        registry.kill_all();
+
+        // A lone job still gets the window it always had — the budget is a
+        // ceiling, not a tax on the ordinary case.
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs().says(&window)));
+        let lone = Registry::bare();
+        launch(&lone, &machine, 7);
+        let status = lone.status_for(7);
+        assert!(
+            status.contains(&"0123456789".repeat(100)),
+            "a single job's window is the full JOB_TAIL: {} bytes",
+            status.len()
+        );
+        lone.kill_all();
+    }
+
     /// The budget is the machine's, not one agent's: `MAX_JOBS` live jobs are
     /// the limit, and the next launch is refused with something the model can
     /// act on.
@@ -1059,11 +1243,57 @@ mod tests {
             mailbox: tx,
         });
         assert_eq!(refused, Err(Refused::Budget));
+        assert_eq!(
+            machine.kills(),
+            1,
+            "the command handed to the refused launch is stopped, not orphaned"
+        );
+        assert_eq!(registry.running(), MAX_JOBS, "and it took no slot");
         assert!(
             Refused::Budget.message(8).contains("command_control"),
             "the refusal tells the model how to make room"
         );
         registry.kill_all();
+    }
+
+    /// The same rule for the lock: a launch refused because a sibling holds the
+    /// machine must not leave the process it was handed running either.
+    /// `launch` owns the job before it decides — the lock and the budget are
+    /// checked under one lock, so two agents cannot both be told there is room —
+    /// and a refusal that merely dropped it left the command in its own process
+    /// group, registered nowhere and out of `kill_all`'s reach.
+    #[test]
+    fn a_launch_refused_by_the_lock_is_killed_too() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let (registry, _events, _clock) = registry();
+        registry.take_machine(7, "cargo bench").unwrap();
+
+        let job = machine
+            .spawn(&ShellCommand {
+                command: "cargo build",
+                root: Path::new("/tmp"),
+            })
+            .unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        assert_eq!(
+            registry.launch(Launch {
+                owner: 9,
+                command: "cargo build".to_string(),
+                exclusive: true,
+                job,
+                mailbox: tx,
+            }),
+            Err(Refused::Machine(Held {
+                agent: 7,
+                command: "cargo bench".to_string(),
+            })),
+        );
+        assert_eq!(
+            machine.kills(),
+            1,
+            "the refused command's process group is killed"
+        );
+        assert_eq!(registry.running(), 0, "and it is not a job");
     }
 
     /// The lock lives here, so who holds the machine and what a refused sibling

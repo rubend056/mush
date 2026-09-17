@@ -720,8 +720,8 @@ impl App {
             AgentEvent::JobStarted { job, command } => {
                 // The bar says what just happened, and the registry — which the
                 // rows read every frame — is what says what is running now. No
-                // copy of the job is kept here: the badge is derived (see
-                // `JobBadge`), so it cannot go stale.
+                // copy of the job is kept here: the row's `⚙N` count is derived
+                // from the registry on every frame, so it cannot go stale.
                 let note = format!("{} detached · {}", crate::jobs::label(job), command);
                 if id == self.tree.focused {
                     self.say(note);
@@ -1784,16 +1784,23 @@ impl App {
     /// because it has no work in flight to cancel. Ending an agent is `/new`'s
     /// job.
     fn cancel_cursor_row(&mut self) {
-        if let Some(node) = self.tree.agents.get(self.tree.cursor()) {
-            let id = node.id;
-            if !node.phase.is_busy() {
-                self.say(format!("agent #{id} is not running"));
-                return;
-            }
-            // The row's own `⊘` is the feedback; the bar shows what the tree as
-            // a whole is doing.
-            self.stop_one(id);
+        let Some(id) = self.tree.agents.get(self.tree.cursor()).map(|node| node.id) else {
+            return;
+        };
+        // The same question `working_agents` answers: a run *or* a job is work
+        // in flight. An agent whose run ended while its `cargo bench` still runs
+        // is not idle on the machine, and the key is aimed at the work — so
+        // answering "not running" here, while Ctrl-C stops the very same job,
+        // made the two paths disagree about the same agent.
+        let working = self.tree.node(id).is_some_and(|node| node.phase.is_busy())
+            || !self.tree.live_jobs(id).is_empty();
+        if !working {
+            self.say(format!("agent #{id} is not running"));
+            return;
         }
+        // The row's own `⊘` is the feedback; the bar shows what the tree as a
+        // whole is doing.
+        self.stop_one(id);
     }
 
     /// Take the picker's selected row: the picker is gone either way, because
@@ -2732,6 +2739,64 @@ mod tests {
             );
         }
         assert_eq!(registry.running(), 0, "nothing is left running");
+    }
+
+    /// `c` on a row is aimed at the work, and a detached job is work in flight:
+    /// an agent whose run ended while its `cargo bench` still runs is not idle
+    /// on the machine. The row used to answer "not running" and do nothing,
+    /// while Ctrl-C — which asks `working_agents`, the same question spelled
+    /// once — stopped that very job. Two paths, one answer.
+    #[test]
+    fn c_on_an_idle_agent_still_stops_its_job() {
+        use crate::jobs::Launch;
+        use crate::machine::fake::{Script, Scripted as ScriptedMachine};
+        use crate::machine::{Machine, ShellCommand};
+
+        let (mut app, _rx) = test_app("cancel-job-row");
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let registry = app.tree.handles().jobs;
+        let job = machine
+            .spawn(&ShellCommand {
+                command: "cargo bench",
+                root: std::path::Path::new("/tmp"),
+            })
+            .unwrap();
+        let (tx, job_rx) = crossbeam_channel::unbounded();
+        registry
+            .launch(Launch {
+                owner: 0,
+                command: "cargo bench".to_string(),
+                exclusive: false,
+                job,
+                mailbox: tx,
+            })
+            .unwrap();
+        // The root is idle — and the row must not say so as if the machine were.
+        assert!(!app.tree.agents[0].phase.is_busy());
+        assert_eq!(app.live_jobs(AgentId::ROOT).len(), 1);
+        assert!(app.busy(), "the tree has work in flight on the machine");
+
+        app.tree.cursor_top();
+        app.focus = Focus::Agents;
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('c'),
+            KeyModifiers::NONE,
+        )));
+
+        assert!(
+            !text_of(&app).contains("is not running"),
+            "there is something to stop: {}",
+            text_of(&app)
+        );
+        // Stopped for real: the Stop goes to the owner's actor, which kills what
+        // it started, and the job's own thread reports it.
+        match job_rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(AgentMsg::CommandDone { line, .. }) => {
+                assert!(line.contains("stopped after"), "{line}")
+            }
+            other => panic!("the job must be stopped: {:?}", other.is_ok()),
+        }
+        assert!(!app.busy(), "and the machine is free again");
     }
 
     /// `/new` clears the stored conversation too, not just the visible one: the
