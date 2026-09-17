@@ -85,6 +85,12 @@ this session had to do).
 |---|---|---|---|
 | B22 | **A steering message to a subagent is invisible in that agent's transcript, and an idle target was not woken by it.** `agent_control message` answers success; no child's transcript shows the line. | ⬜ | `agent.rs` (`absorb`/`drain_mailbox` must emit the folded nudge to the UI the way the human's own typed message is echoed) and `app` (`agent_control`'s reply should say *delivered*, not *messaged*, when it cannot know) |
 
+## 2.75 Observed live: a hiccup on the wire kills a whole run
+
+| ID | What | Status | Home |
+|---|---|---|---|
+| B23 | **A transient transport failure ends the run instead of being retried.** Several agents in this session died mid-work with `cannot reach https://api.deepseek.com: Connection reset by peer (os error 104)` — one of them had committed nothing, another was killed by the *harness* process dying around it, and a third lost a run's worth of edits. Every one was a transport hiccup, not a refusal: the endpoint had no opinion about the request. A bounded retry (three attempts with a timeout, backing off) for *transport* failures only — never for a cancellation, a status the endpoint chose, or a body it deliberately sent — would turn "the run is dead and its worktree is half-edited" into "the run paused for a second". Two rules make it honest: Ctrl-C must still abandon a request immediately (the cancel flag is polled between socket slices and must be checked between attempts), and the human must be told (`retrying — connection reset (2/3)`) rather than watching a spinner that looks stuck. | ⬜ | `crates/mush/src/model.rs` (`HttpModel::chat`'s error classification) with the framing left in `http.rs`; backoff through the `Clock` seam so the test needs no sleep |
+
 ## 3. The contract bug that started this file
 
 | ID | What | Status | Home |
