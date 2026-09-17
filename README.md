@@ -175,8 +175,9 @@ from the right when the terminal is narrow:
 so instead of painting shreds.
 
 Under the conversation is mush's own **foot**: `·` for what happened, `!` for a
-failure. It never takes more than two rows; when there is more, the row that says
-`+N more lines · /notes` is the count, and `/notes` reads the whole list. A fatal
+failure. It never takes more than three rows — two for the lines and one for the
+count; when there is more, the row that says `+N more lines · /notes` is the
+count, and `/notes` reads the whole list. A fatal
 run's failure is kept in `.mush/session.json` and is still there next time mush
 opens the workspace — until that agent runs again, when the failure belonged to
 the run being replaced.
