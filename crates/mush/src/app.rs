@@ -14,9 +14,13 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use serde_json::Value;
 
 use mush_core::message::Message;
-use mush_core::{prompt, session, userconfig, Config, Provider, Session, UserConfig, Workspace, LIST_LIMIT, READ_CAP};
+use mush_core::workspace::truncate_for_model;
+use mush_core::{
+    prompt, session, tools, userconfig, Config, Provider, Session, UserConfig, Workspace,
+    LIST_LIMIT, READ_CAP,
+};
 
-use crate::agent::{AgentEvent, AgentMsg};
+use crate::agent::{self, spawn, AgentEvent, AgentMsg, RootHandle};
 use crate::http;
 
 /// Tools that the model may call but that must execute on the UI thread,
@@ -29,8 +33,20 @@ pub struct ToolCallRequest {
 
 pub enum Msg {
     Key(KeyEvent),
-    Agent { id: u64, event: AgentEvent },
-    Tool(ToolCallRequest),
+    /// An event from an agent actor. `conversation` identifies the tree that
+    /// sent it, so an actor left over from `/new` cannot write into the new
+    /// chat: events are tagged and the UI drops the stale ones.
+    Agent {
+        conversation: u64,
+        id: u64,
+        event: AgentEvent,
+    },
+    /// A file tool to run on this thread, on behalf of an agent acting in the
+    /// main workspace. Carries the conversation for the same reason.
+    Tool {
+        conversation: u64,
+        request: ToolCallRequest,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -270,7 +286,7 @@ impl Buffer {
     }
 
     pub fn move_bottom(&mut self) {
-        self.cursor = (self.lines.len() - 1, 0);
+        self.cursor = (self.lines.len().saturating_sub(1), 0);
     }
 
     pub fn scroll_view(&mut self, view_height: usize, view_width: usize) {
@@ -299,7 +315,10 @@ fn byte_index(line: &str, char_col: usize) -> usize {
 
 /// Column including tab expansion, used for cursor placement.
 pub fn display_column(line: &str, char_col: usize) -> usize {
-    line.chars().take(char_col).map(|c| if c == '\t' { 4 } else { 1 }).sum()
+    line.chars()
+        .take(char_col)
+        .map(|c| if c == '\t' { 4 } else { 1 })
+        .sum()
 }
 
 pub struct App {
@@ -325,6 +344,11 @@ pub struct App {
     pub agent_tx: HashMap<u64, Sender<AgentMsg>>,
     /// Shared with the agent actors so runtime config changes apply everywhere.
     pub cfg_shared: Arc<Mutex<Config>>,
+    /// The UI event channel, needed to respawn the root actor on /new.
+    ui_tx: Sender<Msg>,
+    /// Which conversation the live actor tree belongs to; events tagged with
+    /// any other are from an abandoned tree and are ignored.
+    conversation: u64,
     pub status: String,
     pub busy: bool,
     pub should_quit: bool,
@@ -338,14 +362,14 @@ impl App {
     pub fn new(
         ws: Workspace,
         cfg: Config,
-        session: Option<Session>,
-        cfg_shared: Arc<Mutex<Config>>,
-        root_tx: Sender<AgentMsg>,
+        stored: Option<Session>,
+        root: RootHandle,
+        ui_tx: Sender<Msg>,
         models: Vec<String>,
         open_file: Option<String>,
     ) -> Self {
         let system = Message::system(prompt::system_prompt(&ws.root_str()));
-        let chat = session.map(|s| s.messages).unwrap_or_default();
+        let chat = stored.map(|s| s.messages).unwrap_or_default();
         let mut app = Self {
             ws,
             cfg,
@@ -373,8 +397,10 @@ impl App {
             agent_cursor: 0,
             focused: 0,
             agent_msgs: HashMap::new(),
-            agent_tx: HashMap::from([(0, root_tx)]),
-            cfg_shared,
+            agent_tx: HashMap::from([(0, root.tx)]),
+            cfg_shared: root.cfg,
+            ui_tx,
+            conversation: root.conversation,
             status: String::new(),
             busy: false,
             should_quit: false,
@@ -383,7 +409,10 @@ impl App {
             spin: 0,
             system,
         };
-        app.status = format!("{}  •  Tab to move around · Ctrl-P pick a model", app.cfg.label());
+        app.status = format!(
+            "{}  •  Tab to move around · Ctrl-P pick a model",
+            app.cfg.label()
+        );
         app.discover_worktrees();
         if let Some(rel) = open_file {
             app.open_file(&rel);
@@ -414,7 +443,10 @@ impl App {
             let Some(branch) = node.branch.as_deref() else {
                 return false;
             };
-            let Some(id) = branch.strip_prefix("mush/").and_then(|s| s.parse::<u64>().ok()) else {
+            let Some(id) = branch
+                .strip_prefix("mush/")
+                .and_then(|s| s.parse::<u64>().ok())
+            else {
                 return false;
             };
             root.join(format!(".mush/wt/{id}")).exists()
@@ -452,8 +484,25 @@ impl App {
     pub fn update(&mut self, msg: Msg) {
         match msg {
             Msg::Key(key) => self.on_key(key),
-            Msg::Agent { id, event } => self.on_agent(id, event),
-            Msg::Tool(request) => self.on_tool(request),
+            Msg::Agent {
+                conversation,
+                id,
+                event,
+            } => {
+                if conversation == self.conversation {
+                    self.on_agent(id, event);
+                } else if let AgentEvent::Spawned { cmd, .. } = &event {
+                    // A tree `/new` abandoned can still spawn children. They are
+                    // not ours, but they must not run either — and because this
+                    // event is dropped, telling the child here is the only
+                    // chance it gets to end.
+                    let _ = cmd.send(AgentMsg::Shutdown);
+                }
+            }
+            Msg::Tool {
+                conversation,
+                request,
+            } => self.on_tool(conversation, request),
         }
         self.dirty_screen = true;
     }
@@ -468,7 +517,14 @@ impl App {
 
     fn on_agent(&mut self, id: u64, event: AgentEvent) {
         match event {
-            AgentEvent::Spawned { child, parent, brief, depth, branch, cmd } => {
+            AgentEvent::Spawned {
+                child,
+                parent,
+                brief,
+                depth,
+                branch,
+                cmd,
+            } => {
                 self.agent_tx.insert(child, cmd);
                 self.agent_msgs.entry(child).or_default();
                 self.agents.push(AgentNode {
@@ -483,6 +539,16 @@ impl App {
                     error: None,
                 });
                 self.busy = true;
+            }
+            AgentEvent::Running => {
+                // A run started, possibly one the UI did not ask for (an idle
+                // agent woken by a child's result). Mark it so `busy`, the
+                // spinner, and Ctrl-C agree with the actor.
+                if let Some(node) = self.agent_node_mut(id) {
+                    node.running = true;
+                    node.error = None;
+                }
+                self.recompute_busy();
             }
             AgentEvent::Status(status) => {
                 if let Some(node) = self.agent_node_mut(id) {
@@ -502,11 +568,21 @@ impl App {
                 self.chat_scroll = 0;
             }
             AgentEvent::Error(error) => {
+                let cancelled = error == agent::CANCELLED;
                 if let Some(node) = self.agent_node_mut(id) {
                     node.running = false;
-                    node.error = Some(error.clone());
+                    // A cancellation is the human's doing, not a failure.
+                    if !cancelled {
+                        node.error = Some(error.clone());
+                    }
                 }
-                self.notices.push(error);
+                if cancelled {
+                    if id == self.focused || id == 0 {
+                        self.status = "cancelled".to_string();
+                    }
+                } else {
+                    self.notices.push(error);
+                }
                 self.chat_scroll = 0;
                 self.recompute_busy();
             }
@@ -521,6 +597,21 @@ impl App {
                 self.recompute_busy();
             }
             AgentEvent::Resync => self.resync_from_disk(),
+            AgentEvent::Compact { summary } => {
+                // The actor's transcript is now [system, user(summary)];
+                // mirror it so nudges, saves, and the visible chat stay in
+                // sync with what the model actually sees.
+                let carried = Message::user(prompt::compaction_message(&summary));
+                if id == 0 {
+                    self.chat = vec![carried];
+                    self.save_session();
+                    self.notices
+                        .push("context compacted — continuing from a summary".to_string());
+                } else if let Some(msgs) = self.agent_msgs.get_mut(&id) {
+                    *msgs = vec![carried];
+                }
+                self.chat_scroll = 0;
+            }
         }
     }
 
@@ -576,7 +667,18 @@ impl App {
         }
     }
 
-    fn on_tool(&mut self, request: ToolCallRequest) {
+    /// A file tool for an agent in the main workspace: it runs on this thread
+    /// because only the UI knows about live buffers. Only for the conversation
+    /// that is still live, though — a tree `/new` abandoned must not touch the
+    /// workspace, and its agent should be told so rather than blocking until
+    /// the tool timeout.
+    fn on_tool(&mut self, conversation: u64, request: ToolCallRequest) {
+        if conversation != self.conversation {
+            let _ = request
+                .reply
+                .send(Err("this conversation has ended".to_string()));
+            return;
+        }
         let result = self.exec_tool(&request.name, &request.args);
         let _ = request.reply.send(result);
     }
@@ -585,51 +687,24 @@ impl App {
 
     fn exec_tool(&mut self, name: &str, args: &Value) -> Result<String, String> {
         match name {
-            "list_files" => {
-                let requested = args.get("path").and_then(Value::as_str).unwrap_or("");
-                let prefix = requested.trim().trim_start_matches("./").trim_end_matches('/');
-                let files: Vec<String> = self
-                    .ws
-                    .list_files(LIST_LIMIT)
-                    .into_iter()
-                    .filter(|file| {
-                        prefix.is_empty() || prefix == "." || file.starts_with(&format!("{prefix}/"))
-                    })
-                    .collect();
-                if files.is_empty() {
-                    Ok(format!("no files under `{}`", if prefix.is_empty() { "." } else { prefix }))
-                } else {
-                    Ok(files.join("\n"))
-                }
-            }
+            "list_files" => tools::list_result(&self.ws, args, LIST_LIMIT),
             "read_file" => {
-                let rel = arg_string(args, "path")?;
+                let rel = tools::arg_string(args, "path")?;
                 self.read_live(&rel)
             }
             "write_file" => {
-                let rel = arg_string(args, "path")?;
-                let content = arg_string(args, "content")?;
+                let rel = tools::arg_string(args, "path")?;
+                let content = tools::arg_string(args, "content")?;
                 self.write_live(&rel, &content)
             }
             "edit_file" => {
-                let rel = arg_string(args, "path")?;
-                let old = arg_string(args, "old_string")?;
-                let new = arg_string(args, "new_string")?;
-                if old.is_empty() {
-                    return Err("old_string must not be empty".to_string());
-                }
+                let rel = tools::arg_string(args, "path")?;
+                let old = tools::arg_string(args, "old_string")?;
+                let new = tools::arg_string(args, "new_string")?;
                 let current = self.read_for_edit(&rel)?;
-                match current.matches(old.as_str()).count() {
-                    0 => Err(format!("old_string not found in {rel}")),
-                    1 => {
-                        let updated = current.replacen(old.as_str(), new.as_str(), 1);
-                        self.write_live(&rel, &updated)?;
-                        Ok(format!("edited {rel}"))
-                    }
-                    count => Err(format!(
-                        "old_string appears {count} times in {rel}; include more context to make it unique"
-                    )),
-                }
+                let updated = tools::edit_text(&current, &old, &new, &rel)?;
+                self.write_live(&rel, &updated)?;
+                Ok(format!("edited {rel}"))
             }
             other => Err(format!("unknown tool `{other}`")),
         }
@@ -638,7 +713,7 @@ impl App {
     /// Read through the live buffer when the file is open, so an agent always
     /// sees what the human sees. Large files are capped for the model's benefit.
     fn read_live(&self, rel: &str) -> Result<String, String> {
-        Ok(cap_text(self.read_for_edit(rel)?))
+        Ok(truncate_for_model(self.read_for_edit(rel)?, READ_CAP))
     }
 
     /// The complete current text of a file: buffer first, disk second. Used by
@@ -670,7 +745,9 @@ impl App {
 
     fn buffer_index(&self, rel: &str) -> Option<usize> {
         let normalized = rel.trim_start_matches("./");
-        self.buffers.iter().position(|buffer| buffer.rel == normalized)
+        self.buffers
+            .iter()
+            .position(|buffer| buffer.rel == normalized)
     }
 
     pub fn open_file(&mut self, rel: &str) {
@@ -747,27 +824,44 @@ impl App {
         }
         let target = self.focused;
         if target == 0 {
+            // The human's words belong in the transcript they can see, whether
+            // the root is starting a run or already in one.
             self.chat.push(Message::user(text.clone()));
             self.chat_scroll = 0;
             self.save_session();
             if self.busy {
-                // Human steering while the root runs: queued as a nudge.
-                if let Some(tx) = self.agent_tx.get(&0) {
-                    let _ = tx.send(AgentMsg::Nudge(text));
+                // Human steering while the root runs: queued as a nudge. If the
+                // root's mailbox is dead (it was cancelled), fall through and
+                // start a fresh run instead of spinning forever on a ghost.
+                let alive = self
+                    .agent_tx
+                    .get(&0)
+                    .map(|tx| tx.send(AgentMsg::Nudge(text.clone())).is_ok())
+                    .unwrap_or(false);
+                if alive {
+                    self.status = "noted — folded in as the agent continues".to_string();
+                    return;
                 }
-                self.status = "noted — folded in as the agent continues".to_string();
-                return;
-            }
-            self.busy = true;
-            self.status = "thinking…".to_string();
-            if let Some(node) = self.agent_node_mut(0) {
-                node.running = true;
+                self.busy = false;
+                if let Some(node) = self.agent_node_mut(0) {
+                    node.running = false;
+                }
             }
             let mut messages = Vec::with_capacity(self.chat.len() + 1);
             messages.push(self.system.clone());
             messages.extend(self.chat.iter().cloned());
-            if let Some(tx) = self.agent_tx.get(&0) {
-                let _ = tx.send(AgentMsg::Run(messages));
+            match self.agent_tx.get(&0) {
+                Some(tx) if tx.send(AgentMsg::Run(messages)).is_ok() => {
+                    self.busy = true;
+                    self.status = "thinking…".to_string();
+                    if let Some(node) = self.agent_node_mut(0) {
+                        node.running = true;
+                        node.error = None;
+                    }
+                }
+                _ => {
+                    self.status = "root agent is gone — /new restarts it".to_string();
+                }
             }
         } else {
             // Nudge a specific agent; running ones fold it in, idle ones rerun.
@@ -778,10 +872,15 @@ impl App {
                 node.running = true;
                 node.error = None;
             }
-            if let Some(tx) = self.agent_tx.get(&target) {
-                let _ = tx.send(AgentMsg::Nudge(text));
-            } else {
-                self.status = format!("agent #{target} is gone");
+            match self.agent_tx.get(&target) {
+                Some(tx) if tx.send(AgentMsg::Nudge(text)).is_ok() => {}
+                _ => {
+                    if let Some(node) = self.agent_node_mut(target) {
+                        node.running = false;
+                    }
+                    self.status = format!("agent #{target} is gone");
+                    self.recompute_busy();
+                }
             }
         }
     }
@@ -792,20 +891,14 @@ impl App {
             .map(|(name, rest)| (name, rest.trim()))
             .unwrap_or((command, ""));
         match name {
-            "/new" | "/clear" => {
-                self.chat.clear();
-                self.notices.clear();
-                self.chat_scroll = 0;
-                self.save_session();
-                self.status = "new chat".to_string();
-            }
+            "/new" | "/clear" => self.new_chat(),
             "/quit" | "/q" => self.should_quit = true,
             "/help" | "/?" => {
                 self.notices.push(
                     "mush: Tab cycles agents/editor/chat · Enter sends to the focused agent · \
                      Ctrl-P pick a model · Ctrl-S save · Ctrl-R reload · Ctrl-N new chat · \
                      Ctrl-C cancel all. Commands: /provider /model /url /key /models /open \
-                     /diff /merge /discard /new /quit"
+                     /worktrees /diff /merge /discard /new /quit"
                         .to_string(),
                 );
             }
@@ -819,7 +912,11 @@ impl App {
             "/diff" | "/merge" | "/discard" => self.worktree_command(name, rest),
             "/worktrees" => {
                 self.discover_worktrees();
-                let count = self.agents.iter().filter(|n| n.brief == "leftover worktree").count();
+                let count = self
+                    .agents
+                    .iter()
+                    .filter(|n| n.brief == "leftover worktree")
+                    .count();
                 self.status = if count > 0 {
                     format!("{count} leftover worktree(s) registered — /diff, /merge, /discard work on them")
                 } else {
@@ -836,12 +933,13 @@ impl App {
             "/model" => self.open_model_picker(),
             "/url" => {
                 if rest.is_empty() {
-                    self.status = "usage: /url http://host:port — base URL of an OpenAI-compatible \
+                    self.status =
+                        "usage: /url http://host:port — base URL of an OpenAI-compatible \
                                   endpoint"
-                        .to_string();
+                            .to_string();
                     return;
                 }
-                self.cfg.base_url = rest.trim_end_matches('/').to_string();
+                self.cfg.set_base_url(rest);
                 self.refresh_models();
                 self.status = format!("endpoint: {}", self.cfg.base_url);
                 self.apply_config();
@@ -872,7 +970,11 @@ impl App {
                 self.status = if self.models.is_empty() {
                     format!("no models from {}", self.cfg.models_url())
                 } else {
-                    format!("{} models from {}", self.models.len(), self.cfg.models_url())
+                    format!(
+                        "{} models from {}",
+                        self.models.len(),
+                        self.cfg.models_url()
+                    )
                 };
             }
             other => self.notices.push(format!("unknown command: {other}")),
@@ -914,7 +1016,8 @@ impl App {
             self.refresh_models();
         }
         if self.models.is_empty() {
-            self.status = "no models — point at an endpoint with /url or /provider first".to_string();
+            self.status =
+                "no models — point at an endpoint with /url or /provider first".to_string();
             return;
         }
         let cursor = self
@@ -954,7 +1057,7 @@ impl App {
             self.cfg.base_url = provider.default_base_url().to_string();
         }
         let known = self.cfg.default_models();
-        if !known.iter().any(|model| *model == self.cfg.model) {
+        if !known.contains(&self.cfg.model) {
             if let Some(first) = known.first() {
                 self.cfg.model = first.clone();
             }
@@ -1026,20 +1129,66 @@ impl App {
         let command_text = match command {
             "/diff" => format!("git diff HEAD...{branch}"),
             "/merge" => format!("git merge {branch}    (in {})", self.ws.root_str()),
-            "/discard" => format!("git worktree remove {wtree} && git branch -D {branch}"),
+            "/discard" => format!("git worktree remove --force {wtree} && git branch -D {branch}"),
             _ => return,
         };
         self.status = command_text.clone();
         self.notices.push(command_text);
     }
 
+    /// Reset the conversation: stop every actor in the old tree and start a
+    /// fresh root, so the new chat has a clean slate and a live mailbox.
+    ///
+    /// Both `Ctrl-N` and `/new` land here — a chat that is cleared without
+    /// restarting the root would leave the actor holding the old transcript
+    /// (and a busy flag) while the UI shows an empty one.
     fn new_chat(&mut self) {
+        self.stop_all();
+        let root = spawn(
+            self.cfg.clone(),
+            self.ui_tx.clone(),
+            self.ws.root().to_path_buf(),
+        );
+        // The respawned root owns its own config cell and conversation tag;
+        // adopt both, or a later /model would never reach the agent and its
+        // events would look stale.
+        self.cfg_shared = root.cfg.clone();
+        self.conversation = root.conversation;
+        self.agent_tx = HashMap::from([(0, root.tx)]);
+        self.agent_msgs.clear();
+        // Running agents vanish with the old conversation; worktrees they left
+        // behind are still reviewable (they are re-listed below).
+        self.agents = vec![AgentNode {
+            id: 0,
+            parent: None,
+            depth: 0,
+            brief: "you (root agent)".to_string(),
+            running: false,
+            last: String::new(),
+            branch: None,
+            summary: None,
+            error: None,
+        }];
+        self.agent_cursor = 0;
         self.chat.clear();
         self.notices.clear();
         self.chat_scroll = 0;
         self.focused = 0;
+        self.busy = false;
+        self.spin = 0;
+        self.discover_worktrees();
         self.save_session();
-        self.status = "new chat".to_string();
+        self.status = "new chat — agents stopped, root restarted".to_string();
+    }
+
+    /// Ask every actor in the tree to shut down. `Shutdown`, not `Stop`: a
+    /// cancelled actor goes back to waiting for work (which is what Ctrl-C
+    /// should do), while `/new` needs the threads to be gone — and an actor
+    /// holds its own mailbox open, so it never notices that the UI let go.
+    fn stop_all(&self) {
+        for tx in self.agent_tx.values() {
+            let _ = tx.send(AgentMsg::Shutdown);
+        }
     }
 
     fn save_session(&mut self) {
@@ -1115,18 +1264,26 @@ impl App {
         self.should_quit = true;
     }
 
+    /// Cancel the work that is actually running. An idle agent has nothing to
+    /// cancel, and stopping it would kill the root for good (it only comes back
+    /// with `/new`), so Ctrl-C leaves idle agents alone.
     fn interrupt(&mut self) {
         let mut stopped = 0usize;
-        for tx in self.agent_tx.values() {
-            if tx.send(AgentMsg::Stop).is_ok() {
-                stopped += 1;
+        for node in &self.agents {
+            if !node.running {
+                continue;
+            }
+            if let Some(tx) = self.agent_tx.get(&node.id) {
+                if tx.send(AgentMsg::Stop).is_ok() {
+                    stopped += 1;
+                }
             }
         }
-        if stopped > 0 && self.busy {
-            self.status = format!("cancelling {stopped} agent(s)…");
+        self.status = if stopped > 0 {
+            format!("cancelling {stopped} agent(s)…")
         } else {
-            self.status = "Ctrl-Q quits · Ctrl-N starts a new chat".to_string();
-        }
+            "nothing running · Ctrl-Q quits · Ctrl-N starts a new chat".to_string()
+        };
     }
 
     fn cycle_focus(&mut self, direction: i64) {
@@ -1166,6 +1323,12 @@ impl App {
             KeyCode::Char('c') => {
                 if let Some(node) = self.agents.get(self.agent_cursor) {
                     let id = node.id;
+                    if !node.running {
+                        // Stop cancels work; an idle agent has none. Ending one
+                        // is `/new`'s job.
+                        self.status = format!("agent #{id} is not running");
+                        return;
+                    }
                     if let Some(tx) = self.agent_tx.get(&id) {
                         let _ = tx.send(AgentMsg::Stop);
                         self.status = format!("stopping agent #{id}…");
@@ -1275,13 +1438,6 @@ impl App {
     }
 }
 
-fn arg_string(args: &Value, key: &str) -> Result<String, String> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| format!("missing `{key}`"))
-}
-
 /// Show only the edges of a secret for confirmation without leaking it.
 fn mask_key(key: &str) -> String {
     let key = key.trim();
@@ -1291,26 +1447,184 @@ fn mask_key(key: &str) -> String {
     format!("{}…{}", &key[..4], &key[key.len() - 4..])
 }
 
-/// Keep a tool result within a predictable budget for the model.
-fn cap_text(mut text: String) -> String {
-    if text.len() <= READ_CAP {
-        return text;
-    }
-    let mut cut = READ_CAP;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    text.truncate(cut);
-    text.push_str("\n\n[mush: output truncated]");
-    text
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossbeam_channel::Receiver;
 
     fn buffer(text: &str) -> Buffer {
         Buffer::from_text("test".to_string(), text)
+    }
+
+    /// A real `App` on a scratch directory, with a real (idle) root actor. The
+    /// returned receiver keeps the UI channel alive for the life of the test.
+    fn test_app(label: &str) -> (App, Receiver<Msg>) {
+        let root = std::env::temp_dir().join(format!("mush-app-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = Workspace::new(&root).unwrap();
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let app = App::new(
+            ws,
+            cfg,
+            None,
+            handle,
+            tx,
+            vec!["test-model".to_string()],
+            None,
+        );
+        (app, rx)
+    }
+
+    /// `/new` must do what Ctrl-N does: a cleared chat with a live root, not
+    /// an empty pane over a stale conversation.
+    #[test]
+    fn slash_new_restarts_the_root_and_clears_the_conversation() {
+        let (mut app, _rx) = test_app("new");
+        app.chat.push(Message::user("an old task"));
+        app.notices.push("old noise".to_string());
+        app.busy = true;
+        let before = app.cfg_shared.clone();
+
+        app.run_command("/new");
+
+        assert!(app.chat.is_empty(), "the conversation is gone");
+        assert!(app.notices.is_empty(), "notices are gone");
+        assert_eq!(app.agents.len(), 1, "the tree is reset to the root");
+        assert!(!app.busy);
+        // The respawned root owns a fresh config cell and the UI adopted it;
+        // without that, a later /model would never reach the agent.
+        assert!(!Arc::ptr_eq(&before, &app.cfg_shared));
+
+        // Its mailbox is alive, so the next message starts a run instead of
+        // reporting that the root is gone.
+        app.input = "hello".to_string();
+        app.send_message();
+        assert!(app.busy);
+        assert_eq!(app.status, "thinking…");
+    }
+
+    /// An actor `/new` abandoned can still be finishing a request (up to the
+    /// HTTP timeout); its events must not land in the new conversation. Ids
+    /// collide by design — the new root is #0 too.
+    #[test]
+    fn events_from_an_abandoned_conversation_are_ignored() {
+        let (mut app, _rx) = test_app("stale");
+        let abandoned = app.conversation;
+        app.run_command("/new");
+        assert_ne!(app.conversation, abandoned, "a new conversation tag");
+        app.chat.push(Message::user("current work"));
+
+        app.update(Msg::Agent {
+            conversation: abandoned,
+            id: 0,
+            event: AgentEvent::Message(Message::assistant("stale reply")),
+        });
+        app.update(Msg::Agent {
+            conversation: abandoned,
+            id: 0,
+            event: AgentEvent::Compact {
+                summary: "stale summary".to_string(),
+            },
+        });
+        assert_eq!(app.chat.len(), 1, "the stale reply and summary are dropped");
+
+        app.update(Msg::Agent {
+            conversation: app.conversation,
+            id: 0,
+            event: AgentEvent::Message(Message::assistant("fresh reply")),
+        });
+        assert_eq!(app.chat.len(), 2, "the live conversation still lands");
+    }
+
+    /// A steering message sent while the root is busy is folded into the run,
+    /// and it must also be visible: the human has to see what they said.
+    #[test]
+    fn steering_text_is_echoed_in_the_chat() {
+        let (mut app, _rx) = test_app("steer");
+        app.busy = true;
+        app.agents[0].running = true;
+        app.input = "also rename the module".to_string();
+
+        app.send_message();
+
+        assert_eq!(app.chat.len(), 1, "the steering message is echoed");
+        assert_eq!(app.chat[0].text(), "also rename the module");
+        assert!(app.status.contains("noted"), "{}", app.status);
+    }
+
+    /// The file tools of an abandoned tree must not touch the workspace: its
+    /// `write_file` would otherwise land in the live buffers of the new chat.
+    #[test]
+    fn file_tools_from_an_abandoned_conversation_are_refused() {
+        let (mut app, _rx) = test_app("stale-tools");
+        let abandoned = app.conversation;
+        app.run_command("/new");
+        let (reply, replies) = crossbeam_channel::bounded(1);
+
+        app.update(Msg::Tool {
+            conversation: abandoned,
+            request: ToolCallRequest {
+                name: "write_file".to_string(),
+                args: serde_json::json!({"path": "evil.txt", "content": "boom"}),
+                reply,
+            },
+        });
+
+        let result = replies.recv().unwrap();
+        assert!(result.is_err(), "the stale tool is refused, not run");
+        assert!(!app.ws.exists("evil.txt"), "the workspace is untouched");
+    }
+
+    /// A tree `/new` abandoned can still spawn children, and their `Spawned`
+    /// events are dropped — so this is the only moment the UI can tell such a
+    /// child to go away. Without it the child runs unseen forever.
+    #[test]
+    fn a_child_spawned_by_an_abandoned_tree_is_shut_down() {
+        let (mut app, _rx) = test_app("stale-child");
+        let abandoned = app.conversation;
+        app.run_command("/new");
+        let (child_tx, child_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+
+        app.update(Msg::Agent {
+            conversation: abandoned,
+            id: 1,
+            event: AgentEvent::Spawned {
+                child: 1,
+                parent: 0,
+                brief: "sneaky".to_string(),
+                depth: 1,
+                branch: None,
+                cmd: child_tx,
+            },
+        });
+
+        assert!(
+            matches!(child_rx.recv().unwrap(), AgentMsg::Shutdown),
+            "the stray child is told to end"
+        );
+        assert_eq!(app.agents.len(), 1, "and it never joins the new tree");
+    }
+
+    /// Ctrl-C cancels work; it must not end an idle root, which only comes
+    /// back with `/new`.
+    #[test]
+    fn ctrl_c_stops_running_agents_only() {
+        let (mut app, _rx) = test_app("interrupt");
+        app.interrupt();
+        assert!(app.status.contains("nothing running"), "{}", app.status);
+
+        app.input = "hello".to_string();
+        app.send_message();
+        assert_eq!(app.status, "thinking…", "the idle root is still usable");
+
+        let (mut app, _rx) = test_app("interrupt-running");
+        app.agents[0].running = true;
+        app.busy = true;
+        app.interrupt();
+        assert!(app.status.starts_with("cancelling"), "{}", app.status);
     }
 
     #[test]

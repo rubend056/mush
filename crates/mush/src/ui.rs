@@ -65,7 +65,9 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
         .highlight_symbol("› ");
     let mut state = ListState::default();
-    state.select(Some(app.agent_cursor.min(app.agents.len().saturating_sub(1))));
+    state.select(Some(
+        app.agent_cursor.min(app.agents.len().saturating_sub(1)),
+    ));
     frame.render_stateful_widget(list, inner, &mut state);
 }
 
@@ -76,7 +78,11 @@ fn agent_item(app: &App, node: &AgentNode, width: usize) -> ListItem<'static> {
     let glyph = if node.error.is_some() {
         "✗"
     } else if node.running {
-        if app.agents.iter().any(|n| n.parent == Some(node.id) && n.running) {
+        if app
+            .agents
+            .iter()
+            .any(|n| n.parent == Some(node.id) && n.running)
+        {
             "⏸" // waiting on children
         } else {
             "◐"
@@ -99,7 +105,10 @@ fn agent_item(app: &App, node: &AgentNode, width: usize) -> ListItem<'static> {
             node.branch.as_deref().unwrap_or("")
         );
         text.push(' ');
-        text.push_str(&truncate(&tail, width.saturating_sub(text.chars().count() + 1)));
+        text.push_str(&truncate(
+            &tail,
+            width.saturating_sub(text.chars().count() + 1),
+        ));
     }
     ListItem::new(text.trim_end().to_string())
 }
@@ -132,7 +141,8 @@ fn draw_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let Some(index) = app.current else {
         frame.render_widget(
-            Paragraph::new("No file open — Tab to files, Enter to open.").style(dim()),
+            Paragraph::new("No file open — type /open <path> in the chat pane (Tab) to open one.")
+                .style(dim()),
             inner,
         );
         return;
@@ -158,7 +168,13 @@ fn draw_editor(frame: &mut Frame, app: &mut App, area: Rect) {
         let expanded: String = buffer
             .line(row)
             .chars()
-            .map(|c| if c == '\t' { "    ".to_string() } else { c.to_string() })
+            .map(|c| {
+                if c == '\t' {
+                    "    ".to_string()
+                } else {
+                    c.to_string()
+                }
+            })
             .collect();
         let content = slice_columns(&expanded, buffer.h_scroll, text_width);
         lines.push(Line::from(vec![
@@ -183,8 +199,7 @@ fn draw_editor(frame: &mut Frame, app: &mut App, area: Rect) {
 
 fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Chat;
-    let rows =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
+    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
 
     let title = if app.focused == 0 {
         " mush ".to_string()
@@ -229,8 +244,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         frame.render_widget(Paragraph::new(line), input_inner);
         if focused {
             let offset = (UnicodeWidthStr::width(prompt.as_str())
-                + UnicodeWidthStr::width(app.input.as_str()))
-                as u16;
+                + UnicodeWidthStr::width(app.input.as_str())) as u16;
             let max_x = input_inner.x + input_inner.width.saturating_sub(1);
             let x = (input_inner.x + offset).min(max_x);
             frame.set_cursor_position(Position::new(x, input_inner.y));
@@ -273,6 +287,11 @@ fn draw_picker(frame: &mut Frame, app: &App) {
         .title(picker.title());
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
+    // A terminal this short has no room for a list; the hint line and the
+    // window below both need at least one row.
+    if inner.height == 0 || inner.width == 0 {
+        return;
+    }
 
     // Window the list so many items never overflow the popup.
     let visible = inner.height.saturating_sub(1) as usize;
@@ -297,14 +316,20 @@ fn draw_picker(frame: &mut Frame, app: &App) {
     state.select(Some(picker.cursor.saturating_sub(start)));
     frame.render_stateful_widget(list, inner, &mut state);
 
-    let hint = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+    let hint = Rect::new(
+        inner.x,
+        inner.y + inner.height.saturating_sub(1),
+        inner.width,
+        1,
+    );
     frame.render_widget(
         Paragraph::new(Line::from(Span::styled(" Enter pick · Esc cancel ", dim()))),
         hint,
     );
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {    let focus = match app.focus {
+fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
+    let focus = match app.focus {
         Focus::Agents => "agents",
         Focus::Editor => match app.mode {
             Mode::Normal => "editor · normal",
@@ -332,7 +357,10 @@ fn transcript_lines(app: &App, messages: &[Message], width: usize) -> Vec<Line<'
                 dim(),
             )));
             out.push(Line::from(""));
-            out.push(Line::from(Span::styled(format!("model: {}", app.cfg.label()), dim())));
+            out.push(Line::from(Span::styled(
+                format!("model: {}", app.cfg.label()),
+                dim(),
+            )));
             out.push(Line::from(Span::styled(
                 "Tab cycles panes · Enter sends · Ctrl-P pick a model",
                 dim(),
@@ -341,7 +369,10 @@ fn transcript_lines(app: &App, messages: &[Message], width: usize) -> Vec<Line<'
         }
     } else if messages.is_empty() {
         out.push(Line::from(Span::styled(
-            format!("Agent #{} has no messages yet — typing here sends it a nudge.", app.focused),
+            format!(
+                "Agent #{} has no messages yet — typing here sends it a nudge.",
+                app.focused
+            ),
             dim(),
         )));
         return out;
@@ -512,7 +543,10 @@ mod tests {
 
     #[test]
     fn preserves_newlines() {
-        assert_eq!(wrap_text("a\nb", 10), vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(
+            wrap_text("a\nb", 10),
+            vec!["a".to_string(), "b".to_string()]
+        );
     }
 
     #[test]

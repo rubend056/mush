@@ -9,10 +9,11 @@ pub mod config;
 pub mod message;
 pub mod prompt;
 pub mod session;
+pub mod tools;
 pub mod userconfig;
 pub mod workspace;
 
-pub use config::{Config, Provider};
+pub use config::{Config, Overrides, Provider};
 pub use message::{FunctionCall, Message, ToolCall};
 pub use session::Session;
 pub use userconfig::UserConfig;

@@ -7,8 +7,19 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Directories that are never worth showing or walking into.
 const SKIP_DIRS: &[&str] = &[
-    ".git", ".mush", "target", "node_modules", ".venv", "venv", "__pycache__", ".idea", ".vscode",
-    "dist", "build", ".next", ".cache",
+    ".git",
+    ".mush",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".idea",
+    ".vscode",
+    "dist",
+    "build",
+    ".next",
+    ".cache",
 ];
 
 static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -22,7 +33,9 @@ pub struct Workspace {
 
 impl Workspace {
     pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
-        Ok(Self { root: fs::canonicalize(root)? })
+        Ok(Self {
+            root: fs::canonicalize(root)?,
+        })
     }
 
     pub fn root(&self) -> &Path {
@@ -49,9 +62,7 @@ impl Workspace {
             match component {
                 Component::Normal(part) => out.push(part),
                 Component::CurDir => {}
-                Component::ParentDir => {
-                    return Err(format!("path escapes the workspace: {rel}"))
-                }
+                Component::ParentDir => return Err(format!("path escapes the workspace: {rel}")),
                 _ => return Err(format!("invalid path: {rel}")),
             }
         }
@@ -116,16 +127,8 @@ impl Workspace {
         if bytes.contains(&0) {
             return Err(format!("{rel} looks like a binary file"));
         }
-        let mut text = String::from_utf8_lossy(&bytes).into_owned();
-        if text.len() > cap {
-            let mut cut = cap;
-            while cut > 0 && !text.is_char_boundary(cut) {
-                cut -= 1;
-            }
-            text.truncate(cut);
-            text.push_str("\n\n[mush: output truncated]");
-        }
-        Ok(text)
+        let text = String::from_utf8_lossy(&bytes).into_owned();
+        Ok(truncate_for_model(text, cap))
     }
 
     /// Atomically create or replace a file, creating parent directories.
@@ -135,10 +138,27 @@ impl Workspace {
             return Err("refusing to write to the workspace root".to_string());
         }
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent).map_err(|e| format!("cannot create {}: {e}", self.rel(parent)))?;
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("cannot create {}: {e}", self.rel(parent)))?;
         }
         atomic_write(&path, content.as_bytes()).map_err(|e| format!("cannot write {rel}: {e}"))
     }
+}
+
+/// Cap text handed to a model, cutting on a char boundary and marking the
+/// cut, so a partial result can never be mistaken for the whole file.
+/// `usize::MAX` keeps everything.
+pub fn truncate_for_model(mut text: String, cap: usize) -> String {
+    if text.len() <= cap {
+        return text;
+    }
+    let mut cut = cap;
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    text.truncate(cut);
+    text.push_str("\n\n[mush: output truncated]");
+    text
 }
 
 /// Write via a same-directory temp file plus `rename`, so readers never observe
@@ -194,6 +214,16 @@ mod tests {
         let text = ws.read_file("a.txt", 5).unwrap();
         assert!(text.starts_with("é"));
         assert!(text.ends_with("[mush: output truncated]"));
+    }
+
+    #[test]
+    fn truncation_keeps_short_text_intact() {
+        assert_eq!(truncate_for_model("short".to_string(), 100), "short");
+        assert_eq!(truncate_for_model(String::new(), 0), "");
+        assert_eq!(
+            truncate_for_model("abcdef".to_string(), 3),
+            "abc\n\n[mush: output truncated]"
+        );
     }
 
     #[test]

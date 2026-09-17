@@ -15,6 +15,12 @@ use mush_core::Config;
 /// Fail fast when the endpoint is unreachable, rather than inheriting the
 /// operating system's multi-minute connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// A chat completion may legitimately take minutes on a slow local model.
+const CHAT_READ_TIMEOUT: Duration = Duration::from_secs(600);
+/// Listing models must never freeze the caller: the UI thread does this when
+/// `/model`, `/url`, or `/key` runs, and a stalled endpoint should just fall
+/// back to the provider's known list.
+const LIST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 
 pub struct Response {
     pub status: u16,
@@ -27,19 +33,19 @@ pub struct Response {
 trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
-pub fn get_json(url: &str, api_key: Option<&str>) -> io::Result<Response> {
-    request("GET", url, None, api_key)
+pub fn get_json(url: &str, api_key: Option<&str>, read_timeout: Duration) -> io::Result<Response> {
+    request("GET", url, None, api_key, read_timeout)
 }
 
 pub fn post_json(url: &str, body: &str, api_key: Option<&str>) -> io::Result<Response> {
-    request("POST", url, Some(body), api_key)
+    request("POST", url, Some(body), api_key, CHAT_READ_TIMEOUT)
 }
 
 /// List model ids advertised by the endpoint. Falls back to the provider's
 /// known models when the endpoint is unreachable or lacks `/v1/models`.
 pub fn list_models(cfg: &Config) -> Vec<String> {
     let known = cfg.default_models();
-    let response = match get_json(&cfg.models_url(), cfg.api_key.as_deref()) {
+    let response = match get_json(&cfg.models_url(), cfg.api_key.as_deref(), LIST_READ_TIMEOUT) {
         Ok(response) if response.status == 200 => response,
         _ => return known,
     };
@@ -69,9 +75,10 @@ fn request(
     url: &str,
     body: Option<&str>,
     api_key: Option<&str>,
+    read_timeout: Duration,
 ) -> io::Result<Response> {
     let (host, port, path, tls) = parse_url(url)?;
-    let mut stream = connect(&host, port, tls)?;
+    let mut stream = connect(&host, port, tls, read_timeout)?;
 
     let mut head = format!(
         "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\n"
@@ -133,7 +140,12 @@ fn request(
     Ok(Response { status, body })
 }
 
-fn connect(host: &str, port: u16, tls: bool) -> io::Result<Box<dyn ReadWrite>> {
+fn connect(
+    host: &str,
+    port: u16,
+    tls: bool,
+    read_timeout: Duration,
+) -> io::Result<Box<dyn ReadWrite>> {
     let mut last_error = None;
     for address in (host, port).to_socket_addrs()? {
         let stream = match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
@@ -143,9 +155,10 @@ fn connect(host: &str, port: u16, tls: bool) -> io::Result<Box<dyn ReadWrite>> {
                 continue;
             }
         };
-        // A slow remote can take a while; these are liveness guards, not UX timers.
+        // Liveness guards, not UX timers: a stalled endpoint must not pin a
+        // thread (and, for the model list, the whole TUI) forever.
         stream.set_write_timeout(Some(Duration::from_secs(30)))?;
-        stream.set_read_timeout(Some(Duration::from_secs(600)))?;
+        stream.set_read_timeout(Some(read_timeout))?;
         return if tls {
             tls_connect(host, stream).map(|stream| Box::new(stream) as Box<dyn ReadWrite>)
         } else {
@@ -153,7 +166,10 @@ fn connect(host: &str, port: u16, tls: bool) -> io::Result<Box<dyn ReadWrite>> {
         };
     }
     Err(last_error.unwrap_or_else(|| {
-        io::Error::new(io::ErrorKind::NotFound, format!("no address for {host}:{port}"))
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no address for {host}:{port}"),
+        )
     }))
 }
 
@@ -169,10 +185,11 @@ fn tls_connect(
     let config = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
-    let server_name = rustls::pki_types::ServerName::try_from(host.to_string())
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("bad TLS host: {host}")))?;
+    let server_name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| {
+        io::Error::new(io::ErrorKind::InvalidInput, format!("bad TLS host: {host}"))
+    })?;
     let connection = rustls::ClientConnection::new(Arc::new(config), server_name)
-        .map_err(|error| io::Error::new(io::ErrorKind::Other, format!("TLS setup failed: {error}")))?;
+        .map_err(|error| io::Error::other(format!("TLS setup failed: {error}")))?;
     let mut stream = rustls::StreamOwned::new(connection, tcp);
     stream.flush()?; // completes the handshake
     Ok(stream)
@@ -250,12 +267,18 @@ fn read_chunked<R: BufRead>(reader: &mut R) -> io::Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Instant;
 
     #[test]
     fn parses_urls() {
         assert_eq!(
             parse_url("http://rubendpc:8078/v1/models").unwrap(),
-            ("rubendpc".to_string(), 8078, "/v1/models".to_string(), false)
+            (
+                "rubendpc".to_string(),
+                8078,
+                "/v1/models".to_string(),
+                false
+            )
         );
         assert_eq!(
             parse_url("http://localhost").unwrap(),
@@ -279,12 +302,44 @@ mod tests {
         assert!(parse_status("garbage").is_err());
     }
 
+    /// An endpoint that accepts the connection and then says nothing must
+    /// time out, not wedge the caller: this is what keeps a stalled
+    /// `/v1/models` from freezing the TUI.
+    #[test]
+    fn a_silent_endpoint_times_out() {
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept exactly one connection and hold it open without answering.
+        std::thread::spawn(move || {
+            if let Ok(connection) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(30));
+                drop(connection);
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/v1/models");
+        let started = Instant::now();
+        let result = get_json(&url, None, Duration::from_millis(300));
+        assert!(
+            result.is_err(),
+            "a silent endpoint must not look like a success"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "took {:?}",
+            started.elapsed()
+        );
+    }
+
     /// Talks to the configured endpoint; run with `--ignored`.
     #[test]
     #[ignore]
     fn live_models_endpoint() {
         let cfg = mush_core::Config::from_env();
-        let response = get_json(&cfg.models_url(), cfg.api_key.as_deref()).unwrap();
+        let response =
+            get_json(&cfg.models_url(), cfg.api_key.as_deref(), CHAT_READ_TIMEOUT).unwrap();
         assert_eq!(response.status, 200);
         assert!(response.body.contains("data"));
     }
@@ -302,7 +357,8 @@ mod tests {
             api_key: None,
             context_tokens: 8192,
         };
-        let response = get_json(&cfg.models_url(), cfg.api_key.as_deref()).unwrap();
+        let response =
+            get_json(&cfg.models_url(), cfg.api_key.as_deref(), CHAT_READ_TIMEOUT).unwrap();
         assert_eq!(response.status, 401);
     }
 }
