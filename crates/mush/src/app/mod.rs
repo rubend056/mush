@@ -706,7 +706,20 @@ impl App {
                 // The durable half of the same fact: the row's `✗` is derived and
                 // dies with the next run, while this line is tagged, stamped and
                 // written to the session, so a restart still says what broke.
-                self.chat.note_error_for(id, error);
+                self.chat.note_error_for(id, error.clone());
+                // A failure is the third way a run can end, and it is the one
+                // that did not reach the bar: `Stopped` says so, `Failed` fell
+                // back to the idle hint, so the newest thing that had happened
+                // could be a crash under a line advertising Ctrl-P. A guard-stop
+                // is this same event (the runaway guard's `stopped after N
+                // turns…` is the run's error), so both are said here. Only the
+                // agent the human is reading needs the bar — another agent's
+                // failure is on its own row's `✗` and in its own pane's foot —
+                // and the sentence names the agent, which the foot's `!` line
+                // (already in front of the human) does not.
+                if id == self.tree.focused {
+                    self.fail(format!("agent #{id} failed — {error}"));
+                }
             }
             AgentEvent::Done => {
                 let summary = self.last_assistant_text(id);
@@ -856,45 +869,39 @@ impl App {
         }
     }
 
-    /// What the tree is doing, in one line — derived every frame from the
-    /// phases, never stored. When nothing is busy there is nothing to say, and
-    /// the bar falls back to the transient line or the idle hint.
-    pub fn activity_line(&self) -> Option<String> {
-        let busy: Vec<&AgentNode> = self
+    /// The one derived line about the *tree*, when the rows cannot say it
+    /// themselves.
+    ///
+    /// This used to be the focused agent's newest activity
+    /// (`#0 edit_file src/lib.rs 12s`), which the agent's own row had said
+    /// (`◐ #0 edit_file src/lib.rs 12s`) and the transcript had said again
+    /// (`⚙ edit_file src/lib.rs`): one fact, three homes, and the bar's only
+    /// line spent on a sentence the human had already read twice (finding U5).
+    /// What survives is the fact no row states even though its `⏸N` implies
+    /// it: an orchestrator that has ended its turn with children still working
+    /// is napping and *will* resume by itself (§5.5), which is a promise about
+    /// what happens next rather than a report of what is happening now.
+    ///
+    /// Everything else the bar's line one carries is an event with no other
+    /// home — a failure, a stop, a job's report, a command's answer — and the
+    /// newest of those is the status, not this.
+    pub fn tree_line(&self) -> Option<String> {
+        let working = self
             .tree
             .agents
             .iter()
             .filter(|node| node.phase.is_busy())
-            .collect();
-        if busy.is_empty() {
+            .count();
+        let root_is_working = self
+            .tree
+            .node(AgentId::ROOT)
+            .is_some_and(|root| root.phase.is_busy());
+        if working == 0 || root_is_working {
             return None;
         }
-        // The root napped and its children still work: what matters is that the
-        // root will come back, not which child is typing.
-        if !busy.iter().any(|node| node.id == AgentId::ROOT) {
-            return Some(format!(
-                "waiting on {} subagent(s) — the root resumes as they finish",
-                busy.len()
-            ));
-        }
-        let shown = busy
-            .iter()
-            .find(|node| node.id == self.tree.focused)
-            .copied()
-            .unwrap_or(busy[0]);
-        let age = short_age(shown.since.elapsed());
-        let what = match &shown.phase {
-            Phase::Thinking => "thinking".to_string(),
-            Phase::Activity(what) => what.clone(),
-            Phase::Cancelling => "cancelling".to_string(),
-            Phase::Stopped => "stopped".to_string(),
-            _ => return None,
-        };
-        let mut line = format!("#{} {what} {age}", shown.id);
-        if busy.len() > 1 {
-            line.push_str(&format!(" · {} agents working", busy.len()));
-        }
-        Some(line)
+        Some(format!(
+            "waiting on {working} subagent(s) — the root resumes as they finish"
+        ))
     }
 
     /// The last assistant reply in an agent's transcript (its final summary).
@@ -3230,6 +3237,45 @@ mod tests {
         }
     }
 
+    /// A failure is the third way a run can end, and it reaches the bar the way
+    /// a stop does. `Stopped` said what happened and `Failed` did not, so the
+    /// newest thing on screen could be a crash (`✗ #0` on the row, `! cannot
+    /// reach …` in the foot) under a line advertising Ctrl-P. A guard-stop is
+    /// this same event — the runaway guard's complaint is the run's error — so
+    /// one arm covers both endings.
+    #[test]
+    fn a_failure_reaches_the_bar_like_a_stop_does() {
+        let (mut app, _rx) = test_app("failure-bar");
+        let conversation = app.tree.conversation();
+        let guard = "stopped after 40 turns without finishing (runaway guard)";
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Error(guard.to_string()),
+        });
+        assert_eq!(app.tree.agents[0].phase, Phase::Failed(guard.to_string()));
+        let rows = screen(&mut app, 40, 10);
+        let bar = rows.last().expect("the bar is painted");
+        assert!(
+            bar.contains("agent #0 failed"),
+            "the smallest terminal still says what happened: {rows:?}"
+        );
+
+        // The stop that already worked, for comparison: the two endings are
+        // told the same way.
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Stopped,
+        });
+        let rows = screen(&mut app, 40, 10);
+        let bar = rows.last().expect("the bar is painted");
+        assert!(
+            bar.contains("agent #0 stopped"),
+            "a stop says so too: {rows:?}"
+        );
+    }
+
     /// `/notes` is the other half of the cap: the lines the foot ceded are read
     /// in full, oldest first, with the cursor on the newest.
     #[test]
@@ -3948,7 +3994,7 @@ mod tests {
         let (app, _rx) = test_app("idle-phase");
         assert_eq!(app.tree.agents[0].phase, Phase::Idle);
         assert!(!app.busy());
-        assert_eq!(app.activity_line(), None, "nothing to report");
+        assert_eq!(app.tree_line(), None, "nothing to report");
     }
 
     /// The stale-status defect: a finished run must leave nothing behind. Every
@@ -4176,7 +4222,7 @@ mod tests {
         });
         assert_eq!(app.tree.agents[0].phase, Phase::Idle, "the root napped");
         assert_eq!(
-            app.activity_line().as_deref(),
+            app.tree_line().as_deref(),
             Some("waiting on 1 subagent(s) — the root resumes as they finish")
         );
     }

@@ -579,9 +579,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Focus::Chat => "chat",
     };
     // Priority: a failure first (the Ctrl-Q warning included, so it is never
-    // hidden behind work in progress), then what the tree is doing (derived),
-    // then what just happened (fades), then the static hint.
-    let (message, style) = bar_line(app.status_line(), app.activity_line());
+    // hidden behind work in progress), then what the whole tree is doing that
+    // its rows cannot say, then what just happened (fades), then the static
+    // hint.
+    let (message, style) = bar_line(app.status_line(), app.tree_line());
     let line = Line::from(vec![
         Span::styled(
             format!(" {focus} "),
@@ -611,14 +612,21 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 /// (finding B12 — the Ctrl-Q warning included). The order itself is
 /// `chat::Rank`, the one table; this only maps it to a colour.
 ///
-fn bar_line(status: Option<(&str, StatusKind)>, activity: Option<String>) -> (String, Style) {
+/// The focused agent's activity is deliberately not a candidate here. It has
+/// two homes already — the row's own tail, with its age, and the transcript's
+/// `⚙` line — and a bar that repeated it spent its only row on the same
+/// sentence a third time (finding U5). What the bar says instead is what no row
+/// and no transcript can: the newest *event* (a failure, a stop, a job's
+/// report, a command's answer) or the one derived state the rows only imply
+/// (`tree_line`'s napping root).
+fn bar_line(status: Option<(&str, StatusKind)>, tree: Option<String>) -> (String, Style) {
     let alert = status
         .filter(|(_, kind)| *kind == StatusKind::Error)
         .map(|(text, _)| text);
     let said = status
         .filter(|(_, kind)| *kind == StatusKind::Info)
         .map(|(text, _)| text);
-    match Rank::last_word(alert, activity.as_deref(), said) {
+    match Rank::last_word(alert, tree.as_deref(), said) {
         Some((rank, text)) => (
             text.to_string(),
             match rank {
@@ -681,10 +689,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_error_outranks_activity() {
+    fn an_error_outranks_the_tree_line() {
         let (text, _) = bar_line(
             Some(("cannot reach http://127.0.0.1:1", StatusKind::Error)),
-            Some("#0 thinking 3s".to_string()),
+            Some("waiting on 1 subagent(s) — the root resumes as they finish".to_string()),
         );
         assert_eq!(
             text, "cannot reach http://127.0.0.1:1",
@@ -695,7 +703,10 @@ mod tests {
             Some(("opened notes.txt", StatusKind::Info)),
             Some("#0 thinking 3s".to_string()),
         );
-        assert_eq!(text, "#0 thinking 3s", "activity beats a fading info line");
+        assert_eq!(
+            text, "#0 thinking 3s",
+            "derived state beats a fading info line"
+        );
 
         let (text, _) = bar_line(Some(("opened notes.txt", StatusKind::Info)), None);
         assert_eq!(text, "opened notes.txt");
