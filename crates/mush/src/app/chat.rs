@@ -31,6 +31,7 @@ use std::time::Duration;
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use mush_core::message::Message;
 use mush_core::session;
@@ -765,6 +766,40 @@ impl Chat {
     }
 }
 
+/// The rows of one voice: the prefix on the first row, the same width of blank
+/// under it, and the words wrapped *inside* the columns the prefix leaves.
+///
+/// Wrapping at the pane's whole width and prepending the prefix afterwards made
+/// every row `prefix` columns too wide for the pane, and ratatui clipped the
+/// overflow from the right: an assistant's `w00 … w59` at 80 columns lost
+/// `w12 w13` off its first row, `w26 w27` off its second, and one more pair off
+/// every row after that — each wrapped line quietly lost its end, for as long as
+/// the message was. The tool-call rows and the message box already budgeted
+/// their own indent this way; the two voices are where the arithmetic was
+/// missing.
+fn voice(out: &mut Vec<Line<'static>>, prefix: &str, colour: Color, text: &str, width: usize) {
+    let lead = prefix.width();
+    // A pane too narrow for the label and a few words: the label is what the row
+    // cannot afford, because a prefix the pane clips is a row that says who
+    // spoke and nothing about what was said.
+    let (prefix, lead) = if width >= lead + MIN_BODY {
+        (prefix, lead)
+    } else {
+        ("", 0)
+    };
+    for (index, line) in wrap_text(text, width.saturating_sub(lead))
+        .into_iter()
+        .enumerate()
+    {
+        let head = if index == 0 {
+            Span::styled(prefix.to_string(), Style::default().fg(colour))
+        } else {
+            Span::raw(" ".repeat(lead))
+        };
+        out.push(Line::from(vec![head, Span::raw(line)]));
+    }
+}
+
 /// The rows of one notice, wrapped at the pane's width and marked by kind: only
 /// a failure shouts. The mark leads the first row only — a wrapped line is one
 /// line, and a column of `!` reads as several failures.
@@ -802,35 +837,22 @@ fn trim_trailing_blanks(lines: &mut Vec<Line<'static>>) {
     }
 }
 
+/// The fewest columns a message's own words get before the pane gives up on
+/// saying who said them. A prefix wider than the pane is a row of label with no
+/// text after it, so below this the voice goes and the words stay.
+const MIN_BODY: usize = 4;
+
 /// One message's rows: who said it, wrapped at the pane's width.
 fn render_message(out: &mut Vec<Line<'static>>, message: &Message, width: usize) {
     match message.role.as_str() {
         "user" => {
-            for (index, line) in wrap_text(message.text(), width).into_iter().enumerate() {
-                if index == 0 {
-                    out.push(Line::from(vec![
-                        Span::styled("you › ", Style::default().fg(Color::Cyan)),
-                        Span::raw(line),
-                    ]));
-                } else {
-                    out.push(Line::from(vec![Span::raw("      "), Span::raw(line)]));
-                }
-            }
+            voice(out, "you › ", Color::Cyan, message.text(), width);
             out.push(Line::from(""));
         }
         "assistant" => {
             let text = message.text();
             if !text.trim().is_empty() {
-                for (index, line) in wrap_text(text, width).into_iter().enumerate() {
-                    if index == 0 {
-                        out.push(Line::from(vec![
-                            Span::styled("mush › ", Style::default().fg(Color::Green)),
-                            Span::raw(line),
-                        ]));
-                    } else {
-                        out.push(Line::from(vec![Span::raw("       "), Span::raw(line)]));
-                    }
-                }
+                voice(out, "mush › ", Color::Green, text, width);
             }
             for call in message.tool_calls() {
                 // `agent::summarize_args` is the same reading the tree shows:
@@ -995,7 +1017,7 @@ mod tests {
             "the pane is away from the newest line: {held:?}"
         );
 
-        chat.push_message(AgentId::ROOT, Message::user("arrived while held"));
+        chat.push_message(AgentId::ROOT, Message::user("arrived"));
         assert_eq!(
             shown(&pane_rows(&chat, &pane, 20, 2)),
             held,
@@ -1006,7 +1028,7 @@ mod tests {
         chat.scroll_by(AgentId::ROOT, -4);
         let bottom = shown(&pane_rows(&chat, &pane, 20, 2));
         assert!(
-            bottom.iter().any(|row| row.contains("arrived while held")),
+            bottom.iter().any(|row| row.contains("arrived")),
             "{bottom:?}"
         );
     }
@@ -1080,6 +1102,52 @@ mod tests {
         assert!(
             !press(&mut chat, key(KeyCode::Tab)),
             "and so must the pane keys"
+        );
+    }
+
+    /// Every row of a wrapped message fits the pane, and every word of it is
+    /// still there. The voice used to be prepended *after* the text was wrapped
+    /// at the pane's whole width, so every row was six (or seven) columns too
+    /// wide and ratatui clipped the overflow from the right edge: `w12 w13` gone
+    /// from the first row at 80 columns, `w26 w27` from the second, and one more
+    /// pair off every row for the life of the message.
+    #[test]
+    fn a_wrapped_message_keeps_its_tail_at_every_width() {
+        let words: Vec<String> = (0..60).map(|index| format!("w{index:02}")).collect();
+        let text = words.join(" ");
+        for width in [30usize, 40, 60, 80, 120] {
+            for message in [Message::user(&text), Message::assistant(&text)] {
+                let mut rows = Vec::new();
+                render_message(&mut rows, &message, width);
+                let painted = shown(&rows);
+                for row in &painted {
+                    assert!(
+                        UnicodeWidthStr::width(row.as_str()) <= width,
+                        "a {width}-column pane painted {}: {row:?}",
+                        UnicodeWidthStr::width(row.as_str())
+                    );
+                }
+                let flat = painted.join(" ");
+                for word in &words {
+                    assert!(
+                        flat.contains(word.as_str()),
+                        "{word} was clipped at {width}: {painted:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A pane narrower than the voice: the label is what the row cannot afford.
+    /// Painting `you › ` into a five-column pane is a row that says who spoke
+    /// and nothing else, and a message the human cannot read.
+    #[test]
+    fn a_pane_narrower_than_the_voice_still_shows_the_words() {
+        let mut rows = Vec::new();
+        render_message(&mut rows, &Message::user("aaaa bbbb"), 5);
+        assert_eq!(
+            shown(&rows),
+            vec!["aaaa".to_string(), "bbbb".to_string(), String::new()]
         );
     }
 
