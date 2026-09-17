@@ -6,6 +6,7 @@
 
 mod agent;
 mod app;
+mod clock;
 mod http;
 mod input;
 mod machine;

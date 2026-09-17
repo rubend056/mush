@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
@@ -30,6 +30,7 @@ use mush_core::transcript::{
 use mush_core::{prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_SECS};
 
 use crate::app::{AgentId, ConversationId, Msg};
+use crate::clock;
 use crate::machine::{Job, Machine, Shell, ShellCommand};
 use crate::model::{HttpModel, ModelClient, ModelError};
 
@@ -257,6 +258,11 @@ pub struct AgentCtx {
     /// its own process group; a test scripts the end state instead, so the
     /// timeout, the cancellation and the output cap need no subprocess.
     pub machine: Arc<dyn Machine>,
+    /// The clock every wait is measured against. `wait_agents` and a running
+    /// command are the two places mush spends real time, so both read it here:
+    /// a test can reach a timeout or a deadline by advancing a fake instead of
+    /// waiting for the real one.
+    pub clock: Arc<dyn clock::Clock>,
     /// The main workspace root; agents whose root differs are isolated.
     pub root: PathBuf,
     pub ids: Arc<AtomicU64>,
@@ -372,6 +378,7 @@ fn root_actor(
         tx,
         conversation,
         machine: Arc::new(Shell),
+        clock: Arc::new(clock::System),
         root,
         ids: ids.clone(),
         live: live.clone(),
@@ -458,6 +465,7 @@ pub fn revive(
         tx,
         conversation,
         machine: Arc::new(Shell),
+        clock: Arc::new(clock::System),
         root,
         ids,
         live,
@@ -1419,8 +1427,9 @@ fn wait_tool(
         .unwrap_or(WAIT_TIMEOUT_SECS);
     // A model-supplied timeout must never overflow the clock; an
     // unrepresentable one just means "forever" (0 means that too).
+    let clock = actor.ctx.clock.as_ref();
     let deadline = (timeout > 0)
-        .then(|| Instant::now().checked_add(Duration::from_secs(timeout)))
+        .then(|| clock.now().checked_add(Duration::from_secs(timeout)))
         .flatten();
 
     loop {
@@ -1451,11 +1460,11 @@ fn wait_tool(
             }
         }
         if let Some(deadline) = deadline {
-            if Instant::now() >= deadline {
+            if clock.now() >= deadline {
                 return Ok("wait timed out — your agents are still running".to_string());
             }
         }
-        std::thread::sleep(Duration::from_millis(50));
+        clock.sleep(Duration::from_millis(50));
     }
 }
 
@@ -1670,7 +1679,7 @@ fn wait_bounded(
     actor: &Actor,
     state: &mut ActorState,
 ) -> Result<Ended, String> {
-    let started = Instant::now();
+    let started = actor.ctx.clock.now();
     loop {
         match job.poll() {
             Ok(Some(code)) => return Ok(Ended::Exited(code)),
@@ -1686,7 +1695,7 @@ fn wait_bounded(
         // mailbox is polled here only for signals: nudges are parked for the
         // next message boundary, never folded in mid-batch.
         drain_signals(actor, cancel, state);
-        let ended = if started.elapsed() > timeout {
+        let ended = if actor.ctx.clock.now().saturating_duration_since(started) > timeout {
             Some(Ended::TimedOut)
         } else if cancel.load(Ordering::SeqCst) {
             Some(Ended::Cancelled)
@@ -1699,7 +1708,7 @@ fn wait_bounded(
             job.kill();
             return Ok(ended);
         }
-        std::thread::sleep(Duration::from_millis(10));
+        actor.ctx.clock.sleep(Duration::from_millis(10));
     }
 }
 
@@ -1755,6 +1764,7 @@ mod tests {
     use mush_core::{FunctionCall, ToolCall};
     use serde_json::json;
     use std::fs;
+    use std::time::Instant;
 
     #[test]
     fn summarize_prefers_paths_then_commands_then_briefs() {
@@ -2264,6 +2274,7 @@ mod tests {
             tx: ui_tx.clone(),
             conversation: 1,
             machine: Arc::new(Shell),
+            clock: Arc::new(clock::System),
             root: root.clone(),
             ids: Arc::new(AtomicU64::new(1)),
             live: Arc::new(AtomicU64::new(0)),

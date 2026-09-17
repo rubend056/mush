@@ -17,6 +17,8 @@ use std::time::{Duration, Instant};
 
 use mush_core::Config;
 
+use crate::clock::{self, Clock};
+
 /// Fail fast when the endpoint is unreachable, rather than inheriting the
 /// operating system's multi-minute connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
@@ -51,7 +53,15 @@ trait ReadWrite: Read + Write {}
 impl<T: Read + Write> ReadWrite for T {}
 
 pub fn get_json(url: &str, api_key: Option<&str>, read_timeout: Duration) -> io::Result<Response> {
-    request("GET", url, None, api_key, read_timeout, None)
+    request(
+        "GET",
+        url,
+        None,
+        api_key,
+        read_timeout,
+        None,
+        clock::system(),
+    )
 }
 
 /// POST a chat completion. `cancel` is polled while the socket waits, so a Stop
@@ -70,6 +80,7 @@ pub fn post_json(
         api_key,
         CHAT_READ_TIMEOUT,
         Some(cancel),
+        clock::system(),
     )
 }
 
@@ -137,8 +148,9 @@ fn request(
     api_key: Option<&str>,
     read_timeout: Duration,
     cancel: Option<&AtomicBool>,
+    clock: &dyn Clock,
 ) -> io::Result<Response> {
-    let watch = Watch::new(cancel, read_timeout);
+    let watch = Watch::new(cancel, read_timeout, clock);
     // A Stop that arrived before the request did: do not pay for a call the
     // human already cancelled.
     watch.check()?;
@@ -211,13 +223,19 @@ fn request(
 struct Watch<'a> {
     cancel: Option<&'a AtomicBool>,
     deadline: Instant,
+    /// The clock the deadline is compared against. Real requests read the
+    /// system one; a test reaches a deadline by advancing a fake, so the
+    /// "the endpoint stopped responding" path does not cost the suite the
+    /// timeout it is proving.
+    clock: &'a dyn Clock,
 }
 
 impl<'a> Watch<'a> {
-    fn new(cancel: Option<&'a AtomicBool>, timeout: Duration) -> Self {
+    fn new(cancel: Option<&'a AtomicBool>, timeout: Duration, clock: &'a dyn Clock) -> Self {
         Self {
             cancel,
-            deadline: Instant::now() + timeout,
+            deadline: clock.now() + timeout,
+            clock,
         }
     }
 
@@ -237,7 +255,7 @@ impl<'a> Watch<'a> {
                 "request cancelled",
             ));
         }
-        if Instant::now() >= self.deadline {
+        if self.clock.now() >= self.deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
                 "the endpoint stopped responding",
