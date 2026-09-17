@@ -303,6 +303,7 @@ mod tests {
             updated: 0,
             messages: vec![Message::user(text)],
             agents: Vec::new(),
+            notices: Vec::new(),
         }
     }
 

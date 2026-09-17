@@ -32,6 +32,7 @@
 //! | `/discard <id>` | required, an id | throw it away and reclaim it |
 //! | `/forget <id>` | required, an id | drop the agent from this session |
 //! | `/compact` | ignored | fold the focused conversation into a summary |
+//! | `/notes` | ignored | read the notes the foot had no room for |
 //! | `/new` [`/clear`] | ignored | start a new chat |
 //! | `/help` [`/?`] | ignored | list the keys and the commands |
 //! | `/quit` [`/q`] | ignored | leave mush |
@@ -95,6 +96,8 @@ pub enum Command {
     Models,
     Worktrees,
     Compact,
+    /// `/notes`: read every note the foot had no room for.
+    Notes,
     Worktree {
         verb: Verb,
         id: u64,
@@ -230,6 +233,12 @@ pub const COMMANDS: &[Spec] = &[
         help: "fold the focused agent's conversation into a summary",
     },
     Spec {
+        name: "/notes",
+        aliases: &[],
+        args: "",
+        help: "read the notes the foot had no room for",
+    },
+    Spec {
         name: "/new",
         aliases: &["/clear"],
         args: "",
@@ -309,6 +318,7 @@ pub fn parse_command(line: &str) -> Result<Command, CommandError> {
         "/models" => Command::Models,
         "/worktrees" => Command::Worktrees,
         "/compact" => Command::Compact,
+        "/notes" => Command::Notes,
         "/provider" => Command::Provider(optional(argument)),
         "/key" => Command::ApiKey(optional(argument)),
         "/url" if argument.is_empty() => {
