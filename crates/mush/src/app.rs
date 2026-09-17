@@ -20,7 +20,7 @@ use mush_core::{
     Workspace,
 };
 
-use crate::agent::{spawn, AgentEvent, AgentMsg, RootHandle};
+use crate::agent::{self, spawn, AgentEvent, AgentMsg, RootHandle};
 use crate::http;
 use crate::input::Input;
 
@@ -165,6 +165,15 @@ pub enum NoticeKind {
     Error,
 }
 
+/// Where an isolated agent's work ended up, once the human landed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Landed {
+    /// Merged into the main branch; the worktree and the branch were reclaimed.
+    Merged,
+    /// Thrown away on purpose; the worktree and the branch were reclaimed.
+    Discarded,
+}
+
 pub struct AgentNode {
     pub id: u64,
     pub parent: Option<u64>,
@@ -177,6 +186,13 @@ pub struct AgentNode {
     pub branch: Option<String>,
     /// The agent's result once it has one (a leftover worktree has one too).
     pub summary: Option<String>,
+    /// Found on disk rather than spawned in this session. An explicit flag, not
+    /// a sentinel `brief`: the brief is now recovered from the commit subject,
+    /// so matching on its text would stop recognising leftovers the moment they
+    /// learned their real names.
+    pub leftover: bool,
+    /// Set once `/merge` or `/discard` reclaimed the worktree.
+    pub landed: Option<Landed>,
 }
 
 pub struct App {
@@ -267,6 +283,8 @@ impl App {
                 since: Instant::now(),
                 branch: None,
                 summary: None,
+                leftover: false,
+                landed: None,
             }],
             agent_cursor: 0,
             focused: 0,
@@ -347,7 +365,7 @@ impl App {
         let root = self.ws.root().to_path_buf();
         // Drop stale leftovers whose worktree no longer exists.
         self.agents.retain(|node| {
-            if node.brief != "leftover worktree" {
+            if !node.leftover {
                 return true;
             }
             let Some(branch) = node.branch.as_deref() else {
@@ -379,15 +397,38 @@ impl App {
             // `spawn_agent` hands a live child an id a leftover already holds
             // (finding B1).
             self.agent_ids.fetch_max(id + 1, Ordering::SeqCst);
+            // The commit mush made for this worktree names the task and how the
+            // run ended, so a leftover is shown as the work it is instead of an
+            // anonymous placeholder. A branch the human committed to by hand
+            // carries no such subject and stays unnamed.
+            let (brief, phase, summary) =
+                match git::subject_of(&root, &full).and_then(|s| agent::parse_commit_subject(&s)) {
+                    Some((agent::Committed::Finished, brief)) => {
+                        (brief, Phase::Done, "last run finished")
+                    }
+                    Some((agent::Committed::Stopped, brief)) => {
+                        (brief, Phase::Stopped, "last run was stopped")
+                    }
+                    Some((agent::Committed::Failed(error), brief)) => {
+                        (brief, Phase::Failed(error), "last run failed")
+                    }
+                    None => (
+                        "leftover worktree".to_string(),
+                        Phase::Done,
+                        "found on startup",
+                    ),
+                };
             self.agents.push(AgentNode {
                 id,
                 parent: None,
                 depth: 1,
-                brief: "leftover worktree".to_string(),
-                phase: Phase::Done,
+                brief,
+                phase,
                 since: Instant::now(),
                 branch: Some(full),
-                summary: Some("found on startup".to_string()),
+                summary: Some(summary.to_string()),
+                leftover: true,
+                landed: None,
             });
         }
         self.repair_focus();
@@ -513,6 +554,8 @@ impl App {
                     since: Instant::now(),
                     branch,
                     summary: None,
+                    leftover: false,
+                    landed: None,
                 });
                 self.busy = true;
             }
@@ -871,7 +914,9 @@ impl App {
                      Ctrl-P pick a model · Ctrl-N new chat · \
                      Ctrl-C stops the focused agent · Ctrl-X stops them all. \
                      Commands: /provider /model /context /url /key /models \
-                     /worktrees /diff /merge /discard /new /quit",
+                     /worktrees /diff /merge /discard /forget /new /quit \
+                     (/merge and /discard run git for you and reclaim the worktree; \
+                     /forget drops the agent from this session and leaves the branch)",
                 );
             }
             "/context" => {
@@ -900,14 +945,17 @@ impl App {
                 ));
             }
             "/diff" | "/merge" | "/discard" => self.worktree_command(name, rest),
+            "/forget" => {
+                let Ok(id) = rest.trim().parse::<u64>() else {
+                    self.say("usage: /forget <agent id>");
+                    return;
+                };
+                self.forget_agent(id);
+            }
             "/worktrees" => {
                 self.discover_worktrees();
                 self.refresh_git();
-                let count = self
-                    .agents
-                    .iter()
-                    .filter(|n| n.brief == "leftover worktree")
-                    .count();
+                let count = self.agents.iter().filter(|n| n.leftover).count();
                 self.say(if count > 0 {
                     format!("{count} leftover worktree(s) registered — /diff, /merge, /discard work on them")
                 } else {
@@ -1151,28 +1199,142 @@ impl App {
 
     /// Print the exact git commands for an isolated agent's branch. The human
     /// merges in their own IDE — mush never auto-merges.
+    /// `/diff` names the command to read the work; `/merge` and `/discard` run
+    /// it. mush cannot see a git command the human runs in their own shell, so
+    /// the only thing that ever reclaims a worktree and its branch is doing it
+    /// here — which is why the pane stayed cluttered with leftovers.
     fn worktree_command(&mut self, command: &str, rest: &str) {
         let Ok(id) = rest.trim().parse::<u64>() else {
             self.say(format!("usage: {command} <agent id>"));
             return;
         };
-        let Some(node) = self.agent_node_mut(id) else {
-            self.fail(format!("no agent #{id}"));
-            return;
+        let (branch, busy, landed) = match self.agents.iter().find(|node| node.id == id) {
+            None => {
+                self.fail(format!("no agent #{id}"));
+                return;
+            }
+            Some(node) => (node.branch.clone(), node.phase.is_busy(), node.landed),
         };
-        let Some(branch) = node.branch.clone() else {
+        let Some(branch) = branch else {
             self.fail(format!("agent #{id} has no worktree branch (not isolated)"));
             return;
         };
-        let wtree = format!(".mush/wt/{id}");
-        let command_text = match command {
-            "/diff" => format!("git diff HEAD...{branch}"),
-            "/merge" => format!("git merge {branch}    (in {})", self.ws.root_str()),
-            "/discard" => format!("git worktree remove --force {wtree} && git branch -D {branch}"),
-            _ => return,
+        if command == "/diff" {
+            let text = format!("git diff HEAD...{branch}");
+            self.say(text.clone());
+            self.note(text);
+            return;
+        }
+        if let Some(landed) = landed {
+            self.say(format!(
+                "agent #{id} was already {}",
+                match landed {
+                    Landed::Merged => "merged",
+                    Landed::Discarded => "discarded",
+                }
+            ));
+            return;
+        }
+        if busy {
+            // Merging under a running agent would race the commits it is still
+            // making, so refuse instead of interleaving with it.
+            self.fail(format!(
+                "agent #{id} is still running — Ctrl-C stops it before you {command} its work"
+            ));
+            return;
+        }
+        let root = self.ws.root().to_path_buf();
+        let worktree = format!(".mush/wt/{id}");
+        match command {
+            "/merge" => match git::run(&root, &["merge", branch.as_str()]) {
+                Err(error) => self.fail(format!("merge {branch} failed: {error}")),
+                Ok(_) => {
+                    // The work is in HEAD now, so reclaim the disk and the
+                    // branch. Best-effort: a worktree git refuses to remove is
+                    // worth reporting, but the merge — the part that mattered —
+                    // already happened.
+                    let _ = git::run(&root, &["worktree", "remove", "--force", &worktree]);
+                    let branch_note = match git::run(&root, &["branch", "-d", branch.as_str()]) {
+                        Ok(_) => format!("{branch} deleted"),
+                        Err(error) => format!("branch kept: {error}"),
+                    };
+                    if let Some(node) = self.agent_node_mut(id) {
+                        node.landed = Some(Landed::Merged);
+                    }
+                    self.note(format!("merged {branch} into HEAD · {branch_note}"));
+                    self.refresh_git();
+                    self.save_session();
+                }
+            },
+            "/discard" => {
+                let removed = git::run(&root, &["worktree", "remove", "--force", &worktree]);
+                let deleted = git::run(&root, &["branch", "-D", branch.as_str()]);
+                // Say what actually happened: a discard that half-failed must
+                // not read like a clean one.
+                let mut steps = Vec::new();
+                steps.push(match &removed {
+                    Ok(_) => format!("removed {worktree}"),
+                    Err(error) => format!("worktree kept: {error}"),
+                });
+                steps.push(match &deleted {
+                    Ok(_) => format!("deleted {branch}"),
+                    Err(error) => format!("branch kept: {error}"),
+                });
+                let outcome = steps.join(" · ");
+                if removed.is_err() && deleted.is_err() {
+                    self.fail(format!("cannot discard agent #{id}: {outcome}"));
+                } else {
+                    if let Some(node) = self.agent_node_mut(id) {
+                        node.landed = Some(Landed::Discarded);
+                    }
+                    self.note(format!(
+                        "discarded agent #{id} — its work is gone · {outcome}"
+                    ));
+                    self.refresh_git();
+                    self.save_session();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Drop an agent's node and transcript from this session.
+    ///
+    /// This is deliberately *not* `/discard`: the worktree and any unmerged work
+    /// are left alone, so forgetting a live one only means `/worktrees` lists it
+    /// again (which is the honest outcome — forgetting is about the
+    /// conversation, not the disk).
+    fn forget_agent(&mut self, id: u64) {
+        if id == 0 {
+            self.fail("the root agent cannot be forgotten — /new restarts it");
+            return;
+        }
+        let Some(node) = self.agents.iter().find(|node| node.id == id) else {
+            self.fail(format!("no agent #{id}"));
+            return;
         };
-        self.say(command_text.clone());
-        self.note(command_text);
+        if node.phase.is_busy() {
+            self.fail(format!(
+                "agent #{id} is still running — Ctrl-C stops it first"
+            ));
+            return;
+        }
+        let unmerged = node.branch.clone().filter(|_| node.landed.is_none());
+        self.agents.retain(|node| node.id != id);
+        self.agent_msgs.remove(&id);
+        // Dropping the last sender ends the actor: an idle agent whose mailbox
+        // is gone has nothing left to wait for.
+        self.agent_tx.remove(&id);
+        self.agent_cancel.remove(&id);
+        self.agent_stats.remove(&id);
+        self.repair_focus();
+        self.recompute_busy();
+        match unmerged {
+            Some(branch) => self.note(format!(
+                "forgot agent #{id} — {branch} is untouched, so /worktrees lists it again"
+            )),
+            None => self.say(format!("forgot agent #{id}")),
+        }
     }
 
     /// Reset the conversation: stop every actor in the old tree and start a
@@ -1208,6 +1370,8 @@ impl App {
             since: Instant::now(),
             branch: None,
             summary: None,
+            leftover: false,
+            landed: None,
         }];
         self.agent_cursor = 0;
         self.chat.clear();
@@ -1482,6 +1646,222 @@ mod tests {
 
     /// A real `App` on a scratch directory, with a real (idle) root actor. The
     /// returned receiver keeps the UI channel alive for the life of the test.
+    /// A real repository, because `/merge`, `/discard` and worktree discovery
+    /// all shell out to git — a fake would test nothing they actually do.
+    fn repo(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mush-land-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        git(&dir, &["-c", "init.defaultBranch=master", "init", "-q"]);
+        git(&dir, &["config", "user.email", "mush@test"]);
+        git(&dir, &["config", "user.name", "mush"]);
+        std::fs::write(dir.join("a.txt"), "one\n").unwrap();
+        git(&dir, &["add", "-A"]);
+        git(&dir, &["commit", "-qm", "init"]);
+        dir
+    }
+
+    fn git(dir: &std::path::Path, args: &[&str]) {
+        let out = std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    fn app_at(root: std::path::PathBuf) -> App {
+        let ws = Workspace::new(&root).unwrap();
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        App::new(ws, cfg, None, handle, tx, Vec::new())
+    }
+
+    /// An isolated agent's worktree with one commit on it, committed exactly the
+    /// way the actor commits (so the subject is real, not test-shaped).
+    fn isolated_work(root: &std::path::Path, id: u64, brief: &str) {
+        let worktree = root.join(format!(".mush/wt/{id}"));
+        std::fs::create_dir_all(root.join(".mush")).unwrap();
+        git(
+            root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().unwrap(),
+                "-b",
+                &format!("mush/{id}"),
+            ],
+        );
+        std::fs::write(worktree.join("work.txt"), "the work\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(
+            &worktree,
+            &[
+                "commit",
+                "-qm",
+                &crate::agent::commit_subject(id, brief, &agent::Outcome::Finished("ok".into())),
+            ],
+        );
+    }
+
+    /// A worktree left on disk is identified by what its commit says, not by a
+    /// placeholder: the row must show the task the agent was actually given.
+    #[test]
+    fn a_leftover_worktree_recovers_its_brief_from_git() {
+        let root = repo("recover");
+        isolated_work(&root, 3, "port the parser module");
+        let app = app_at(root.clone());
+
+        let node = app
+            .agents
+            .iter()
+            .find(|node| node.id == 3)
+            .expect("the worktree must be registered");
+        assert_eq!(node.brief, "port the parser module");
+        assert!(node.leftover);
+        assert_eq!(node.branch.as_deref(), Some("mush/3"));
+        assert_eq!(node.phase, Phase::Done, "the subject says it finished");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A branch mush did not commit to has no subject to read, so it keeps the
+    /// placeholder rather than inventing a task.
+    #[test]
+    fn a_hand_made_branch_keeps_the_placeholder() {
+        let root = repo("hand-made");
+        isolated_work(&root, 5, "first");
+        let worktree = root.join(".mush/wt/5");
+        std::fs::write(worktree.join("more.txt"), "more\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-qm", "my own commit message"]);
+
+        let app = app_at(root.clone());
+        let node = app.agents.iter().find(|node| node.id == 5).unwrap();
+        assert_eq!(node.brief, "leftover worktree");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `/merge` runs git for real: the work lands in HEAD, and the worktree and
+    /// the branch — the clutter — are reclaimed, which is the whole reason the
+    /// pane kept filling up.
+    #[test]
+    fn merging_an_agent_lands_the_work_and_reclaims_the_worktree() {
+        let root = repo("merge");
+        isolated_work(&root, 1, "add the parser");
+        let mut app = app_at(root.clone());
+
+        app.worktree_command("/merge", "1");
+
+        assert!(root.join("work.txt").exists(), "the work is in HEAD now");
+        assert!(
+            !root.join(".mush/wt/1").exists(),
+            "the worktree is reclaimed"
+        );
+        let branches = std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(["branch", "--list", "mush/1"])
+            .output()
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
+            "the branch is reclaimed"
+        );
+        let node = app.agents.iter().find(|node| node.id == 1).unwrap();
+        assert_eq!(node.landed, Some(Landed::Merged));
+        // A second /merge must not re-run git or claim a second merge.
+        app.worktree_command("/merge", "1");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `/discard` throws the work away on purpose and says so.
+    #[test]
+    fn discarding_an_agent_removes_the_worktree_and_the_branch() {
+        let root = repo("discard");
+        isolated_work(&root, 2, "throwaway");
+        let mut app = app_at(root.clone());
+
+        app.worktree_command("/discard", "2");
+
+        assert!(!root.join(".mush/wt/2").exists());
+        assert!(!root.join("work.txt").exists(), "the work did not land");
+        let node = app.agents.iter().find(|node| node.id == 2).unwrap();
+        assert_eq!(node.landed, Some(Landed::Discarded));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Landing work under a *running* agent would race the commits it is still
+    /// making, so both commands refuse instead of interleaving with it.
+    #[test]
+    fn a_running_agent_refuses_to_be_merged_or_discarded() {
+        let root = repo("busy");
+        isolated_work(&root, 4, "still working");
+        let mut app = app_at(root.clone());
+        app.agents.iter_mut().find(|n| n.id == 4).unwrap().phase = Phase::Thinking;
+
+        app.worktree_command("/merge", "4");
+        app.worktree_command("/discard", "4");
+
+        assert!(root.join(".mush/wt/4").exists(), "nothing was reclaimed");
+        let node = app.agents.iter().find(|node| node.id == 4).unwrap();
+        assert_eq!(node.landed, None);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `/forget` drops the conversation, not the work: the branch survives, so
+    /// the honest thing is to say it is still there.
+    #[test]
+    fn forgetting_an_agent_drops_the_node_and_keeps_the_worktree() {
+        let root = repo("forget");
+        isolated_work(&root, 6, "leave me");
+        let mut app = app_at(root.clone());
+        app.agent_msgs.insert(6, vec![Message::user("hello")]);
+
+        app.forget_agent(6);
+
+        assert!(app.agents.iter().all(|node| node.id != 6));
+        assert!(!app.agent_msgs.contains_key(&6));
+        assert!(
+            root.join(".mush/wt/6").exists(),
+            "forgetting is not discarding"
+        );
+        assert_eq!(app.focused, 0, "focus cannot point at a ghost");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The root is not forgettable, and a running agent has to be stopped first.
+    #[test]
+    fn forgetting_refuses_the_root_and_a_running_agent() {
+        let (mut app, _rx) = test_app("forget-guards");
+        app.forget_agent(0);
+        assert!(app.agents.iter().any(|node| node.id == 0));
+
+        app.agents.push(AgentNode {
+            id: 9,
+            parent: Some(0),
+            depth: 1,
+            brief: "busy".to_string(),
+            phase: Phase::Thinking,
+            since: Instant::now(),
+            branch: None,
+            summary: None,
+            leftover: false,
+            landed: None,
+        });
+        app.forget_agent(9);
+        assert!(
+            app.agents.iter().any(|node| node.id == 9),
+            "a running agent is not forgotten under itself"
+        );
+    }
+
     fn test_app(label: &str) -> (App, Receiver<Msg>) {
         let root = std::env::temp_dir().join(format!("mush-app-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1616,6 +1996,8 @@ mod tests {
             since: Instant::now(),
             branch: None,
             summary: Some("did the work".to_string()),
+            leftover: false,
+            landed: None,
         });
         app.focused = 1;
         app.input.insert("one more thing");

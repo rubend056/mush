@@ -85,6 +85,79 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// What a commit subject can say about the run that produced it.
+///
+/// A subject carries the *task*, not the result, so this is the projection of
+/// [`Outcome`] onto what survives in git: how the run ended. It exists so a
+/// worktree found on startup can be shown as the work it really is, instead of
+/// an anonymous "leftover worktree".
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Committed {
+    Finished,
+    Stopped,
+    Failed(String),
+}
+
+impl From<&Outcome> for Committed {
+    fn from(outcome: &Outcome) -> Self {
+        match outcome {
+            Outcome::Finished(_) => Committed::Finished,
+            Outcome::Stopped => Committed::Stopped,
+            Outcome::Failed(error) => Committed::Failed(error.clone()),
+        }
+    }
+}
+
+/// The commit subject for an isolated agent's work.
+///
+/// The outcome is in the subject on purpose: an interrupted run commits its work
+/// in progress too, and a log full of identically-formatted `mush #3: <brief>`
+/// subjects cannot be told apart from finished work. [`parse_commit_subject`] is
+/// the inverse, and the two are tested against each other.
+pub fn commit_subject(id: u64, brief: &str, outcome: &Outcome) -> String {
+    match Committed::from(outcome) {
+        Committed::Finished => format!("mush #{id}: {}", truncate(brief, 60)),
+        Committed::Stopped => format!(
+            "mush #{id} (stopped, work in progress): {}",
+            truncate(brief, 60)
+        ),
+        Committed::Failed(error) => format!(
+            "mush #{id} (failed: {}): {}",
+            truncate(&error, 40),
+            truncate(brief, 60)
+        ),
+    }
+}
+
+/// Read back what [`commit_subject`] wrote: how the run ended, and the task it
+/// was given. `None` for any subject mush did not write — a commit the human
+/// made by hand on that branch is not evidence about an agent.
+pub fn parse_commit_subject(subject: &str) -> Option<(Committed, String)> {
+    let after = subject.strip_prefix("mush #")?;
+    // The id is a run of digits. It must not be located by splitting on the
+    // first space: the `:` sits *before* the space (`mush #7: brief`), so that
+    // split would swallow the delimiter and every finished run would fail to
+    // parse.
+    let rest = after.trim_start_matches(|c: char| c.is_ascii_digit());
+    if rest.len() == after.len() {
+        return None;
+    }
+    // What follows is `: ` for a finished run, or ` (` for a stop or failure.
+    if let Some(brief) = rest.strip_prefix(": ") {
+        return Some((Committed::Finished, brief.to_string()));
+    }
+    let rest = rest.strip_prefix(" (")?;
+    let (head, brief) = rest.split_once("): ")?;
+    let ended = if head == "stopped, work in progress" {
+        Committed::Stopped
+    } else {
+        // Any other shape must name a failure; if it does not, this subject is
+        // not one mush wrote.
+        Committed::Failed(head.strip_prefix("failed: ")?.to_string())
+    };
+    Some((ended, brief.to_string()))
+}
+
 impl Outcome {
     /// The line a parent reads. Each outcome names itself, so a stop can never
     /// be mistaken for a result.
@@ -1293,21 +1366,7 @@ fn commit_worktree(
         return Ok(None);
     }
     git_output(root, &["add", "-A"])?;
-    // The subject carries the outcome: an interrupted run commits its work in
-    // progress too, and a log full of identically-formatted "mush #3: <brief>"
-    // subjects cannot be told apart from finished work.
-    let subject = match outcome {
-        Outcome::Finished(_) => format!("mush #{id}: {}", truncate(brief, 60)),
-        Outcome::Stopped => format!(
-            "mush #{id} (stopped, work in progress): {}",
-            truncate(brief, 60)
-        ),
-        Outcome::Failed(error) => format!(
-            "mush #{id} (failed: {}): {}",
-            truncate(error, 40),
-            truncate(brief, 60)
-        ),
-    };
+    let subject = commit_subject(id, brief, outcome);
     git_output(
         root,
         &[
@@ -1807,6 +1866,41 @@ mod tests {
             ),
             Fold::Run
         ));
+    }
+
+    /// The subject written for a commit and the subject read back from git must
+    /// agree, or a worktree found on startup is shown as the wrong work.
+    #[test]
+    fn a_commit_subject_round_trips_through_git() {
+        let cases = [
+            (Outcome::Finished("done".into()), Committed::Finished),
+            (Outcome::Stopped, Committed::Stopped),
+            (
+                Outcome::Failed("no route".into()),
+                Committed::Failed("no route".into()),
+            ),
+        ];
+        for (outcome, expected) in cases {
+            let subject = commit_subject(7, "port the parser", &outcome);
+            assert!(subject.starts_with("mush #7"), "{subject}");
+            let (ended, brief) = parse_commit_subject(&subject)
+                .unwrap_or_else(|| panic!("{subject} must parse back"));
+            assert_eq!(ended, expected, "{subject}");
+            assert_eq!(brief, "port the parser", "{subject}");
+        }
+    }
+
+    /// A branch the human committed to by hand is not evidence about an agent,
+    /// so it parses as nothing rather than as a finished run.
+    #[test]
+    fn only_a_subject_mush_wrote_is_read_back() {
+        assert_eq!(parse_commit_subject("fix the bug myself"), None);
+        assert_eq!(parse_commit_subject("mush #3"), None);
+        assert_eq!(parse_commit_subject("mush #3 (something else): x"), None);
+        assert_eq!(
+            parse_commit_subject("mush #3: "),
+            Some((Committed::Finished, String::new()))
+        );
     }
 
     /// A child that was stopped and then resumed finishes later; the stale

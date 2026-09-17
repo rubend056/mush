@@ -60,6 +60,49 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Run a git command that *changes* the repository and return its trimmed
+/// stdout. Unlike [`status`] and friends this can fail for a reason the human
+/// needs to read (a merge conflict, a worktree that is still checked out), so
+/// the error carries git's own message instead of collapsing to `None`.
+///
+/// The one invocation style for mutating verbs: `-C` so the caller names the
+/// repository, and `LC_ALL=C` so a conflict or error reads the same everywhere.
+pub fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .map_err(|_| "git binary unavailable".to_string())?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        let detail = if stderr.is_empty() { stdout } else { stderr };
+        return Err(if detail.is_empty() {
+            format!("git {} failed", args.first().unwrap_or(&""))
+        } else {
+            detail
+        });
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// The subject line of the commit `name` points at.
+///
+/// This is how a worktree left behind by an earlier session is identified: the
+/// commit mush made for it carries the agent's id, the task it was given, and
+/// how the run ended, so the UI can show a real brief instead of a placeholder.
+pub fn subject_of(dir: &Path, name: &str) -> Option<String> {
+    let sha = commit(dir, name)?;
+    let subject = git(dir, &["log", "-1", "--format=%s", &sha])?;
+    if subject.is_empty() {
+        None
+    } else {
+        Some(subject)
+    }
+}
+
 /// The checked-out branch, or `None` when detached or outside a repository.
 pub fn branch(dir: &Path) -> Option<String> {
     let name = git(dir, &["symbolic-ref", "--short", "-q", "HEAD"])?;
@@ -228,6 +271,50 @@ mod tests {
         // The ordinary case still works.
         let stat = branch_stat(&dir, "HEAD", "master").unwrap();
         assert!(stat.is_empty(), "HEAD is master here: {stat:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A mutating verb reports git's own message, and the subject it wrote is
+    /// readable back: this is the pair a leftover worktree is identified by.
+    #[test]
+    fn run_commits_and_the_subject_reads_back() {
+        let dir = init_repo("verb");
+        fs::write(dir.join("b.txt"), "two\n").unwrap();
+        run(&dir, &["add", "-A"]).unwrap();
+        run(
+            &dir,
+            &[
+                "-c",
+                "user.name=mush",
+                "-c",
+                "user.email=mush@local",
+                "commit",
+                "-qm",
+                "mush #4: port the parser",
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            subject_of(&dir, "HEAD").as_deref(),
+            Some("mush #4: port the parser")
+        );
+        // A revision that does not exist is not a subject, and neither is a
+        // missing branch.
+        assert_eq!(subject_of(&dir, "mush/99"), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A failing verb must carry git's reason rather than an empty error: that
+    /// message is what tells a human a merge conflicted.
+    #[test]
+    fn a_failed_verb_reports_why() {
+        let dir = init_repo("verb-fail");
+        let error = run(&dir, &["merge", "no-such-branch"]).unwrap_err();
+        assert!(!error.is_empty());
+        assert!(
+            error.contains("no-such-branch") || error.contains("not something we can merge"),
+            "{error}"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

@@ -11,7 +11,9 @@ use unicode_width::UnicodeWidthStr;
 use mush_core::message::Message;
 use mush_core::text::{fit_row, truncate, wrap_text};
 
-use crate::app::{short_age, AgentNode, App, Focus, NoticeKind, Phase, PickerKind, StatusKind};
+use crate::app::{
+    short_age, AgentNode, App, Focus, Landed, NoticeKind, Phase, PickerKind, StatusKind,
+};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// The idle bar hint, when there is nothing to report.
@@ -209,15 +211,11 @@ fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>>
             Style::default(),
         ),
     ]));
-    if node.branch.is_some() || matches!(node.phase, Phase::Idle | Phase::Stopped) {
-        let mut detail = Vec::new();
-        if let Some(branch) = &node.branch {
-            // Where the work is, and the two commands that land it: this is the
-            // one place on screen that says an isolated agent exists at all.
-            detail.push(format!(".mush/wt/{}", node.id));
-            detail.push(format!("git diff HEAD...{branch}"));
-            detail.push(format!("/merge {}", node.id));
-        }
+    if node.landed.is_some()
+        || node.branch.is_some()
+        || matches!(node.phase, Phase::Idle | Phase::Stopped)
+    {
+        let mut detail = agent_detail(node);
         let activity = phase_detail(node);
         if !activity.is_empty() {
             detail.insert(0, activity);
@@ -234,6 +232,26 @@ fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>>
         let _ = app;
     }
     lines
+}
+
+/// Where an isolated agent's work is — or where it went. Pure, so the row's
+/// promise can be asserted: a landed worktree must not name a `git diff` or a
+/// `/merge` that can no longer work.
+fn agent_detail(node: &AgentNode) -> Vec<String> {
+    match node.landed {
+        Some(Landed::Merged) => vec!["merged into HEAD".to_string()],
+        Some(Landed::Discarded) => vec!["discarded — its work is gone".to_string()],
+        None => match &node.branch {
+            // This is the one place on screen that says an isolated agent
+            // exists at all, and the commands that land it.
+            Some(branch) => vec![
+                format!(".mush/wt/{}", node.id),
+                format!("git diff HEAD...{branch}"),
+                format!("/merge {}", node.id),
+            ],
+            None => Vec::new(),
+        },
+    }
 }
 
 /// The glyph is derived from the phase and the tree, never stored: an agent is
@@ -688,9 +706,9 @@ mod tests {
 
     /// The detail line carries the age of the *phase*, so a slow model looks
     /// slow instead of looking stuck.
-    #[test]
-    fn details_age_with_the_phase() {
-        let node = |phase: Phase, age: u64| AgentNode {
+    /// A node carrying nothing but the facts a row test needs.
+    fn node(phase: Phase, age: u64) -> AgentNode {
+        AgentNode {
             id: 2,
             parent: None,
             depth: 0,
@@ -699,7 +717,13 @@ mod tests {
             since: std::time::Instant::now() - std::time::Duration::from_secs(age),
             branch: None,
             summary: None,
-        };
+            leftover: false,
+            landed: None,
+        }
+    }
+
+    #[test]
+    fn details_age_with_the_phase() {
         assert_eq!(phase_detail(&node(Phase::Thinking, 3)), "thinking 3s");
         assert_eq!(
             phase_detail(&node(Phase::Activity("edit_file src/a.rs".into()), 75)),
@@ -720,6 +744,44 @@ mod tests {
         assert!(
             !phase_detail(&stopped).contains("half the parser"),
             "a stop must not show the previous run's summary"
+        );
+    }
+
+    /// A landed worktree still has a branch recorded, so the row must key off
+    /// `landed` to stop offering a diff and a merge that can no longer work.
+    #[test]
+    fn a_landed_agent_does_not_offer_commands_that_cannot_work() {
+        let mut merged = node(Phase::Done, 1);
+        merged.branch = Some("mush/9".to_string());
+        merged.landed = Some(Landed::Merged);
+        let text = agent_detail(&merged).join(" · ");
+        assert_eq!(text, "merged into HEAD");
+        assert!(!text.contains("git diff"), "{text}");
+        assert!(!text.contains("/merge"), "{text}");
+
+        let mut discarded = node(Phase::Done, 1);
+        discarded.branch = Some("mush/9".to_string());
+        discarded.landed = Some(Landed::Discarded);
+        let text = agent_detail(&discarded).join(" · ");
+        assert!(text.contains("discarded"), "{text}");
+        assert!(!text.contains("/merge"), "{text}");
+    }
+
+    /// Before anything lands, the row is the one place that says where an
+    /// isolated agent's work is and how to bring it in.
+    #[test]
+    fn an_unmerged_agent_names_its_worktree_and_the_command_to_merge_it() {
+        let mut open = node(Phase::Done, 1);
+        open.branch = Some("mush/9".to_string());
+        let text = agent_detail(&open).join(" · ");
+        // The commands are keyed by the *id* (the worktree is `.mush/wt/<id>`),
+        // which need not match the number in the branch name.
+        assert_eq!(
+            text,
+            format!(
+                ".mush/wt/{} · git diff HEAD...mush/9 · /merge {}",
+                open.id, open.id
+            )
         );
     }
 }
