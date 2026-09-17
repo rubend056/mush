@@ -2988,143 +2988,85 @@ mod tests {
     }
 
     /// Hitting the turn limit must end with a summary, not a bare `stopped
-    /// after 24 turns without finishing`: the safety valve stays, the failure
-    /// goes (finding N1).
+    /// after 200 turns without finishing`: the safety valve stays, the failure
+    /// goes (finding N1). Every turn before the guard does real work — one
+    /// `write_file`, with the arguments differing each turn so the run is not
+    /// stopped early as a loop instead.
     #[test]
-    #[ignore = "needs python3; spawns a local mock model server"]
     fn the_turn_limit_ends_with_a_summary() {
-        const PORT: u16 = 18_735;
-        let mock = start_mock(PORT);
-        let root = std::env::temp_dir().join(format!("mush-turns-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        const WRAPPED_UP: &str = "wrapped up: the work done so far is in the workspace";
+        let root = scratch_dir("turns");
 
-        let cfg = Config::new(format!("http://127.0.0.1:{PORT}"), "mock", None);
+        let mut scripted = Scripted::new();
+        for turn in 0..RUNAWAY_TURNS - 1 {
+            scripted = scripted.calls(vec![tool_call(
+                "call",
+                "write_file",
+                json!({ "path": "notes.txt", "content": format!("turn {turn}") }),
+            )]);
+        }
+        let scripted = Arc::new(scripted.says(WRAPPED_UP));
+
+        let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
+        // A window wide enough that this transcript never compacts: the only
+        // thing that may end this run is the runaway guard.
+        cfg.context_tokens = 128_000;
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let root_tx = spawn(cfg, tx, root.clone()).tx;
+        let root_tx = spawn_scripted(cfg, tx, root.clone(), scripted.clone()).tx;
         root_tx
             .send(AgentMsg::Run(vec![
                 Message::system(prompt::system_prompt(root.to_str().unwrap())),
-                Message::user("TURNS"),
+                Message::user("TURNS: keep working until you are done".to_string()),
             ]))
             .unwrap();
 
-        let mut done = false;
-        let mut error = None;
-        let mut wrapped_up = false;
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !done && error.is_none() && Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(Msg::Agent { event, .. }) => match event {
-                    AgentEvent::Done => done = true,
-                    AgentEvent::Error(why) => error = Some(why),
-                    AgentEvent::Message(message) if message.role == "assistant" => {
-                        wrapped_up |= message.text().contains("wrapped up");
-                    }
-                    _ => {}
-                },
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                // Input events belong to the UI; this test only listens to actors.
-                Ok(_) => {}
-            }
-        }
-        stop_mock(mock);
-        let _ = fs::remove_dir_all(&root);
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&rx, WAIT, |seen| seen.done > 0 || !seen.errors.is_empty()),
+            "the run must end: {seen:?}"
+        );
         assert_eq!(
-            error, None,
+            seen.errors,
+            Vec::<String>::new(),
             "the turn limit must not be reported as an error"
         );
-        assert!(done, "the run must finish normally");
-        assert!(wrapped_up, "the wrap-up turn's summary must be the result");
-    }
-
-    /// Start the scripted mock model server and wait until it answers.
-    fn start_mock(port: u16) -> Child {
-        start_mock_with(port, &[])
-    }
-
-    /// Same, with extra script arguments (the STEER scenario takes a marker
-    /// path so the test knows when its first reply is in flight).
-    fn start_mock_with(port: u16, extra: &[&str]) -> Child {
-        use std::process::Command;
-
-        const MOCK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/mock_llm.py");
-        let mock = Command::new("python3")
-            .arg(MOCK)
-            .arg(port.to_string())
-            .args(extra)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("mock server starts");
-
-        let probe = format!(
-            "import urllib.request;urllib.request.urlopen(\
-             'http://127.0.0.1:{port}/v1/models', timeout=0.2)"
+        assert_eq!(seen.done, 1, "the run must finish normally: {seen:?}");
+        assert_eq!(
+            seen.replies,
+            vec![WRAPPED_UP.to_string()],
+            "the wrap-up turn's summary must be the result"
         );
-        let mut ready = false;
-        for _ in 0..100 {
-            let status = Command::new("python3")
-                .args(["-c", &probe])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if status {
-                ready = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        assert!(ready, "mock model server (port {port}) did not come up");
-        mock
-    }
+        assert!(
+            seen.notices
+                .iter()
+                .any(|notice| notice.contains("runaway guard")),
+            "the human must be told why the tools went away: {:?}",
+            seen.notices
+        );
 
-    /// Kill the mock server and reap it, so the suite leaves no zombies.
-    fn stop_mock(mut mock: Child) {
-        let _ = mock.kill();
-        let _ = mock.wait();
-    }
-
-    /// A scratch git repo with one initial commit, ready for worktrees. The
-    /// label keeps parallel tests from sharing a directory.
-    fn init_git_repo(label: &str) -> PathBuf {
-        use std::process::Command;
-
-        let root = scratch_dir(&format!("git-{label}"));
-        let git = |args: &[&str]| {
-            let status = Command::new("git")
-                .arg("-C")
-                .arg(&root)
-                .args(args)
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {args:?} failed");
-        };
-        git(&["init", "-q", "-b", "main"]);
-        git(&["config", "user.email", "t@t"]);
-        git(&["config", "user.name", "t"]);
-        fs::write(root.join("base.txt"), "base\n").unwrap();
-        git(&["add", "-A"]);
-        git(&["commit", "-qm", "init"]);
-        root
-    }
-
-    fn git_rev_parse(root: &Path, rev: &str) -> Option<String> {
-        use std::process::Command;
-
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(["rev-parse", rev])
-            .output()
-            .ok()?;
-        if !output.status.success() {
-            return None;
-        }
-        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+        // Every turn ran: one request per turn, and the last one asked for the
+        // summary with the tools withdrawn rather than failing the run.
+        let asked = scripted.asked();
+        assert_eq!(
+            asked.len(),
+            RUNAWAY_TURNS,
+            "the run must use every turn before the guard"
+        );
+        assert_eq!(
+            asked[RUNAWAY_TURNS - 1].tools,
+            0,
+            "the wrap-up turn must be asked without tools"
+        );
+        assert!(
+            asked[RUNAWAY_TURNS - 1].saw("runaway guard"),
+            "the wrap-up request must say why the tools went away"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("notes.txt")).ok().as_deref(),
+            Some(format!("turn {}", RUNAWAY_TURNS - 2).as_str()),
+            "the last turn before the guard must have done its work"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// How long a scenario waits for something the run is *supposed* to do.
@@ -3196,5 +3138,44 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// A scratch git repo with one initial commit, ready for worktrees. The
+    /// label keeps parallel tests from sharing a directory.
+    fn init_git_repo(label: &str) -> PathBuf {
+        use std::process::Command;
+
+        let root = scratch_dir(&format!("git-{label}"));
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        root
+    }
+
+    fn git_rev_parse(root: &Path, rev: &str) -> Option<String> {
+        use std::process::Command;
+
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(root)
+            .args(["rev-parse", rev])
+            .output()
+            .ok()?;
+        if !output.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 }
