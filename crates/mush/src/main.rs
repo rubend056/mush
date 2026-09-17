@@ -836,6 +836,10 @@ mod tests {
             help.contains(&keys),
             "the key table is not in --help:\n{help}"
         );
+        // The tree walk the human asked for is named here too.
+        for want in ["←", "→"] {
+            assert!(help.contains(want), "`{want}` is missing:\n{help}");
+        }
 
         // And the command table, so `/compact`-style absence cannot return.
         let commands = app::commands::table(&mush_core::provider::names_piped());

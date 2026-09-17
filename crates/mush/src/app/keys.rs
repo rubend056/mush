@@ -128,6 +128,16 @@ pub const KEYS: &[Binding] = &[
     },
     Binding {
         context: Context::Agents,
+        keys: "←",
+        help: "the selected agent's parent",
+    },
+    Binding {
+        context: Context::Agents,
+        keys: "→",
+        help: "the selected agent's first child",
+    },
+    Binding {
+        context: Context::Agents,
         keys: "Enter",
         help: "focus the selected agent",
     },
@@ -271,6 +281,11 @@ pub enum Intent {
     PickerLast,
     /// Move the tree's cursor `step` rows, without leaving the pane.
     TreeMove(i64),
+    /// Walk the tree along the parent links: `-1` selects the selected agent's
+    /// parent (`←`), `+1` its first child (`→`). A root has no parent and a
+    /// leaf has no child, so the cursor stays put — an honest no-op rather than
+    /// a jump somewhere that is not the row the human asked for (finding U10).
+    TreeWalk(i64),
     TreeFirst,
     TreeLast,
     /// Focus the agent under the tree's cursor.
@@ -350,6 +365,11 @@ fn tree(key: KeyEvent) -> Intent {
         KeyCode::Enter => Intent::TreeFocus,
         KeyCode::Char('c') => Intent::TreeCancel,
         KeyCode::Esc => Intent::TreeBackToRoot,
+        // `←`/`→` walk the parent links, `j`/`k` walk the rows. They are "up
+        // and down the tree" rather than "previous and next row": with a
+        // grandchild selected, `←` is its parent, not its uncle above it.
+        KeyCode::Left => Intent::TreeWalk(-1),
+        KeyCode::Right => Intent::TreeWalk(1),
         _ => Intent::Ignore,
     }
 }
@@ -445,6 +465,8 @@ mod tests {
             (none(KeyCode::Enter), Intent::TreeFocus),
             (none(KeyCode::Char('c')), Intent::TreeCancel),
             (none(KeyCode::Esc), Intent::TreeBackToRoot),
+            (none(KeyCode::Left), Intent::TreeWalk(-1)),
+            (none(KeyCode::Right), Intent::TreeWalk(1)),
         ];
         for (key, want) in cases {
             assert_eq!(at(Focus::Agents, false, key), want, "{key:?}");
@@ -654,6 +676,30 @@ mod tests {
         assert_eq!(
             at(Focus::Agents, false, none(KeyCode::Char(' '))),
             Intent::Ignore
+        );
+    }
+
+    /// `←`/`→` belong to whichever pane has the keyboard: the tree walks its
+    /// parent links in the agents pane, and the chat keeps them for the message
+    /// box cursor. Both halves are one row of this table, so "`←` moves the
+    /// tree" cannot quietly become "`←` moves the box too".
+    #[test]
+    fn left_and_right_belong_to_whichever_pane_has_the_keyboard() {
+        assert_eq!(
+            at(Focus::Agents, false, none(KeyCode::Left)),
+            Intent::TreeWalk(-1)
+        );
+        assert_eq!(
+            at(Focus::Agents, false, none(KeyCode::Right)),
+            Intent::TreeWalk(1)
+        );
+        assert_eq!(
+            at(Focus::Chat, false, none(KeyCode::Left)),
+            Intent::Chat(ChatKey::Left)
+        );
+        assert_eq!(
+            at(Focus::Chat, false, none(KeyCode::Right)),
+            Intent::Chat(ChatKey::Right)
         );
     }
 }
