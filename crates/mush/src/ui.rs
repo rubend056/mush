@@ -10,7 +10,9 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use mush_core::message::Message;
 
-use crate::app::{display_column, AgentNode, App, Focus, Mode, PickerKind};
+use crate::app::{
+    display_column, short_age, AgentNode, App, Focus, Mode, Phase, PickerKind, StatusKind,
+};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
@@ -71,43 +73,25 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, inner, &mut state);
 }
 
-/// One tree row: indent by depth, status glyph, id, brief, last action, branch.
+/// One tree row: indent by depth, status glyph, id, brief, activity, branch.
 /// `▶` marks the focused agent (whose chat the bottom pane shows).
 fn agent_item(app: &App, node: &AgentNode, width: usize) -> ListItem<'static> {
     let indent = "  ".repeat(node.depth);
-    // The cancel state comes second: a Stop is on its way, so "running"
-    // would be a lie even though the actor has not stopped yet.
-    let glyph = if node.error.is_some() {
-        "✗"
-    } else if node.cancelling {
-        "⊘"
-    } else if node.running {
-        if app
-            .agents
-            .iter()
-            .any(|n| n.parent == Some(node.id) && n.running)
-        {
-            "⏸" // waiting on children
-        } else {
-            "◐"
-        }
-    } else {
-        "✓"
-    };
     let marker = if app.focused == node.id { "▶" } else { " " };
-    let mut text = format!("{indent}{marker}{glyph} #{:<3}", node.id);
+    let waiting = app
+        .agents
+        .iter()
+        .any(|n| n.parent == Some(node.id) && n.phase.is_busy());
+    let mut text = format!(
+        "{indent}{marker}{} #{:<3}",
+        phase_glyph(&node.phase, waiting),
+        node.id
+    );
     if width > text.chars().count() + 1 {
-        let detail = if node.cancelling {
-            "cancelling…".to_string()
-        } else if node.running {
-            node.last.clone()
-        } else {
-            node.summary.clone().unwrap_or_default()
-        };
         let tail = format!(
             "{}  {}  {}",
             truncate(&node.brief, 18),
-            truncate(&detail, 14),
+            truncate(&phase_detail(node), 18),
             node.branch.as_deref().unwrap_or("")
         );
         text.push(' ');
@@ -117,6 +101,38 @@ fn agent_item(app: &App, node: &AgentNode, width: usize) -> ListItem<'static> {
         ));
     }
     ListItem::new(text.trim_end().to_string())
+}
+
+/// The glyph is derived from the phase and the tree, never stored: an agent is
+/// `·` until it does something, `✓` only when a run finished, `⏸` when it is
+/// busy *because* its children are, and `⊘` while a cancel is in flight.
+fn phase_glyph(phase: &Phase, waiting_on_children: bool) -> &'static str {
+    match phase {
+        Phase::Failed(_) => "✗",
+        Phase::Cancelling => "⊘",
+        Phase::Idle => "·",
+        Phase::Done => "✓",
+        Phase::Thinking | Phase::Activity(_) => {
+            if waiting_on_children {
+                "⏸"
+            } else {
+                "◐"
+            }
+        }
+    }
+}
+
+/// What the row says the agent is doing, ageing with the phase so a slow model
+/// is visible as `thinking 42s` rather than a static word.
+fn phase_detail(node: &AgentNode) -> String {
+    let age = short_age(node.since.elapsed());
+    match &node.phase {
+        Phase::Thinking => format!("thinking {age}"),
+        Phase::Activity(what) => format!("{what} {age}"),
+        Phase::Cancelling => "cancelling…".to_string(),
+        Phase::Failed(error) => error.clone(),
+        Phase::Idle | Phase::Done => node.summary.clone().unwrap_or_default(),
+    }
 }
 
 fn draw_editor(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -343,13 +359,28 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         },
         Focus::Chat => "chat",
     };
+    // Priority: what the tree is doing (derived) › what just happened (fades) ›
+    // the static hint. Work in progress is never stored, so it cannot linger.
+    let (message, style) = match (app.activity_line(), app.status_line()) {
+        (Some(activity), _) => (activity, Style::default().fg(Color::Cyan)),
+        (None, Some((text, StatusKind::Error))) => {
+            (text.to_string(), Style::default().fg(Color::Red))
+        }
+        (None, Some((text, StatusKind::Info))) => {
+            (text.to_string(), Style::default().fg(Color::Gray))
+        }
+        (None, None) => (
+            "Tab cycles panes · /help lists commands · Ctrl-P picks a model".to_string(),
+            dim(),
+        ),
+    };
     let line = Line::from(vec![
         Span::styled(
             format!(" {focus} "),
             Style::default().fg(Color::Black).bg(Color::Cyan),
         ),
         Span::raw(" "),
-        Span::styled(app.status.clone(), Style::default().fg(Color::Gray)),
+        Span::styled(message, style),
     ]);
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -395,7 +426,15 @@ fn transcript_lines(app: &App, messages: &[Message], width: usize) -> Vec<Line<'
             )));
         }
     }
-    if app.busy {
+    // The spinner belongs to the transcript on screen: another agent working
+    // elsewhere is not this conversation's business.
+    let focused_busy = app
+        .agents
+        .iter()
+        .find(|node| node.id == app.focused)
+        .map(|node| node.phase.is_busy())
+        .unwrap_or(false);
+    if focused_busy {
         out.push(Line::from(""));
         out.push(Line::from(Span::styled(
             format!("{} working…", SPINNER[(app.spin as usize) % SPINNER.len()]),
@@ -539,6 +578,49 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row's glyph is the whole status vocabulary in one character; it must
+    /// never claim a run that did not happen (`·`, not `✓`).
+    #[test]
+    fn glyphs_are_truthful() {
+        assert_eq!(phase_glyph(&Phase::Idle, false), "·");
+        assert_eq!(phase_glyph(&Phase::Thinking, false), "◐");
+        assert_eq!(phase_glyph(&Phase::Thinking, true), "⏸");
+        assert_eq!(
+            phase_glyph(&Phase::Activity("edit_file a.rs".into()), true),
+            "⏸"
+        );
+        assert_eq!(phase_glyph(&Phase::Cancelling, false), "⊘");
+        assert_eq!(phase_glyph(&Phase::Done, false), "✓");
+        assert_eq!(phase_glyph(&Phase::Failed("boom".into()), false), "✗");
+    }
+
+    /// The detail line carries the age of the *phase*, so a slow model looks
+    /// slow instead of looking stuck.
+    #[test]
+    fn details_age_with_the_phase() {
+        let node = |phase: Phase, age: u64| AgentNode {
+            id: 2,
+            parent: None,
+            depth: 0,
+            brief: "lexer".to_string(),
+            phase,
+            since: std::time::Instant::now() - std::time::Duration::from_secs(age),
+            branch: None,
+            summary: None,
+        };
+        assert_eq!(phase_detail(&node(Phase::Thinking, 3)), "thinking 3s");
+        assert_eq!(
+            phase_detail(&node(Phase::Activity("edit_file src/a.rs".into()), 75)),
+            "edit_file src/a.rs 1m15s"
+        );
+        assert_eq!(phase_detail(&node(Phase::Cancelling, 1)), "cancelling…");
+        assert_eq!(
+            phase_detail(&node(Phase::Failed("no route".into()), 9)),
+            "no route"
+        );
+        assert_eq!(phase_detail(&node(Phase::Idle, 9)), "");
+    }
 
     #[test]
     fn wraps_on_word_boundaries() {

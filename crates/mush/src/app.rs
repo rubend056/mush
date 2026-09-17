@@ -9,6 +9,7 @@ use std::collections::HashMap;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
@@ -88,19 +89,81 @@ impl Picker {
 
 /// One entry in the agent tree. Order in the vector is tree order; ids are
 /// stable, so positions do not shift while agents are alive.
+/// What an agent is doing *now*, as opposed to what it last said it was doing.
+///
+/// The row glyph, the activity text, and the status bar all render this, so a
+/// finished or cancelled run cannot leave a `thinking…` behind: when a phase
+/// ends, the lines that described it stop existing. Nothing here is a string
+/// mirror of the transcript.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Phase {
+    /// Nothing in flight: never ran, or its run ended without a result.
+    Idle,
+    /// A request is in flight and the model has not named a tool yet.
+    Thinking,
+    /// The last thing the agent reported doing: `edit_file src/lib.rs`, `run_command cargo test`, `summarizing…`.
+    Activity(String),
+    /// A Stop is on its way and the actor has not yielded yet.
+    Cancelling,
+    /// The run finished; `summary` holds what it produced.
+    Done,
+    /// The run failed; the payload is what the human needs to read.
+    Failed(String),
+}
+
+impl Phase {
+    /// Whether work is in flight. `Idle`, `Done`, and `Failed` are at rest.
+    pub fn is_busy(&self) -> bool {
+        matches!(
+            self,
+            Phase::Thinking | Phase::Activity(_) | Phase::Cancelling
+        )
+    }
+}
+
+/// An age the way a glance wants it: seconds, then minutes, then hours — never
+/// a five-digit number that takes arithmetic to read.
+pub fn short_age(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3599 => format!("{}m{:02}s", seconds / 60, seconds % 60),
+        _ => format!("{}h{:02}m", seconds / 3600, (seconds % 3600) / 60),
+    }
+}
+
+/// A transient line for the workspace bar. Nothing here describes work in
+/// progress — that is derived from the agents' phases — so it cannot go stale.
+/// `Info` fades; `Error` stays until something replaces it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StatusKind {
+    Info,
+    Error,
+}
+
+/// How long an `Info` line is worth showing. Long enough to read after a
+/// command, short enough that it never becomes furniture.
+const INFO_TTL: Duration = Duration::from_secs(5);
+
+#[derive(Clone, Debug)]
+pub struct Status {
+    pub kind: StatusKind,
+    pub text: String,
+    pub set_at: Instant,
+}
+
 pub struct AgentNode {
     pub id: u64,
     pub parent: Option<u64>,
     pub depth: usize,
     pub brief: String,
-    pub running: bool,
-    /// A Stop is on its way and the actor has not yielded yet. The row says so
-    /// instead of looking like work that is still going somewhere.
-    pub cancelling: bool,
-    pub last: String,
+    /// What it is doing now, and since when — the row and the bar derive from
+    /// this instead of storing rendered text.
+    pub phase: Phase,
+    pub since: Instant,
     pub branch: Option<String>,
+    /// The agent's result once it has one (a leftover worktree has one too).
     pub summary: Option<String>,
-    pub error: Option<String>,
 }
 
 /// A single open file. Lines are stored without their terminators; whether the
@@ -357,7 +420,9 @@ pub struct App {
     /// Which conversation the live actor tree belongs to; events tagged with
     /// any other are from an abandoned tree and are ignored.
     conversation: u64,
-    pub status: String,
+    /// A transient line for the bar: what just happened, or what went wrong.
+    /// Work in progress does not live here — it is derived from the phases.
+    pub status: Option<Status>,
     pub busy: bool,
     pub should_quit: bool,
     pub dirty_screen: bool,
@@ -396,12 +461,10 @@ impl App {
                 parent: None,
                 depth: 0,
                 brief: "you (root agent)".to_string(),
-                running: false,
-                cancelling: false,
-                last: String::new(),
+                phase: Phase::Idle,
+                since: Instant::now(),
                 branch: None,
                 summary: None,
-                error: None,
             }],
             agent_cursor: 0,
             focused: 0,
@@ -411,7 +474,7 @@ impl App {
             cfg_shared: root.cfg,
             ui_tx,
             conversation: root.conversation,
-            status: String::new(),
+            status: None,
             busy: false,
             should_quit: false,
             dirty_screen: true,
@@ -419,10 +482,10 @@ impl App {
             spin: 0,
             system,
         };
-        app.status = format!(
+        app.say(format!(
             "{}  •  Tab to move around · Ctrl-P pick a model",
             app.cfg.label()
-        );
+        ));
         app.discover_worktrees();
         if let Some(rel) = open_file {
             app.open_file(&rel);
@@ -480,12 +543,10 @@ impl App {
                 parent: None,
                 depth: 1,
                 brief: "leftover worktree".to_string(),
-                running: false,
-                cancelling: false,
-                last: String::new(),
+                phase: Phase::Done,
+                since: Instant::now(),
                 branch: Some(full),
                 summary: Some("found on startup".to_string()),
-                error: None,
             });
         }
     }
@@ -518,11 +579,19 @@ impl App {
         self.dirty_screen = true;
     }
 
-    /// Called once per event-loop pass so the status spinner animates.
+    /// Called once per event-loop pass so the status spinner animates, and so
+    /// a line that has outlived its welcome leaves the screen even when nothing
+    /// else is happening.
     pub fn tick(&mut self) {
         if self.busy {
             self.spin = self.spin.wrapping_add(1);
             self.dirty_screen = true;
+        }
+        if let Some(status) = &self.status {
+            if status.kind == StatusKind::Info && status.set_at.elapsed() >= INFO_TTL {
+                self.status = None;
+                self.dirty_screen = true;
+            }
         }
     }
 
@@ -543,12 +612,10 @@ impl App {
                     parent: Some(parent),
                     depth,
                     brief,
-                    running: true,
-                    cancelling: false,
-                    last: "spawned".to_string(),
+                    phase: Phase::Thinking,
+                    since: Instant::now(),
                     branch,
                     summary: None,
-                    error: None,
                 });
                 self.busy = true;
             }
@@ -557,9 +624,8 @@ impl App {
                 // agent woken by a child's result). Mark it so `busy`, the
                 // spinner, and Ctrl-C agree with the actor.
                 if let Some(node) = self.agent_node_mut(id) {
-                    node.running = true;
-                    node.cancelling = false;
-                    node.error = None;
+                    node.phase = Phase::Thinking;
+                    node.since = Instant::now();
                 }
                 // Keep the run's flag: a Stop must be able to reach a model
                 // call that is still waiting, not just the actor's mailbox.
@@ -568,11 +634,13 @@ impl App {
             }
             AgentEvent::Status(status) => {
                 if let Some(node) = self.agent_node_mut(id) {
-                    node.last = status.clone();
+                    node.phase = Phase::Activity(status);
+                    node.since = Instant::now();
                 }
-                if id == self.focused {
-                    self.status = status;
-                }
+                // A status can arrive after the run's work is done (a commit
+                // message, say) and before `Done`: keep `busy` in step with the
+                // phases it is derived from.
+                self.recompute_busy();
             }
             AgentEvent::Message(message) => {
                 if id == 0 {
@@ -586,17 +654,19 @@ impl App {
             AgentEvent::Error(error) => {
                 let cancelled = error == agent::CANCELLED;
                 if let Some(node) = self.agent_node_mut(id) {
-                    node.running = false;
-                    node.cancelling = false;
-                    // A cancellation is the human's doing, not a failure.
-                    if !cancelled {
-                        node.error = Some(error.clone());
-                    }
+                    // A cancelled run produced nothing to show: it is over, not
+                    // finished, so the row goes quiet instead of claiming `✓`.
+                    node.phase = if cancelled {
+                        Phase::Idle
+                    } else {
+                        Phase::Failed(error.clone())
+                    };
+                    node.since = Instant::now();
                 }
                 self.agent_cancel.remove(&id);
                 if cancelled {
                     if id == self.focused || id == 0 {
-                        self.status = "cancelled".to_string();
+                        self.say("cancelled");
                     }
                 } else {
                     self.notices.push(error);
@@ -607,8 +677,8 @@ impl App {
             AgentEvent::Done => {
                 let summary = self.last_assistant_text(id);
                 if let Some(node) = self.agent_node_mut(id) {
-                    node.running = false;
-                    node.cancelling = false;
+                    node.phase = Phase::Done;
+                    node.since = Instant::now();
                     if node.summary.is_none() {
                         node.summary = summary;
                     }
@@ -636,21 +706,78 @@ impl App {
     }
 
     /// An agent stopped working: we are busy while any agent in the tree is
-    /// running. If the root ends while subagents still run, say so — the root
-    /// is woken with their results as they finish.
+    /// running. Derived from the phases, so it cannot disagree with the rows.
     fn recompute_busy(&mut self) {
-        let root_running = self.agents.iter().any(|node| node.id == 0 && node.running);
-        let waiting = self
+        self.busy = self.agents.iter().any(|node| node.phase.is_busy());
+    }
+
+    /// Remember a transient line for the bar: what a command just did, what the
+    /// human just asked for. It fades.
+    pub fn say(&mut self, text: impl Into<String>) {
+        self.status = Some(Status {
+            kind: StatusKind::Info,
+            text: text.into(),
+            set_at: Instant::now(),
+        });
+    }
+
+    /// Remember something that went wrong. Errors do not fade: they stay until
+    /// a later line replaces them.
+    pub fn fail(&mut self, text: impl Into<String>) {
+        self.status = Some(Status {
+            kind: StatusKind::Error,
+            text: text.into(),
+            set_at: Instant::now(),
+        });
+    }
+
+    /// The transient line, if it is still worth showing.
+    pub fn status_line(&self) -> Option<(&str, StatusKind)> {
+        let status = self.status.as_ref()?;
+        if status.kind == StatusKind::Error || status.set_at.elapsed() < INFO_TTL {
+            Some((status.text.as_str(), status.kind))
+        } else {
+            None
+        }
+    }
+
+    /// What the tree is doing, in one line — derived every frame from the
+    /// phases, never stored. When nothing is busy there is nothing to say, and
+    /// the bar falls back to the transient line or the idle hint.
+    pub fn activity_line(&self) -> Option<String> {
+        let busy: Vec<&AgentNode> = self
             .agents
             .iter()
-            .filter(|node| node.parent.is_some() && node.running)
-            .count();
-        self.busy = root_running || waiting > 0;
-        if waiting > 0 && !root_running {
-            self.status = format!(
-                "waiting on {waiting} subagent(s) — the root resumes as they finish or reply"
-            );
+            .filter(|node| node.phase.is_busy())
+            .collect();
+        if busy.is_empty() {
+            return None;
         }
+        // The root napped and its children still work: what matters is that the
+        // root will come back, not which child is typing.
+        if !busy.iter().any(|node| node.id == 0) {
+            return Some(format!(
+                "waiting on {} subagent(s) — the root resumes as they finish",
+                busy.len()
+            ));
+        }
+        let shown = busy
+            .iter()
+            .find(|node| node.id == self.focused)
+            .copied()
+            .unwrap_or(busy[0]);
+        let age = short_age(shown.since.elapsed());
+        let what = match &shown.phase {
+            Phase::Thinking => "thinking".to_string(),
+            Phase::Activity(what) => what.clone(),
+            Phase::Cancelling => "cancelling".to_string(),
+            _ => return None,
+        };
+        let mut line = format!("#{} {what} {age}", shown.id);
+        if busy.len() > 1 {
+            line.push_str(&format!(" · {} agents working", busy.len()));
+        }
+        Some(line)
     }
 
     /// The last assistant reply in an agent's transcript (its final summary).
@@ -783,15 +910,15 @@ impl App {
                 self.current = Some(self.buffers.len() - 1);
                 self.focus = Focus::Editor;
                 self.mode = Mode::Normal;
-                self.status = format!("opened {rel}");
+                self.say(format!("opened {rel}"));
             }
-            Err(error) => self.status = error,
+            Err(error) => self.fail(error),
         }
     }
 
     pub fn save_current(&mut self) {
         let Some(index) = self.current else {
-            self.status = "no file open".to_string();
+            self.say("no file open");
             return;
         };
         let rel = self.buffers[index].rel.clone();
@@ -799,9 +926,9 @@ impl App {
         match self.ws.write_file(&rel, &text) {
             Ok(()) => {
                 self.buffers[index].dirty = false;
-                self.status = format!("saved {rel}");
+                self.say(format!("saved {rel}"));
             }
-            Err(error) => self.status = error,
+            Err(error) => self.fail(error),
         }
     }
 
@@ -814,9 +941,9 @@ impl App {
             Ok(text) => {
                 self.buffers[index].set_text(&text);
                 self.buffers[index].dirty = false;
-                self.status = format!("reloaded {rel}");
+                self.say(format!("reloaded {rel}"));
             }
-            Err(error) => self.status = error,
+            Err(error) => self.fail(error),
         }
     }
 
@@ -849,7 +976,14 @@ impl App {
             self.chat.push(Message::user(text.clone()));
             self.chat_scroll = 0;
             self.save_session();
-            if self.busy {
+            // The root's own phase, not the tree's: a napping orchestrator is
+            // idle, and its next message starts a run rather than nudging a
+            // conversation that is not in flight.
+            let root_busy = self
+                .agents
+                .iter()
+                .any(|node| node.id == 0 && node.phase.is_busy());
+            if root_busy {
                 // Human steering while the root runs: queued as a nudge. If the
                 // root's mailbox is dead (it was cancelled), fall through and
                 // start a fresh run instead of spinning forever on a ghost.
@@ -859,12 +993,11 @@ impl App {
                     .map(|tx| tx.send(AgentMsg::Nudge(text.clone())).is_ok())
                     .unwrap_or(false);
                 if alive {
-                    self.status = "noted — folded in as the agent continues".to_string();
+                    self.say("noted — folded in as the agent continues");
                     return;
                 }
-                self.busy = false;
                 if let Some(node) = self.agent_node_mut(0) {
-                    node.running = false;
+                    node.phase = Phase::Idle;
                 }
             }
             let mut messages = Vec::with_capacity(self.chat.len() + 1);
@@ -872,15 +1005,16 @@ impl App {
             messages.extend(self.chat.iter().cloned());
             match self.agent_tx.get(&0) {
                 Some(tx) if tx.send(AgentMsg::Run(messages)).is_ok() => {
-                    self.busy = true;
-                    self.status = "thinking…".to_string();
+                    // The run starts now as far as the human is concerned; the
+                    // actor's `Running` event will agree with this.
                     if let Some(node) = self.agent_node_mut(0) {
-                        node.running = true;
-                        node.error = None;
+                        node.phase = Phase::Thinking;
+                        node.since = Instant::now();
                     }
+                    self.recompute_busy();
                 }
                 _ => {
-                    self.status = "root agent is gone — /new restarts it".to_string();
+                    self.fail("root agent is gone — /new restarts it");
                 }
             }
         } else {
@@ -889,19 +1023,19 @@ impl App {
                 msgs.push(Message::user(text.clone()));
             }
             if let Some(node) = self.agent_node_mut(target) {
-                node.running = true;
-                node.error = None;
+                node.phase = Phase::Thinking;
+                node.since = Instant::now();
             }
             match self.agent_tx.get(&target) {
                 Some(tx) if tx.send(AgentMsg::Nudge(text)).is_ok() => {}
                 _ => {
                     if let Some(node) = self.agent_node_mut(target) {
-                        node.running = false;
+                        node.phase = Phase::Idle;
                     }
-                    self.status = format!("agent #{target} is gone");
-                    self.recompute_busy();
+                    self.fail(format!("agent #{target} is gone"));
                 }
             }
+            self.recompute_busy();
         }
     }
 
@@ -924,7 +1058,7 @@ impl App {
             }
             "/open" => {
                 if rest.is_empty() {
-                    self.status = "usage: /open <path>".to_string();
+                    self.say("usage: /open <path>");
                     return;
                 }
                 self.open_file(rest);
@@ -937,11 +1071,11 @@ impl App {
                     .iter()
                     .filter(|n| n.brief == "leftover worktree")
                     .count();
-                self.status = if count > 0 {
+                self.say(if count > 0 {
                     format!("{count} leftover worktree(s) registered — /diff, /merge, /discard work on them")
                 } else {
                     "no leftover worktrees".to_string()
-                };
+                });
             }
             "/provider" => {
                 if rest.is_empty() {
@@ -953,41 +1087,38 @@ impl App {
             "/model" => self.open_model_picker(),
             "/url" => {
                 if rest.is_empty() {
-                    self.status =
+                    self.say(
                         "usage: /url http://host:port — base URL of an OpenAI-compatible \
-                                  endpoint"
-                            .to_string();
+                                  endpoint",
+                    );
                     return;
                 }
                 self.cfg.set_base_url(rest);
                 self.refresh_models();
-                self.status = format!("endpoint: {}", self.cfg.base_url);
+                self.say(format!("endpoint: {}", self.cfg.base_url));
                 self.apply_config();
                 self.persist_user_config();
             }
             "/key" => {
                 if rest.is_empty() {
                     match &self.cfg.api_key {
-                        Some(key) => self.status = format!("api key set ({}…)", mask_key(key)),
-                        None => {
-                            self.status =
-                                "no api key — /key <secret> sets one (memory only)".to_string()
-                        }
+                        Some(key) => self.say(format!("api key set ({}…)", mask_key(key))),
+                        None => self.say("no api key — /key <secret> sets one (memory only)"),
                     }
                     return;
                 }
                 self.cfg.api_key = Some(rest.to_string());
                 self.apply_config();
                 self.persist_user_config();
-                self.status = format!(
+                self.say(format!(
                     "api key set ({}…) — saved to {}",
                     mask_key(rest),
                     userconfig::config_path().display()
-                );
+                ));
             }
             "/models" => {
                 self.refresh_models();
-                self.status = if self.models.is_empty() {
+                self.say(if self.models.is_empty() {
                     format!("no models from {}", self.cfg.models_url())
                 } else {
                     format!(
@@ -995,7 +1126,7 @@ impl App {
                         self.models.len(),
                         self.cfg.models_url()
                     )
-                };
+                });
             }
             other => self.notices.push(format!("unknown command: {other}")),
         }
@@ -1021,7 +1152,7 @@ impl App {
             model: self.cfg.model.clone(),
         };
         if let Err(error) = user.save() {
-            self.status = format!("could not save home config: {error}");
+            self.fail(format!("could not save home config: {error}"));
         }
     }
 
@@ -1036,8 +1167,7 @@ impl App {
             self.refresh_models();
         }
         if self.models.is_empty() {
-            self.status =
-                "no models — point at an endpoint with /url or /provider first".to_string();
+            self.fail("no models — point at an endpoint with /url or /provider first");
             return;
         }
         let cursor = self
@@ -1067,7 +1197,9 @@ impl App {
 
     fn apply_provider(&mut self, name: &str) {
         let Some(provider) = Provider::parse(name) else {
-            self.status = format!("unknown provider `{name}` — try deepseek or custom");
+            self.fail(format!(
+                "unknown provider `{name}` — try deepseek or custom"
+            ));
             return;
         };
         self.cfg.provider = provider;
@@ -1085,7 +1217,7 @@ impl App {
         self.refresh_models();
         self.apply_config();
         self.persist_user_config();
-        self.status = format!("provider: {}", provider.name());
+        self.say(format!("provider: {}", provider.name()));
     }
 
     fn key_picker(&mut self, key: KeyEvent) {
@@ -1124,7 +1256,7 @@ impl App {
                 self.cfg.model = item.to_string();
                 self.apply_config();
                 self.persist_user_config();
-                self.status = format!("model: {}", self.cfg.label());
+                self.say(format!("model: {}", self.cfg.label()));
             }
             PickerKind::Provider => self.apply_provider(item),
         }
@@ -1134,15 +1266,15 @@ impl App {
     /// merges in their own IDE — mush never auto-merges.
     fn worktree_command(&mut self, command: &str, rest: &str) {
         let Ok(id) = rest.trim().parse::<u64>() else {
-            self.status = format!("usage: {command} <agent id>");
+            self.say(format!("usage: {command} <agent id>"));
             return;
         };
         let Some(node) = self.agent_node_mut(id) else {
-            self.status = format!("no agent #{id}");
+            self.fail(format!("no agent #{id}"));
             return;
         };
         let Some(branch) = node.branch.clone() else {
-            self.status = format!("agent #{id} has no worktree branch (not isolated)");
+            self.fail(format!("agent #{id} has no worktree branch (not isolated)"));
             return;
         };
         let wtree = format!(".mush/wt/{id}");
@@ -1152,7 +1284,7 @@ impl App {
             "/discard" => format!("git worktree remove --force {wtree} && git branch -D {branch}"),
             _ => return,
         };
-        self.status = command_text.clone();
+        self.say(command_text.clone());
         self.notices.push(command_text);
     }
 
@@ -1184,12 +1316,10 @@ impl App {
             parent: None,
             depth: 0,
             brief: "you (root agent)".to_string(),
-            running: false,
-            cancelling: false,
-            last: String::new(),
+            phase: Phase::Idle,
+            since: Instant::now(),
             branch: None,
             summary: None,
-            error: None,
         }];
         self.agent_cursor = 0;
         self.chat.clear();
@@ -1200,7 +1330,7 @@ impl App {
         self.spin = 0;
         self.discover_worktrees();
         self.save_session();
-        self.status = "new chat — agents stopped, root restarted".to_string();
+        self.say("new chat — agents stopped, root restarted");
     }
 
     /// Ask every actor in the tree to shut down. `Shutdown`, not `Stop`: a
@@ -1223,7 +1353,7 @@ impl App {
             messages: self.chat.clone(),
         };
         if let Err(error) = session.save(self.ws.root()) {
-            self.status = format!("could not save session: {error}");
+            self.fail(format!("could not save session: {error}"));
         }
     }
 
@@ -1280,7 +1410,7 @@ impl App {
         let dirty = self.buffers.iter().any(|buffer| buffer.dirty);
         if dirty && !self.quit_armed {
             self.quit_armed = true;
-            self.status = "unsaved changes — Ctrl-Q again to discard, Ctrl-S to save".to_string();
+            self.fail("unsaved changes — Ctrl-Q again to discard, Ctrl-S to save");
             return;
         }
         self.should_quit = true;
@@ -1306,7 +1436,7 @@ impl App {
         let targets: Vec<u64> = self
             .agents
             .iter()
-            .filter(|node| node.running)
+            .filter(|node| node.phase.is_busy())
             .map(|node| node.id)
             .collect();
         let mut stopped = 0usize;
@@ -1318,14 +1448,14 @@ impl App {
             // Say so immediately: the actor may be mid-request, and a row that
             // keeps spinning looks like the Stop was never heard.
             if let Some(node) = self.agent_node_mut(id) {
-                node.cancelling = true;
+                node.phase = Phase::Cancelling;
+                node.since = Instant::now();
             }
         }
-        self.status = if stopped > 0 {
-            format!("cancelling {stopped} agent(s)…")
-        } else {
-            "nothing running · Ctrl-Q quits · Ctrl-N starts a new chat".to_string()
-        };
+        if stopped == 0 {
+            self.say("nothing running · Ctrl-Q quits · Ctrl-N starts a new chat");
+        }
+        self.recompute_busy();
     }
 
     fn cycle_focus(&mut self, direction: i64) {
@@ -1359,23 +1489,25 @@ impl App {
             KeyCode::Enter => {
                 if let Some(node) = self.agents.get(self.agent_cursor) {
                     self.focused = node.id;
-                    self.status = format!("agent #{}: {}", node.id, node.brief);
+                    self.say(format!("agent #{}: {}", node.id, node.brief));
                 }
             }
             KeyCode::Char('c') => {
                 if let Some(node) = self.agents.get(self.agent_cursor) {
                     let id = node.id;
-                    if !node.running {
+                    if !node.phase.is_busy() {
                         // Stop cancels work; an idle agent has none. Ending one
                         // is `/new`'s job.
-                        self.status = format!("agent #{id} is not running");
+                        self.say(format!("agent #{id} is not running"));
                         return;
                     }
                     if self.stop_agent(id) {
+                        // The row's own `⊘` is the feedback; the bar shows what
+                        // the tree as a whole is doing.
                         if let Some(node) = self.agent_node_mut(id) {
-                            node.cancelling = true;
+                            node.phase = Phase::Cancelling;
+                            node.since = Instant::now();
                         }
-                        self.status = format!("stopping agent #{id}…");
                     }
                 }
             }
@@ -1500,6 +1632,18 @@ mod tests {
         Buffer::from_text("test".to_string(), text)
     }
 
+    /// The transient line the bar would show, or the empty string.
+    fn text_of(app: &App) -> &str {
+        app.status_line().map(|(text, _)| text).unwrap_or("")
+    }
+
+    /// Pretend a status line was written `seconds` ago.
+    fn age_status(app: &mut App, seconds: u64) {
+        if let Some(status) = app.status.as_mut() {
+            status.set_at = Instant::now() - Duration::from_secs(seconds);
+        }
+    }
+
     /// A real `App` on a scratch directory, with a real (idle) root actor. The
     /// returned receiver keeps the UI channel alive for the life of the test.
     fn test_app(label: &str) -> (App, Receiver<Msg>) {
@@ -1547,7 +1691,7 @@ mod tests {
         app.input = "hello".to_string();
         app.send_message();
         assert!(app.busy);
-        assert_eq!(app.status, "thinking…");
+        assert_eq!(app.agents[0].phase, Phase::Thinking);
     }
 
     /// An actor `/new` abandoned can still be finishing a request (up to the
@@ -1589,14 +1733,14 @@ mod tests {
     fn steering_text_is_echoed_in_the_chat() {
         let (mut app, _rx) = test_app("steer");
         app.busy = true;
-        app.agents[0].running = true;
+        app.agents[0].phase = Phase::Thinking;
         app.input = "also rename the module".to_string();
 
         app.send_message();
 
         assert_eq!(app.chat.len(), 1, "the steering message is echoed");
         assert_eq!(app.chat[0].text(), "also rename the module");
-        assert!(app.status.contains("noted"), "{}", app.status);
+        assert_eq!(text_of(&app), "noted — folded in as the agent continues");
     }
 
     /// The file tools of an abandoned tree must not touch the workspace: its
@@ -1658,21 +1802,29 @@ mod tests {
     fn ctrl_c_stops_running_agents_only() {
         let (mut app, _rx) = test_app("interrupt");
         app.interrupt();
-        assert!(app.status.contains("nothing running"), "{}", app.status);
+        assert_eq!(
+            text_of(&app),
+            "nothing running · Ctrl-Q quits · Ctrl-N starts a new chat"
+        );
 
         app.input = "hello".to_string();
         app.send_message();
-        assert_eq!(app.status, "thinking…", "the idle root is still usable");
+        assert_eq!(
+            app.agents[0].phase,
+            Phase::Thinking,
+            "the idle root is usable"
+        );
 
         let (mut app, _rx) = test_app("interrupt-running");
-        app.agents[0].running = true;
-        app.busy = true;
+        app.agents[0].phase = Phase::Thinking;
+        app.recompute_busy();
         app.interrupt();
-        assert!(app.status.starts_with("cancelling"), "{}", app.status);
-        assert!(
-            app.agents[0].cancelling,
+        assert_eq!(
+            app.agents[0].phase,
+            Phase::Cancelling,
             "the row must show that a cancel is in flight"
         );
+        assert_eq!(app.activity_line().as_deref(), Some("#0 cancelling 0s"));
     }
 
     /// The cancel mark lasts exactly as long as the cancel does: the actor
@@ -1681,18 +1833,18 @@ mod tests {
     fn a_cancel_mark_clears_when_the_actor_yields() {
         let (mut app, _rx) = test_app("cancel-mark");
         let conversation = app.conversation;
-        app.agents[0].running = true;
+        app.agents[0].phase = Phase::Thinking;
         app.interrupt();
-        assert!(app.agents[0].cancelling);
+        assert_eq!(app.agents[0].phase, Phase::Cancelling);
 
         app.update(Msg::Agent {
             conversation,
             id: 0,
             event: AgentEvent::Error(agent::CANCELLED.to_string()),
         });
-        assert!(!app.agents[0].cancelling, "the actor has stopped");
+        assert_eq!(app.agents[0].phase, Phase::Idle, "the actor has stopped");
 
-        app.agents[0].running = true;
+        app.agents[0].phase = Phase::Thinking;
         app.interrupt();
         app.update(Msg::Agent {
             conversation,
@@ -1701,10 +1853,118 @@ mod tests {
                 cancel: Arc::new(AtomicBool::new(false)),
             },
         });
-        assert!(
-            !app.agents[0].cancelling,
-            "a new run is not a cancelled one"
+        assert_eq!(app.agents[0].phase, Phase::Thinking, "a new run is running");
+    }
+
+    /// An agent that has not run is not done, and it is not busy: the row must
+    /// say so rather than claim a `✓` it never earned.
+    #[test]
+    fn an_idle_agent_is_neither_done_nor_busy() {
+        let (app, _rx) = test_app("idle-phase");
+        assert_eq!(app.agents[0].phase, Phase::Idle);
+        assert!(!app.busy);
+        assert_eq!(app.activity_line(), None, "nothing to report");
+    }
+
+    /// The stale-status defect: a finished run must leave nothing behind. The
+    /// bar derives from the phases, so when the run ends the line is gone.
+    #[test]
+    fn a_finished_run_leaves_nothing_behind() {
+        let (mut app, _rx) = test_app("finished-phase");
+        let conversation = app.conversation;
+        app.agents[0].phase = Phase::Thinking;
+        app.agents[0].since = Instant::now() - Duration::from_secs(70);
+        app.recompute_busy();
+        assert_eq!(app.activity_line().as_deref(), Some("#0 thinking 1m10s"));
+
+        app.update(Msg::Agent {
+            conversation,
+            id: 0,
+            event: AgentEvent::Done,
+        });
+        assert_eq!(app.agents[0].phase, Phase::Done);
+        assert!(!app.busy);
+        assert_eq!(app.activity_line(), None, "no `thinking` survives the run");
+    }
+
+    /// A napping root with live children is derived from the tree: nobody has
+    /// to remember to write it, so it cannot be forgotten either.
+    #[test]
+    fn a_napping_root_reports_its_children() {
+        let (mut app, _rx) = test_app("napping-root");
+        let conversation = app.conversation;
+        app.update(Msg::Agent {
+            conversation,
+            id: 1,
+            event: AgentEvent::Spawned {
+                child: 1,
+                parent: 0,
+                brief: "lexer".to_string(),
+                depth: 1,
+                branch: None,
+                cmd: crossbeam_channel::unbounded().0,
+            },
+        });
+        app.update(Msg::Agent {
+            conversation,
+            id: 1,
+            event: AgentEvent::Status("edit_file src/lex.rs".to_string()),
+        });
+        assert_eq!(app.agents[0].phase, Phase::Idle, "the root napped");
+        assert_eq!(
+            app.activity_line().as_deref(),
+            Some("waiting on 1 subagent(s) — the root resumes as they finish")
         );
+    }
+
+    /// Busy agents are named with their age: a model that has thought for two
+    /// minutes should look different from one that has thought for a second.
+    #[test]
+    fn busy_agents_are_named_with_their_age() {
+        let (mut app, _rx) = test_app("activity-age");
+        app.agents[0].phase = Phase::Activity("edit_file src/lib.rs".to_string());
+        app.agents[0].since = Instant::now() - Duration::from_secs(12);
+        app.recompute_busy();
+        assert_eq!(
+            app.activity_line().as_deref(),
+            Some("#0 edit_file src/lib.rs 12s")
+        );
+    }
+
+    /// An informational line is worth reading for a moment; an error is worth
+    /// reading until it is fixed or replaced.
+    #[test]
+    fn info_fades_and_errors_stay() {
+        let (mut app, _rx) = test_app("status-life");
+        // A fresh app announces its model; that line ages out like any other.
+        assert!(text_of(&app).contains("test-model"));
+        age_status(&mut app, 6);
+        assert_eq!(text_of(&app), "", "an info line fades");
+        app.tick();
+        assert!(app.status.is_none(), "and is dropped, not just hidden");
+
+        app.say("saved src/main.rs");
+        assert_eq!(text_of(&app), "saved src/main.rs");
+
+        app.fail("cannot write /etc/passwd");
+        age_status(&mut app, 600);
+        assert_eq!(text_of(&app), "cannot write /etc/passwd");
+        assert_eq!(
+            app.status_line().map(|(_, kind)| kind),
+            Some(StatusKind::Error)
+        );
+        assert_eq!(
+            app.status_line().map(|(_, kind)| kind),
+            Some(StatusKind::Error)
+        );
+    }
+
+    /// Ages are read at a glance, so they must not be raw seconds.
+    #[test]
+    fn ages_read_like_clocks() {
+        assert_eq!(short_age(Duration::from_secs(3)), "3s");
+        assert_eq!(short_age(Duration::from_secs(70)), "1m10s");
+        assert_eq!(short_age(Duration::from_secs(3600 + 120)), "1h02m");
     }
 
     #[test]

@@ -248,6 +248,15 @@ defects. They share one shape: the data exists, the pixels do not.
 Four rules, no new panes, no new dependencies, and `ui.rs` stays dumb — all values
 are computed in `App`.
 
+- **R0 — Derive, don't store.** `[DONE]` The three defects above were one bug: the
+  screen kept *conclusions* (a status string, a `running` flag) instead of *facts*.
+  An agent now has a `Phase` (`Idle · Thinking · Activity(label) · Cancelling ·
+  Done · Failed`) and the instant it began; the row glyph, the activity text, and
+  the bar are derived from those every frame. `App::status` is a typed line with a
+  lifetime: `Info` fades after five seconds, `Error` stays, and work in progress is
+  never stored at all — which is what makes `✓` on an idle agent and a lingering
+  `thinking…` impossible rather than merely fixed.
+
 - **R1 — Ranked fields, then a footer.** One row per agent, spent left to right in
   priority order (`glyph · id · brief · activity · branch · stat`); the *selected*
   row's full facts get a 1–2 line footer under the list. A narrow pane degrades to
@@ -258,9 +267,9 @@ are computed in `App`.
   `mush needs at least 40×10`; a compact tier that puts the agent strip above the
   chat and hides an empty editor; the present three panes at 80×20 and up; a
   capped, centred transcript (≈110 cols) on very wide terminals.
-- **R4 — Truthful glyphs.** `·` idle/never ran, `◐` running, `⏸` waiting on
-  children, `⊘` a cancel in flight, `✓` finished, `✗` failed, `⑔` isolated, with
-  a legend in the pane title.
+- **R4 — Truthful glyphs.** `[DONE for the row]` `·` idle/never ran, `◐` running,
+  `⏸` waiting on children, `⊘` a cancel in flight, `✓` finished, `✗` failed, `⑂`
+  isolated, with a legend in the pane title (the legend and `⑂` still to come).
 
 ```
 ┌ agents · 2 running · Σ +324 −40 ────────────┐
@@ -591,10 +600,11 @@ later one.
 - **The checks.** `cargo fmt --all --check`, `cargo clippy --all-targets --
   -D warnings`, the unit tests, and the pty resize and cancel scenarios are the
   whole gate; they run anywhere rust and python3 do, so any CI can call them.
-- **Screen review.** The UI audit drove the real binary over a pty at 200×50 down
-  to 30×8 with a scripted model and photographed the result. The defects it found
-  (ten, §4.5) were invisible to unit tests and obvious in the pictures; repeat it
-  for M2.7.
+- **Screen review.** `scripts/screen.py` drives the real binary over a pty and
+  prints the painted screen as text at 200×50 down to 30×8, which is how the ten
+  defects of §4.5 were found and how the next layer gets reviewed. Pass `--ask`
+  with a reachable endpoint to see the agent's own screens (thinking, cancel,
+  done); without it the editor's screens need no model at all.
 - **Not yet.** Property tests for merge/undo (they arrive with M4), and a fuzz
   target for the path jail.
 

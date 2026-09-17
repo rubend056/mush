@@ -94,10 +94,13 @@ worktrees) but they need a model that actually delegates: small local models
 tend to flatten the chain and do the leaf work themselves. Prefer a capable
 model for orchestration.
 
-The **agents** pane shows the whole tree: depth by indentation, `◐` running,
-`⏸` waiting on children, `⊘` a cancel in flight, `✓` done (with its final
-summary), `✗` failed, branch suffix for isolated agents. Enter on a row focuses
-that agent — the chat below switches to its transcript and typing nudges it.
+The **agents** pane shows the whole tree: depth by indentation, `·` idle, `◐`
+running, `⏸` waiting on children, `⊘` a cancel in flight, `✓` done (with its final
+summary), `✗` failed, branch suffix for isolated agents. Running rows age with
+their phase (`◐ #1 edit_file src/lex.rs 12s`), and the status bar says what the
+tree is doing without ever keeping a line that has stopped being true. Enter on a
+row focuses that agent — the chat below switches to its transcript and typing
+nudges it.
 `Esc` returns to the root, `c` cancels the selected agent, `Ctrl-C` cancels
 everything that is running (an idle agent is left alone — it has nothing to
 cancel). A cancel reaches the model call itself: the request is read in short
