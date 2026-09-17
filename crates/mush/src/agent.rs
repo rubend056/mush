@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{ErrorKind, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -35,7 +35,7 @@ use mush_core::workspace::truncate_for_model;
 use mush_core::{prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_SECS};
 
 use crate::app::{AgentId, ConversationId, Msg};
-use crate::http;
+use crate::model::{HttpModel, ModelClient, ModelError};
 
 /// Backstop against a model that never stops — *not* a budget for the work.
 ///
@@ -248,6 +248,10 @@ pub struct AgentCtx {
     /// Shared so a runtime `/provider` / `/url` / `/model` / `/key` applies to
     /// every agent immediately.
     pub cfg: Arc<Mutex<Config>>,
+    /// Where this agent's model calls go. Shared by the whole tree — a child
+    /// gets its parent's client — so one endpoint serves every agent, and one
+    /// scripted client can serve a whole tree in a test.
+    pub model: Arc<dyn ModelClient>,
     pub tx: Sender<Msg>,
     /// Which conversation this tree belongs to. The UI drops events stamped
     /// with another one: after `/new`, an abandoned actor can still be
@@ -333,8 +337,12 @@ pub fn spawn(cfg: Config, tx: Sender<Msg>, root: PathBuf) -> RootHandle {
     // raise the floor above leftover worktree ids.
     let ids = Arc::new(AtomicU64::new(1));
     let live = Arc::new(AtomicU64::new(0));
+    // The real endpoint, behind the seam: every agent in this tree calls it
+    // through `AgentCtx::model`, children included.
+    let model: Arc<dyn ModelClient> = Arc::new(HttpModel::new(shared.clone()));
     let ctx = Arc::new(AgentCtx {
         cfg: shared.clone(),
+        model,
         tx,
         conversation,
         root,
@@ -418,7 +426,8 @@ pub fn revive(
     // checkout.
     let branch = if isolated.is_some() { branch } else { None };
     let ctx = Arc::new(AgentCtx {
-        cfg,
+        cfg: cfg.clone(),
+        model: Arc::new(HttpModel::new(cfg)),
         tx,
         conversation,
         root,
@@ -754,72 +763,67 @@ fn run_loop(
             request.reasoning_effort = Some(effort.to_string());
         }
 
-        let body = match serde_json::to_string(&request) {
-            Ok(body) => body,
-            Err(error) => return Err(format!("could not encode request: {error}")),
-        };
-
-        let response = match http::post_json(&cfg.chat_url(), &body, cfg.api_key.as_deref(), cancel)
-        {
-            Ok(response) => response,
+        let reply = match actor.ctx.model.chat(&request, cancel) {
+            Ok(reply) => reply,
             // The reader stops the moment the human cancels; that is a
             // cancellation, not a failure to reach the endpoint.
-            Err(_) if cancel.load(Ordering::SeqCst) => return Err(CANCELLED.to_string()),
+            Err(ModelError::Cancelled) => return Err(CANCELLED.to_string()),
             // A refusal — a body past `MAX_BODY_BYTES`, a malformed status or
             // chunk line — is not a connection failure: the endpoint answered,
             // and saying so is the difference between "check the URL" and "the
             // reply was too big".
-            Err(error) if error.kind() == ErrorKind::InvalidData => {
+            Err(ModelError::Refused(error)) => {
                 return Err(format!("the endpoint's reply was refused: {error}"));
             }
-            Err(error) => {
+            Err(ModelError::Unreachable(error)) => {
                 return Err(format!("cannot reach {}: {error}", cfg.base_url));
             }
-        };
-
-        if response.status != 200 {
-            let parsed = serde_json::from_str::<ChatResponse>(&response.body).ok();
-            let detail = parsed
-                .and_then(|r| r.error.map(|e| e.message))
-                .unwrap_or_else(|| truncate(&response.body, 600));
-            // A hosted API advertises nothing, so its own complaint is the only
-            // current source for the window. Learn it, tell the human, retry
-            // once — and never again in this run, or a server that complains
-            // about everything becomes a loop. A number that would collapse the
-            // window by more than 8x is refused: a rate-limit body must not
-            // teach mush that the endpoint has ten tokens (finding A3).
-            if !learned_context && !cfg.context_explicit {
-                if let Some(tokens) = parse_context_hint(&detail) {
-                    let plausible = tokens < cfg.context_tokens
-                        && tokens.saturating_mul(8) >= cfg.context_tokens;
-                    if plausible {
-                        cfg.context_tokens = tokens;
-                        if let Ok(mut shared) = actor.ctx.cfg.lock() {
-                            shared.context_tokens = tokens;
+            Err(ModelError::Encode(error)) => {
+                return Err(format!("could not encode request: {error}"));
+            }
+            Err(ModelError::Malformed(error)) => {
+                return Err(format!("could not parse model response: {error}"));
+            }
+            Err(ModelError::Status { status, body }) => {
+                let parsed = serde_json::from_str::<ChatResponse>(&body).ok();
+                let detail = parsed
+                    .and_then(|r| r.error.map(|e| e.message))
+                    .unwrap_or_else(|| truncate(&body, 600));
+                // A hosted API advertises nothing, so its own complaint is the
+                // only current source for the window. Learn it, tell the human,
+                // retry once — and never again in this run, or a server that
+                // complains about everything becomes a loop. A number that
+                // would collapse the window by more than 8x is refused: a
+                // rate-limit body must not teach mush that the endpoint has ten
+                // tokens (finding A3).
+                if !learned_context && !cfg.context_explicit {
+                    if let Some(tokens) = parse_context_hint(&detail) {
+                        let plausible = tokens < cfg.context_tokens
+                            && tokens.saturating_mul(8) >= cfg.context_tokens;
+                        if plausible {
+                            cfg.context_tokens = tokens;
+                            if let Ok(mut shared) = actor.ctx.cfg.lock() {
+                                shared.context_tokens = tokens;
+                            }
+                            // The UI owns the copy every surface reads, so it
+                            // gets the number too (finding B7).
+                            actor.ctx.emit(actor.id, AgentEvent::Context { tokens });
+                            actor.ctx.emit(
+                                actor.id,
+                                AgentEvent::Status(format!(
+                                    "context window is {tokens} tokens — retrying"
+                                )),
+                            );
+                            learned_context = true;
+                            continue;
                         }
-                        // The UI owns the copy every surface reads, so it gets
-                        // the number too (finding B7).
-                        actor.ctx.emit(actor.id, AgentEvent::Context { tokens });
-                        actor.ctx.emit(
-                            actor.id,
-                            AgentEvent::Status(format!(
-                                "context window is {tokens} tokens — retrying"
-                            )),
-                        );
-                        learned_context = true;
-                        continue;
                     }
                 }
+                return Err(format!("model returned HTTP {status}: {detail}"));
             }
-            return Err(format!("model returned HTTP {}: {detail}", response.status));
-        }
-
-        let parsed = match serde_json::from_str::<ChatResponse>(&response.body) {
-            Ok(parsed) => parsed,
-            Err(error) => return Err(format!("could not parse model response: {error}")),
         };
 
-        let Some(choice) = parsed.choices.into_iter().next() else {
+        let Some(choice) = reply.choices.into_iter().next() else {
             return Err("model returned no choices".to_string());
         };
         // `length` means the endpoint cut the reply off at `max_tokens` — with
@@ -1084,25 +1088,21 @@ fn compact_history(
         },
         reasoning_effort: cfg.reasoning_effort().map(str::to_string),
     };
-    let body = match serde_json::to_string(&request) {
-        Ok(body) => body,
-        Err(error) => return Err(format!("could not encode request: {error}")),
-    };
-    let response = match http::post_json(&cfg.chat_url(), &body, cfg.api_key.as_deref(), cancel) {
-        Ok(response) => response,
+    let reply = match actor.ctx.model.chat(&request, cancel) {
+        Ok(reply) => reply,
         // A cancelled run is already ending; do not report a network failure.
-        Err(_) if cancel.load(Ordering::SeqCst) => return Err(CANCELLED.to_string()),
+        Err(ModelError::Cancelled) => return Err(CANCELLED.to_string()),
         // The run will fail on its real request anyway; surface it.
-        Err(error) => return Err(format!("cannot reach {}: {error}", cfg.base_url)),
+        Err(ModelError::Unreachable(error)) | Err(ModelError::Refused(error)) => {
+            return Err(format!("cannot reach {}: {error}", cfg.base_url));
+        }
+        Err(ModelError::Encode(error)) => return Err(format!("could not encode request: {error}")),
+        // The endpoint complained, or answered something we cannot read: the
+        // run will fail on its real request anyway, and a summary mush could
+        // not make is not that failure.
+        Err(ModelError::Status { .. }) | Err(ModelError::Malformed(_)) => return Ok(()),
     };
-    if response.status != 200 {
-        return Ok(());
-    }
-    let parsed = match serde_json::from_str::<ChatResponse>(&response.body) {
-        Ok(parsed) => parsed,
-        Err(_) => return Ok(()),
-    };
-    let summary = parsed
+    let summary = reply
         .choices
         .into_iter()
         .next()
@@ -1782,6 +1782,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::fake::{tool_call, Scripted};
     use mush_core::{FunctionCall, ToolCall};
     use serde_json::json;
     use std::fs;
@@ -2253,13 +2254,44 @@ mod tests {
     }
 
     fn test_actor(label: &str) -> (Actor, Sender<AgentMsg>) {
+        let cfg = test_cfg();
+        let (actor, ui, mailbox) = build_actor(label, Arc::new(HttpModel::new(cfg.clone())), cfg);
+        // Nothing here reads the UI; the receiver is leaked so the channel
+        // stays open for the events a run emits into it.
+        std::mem::forget(ui);
+        (actor, mailbox)
+    }
+
+    /// The same actor, with its model calls served by a script instead of a
+    /// socket — so a whole run can be driven in process, with no server.
+    fn scripted_actor(
+        label: &str,
+        model: &Arc<Scripted>,
+    ) -> (Actor, Receiver<Msg>, Sender<AgentMsg>) {
+        build_actor(label, model.clone(), test_cfg())
+    }
+
+    /// A scratch config cell. The endpoint is deliberately unreachable: every
+    /// test that uses it must go through a scripted model.
+    fn test_cfg() -> Arc<Mutex<Config>> {
+        Arc::new(Mutex::new(Config::new("http://127.0.0.1:1", "test", None)))
+    }
+
+    /// A standalone actor over a scratch workspace, with `model` as its client
+    /// and `cfg` as the tree's shared configuration. The UI receiver comes back
+    /// so a test can read the events the run emits.
+    fn build_actor(
+        label: &str,
+        model: Arc<dyn ModelClient>,
+        cfg: Arc<Mutex<Config>>,
+    ) -> (Actor, Receiver<Msg>, Sender<AgentMsg>) {
         let root = std::env::temp_dir().join(format!("mush-actor-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let (ui_tx, ui_rx) = crossbeam_channel::unbounded::<Msg>();
-        std::mem::forget(ui_rx);
         let ctx = Arc::new(AgentCtx {
-            cfg: Arc::new(Mutex::new(Config::new("http://127.0.0.1:1", "test", None))),
+            cfg,
+            model,
             tx: ui_tx.clone(),
             conversation: 1,
             root: root.clone(),
@@ -2280,7 +2312,7 @@ mod tests {
             parent_tx: dead_tx,
             rx,
         };
-        (actor, my_tx)
+        (actor, ui_rx, my_tx)
     }
 
     /// The bug this guards: re-queuing a parked nudge into the actor's own
@@ -2367,6 +2399,115 @@ mod tests {
             "the new transcript has no #1 done line, so it is undelivered again"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A whole run, in process: the model asks for a tool, the tool runs, and
+    /// the model's answer ends the run. The `ModelClient` seam is what makes
+    /// this possible with no server, no port and no thread.
+    #[test]
+    fn a_scripted_run_runs_its_tool_call_and_ends_with_the_answer() {
+        let model = Arc::new(
+            Scripted::new()
+                .calls(vec![tool_call(
+                    "call_1",
+                    "write_file",
+                    json!({ "path": "note.txt", "content": "hello" }),
+                )])
+                .says("wrote note.txt"),
+        );
+        let (actor, _ui, _mailbox) = scripted_actor("scripted-run", &model);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("write note.txt"),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+
+        assert_eq!(result.as_deref(), Some("wrote note.txt"));
+        assert_eq!(
+            fs::read_to_string(actor.ws.root().join("note.txt")).unwrap(),
+            "hello",
+            "the tool the model asked for must actually run"
+        );
+        assert_eq!(
+            messages.last().unwrap().text(),
+            "wrote note.txt",
+            "the transcript ends with the answer"
+        );
+
+        // Two turns, two asks — and the second one carried the tool result.
+        let asked = model.asked();
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[0].model, "test");
+        assert!(asked[0].tools > 0, "the first turn offered the tools");
+        let carried = asked[1].messages.last().unwrap();
+        assert_eq!(carried.role, "tool");
+        assert_eq!(carried.text(), "wrote note.txt");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The learned-context retry, in process: the endpoint refuses the request
+    /// as past its window, the run adopts the window the endpoint named, tells
+    /// the UI, and asks again — where before this seam the only way to see that
+    /// was a mock server on a fixed port.
+    #[test]
+    fn a_context_complaint_teaches_the_window_and_the_run_asks_again() {
+        let model = Arc::new(
+            Scripted::new()
+                .fails_with(
+                    400,
+                    r#"{"error":{"message":"This model's maximum context length is 4096 tokens"}}"#,
+                )
+                .says("done"),
+        );
+        let (actor, ui, _mailbox) = scripted_actor("learned-context", &model);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::system("you are mush"), Message::user("task")];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+
+        assert_eq!(result.as_deref(), Some("done"));
+        assert_eq!(model.asked().len(), 2, "the run re-asked after learning");
+        assert_eq!(
+            actor.ctx.cfg.lock().unwrap().context_tokens,
+            4_096,
+            "the learned window reaches the shared config"
+        );
+        assert_eq!(contexts(&ui), vec![4_096], "and the UI is told");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A cancellation mid-reply is a stop: the client sets the flag the reader
+    /// polls, exactly as the real one does, and the run ends cancelled with no
+    /// turn taken — not as a failure to reach the endpoint.
+    #[test]
+    fn a_scripted_cancellation_stops_the_run_without_a_turn() {
+        let model = Arc::new(Scripted::new().cancels());
+        let (actor, _ui, _mailbox) = scripted_actor("cancelled", &model);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::system("you are mush"), Message::user("task")];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+
+        assert_eq!(error, CANCELLED);
+        assert!(cancel.load(Ordering::SeqCst), "the flag is set too");
+        assert_eq!(messages.len(), 2, "a cancelled reply is not a turn");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// Every context window a run announced to the UI.
+    fn contexts(rx: &Receiver<Msg>) -> Vec<usize> {
+        let mut found = Vec::new();
+        while let Ok(Msg::Agent { event, .. }) = rx.try_recv() {
+            if let AgentEvent::Context { tokens } = event {
+                found.push(tokens);
+            }
+        }
+        found
     }
 
     /// The full orchestration path, headless: root spawns an isolated child,
