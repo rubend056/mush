@@ -203,6 +203,11 @@ pub enum AgentMsg {
     Run(Vec<Message>),
     /// Append a user message; if idle, run again.
     Nudge(String),
+    /// Fold this agent's conversation into a summary now, instead of waiting
+    /// for the window to fill (`/compact`). A summarize request and a
+    /// transcript replacement, not work to answer: an idle agent does it at
+    /// once and stays idle.
+    Compact,
     /// Cancel the current run. An idle agent ignores it — Stop cancels work,
     /// it does not end an agent.
     Stop,
@@ -307,6 +312,11 @@ struct ActorState {
     /// Commands parked while a blocking tool call was in flight; folded in at
     /// the next message boundary (see `drain_signals`).
     deferred: Vec<AgentMsg>,
+    /// A `Compact` arrived: the conversation is to be folded into a summary
+    /// now, rather than when the window fills. Honoured at the next message
+    /// boundary mid-run (never between an assistant's tool calls and their
+    /// results), and at once while idle.
+    compact_requested: bool,
     /// A `Shutdown` arrived: stop the run and end this actor.
     shutdown: bool,
     /// A `Stop` arrived with the work this actor is about to start; the run it
@@ -629,6 +639,18 @@ fn wait_for_work(
         // Idle: block until there is something to do. A stray Stop carries no
         // work, so it just means waiting again.
         loop {
+            // A `/compact` folded in below — or left over from a run that
+            // ended before it reached a boundary — is honoured here rather
+            // than in the run that follows, because there is no run: the
+            // human asked for a summary, not for an answer turn. The actor
+            // folds its conversation and goes back to waiting.
+            if state.compact_requested {
+                compact_now(actor, state, transcript);
+                if state.shutdown {
+                    return false;
+                }
+                continue;
+            }
             match actor.rx.recv() {
                 // Every handle to this agent is gone; so is any reason to live.
                 Err(_) => return false,
@@ -734,6 +756,13 @@ fn absorb(state: &mut ActorState, transcript: &mut Vec<Message>, command: AgentM
             transcript.push(Message::user(text));
             Fold::Run
         }
+        // The human asked for a fold now. Not work to answer, so not a run:
+        // the flag is honoured by `wait_for_work`'s idle loop, and by the
+        // next turn of a run already in flight.
+        AgentMsg::Compact => {
+            state.compact_requested = true;
+            Fold::Idle
+        }
         AgentMsg::ChildDone { id, outcome } => {
             // The parent ended (or napped) while a child still ran: waking it
             // with the completion restarts its run with the result folded in,
@@ -807,11 +836,13 @@ fn run_loop(
             .map_err(|_| "shared configuration poisoned".to_string())?;
 
         let budget = cfg.history_budget();
-        // Approaching the context window: fold the conversation into a summary
-        // instead of dropping old turns, so long-running tasks keep their
-        // state. The summarize request re-sends the history, so only fire
-        // while it still fits; beyond that, trimming stays the last resort.
-        if needs_compaction(messages, budget) {
+        // Approaching the context window — or asked for outright by a
+        // `/compact` that arrived at this boundary: fold the conversation into
+        // a summary instead of dropping old turns, so long-running tasks keep
+        // their state. The summarize request re-sends the history, so only
+        // fire while it still fits; beyond that, trimming stays the last
+        // resort.
+        if state.compact_requested || needs_compaction(messages, budget) {
             compact_history(actor, &cfg, messages, cancel, state)?;
         }
         // Keep the whole request inside the endpoint's context window.
@@ -1165,10 +1196,23 @@ ran. Do the same work in smaller steps: one file per call, a few hundred lines \
 at a time (write the first part with write_file, then add the rest with \
 edit_file). Do not repeat work you already completed in earlier calls.";
 
+/// What a human who typed `/compact` is told when there is nothing to fold.
+///
+/// A fold of `[system, the opening message]` costs a request and can only
+/// re-summarize the summary, so it is refused — but never silently: the human
+/// asked, and a status line that fades into nothing is the failure mode this
+/// whole command exists to avoid. Anything bigger is folded as asked.
+const NOTHING_TO_COMPACT: &str =
+    "nothing to compact — this transcript is already short enough to send whole";
+
 /// Fold the transcript into a summary: ask the model to condense it, then
 /// replace the conversation with `[system, user(summary)]` — the summary is
 /// the new opening task message, which trimming protects. Does nothing when
 /// the model could not produce a summary; trimming is the fallback.
+///
+/// The one compaction routine: the automatic trigger (the window filling up)
+/// and the human's `/compact` both come through here, so they cannot disagree
+/// about what "the summary message" is or about when folding is worth a call.
 fn compact_history(
     actor: &Actor,
     cfg: &Config,
@@ -1176,20 +1220,37 @@ fn compact_history(
     cancel: &AtomicBool,
     state: &mut ActorState,
 ) -> Result<(), String> {
+    // Whether the human asked for this fold, as opposed to the window filling
+    // on its own. Only the first is owed a line when there is nothing to do:
+    // the automatic trigger would not have fired, so it has nothing to report.
+    let asked = std::mem::take(&mut state.compact_requested);
     if !matches!(messages.first(), Some(message) if message.role == "system") {
         return Ok(());
     }
-    // Nothing left to fold: system + one user message is already minimal
+    // Nothing left to fold: system + one message is already minimal
     // (usually a previous summary), so compacting again would just cost a
-    // request and re-summarize the summary.
+    // request and re-summarize the summary. A human who asked for it is told
+    // so rather than left watching a status line that never ends.
     if messages.len() <= 2 {
+        if asked {
+            actor
+                .ctx
+                .emit(actor.id, AgentEvent::Notice(NOTHING_TO_COMPACT.to_string()));
+        }
         return Ok(());
     }
     let actor_id = actor.id;
-    actor.ctx.emit(
-        actor_id,
-        AgentEvent::Status("context nearly full — summarizing…".to_string()),
-    );
+    // The human is told why this is happening: "nearly full" is a fact about
+    // the automatic trigger, and saying it for a fold they asked for would be
+    // a line about a condition that is not true.
+    let why = if asked {
+        "compacting on request…"
+    } else {
+        "context nearly full — summarizing…"
+    };
+    actor
+        .ctx
+        .emit(actor_id, AgentEvent::Status(why.to_string()));
 
     // Fold pending nudges/completions in first; a Stop cancels the run.
     drain_mailbox(&actor.rx, cancel, messages, state);
@@ -1237,6 +1298,12 @@ fn compact_history(
         .map(|choice| choice.message.text().trim().to_string())
         .unwrap_or_default();
     if summary.is_empty() {
+        if asked {
+            actor.ctx.emit(
+                actor.id,
+                AgentEvent::Notice("could not compact — the model returned no summary".to_string()),
+            );
+        }
         return Ok(());
     }
 
@@ -1249,6 +1316,45 @@ fn compact_history(
         },
     );
     Ok(())
+}
+
+/// Fold an idle agent's conversation into a summary because the human asked
+/// (`/compact`).
+///
+/// This is the whole request: one summarize call and one transcript
+/// replacement, through the same [`compact_history`] the automatic trigger
+/// uses, so the pane, the session save and the meter — all driven by the
+/// `Compact` event — stay in sync for both. It is deliberately *not* a run:
+/// no `Running`, so the row never claims work; no answer turn, because there
+/// is nothing to answer (the summary is the result); nothing reported to the
+/// parent, because no run ended.
+///
+/// Failures are a notice rather than an `Error`: an idle agent that could not
+/// summarize has not failed at anything, and marking its row failed would be
+/// the same lie in the other direction.
+fn compact_now(actor: &Actor, state: &mut ActorState, transcript: &mut Vec<Message>) {
+    // The same fallback a tool takes on a poisoned cell: the fold everything
+    // else reads has already been asked for, and the flag must not be left
+    // set, or the actor would fold the same transcript on every wait.
+    let cfg = actor
+        .ctx
+        .cfg
+        .lock()
+        .map(|cfg| cfg.clone())
+        .unwrap_or_else(|_| Config::new("http://127.0.0.1:1", "", None));
+    // A fresh flag: an idle agent has no run for a Stop to cancel. One that
+    // arrives while the summary is in flight still ends the request early,
+    // and is then swallowed exactly as it is for any idle actor.
+    let cancel = AtomicBool::new(false);
+    match compact_history(actor, &cfg, transcript, &cancel, state) {
+        Ok(()) => {}
+        // The human stopped it; that is not a failure to report.
+        Err(error) if error == CANCELLED => {}
+        Err(error) => actor.ctx.emit(
+            actor.id,
+            AgentEvent::Notice(format!("could not compact: {error}")),
+        ),
+    }
 }
 
 /// Fold in only what may appear between tool calls: cancellation, shutdown, and
@@ -1286,6 +1392,10 @@ fn drain_mailbox(
     for command in parked.into_iter().chain(rx.try_iter()) {
         match command {
             AgentMsg::Nudge(text) => messages.push(Message::user(text)),
+            // A message-boundary job like a nudge: the transcript is folded
+            // into a summary at the next turn, never between an assistant's
+            // tool calls and their results.
+            AgentMsg::Compact => state.compact_requested = true,
             AgentMsg::Stop => cancel.store(true, Ordering::SeqCst),
             AgentMsg::Shutdown => {
                 // Cancel now, and remember: the run ends, and so does the actor.
@@ -3539,6 +3649,276 @@ mod tests {
                 .ok()
                 .as_deref(),
             Some("isolated work")
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `/compact` on an idle agent: the conversation is folded into a summary
+    /// there and then, and nothing else happens. No `Running`, no answer turn,
+    /// one model call — the request is a summary, not new work to answer.
+    #[test]
+    fn a_compact_request_folds_an_idle_agent_without_a_run() {
+        let root = scratch_dir("compact-idle");
+        let summary = "the task was to say something; it was said";
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary)
+                .says("first answer")
+                .says("carried on"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("say something".to_string()),
+            ]))
+            .unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the run must finish before the fold: {seen:?}"
+        );
+
+        root_tx.send(AgentMsg::Compact).unwrap();
+        assert!(
+            seen.wait(&events, WAIT, |seen| !seen.summaries.is_empty()),
+            "an idle /compact must fold the transcript: {seen:?}"
+        );
+        assert_eq!(seen.summaries, vec![summary.to_string()]);
+        assert_eq!(
+            seen.done, 1,
+            "the fold is not a run: no second completion came out of it"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+        let running = events
+            .events()
+            .iter()
+            .filter(|(_, event)| matches!(event, AgentEvent::Running { .. }))
+            .count();
+        assert_eq!(running, 1, "only the run that was asked for, before it");
+
+        // One ask for the run, one for the fold — the second carries no tools
+        // and the instruction, and no answer was requested after it.
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 2, "one summarize call, nothing else");
+        assert!(asked[1].saw(COMPACT_INSTRUCTION), "the second ask folds");
+        assert_eq!(asked[1].tools, 0, "a plain, tool-free request");
+
+        // The transcript really is `[system, user(summary)]`: the next request
+        // is that plus the words the human typed after it.
+        root_tx
+            .send(AgentMsg::Nudge("carry on".to_string()))
+            .unwrap();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 2),
+            "the nudge must be answered: {seen:?}"
+        );
+        let asked = scripted.asked();
+        let after = asked.last().unwrap();
+        assert_eq!(
+            after.messages.iter().map(Message::text).collect::<Vec<_>>(),
+            vec![
+                "you are mush".to_string(),
+                prompt::compaction_message(summary),
+                "carry on".to_string(),
+            ],
+            "the fold replaced everything but the system prompt"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A `Compact` that arrives while the model is working is parked like a
+    /// nudge: the fold happens at the next message boundary, after the tool
+    /// batch it arrived behind has been executed and answered — never between
+    /// an assistant's calls and their results.
+    #[test]
+    fn a_compact_request_waits_for_the_tool_result_it_arrived_behind() {
+        let root = scratch_dir("compact-mid-run");
+        let gate = Arc::new(Gate::new());
+        let summary = "wrote note.txt; nothing else happened";
+        let scripted = Arc::new(
+            Scripted::new()
+                // Held, so the test can put the request in the mailbox while
+                // the run is provably in flight — no sleep, no race.
+                .held(gate.clone())
+                .calls(vec![tool_call(
+                    "c1",
+                    "write_file",
+                    json!({ "path": "note.txt", "content": "worth folding" }),
+                )])
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary)
+                .says("carried on after the fold"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("write the note".to_string()),
+            ]))
+            .unwrap();
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the run never reached the model"
+        );
+        root_tx.send(AgentMsg::Compact).unwrap();
+        gate.release();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the run must finish with the fold folded in: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+        assert_eq!(seen.summaries, vec![summary.to_string()]);
+
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 3, "tool call, fold, then the answer");
+        assert!(
+            !asked[0].saw(COMPACT_INSTRUCTION),
+            "it is not injected into the request already in flight"
+        );
+        let fold = &asked[1];
+        assert!(fold.saw(COMPACT_INSTRUCTION), "the second ask is the fold");
+        assert!(
+            fold.saw("wrote note.txt"),
+            "the fold happens at the boundary, behind the batch's result: {:?}",
+            fold.messages.iter().map(Message::text).collect::<Vec<_>>()
+        );
+        // And the run continued from the summary alone.
+        assert_eq!(
+            asked[2]
+                .messages
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>(),
+            vec![
+                "you are mush".to_string(),
+                prompt::compaction_message(summary)
+            ]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A `/compact` sent while the model is writing the run's *last* reply
+    /// arrives at the boundary the run ends on. It must not be dropped with the
+    /// run: the actor folds as it goes idle, after the completion — once.
+    #[test]
+    fn a_compact_request_behind_the_last_reply_is_honoured_as_the_run_ends() {
+        let root = scratch_dir("compact-end-of-run");
+        let gate = Arc::new(Gate::new());
+        let summary = "the task was to answer; it was answered";
+        let scripted = Arc::new(
+            Scripted::new()
+                .held(gate.clone())
+                .says("answered")
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("answer me".to_string()),
+            ]))
+            .unwrap();
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the run never reached the model"
+        );
+        root_tx.send(AgentMsg::Compact).unwrap();
+        gate.release();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| !seen.summaries.is_empty()),
+            "the request must survive the run it arrived in: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+        assert_eq!(seen.done, 1, "the fold is not a second run");
+        assert_eq!(seen.summaries, vec![summary.to_string()]);
+
+        // The completion comes first: the fold happens as the actor goes idle,
+        // not instead of finishing the run.
+        let order: Vec<&str> = events
+            .events()
+            .iter()
+            .filter_map(|(_, event)| match event {
+                AgentEvent::Done => Some("done"),
+                AgentEvent::Compact { .. } => Some("compact"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(order, vec!["done", "compact"]);
+        assert_eq!(
+            scripted.asked().len(),
+            2,
+            "the answer, then the one summarize call"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A fold of a transcript that is already `system + one message` is refused:
+    /// it would cost a request and re-summarize the summary. The human asked,
+    /// though, so the refusal is said out loud instead of being silence.
+    #[test]
+    fn a_fold_with_nothing_to_fold_says_so_instead_of_asking_the_model() {
+        let root = scratch_dir("compact-minimal");
+        let scripted = Arc::new(Scripted::new().says("answered"));
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![Message::system("you are mush")]))
+            .unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the run must finish first: {seen:?}"
+        );
+        assert_eq!(scripted.asked().len(), 1, "the run's own request");
+
+        root_tx.send(AgentMsg::Compact).unwrap();
+        assert!(
+            seen.wait(&events, WAIT, |seen| !seen.notices.is_empty()),
+            "the refusal must be visible: {seen:?}"
+        );
+        assert_eq!(seen.notices, vec![NOTHING_TO_COMPACT.to_string()]);
+        assert!(
+            seen.summaries.is_empty(),
+            "nothing was folded, so no summary was claimed"
+        );
+        assert_eq!(
+            scripted.asked().len(),
+            1,
+            "the refusal costs no summarize call"
         );
         let _ = fs::remove_dir_all(&root);
     }

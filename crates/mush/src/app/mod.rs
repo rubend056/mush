@@ -793,6 +793,7 @@ impl App {
                 ));
             }
             "/diff" | "/merge" | "/discard" => self.worktree_command(name, rest),
+            "/compact" => self.compact_focused(),
             "/forget" => {
                 let Ok(id) = rest.trim().parse::<u64>() else {
                     self.say("usage: /forget <agent id>");
@@ -1149,6 +1150,25 @@ impl App {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// `/compact`: ask the focused agent to fold its conversation into a
+    /// summary now, instead of waiting for the window to fill.
+    ///
+    /// The request goes to the agent, not to its row: the fold itself is the
+    /// actor's job, and its `Compact` event is what replaces the transcript
+    /// here, saves the session and moves the meter. So nothing is claimed
+    /// about the agent's phase — unlike a nudge, which the row shows as
+    /// `thinking…` because a run really is about to start. A mailbox that is
+    /// gone is the one thing the human has to hear, and it is said plainly
+    /// rather than left as a status line about work nobody is doing
+    /// (finding B10).
+    fn compact_focused(&mut self) {
+        let target = self.tree.focused;
+        match self.tree.agent_tx.get(&target) {
+            Some(tx) if tx.send(AgentMsg::Compact).is_ok() => {}
+            _ => self.fail(format!("agent #{target} is gone")),
         }
     }
 
