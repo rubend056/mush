@@ -212,6 +212,12 @@ fn set_dir(dir: &mut Option<PathBuf>, value: &str) -> Result<(), String> {
 }
 
 fn print_help() {
+    // The command list is the table the parser is written against, so `--help`
+    // cannot advertise a command that does not exist, or miss one that does:
+    // `/compact` was implemented, listed by `/help` and absent here, because
+    // this paragraph was written by hand (the help/status drift half of
+    // finding B2). The provider names are still the provider module's to spell.
+    let commands = app::commands::table(&mush_core::provider::names_piped());
     println!(
         "mush {}\n\
          A small, fast terminal surface for coding agents.\n\n\
@@ -251,17 +257,7 @@ fn print_help() {
          \x20   wheel             scroll the transcript\n\
          \x20   Ctrl-Q            quit\n\n\
          COMMANDS (type in the chat):\n\
-         \x20   /provider [{}]  switch provider\n\
-         \x20   /model                       pick a model\n\
-         \x20   /context [TOKENS]            show or set the context window\n\
-         \x20   /url http://host:port        set the endpoint\n\
-         \x20   /key <secret>                set the API key (saved to the home config)\n\
-         \x20   /models                      refresh the model list\n\
-         \x20   /worktrees                   re-scan for leftover isolated worktrees\n\
-         \x20   /diff <id>                   print the diff command for an isolated agent\n\
-         \x20   /merge|/discard <id>         merge or throw away its work, and reclaim it\n\
-         \x20   /forget <id>                 drop the agent from this session (its branch stays)\n\
-         \x20   /new  /help  /quit\n\
+         {commands}\n\
          Endpoint, API key, model, and the request knobs live in\n\
          $MUSH_CONFIG or the platform config directory. That file is hand-editable,\n\
          every field is optional, and the one mush writes documents itself.\n\
@@ -272,7 +268,6 @@ fn print_help() {
         mush_core::provider::DEFAULT_PROVIDER.name(),
         mush_core::provider::effort_default_hint(),
         mush_core::provider::thinking_default_hint(),
-        mush_core::provider::names_piped(),
     );
 }
 

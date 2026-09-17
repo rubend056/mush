@@ -15,8 +15,10 @@ use crate::app::{
     short_age, AgentId, AgentNode, App, Focus, Landed, Pane, Phase, PickerKind, Rank, StatusKind,
 };
 
-/// The idle bar hint, when there is nothing to report.
-const HINT: &str = "Tab cycles panes · /help lists commands · Ctrl-P picks a model";
+/// The idle bar hint, when there is nothing to report. The commands it names
+/// are checked against `app::commands::COMMANDS` by a test there, so the bar
+/// cannot advertise a command the parser does not have (finding B2).
+pub(crate) const HINT: &str = "Tab cycles panes · /help lists commands · Ctrl-P picks a model";
 /// Beyond this the transcript is unreadable, however wide the terminal is.
 const MAX_TRANSCRIPT: u16 = 110;
 /// Below this mush has no room to be honest: say so instead of painting shreds.

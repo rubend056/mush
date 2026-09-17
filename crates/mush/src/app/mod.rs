@@ -11,6 +11,8 @@
 //! module routes messages into both and renders what they say.
 
 mod chat;
+pub mod commands;
+mod keys;
 mod tree;
 
 pub use chat::{Chat, Pane, Rank};
@@ -21,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::KeyEvent;
 
 use mush_core::message::Message;
 use mush_core::{
@@ -32,6 +34,9 @@ use mush_core::{
 use crate::agent::{self, spawn, AgentEvent, AgentMsg, RootHandle};
 use crate::http;
 use crate::session_save::SessionSave;
+
+use commands::{Command, CommandError, Verb};
+use keys::Intent;
 
 pub enum Msg {
     Key(KeyEvent),
@@ -53,7 +58,7 @@ pub enum Msg {
     },
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Focus {
     Agents,
     Chat,
@@ -114,6 +119,22 @@ fn ended_on_an_answer(messages: &[Message]) -> bool {
     matches!(
         messages.last(),
         Some(message) if message.role == "assistant" && message.tool_calls().is_empty()
+    )
+}
+
+/// `/help`: what the keys do, then the command table.
+///
+/// The table is the same one `mush --help` prints, so the two surfaces cannot
+/// advertise different commands — `/compact` used to be implemented, listed by
+/// `/help` and missing from `--help`, because each list was written by hand
+/// (the help/status drift half of finding B2). It is a notice rather than a
+/// status line: it is a thing to read, not a thing that just happened.
+fn help_notice() -> String {
+    format!(
+        "mush: Tab cycles agents/chat · Enter sends to the focused agent · \
+         Ctrl-P pick a model · Ctrl-N new chat · \
+         Ctrl-C stops the focused agent · Ctrl-X stops them all. Commands:\n{}",
+        commands::table(&mush_core::provider::names_piped())
     )
 }
 
@@ -771,15 +792,36 @@ impl App {
 
     // ------------------------------------------------------------- chat / LLM
 
+    /// Send what is in the message box: a command to run, or a message for the
+    /// focused agent.
+    ///
+    /// The two are told apart by the one parser (`app::commands`), which returns
+    /// a value rather than a string to compare here — so what a command *is*
+    /// has exactly one definition, and the help text reads the same table the
+    /// arms do.
     fn send_message(&mut self) {
         let text = self.chat.take_input().trim().to_string();
         if text.is_empty() {
             return;
         }
-        if text.starts_with('/') {
-            self.run_command(&text);
-            return;
+        match commands::parse_command(&text) {
+            Ok(command) => self.apply_command(command),
+            // No slash: the human is talking to an agent.
+            Err(CommandError::NotACommand) => self.deliver(text),
+            // A command that exists but whose argument does not read. The line
+            // was spelled beside the rule that rejected it, and the bar is
+            // where every other complaint of this kind goes.
+            Err(CommandError::Usage(line)) => self.say(line),
+            // A slash nobody implements: a transcript error, where a human
+            // looking at what they typed will see it.
+            Err(CommandError::Unknown(name)) => {
+                self.chat.note_error(format!("unknown command: {name}"))
+            }
         }
+    }
+
+    /// A typed message, from the human to the focused agent.
+    fn deliver(&mut self, text: String) {
         let target = self.tree.focused;
         if target == AgentId::ROOT {
             // The human's words belong in the transcript they can see, whether
@@ -843,43 +885,23 @@ impl App {
         }
     }
 
-    fn run_command(&mut self, command: &str) {
-        let (name, rest) = command
-            .split_once(' ')
-            .map(|(name, rest)| (name, rest.trim()))
-            .unwrap_or((command, ""));
-        match name {
-            "/new" | "/clear" => self.new_chat(),
-            "/quit" | "/q" => self.should_quit = true,
-            "/help" | "/?" => {
-                self.chat.note(
-                    "mush: Tab cycles agents/chat · Enter sends to the focused agent · \
-                     Ctrl-P pick a model · Ctrl-N new chat · \
-                     Ctrl-C stops the focused agent · Ctrl-X stops them all. \
-                     Commands: /provider /model /context /url /key /models \
-                     /worktrees /diff /merge /discard /forget /compact /new /quit \
-                     (/merge and /discard run git for you and reclaim the worktree; \
-                     /forget drops the agent from this session and leaves the branch; \
-                     /compact folds the focused agent's conversation into a summary)",
-                );
-            }
-            "/context" => {
-                if rest.is_empty() {
-                    self.say(format!(
-                        "{} · {} tokens used · set it with /context <tokens>",
-                        self.context_label(),
-                        crate::app::tokens_label(self.context_used_tokens())
-                    ));
-                    return;
-                }
-                let Ok(tokens) = rest.trim().parse::<usize>() else {
-                    self.say("usage: /context <tokens>");
-                    return;
-                };
-                if tokens == 0 {
-                    self.say("usage: /context <tokens>");
-                    return;
-                }
+    /// Run one parsed command.
+    ///
+    /// Matching the variant rather than the typed line is what makes a command
+    /// the parser knows but this match does not a compile error instead of a
+    /// silent fall-through, and it is what lets the help text, the parser and
+    /// these arms all read the same table (`app::commands`).
+    fn apply_command(&mut self, command: Command) {
+        match command {
+            Command::New => self.new_chat(),
+            Command::Quit => self.should_quit = true,
+            Command::Help => self.chat.note(help_notice()),
+            Command::Context(None) => self.say(format!(
+                "{} · {} tokens used · set it with /context <tokens>",
+                self.context_label(),
+                tokens_label(self.context_used_tokens())
+            )),
+            Command::Context(Some(tokens)) => {
                 self.cfg.set_context(tokens);
                 self.apply_config();
                 // A stated window is remembered for this workspace, so it is on
@@ -890,16 +912,10 @@ impl App {
                     self.context_label()
                 ));
             }
-            "/diff" | "/merge" | "/discard" => self.worktree_command(name, rest),
-            "/compact" => self.compact_focused(),
-            "/forget" => {
-                let Ok(id) = rest.trim().parse::<u64>() else {
-                    self.say("usage: /forget <agent id>");
-                    return;
-                };
-                self.forget_agent(AgentId(id));
-            }
-            "/worktrees" => {
+            Command::Worktree { verb, id } => self.worktree_command(verb, AgentId(id)),
+            Command::Compact => self.compact_focused(),
+            Command::Forget(id) => self.forget_agent(AgentId(id)),
+            Command::Worktrees => {
                 self.discover_worktrees();
                 self.refresh_git();
                 let count = self.tree.agents.iter().filter(|n| n.leftover).count();
@@ -909,23 +925,11 @@ impl App {
                     "no leftover worktrees".to_string()
                 });
             }
-            "/provider" => {
-                if rest.is_empty() {
-                    self.open_provider_picker();
-                } else {
-                    self.apply_provider(rest);
-                }
-            }
-            "/model" => self.open_model_picker(),
-            "/url" => {
-                if rest.is_empty() {
-                    self.say(
-                        "usage: /url http://host:port — base URL of an OpenAI-compatible \
-                                  endpoint",
-                    );
-                    return;
-                }
-                self.cfg.set_base_url(rest);
+            Command::Provider(None) => self.open_provider_picker(),
+            Command::Provider(Some(name)) => self.apply_provider(&name),
+            Command::Model => self.open_model_picker(),
+            Command::Url(url) => {
+                self.cfg.set_base_url(&url);
                 // A new endpoint may host a different model with a different
                 // window; re-derive it unless the human stated one (finding A5).
                 self.cfg.rederive_context();
@@ -938,24 +942,23 @@ impl App {
                 self.apply_config();
                 self.persist_user_config();
             }
-            "/key" => {
-                if rest.is_empty() {
-                    match &self.cfg.api_key {
-                        Some(key) => self.say(format!("api key set ({}…)", mask_key(key))),
-                        None => self.say("no api key — /key <secret> sets one (memory only)"),
-                    }
-                    return;
-                }
-                self.cfg.api_key = Some(rest.to_string());
+            Command::ApiKey(None) => match &self.cfg.api_key {
+                Some(key) => self.say(format!("api key set ({}…)", mask_key(key))),
+                None => self.say("no api key — /key <secret> sets one (memory only)"),
+            },
+            Command::ApiKey(Some(secret)) => {
+                // Masked before it is moved: the message quotes the same secret
+                // the config now holds, and only its head is ever printed.
+                let shown = mask_key(&secret);
+                self.cfg.api_key = Some(secret);
                 self.apply_config();
                 self.persist_user_config();
                 self.say(format!(
-                    "api key set ({}…) — saved to {}",
-                    mask_key(rest),
+                    "api key set ({shown}…) — saved to {}",
                     userconfig::config_path().display()
                 ));
             }
-            "/models" => {
+            Command::Models => {
                 self.refresh_models();
                 self.say(if self.models.is_empty() {
                     format!("no models from {}", self.cfg.models_url())
@@ -967,7 +970,6 @@ impl App {
                     )
                 });
             }
-            other => self.chat.note_error(format!("unknown command: {other}")),
         }
     }
 
@@ -1097,36 +1099,6 @@ impl App {
         ));
     }
 
-    fn key_picker(&mut self, key: KeyEvent) {
-        let Some(picker) = self.picker.as_mut() else {
-            return;
-        };
-        match key.code {
-            KeyCode::Esc => self.picker = None,
-            KeyCode::Enter => {
-                let kind = picker.kind;
-                let item = picker.items.get(picker.cursor).cloned();
-                self.picker = None;
-                if let Some(item) = item {
-                    self.pick(kind, &item);
-                }
-            }
-            KeyCode::Char('j') | KeyCode::Down => {
-                if picker.cursor + 1 < picker.items.len() {
-                    picker.cursor += 1;
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                picker.cursor = picker.cursor.saturating_sub(1);
-            }
-            KeyCode::Char('g') | KeyCode::Home => picker.cursor = 0,
-            KeyCode::Char('G') | KeyCode::End => {
-                picker.cursor = picker.items.len().saturating_sub(1)
-            }
-            _ => {}
-        }
-    }
-
     fn pick(&mut self, kind: PickerKind, item: &str) {
         match kind {
             PickerKind::Model => {
@@ -1155,12 +1127,7 @@ impl App {
     /// it. mush cannot see a git command the human runs in their own shell, so
     /// the only thing that ever reclaims a worktree and its branch is doing it
     /// here — which is why the pane stayed cluttered with leftovers.
-    fn worktree_command(&mut self, command: &str, rest: &str) {
-        let Ok(raw) = rest.trim().parse::<u64>() else {
-            self.say(format!("usage: {command} <agent id>"));
-            return;
-        };
-        let id = AgentId(raw);
+    fn worktree_command(&mut self, verb: Verb, id: AgentId) {
         let (branch, busy, landed) = match self.tree.node(id) {
             None => {
                 self.fail(format!("no agent #{id}"));
@@ -1172,7 +1139,10 @@ impl App {
             self.fail(format!("agent #{id} has no worktree branch (not isolated)"));
             return;
         };
-        if command == "/diff" {
+        // The read is the one verb that changes nothing, so it goes first: it
+        // is the answer to "what would merging this do", and neither of the
+        // refusals below applies to looking.
+        if verb == Verb::Diff {
             let text = format!("git diff HEAD...{branch}");
             self.say(text.clone());
             self.chat.note(text);
@@ -1192,7 +1162,8 @@ impl App {
             // Merging under a running agent would race the commits it is still
             // making, so refuse instead of interleaving with it.
             self.fail(format!(
-                "agent #{id} is still running — Ctrl-C stops it before you {command} its work"
+                "agent #{id} is still running — Ctrl-C stops it before you {} its work",
+                verb.name()
             ));
             return;
         }
@@ -1206,8 +1177,11 @@ impl App {
             .unwrap_or(&worktree)
             .to_string_lossy()
             .to_string();
-        match command {
-            "/merge" => match git::run(&root, &["merge", branch.as_str()]) {
+        match verb {
+            // Returned above: a read has nothing to land and nothing to
+            // reclaim.
+            Verb::Diff => {}
+            Verb::Merge => match git::run(&root, &["merge", branch.as_str()]) {
                 Err(error) => self.fail(format!("merge {branch} failed: {error}")),
                 Ok(_) => {
                     // The work is in HEAD now, so reclaim the disk and the
@@ -1226,7 +1200,7 @@ impl App {
                     self.flush_session();
                 }
             },
-            "/discard" => {
+            Verb::Discard => {
                 let removed = git::run(&root, &["worktree", "remove", "--force", &worktree]);
                 let deleted = git::run(&root, &["branch", "-D", branch.as_str()]);
                 // Say what actually happened: a discard that half-failed must
@@ -1252,7 +1226,6 @@ impl App {
                     self.flush_session();
                 }
             }
-            _ => {}
         }
     }
 
@@ -1455,37 +1428,41 @@ impl App {
 
     // ------------------------------------------------------------------ input
 
+    /// One key: [`keys::key`] decides what it means and [`Self::apply_intent`]
+    /// carries the decision out. Nothing from here down reads a `KeyCode`, so a
+    /// binding is testable without an `App` — which the old shape, where an arm
+    /// both matched a key and did its work, made impossible (finding B2).
     fn on_key(&mut self, key: KeyEvent) {
-        if key.kind == KeyEventKind::Release {
-            return;
-        }
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        self.apply_intent(keys::key(self.focus, self.picker.is_some(), key));
+    }
 
-        if ctrl {
-            match key.code {
-                KeyCode::Char('q') => return self.request_quit(),
-                KeyCode::Char('c') => return self.interrupt(),
-                KeyCode::Char('x') => return self.interrupt_all(),
-                KeyCode::Char('n') => return self.new_chat(),
-                KeyCode::Char('p') => return self.open_model_picker(),
-                _ => {}
+    /// Do what an intent says. One arm per intent, every side effect of the
+    /// keyboard in one readable list: which pane moves, what is sent, what is
+    /// picked, and which config change is remembered.
+    fn apply_intent(&mut self, intent: Intent) {
+        match intent {
+            Intent::Ignore => {}
+            Intent::Quit => self.request_quit(),
+            Intent::NewChat => self.new_chat(),
+            Intent::Interrupt => self.interrupt(),
+            Intent::InterruptAll => self.interrupt_all(),
+            Intent::OpenModelPicker => self.open_model_picker(),
+            Intent::CycleFocus(direction) => self.cycle_focus(direction),
+            Intent::PickerClose => self.picker = None,
+            Intent::PickerPick => self.pick_cursor(),
+            Intent::PickerMove(step) => self.move_picker(step),
+            Intent::PickerFirst => self.set_picker_cursor(0),
+            Intent::PickerLast => self.set_picker_cursor(usize::MAX),
+            Intent::TreeMove(step) => self.tree.move_cursor(step),
+            Intent::TreeFirst => self.tree.cursor_top(),
+            Intent::TreeLast => self.tree.cursor_bottom(),
+            Intent::TreeFocus => self.focus_cursor_row(),
+            Intent::TreeCancel => self.cancel_cursor_row(),
+            Intent::TreeBackToRoot => {
+                self.tree.focus(AgentId::ROOT);
             }
-        }
-
-        match key.code {
-            KeyCode::Tab => return self.cycle_focus(1),
-            KeyCode::BackTab => return self.cycle_focus(-1),
-            _ => {}
-        }
-
-        if self.picker.is_some() {
-            self.key_picker(key);
-            return;
-        }
-
-        match self.focus {
-            Focus::Agents => self.key_agents(key),
-            Focus::Chat => self.key_chat(key),
+            Intent::Send => self.send_message(),
+            Intent::Chat(key) => self.chat.apply(key),
         }
     }
 
@@ -1578,54 +1555,71 @@ impl App {
         self.focus = order[next];
     }
 
-    fn key_agents(&mut self, key: KeyEvent) {
-        match key.code {
-            KeyCode::Char('j') | KeyCode::Down => self.tree.move_cursor(1),
-            KeyCode::Char('k') | KeyCode::Up => self.tree.move_cursor(-1),
-            KeyCode::Char('g') | KeyCode::Home => self.tree.cursor_top(),
-            KeyCode::Char('G') | KeyCode::End => self.tree.cursor_bottom(),
-            KeyCode::Enter => {
-                if let Some(id) = self.tree.focus_cursor() {
-                    let brief = self
-                        .tree
-                        .node(id)
-                        .map(|node| node.brief.clone())
-                        .unwrap_or_default();
-                    self.say(format!("agent #{id}: {brief}"));
-                }
-            }
-            KeyCode::Char('c') => {
-                if let Some(node) = self.tree.agents.get(self.tree.cursor()) {
-                    let id = node.id;
-                    if !node.phase.is_busy() {
-                        // Stop cancels work; an idle agent has none. Ending one
-                        // is `/new`'s job.
-                        self.say(format!("agent #{id} is not running"));
-                        return;
-                    }
-                    // The row's own `⊘` is the feedback; the bar shows what the
-                    // tree as a whole is doing.
-                    self.stop_one(id);
-                }
-            }
-            KeyCode::Esc => {
-                self.tree.focus(AgentId::ROOT);
-            }
-            _ => {}
+    /// Focus the row the tree's cursor is on, and say whose pane the chat now
+    /// shows: `Enter` in the agent pane is a move of the *view*, so the brief
+    /// goes to the bar where a human can read it before typing.
+    fn focus_cursor_row(&mut self) {
+        if let Some(id) = self.tree.focus_cursor() {
+            let brief = self
+                .tree
+                .node(id)
+                .map(|node| node.brief.clone())
+                .unwrap_or_default();
+            self.say(format!("agent #{id}: {brief}"));
         }
     }
 
-    /// The chat pane's keys: the message box and the transcript's scrollback
-    /// belong to the [`Chat`], so they are routed to it whole. `<Enter>` is the
-    /// one key it cannot own: sending is the agents' business.
-    fn key_chat(&mut self, key: KeyEvent) {
-        let modified = key.modifiers.contains(KeyModifiers::SHIFT)
-            || key.modifiers.contains(KeyModifiers::ALT);
-        if key.code == KeyCode::Enter && !modified {
-            self.send_message();
-            return;
+    /// `c` on the tree's cursor row: stop it if it has work to stop.
+    ///
+    /// Stopping an idle agent is not a no-op to be swallowed — the human asked
+    /// for something that cannot happen, and the row's phase is left alone
+    /// because it has no work in flight to cancel. Ending an agent is `/new`'s
+    /// job.
+    fn cancel_cursor_row(&mut self) {
+        if let Some(node) = self.tree.agents.get(self.tree.cursor()) {
+            let id = node.id;
+            if !node.phase.is_busy() {
+                self.say(format!("agent #{id} is not running"));
+                return;
+            }
+            // The row's own `⊘` is the feedback; the bar shows what the tree as
+            // a whole is doing.
+            self.stop_one(id);
         }
-        let _ = self.chat.key(key);
+    }
+
+    /// Take the picker's selected row: the picker is gone either way, because
+    /// `Enter` is a decision even when there is nothing to decide.
+    fn pick_cursor(&mut self) {
+        let Some(picker) = self.picker.as_ref() else {
+            return;
+        };
+        let kind = picker.kind;
+        let item = picker.items.get(picker.cursor).cloned();
+        self.picker = None;
+        if let Some(item) = item {
+            self.pick(kind, &item);
+        }
+    }
+
+    /// Move the picker's cursor, stopping at both ends: a picker is not a
+    /// wheel, and wrapping from the last model to the first hides how many
+    /// there are.
+    fn move_picker(&mut self, step: i64) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let last = picker.items.len().saturating_sub(1) as i64;
+        picker.cursor = (picker.cursor as i64 + step).clamp(0, last) as usize;
+    }
+
+    /// Put the picker's cursor on a row, clamped to the list — `usize::MAX` is
+    /// the end of it.
+    fn set_picker_cursor(&mut self, row: usize) {
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        picker.cursor = row.min(picker.items.len().saturating_sub(1));
     }
 }
 
@@ -1649,9 +1643,20 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use crossbeam_channel::Receiver;
+    use ratatui::crossterm::event::{KeyCode, KeyModifiers};
 
     use crate::session_save;
     use crate::session_save::SessionSave;
+
+    /// Run a typed line the way a send does: through the pure parser, then the
+    /// arms. A test that names a command string this way exercises both, so the
+    /// parser cannot be right about an argument the executor reads differently
+    /// (finding B2).
+    fn run(app: &mut App, line: &str) {
+        let command = commands::parse_command(line)
+            .unwrap_or_else(|error| panic!("`{line}` is not a command: {error}"));
+        app.apply_command(command);
+    }
 
     /// The transient line the bar would show, or the empty string.
     fn text_of(app: &App) -> &str {
@@ -1844,7 +1849,7 @@ mod tests {
         isolated_work(&root, 1, "add the parser");
         let mut app = app_at(root.clone());
 
-        app.worktree_command("/merge", "1");
+        run(&mut app, "/merge 1");
 
         assert!(root.join("work.txt").exists(), "the work is in HEAD now");
         assert!(
@@ -1869,7 +1874,7 @@ mod tests {
             .unwrap();
         assert_eq!(node.landed, Some(Landed::Merged));
         // A second /merge must not re-run git or claim a second merge.
-        app.worktree_command("/merge", "1");
+        run(&mut app, "/merge 1");
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -1880,7 +1885,7 @@ mod tests {
         isolated_work(&root, 2, "throwaway");
         let mut app = app_at(root.clone());
 
-        app.worktree_command("/discard", "2");
+        run(&mut app, "/discard 2");
 
         assert!(!root.join(".mush/wt/2").exists());
         assert!(!root.join("work.txt").exists(), "the work did not land");
@@ -1903,8 +1908,8 @@ mod tests {
         let mut app = app_at(root.clone());
         app.tree.begin(AgentId(4), None);
 
-        app.worktree_command("/merge", "4");
-        app.worktree_command("/discard", "4");
+        run(&mut app, "/merge 4");
+        run(&mut app, "/discard 4");
 
         assert!(root.join(".mush/wt/4").exists(), "nothing was reclaimed");
         let node = app
@@ -2357,7 +2362,7 @@ mod tests {
     fn a_stated_context_is_on_disk_before_the_command_returns() {
         let root = dir("context");
         let (mut app, _writer) = app_writing(&root);
-        app.run_command("/context 240000");
+        run(&mut app, "/context 240000");
 
         let stored = Session::load(&root).expect("the command flushed it");
         assert_eq!(stored.context, Some(240_000));
@@ -2420,7 +2425,7 @@ mod tests {
         app.send_message();
         assert_eq!(Session::load(&root).unwrap().messages.len(), 1);
 
-        app.run_command("/new");
+        run(&mut app, "/new");
 
         let stored = Session::load(&root).expect("the command flushed it");
         assert!(stored.messages.is_empty(), "the old chat is not resumed");
@@ -2435,7 +2440,7 @@ mod tests {
         let root = repo("merge-file");
         isolated_work(&root, 3, "add the parser");
         let (mut app, _writer) = app_writing(&root);
-        app.worktree_command("/merge", "3");
+        run(&mut app, "/merge 3");
 
         let stored = Session::load(&root).expect("the command flushed it");
         let landed = stored
@@ -2576,7 +2581,7 @@ mod tests {
         app.chat.note_for(AgentId::ROOT, "old noise");
         let before = app.cfg_shared.clone();
 
-        app.run_command("/new");
+        run(&mut app, "/new");
 
         assert!(
             app.chat.transcript(AgentId::ROOT).is_empty(),
@@ -2607,7 +2612,7 @@ mod tests {
     fn events_from_an_abandoned_conversation_are_ignored() {
         let (mut app, _rx) = test_app("stale");
         let abandoned = app.tree.conversation();
-        app.run_command("/new");
+        run(&mut app, "/new");
         assert_ne!(app.tree.conversation(), abandoned, "a new conversation tag");
         app.chat
             .push_message(AgentId::ROOT, Message::user("current work"));
@@ -2791,7 +2796,7 @@ mod tests {
         app.tree.focus(AgentId(1));
         let before = app.tree.node(AgentId(1)).unwrap().phase.clone();
 
-        app.run_command("/compact");
+        run(&mut app, "/compact");
 
         assert!(
             matches!(asked.try_recv(), Ok(AgentMsg::Compact)),
@@ -2825,7 +2830,7 @@ mod tests {
         app.tree.agent_tx.remove(&AgentId(1));
         app.tree.focus(AgentId(1));
 
-        app.run_command("/compact");
+        run(&mut app, "/compact");
 
         assert_eq!(text_of(&app), "agent #1 is gone");
         assert_eq!(
@@ -2839,7 +2844,7 @@ mod tests {
     #[test]
     fn help_advertises_compact() {
         let (mut app, _rx) = test_app("compact-help");
-        app.run_command("/help");
+        run(&mut app, "/help");
         let help = app
             .chat
             .notices_for(AgentId::ROOT)
@@ -2856,7 +2861,7 @@ mod tests {
     fn a_child_spawned_by_an_abandoned_tree_is_shut_down() {
         let (mut app, _rx) = test_app("stale-child");
         let abandoned = app.tree.conversation();
-        app.run_command("/new");
+        run(&mut app, "/new");
         let (child_tx, child_rx) = crossbeam_channel::unbounded::<AgentMsg>();
 
         app.update(Msg::Agent {

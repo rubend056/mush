@@ -18,7 +18,6 @@
 
 use std::collections::HashMap;
 
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 
@@ -26,6 +25,7 @@ use mush_core::message::Message;
 use mush_core::text::{truncate, wrap_text, wrap_text_capped};
 
 use crate::agent::summarize_args;
+use crate::app::keys::ChatKey;
 use crate::app::tree::AgentId;
 use crate::input::Input;
 use crate::ui::dim;
@@ -426,36 +426,31 @@ impl Chat {
         self.input.take()
     }
 
-    /// A key that means something to the chat itself: editing the message box,
-    /// or scrolling the transcript. Returns whether it was consumed —
-    /// `<Enter>` is not, because sending is the agents' business, and neither
-    /// is any key this value has no opinion about.
-    pub fn key(&mut self, key: KeyEvent) -> bool {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
-        match key.code {
+    /// Do one key the keymap handed to the chat: editing the message box, or
+    /// scrolling the transcript.
+    ///
+    /// Which keys those are is [`crate::app::keys`]'s decision, not this one's
+    /// — this is only where they happen, so the box cannot have a second,
+    /// private key table that drifts from the app's. `<Enter>` never arrives
+    /// here: sending is the agents' business, and the keymap asks the pane
+    /// that question first.
+    pub fn apply(&mut self, key: ChatKey) {
+        match key {
             // A new line instead of sending. Only terminals that report the
             // modifier can deliver Shift+Enter (kitty, WezTerm, foot, Ghostty,
             // recent Alacritty); elsewhere it arrives as a plain Enter, which
             // is why Alt+Enter does the same thing and is the reliable one.
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) || alt => {
-                self.input.insert("\n")
-            }
-            KeyCode::Backspace => self.input.backspace(),
-            KeyCode::Delete => self.input.delete_forward(),
-            KeyCode::Left => self.input.move_left(),
-            KeyCode::Right => self.input.move_right(),
-            KeyCode::Home => self.input.move_home(),
-            KeyCode::End => self.input.move_end(),
-            KeyCode::Char(c) if !ctrl && !alt => self.input.insert(&c.to_string()),
-            KeyCode::Up => self.scroll_by(1),
-            KeyCode::Down => self.scroll_by(-1),
-            KeyCode::PageUp => self.scroll_by(10),
-            KeyCode::PageDown => self.scroll_by(-10),
-            KeyCode::Esc => self.input.clear(),
-            _ => return false,
+            ChatKey::Newline => self.input.insert("\n"),
+            ChatKey::Backspace => self.input.backspace(),
+            ChatKey::Delete => self.input.delete_forward(),
+            ChatKey::Left => self.input.move_left(),
+            ChatKey::Right => self.input.move_right(),
+            ChatKey::Home => self.input.move_home(),
+            ChatKey::End => self.input.move_end(),
+            ChatKey::Insert(c) => self.input.insert(&c.to_string()),
+            ChatKey::Scroll(rows) => self.scroll_by(rows),
+            ChatKey::Clear => self.input.clear(),
         }
-        true
     }
 }
 
@@ -548,9 +543,27 @@ fn render_message(out: &mut Vec<Line<'static>>, message: &Message, width: usize)
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    use crate::app::keys::{self, Intent};
+    use crate::app::Focus;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// Press a key the way the app does: the pure keymap decides which pane
+    /// owns it, and the chat runs what it is handed. The editing keys are
+    /// tested through the real table rather than a private entry point, so a
+    /// key that stopped reaching the box fails here.
+    fn press(chat: &mut Chat, key: KeyEvent) -> bool {
+        match keys::key(Focus::Chat, false, key) {
+            Intent::Chat(intent) => {
+                chat.apply(intent);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn pane(agent: AgentId) -> Pane<'static> {
@@ -619,12 +632,12 @@ mod tests {
         assert_eq!(bottom, vec!["you › line 4"], "anchored at the newest");
 
         // Up and down are the pane's own keys.
-        assert!(chat.key(key(KeyCode::Up)));
+        assert!(press(&mut chat, key(KeyCode::Up)));
         let up = shown(&chat.visible_lines(&pane, 20, 2));
         assert_ne!(up, bottom, "scrolling shows what was above the fold");
         assert!(up.iter().any(|row| row.contains("line 3")), "{up:?}");
 
-        assert!(chat.key(key(KeyCode::Down)));
+        assert!(press(&mut chat, key(KeyCode::Down)));
         assert_eq!(shown(&chat.visible_lines(&pane, 20, 2)), bottom);
         chat.scroll_to_bottom();
         assert_eq!(shown(&chat.visible_lines(&pane, 20, 2)), bottom);
@@ -664,13 +677,16 @@ mod tests {
         let mut chat = Chat::bare();
         let shift = KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT);
 
-        assert!(chat.key(shift), "a modified Enter is an edit");
+        assert!(press(&mut chat, shift), "a modified Enter is an edit");
         assert_eq!(chat.input().text(), "\n");
         assert!(
-            !chat.key(key(KeyCode::Enter)),
+            !press(&mut chat, key(KeyCode::Enter)),
             "a plain Enter must reach the agents"
         );
-        assert!(!chat.key(key(KeyCode::Tab)), "and so must the pane keys");
+        assert!(
+            !press(&mut chat, key(KeyCode::Tab)),
+            "and so must the pane keys"
+        );
     }
 
     /// A message taller than the pane must show its *end*, not its start: the
@@ -851,18 +867,18 @@ mod tests {
         // A family emoji is one grapheme and three code points.
         chat.insert("x\u{1f469}\u{200d}\u{1f469}\u{200d}\u{1f466}y");
 
-        assert!(chat.key(key(KeyCode::Backspace)));
+        assert!(press(&mut chat, key(KeyCode::Backspace)));
         assert_eq!(
             chat.input().text(),
             "x\u{1f469}\u{200d}\u{1f469}\u{200d}\u{1f466}"
         );
-        assert!(chat.key(key(KeyCode::Backspace)));
+        assert!(press(&mut chat, key(KeyCode::Backspace)));
         assert_eq!(chat.input().text(), "x", "the whole emoji went at once");
 
         // And the cursor is where the typing goes, not only where it can be
         // deleted from: after moving left, the character is inserted before `x`.
-        assert!(chat.key(key(KeyCode::Left)));
-        assert!(chat.key(key(KeyCode::Char('A'))));
+        assert!(press(&mut chat, key(KeyCode::Left)));
+        assert!(press(&mut chat, key(KeyCode::Char('A'))));
         assert_eq!(chat.input().text(), "Ax");
     }
 }
