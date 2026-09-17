@@ -348,6 +348,14 @@ fn absorb(state: &mut ActorState, transcript: &mut Vec<Message>, command: AgentM
             // the same news twice; anything it cannot know about is still
             // ours to announce.
             *transcript = messages;
+            // A nudge parked here is already in that transcript — the UI echoes
+            // every human message before sending it — so keeping the copy would
+            // hand the model the same words twice at the next boundary. (That is
+            // the cancelled-run case: the run ended before the nudge was folded
+            // in, and the human has since written again.)
+            state
+                .deferred
+                .retain(|command| !matches!(command, AgentMsg::Nudge(_)));
             // The human may have typed while a tool batch was running, which
             // puts their words between an assistant's calls and their results;
             // strict servers reject that shape.
@@ -1556,6 +1564,33 @@ mod tests {
             "fix the parser"
         );
         assert_eq!(summarize(&json!({})), "");
+    }
+
+    /// A nudge parked during a run that was cancelled is already in the UI's
+    /// transcript, which echoes every human message. Adopting that transcript
+    /// must not deliver the parked copy a second time.
+    #[test]
+    fn adopting_a_transcript_drops_parked_nudges() {
+        let mut state = ActorState::default();
+        let mut transcript = vec![Message::system("sys")];
+        state
+            .deferred
+            .push(AgentMsg::Nudge("said once".to_string()));
+
+        let carried = vec![Message::system("sys"), Message::user("said once")];
+        assert!(matches!(
+            absorb(&mut state, &mut transcript, AgentMsg::Run(carried)),
+            Fold::Run
+        ));
+        assert_eq!(transcript.len(), 2, "the UI's transcript wins");
+        assert!(state.deferred.is_empty(), "the parked copy is gone");
+
+        // The next message boundary has nothing left to inject, or the model
+        // would answer the same sentence twice.
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let mut messages = Vec::new();
+        drain_mailbox(&rx, &AtomicBool::new(false), &mut messages, &mut state);
+        assert!(messages.is_empty(), "no duplicate user message");
     }
 
     #[test]
