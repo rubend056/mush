@@ -34,8 +34,9 @@ const READ_SLICE: Duration = Duration::from_millis(200);
 /// A request body is small; a write that blocks this long is a dead endpoint.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A response body larger than this is refused while it is being read, so a
-/// server cannot make mush allocate without bound (docs §8).
-const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+/// server cannot make mush allocate without bound (docs §8). Generous on
+/// purpose: a big diff or a long model reply is normal work.
+const MAX_BODY_BYTES: usize = 80 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct Response {

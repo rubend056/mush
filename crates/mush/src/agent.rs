@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Read;
+use std::io::{ErrorKind, Read};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -33,8 +33,17 @@ use crate::http;
 
 /// Safety valve: how many model turns one run may take. The final turn is a
 /// wrap-up turn — tools are withdrawn and the model is asked to summarize — so
-/// hitting the limit produces a result, not an error (finding N1).
+/// hitting the limit produces a result, not an error (finding N1). The human
+/// still gets an explicit notice when the limit is reached.
 const MAX_TURNS: usize = 24;
+/// Ceiling on one model reply, in tokens. It has to cover a thinking model's
+/// reasoning too: when the cap is spent before the visible answer, the reply
+/// arrives cut off (`finish_reason: length`) and the run fails loudly instead
+/// of ending as if the work were done.
+const MAX_REPLY_TOKENS: u32 = 20_480;
+/// Ceiling on a compaction summary. A summary is prose, not a transcript, but
+/// reasoning tokens count against it too.
+const COMPACT_REPLY_TOKENS: u32 = 10_240;
 /// How deep subagent chains may go (0 = root agent only).
 pub const MAX_DEPTH: usize = 3;
 /// Hard ceiling on simultaneously running agents across the whole tree.
@@ -82,6 +91,10 @@ pub enum AgentEvent {
         cancel: Arc<AtomicBool>,
     },
     Status(String),
+    /// A line for the transcript that is not a message and not a failure: a
+    /// limit the run reached, say. Unlike `Status` it stays visible, and unlike
+    /// `Error` it does not mark the run failed.
+    Notice(String),
     Message(Message),
     Done,
     Error(String),
@@ -433,6 +446,16 @@ fn run_loop(
         // A long task then ends with a report of what was done and what is
         // left, instead of a bare `stopped after 24 turns` (finding N1).
         let wrap_up = turn + 1 == MAX_TURNS;
+        if wrap_up {
+            // The wrap-up turn still ends the run with a summary (finding N1),
+            // but the human should learn why tools suddenly went away.
+            actor.ctx.emit(
+                actor.id,
+                AgentEvent::Notice(format!(
+                    "turn limit reached ({MAX_TURNS} turns) — asking the model to wrap up"
+                )),
+            );
+        }
         drain_mailbox(&actor.rx, cancel, messages, state);
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.to_string());
@@ -481,7 +504,7 @@ fn run_loop(
             tool_choice: if wrap_up { "none" } else { "auto" },
             stream: false,
             temperature: 0.2,
-            max_tokens: 2048,
+            max_tokens: MAX_REPLY_TOKENS,
             thinking: None,
             reasoning_effort: None,
         };
@@ -505,6 +528,13 @@ fn run_loop(
             // The reader stops the moment the human cancels; that is a
             // cancellation, not a failure to reach the endpoint.
             Err(_) if cancel.load(Ordering::SeqCst) => return Err(CANCELLED.to_string()),
+            // A refusal — a body past `MAX_BODY_BYTES`, a malformed status or
+            // chunk line — is not a connection failure: the endpoint answered,
+            // and saying so is the difference between "check the URL" and "the
+            // reply was too big".
+            Err(error) if error.kind() == ErrorKind::InvalidData => {
+                return Err(format!("the endpoint's reply was refused: {error}"));
+            }
             Err(error) => {
                 return Err(format!("cannot reach {}: {error}", cfg.base_url));
             }
@@ -555,6 +585,12 @@ fn run_loop(
         let Some(choice) = parsed.choices.into_iter().next() else {
             return Err("model returned no choices".to_string());
         };
+        // `length` means the endpoint cut the reply off at `max_tokens` — with
+        // a thinking model the cap can be spent before any visible text. Such a
+        // reply is not a result: the text is partial and a tool call may be
+        // half-written JSON, so the run fails loudly below instead of ending as
+        // if the work were done.
+        let truncated = choice.finish_reason.as_deref() == Some("length");
 
         let assistant = sanitize_tool_calls(choice.message);
         let tool_calls = assistant.tool_calls().to_vec();
@@ -572,6 +608,28 @@ fn run_loop(
 
         messages.push(assistant.clone());
         actor.ctx.emit(actor.id, AgentEvent::Message(assistant));
+
+        if truncated {
+            // Every call in the emitted message must be answered or the
+            // transcript keeps a dangling tool call, but a call cut off at the
+            // token cap must never run: its arguments are whatever JSON
+            // survived. Answer them with the reason, then end the run saying
+            // why — a reply that stopped mid-sentence must not look finished.
+            for call in &tool_calls {
+                let message = Message::tool(
+                    call.id.clone(),
+                    format!(
+                        "error: the model's reply was cut off at {MAX_REPLY_TOKENS} tokens; this call was not run"
+                    ),
+                );
+                messages.push(message.clone());
+                actor.ctx.emit(actor.id, AgentEvent::Message(message));
+            }
+            return Err(format!(
+                "the model's reply was cut off at the {MAX_REPLY_TOKENS}-token limit \
+                 (finish_reason: length) — nothing after it ran"
+            ));
+        }
 
         if wrap_up {
             // Whatever the model wrote is the run's result. If it tried to keep
@@ -596,7 +654,7 @@ fn run_loop(
             if content.is_empty() {
                 actor.ctx.emit(
                     actor.id,
-                    AgentEvent::Status("model produced an empty reply".into()),
+                    AgentEvent::Notice("model produced an empty reply".into()),
                 );
             }
             // Parked nudges belong after the reply; the human wrote them while
@@ -739,7 +797,7 @@ fn compact_history(
         tool_choice: "none",
         stream: false,
         temperature: 0.2,
-        max_tokens: 1024,
+        max_tokens: COMPACT_REPLY_TOKENS,
         thinking: if cfg.thinking_enabled() {
             Some(json!({ "type": "enabled" }))
         } else {

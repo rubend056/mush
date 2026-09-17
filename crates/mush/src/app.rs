@@ -545,6 +545,13 @@ impl App {
                 // phases it is derived from.
                 self.recompute_busy();
             }
+            AgentEvent::Notice(text) => {
+                // A limit the run reached (it still produced a result), or a
+                // reply that was empty: a line in the transcript, tagged with
+                // the agent it concerns (finding B19).
+                self.note_for(id, text);
+                self.chat_scroll = 0;
+            }
             AgentEvent::Message(message) => {
                 if id == 0 {
                     self.chat.push(message);
