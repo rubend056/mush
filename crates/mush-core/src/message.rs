@@ -234,6 +234,26 @@ pub struct ChatResponse {
     pub choices: Vec<Choice>,
     #[serde(default)]
     pub error: Option<ApiError>,
+    /// What the endpoint counted for this request, when it reports it at all.
+    /// The only *real* token count mush ever gets: a server that omits it
+    /// leaves the bytes-per-token estimate as the one number there is.
+    #[serde(default)]
+    pub usage: Option<Usage>,
+}
+
+/// Token counts as the endpoint reports them.
+///
+/// Loose like the rest of the module: every field defaults, because servers
+/// disagree about which of the three they send — `total_tokens` most of all.
+/// A count is read, never invented: nothing here is derived from the text.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -368,6 +388,38 @@ mod tests {
         message.ensure_tool_call_ids();
         message.ensure_tool_call_ids();
         assert_eq!(serde_json::to_string(&message).unwrap(), before);
+    }
+
+    /// A reply may report its own token counts; what mush *sends* never does,
+    /// so a parsed one is not re-serialized (the response type is only ever
+    /// read from the wire).
+    #[test]
+    fn usage_is_kept_and_defaults_when_a_server_omits_it() {
+        let reply: ChatResponse = serde_json::from_str(
+            r#"{"choices":[],"usage":{"prompt_tokens":1200,"completion_tokens":34,"total_tokens":1234}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            reply.usage,
+            Some(Usage {
+                prompt_tokens: 1200,
+                completion_tokens: 34,
+                total_tokens: 1234,
+            })
+        );
+        // A server that sends none, or only some of the three, is not an error.
+        let bare: ChatResponse = serde_json::from_str(r#"{"choices":[]}"#).unwrap();
+        assert_eq!(bare.usage, None);
+        let partial: ChatResponse =
+            serde_json::from_str(r#"{"choices":[],"usage":{"completion_tokens":7}}"#).unwrap();
+        assert_eq!(
+            partial.usage,
+            Some(Usage {
+                prompt_tokens: 0,
+                completion_tokens: 7,
+                total_tokens: 0,
+            })
+        );
     }
 
     #[test]

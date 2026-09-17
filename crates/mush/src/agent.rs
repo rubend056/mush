@@ -66,6 +66,55 @@ fn reply_cap(cfg: &Config) -> u32 {
     let share = (cfg.context_tokens / 4) as u64;
     MAX_REPLY_TOKENS.min(share.max(1024) as u32)
 }
+/// The real token counts the endpoint reported for this run's calls, summed
+/// over the turns it reported them on. `None` until a reply carries `usage`: a
+/// server that reports none leaves mush's own bytes-per-token estimate as the
+/// only number there is, and that estimate is what the UI's meter shows.
+#[derive(Clone, Copy, Default)]
+struct RunUsage {
+    prompt: u64,
+    completion: u64,
+    total: u64,
+    /// Whether a reply that was counted left the total out. A sum with a hole
+    /// in it is not a total, so the two parts stand in for one.
+    total_missing: bool,
+}
+
+impl RunUsage {
+    fn add(&mut self, usage: &mush_core::Usage) {
+        self.prompt += usage.prompt_tokens;
+        self.completion += usage.completion_tokens;
+        if usage.total_tokens == 0 {
+            self.total_missing = true;
+        } else {
+            self.total += usage.total_tokens;
+        }
+    }
+
+    /// The line the run reports. A server that omits the total still gets one:
+    /// the two parts are what it counted, and adding them invents nothing.
+    fn line(&self) -> String {
+        let total = if self.total_missing {
+            self.prompt + self.completion
+        } else {
+            self.total
+        };
+        format!(
+            "the endpoint counted {} prompt + {} completion tokens this run ({total} total)",
+            self.prompt, self.completion
+        )
+    }
+}
+
+/// Report the endpoint's own numbers once, when the run ends. Cheap and rare
+/// (one line per run), and the only place a real count can come from: the
+/// UI's meter is bytes/3, which is all a server without `usage` offers.
+fn report_usage(actor: &Actor, usage: Option<RunUsage>) {
+    if let Some(usage) = usage {
+        actor.ctx.emit(actor.id, AgentEvent::Notice(usage.line()));
+    }
+}
+
 /// The reply's finish reason when it is none of the three mush understands:
 /// `stop`, a tool batch, and the token cap. `content_filter` is the endpoint
 /// refusing to hand over what the model wrote; any other value is a reply the
@@ -810,6 +859,9 @@ fn run_loop(
     let mut repeats = 0usize;
     // Consecutive replies the endpoint cut off at the token cap.
     let mut cut_offs = 0usize;
+    // What the endpoint itself counted, when it says: the UI's meter is an
+    // estimate, and this is the one number that is not.
+    let mut usage: Option<RunUsage> = None;
 
     for turn in 0..RUNAWAY_TURNS {
         // The last turn is a wrap-up: no tools, and a request for a summary.
@@ -958,6 +1010,10 @@ fn run_loop(
         let Some(choice) = reply.choices.into_iter().next() else {
             return Err("model returned no choices".to_string());
         };
+        // Read before the reply's other parts are consumed below.
+        if let Some(reported) = reply.usage.as_ref() {
+            usage.get_or_insert_with(RunUsage::default).add(reported);
+        }
         // `length` means the endpoint cut the reply off at `max_tokens` — with
         // a thinking model the cap can be spent before any visible text. Such a
         // reply is not a result: the text is partial and a tool call may be
@@ -1100,6 +1156,7 @@ fn run_loop(
                     "stopped after {RUNAWAY_TURNS} turns without finishing (runaway guard)"
                 ))
             } else {
+                report_usage(actor, usage);
                 Ok(Some(content))
             };
         }
@@ -1142,6 +1199,7 @@ fn run_loop(
             if steered {
                 continue;
             }
+            report_usage(actor, usage);
             return Ok(if content.is_empty() {
                 None
             } else {
@@ -3022,6 +3080,91 @@ mod tests {
         );
         let _ = fs::remove_dir_all(actor.ws.root());
         let _ = mailbox;
+    }
+
+    /// A server that reports `usage` is the only source of a *real* token
+    /// count: the UI's meter is bytes/3. The run reports what it was told,
+    /// once, when the run ends.
+    #[test]
+    fn the_run_reports_the_endpoints_own_token_counts() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .says("all done")
+                .with_usage(1_200, 34, 1_234),
+        );
+        let (actor, events, mailbox) = scripted_actor("usage", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::system("you are mush"), Message::user("say hi")];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("all done"));
+
+        let usage: Vec<String> = notices(&events);
+        assert_eq!(usage.len(), 1, "one line per run: {usage:?}");
+        assert_eq!(
+            usage[0],
+            "the endpoint counted 1200 prompt + 34 completion tokens this run (1234 total)"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// A run is more than one call, and the number reported is the run's: the
+    /// parts are added up, and a server that never sends `total_tokens` still
+    /// gets one that adds up.
+    #[test]
+    fn the_runs_usage_adds_up_over_its_calls() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .calls(vec![tool_call("c1", "list_files", json!({}))])
+                .with_usage(1_100, 11, 1_111)
+                .says("done")
+                // The same server, not reporting a total this time.
+                .with_usage(2_200, 22, 0),
+        );
+        let (actor, events, mailbox) = scripted_actor("usage-sum", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::user("look around")];
+
+        run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        let usage: Vec<String> = notices(&events);
+        assert_eq!(usage.len(), 1, "{usage:?}");
+        assert_eq!(
+            usage[0],
+            "the endpoint counted 3300 prompt + 33 completion tokens this run (3333 total)"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// A server that reports nothing leaves mush's own estimate as the only
+    /// number there is, and the run says nothing it was not told.
+    #[test]
+    fn a_server_without_usage_reports_no_numbers() {
+        let scripted = Arc::new(Scripted::new().says("all done"));
+        let (actor, events, mailbox) = scripted_actor("usage-none", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::user("say hi")];
+
+        run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert!(notices(&events).is_empty(), "{:?}", notices(&events));
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// The usage lines a run emitted, in order.
+    fn notices(events: &Recorder) -> Vec<String> {
+        events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(what) if what.contains("endpoint counted") => Some(what),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The three reasons mush does understand are the only ones read as ends:

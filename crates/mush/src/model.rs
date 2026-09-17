@@ -137,7 +137,9 @@ pub(crate) mod fake {
 
     use crossbeam_channel::{Receiver, Sender};
 
-    use mush_core::message::{ChatRequest, ChatResponse, Choice, FunctionCall, Message, ToolCall};
+    use mush_core::message::{
+        ChatRequest, ChatResponse, Choice, FunctionCall, Message, ToolCall, Usage,
+    };
     use serde_json::Value;
 
     use super::{ModelClient, ModelError};
@@ -336,6 +338,24 @@ pub(crate) mod fake {
             self
         }
 
+        /// The reply just scripted carries the endpoint's own token counts, the
+        /// way a server that reports `usage` calls do — and a server that does
+        /// not is every other scripted reply.
+        pub fn with_usage(self, prompt: u64, completion: u64, total: u64) -> Self {
+            let mut rules = self.rules.lock().expect("no test panicked mid-script");
+            if let Some(rule) = rules.back_mut() {
+                if let Answer::Now(Ok(reply)) | Answer::Held(_, Ok(reply)) = &mut rule.answer {
+                    reply.usage = Some(Usage {
+                        prompt_tokens: prompt,
+                        completion_tokens: completion,
+                        total_tokens: total,
+                    });
+                }
+            }
+            drop(rules);
+            self
+        }
+
         /// Every request made so far, in order.
         pub fn asked(&self) -> Vec<Asked> {
             self.asked
@@ -426,6 +446,7 @@ pub(crate) mod fake {
                 finish_reason: Some(finish_reason.to_string()),
             }],
             error: None,
+            usage: None,
         }
     }
 
