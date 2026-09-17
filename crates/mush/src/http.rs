@@ -321,22 +321,31 @@ fn exchange(
         return Err((error, heard));
     }
 
-    let status_line = match read_line(&mut stream, watch) {
-        Ok(Some(line)) => line,
-        // Nothing at all came back: the peer closed the connection before it
-        // answered (a kept connection the server has since dropped), which is
-        // not the same thing as a malformed status line, and must not be
-        // reported as one.
-        Ok(None) => {
-            return Err((
-                io::Error::new(
-                    io::ErrorKind::ConnectionAborted,
-                    "the connection ended before it answered",
-                ),
-                heard,
-            ))
+    // A blank line is not an answer: a kept connection can carry one from the
+    // exchange before it (a server's keep-alive probe, or framing that left a
+    // CRLF behind — see `read_chunked`). Read as the status line it was
+    // reported as `malformed status line: ""`, refusing a reply that had not
+    // even started. Skipping it keeps `heard` false, so a connection that dies
+    // after the blank line is still "nothing heard" and gets its one retry.
+    let status_line = loop {
+        match read_line(&mut stream, watch) {
+            Ok(Some(line)) if line.is_empty() => continue,
+            Ok(Some(line)) => break line,
+            // Nothing at all came back: the peer closed the connection before it
+            // answered (a kept connection the server has since dropped), which is
+            // not the same thing as a malformed status line, and must not be
+            // reported as one.
+            Ok(None) => {
+                return Err((
+                    io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        "the connection ended before it answered",
+                    ),
+                    heard,
+                ))
+            }
+            Err(error) => return Err((error, heard)),
         }
-        Err(error) => return Err((error, heard)),
     };
     heard = true;
     let status = match parse_status(&status_line) {
@@ -747,6 +756,20 @@ fn read_chunked<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<String>
             )
         })?;
         if size == 0 {
+            // The body ends at the zero chunk, but its framing does not: a
+            // trailer section follows — `0 CRLF`, any trailer fields, then a
+            // blank line. Left in the buffer, that blank line was read as the
+            // *next* request's status line on a kept connection, which refused
+            // a healthy reply as `malformed status line: ""`.
+            loop {
+                match read_line(reader, watch)? {
+                    Some(line) if line.is_empty() => break,
+                    // A trailer field: part of this body, not the next reply.
+                    Some(_) => continue,
+                    // The stream ended at the zero chunk; the body is complete.
+                    None => break,
+                }
+            }
             break;
         }
         if out.len() + size > MAX_BODY_BYTES {
@@ -1066,6 +1089,127 @@ mod tests {
         );
         assert_eq!(opened.load(Ordering::SeqCst), 2, "one retry, no more");
         assert_eq!(pool.idle(), 1, "the fresh connection is kept");
+    }
+
+    /// A chunked reply ends with a trailer section, and the blank line that
+    /// ends *that* belongs to the reply that is already over. Left in the
+    /// buffer, it became the next request's "status line" and the endpoint's
+    /// healthy answer was refused as `malformed status line: ""`.
+    #[test]
+    fn a_chunked_reply_does_not_poison_the_kept_connection() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opens = opened.clone();
+        let mut queue = std::collections::VecDeque::new();
+        // One connection: a chunked reply (a trailer field, then the blank line
+        // that ends the trailer), then the answer to the next request.
+        let chunked = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                       Transfer-Encoding: chunked\r\n\r\n\
+                       9\r\n{\"one\":1}\r\n0\r\nX-Trace: abc\r\n\r\n";
+        queue.push_back(wire(&written, &[chunked, &ok("{\"two\":2}")]));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+            opens.fetch_add(1, Ordering::SeqCst);
+            match queue.pop_front() {
+                Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+                None => Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "the test scripted no more connections",
+                )),
+            }
+        };
+        let pool = Pool::new();
+        let url = "http://models.test:8078/v1/chat/completions";
+
+        assert_eq!(
+            send(&pool, &mut opener, url, "{}").unwrap().body,
+            "{\"one\":1}"
+        );
+        let second = send(&pool, &mut opener, url, "{}").unwrap();
+        assert_eq!(
+            second.body, "{\"two\":2}",
+            "the kept connection answers the next request"
+        );
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            1,
+            "the chunked reply's connection is reused cleanly"
+        );
+    }
+
+    /// A server can put a bare CRLF in front of a reply on an idle kept
+    /// connection (a keep-alive probe, or a framing slip). It is not a status
+    /// line: the reply behind it is read normally, on the same connection.
+    #[test]
+    fn a_blank_line_before_a_status_line_is_skipped() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opens = opened.clone();
+        let mut queue = std::collections::VecDeque::new();
+        let second = format!("\r\n{}", ok("{\"two\":2}"));
+        queue.push_back(wire(&written, &[&ok("{\"one\":1}"), &second]));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+            opens.fetch_add(1, Ordering::SeqCst);
+            match queue.pop_front() {
+                Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+                None => Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "the test scripted no more connections",
+                )),
+            }
+        };
+        let pool = Pool::new();
+        let url = "http://models.test:8078/v1/chat/completions";
+
+        assert_eq!(
+            send(&pool, &mut opener, url, "{}").unwrap().body,
+            "{\"one\":1}"
+        );
+        assert_eq!(
+            send(&pool, &mut opener, url, "{}").unwrap().body,
+            "{\"two\":2}"
+        );
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            1,
+            "no reconnect: the blank line did not end the connection"
+        );
+    }
+
+    /// The blank line and then the server is gone (the shape the pool sees
+    /// when a server probes an idle connection and closes it). Nothing was
+    /// heard from the connection, so the request is answered on a fresh one —
+    /// not refused as a malformed status line.
+    #[test]
+    fn a_blank_line_then_a_closed_connection_is_retried() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opens = opened.clone();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(wire(&written, &[&ok("{\"one\":1}"), "\r\n"]));
+        queue.push_back(wire(&written, &[&ok("{\"two\":2}")]));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+            opens.fetch_add(1, Ordering::SeqCst);
+            match queue.pop_front() {
+                Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+                None => Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "the test scripted no more connections",
+                )),
+            }
+        };
+        let pool = Pool::new();
+        let url = "http://models.test:8078/v1/chat/completions";
+
+        assert_eq!(
+            send(&pool, &mut opener, url, "{}").unwrap().body,
+            "{\"one\":1}"
+        );
+        let second = send(&pool, &mut opener, url, "{}").unwrap();
+        assert_eq!(
+            second.body, "{\"two\":2}",
+            "the request was answered on a fresh connection"
+        );
+        assert_eq!(opened.load(Ordering::SeqCst), 2, "one retry, no more");
     }
 
     /// A reply that ends the connection — `Connection: close`, or a body framed
