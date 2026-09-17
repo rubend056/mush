@@ -31,6 +31,7 @@ use mush_core::{
 
 use crate::agent::{self, spawn, AgentEvent, AgentMsg, RootHandle};
 use crate::http;
+use crate::session_save::SessionSave;
 
 pub enum Msg {
     Key(KeyEvent),
@@ -116,6 +117,17 @@ pub enum StatusKind {
 /// command, short enough that it never becomes furniture.
 const INFO_TTL: Duration = Duration::from_secs(5);
 
+/// How long the session file may lag the conversation.
+///
+/// The human reads the transcript, not the file, and the file is only read
+/// again by the *next* mush — so a second of staleness is invisible, while a
+/// write per streamed message is a lag on every tool result. A second is also
+/// what a crash costs: at most 1000 ms of streamed chat, and never the human's
+/// own message, a command that changed what is stored, or a compaction, all of
+/// which are written before they return (see `App::flush_session` and the marks
+/// in `on_agent`).
+const SESSION_DEBOUNCE: Duration = Duration::from_secs(1);
+
 #[derive(Clone, Debug)]
 pub struct Status {
     pub kind: StatusKind,
@@ -139,6 +151,14 @@ pub struct App {
     pub tree: AgentTree,
     /// Shared with the agent actors so runtime config changes apply everywhere.
     pub cfg_shared: Arc<Mutex<Config>>,
+    /// Where a snapshot of this conversation goes. The serialization and the
+    /// write happen on the writer's own thread; this thread only hands the
+    /// state over.
+    session_save: Arc<dyn SessionSave>,
+    /// When the conversation last changed with no snapshot handed over since.
+    /// `None` means the file is current. `tick` is where it is turned into a
+    /// write, so a burst of messages costs one rebuild instead of one each.
+    session_dirty_at: Option<Instant>,
     /// The UI event channel, needed to respawn the root actor on /new.
     ui_tx: Sender<Msg>,
     /// When the git snapshot was last taken, so a long run refreshes it.
@@ -162,6 +182,7 @@ impl App {
         root: RootHandle,
         ui_tx: Sender<Msg>,
         models: Vec<http::Model>,
+        session_save: Arc<dyn SessionSave>,
     ) -> Self {
         let system = Message::system(prompt::system_prompt(&ws.root_str()));
         let (messages, stored_agents) = match stored {
@@ -179,6 +200,8 @@ impl App {
             git: None,
             tree: AgentTree::rooted(root),
             cfg_shared,
+            session_save,
+            session_dirty_at: None,
             ui_tx,
             git_at: None,
             git_in_flight: false,
@@ -465,6 +488,22 @@ impl App {
         if self.tree.expire_cancels() {
             self.dirty_screen = true;
         }
+        // The file is allowed to lag the conversation by `SESSION_DEBOUNCE`.
+        // This is where that lag is paid: the rebuild and the hand-over happen
+        // once per interval, on a tick, and never in the handler that received
+        // a message — which is what makes a tool result cost the UI nothing.
+        if self
+            .session_dirty_at
+            .map(|dirty_at| dirty_at.elapsed() >= SESSION_DEBOUNCE)
+            .unwrap_or(false)
+        {
+            self.save_session();
+        }
+        // A write that failed on the writer's thread has no caller to return
+        // to, so it is picked up here — the next tick after it happened.
+        if let Some(error) = self.session_save.take_error() {
+            self.fail(format!("could not save session: {error}"));
+        }
     }
 
     fn on_agent(&mut self, id: AgentId, event: AgentEvent) {
@@ -488,6 +527,9 @@ impl App {
                 // The brief opens the child's transcript: the model sees the
                 // brief, so the human should too (finding B13).
                 self.chat.push_message(opened.id, opened.opening);
+                // The node — its brief, branch and parent — is stored, so a
+                // restart comes back with the same tree.
+                self.mark_session_dirty();
             }
             AgentEvent::Running { cancel } => {
                 // A run started, possibly one the UI did not ask for (an idle
@@ -511,9 +553,11 @@ impl App {
             }
             AgentEvent::Message(message) => {
                 self.chat.push_message(id, message);
-                if id == AgentId::ROOT {
-                    self.save_session();
-                }
+                // Every message is part of what the file stores — a subagent's
+                // as much as the root's — but the mark is O(1): the rebuild and
+                // the write wait for the debounced tick, so a streamed tool
+                // result cannot stall the frame that shows it.
+                self.mark_session_dirty();
                 self.chat.scroll_to_bottom();
             }
             AgentEvent::Stopped => {
@@ -521,6 +565,9 @@ impl App {
                 // and the actor is idle and resumable. Saying which one it is
                 // is the difference between a lost agent and a parked one.
                 self.tree.stopped(id);
+                // The phase is stored, so a restart must not show a stopped run
+                // as one that never happened.
+                self.mark_session_dirty();
                 self.refresh_git();
                 // Only the agent the human is looking at needs the bar; a
                 // stop they did not ask for still shows as ⊘ on its row.
@@ -531,6 +578,7 @@ impl App {
             }
             AgentEvent::Error(error) => {
                 self.tree.fail(id, error.clone());
+                self.mark_session_dirty();
                 self.refresh_git();
                 self.chat.note_error_for(id, error);
                 self.chat.scroll_to_bottom();
@@ -540,6 +588,7 @@ impl App {
                 // Every Done replaces the row's summary; keeping the first one
                 // described a run that ended long ago (finding B14).
                 self.tree.finish(id, summary);
+                self.mark_session_dirty();
                 self.refresh_git();
             }
             AgentEvent::Context { tokens } => {
@@ -559,9 +608,14 @@ impl App {
                 let carried = Message::user(prompt::compaction_message(&summary));
                 self.chat.replace_transcript(id, vec![carried]);
                 if id == AgentId::ROOT {
-                    self.save_session();
+                    // A fold is deliberate and expensive, and the transcript it
+                    // leaves is what a restart resumes from — so it is written
+                    // before this returns rather than waiting out the debounce.
+                    self.flush_session();
                     self.chat
                         .note("context compacted — continuing from a summary");
+                } else {
+                    self.mark_session_dirty();
                 }
                 self.chat.scroll_to_bottom();
             }
@@ -695,7 +749,10 @@ impl App {
             self.chat
                 .push_message(AgentId::ROOT, Message::user(text.clone()));
             self.chat.scroll_to_bottom();
-            self.save_session();
+            // The human's own words are the one thing worth blocking on: the
+            // run they start may take minutes, and a crash in it must not lose
+            // the request. This is one write per turn, not one per response.
+            self.flush_session();
             // The root's own phase, not the tree's: a napping orchestrator is
             // idle, and its next message starts a run rather than nudging a
             // conversation that is not in flight.
@@ -787,7 +844,9 @@ impl App {
                 }
                 self.cfg.set_context(tokens);
                 self.apply_config();
-                self.save_session();
+                // A stated window is remembered for this workspace, so it is on
+                // disk before the command returns.
+                self.flush_session();
                 self.say(format!(
                     "{} — remembered for this workspace",
                     self.context_label()
@@ -1124,7 +1183,7 @@ impl App {
                     self.chat
                         .note(format!("merged {branch} into HEAD · {branch_note}"));
                     self.refresh_git();
-                    self.save_session();
+                    self.flush_session();
                 }
             },
             "/discard" => {
@@ -1150,7 +1209,7 @@ impl App {
                         "discarded agent #{id} — its work is gone · {outcome}"
                     ));
                     self.refresh_git();
-                    self.save_session();
+                    self.flush_session();
                 }
             }
             _ => {}
@@ -1202,6 +1261,10 @@ impl App {
         let unmerged = node.branch.clone().filter(|_| node.landed.is_none());
         self.tree.reap(&[id]);
         self.chat.forget(id);
+        // Written before this returns: a forgotten agent that came back after a
+        // restart would be the worst kind of surprise, and it is one line to
+        // prevent.
+        self.flush_session();
         match unmerged {
             Some(branch) => self.chat.note(format!(
                 "forgot agent #{id} — {branch} is untouched, so /worktrees lists it again"
@@ -1235,7 +1298,9 @@ impl App {
         self.spin = 0;
         self.discover_worktrees();
         self.refresh_git();
-        self.save_session();
+        // The old conversation is gone from this moment: if the write were left
+        // to the debounce, a crash would bring it back with the next start.
+        self.flush_session();
         self.say("new chat — agents stopped, root restarted");
     }
 
@@ -1249,7 +1314,52 @@ impl App {
         }
     }
 
+    /// Note that what the session stores has changed.
+    ///
+    /// O(1), because the caller is a message handler on the UI thread: a
+    /// streamed response must not rebuild a session, let alone write one. The
+    /// mark is deliberately *not* moved by later changes — a stream that never
+    /// pauses still reaches the file once per `SESSION_DEBOUNCE` instead of
+    /// being deferred until it stops.
+    fn mark_session_dirty(&mut self) {
+        if self.session_dirty_at.is_none() {
+            self.session_dirty_at = Some(Instant::now());
+        }
+    }
+
+    /// Rebuild the session and hand it to the writer, which serializes it and
+    /// writes it on its own thread.
+    ///
+    /// Called from the debounced tick. The rebuild is the one part of a save
+    /// that cannot leave this thread — the conversation lives here — so it is
+    /// paid once per `SESSION_DEBOUNCE` rather than once per streamed message,
+    /// and never while a burst of them is being drained.
     fn save_session(&mut self) {
+        self.session_dirty_at = None;
+        let session = self.session_snapshot();
+        self.session_save.save(session);
+    }
+
+    /// Write the session and wait for the disk: the call sites that mean "this
+    /// must not be lost" — the human's own message, a command that changed what
+    /// is stored, a compaction, quitting.
+    ///
+    /// Nothing else waits, which is what keeps the wait off the message path: a
+    /// streamed response is covered by the debounce and by the flush on the way
+    /// out, so the most a crash can cost is the last `SESSION_DEBOUNCE` of chat.
+    fn flush_session(&mut self) {
+        self.session_dirty_at = None;
+        let session = self.session_snapshot();
+        self.session_save.save(session);
+        self.session_save.flush();
+        if let Some(error) = self.session_save.take_error() {
+            self.fail(format!("could not save session: {error}"));
+        }
+    }
+
+    /// The conversation as it is stored: the root transcript, every subagent's,
+    /// and the endpoint selection it was held against.
+    fn session_snapshot(&self) -> Session {
         // Every subagent, not just the root: without this a relaunch forgot
         // each child's context, and "continue that agent" meant writing the
         // brief again from scratch.
@@ -1289,7 +1399,7 @@ impl App {
                     .collect(),
             })
             .collect();
-        let session = Session {
+        Session {
             root: self.ws.root_str(),
             model: self.cfg.model.clone(),
             provider: self.cfg.provider.name().to_string(),
@@ -1300,9 +1410,6 @@ impl App {
             updated: session::now_secs(),
             messages: self.chat.transcript(AgentId::ROOT).to_vec(),
             agents,
-        };
-        if let Err(error) = session.save(self.ws.root()) {
-            self.fail(format!("could not save session: {error}"));
         }
     }
 
@@ -1482,12 +1589,29 @@ impl App {
     }
 }
 
+impl Drop for App {
+    /// The exit flush: whatever the debounce had not written yet goes out here,
+    /// so quitting — the one way out of the event loop — costs nothing. This is
+    /// what bounds a crash to `SESSION_DEBOUNCE` of streamed chat rather than to
+    /// everything since the last boundary. A failure here is reported the usual
+    /// way and then lost with the status line: there is no screen left to read
+    /// it on.
+    fn drop(&mut self) {
+        if self.session_dirty_at.is_some() {
+            self.flush_session();
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use crossbeam_channel::Receiver;
+
+    use crate::session_save;
+    use crate::session_save::SessionSave;
 
     /// The transient line the bar would show, or the empty string.
     fn text_of(app: &App) -> &str {
@@ -1537,7 +1661,67 @@ mod tests {
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
         let handle = spawn(cfg.clone(), tx.clone(), root.clone());
-        App::new(ws, cfg, None, handle, tx, Vec::new())
+        App::new(
+            ws,
+            cfg,
+            None,
+            handle,
+            tx,
+            Vec::new(),
+            session_save::fake::Recorder::new(),
+        )
+    }
+
+    /// An `App` whose session writes go to a real writer on a real path, for
+    /// the tests that read the file back. The writer is returned so a test can
+    /// see how many writes the conversation cost.
+    fn app_writing(root: &std::path::Path) -> (App, Arc<session_save::Writer>) {
+        let ws = Workspace::new(root).unwrap();
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let handle = spawn(cfg.clone(), tx.clone(), root.to_path_buf());
+        let writer = Arc::new(session_save::Writer::new(root.to_path_buf()));
+        let app = App::new(ws, cfg, None, handle, tx, Vec::new(), writer.clone());
+        (app, writer)
+    }
+
+    /// An `App` on a scratch directory whose saves are recorded instead of
+    /// written, so a test sees what the UI thread handed over and when.
+    fn app_recording(label: &str) -> (App, Arc<session_save::fake::Recorder>) {
+        let root = dir(label);
+        let ws = Workspace::new(&root).unwrap();
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let recorder = session_save::fake::Recorder::new();
+        let app = App::new(ws, cfg, None, handle, tx, Vec::new(), recorder.clone());
+        (app, recorder)
+    }
+
+    /// An empty directory for a session to be written into.
+    fn dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("mush-save-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// One streamed message from the root, the way its actor sends them.
+    fn streamed(app: &mut App, text: &str) {
+        let conversation = app.tree.conversation();
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Message(Message::assistant(text)),
+        });
+    }
+
+    /// Pretend the session became dirty `elapsed` ago, so the debounce is
+    /// tested instead of waited out.
+    fn age_session(app: &mut App, elapsed: Duration) {
+        if app.session_dirty_at.is_some() {
+            app.session_dirty_at = Some(Instant::now() - elapsed);
+        }
     }
 
     /// An isolated agent's worktree with one commit on it, committed exactly the
@@ -1776,7 +1960,15 @@ mod tests {
             }],
         };
 
-        let app = App::new(ws, cfg, Some(stored), handle, tx, Vec::new());
+        let app = App::new(
+            ws,
+            cfg,
+            Some(stored),
+            handle,
+            tx,
+            Vec::new(),
+            session_save::fake::Recorder::new(),
+        );
 
         let node = app
             .tree
@@ -1838,6 +2030,239 @@ mod tests {
         );
     }
 
+    /// A streamed message is the message path, and the message path must build
+    /// nothing: the debounce is what turns a burst of them into one write.
+    #[test]
+    fn a_streamed_message_hands_no_snapshot_to_the_writer() {
+        let (mut app, recorder) = app_recording("streamed");
+        for i in 0..5 {
+            streamed(&mut app, &format!("m{i}"));
+        }
+        assert_eq!(
+            recorder.len(),
+            0,
+            "the handler rebuilt nothing: a tool result costs no snapshot"
+        );
+        assert!(
+            app.session_dirty_at.is_some(),
+            "it did mark the conversation dirty, though"
+        );
+
+        // A second on, the tick pays for all five at once — with the last of
+        // them, which is the state a restart must resume from.
+        age_session(&mut app, SESSION_DEBOUNCE);
+        app.tick();
+        let saved = recorder.saved();
+        assert_eq!(saved.len(), 1, "one snapshot for the burst");
+        assert_eq!(saved[0].messages.len(), 5);
+        assert_eq!(saved[0].messages[4].text(), "m4");
+        assert!(
+            app.session_dirty_at.is_none(),
+            "and the file is current again"
+        );
+    }
+
+    /// The whole point of the debounce, end to end: a burst of root messages
+    /// costs one write, and the file it leaves holds the last of them.
+    #[test]
+    fn a_burst_of_messages_ends_in_one_write_holding_the_last_of_them() {
+        let root = dir("burst");
+        let (mut app, writer) = app_writing(&root);
+        for i in 0..5 {
+            streamed(&mut app, &format!("m{i}"));
+        }
+        assert!(
+            !session::session_path(&root).exists(),
+            "no message wrote a file"
+        );
+
+        age_session(&mut app, SESSION_DEBOUNCE);
+        app.tick();
+        // Wait for the writer rather than for a clock: the hand-over is the
+        // UI thread's, and the write is the writer's.
+        writer.flush();
+        assert_eq!(writer.writes(), 1, "five messages, one write");
+        let stored = Session::load(&root).expect("the burst reached the disk");
+        assert_eq!(stored.messages.len(), 5);
+        assert_eq!(stored.messages.last().unwrap().text(), "m4");
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The human's own message is on disk before the send returns: the run it
+    /// starts may take minutes, and a crash in it must not lose the request.
+    /// This is the boundary the debounce is *not* allowed to cover.
+    #[test]
+    fn a_sent_message_is_on_disk_before_the_send_returns() {
+        let root = dir("send");
+        let (mut app, _writer) = app_writing(&root);
+        app.chat.insert("please port the parser");
+        app.send_message();
+
+        let stored = Session::load(&root).expect("the send flushed it");
+        assert_eq!(
+            stored.messages.last().map(|message| message.text()),
+            Some("please port the parser")
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A window the human stated is remembered for the workspace, so `/context`
+    /// must not lose it: the command is not done until the file says so.
+    #[test]
+    fn a_stated_context_is_on_disk_before_the_command_returns() {
+        let root = dir("context");
+        let (mut app, _writer) = app_writing(&root);
+        app.run_command("/context 240000");
+
+        let stored = Session::load(&root).expect("the command flushed it");
+        assert_eq!(stored.context, Some(240_000));
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `/forget` is a deletion, and a deletion that only lived in memory would
+    /// come back at the next start — the agent would be listed as if the human
+    /// had never dropped it.
+    #[test]
+    fn a_forgotten_agent_is_gone_from_the_file() {
+        let root = repo("forget-file");
+        isolated_work(&root, 6, "leave me");
+        let (mut app, _writer) = app_writing(&root);
+        app.chat
+            .replace_transcript(AgentId(6), vec![Message::user("hello")]);
+
+        app.forget_agent(AgentId(6));
+
+        let stored = Session::load(&root).expect("the command flushed it");
+        assert!(
+            stored.agents.iter().all(|agent| agent.id != 6),
+            "a forgotten agent cannot come back from the file"
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Quitting writes what the debounce had not: the exit flush is what makes
+    /// a crash cost a second of chat rather than everything since the last
+    /// boundary.
+    #[test]
+    fn quitting_writes_the_messages_the_debounce_had_not() {
+        let root = dir("quit");
+        let (mut app, _writer) = app_writing(&root);
+        streamed(&mut app, "the last thing said");
+        assert!(
+            !session::session_path(&root).exists(),
+            "the debounce has not elapsed"
+        );
+
+        drop(app);
+
+        let stored = Session::load(&root).expect("the exit flush wrote it");
+        assert_eq!(
+            stored.messages.last().map(|message| message.text()),
+            Some("the last thing said")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `/new` clears the stored conversation too, not just the visible one: the
+    /// old chat coming back at the next start is exactly what the flush stops.
+    #[test]
+    fn a_new_chat_clears_the_stored_conversation() {
+        let root = dir("new-chat");
+        let (mut app, _writer) = app_writing(&root);
+        app.chat.insert("something worth remembering");
+        app.send_message();
+        assert_eq!(Session::load(&root).unwrap().messages.len(), 1);
+
+        app.run_command("/new");
+
+        let stored = Session::load(&root).expect("the command flushed it");
+        assert!(stored.messages.is_empty(), "the old chat is not resumed");
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `/merge` lands an agent, and landing it is stored: a restart must not
+    /// offer to merge work that is already in HEAD.
+    #[test]
+    fn a_landed_merge_is_in_the_file_before_the_command_returns() {
+        let root = repo("merge-file");
+        isolated_work(&root, 3, "add the parser");
+        let (mut app, _writer) = app_writing(&root);
+        app.worktree_command("/merge", "3");
+
+        let stored = Session::load(&root).expect("the command flushed it");
+        let landed = stored
+            .agents
+            .iter()
+            .find(|agent| agent.id == 3)
+            .expect("the agent it landed");
+        assert_eq!(landed.landed, Some(session::StoredLanded::Merged));
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A compaction is what a restart resumes from, so the folded transcript is
+    /// written before the event returns rather than waiting out the debounce.
+    #[test]
+    fn a_compaction_is_written_before_the_event_returns() {
+        let root = dir("compact");
+        let (mut app, _writer) = app_writing(&root);
+        streamed(&mut app, "a long conversation");
+        let conversation = app.tree.conversation();
+
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Compact {
+                summary: "porting the parser".to_string(),
+            },
+        });
+
+        let stored = Session::load(&root).expect("the fold flushed it");
+        assert_eq!(stored.messages.len(), 1, "the conversation is the summary");
+        assert!(stored.messages[0].text().contains("porting the parser"));
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A background write's failure has no caller to return to, so it waits for
+    /// a tick and is reported the way the flush path reports it: a workspace
+    /// mush cannot write to must not look saved.
+    #[test]
+    fn a_failed_background_write_is_reported_on_a_tick() {
+        use session_save::fake::Recorder;
+
+        let recorder = Recorder::new().fails("no space left on device");
+        let root = dir("failed-write");
+        let ws = Workspace::new(&root).unwrap();
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let mut app = App::new(ws, cfg, None, handle, tx, Vec::new(), recorder);
+        streamed(&mut app, "lost");
+
+        // The debounce hands it over; the scripted write fails; the next tick is
+        // where the UI can hear about it.
+        age_session(&mut app, SESSION_DEBOUNCE);
+        app.tick();
+        app.tick();
+
+        assert_eq!(
+            app.status.as_ref().map(|status| status.kind),
+            Some(StatusKind::Error)
+        );
+        assert!(
+            text_of(&app).contains("could not save session"),
+            "it says what failed: {}",
+            text_of(&app)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// How long one frame costs on a session the size of a real one. A frame
     /// that does not fit in a 60 fps budget is felt as lag, so this is a
     /// regression guard as much as a measurement.
@@ -1893,6 +2318,7 @@ mod tests {
                 id: "test-model".to_string(),
                 context: None,
             }],
+            session_save::fake::Recorder::new(),
         );
         (app, rx)
     }
@@ -2572,7 +2998,15 @@ mod tests {
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
         let handle = spawn(cfg.clone(), tx.clone(), root.clone());
-        let mut app = App::new(ws, cfg, None, handle, tx, Vec::new());
+        let mut app = App::new(
+            ws,
+            cfg,
+            None,
+            handle,
+            tx,
+            Vec::new(),
+            session_save::fake::Recorder::new(),
+        );
 
         assert!(
             app.tree.agents.iter().any(|node| node.id == AgentId(7)),

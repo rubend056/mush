@@ -12,12 +12,14 @@ mod http;
 mod input;
 mod machine;
 mod model;
+mod session_save;
 mod ui;
 
 use std::error::Error;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Receiver};
@@ -360,7 +362,11 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let (tx, rx) = unbounded::<Msg>();
     let root = agent::spawn(config.clone(), tx.clone(), workspace.root().to_path_buf());
-    let mut app = App::new(workspace, config, stored, root, tx.clone(), models);
+    // The session goes out through its own thread: the UI thread hands a
+    // snapshot over and keeps painting (see `session_save`). `App`'s drop is the
+    // exit flush.
+    let save = Arc::new(session_save::Writer::new(workspace.root().to_path_buf()));
+    let mut app = App::new(workspace, config, stored, root, tx.clone(), models, save);
 
     install_panic_hook();
     let mut guard = TerminalGuard::enter()?;

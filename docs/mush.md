@@ -360,8 +360,13 @@ built-in defaults.
 **including itself** — so the directory never shows up in `git status` and never
 needs to be added to the project's own `.gitignore`.
 
-`session.json` is rewritten after every message, so quitting (or crashing) loses
-nothing. On startup the conversation resumes where it left off. `/new` clears it.
+`session.json` is written on its own thread. A streamed message only marks the
+conversation dirty, and the file is rewritten at most once a second — so a tool
+result costs the screen nothing — while a sent message, a command that changed
+what is stored, a compaction and `/new` are written before they return, and
+quitting writes whatever is still only in memory. Quitting therefore loses
+nothing, and a crash can cost at most the last second of a streamed reply. On
+startup the conversation resumes where it left off. `/new` clears it.
 
 ---
 
