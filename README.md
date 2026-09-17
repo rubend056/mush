@@ -98,22 +98,30 @@ The **agents** pane shows the whole tree: depth by indentation, `◐` running,
 `⏸` waiting on children, `✓` done (with its final summary), `✗` failed,
 branch suffix for isolated agents. Enter on a row focuses that agent — the
 chat below switches to its transcript and typing nudges it. `Esc` returns to
-the root, `c` cancels the selected agent, `Ctrl-C` cancels everything.
+the root, `c` cancels the selected agent, `Ctrl-C` cancels everything that is
+running (an idle agent is left alone — it has nothing to cancel).
 
 `isolated: true` gives a child its own git worktree
 (`.mush/wt/<id>` on branch `mush/<id>`), so parallel agents edit real files
-without colliding. **mush never auto-merges** — the tree shows the branch and
-these print the exact commands:
+without colliding. A run's work is **committed** to that branch when the run ends
+(`mush #3: <brief>`), so the branch really carries it. **mush never auto-merges** —
+the tree shows the branch and these print the exact commands:
 
 ```
 /diff <id>      git diff HEAD...mush/3
 /merge <id>     git merge mush/3
-/discard <id>   git worktree remove .mush/wt/3 && git branch -D mush/3
+/discard <id>   git worktree remove --force .mush/wt/3 && git branch -D mush/3
 ```
 
 Leftover worktrees (`mush/*` branches) are rediscovered on startup and shown
 in the tree, so those commands keep working after a restart; `/worktrees`
 re-scans.
+
+Long running conversations are **auto-compacted**: when the history nears the
+endpoint's context window, mush asks the model to summarize everything
+important and continues from `system + summary` (`MUSH_CONTEXT` sets the
+window; the summary appears in the chat). Nothing is silently dropped —
+trimming only cuts in when the model itself cannot produce a summary.
 
 ## Keys
 
@@ -122,14 +130,17 @@ re-scans.
 | `Tab` / `Shift-Tab` | cycle panes (agents, editor, chat) |
 | `Enter` | send message (chat) · focus agent (agents) |
 | `i` / `Esc` | enter / leave insert mode (editor) |
+| `hjkl` · `0` `$` · `g` `G` · `Ctrl-D` `Ctrl-U` | move (editor, normal mode) |
+| `i` `a` `I` `A` `o` `O` · `x` | insert and delete (editor, normal mode) |
+| `j` `k` · `Enter` · `c` · `Esc` | select, focus, cancel, back to root (agents) |
 | `Ctrl-P` | model picker |
 | `Ctrl-S` / `Ctrl-R` | save / reload the open file |
-| `Ctrl-N` | new chat |
-| `Ctrl-C` | cancel all agents |
+| `Ctrl-N` | new chat (stops every agent, restarts the root) |
+| `Ctrl-C` | cancel running agents — an idle root is left alone |
 | `Ctrl-Q` | quit (twice if there are unsaved changes) |
 
 Chat commands: `/provider`, `/model`, `/url`, `/key`, `/models`, `/open`,
-`/diff`, `/merge`, `/discard`, `/new`, `/help`, `/quit`.
+`/worktrees`, `/diff`, `/merge`, `/discard`, `/new`, `/help`, `/quit`.
 
 ## What it writes
 
@@ -147,16 +158,35 @@ and the roadmap.
 ## Layout
 
 ```
-crates/mush-core/   pure domain: workspace, session, prompt, messages, user config
+crates/mush-core/   pure domain: workspace, sessions, prompt, messages, config, tools
 crates/mush/        the binary: TUI, agent actors, HTTP client
 scripts/smoke.py    end-to-end test that drives the real TUI over a pty
+scripts/mock_llm.py scripted model server for the deterministic agent tests
+docs/mush.md        the design doc
 ```
 
 ## Tests
 
 ```sh
 cargo test                    # offline unit tests
-cargo test -- --ignored       # live endpoint tests, plus isolated_subagent
-                              # (deterministic orchestration via scripts/mock_llm.py)
-python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke
+cargo test -- --ignored       # live endpoint tests, plus isolated_subagent,
+                              # deep_chain, and compaction (deterministic, via
+                              # scripts/mock_llm.py)
+python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke           # needs a model
+python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --resize  # needs none
 ```
+
+The last scenario drives the real binary over a pty and resizes it; it verifies
+the app repaints on its own, with no keystroke.
+
+## Development
+
+```sh
+cargo fmt --all --check
+cargo clippy --all-targets -- -D warnings
+cargo test
+```
+
+## License
+
+MIT — see [LICENSE](LICENSE).
