@@ -2918,6 +2918,47 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// The acknowledgement itself, through a live actor: a run that a Stop ends
+    /// is reported as `Stopped` — once, and not as `Done` and not as an error.
+    /// That event is what takes the tree's row out of `⊘ cancelling…` the moment
+    /// the cancel lands, and it is the difference between a cancel that landed
+    /// and one that never will (finding B6). The scripted client answers the way
+    /// the reader does when the flag is set, so what this pins is the actor's
+    /// half of that: how a cancelled run is *reported*.
+    #[test]
+    fn a_run_that_a_stop_ends_is_acknowledged_as_stopped() {
+        let model = Arc::new(Scripted::new().cancels());
+        let events = Recorder::new();
+        let root = scratch_dir("stop-ack");
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            model,
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("work"),
+            ]))
+            .unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.stopped > 0
+                || !seen.errors.is_empty()),
+            "the run must be acknowledged: {seen:?}"
+        );
+        assert_eq!(
+            seen.stopped, 1,
+            "reported as stopped, exactly once: {seen:?}"
+        );
+        assert_eq!(seen.done, 0, "a stopped run is not a finished one");
+        assert!(seen.errors.is_empty(), "and not a failure: {seen:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Every context window a run announced to the UI.
     fn contexts(events: &Recorder) -> Vec<usize> {
         events
