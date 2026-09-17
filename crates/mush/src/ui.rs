@@ -403,11 +403,22 @@ fn phase_glyph(phase: &Phase) -> &'static str {
 
 /// What the row says the agent is doing, ageing with the phase so a slow model
 /// is visible as `thinking 42s` rather than a static word.
+///
+/// A run parked in a wait says so instead of naming the tool: `wait_agents 3s`
+/// reads like a model call in flight, and the human asked for an hourglass for
+/// the case where nothing is being computed — a napping orchestrator was the
+/// one agent on the screen claiming work it was not doing (finding U7).
 fn phase_detail(node: &AgentNode) -> String {
     let age = short_age(node.since.elapsed());
     match &node.phase {
         Phase::Thinking => format!("thinking {age}"),
-        Phase::Activity(what) => format!("{what} {age}"),
+        Phase::Activity(what) => match node.phase.waiting() {
+            Some(waiting) => format!("waiting on {} {age}", waiting.noun()),
+            // The actor's label is the tool name and its summarized arguments;
+            // with no arguments it ends in a space, which the row would paint
+            // as a double one (`wait_agents  3s`).
+            None => format!("{} {age}", what.trim_end()),
+        },
         Phase::Cancelling => "cancelling…".to_string(),
         // A stopped run has no result to show: its last summary belongs to a
         // run that was interrupted, so showing it would claim work that was
@@ -446,10 +457,16 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             agent: app.tree.focused,
             // A run in flight is what the pane's own activity line is derived
             // from, and the spinner is the frame `App::tick` advanced.
+            //
+            // A run parked in a wait is *not* one: the foot's `working…` may
+            // only claim a model call, and `wait_agents` is not one — the
+            // agent is waiting for somebody else's result, and the row says so
+            // (`waiting on agents 3s`). Painting the spinner over that was
+            // exactly the lie finding U7 named.
             busy: app
                 .tree
                 .node(app.tree.focused)
-                .map(|node| node.phase.is_busy())
+                .map(|node| node.phase.is_busy() && node.phase.waiting().is_none())
                 .unwrap_or(false),
             spin: app.spin,
             label: &label,
