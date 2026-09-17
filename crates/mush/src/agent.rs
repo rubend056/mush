@@ -66,6 +66,38 @@ fn reply_cap(cfg: &Config) -> u32 {
     let share = (cfg.context_tokens / 4) as u64;
     MAX_REPLY_TOKENS.min(share.max(1024) as u32)
 }
+/// The reply's finish reason when it is none of the three mush understands:
+/// `stop`, a tool batch, and the token cap. `content_filter` is the endpoint
+/// refusing to hand over what the model wrote; any other value is a reply the
+/// endpoint chose not to finish normally. Neither is a result — and with no
+/// content a refused reply used to surface as an empty one, which reads as the
+/// model having nothing to say.
+///
+/// A missing reason — or an empty one, which some servers send instead of
+/// `stop` — says nothing, and is the only reason read as a normal end besides
+/// the three.
+fn refusal_reason(finish_reason: Option<&str>) -> Option<&str> {
+    match finish_reason {
+        None | Some("") | Some("stop") | Some("tool_calls") | Some("length") => None,
+        Some(other) => Some(other),
+    }
+}
+
+/// Why a refused reply is not a result, in the run's own words. `length` gets
+/// its own account (the cap can be asked down and retried); a refusal is the
+/// endpoint's verdict and no amount of retrying inside one run changes it.
+fn refusal_error(reason: &str) -> String {
+    match reason {
+        "content_filter" => "the model's reply was stopped by the endpoint's content filter \
+                             (finish_reason: content_filter) — the endpoint refused to answer"
+            .to_string(),
+        other => format!(
+            "the model's reply ended with an unsupported finish_reason: {other} \
+             — the endpoint did not finish the answer"
+        ),
+    }
+}
+
 /// Consecutive cut-off replies before the run gives up. A cut reply is usually
 /// a *too big* answer — a whole file in one `write_file`, or a long reasoning
 /// pass — not a broken model, so the run asks for smaller pieces and carries
@@ -931,7 +963,11 @@ fn run_loop(
         // reply is not a result: the text is partial and a tool call may be
         // half-written JSON, so the run fails loudly below instead of ending as
         // if the work were done.
-        let truncated = choice.finish_reason.as_deref() == Some("length");
+        let finish = choice.finish_reason.as_deref().map(str::trim);
+        let truncated = finish == Some("length");
+        // Any other reason mush does not know — `content_filter` first among
+        // them — is not a normal end either, and must not be read as one.
+        let refused = refusal_reason(finish).map(str::to_string);
 
         let assistant = sanitize_tool_calls(choice.message);
         let tool_calls = assistant.tool_calls().to_vec();
@@ -987,6 +1023,25 @@ fn run_loop(
             );
             messages.push(Message::user(TRUNCATION_INSTRUCTION));
             continue;
+        }
+
+        if let Some(reason) = refused {
+            // A refused reply may still carry tool calls (a filtering endpoint
+            // emits the call, then stops). Answer them, never run them: half a
+            // plan is not a plan, and a dangling call would poison every later
+            // request in the conversation.
+            for call in &tool_calls {
+                let message = Message::tool(
+                    call.id.clone(),
+                    format!(
+                        "error: the model's reply ended with finish_reason: {reason}; \
+                         this call was not run"
+                    ),
+                );
+                messages.push(message.clone());
+                actor.ctx.emit(actor.id, AgentEvent::Message(message));
+            }
+            return Err(refusal_error(&reason));
         }
 
         // The same batch of calls, twice in a row with nothing changed in
@@ -2884,6 +2939,109 @@ mod tests {
         );
         let _ = fs::remove_dir_all(actor.ws.root());
         let _ = mailbox;
+    }
+
+    /// `length` is not the only reason a reply is not an answer.
+    /// `content_filter` is the endpoint saying it refused to hand over what the
+    /// model wrote, and an unknown reason is no more a normal end — neither may
+    /// be reported as if the model had simply had nothing to say.
+    #[test]
+    fn a_refused_reply_is_an_error_not_an_empty_answer() {
+        let scripted =
+            Arc::new(Scripted::new().finishing(Message::assistant(""), "content_filter"));
+        let (actor, events, mailbox) = scripted_actor("filtered", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("say something"),
+        ];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+        assert!(error.contains("content_filter"), "{error}");
+        assert!(error.contains("refused"), "{error}");
+        assert!(
+            !events.events_for(AgentId(7)).iter().any(
+                |event| matches!(event, AgentEvent::Notice(what) if what.contains("empty reply"))
+            ),
+            "a refusal is not an empty reply"
+        );
+        assert_eq!(scripted.asked().len(), 1, "a refusal is not retried");
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// A reason mush has never heard of is still the endpoint saying it did not
+    /// finish the answer; the run names it instead of ending as if it had.
+    #[test]
+    fn an_unknown_finish_reason_is_named_in_the_runs_error() {
+        let scripted =
+            Arc::new(Scripted::new().finishing(Message::assistant("half a th"), "safety"));
+        let (actor, _events, mailbox) = scripted_actor("unknown-reason", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::user("do the thing")];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+        assert!(error.contains("safety"), "{error}");
+        assert!(error.contains("finish_reason"), "{error}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// A refused reply can still carry the call it was about to make. It must
+    /// be answered (never run), or the transcript keeps a dangling call that
+    /// poisons every later request in the conversation.
+    #[test]
+    fn a_refused_reply_answers_the_calls_it_carried() {
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls = Some(vec![tool_call(
+            "c0",
+            "write_file",
+            json!({ "path": "secret.txt", "content": "x" }),
+        )]);
+        let scripted = Arc::new(Scripted::new().finishing(assistant, "content_filter"));
+        let (actor, _events, mailbox) = scripted_actor("filtered-call", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::user("write the file")];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+        assert!(error.contains("content_filter"), "{error}");
+        assert!(
+            !actor.ws.root().join("secret.txt").exists(),
+            "a call from a refused reply must never run"
+        );
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[2].role, "tool");
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("c0"));
+        assert!(
+            messages[2].text().contains("was not run"),
+            "{}",
+            messages[2].text()
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// The three reasons mush does understand are the only ones read as ends:
+    /// everything else goes to `refusal_reason`.
+    #[test]
+    fn only_stop_a_tool_batch_and_the_cap_are_normal_ends() {
+        for reason in [
+            None,
+            Some(""),
+            Some("stop"),
+            Some("tool_calls"),
+            Some("length"),
+        ] {
+            assert_eq!(refusal_reason(reason), None, "{reason:?}");
+        }
+        for reason in ["content_filter", "safety", "eos"] {
+            assert_eq!(refusal_reason(Some(reason)), Some(reason), "{reason:?}");
+        }
+        assert!(refusal_error("content_filter").contains("content filter"));
+        assert!(refusal_error("safety").contains("safety"));
     }
 
     /// A model that keeps answering too big has to end the run: the bounded

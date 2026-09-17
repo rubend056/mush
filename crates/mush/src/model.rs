@@ -281,6 +281,14 @@ pub(crate) mod fake {
             self
         }
 
+        /// The next reply is this message, finished for this reason: how a
+        /// server that refuses (`finish_reason: content_filter`) or ends a
+        /// reply in a way mush does not know answers.
+        pub fn finishing(mut self, message: Message, finish_reason: &str) -> Self {
+            self.script(Ok(reply(message, finish_reason)));
+            self
+        }
+
         /// The next reply is cut off at the token cap: the endpoint stopped it
         /// mid-answer (`finish_reason: length`), which is what a model does when
         /// it tries to write a whole file in one call.
