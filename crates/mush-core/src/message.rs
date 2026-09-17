@@ -3,10 +3,50 @@
 //! These are intentionally loose (`Option` everywhere, `#[serde(default)]`) so
 //! that the many "OpenAI-compatible" servers out there all round-trip cleanly.
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
+use serde_json::Value;
 
 fn function_type() -> String {
     "function".to_string()
+}
+
+/// Text out of the two shapes a reply's `content` arrives in.
+///
+/// The spec's request form — and what most endpoints answer with — is a plain
+/// string. Newer OpenAI models and several compatible servers answer with an
+/// *array of content parts* instead (`[{"type":"text","text":"hi"}]`). Both
+/// are the same message, so both parse; a reply is not a `Malformed` one just
+/// because a server chose the other spelling.
+///
+/// Parts are concatenated in order, verbatim, with nothing inserted between
+/// them: they are consecutive pieces of one answer, and a separator mush
+/// invented would put words in the model's mouth. A part that carries no text
+/// (an image URL, a refusal block) contributes nothing.
+fn content_from_wire<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(Option::<Value>::deserialize(deserializer)?.map(content_text))
+}
+
+fn content_text(value: Value) -> String {
+    match value {
+        Value::String(text) => text,
+        // `content: null` is the shape of a pure tool-call reply: no text.
+        Value::Null => String::new(),
+        Value::Array(parts) => parts.into_iter().map(part_text).collect(),
+        // Some servers wrap a lone part in an object instead of an array.
+        part @ Value::Object(_) => part_text(part),
+        // Nothing else is text, but it is not a reason to drop the reply.
+        other => other.to_string(),
+    }
+}
+
+fn part_text(part: Value) -> String {
+    part.get("text")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string()
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -28,7 +68,14 @@ pub struct ToolCall {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Message {
     pub role: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Always a string on the way out — the spec's own request form, for both
+    /// assistant history and tool results. On the way in, either wire shape
+    /// (see [`content_from_wire`]).
+    #[serde(
+        default,
+        deserialize_with = "content_from_wire",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub content: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_calls: Option<Vec<ToolCall>>,
@@ -141,6 +188,67 @@ pub struct ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A spec-legal reply whose `content` is an array of parts must parse: a
+    /// server that sends the newer shape is not a broken endpoint, and dying
+    /// with "could not parse model response" on it loses a whole run.
+    #[test]
+    fn a_reply_parses_from_content_parts_as_well_as_a_string() {
+        let plain: Message =
+            serde_json::from_str(r#"{"role":"assistant","content":"hi"}"#).unwrap();
+        assert_eq!(plain.text(), "hi");
+
+        let parts: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":[{"type":"text","text":"hi"},{"type":"text","text":" there"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(parts.text(), "hi there", "parts concatenate in order");
+
+        // A part that is not text (an image, a refusal block) carries none, and
+        // a lone part wrapped in an object is still the same answer.
+        let mixed: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":[{"type":"text","text":"look:"},{"type":"image_url","image_url":{"url":"http://x"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(mixed.text(), "look:");
+        let wrapped: Message =
+            serde_json::from_str(r#"{"role":"assistant","content":{"type":"text","text":"hi"}}"#)
+                .unwrap();
+        assert_eq!(wrapped.text(), "hi");
+
+        // The whole reply, not just the message: this is the parse a model call
+        // does, so the parts shape has to survive it too.
+        let reply: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"role":"assistant","content":[{"type":"text","text":"hi"}]},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(reply.choices[0].message.text(), "hi");
+
+        // A pure tool-call reply has no text at all, in either spelling.
+        let null: Message = serde_json::from_str(r#"{"role":"assistant","content":null}"#).unwrap();
+        assert_eq!(null.text(), "");
+        let missing: Message = serde_json::from_str(r#"{"role":"assistant"}"#).unwrap();
+        assert_eq!(missing.text(), "");
+    }
+
+    /// What mush *sends* stays the spec's own wire form: a string. History
+    /// re-serialized after a parsed reply must not go back as parts, or the
+    /// request shape would depend on which server answered last.
+    #[test]
+    fn assistant_content_is_written_back_as_a_string() {
+        let parsed: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":[{"type":"text","text":"hi"},{"type":"text","text":" there"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            serde_json::to_string(&parsed).unwrap(),
+            r#"{"role":"assistant","content":"hi there"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Message::assistant("hi")).unwrap(),
+            r#"{"role":"assistant","content":"hi"}"#
+        );
+    }
 
     #[test]
     fn provider_params_are_opt_in() {
