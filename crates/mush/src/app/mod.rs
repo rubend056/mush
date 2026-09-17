@@ -672,16 +672,17 @@ impl App {
                 // reply that was empty: a line in the transcript, tagged with
                 // the agent it concerns (finding B19).
                 self.chat.note_for(id, text);
-                self.chat.scroll_to_bottom();
             }
             AgentEvent::Message(message) => {
+                // The pane is deliberately not sent to the bottom here: the
+                // position is the human's, and a pane that is at the bottom
+                // follows the newest line by construction (finding U3).
                 self.chat.push_message(id, message);
                 // Every message is part of what the file stores — a subagent's
                 // as much as the root's — but the mark is O(1): the rebuild and
                 // the write wait for the debounced tick, so a streamed tool
                 // result cannot stall the frame that shows it.
                 self.mark_session_dirty();
-                self.chat.scroll_to_bottom();
             }
             AgentEvent::Stopped => {
                 // Stopped is not failed and not done: the run produced nothing,
@@ -697,7 +698,6 @@ impl App {
                 if id == self.tree.focused {
                     self.say(format!("agent #{id} stopped — send a message to resume it"));
                 }
-                self.chat.scroll_to_bottom();
             }
             AgentEvent::Error(error) => {
                 self.tree.fail(id, error.clone());
@@ -707,7 +707,6 @@ impl App {
                 // dies with the next run, while this line is tagged, stamped and
                 // written to the session, so a restart still says what broke.
                 self.chat.note_error_for(id, error);
-                self.chat.scroll_to_bottom();
             }
             AgentEvent::Done => {
                 let summary = self.last_assistant_text(id);
@@ -765,7 +764,6 @@ impl App {
                 } else {
                     self.mark_session_dirty();
                 }
-                self.chat.scroll_to_bottom();
             }
         }
     }
@@ -961,9 +959,12 @@ impl App {
         if target == AgentId::ROOT {
             // The human's words belong in the transcript they can see, whether
             // the root is starting a run or already in one.
+            //
+            // Sending does not send the pane to the bottom either: the human
+            // chose where to read, and the key that puts a pane back at the
+            // newest line is the one they press (finding U3).
             self.chat
                 .push_message(AgentId::ROOT, Message::user(text.clone()));
-            self.chat.scroll_to_bottom();
             // The human's own words are the one thing worth blocking on: the
             // run they start may take minutes, and a crash in it must not lose
             // the request. This is one write per turn, not one per response.
@@ -1669,7 +1670,7 @@ impl App {
                 self.tree.focus(AgentId::ROOT);
             }
             Intent::Send => self.send_message(),
-            Intent::Chat(key) => self.chat.apply(key),
+            Intent::Chat(key) => self.chat.apply(self.tree.focused, key),
         }
     }
 
@@ -2013,6 +2014,15 @@ mod tests {
                     .trim_end()
                     .to_string()
             })
+            .collect()
+    }
+
+    /// What the chat pane paints, and only it: the agents pane is the columns
+    /// to its left at this size.
+    fn chat_rows(app: &mut App) -> Vec<String> {
+        screen(app, 120, 32)
+            .into_iter()
+            .map(|row| row.chars().skip(31).collect())
             .collect()
     }
 
@@ -4056,6 +4066,68 @@ mod tests {
             .clone();
         assert!(child_row.contains("◐ #1"), "{child_row}");
         assert!(!child_row.contains("⏸"), "{child_row}");
+    }
+
+    /// A pane's position is the human's: another agent's line cannot move it,
+    /// and neither can the pane's own line while they are away from the bottom
+    /// (finding U3).
+    #[test]
+    fn news_moves_only_the_pane_it_is_about_and_only_from_the_bottom() {
+        let (mut app, _rx) = test_app("scroll-pin");
+        let conversation = app.tree.conversation();
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Spawned {
+                child: 1,
+                parent: 0,
+                brief: "lexer".to_string(),
+                depth: 1,
+                branch: None,
+                cmd: crossbeam_channel::unbounded().0,
+            },
+        });
+        // A transcript long enough to scroll, in the pane the human is reading.
+        for index in 0..30 {
+            app.chat
+                .push_message(AgentId(1), Message::assistant(format!("line {index}")));
+        }
+        app.tree.focus(AgentId(1));
+        app.chat.scroll_by(AgentId(1), 4);
+        let held = chat_rows(&mut app);
+        assert!(
+            !held.join("\n").contains("line 29"),
+            "the pane is away from the newest line: {held:?}"
+        );
+
+        // Another agent's news: the root says something of its own.
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Message(Message::assistant("the root's line")),
+        });
+        assert_eq!(
+            chat_rows(&mut app),
+            held,
+            "another agent's line must not move this pane"
+        );
+
+        // And the pane's own agent speaks while the human is away from the
+        // bottom: they are still where they put themselves.
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId(1),
+            event: AgentEvent::Message(Message::assistant("its own line")),
+        });
+        assert_eq!(chat_rows(&mut app), held, "a held pane is the human's");
+
+        // At the bottom the same news is exactly what the pane shows: that is
+        // what following means, and it needs nothing to be told to it.
+        app.chat.scroll_by(AgentId(1), -4);
+        assert!(
+            chat_rows(&mut app).join("\n").contains("its own line"),
+            "a pane at the bottom follows the newest line"
+        );
     }
 
     /// Busy agents are named with their age: a model that has thought for two
