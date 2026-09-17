@@ -7,6 +7,96 @@
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
+/// Untrusted text made safe to paint: a model's reply, a tool result, a file
+/// name a model chose, a line a server wrote.
+///
+/// A pane is a terminal, and a terminal acts on what it is given: a bare `\r`
+/// returns the cursor to column 1 (a reply of `…and then\rREPLACED…` erased the
+/// pane's own border), `ESC ]0;PWNED BEL` sets the window title, and a CSI `2J`
+/// wipes the frame — the conversation is not allowed to repaint the screen it is
+/// shown on. So:
+///
+/// - an **escape sequence is removed whole** — CSI, OSC, and every other
+///   `ESC`-introduced form. Dropping the escape byte alone would leave the rest
+///   of the sequence's bytes to be painted as text, which is a different lie.
+/// - a **carriage return** becomes `␍`: it is a *visible* intent (the row was
+///   meant to be overwritten) that no row can honour, and it is rare enough that
+///   marking it is honest where dropping it would silently join two words. The
+///   `\r` of a `\r\n` is a line ending, so it goes with nothing shown.
+/// - every other **C0/C1 control** and `DEL` is dropped, along with the bidi
+///   embedding and isolate characters: they exist to command a display rather
+///   than to be read, and the one U+200D a ZWJ emoji needs is not among them.
+/// - a **tab** is kept. It is layout, not a command, and [`wrap_text`] renders
+///   it as four columns — the pane's tab stop, never the terminal's.
+///
+/// Nothing here touches a terminal: this is the same width-and-text arithmetic
+/// as the rest of the module, and it is what the wrappers apply before a row is
+/// built, so no caller can forget it.
+pub fn sanitize(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '\x1b' => skip_escape(&mut chars),
+            // The `\r` of a `\r\n` is a line ending; so is one at the very end
+            // of the text, because the wrapper splits on `\n` before it ever
+            // gets here.
+            '\r' if chars.peek() == Some(&'\n') || chars.peek().is_none() => {}
+            '\r' => out.push('␍'),
+            '\t' | '\n' => out.push(ch),
+            ch if invisible(ch) => {}
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+/// A character that commands a display instead of appearing on it.
+fn invisible(ch: char) -> bool {
+    ch.is_control() || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+}
+
+/// Consume one escape sequence, whole.
+///
+/// `ESC` introduces CSI (`ESC [ parameters intermediates final`), OSC (`ESC ] …
+/// BEL` or `… ESC \`), and a family of short forms (`ESC 7`, `ESC (B`). A
+/// sequence that never terminates — a truncated reply, a line cut by the
+/// wrapper — takes the rest of the text with it: the bytes of a command are not
+/// words, and painting half of one is how the sequence's own digits end up on
+/// screen.
+fn skip_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+    match chars.next() {
+        // CSI: parameters and intermediates, then one byte in `@`–`~`.
+        Some('[') => {
+            for ch in chars.by_ref() {
+                if ('\u{40}'..='\u{7e}').contains(&ch) || ch.is_control() {
+                    break;
+                }
+            }
+        }
+        // OSC: everything up to BEL, or to the string terminator `ESC \`.
+        Some(']') => {
+            for ch in chars.by_ref() {
+                if ch == '\x07' {
+                    break;
+                }
+                if ch == '\x1b' {
+                    chars.next();
+                    break;
+                }
+            }
+        }
+        // The short forms that take one more character: a character-set
+        // designation (`ESC (`), a line attribute (`ESC #`), a charset (`ESC %`).
+        Some('(' | ')' | '#' | '%') => {
+            chars.next();
+        }
+        // `ESC` plus a single byte (`ESC 7`, `ESC =`), and a lone `ESC` at the
+        // end of the text: nothing more to consume.
+        _ => {}
+    }
+}
+
 /// Word-aware wrapping that preserves explicit newlines and never splits a
 /// grapheme's display width arithmetic.
 pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -30,6 +120,10 @@ fn wrap_capped(text: &str, width: usize, max_lines: Option<usize>) -> Vec<String
         if max_lines.is_some_and(|max| out.len() >= max) {
             break;
         }
+        // Per line, before it is measured: one pass over the lines this caller
+        // will actually paint, and a wide glyph or an escape sequence cannot
+        // make the wrapping and the terminal disagree about where the row ends.
+        let raw = sanitize(raw);
         let mut current = String::new();
         let mut current_width = 0usize;
         let mut last_space: Option<usize> = None;
@@ -188,6 +282,50 @@ mod tests {
         let lines = wrap_text("the quick brown fox jumps", 10);
         assert!(lines.iter().all(|line| line.chars().count() <= 10));
         assert_eq!(lines.concat().replace(' ', ""), "thequickbrownfoxjumps");
+    }
+
+    /// A model's reply, a tool result or a file name can carry the bytes that
+    /// command a terminal. None of them may leave a pane: a `\r` moved the
+    /// cursor back over the border, an OSC set the window title, and a CSI wiped
+    /// the frame.
+    #[test]
+    fn untrusted_text_cannot_command_the_terminal() {
+        // An escape sequence goes whole: not its letter alone, not its digits.
+        assert_eq!(sanitize("\x1b]0;PWNED\x07done"), "done");
+        assert_eq!(sanitize("\x1b[2J\x1b[Hwiped"), "wiped");
+        assert_eq!(sanitize("\x1b[1;31mred\x1b[0m"), "red");
+        assert_eq!(sanitize("\x1b(Bascii"), "ascii");
+        assert_eq!(sanitize("\x1b7saved"), "saved");
+        // An unterminated sequence takes the rest of the text with it.
+        assert_eq!(sanitize("before\x1b[38;5"), "before");
+        // A carriage return is visible, because two words joined is a lie; the
+        // `\r` of a CRLF is a line ending and shows nothing.
+        assert_eq!(sanitize("and then\rREPLACED"), "and then␍REPLACED");
+        assert_eq!(sanitize("line\r\nnext"), "line\nnext");
+        assert_eq!(sanitize("line\r"), "line");
+        // The controls that only ever commanded a display go, and a tab stays:
+        // it is layout, and the wrapper is what gives it columns.
+        assert_eq!(sanitize("a\x07b\x00c\x7fd"), "abcd");
+        assert_eq!(sanitize("a\tb"), "a\tb");
+        assert_eq!(sanitize("safe\u{202e}drowssap"), "safedrowssap");
+        // And the ordinary text a transcript is made of is untouched.
+        assert_eq!(sanitize("w00 w01 · #1 done: ✓"), "w00 w01 · #1 done: ✓");
+    }
+
+    /// A wrapped row is what the terminal will paint: no escape survives the
+    /// wrapper, so a caller that forgets to sanitize cannot leak one either.
+    #[test]
+    fn wrapping_defangs_as_it_wraps() {
+        let rows = wrap_text("start \x1b[2Jmiddle\rREPLACED tail", 40);
+        assert_eq!(rows.join(" "), "start middle␍REPLACED tail");
+        assert!(!rows.join("").contains('\x1b'));
+
+        // A tab is still four columns of layout, and a line's end is still a row.
+        assert_eq!(wrap_text("a\tb", 40), vec!["a    b".to_string()]);
+        assert_eq!(
+            wrap_text("one\r\ntwo", 40),
+            vec!["one".to_string(), "two".to_string()]
+        );
     }
 
     #[test]

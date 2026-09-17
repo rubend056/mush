@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use mush_core::config::parse_context_hint;
 use mush_core::git;
 use mush_core::message::{ChatRequest, ChatResponse};
-use mush_core::text::truncate;
+use mush_core::text::{sanitize, truncate};
 use mush_core::tools::ToolName;
 use mush_core::transcript::{
     needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
@@ -2684,7 +2684,17 @@ pub fn summarize_args(raw: &str) -> String {
     summarize(&args)
 }
 
+/// [`read_args`], defanged. The arguments are the model's own text and a file
+/// name is a file name, and this label is painted raw — one span in the
+/// transcript (`docs/mush.md` §4.5 R4), one activity line in the tree — so a
+/// `path` of `…\u{1b}]0;PWNED` would otherwise repaint the terminal it is drawn
+/// on. The one reading both callers share is the one place to do it.
 fn summarize(args: &Value) -> String {
+    sanitize(&read_args(args))
+}
+
+/// What the arguments say, before the text is made safe to paint.
+fn read_args(args: &Value) -> String {
     if let Some(path) = args.get("path").and_then(Value::as_str) {
         return path.to_string();
     }
@@ -2738,6 +2748,25 @@ mod tests {
             "fix the parser"
         );
         assert_eq!(summarize(&json!({})), "");
+    }
+
+    /// The label is painted raw — one span in the transcript, one activity line
+    /// in the tree — and a file name is a file name: a model that puts an escape
+    /// sequence in an argument must not repaint the terminal it is drawn on.
+    #[test]
+    fn a_summary_carries_no_escape_from_an_argument() {
+        assert_eq!(
+            summarize_args(r#"{"path":"src/\u001b]0;PWNED\u0007main.rs"}"#),
+            "src/main.rs"
+        );
+        assert_eq!(
+            summarize_args(r#"{"command":"cat log\u001b[2J\u001b[H"}"#),
+            "cat log"
+        );
+        assert_eq!(
+            summarize_args(r#"{"brief":"do\u0007 this\rplease"}"#),
+            "do this please"
+        );
     }
 
     /// A tool label is one line by definition. Truncating a command's raw text

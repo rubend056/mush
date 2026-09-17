@@ -1402,6 +1402,84 @@ mod tests {
         );
     }
 
+    /// A model can write an escape into its reply and a tool result can carry
+    /// one out of a log file. Neither reaches the terminal that paints the pane:
+    /// the reply that erased the border, the OSC that set the window title and
+    /// the CSI that wiped the frame are all just text now — and text that lost
+    /// its commands, not text that kept them.
+    #[test]
+    fn a_pane_paints_no_escape_sequence_and_no_carriage_return() {
+        let mut chat = Chat::bare();
+        say(&mut chat, AgentId::ROOT, "look at this");
+        chat.push_message(
+            AgentId::ROOT,
+            Message::assistant("and then\rREPLACED \x1b]0;PWNED\x07"),
+        );
+        chat.push_message(
+            AgentId::ROOT,
+            Message::tool("call_1", "\x1b[2J\x1b[Hwiped\ttabbed\nsecond row"),
+        );
+        chat.note_for(AgentId::ROOT, "a note \x1b[31min red\x1b[0m");
+
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 8)).join("\n");
+        assert!(!rows.contains('\x1b'), "{rows:?}");
+        assert!(!rows.contains('\r'), "{rows:?}");
+        assert!(rows.contains("and then␍REPLACED"), "{rows:?}");
+        assert!(rows.contains("wiped    tabbed"), "{rows:?}");
+        assert!(rows.contains("second row"), "{rows:?}");
+        assert!(rows.contains("· a note in red"), "{rows:?}");
+    }
+
+    /// The tool-call label is the model's own arguments, and it is painted as one
+    /// span rather than wrapped, so it is defanged where it is read: both the
+    /// transcript and the tree's row paint `summarize_args`.
+    #[test]
+    fn a_tool_call_label_carries_no_escape_from_its_arguments() {
+        let mut chat = Chat::bare();
+        let call = mush_core::ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: mush_core::FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"path":"src/\u001b]0;PWNED\u0007main.rs"}"#.into(),
+            },
+        };
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                role: "assistant".into(),
+                tool_calls: Some(vec![call]),
+                ..Default::default()
+            },
+        );
+
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 4)).join("\n");
+        assert!(!rows.contains('\x1b'), "{rows:?}");
+        assert!(rows.contains("⚙ read_file src/"), "{rows:?}");
+
+        // And a command whose argument carries an escape: the label keeps its
+        // words and loses the sequence.
+        let mut chat = Chat::bare();
+        let call = mush_core::ToolCall {
+            id: "call_2".into(),
+            kind: "function".into(),
+            function: mush_core::FunctionCall {
+                name: "run_command".into(),
+                arguments: r#"{"command":"cat log\u001b[2J\u001b[H"}"#.into(),
+            },
+        };
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                role: "assistant".into(),
+                tool_calls: Some(vec![call]),
+                ..Default::default()
+            },
+        );
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 4)).join("\n");
+        assert!(rows.contains("⚙ run_command cat log"), "{rows:?}");
+    }
+
     /// A line the human did not say is not painted in the human's voice. Three
     /// kinds of them reach a child's pane: the brief its parent spawned it with,
     /// a parent's steering (`agent_control message`, the words of which the
