@@ -3878,6 +3878,97 @@ mod tests {
         assert_eq!(app.activity_line(), None, "no `thinking` survives the run");
     }
 
+    /// The pane title counts the phases it names, and no agent is in two of its
+    /// counts (finding U2).
+    ///
+    /// It used to say `N running` over every busy phase, so an agent napping on
+    /// its children — a row wearing `⏸` — was counted as work the title could
+    /// not show. The counts now come from the phases as two disjoint buckets,
+    /// and each clause says which one it is.
+    #[test]
+    fn the_title_counts_working_and_waiting_agents_separately() {
+        let (mut app, _rx) = test_app("title-counts");
+        let conversation = app.tree.conversation();
+        // The root naps on two children, and one of those has a child of its
+        // own: three agents work, one waits, and nobody is both.
+        for (id, parent, depth) in [(1u64, 0u64, 1usize), (2, 0, 1), (3, 2, 2)] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId(parent),
+                event: AgentEvent::Spawned {
+                    child: id,
+                    parent,
+                    brief: format!("child {id}"),
+                    depth,
+                    branch: None,
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+        }
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Done,
+        });
+        // A branch with work on it, so the totals have something to say and
+        // must yield the line to the counts rather than be cut in half.
+        app.tree.agent_stats.insert(
+            AgentId(1),
+            mush_core::git::Stat {
+                files: 1,
+                added: 324,
+                removed: 40,
+            },
+        );
+        assert_eq!(
+            app.tree.roster(),
+            crate::app::tree::Roster {
+                working: 3,
+                waiting: 1
+            }
+        );
+
+        let rows = screen(&mut app, 200, 50);
+        assert!(
+            rows[0].contains(" agents · 3 working · 1 waiting"),
+            "the title counts what it names: {}",
+            rows[0]
+        );
+        assert!(
+            !rows[0].contains("Σ +324 −") || rows[0].contains("Σ +324 −40"),
+            "a total is painted whole or not at all: {}",
+            rows[0]
+        );
+    }
+
+    /// A clause that does not fit is dropped whole, and the totals are the last
+    /// to go: a pane 32 columns wide cannot hold ` agents · 3 working · 1
+    /// waiting · Σ +324 −40`, and the half of it that would fit (`Σ +324 −`) is
+    /// a total that is not the total.
+    #[test]
+    fn the_title_elides_clauses_instead_of_cutting_numbers() {
+        let (mut app, _rx) = test_app("title-elides");
+        app.tree.agent_stats.insert(
+            AgentId::ROOT,
+            mush_core::git::Stat {
+                files: 1,
+                added: 324,
+                removed: 40,
+            },
+        );
+
+        // Widest pane `draw` ever gives this pane, and nobody working: the
+        // totals fit and are shown in full.
+        let wide = screen(&mut app, 200, 50);
+        assert!(wide[0].contains(" agents · Σ +324 −40"), "{}", wide[0]);
+
+        // Too narrow for that clause: it goes entirely, rather than painting
+        // `Σ +324 −`.
+        let narrow = screen(&mut app, 80, 24);
+        assert!(!narrow[0].contains("Σ"), "{}", narrow[0]);
+        assert!(narrow[0].contains(" agents "), "{}", narrow[0]);
+    }
+
     /// A napping root with live children is derived from the tree: nobody has
     /// to remember to write it, so it cannot be forgotten either.
     #[test]

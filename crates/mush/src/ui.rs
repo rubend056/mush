@@ -106,7 +106,7 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border(focused))
-        .title(agents_title(app));
+        .title(agents_title(app, area.width.saturating_sub(2) as usize));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -163,18 +163,30 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// `agents · 2 running · Σ +324 −40`: what the whole tree is doing, and how
-/// much its branches carry.
-fn agents_title(app: &App) -> String {
-    let mut title = String::from(" agents ");
-    let busy = app
-        .tree
-        .agents
-        .iter()
-        .filter(|node| node.phase.is_busy())
-        .count();
-    if busy > 0 {
-        title.push_str(&format!(" · {busy} running"));
+/// ` agents · 3 working · 2 waiting · Σ +324 −40`: what the whole tree is doing,
+/// and how much its branches carry.
+///
+/// Every clause is a count of the phases, named for what it counts, and no
+/// agent is in two of them: `N working` is the agents whose own run is in
+/// flight, `M waiting` the ones at rest with children working (the `⏸` rows),
+/// and the totals are the branches'. It used to say `N running` over a number
+/// that included the napping ones, which is how the title came to contradict
+/// the rows under it (finding U2).
+///
+/// The clauses are ranked and dropped whole from the right while they do not
+/// fit — the way `facts_line` elides — because this pane is 32 columns wide at
+/// its widest and a clause cut mid-number (`Σ +324 −`, `2 waitin`) is a count
+/// that is not the count. The totals are last because the least is lost last:
+/// every branch's own `+add −del` is on its row and in the selected row's
+/// footer, while who is working exists only here.
+fn agents_title(app: &App, width: usize) -> String {
+    let roster = app.tree.roster();
+    let mut cells = Vec::new();
+    if roster.working > 0 {
+        cells.push(format!("{} working", roster.working));
+    }
+    if roster.waiting > 0 {
+        cells.push(format!("{} waiting", roster.waiting));
     }
     let mut added = 0;
     let mut removed = 0;
@@ -183,9 +195,16 @@ fn agents_title(app: &App) -> String {
         removed += stat.removed;
     }
     if added + removed > 0 {
-        title.push_str(&format!(" · Σ +{added} −{removed}"));
+        cells.push(format!("Σ +{added} −{removed}"));
     }
-    title
+    while !cells.is_empty() {
+        let joined = format!(" agents · {}", cells.join(" · "));
+        if UnicodeWidthStr::width(joined.as_str()) <= width {
+            return joined;
+        }
+        cells.pop();
+    }
+    " agents ".to_string()
 }
 
 /// One tree row, with the fields it can afford.

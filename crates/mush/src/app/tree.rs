@@ -117,6 +117,21 @@ pub struct AgentNode {
     pub landed: Option<Landed>,
 }
 
+/// How many agents are in each of the states the pane title names.
+///
+/// A struct rather than a live count beside the list it counts: the two
+/// buckets are derived together, from one walk over the phases, so the title
+/// cannot add up a different set than the rows show (finding U2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Roster {
+    /// Runs in flight: `Thinking`, `Activity`, `Cancelling`.
+    pub working: usize,
+    /// At rest with children working — waiting to be woken by a completion.
+    /// "Children" are its own, the same unit its row's `⏸N` mark counts: a
+    /// grandchild's work is its own parent's to wait for.
+    pub waiting: usize,
+}
+
 /// A child actor that now exists, as its parent reported it: everything the
 /// tree needs to give it a row, a mailbox, and an opening line.
 pub struct Spawn {
@@ -551,12 +566,42 @@ impl AgentTree {
         self.agents.iter().any(|node| node.phase.is_busy())
     }
 
+    /// Who is doing what, one bucket per agent.
+    ///
+    /// The pane title reads these, and they are derived from the phases every
+    /// frame: a count is a fact like any other, and the title that counted
+    /// agents napping on their children as "running" was reading the wrong
+    /// fact (finding U2).
+    ///
+    /// Each agent lands in at most one bucket, so nothing is counted twice for
+    /// having children. A run being cancelled counts as working: the actor has
+    /// not yielded and the work really is in flight (its row wears `⊘` and says
+    /// `cancelling…`).
+    pub fn roster(&self) -> Roster {
+        let mut roster = Roster::default();
+        for node in &self.agents {
+            if node.phase.is_busy() {
+                roster.working += 1;
+            } else if matches!(node.phase, Phase::Idle | Phase::Done)
+                && self.busy_children(node.id) > 0
+            {
+                // At rest with work out: §5.5's napping orchestrator, which the
+                // row draws as `⏸`. Counted here and *nowhere else* — counting
+                // it as working as well is exactly what the title did wrong.
+                // A failed or stopped agent waits for nothing, so it is in no
+                // bucket: its own `✗`/`⊘` row is where that fact lives.
+                roster.waiting += 1;
+            }
+        }
+        roster
+    }
+
     /// How many of `id`'s own children have work in flight.
     ///
-    /// One derivation, read by the row's `⏸N` mark and by the pane title's
-    /// count, because "this agent has children working" is one fact and two
-    /// copies of it are two things that can disagree (finding U1). It is about
-    /// the children, never about the parent's own phase: a working agent whose
+    /// One derivation, read by the row's `⏸N` mark and by the title's count,
+    /// because "this agent has children working" is one fact and two copies of
+    /// it are two things that can disagree (finding U1). It is about the
+    /// children, never about the parent's own phase: a working agent whose
     /// children work is still working.
     pub fn busy_children(&self, id: AgentId) -> usize {
         self.agents
@@ -711,6 +756,54 @@ mod tests {
 
         tree.stopped(id);
         assert!(!tree.busy(), "and a stopped one");
+    }
+
+    /// The title's counts are derived from the phases, and no agent is in two
+    /// buckets: a parent napping on a working child is waiting, never also
+    /// working (finding U2).
+    #[test]
+    fn the_roster_buckets_each_agent_once() {
+        let mut tree = AgentTree::bare();
+        assert_eq!(tree.roster(), Roster::default(), "nothing is happening yet");
+
+        // One child, working, under an idle root.
+        let (opened, _rx) = child(&mut tree, 1);
+        assert_eq!(
+            tree.roster(),
+            Roster {
+                working: 1,
+                waiting: 1
+            },
+            "the working child, and the root napping on it"
+        );
+
+        // The child's run ends with a grandchild of its own working: the child
+        // naps on it (its own children are the unit, the same one its row's
+        // `⏸N` counts), and the root — whose own child is done — is in no
+        // bucket at all.
+        tree.finish(opened.id, Some("spawned #2".to_string()));
+        let (tx, _rx2) = crossbeam_channel::unbounded::<AgentMsg>();
+        let grandchild = tree.insert(Spawn {
+            id: AgentId(2),
+            parent: AgentId(1),
+            brief: "deep.txt".to_string(),
+            depth: 2,
+            branch: None,
+            cmd: tx,
+        });
+        assert_eq!(
+            tree.roster(),
+            Roster {
+                working: 1,
+                waiting: 1
+            },
+            "the grandchild works and its parent naps"
+        );
+
+        // A stopped agent waits for nothing, so it is in no bucket: its own
+        // `⊘` row is where that fact lives.
+        tree.stopped(grandchild.id);
+        assert_eq!(tree.roster(), Roster::default());
     }
 
     /// A status that arrives after the run ended must not put a finished agent
