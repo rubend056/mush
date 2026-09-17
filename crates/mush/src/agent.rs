@@ -1782,6 +1782,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::fake::{tool_call, Scripted};
     use mush_core::{FunctionCall, ToolCall};
     use serde_json::json;
     use std::fs;
@@ -2253,15 +2254,44 @@ mod tests {
     }
 
     fn test_actor(label: &str) -> (Actor, Sender<AgentMsg>) {
+        let cfg = test_cfg();
+        let (actor, ui, mailbox) = build_actor(label, Arc::new(HttpModel::new(cfg.clone())), cfg);
+        // Nothing here reads the UI; the receiver is leaked so the channel
+        // stays open for the events a run emits into it.
+        std::mem::forget(ui);
+        (actor, mailbox)
+    }
+
+    /// The same actor, with its model calls served by a script instead of a
+    /// socket — so a whole run can be driven in process, with no server.
+    fn scripted_actor(
+        label: &str,
+        model: &Arc<Scripted>,
+    ) -> (Actor, Receiver<Msg>, Sender<AgentMsg>) {
+        build_actor(label, model.clone(), test_cfg())
+    }
+
+    /// A scratch config cell. The endpoint is deliberately unreachable: every
+    /// test that uses it must go through a scripted model.
+    fn test_cfg() -> Arc<Mutex<Config>> {
+        Arc::new(Mutex::new(Config::new("http://127.0.0.1:1", "test", None)))
+    }
+
+    /// A standalone actor over a scratch workspace, with `model` as its client
+    /// and `cfg` as the tree's shared configuration. The UI receiver comes back
+    /// so a test can read the events the run emits.
+    fn build_actor(
+        label: &str,
+        model: Arc<dyn ModelClient>,
+        cfg: Arc<Mutex<Config>>,
+    ) -> (Actor, Receiver<Msg>, Sender<AgentMsg>) {
         let root = std::env::temp_dir().join(format!("mush-actor-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let (ui_tx, ui_rx) = crossbeam_channel::unbounded::<Msg>();
-        std::mem::forget(ui_rx);
-        let cfg = Arc::new(Mutex::new(Config::new("http://127.0.0.1:1", "test", None)));
         let ctx = Arc::new(AgentCtx {
-            cfg: cfg.clone(),
-            model: Arc::new(HttpModel::new(cfg)),
+            cfg,
+            model,
             tx: ui_tx.clone(),
             conversation: 1,
             root: root.clone(),
@@ -2282,7 +2312,7 @@ mod tests {
             parent_tx: dead_tx,
             rx,
         };
-        (actor, my_tx)
+        (actor, ui_rx, my_tx)
     }
 
     /// The bug this guards: re-queuing a parked nudge into the actor's own
@@ -2369,6 +2399,115 @@ mod tests {
             "the new transcript has no #1 done line, so it is undelivered again"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A whole run, in process: the model asks for a tool, the tool runs, and
+    /// the model's answer ends the run. The `ModelClient` seam is what makes
+    /// this possible with no server, no port and no thread.
+    #[test]
+    fn a_scripted_run_runs_its_tool_call_and_ends_with_the_answer() {
+        let model = Arc::new(
+            Scripted::new()
+                .calls(vec![tool_call(
+                    "call_1",
+                    "write_file",
+                    json!({ "path": "note.txt", "content": "hello" }),
+                )])
+                .says("wrote note.txt"),
+        );
+        let (actor, _ui, _mailbox) = scripted_actor("scripted-run", &model);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("write note.txt"),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+
+        assert_eq!(result.as_deref(), Some("wrote note.txt"));
+        assert_eq!(
+            fs::read_to_string(actor.ws.root().join("note.txt")).unwrap(),
+            "hello",
+            "the tool the model asked for must actually run"
+        );
+        assert_eq!(
+            messages.last().unwrap().text(),
+            "wrote note.txt",
+            "the transcript ends with the answer"
+        );
+
+        // Two turns, two asks — and the second one carried the tool result.
+        let asked = model.asked();
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[0].model, "test");
+        assert!(asked[0].tools > 0, "the first turn offered the tools");
+        let carried = asked[1].messages.last().unwrap();
+        assert_eq!(carried.role, "tool");
+        assert_eq!(carried.text(), "wrote note.txt");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The learned-context retry, in process: the endpoint refuses the request
+    /// as past its window, the run adopts the window the endpoint named, tells
+    /// the UI, and asks again — where before this seam the only way to see that
+    /// was a mock server on a fixed port.
+    #[test]
+    fn a_context_complaint_teaches_the_window_and_the_run_asks_again() {
+        let model = Arc::new(
+            Scripted::new()
+                .fails_with(
+                    400,
+                    r#"{"error":{"message":"This model's maximum context length is 4096 tokens"}}"#,
+                )
+                .says("done"),
+        );
+        let (actor, ui, _mailbox) = scripted_actor("learned-context", &model);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::system("you are mush"), Message::user("task")];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+
+        assert_eq!(result.as_deref(), Some("done"));
+        assert_eq!(model.asked().len(), 2, "the run re-asked after learning");
+        assert_eq!(
+            actor.ctx.cfg.lock().unwrap().context_tokens,
+            4_096,
+            "the learned window reaches the shared config"
+        );
+        assert_eq!(contexts(&ui), vec![4_096], "and the UI is told");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A cancellation mid-reply is a stop: the client sets the flag the reader
+    /// polls, exactly as the real one does, and the run ends cancelled with no
+    /// turn taken — not as a failure to reach the endpoint.
+    #[test]
+    fn a_scripted_cancellation_stops_the_run_without_a_turn() {
+        let model = Arc::new(Scripted::new().cancels());
+        let (actor, _ui, _mailbox) = scripted_actor("cancelled", &model);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::system("you are mush"), Message::user("task")];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+
+        assert_eq!(error, CANCELLED);
+        assert!(cancel.load(Ordering::SeqCst), "the flag is set too");
+        assert_eq!(messages.len(), 2, "a cancelled reply is not a turn");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// Every context window a run announced to the UI.
+    fn contexts(rx: &Receiver<Msg>) -> Vec<usize> {
+        let mut found = Vec::new();
+        while let Ok(Msg::Agent { event, .. }) = rx.try_recv() {
+            if let AgentEvent::Context { tokens } = event {
+                found.push(tokens);
+            }
+        }
+        found
     }
 
     /// The full orchestration path, headless: root spawns an isolated child,

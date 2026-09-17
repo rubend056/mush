@@ -38,7 +38,7 @@ pub enum ModelError {
     /// The endpoint could not be reached, or answered nothing at all.
     Unreachable(String),
     /// The endpoint answered, but its reply was refused before it could be
-    /// read: a body past [`http`]'s cap, a malformed status line or chunk line.
+    /// read: a body past `http`'s cap, a malformed status line or chunk line.
     Refused(String),
     /// The endpoint answered with a status other than 200. `body` is what it
     /// said, verbatim: the caller reads the endpoint's own complaint out of it
@@ -117,5 +117,158 @@ impl ModelClient for HttpModel {
 
         serde_json::from_str::<ChatResponse>(&response.body)
             .map_err(|error| ModelError::Malformed(error.to_string()))
+    }
+}
+
+/// A scripted model, for tests: a queue of replies, and a log of the requests
+/// that consumed them.
+///
+/// Nothing here opens a socket, starts a thread or sleeps, so a whole
+/// `run_loop` — tool calls, the learned-context retry, a cancellation —
+/// is asserted in process.
+#[cfg(test)]
+pub(crate) mod fake {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
+
+    use mush_core::message::{ChatRequest, ChatResponse, Choice, FunctionCall, Message, ToolCall};
+    use serde_json::Value;
+
+    use super::{ModelClient, ModelError};
+
+    /// The request the caller made, copied out of the borrow it held — the
+    /// caller's transcript does not outlive the call, so a test that wants to
+    /// assert "the second request carried the tool result" reads it here.
+    #[derive(Clone, Debug)]
+    pub struct Asked {
+        pub model: String,
+        pub messages: Vec<Message>,
+        pub tools: usize,
+    }
+
+    /// The model that answers whatever the test says, in order.
+    #[derive(Default)]
+    pub struct Scripted {
+        replies: Mutex<VecDeque<Result<ChatResponse, ModelError>>>,
+        asked: Mutex<Vec<Asked>>,
+    }
+
+    impl Scripted {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// The next reply is this text, finished.
+        pub fn says(mut self, content: &str) -> Self {
+            self.script(Ok(reply(Message::assistant(content), "stop")));
+            self
+        }
+
+        /// The next reply asks for these calls before it can answer.
+        pub fn calls(mut self, calls: Vec<ToolCall>) -> Self {
+            self.script(Ok(reply(
+                Message {
+                    role: "assistant".into(),
+                    tool_calls: Some(calls),
+                    ..Default::default()
+                },
+                "tool_calls",
+            )));
+            self
+        }
+
+        /// The next call fails the way an endpoint does: a status other than
+        /// 200, and its own complaint as the body.
+        pub fn fails_with(mut self, status: u16, body: &str) -> Self {
+            self.script(Err(ModelError::Status {
+                status,
+                body: body.to_string(),
+            }));
+            self
+        }
+
+        /// The next call is cancelled mid-reply. The flag the reader polls is
+        /// set as well as the error being returned, because that is what the
+        /// real client does: a caller that trusts the flag sees the same thing.
+        pub fn cancels(mut self) -> Self {
+            self.script(Err(ModelError::Cancelled));
+            self
+        }
+
+        /// Every request made so far, in order.
+        pub fn asked(&self) -> Vec<Asked> {
+            self.asked
+                .lock()
+                .expect("no test panicked mid-script")
+                .clone()
+        }
+
+        fn script(&mut self, reply: Result<ChatResponse, ModelError>) {
+            self.replies
+                .lock()
+                .expect("no test panicked mid-script")
+                .push_back(reply);
+        }
+    }
+
+    impl ModelClient for Scripted {
+        fn chat(
+            &self,
+            request: &ChatRequest<'_>,
+            cancel: &AtomicBool,
+        ) -> Result<ChatResponse, ModelError> {
+            self.asked
+                .lock()
+                .expect("no test panicked mid-script")
+                .push(Asked {
+                    model: request.model.to_string(),
+                    messages: request.messages.to_vec(),
+                    tools: request.tools.len(),
+                });
+            match self
+                .replies
+                .lock()
+                .expect("no test panicked mid-script")
+                .pop_front()
+            {
+                Some(Ok(reply)) => Ok(reply),
+                Some(Err(error)) => {
+                    if error == ModelError::Cancelled {
+                        cancel.store(true, Ordering::SeqCst);
+                    }
+                    Err(error)
+                }
+                // Never panic: a script that ran out is a test bug, and saying
+                // so in the run's own error beats hanging a thread that waits
+                // for a reply which is not coming.
+                None => Err(ModelError::Unreachable(
+                    "the scripted model was asked more times than it was scripted".to_string(),
+                )),
+            }
+        }
+    }
+
+    /// One reply from the endpoint: this message, and this finish reason.
+    pub fn reply(message: Message, finish_reason: &str) -> ChatResponse {
+        ChatResponse {
+            choices: vec![Choice {
+                message,
+                finish_reason: Some(finish_reason.to_string()),
+            }],
+            error: None,
+        }
+    }
+
+    /// A tool call as a model writes one: an id, a name, and its arguments.
+    pub fn tool_call(id: &str, name: &str, arguments: Value) -> ToolCall {
+        ToolCall {
+            id: id.to_string(),
+            kind: "function".to_string(),
+            function: FunctionCall {
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        }
     }
 }
