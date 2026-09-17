@@ -3896,7 +3896,12 @@ mod tests {
             Phase::Cancelling,
             "the row must show that a cancel is in flight"
         );
-        assert_eq!(app.activity_line().as_deref(), Some("#0 cancelling 0s"));
+        let rows = screen(&mut app, 120, 32);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("⊘ #0") && row.contains("cancelling…")),
+            "the row is where a cancel in flight is drawn: {rows:?}"
+        );
     }
 
     /// The cancel mark lasts exactly as long as the cancel does: the actor
@@ -3946,15 +3951,21 @@ mod tests {
         assert_eq!(app.activity_line(), None, "nothing to report");
     }
 
-    /// The stale-status defect: a finished run must leave nothing behind. The
-    /// bar derives from the phases, so when the run ends the line is gone.
+    /// The stale-status defect: a finished run must leave nothing behind. Every
+    /// line about work in progress is derived from the phase, so when the run
+    /// ends they all stop existing at once.
     #[test]
     fn a_finished_run_leaves_nothing_behind() {
         let (mut app, _rx) = test_app("finished-phase");
         let conversation = app.tree.conversation();
         app.tree.begin(AgentId::ROOT, None);
         app.tree.age(AgentId::ROOT, Duration::from_secs(70));
-        assert_eq!(app.activity_line().as_deref(), Some("#0 thinking 1m10s"));
+        assert!(
+            screen(&mut app, 120, 32)
+                .iter()
+                .any(|row| row.contains("◐ #0") && row.contains("thinking 1m10s")),
+            "a run in flight names its age"
+        );
 
         app.update(Msg::Agent {
             conversation,
@@ -3963,7 +3974,8 @@ mod tests {
         });
         assert_eq!(app.tree.agents[0].phase, Phase::Done);
         assert!(!app.busy());
-        assert_eq!(app.activity_line(), None, "no `thinking` survives the run");
+        let rows = screen(&mut app, 120, 32).join("\n");
+        assert!(!rows.contains("thinking"), "no `thinking` survives: {rows}");
     }
 
     /// The pane title counts the phases it names, and no agent is in two of its
@@ -4030,9 +4042,9 @@ mod tests {
     }
 
     /// A clause that does not fit is dropped whole, and the totals are the last
-    /// to go: a pane 32 columns wide cannot hold ` agents · 3 working · 1
-    /// waiting · Σ +324 −40`, and the half of it that would fit (`Σ +324 −`) is
-    /// a total that is not the total.
+    /// to go: the pane is at most 46 columns wide, and ` agents · 1 working · 1
+    /// waiting · Σ +324 −40` is 44 of them — the half of it that would fit
+    /// (`Σ +324 −`) is a total that is not the total.
     #[test]
     fn the_title_elides_clauses_instead_of_cutting_numbers() {
         let (mut app, _rx) = test_app("title-elides");
@@ -4044,17 +4056,24 @@ mod tests {
                 removed: 40,
             },
         );
+        // A running child: one agent working, and a root that is waiting on it.
+        crowd(&mut app, 1);
 
-        // Widest pane `draw` ever gives this pane, and nobody working: the
-        // totals fit and are shown in full.
+        // Widest pane `draw` ever gives this pane: every clause fits, totals
+        // included, and each one is whole.
         let wide = screen(&mut app, 200, 50);
-        assert!(wide[0].contains(" agents · Σ +324 −40"), "{}", wide[0]);
+        assert!(
+            wide[0].contains(" agents · 1 working · 1 waiting · Σ +324 −40"),
+            "{}",
+            wide[0]
+        );
 
-        // Too narrow for that clause: it goes entirely, rather than painting
-        // `Σ +324 −`.
+        // The narrow pane (80 columns, where the tree keeps its thirty): the
+        // totals go first, then the waiting count, and never mid-number.
         let narrow = screen(&mut app, 80, 24);
         assert!(!narrow[0].contains("Σ"), "{}", narrow[0]);
-        assert!(narrow[0].contains(" agents "), "{}", narrow[0]);
+        assert!(!narrow[0].contains("waiting"), "{}", narrow[0]);
+        assert!(narrow[0].contains(" agents · 1 working"), "{}", narrow[0]);
     }
 
     /// The pane paints tree order, and every key that moves or reads the cursor
@@ -4283,17 +4302,27 @@ mod tests {
         );
     }
 
-    /// Busy agents are named with their age: a model that has thought for two
-    /// minutes should look different from one that has thought for a second.
+    /// Busy agents are named with their age, on their own row: a model that
+    /// has thought for two minutes should look different from one that has
+    /// thought for a second, and the row is where that is read.
     #[test]
     fn busy_agents_are_named_with_their_age() {
         let (mut app, _rx) = test_app("activity-age");
         app.tree.begin(AgentId::ROOT, None);
         app.tree.activity(AgentId::ROOT, "edit_file src/lib.rs");
         app.tree.age(AgentId::ROOT, Duration::from_secs(12));
-        assert_eq!(
-            app.activity_line().as_deref(),
-            Some("#0 edit_file src/lib.rs 12s")
+        let rows = screen(&mut app, 120, 32);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("◐ #0") && row.contains("edit_file src/lib.rs 12s")),
+            "the row names the work and its age: {rows:?}"
+        );
+        // And the first line of the bar says something else: the activity has
+        // two homes already, and the bar has only one line (finding U5).
+        let bar = rows.last().expect("the bar is painted");
+        assert!(
+            !bar.contains("edit_file"),
+            "the bar does not repeat the row: {bar:?}"
         );
     }
 

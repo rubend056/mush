@@ -89,11 +89,21 @@ pub fn truncate(text: &str, max: usize) -> String {
 
 /// Lay out one row in the width it has.
 ///
-/// The row answers "what is happening": the state (glyph, id) is never
-/// sacrificed, then the branch and line delta — facts that exist nowhere else on
-/// the screen — then the brief, then the activity, which the bar already repeats
-/// for the focused agent. Fields are dropped from the right when the pane is
-/// narrow, and the cursor row's full facts are one row below in the footer.
+/// The row answers "what is happening": the state (glyph, id, and the marks
+/// beside it) is never sacrificed, then the branch and the line delta — facts
+/// that exist nowhere else on the screen — then the activity, then the brief.
+///
+/// The activity is spent *before* the brief, which is the whole point of this
+/// function: a row that fits its brief and its branch but not the sentence
+/// saying what the agent is doing has spent its last columns on the one field
+/// the screen can find elsewhere — the brief is one row below in the cursor
+/// row's footer, and again as the transcript's opening line. Truncating the
+/// brief to fit instead of reserving room for the activity is how a busy
+/// agent's row came to read `◐ #1 delegate …  mush/1` with its current tool
+/// call and its age gone (§4.5's first question, unanswered at 200×50).
+///
+/// A field is dropped whole rather than cut to a letter or two: a brief of
+/// three columns is not a brief, and the footer carries the real one.
 pub fn fit_row(
     head: &str,
     brief: &str,
@@ -101,6 +111,10 @@ pub fn fit_row(
     tail: &[String],
     width: usize,
 ) -> String {
+    /// The least a field is worth: under this it is a lie about what the text
+    /// says (`cre…`), so the row spends the columns on nothing instead.
+    const MIN_FIELD: usize = 7;
+
     let head_width = UnicodeWidthStr::width(head);
     if width <= head_width + 2 {
         return head.to_string();
@@ -110,28 +124,31 @@ pub fn fit_row(
     let show_branch = branch_width > 0 && branch_width + 2 <= budget.saturating_sub(4);
     let after_branch = budget.saturating_sub(if show_branch { branch_width + 2 } else { 0 });
 
+    // The tail, reserved first and each cell whole.
+    let mut cells = Vec::new();
+    let mut remaining = after_branch;
+    for cell in tail {
+        let cell_width = UnicodeWidthStr::width(cell.as_str());
+        if remaining < cell_width + 2 {
+            break;
+        }
+        cells.push(cell);
+        remaining -= cell_width + 2;
+    }
+
     let mut line = head.to_string();
-    let mut remaining = budget;
-    if after_branch >= 7 && !brief.is_empty() {
-        let text = truncate(brief, after_branch - 1);
-        // `truncate` budgets display columns now, so this width is the truth.
-        remaining = remaining.saturating_sub(UnicodeWidthStr::width(text.as_str()) + 1);
+    if remaining >= MIN_FIELD && !brief.is_empty() {
+        let text = truncate(brief, remaining - 1);
         line.push(' ');
         line.push_str(&text);
     }
     if show_branch {
         line.push_str("  ");
         line.push_str(branch_stat);
-        remaining = remaining.saturating_sub(branch_width + 2);
     }
-    for cell in tail {
-        let cell_width = UnicodeWidthStr::width(cell.as_str());
-        if remaining < cell_width + 2 {
-            break;
-        }
+    for cell in cells {
         line.push_str("  ");
         line.push_str(cell);
-        remaining -= cell_width + 2;
     }
     line.trim_end().to_string()
 }
@@ -153,34 +170,58 @@ pub fn mask_key(key: &str) -> String {
 mod tests {
     use super::*;
 
-    /// A row gives up its least useful field first: the activity goes before
-    /// the branch, the branch before the brief, and the state never goes.
+    /// A row spends its activity before its brief, and its state never goes.
+    ///
+    /// "What is each agent doing?" is the first question the screen exists to
+    /// answer, and the activity is the only field that answers it — the brief's
+    /// full text is one row below in the cursor row's footer. Truncating the
+    /// brief to fit, which is what spending it first means, is how a busy
+    /// agent's row came to read `◐ #1 delegate …  mush/1` with its current tool
+    /// call gone.
     #[test]
-    fn a_row_gives_up_its_brief_before_its_facts() {
-        let head = "▶◐ #2  ";
+    fn a_row_spends_its_activity_before_its_brief() {
+        let head = "▶◐ #2";
         let activity = ["write deep.txt 3s".to_string()];
-        let wide = fit_row(head, "create a file", "mush/2 +8−0", &activity, 70);
+
+        // Roomy: state, brief, branch and activity together.
         assert_eq!(
-            wide,
-            "▶◐ #2   create a file  mush/2 +8−0  write deep.txt 3s"
+            fit_row(head, "create a file", "mush/2 +8−0", &activity, 70),
+            "▶◐ #2 create a file  mush/2 +8−0  write deep.txt 3s"
         );
 
-        // Narrow: the activity goes, the branch and stat stay.
+        // 40 columns: the branch and the activity fit and the brief does not,
+        // so the brief is what yields — cut to two columns it would be neither
+        // a word nor here, so it goes.
+        assert_eq!(
+            fit_row(head, "create a file", "mush/2 +8−0", &activity, 40),
+            "▶◐ #2  mush/2 +8−0  write deep.txt 3s"
+        );
+
+        // Narrower again: the activity no longer fits whole, so it is dropped
+        // and the brief spends what it can — a field goes whole.
         let narrow = fit_row(head, "create a file", "mush/2 +8−0", &activity, 34);
-        assert!(narrow.contains("mush/2 +8−0"), "{narrow}");
-        assert!(!narrow.contains("write deep.txt"), "{narrow}");
+        assert_eq!(narrow, "▶◐ #2 create a file  mush/2 +8−0", "{narrow}");
 
-        // Narrower: the brief yields too, the branch still stays.
-        let tighter = fit_row(head, "create a file", "mush/2 +8−0", &activity, 26);
-        assert!(tighter.contains("mush/2 +8−0"), "{tighter}");
-        assert!(!tighter.contains("create"), "{tighter}");
+        // Narrower: the brief is cut to a word, the branch still stays.
+        assert_eq!(
+            fit_row(head, "create a file", "mush/2 +8−0", &activity, 26),
+            "▶◐ #2 creat…  mush/2 +8−0"
+        );
 
-        // Narrowest: the state alone, which is never dropped (the row is
-        // trimmed, so the padded id loses its trailing spaces).
+        // Narrowest: the state alone, which is never dropped.
         assert_eq!(
             fit_row(head, "create a file", "mush/2 +8−0", &activity, 10),
-            head.trim_end()
+            head
         );
+
+        // And at no width does the row outgrow the columns it was given.
+        for width in 8..=120usize {
+            let row = fit_row(head, "create a file", "mush/2 +8−0", &activity, width);
+            assert!(
+                UnicodeWidthStr::width(row.as_str()) <= width,
+                "{row:?} is wider than {width}"
+            );
+        }
     }
 
     #[test]

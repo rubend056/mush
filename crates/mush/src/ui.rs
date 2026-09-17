@@ -21,6 +21,22 @@ use crate::app::{
 pub(crate) const HINT: &str = "Tab cycles panes · /help lists commands · Ctrl-P picks a model";
 /// Beyond this the transcript is unreadable, however wide the terminal is.
 const MAX_TRANSCRIPT: u16 = 110;
+/// How many columns the agent pane is given, and why it is a length rather than
+/// a share of the terminal.
+///
+/// R1's row spends its fields left to right — `state · branch +delta · what it
+/// is doing · its title` — and that is about forty columns of real labels. Below
+/// thirty the chat is the better use of a narrow screen; past forty-six the tree
+/// has nothing else to put there (a tool label is the widest field it has) while
+/// a wider terminal is what the transcript's measure is for (it is capped at 110
+/// columns anyway). The share this replaced was 26%, which is 31 columns at 120:
+/// `▶◐ #0` left 22 for a 23-column `edit_file src/lib.rs 12s`, so a busy agent's
+/// tool call and its age were dropped there — every frame, on the size the
+/// audit photographs.
+const AGENTS_MIN_COLUMNS: u16 = 30;
+const AGENTS_MAX_COLUMNS: u16 = 46;
+/// The chat below this is a column of broken words, whatever the tree wants.
+const CHAT_MIN_COLUMNS: u16 = 40;
 /// Below this mush has no room to be honest: say so instead of painting shreds.
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 10;
@@ -34,6 +50,16 @@ const PICKER_MAX_WIDTH: u16 = 80;
 
 fn picker_width(terminal_width: u16) -> u16 {
     (terminal_width * 60 / 100).clamp(PICKER_MIN_WIDTH, PICKER_MAX_WIDTH)
+}
+
+/// The columns the agent pane is painted in — see the constants above for why
+/// this is a length: a row's four ranked fields need about forty of them, the
+/// chat keeps its own floor, and past the cap the extra columns are empty.
+fn agents_columns(terminal_width: u16) -> u16 {
+    let share = (terminal_width as u32 * 34 / 100) as u16;
+    share
+        .clamp(AGENTS_MIN_COLUMNS, AGENTS_MAX_COLUMNS)
+        .min(terminal_width.saturating_sub(CHAT_MIN_COLUMNS))
 }
 
 /// The columns the picker's list gives one item's text. The term carries the
@@ -96,12 +122,10 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         ])
         .split(area);
         // On a very wide terminal the tree stops growing: past a point it is
-        // empty space, and the chat is what the width belongs to.
-        let agents_pane = if area.width >= 160 {
-            Constraint::Length(34)
-        } else {
-            Constraint::Percentage(26)
-        };
+        // empty space, and the chat is what the width belongs to. Below that it
+        // gets the columns R1's row needs, so the fields the row is built from
+        // are the fields it can paint.
+        let agents_pane = Constraint::Length(agents_columns(area.width));
         let columns = Layout::horizontal([agents_pane, Constraint::Min(20)]).split(rows[0]);
         draw_agents(frame, app, columns[0]);
         draw_chat(frame, app, columns[1]);
@@ -297,24 +321,25 @@ fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>>
             Style::default(),
         ),
     ]));
-    if node.landed.is_some()
-        || node.branch.is_some()
-        || matches!(node.phase, Phase::Idle | Phase::Stopped)
-    {
-        let mut detail = agent_detail(node);
-        let activity = phase_detail(node);
-        if !activity.is_empty() {
-            detail.insert(0, activity);
-        }
-        if !detail.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    " {}",
-                    truncate(&detail.join(" · "), width.saturating_sub(2))
-                ),
-                dim(),
-            )));
-        }
+    // The cursor row's facts in full, and always: the row above may have had to
+    // give up its activity or its brief to fit, and this is where they are not
+    // lost — what the agent is doing *now*, where its work is, and the commands
+    // that land it. It used to be painted only for a landed, isolated, idle or
+    // stopped agent, so the one row the human is reading was the one whose
+    // activity could vanish from the screen entirely (finding P4).
+    let mut detail = agent_detail(node);
+    let activity = phase_detail(node);
+    if !activity.is_empty() {
+        detail.insert(0, activity);
+    }
+    if !detail.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {}",
+                truncate(&detail.join(" · "), width.saturating_sub(2))
+            ),
+            dim(),
+        )));
     }
     // The selected row's jobs, in full: which command, how long, and whether it
     // is the one holding the machine. Read from the same registry the row's
@@ -585,6 +610,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 /// testable without a frame: an error must never lose to work in progress
 /// (finding B12 — the Ctrl-Q warning included). The order itself is
 /// `chat::Rank`, the one table; this only maps it to a colour.
+///
 fn bar_line(status: Option<(&str, StatusKind)>, activity: Option<String>) -> (String, Style) {
     let alert = status
         .filter(|(_, kind)| *kind == StatusKind::Error)
