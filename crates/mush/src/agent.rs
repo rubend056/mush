@@ -11,17 +11,13 @@
 //! sync. An isolated agent works in its own git worktree.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
-use tempfile::NamedTempFile;
 
 use mush_core::config::parse_context_hint;
 use mush_core::git;
@@ -31,10 +27,12 @@ use mush_core::transcript::{
     needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
     COMPACT_REPLY_TOKENS,
 };
-use mush_core::workspace::truncate_for_model;
 use mush_core::{prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_SECS};
 
 use crate::app::{AgentId, ConversationId, Msg};
+use crate::clock;
+use crate::events::{Events, Ui};
+use crate::machine::{Job, Machine, Shell, ShellCommand};
 use crate::model::{HttpModel, ModelClient, ModelError};
 
 /// Backstop against a model that never stops — *not* a budget for the work.
@@ -216,7 +214,11 @@ pub enum AgentMsg {
 }
 
 /// Events streamed to the UI thread, tagged with the emitting agent's id.
-#[derive(Debug)]
+///
+/// `Clone` so a test's recording sink can hand out what it saw (see
+/// `crate::events::fake`): an event carries no state of its own — a mailbox or
+/// a cancellation flag is a handle, not a copy.
+#[derive(Clone, Debug)]
 pub enum AgentEvent {
     /// A child actor now exists (sent by its parent), with the handle to steer it.
     Spawned {
@@ -267,11 +269,19 @@ pub struct AgentCtx {
     /// gets its parent's client — so one endpoint serves every agent, and one
     /// scripted client can serve a whole tree in a test.
     pub model: Arc<dyn ModelClient>,
-    pub tx: Sender<Msg>,
-    /// Which conversation this tree belongs to. The UI drops events stamped
-    /// with another one: after `/new`, an abandoned actor can still be
-    /// finishing a request, and its events must not land in the new chat.
-    pub conversation: u64,
+    /// Where this tree's events go: the UI thread's channel, or a recording
+    /// sink in a test. Carried here rather than reached for directly, so an
+    /// actor cannot quietly take a second path to the UI.
+    pub events: Arc<dyn Events>,
+    /// How a `run_command` is started and watched. The real one runs `sh` in
+    /// its own process group; a test scripts the end state instead, so the
+    /// timeout, the cancellation and the output cap need no subprocess.
+    pub machine: Arc<dyn Machine>,
+    /// The clock every wait is measured against. `wait_agents` and a running
+    /// command are the two places mush spends real time, so both read it here:
+    /// a test can reach a timeout or a deadline by advancing a fake instead of
+    /// waiting for the real one.
+    pub clock: Arc<dyn clock::Clock>,
     /// The main workspace root; agents whose root differs are isolated.
     pub root: PathBuf,
     pub ids: Arc<AtomicU64>,
@@ -279,13 +289,9 @@ pub struct AgentCtx {
 }
 
 impl AgentCtx {
-    /// Send an id-tagged event to the UI, stamped with this conversation.
+    /// Report something that happened to agent `id`.
     fn emit(&self, id: u64, event: AgentEvent) {
-        let _ = self.tx.send(Msg::Agent {
-            conversation: ConversationId(self.conversation),
-            id: AgentId(id),
-            event,
-        });
+        self.events.emit(AgentId(id), event);
     }
 }
 
@@ -302,6 +308,9 @@ struct ActorState {
     deferred: Vec<AgentMsg>,
     /// A `Shutdown` arrived: stop the run and end this actor.
     shutdown: bool,
+    /// A `Stop` arrived with the work this actor is about to start; the run it
+    /// points at is born cancelled (finding B6).
+    stop_requested: bool,
 }
 
 /// One agent: its identity, its workspace, and the mailboxes it is wired to.
@@ -332,7 +341,7 @@ pub struct RootHandle {
     /// The config cell every actor in this tree reads, so a runtime `/model`
     /// reaches them all.
     pub cfg: Arc<Mutex<Config>>,
-    /// Identifies this conversation in events; see `AgentCtx::conversation`.
+    /// Identifies this conversation in events; see `agent::next_conversation`.
     pub conversation: u64,
     /// The tree's id counter, so the UI can raise its floor to the highest id
     /// a leftover worktree already occupies (finding B1).
@@ -348,35 +357,45 @@ pub fn spawn(cfg: Config, tx: Sender<Msg>, root: PathBuf) -> RootHandle {
     // The real endpoint, behind the seam: every agent in this tree calls it
     // through `AgentCtx::model`, children included.
     let model: Arc<dyn ModelClient> = Arc::new(HttpModel::new(shared.clone()));
-    root_actor(shared, model, tx, root)
+    let conversation = next_conversation();
+    let ui: Arc<dyn Events> = Arc::new(Ui::new(tx, conversation));
+    root_actor(shared, model, ui, conversation, root)
 }
 
 /// The same tree, with its model calls served by the caller instead of the
-/// real endpoint.
+/// real endpoint, and its events recorded instead of shown.
 ///
-/// Children inherit the client through the cloned context, so one scripted
-/// model serves a whole tree: a test can drive a parent, its children and its
-/// grandchildren through one script, with no socket, no server and no sleep.
+/// Children inherit the client and the sink through the cloned context, so one
+/// scripted model serves a whole tree — a test can drive a parent, its children
+/// and its grandchildren through one script, with no socket, no server and no
+/// sleep — and one recorder sees every event the whole tree emits.
 #[cfg(test)]
 pub(crate) fn spawn_scripted(
     cfg: Config,
-    tx: Sender<Msg>,
+    events: Arc<dyn Events>,
     root: PathBuf,
     model: Arc<dyn ModelClient>,
 ) -> RootHandle {
-    root_actor(Arc::new(Mutex::new(cfg)), model, tx, root)
+    let conversation = next_conversation();
+    root_actor(Arc::new(Mutex::new(cfg)), model, events, conversation, root)
 }
 
-/// Start the root actor of one conversation over a given model.
+/// One conversation per `/new`, so stale events can be told apart: an actor
+/// left over from a replaced tree can still be finishing a request, and its
+/// events must not land in the new chat.
+fn next_conversation() -> ConversationId {
+    static CONVERSATIONS: AtomicU64 = AtomicU64::new(1);
+    ConversationId(CONVERSATIONS.fetch_add(1, Ordering::SeqCst))
+}
+
+/// Start the root actor of one conversation over a given model and sink.
 fn root_actor(
     shared: Arc<Mutex<Config>>,
     model: Arc<dyn ModelClient>,
-    tx: Sender<Msg>,
+    events: Arc<dyn Events>,
+    conversation: ConversationId,
     root: PathBuf,
 ) -> RootHandle {
-    // One conversation per `/new`, so stale events can be told apart.
-    static CONVERSATIONS: AtomicU64 = AtomicU64::new(1);
-    let conversation = CONVERSATIONS.fetch_add(1, Ordering::SeqCst);
     // Root agent is id 0; children start at 1. The UI holds a clone so it can
     // raise the floor above leftover worktree ids.
     let ids = Arc::new(AtomicU64::new(1));
@@ -384,8 +403,9 @@ fn root_actor(
     let ctx = Arc::new(AgentCtx {
         cfg: shared.clone(),
         model,
-        tx,
-        conversation,
+        events,
+        machine: Arc::new(Shell),
+        clock: Arc::new(clock::System),
         root,
         ids: ids.clone(),
         live: live.clone(),
@@ -411,7 +431,7 @@ fn root_actor(
     RootHandle {
         tx: cmd_tx,
         cfg: shared,
-        conversation,
+        conversation: conversation.0,
         ids: ids.clone(),
         live,
     }
@@ -469,8 +489,9 @@ pub fn revive(
     let ctx = Arc::new(AgentCtx {
         cfg: cfg.clone(),
         model: Arc::new(HttpModel::new(cfg)),
-        tx,
-        conversation,
+        events: Arc::new(Ui::new(tx, ConversationId(conversation))),
+        machine: Arc::new(Shell),
+        clock: Arc::new(clock::System),
         root,
         ids,
         live,
@@ -532,7 +553,7 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
             return;
         }
         ready = false;
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = run_cancel(&mut state);
         // Say so up front: the UI did not necessarily ask for this run (a nap
         // ends with a wake-up), and the tree must show it running. The flag
         // travels with the event so the human can stop a run that is blocked
@@ -623,12 +644,33 @@ fn wait_for_work(
     loop {
         match actor.rx.try_recv() {
             Err(_) => return true,
-            Ok(command) => match absorb(state, transcript, command) {
-                Fold::End => return false,
-                Fold::Run | Fold::Idle => {}
-            },
+            Ok(command) => {
+                // A Stop that arrives *behind* the work it was aimed at. The
+                // blocking loop above folds a Stop away because nothing has
+                // been asked of an idle actor; here the run is about to start,
+                // so a Stop that came after the Run is aimed at it. Swallowing
+                // it is the one way a Ctrl-C does nothing at all: the run pays
+                // for its model calls and the human waits for the row to stop
+                // saying `⊘` on its own (finding B6).
+                let aimed_at_this_run = matches!(command, AgentMsg::Stop);
+                match absorb(state, transcript, command) {
+                    Fold::End => return false,
+                    _ if aimed_at_this_run => state.stop_requested = true,
+                    Fold::Run | Fold::Idle => {}
+                }
+            }
         }
     }
+}
+
+/// The cancellation flag a run starts with.
+///
+/// A Stop that arrived with the work — after the `Run`, before this run's first
+/// message boundary — is already aimed at it, so the flag is born set. Anything
+/// else starts a run the human has not asked to stop, even if an earlier Stop
+/// was folded away while the actor was idle: that one cancelled nothing.
+fn run_cancel(state: &mut ActorState) -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(std::mem::take(&mut state.stop_requested)))
 }
 
 /// What a command means for an actor that is not running.
@@ -1128,11 +1170,11 @@ fn compact_history(
     if messages.len() <= 2 {
         return Ok(());
     }
-    let _ = actor.ctx.tx.send(Msg::Agent {
-        conversation: ConversationId(actor.ctx.conversation),
-        id: AgentId(actor.id),
-        event: AgentEvent::Status("context nearly full — summarizing…".to_string()),
-    });
+    let actor_id = actor.id;
+    actor.ctx.emit(
+        actor_id,
+        AgentEvent::Status("context nearly full — summarizing…".to_string()),
+    );
 
     // Fold pending nudges/completions in first; a Stop cancels the run.
     drain_mailbox(&actor.rx, cancel, messages, state);
@@ -1461,8 +1503,9 @@ fn wait_tool(
         .unwrap_or(WAIT_TIMEOUT_SECS);
     // A model-supplied timeout must never overflow the clock; an
     // unrepresentable one just means "forever" (0 means that too).
+    let clock = actor.ctx.clock.as_ref();
     let deadline = (timeout > 0)
-        .then(|| Instant::now().checked_add(Duration::from_secs(timeout)))
+        .then(|| clock.now().checked_add(Duration::from_secs(timeout)))
         .flatten();
 
     loop {
@@ -1493,11 +1536,11 @@ fn wait_tool(
             }
         }
         if let Some(deadline) = deadline {
-            if Instant::now() >= deadline {
+            if clock.now() >= deadline {
                 return Ok("wait timed out — your agents are still running".to_string());
             }
         }
-        std::thread::sleep(Duration::from_millis(50));
+        clock.sleep(Duration::from_millis(50));
     }
 }
 
@@ -1653,7 +1696,8 @@ const CMD_OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
 
 /// Why a command stopped running.
 enum Ended {
-    Exited(ExitStatus),
+    /// It ended by itself, with this exit code (`-1` when a signal ended it).
+    Exited(i32),
     TimedOut,
     Cancelled,
     TooMuchOutput,
@@ -1661,11 +1705,10 @@ enum Ended {
 
 /// Run a shell command in `root` and return a report the model can read.
 ///
-/// Output goes to scratch files rather than pipes on purpose: a pipe is only
-/// complete once *every* process holding it exits, so a command that leaves a
-/// background job behind (`npm run dev &`) would otherwise pin this thread
-/// forever — past the timeout and past any cancellation. Files can be read
-/// whenever we stop waiting, so the timeout is a real bound.
+/// The command itself is the [`Machine`]'s: how to start one, how it is
+/// watched, and the three ways it stops (its time is up, a Stop arrived, it
+/// wrote too much) are this function's, which is what makes all three
+/// assertable with a scripted machine and a scripted clock.
 fn run_shell(
     command: &str,
     root: &Path,
@@ -1674,29 +1717,9 @@ fn run_shell(
     actor: &Actor,
     state: &mut ActorState,
 ) -> Result<String, String> {
-    let out = Scratch::new("out")?;
-    let err = Scratch::new("err")?;
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out.writer()?))
-        .stderr(Stdio::from(err.writer()?));
-    // Its own process group, so a signal aimed at mush never lands on a build
-    // and cleanup can target everything the command started.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("could not run command: {e}"))?;
-
-    let ended = wait_bounded(&mut child, timeout, cancel, &out, &err, actor, state)?;
-    let stdout = out.read(CMD_CAP);
-    let stderr = err.read(CMD_CAP);
+    let mut job = actor.ctx.machine.spawn(&ShellCommand { command, root })?;
+    let ended = wait_bounded(job.as_mut(), timeout, cancel, actor, state)?;
+    let (stdout, stderr) = job.output(CMD_CAP);
 
     // No `$ {command}` echo: the tool call is already rendered from the
     // assistant message that made it (`⚙ run_command …`), so printing it here
@@ -1713,9 +1736,7 @@ fn run_shell(
         report.push('\n');
     }
     match ended {
-        Ended::Exited(status) => {
-            report.push_str(&format!("[exit {}]", status.code().unwrap_or(-1)))
-        }
+        Ended::Exited(code) => report.push_str(&format!("[exit {code}]")),
         Ended::TimedOut => report.push_str(&format!("[timed out after {}s]", timeout.as_secs())),
         Ended::Cancelled => report.push_str("[cancelled]"),
         Ended::TooMuchOutput => report.push_str(&format!(
@@ -1725,27 +1746,24 @@ fn run_shell(
     Ok(report)
 }
 
-/// Wait for a child, stopping it when the timeout, a cancellation, or the
+/// Wait for a command, stopping it when the timeout, a cancellation, or the
 /// output limit arrives first.
 fn wait_bounded(
-    child: &mut Child,
+    job: &mut dyn Job,
     timeout: Duration,
     cancel: &AtomicBool,
-    out: &Scratch,
-    err: &Scratch,
     actor: &Actor,
     state: &mut ActorState,
 ) -> Result<Ended, String> {
-    let started = Instant::now();
+    let started = actor.ctx.clock.now();
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(Ended::Exited(status)),
+        match job.poll() {
+            Ok(Some(code)) => return Ok(Ended::Exited(code)),
             Ok(None) => {}
             Err(error) => {
-                // Never leave a half-reaped child (or a running process)
-                // behind on an error path.
-                kill_command(child);
-                return Err(format!("could not wait for command: {error}"));
+                // Never leave a running process behind on an error path.
+                job.kill();
+                return Err(error);
             }
         }
         // A Stop or Shutdown has to reach a command *while* it runs, or Ctrl-C
@@ -1753,82 +1771,20 @@ fn wait_bounded(
         // mailbox is polled here only for signals: nudges are parked for the
         // next message boundary, never folded in mid-batch.
         drain_signals(actor, cancel, state);
-        let ended = if started.elapsed() > timeout {
+        let ended = if actor.ctx.clock.now().saturating_duration_since(started) > timeout {
             Some(Ended::TimedOut)
         } else if cancel.load(Ordering::SeqCst) {
             Some(Ended::Cancelled)
-        } else if out.size() + err.size() > CMD_OUTPUT_LIMIT {
+        } else if job.written() > CMD_OUTPUT_LIMIT {
             Some(Ended::TooMuchOutput)
         } else {
             None
         };
         if let Some(ended) = ended {
-            kill_command(child);
+            job.kill();
             return Ok(ended);
         }
-        std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// Stop a command and everything it started. The direct child is always
-/// killed; its process group catches background jobs it left behind (and, on
-/// Unix, keeps them from filling the scratch file forever).
-fn kill_command(child: &mut Child) {
-    let group = child.id();
-    let _ = child.kill();
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .args(["-9", &format!("-{group}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = child.wait();
-}
-
-/// A command's output file, removed when it is dropped.
-///
-/// `NamedTempFile` picks the name and creates it exclusively, so a guessable
-/// name in a shared temp directory can never redirect or read what a command
-/// prints — the property the hand-rolled counter and `0600` tried to buy. It is
-/// named (rather than an O_TMPFILE handle) because the child needs its own file
-/// description: `reopen` gives one for reading without moving the writer's
-/// offset.
-struct Scratch {
-    file: NamedTempFile,
-}
-
-impl Scratch {
-    fn new(kind: &str) -> Result<Self, String> {
-        NamedTempFile::with_prefix(format!("mush-cmd-{kind}-"))
-            .map(|file| Self { file })
-            .map_err(|error| format!("cannot create a scratch file: {error}"))
-    }
-
-    /// An independent write handle for the child to inherit.
-    fn writer(&self) -> Result<File, String> {
-        self.file
-            .reopen()
-            .map_err(|error| format!("cannot open the scratch file: {error}"))
-    }
-
-    /// What was written, capped for the model. Reads one byte past the cap so
-    /// a truncated result is marked as such.
-    fn read(&self, cap: usize) -> String {
-        let mut bytes = Vec::new();
-        if let Ok(file) = self.file.reopen() {
-            let _ = file.take(cap as u64 + 1).read_to_end(&mut bytes);
-        }
-        truncate_for_model(String::from_utf8_lossy(&bytes).into_owned(), cap)
-    }
-
-    fn size(&self) -> u64 {
-        self.file
-            .as_file()
-            .metadata()
-            .map(|meta| meta.len())
-            .unwrap_or(0)
+        actor.ctx.clock.sleep(Duration::from_millis(10));
     }
 }
 
@@ -1880,10 +1836,14 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::fake::Advanceable;
+    use crate::events::fake::Recorder;
+    use crate::machine::fake::{Script, Scripted as ScriptedMachine};
     use crate::model::fake::{tool_call, Asked, Gate, Scripted};
     use mush_core::{FunctionCall, ToolCall};
     use serde_json::json;
     use std::fs;
+    use std::time::Instant;
 
     #[test]
     fn summarize_prefers_paths_then_commands_then_briefs() {
@@ -2146,6 +2106,13 @@ mod tests {
 
     /// A background job inherits the command's output file, so leaving one
     /// behind must not hold the tool (and the agent) hostage.
+    ///
+    /// This one stays a real `sh`. It is the *reason* the output goes to files
+    /// rather than pipes — a pipe is only complete once every holder exits — and
+    /// a scripted machine cannot demonstrate that, because a scripted job holds
+    /// nothing. It is bounded: the command returns at once, and the `sleep 30`
+    /// it leaves behind dies with the process group when the scratch files are
+    /// read.
     #[test]
     fn a_background_job_does_not_hold_the_tool_hostage() {
         let (actor, _mailbox) = test_actor("background");
@@ -2172,36 +2139,95 @@ mod tests {
     }
 
     /// The timeout is a real bound, and the report says what happened.
+    ///
+    /// Both halves are scripted: the command never exits, and the clock moves
+    /// only when the wait asks it to. The assertions are about the clock — the
+    /// deadline is what stopped the command, and the command was killed rather
+    /// than left behind — so proving a five-second timeout no longer costs five
+    /// seconds and a real `sleep`.
     #[test]
     fn a_command_that_runs_forever_is_killed_on_time() {
-        let (actor, _mailbox) = test_actor("timeout");
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("timeout", machine.clone(), clock.clone());
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
+        let timeout = Duration::from_secs(5);
         let started = Instant::now();
         let report = run_shell(
             "sleep 30",
             &std::env::temp_dir(),
-            Duration::from_millis(200),
+            timeout,
             &cancel,
             &actor,
             &mut state,
         )
         .unwrap();
-        assert!(report.contains("timed out"), "{report}");
+
+        assert!(report.contains("[timed out after 5s]"), "{report}");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "took {:?}",
+            clock.elapsed() >= timeout,
+            "the deadline is what stopped it, not the end of the command: {:?}",
+            clock.elapsed()
+        );
+        assert_eq!(
+            machine.kills(),
+            1,
+            "and the command was killed, not left running"
+        );
+        assert_eq!(machine.spawned(), vec!["sleep 30".to_string()]);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the deadline was reached without waiting for it: {:?}",
             started.elapsed()
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// A command that ends on its own is reported, not killed: what it said on
+    /// both streams, and the code it exited with. The ordinary path, driven by
+    /// a script instead of by `sh`.
+    #[test]
+    fn a_command_that_ends_reports_its_output_and_its_exit_code() {
+        let machine = Arc::new(
+            ScriptedMachine::new().runs(Script::exits(3).says("on stdout").complains("on stderr")),
+        );
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("exits", machine.clone(), clock.clone());
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+
+        let report = run_shell(
+            "false",
+            &std::env::temp_dir(),
+            Duration::from_secs(5),
+            &cancel,
+            &actor,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report, "on stdout\n--- stderr ---\non stderr\n[exit 3]",
+            "both streams, then how it ended"
+        );
+        assert_eq!(machine.kills(), 0, "nothing to kill: it had finished");
+        assert_eq!(
+            clock.elapsed(),
+            Duration::ZERO,
+            "and nothing was waited for"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// Ctrl-C reaches a command that is still running; the tool returns at once
-    /// and says why. A plain flag is enough: `run_shell` polls the mailbox
-    /// itself, so a real Stop lands the same way.
+    /// and says why. The command hangs, the flag is already set, and the report
+    /// is the only thing the model ever sees of it.
     #[test]
     fn a_running_command_can_be_cancelled() {
-        let (actor, _mailbox) = test_actor("cancel");
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("cancel", machine.clone(), clock.clone());
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(true);
         let started = Instant::now();
@@ -2214,12 +2240,15 @@ mod tests {
             &mut state,
         )
         .unwrap();
+
         assert!(report.contains("[cancelled]"), "{report}");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "took {:?}",
-            started.elapsed()
+        assert_eq!(machine.kills(), 1, "the command is stopped, not orphaned");
+        assert_eq!(
+            clock.elapsed(),
+            Duration::ZERO,
+            "a cancel is not a timeout: no time had to pass"
         );
+        assert!(started.elapsed() < Duration::from_secs(1));
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -2227,10 +2256,13 @@ mod tests {
     /// left for the end of the batch.
     #[test]
     fn a_stop_in_the_mailbox_interrupts_a_running_command() {
-        let (actor, mailbox) = test_actor("stop-command");
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, mailbox) = scripted_tools_actor("stop-command", machine.clone(), clock.clone());
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
         mailbox.send(AgentMsg::Stop).unwrap();
+
         let report = run_shell(
             "echo starting; sleep 30",
             &std::env::temp_dir(),
@@ -2240,15 +2272,29 @@ mod tests {
             &mut state,
         )
         .unwrap();
+
         assert!(report.contains("[cancelled]"), "{report}");
+        assert!(cancel.load(Ordering::SeqCst), "the Stop set the flag");
+        assert_eq!(machine.kills(), 1);
+        assert_eq!(
+            clock.elapsed(),
+            Duration::ZERO,
+            "the command never reached its own timeout"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// A command that writes without end is stopped at the disk limit rather
     /// than filling the filesystem — the model only ever sees the first chunk.
+    /// The writer is scripted: one megabyte a poll, forever, which reaches the
+    /// eight-megabyte limit in nine polls with no `yes`, no disk and no race.
     #[test]
     fn a_runaway_writer_is_stopped_at_the_output_limit() {
-        let (actor, _mailbox) = test_actor("runaway");
+        let machine = Arc::new(
+            ScriptedMachine::new().runs(Script::hangs().says("mush\n").writes_without_end(1 << 20)),
+        );
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("runaway", machine.clone(), clock.clone());
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
         let started = Instant::now();
@@ -2261,18 +2307,25 @@ mod tests {
             &mut state,
         )
         .unwrap();
+
         assert!(report.contains("output passed"), "{report}");
+        assert_eq!(machine.kills(), 1, "the runaway writer was killed");
         assert!(report.len() < CMD_CAP * 2, "report grew: {}", report.len());
         assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "took {:?}",
-            started.elapsed()
+            clock.elapsed() < Duration::from_secs(30),
+            "bytes stopped it, not the command's own timeout: {:?}",
+            clock.elapsed()
         );
+        assert!(started.elapsed() < Duration::from_secs(1));
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// Output longer than the cap is truncated and marked, and the command
     /// still finishes (nothing blocks on a full pipe).
+    ///
+    /// This one stays a real `sh` too: `yes` into `head` is what a real,
+    /// bounded command writing past `CMD_CAP` looks like, and what it proves is
+    /// the *real* scratch-file read — the fake only ever hands back a string.
     #[test]
     fn long_output_is_capped_and_marked() {
         let (actor, _mailbox) = test_actor("long-output");
@@ -2353,10 +2406,8 @@ mod tests {
 
     fn test_actor(label: &str) -> (Actor, Sender<AgentMsg>) {
         let cfg = test_cfg();
-        let (actor, ui, mailbox) = build_actor(label, Arc::new(HttpModel::new(cfg.clone())), cfg);
-        // Nothing here reads the UI; the receiver is leaked so the channel
-        // stays open for the events a run emits into it.
-        std::mem::forget(ui);
+        let (actor, _events, mailbox) =
+            build_actor(label, Arc::new(HttpModel::new(cfg.clone())), cfg);
         (actor, mailbox)
     }
 
@@ -2365,7 +2416,7 @@ mod tests {
     fn scripted_actor(
         label: &str,
         model: &Arc<Scripted>,
-    ) -> (Actor, Receiver<Msg>, Sender<AgentMsg>) {
+    ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
         build_actor(label, model.clone(), test_cfg())
     }
 
@@ -2376,22 +2427,56 @@ mod tests {
     }
 
     /// A standalone actor over a scratch workspace, with `model` as its client
-    /// and `cfg` as the tree's shared configuration. The UI receiver comes back
-    /// so a test can read the events the run emits.
+    /// and `cfg` as the tree's shared configuration. Its events go to a
+    /// recording sink, which comes back so a test can read what the run said.
     fn build_actor(
         label: &str,
         model: Arc<dyn ModelClient>,
         cfg: Arc<Mutex<Config>>,
-    ) -> (Actor, Receiver<Msg>, Sender<AgentMsg>) {
+    ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
+        build_actor_about(label, model, cfg, Arc::new(Shell), Arc::new(clock::System))
+    }
+
+    /// A standalone actor over a scratch workspace whose shells are scripted
+    /// and whose clock only moves when the test says so: how a command ends and
+    /// how long time takes are both facts the test writes down, so a timeout or
+    /// an output cap costs neither a subprocess nor a wait.
+    fn scripted_tools_actor(
+        label: &str,
+        machine: Arc<dyn Machine>,
+        clock: Arc<dyn clock::Clock>,
+    ) -> (Actor, Sender<AgentMsg>) {
+        let cfg = test_cfg();
+        let (actor, _events, mailbox) = build_actor_about(
+            label,
+            Arc::new(HttpModel::new(cfg.clone())),
+            cfg,
+            machine,
+            clock,
+        );
+        (actor, mailbox)
+    }
+
+    /// The same, naming the machine and the clock it runs on. The endpoint in
+    /// the config is a port nothing listens on, so a test that reaches the
+    /// model at all fails loudly instead of using a socket.
+    fn build_actor_about(
+        label: &str,
+        model: Arc<dyn ModelClient>,
+        cfg: Arc<Mutex<Config>>,
+        machine: Arc<dyn Machine>,
+        clock: Arc<dyn clock::Clock>,
+    ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
         let root = std::env::temp_dir().join(format!("mush-actor-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let (ui_tx, ui_rx) = crossbeam_channel::unbounded::<Msg>();
+        let recorder = Recorder::new();
         let ctx = Arc::new(AgentCtx {
             cfg,
             model,
-            tx: ui_tx.clone(),
-            conversation: 1,
+            events: recorder.clone(),
+            machine,
+            clock,
             root: root.clone(),
             ids: Arc::new(AtomicU64::new(1)),
             live: Arc::new(AtomicU64::new(0)),
@@ -2410,7 +2495,7 @@ mod tests {
             parent_tx: dead_tx,
             rx,
         };
-        (actor, ui_rx, my_tx)
+        (actor, recorder, my_tx)
     }
 
     /// The root napping on `wait_agents` must hear the human. Parking their
@@ -2450,6 +2535,40 @@ mod tests {
             matches!(state.deferred.first(), Some(AgentMsg::Nudge(text)) if text == "what about the tests?"),
             "the message must survive the interrupted wait: {:?}",
             state.deferred.len()
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The other shape a human message arrives in: the UI believed the agent
+    /// was idle and sent the whole transcript, whose last message is what the
+    /// human just typed. That must end a blocking wait too — an actor that only
+    /// listened for `Nudge` would sit here until the child finished.
+    #[test]
+    fn a_wait_that_no_child_ends_times_out_on_the_clock() {
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) =
+            scripted_tools_actor("wait-timeout", Arc::new(Shell), clock.clone());
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        // A child that exists and never finishes: the state a parent is in for
+        // the whole of a long wait.
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+        state.running.insert(1);
+
+        let started = Instant::now();
+        let result = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 600 })).unwrap();
+
+        assert!(result.contains("wait timed out"), "{result}");
+        assert!(
+            clock.elapsed() >= Duration::from_secs(600),
+            "the deadline is what ended the wait: {:?}",
+            clock.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "and it was reached without waiting for it: {:?}",
+            started.elapsed()
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
@@ -2539,10 +2658,10 @@ mod tests {
                 .when(|asked: &Asked| asked.depth() == Some(1))
                 .says("gate opened"),
         );
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let events = Recorder::new();
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
-            tx,
+            events.clone(),
             root.clone(),
             scripted.clone(),
         )
@@ -2603,7 +2722,7 @@ mod tests {
         // The human's words are what the model answered, in this run.
         let mut seen = Watched::default();
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done >= 1),
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
             "the interrupted run must finish so the answer is delivered: {seen:?}"
         );
         assert_eq!(seen.errors, Vec::<String>::new());
@@ -2785,6 +2904,51 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// A Stop that arrives *behind* the work it was aimed at must not be
+    /// swallowed. The blocking wait folds a Stop away while the actor is idle —
+    /// there is no work to cancel — but once a `Run` has been read, a Stop that
+    /// follows it was aimed at the run about to start, and nothing later in the
+    /// run will ever see it: the flag is created at the start, so the human's
+    /// Ctrl-C did nothing at all and the row sat at `⊘` until the run ended on
+    /// its own (finding B6).
+    #[test]
+    fn a_stop_behind_the_run_it_was_aimed_at_is_not_swallowed() {
+        let (actor, mailbox) = test_actor("stop-behind-run");
+        let mut state = ActorState::default();
+        let mut transcript = vec![Message::system("you are mush")];
+
+        mailbox
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("do the work"),
+            ]))
+            .unwrap();
+        mailbox.send(AgentMsg::Stop).unwrap();
+
+        assert!(
+            wait_for_work(&actor, &mut state, &mut transcript, false),
+            "there is a run to start"
+        );
+        assert_eq!(transcript.len(), 2, "and its task is folded in");
+        assert!(
+            run_cancel(&mut state).load(Ordering::SeqCst),
+            "the run is born cancelled, so the Stop lands where it was aimed"
+        );
+
+        // A Stop with no work in front of it stays a no-op: an agent the human
+        // stopped while it was idle must still run when they later ask it to.
+        let mut state = ActorState::default();
+        assert!(matches!(
+            absorb(&mut state, &mut transcript, AgentMsg::Stop),
+            Fold::Idle
+        ));
+        assert!(
+            !run_cancel(&mut state).load(Ordering::SeqCst),
+            "a Stop folded away while idle cancels nothing"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// A completion that the model has not read yet must be delivered when the
     /// UI's transcript replaces the actor's, or the result is lost for good.
     #[test]
@@ -2823,7 +2987,7 @@ mod tests {
                 )])
                 .says("wrote note.txt"),
         );
-        let (actor, _ui, _mailbox) = scripted_actor("scripted-run", &model);
+        let (actor, _events, _mailbox) = scripted_actor("scripted-run", &model);
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
         let mut messages = vec![
@@ -2870,7 +3034,7 @@ mod tests {
                 )
                 .says("done"),
         );
-        let (actor, ui, _mailbox) = scripted_actor("learned-context", &model);
+        let (actor, events, _mailbox) = scripted_actor("learned-context", &model);
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
@@ -2884,7 +3048,7 @@ mod tests {
             4_096,
             "the learned window reaches the shared config"
         );
-        assert_eq!(contexts(&ui), vec![4_096], "and the UI is told");
+        assert_eq!(contexts(&events), vec![4_096], "and the UI is told");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -2894,7 +3058,7 @@ mod tests {
     #[test]
     fn a_scripted_cancellation_stops_the_run_without_a_turn() {
         let model = Arc::new(Scripted::new().cancels());
-        let (actor, _ui, _mailbox) = scripted_actor("cancelled", &model);
+        let (actor, _events, _mailbox) = scripted_actor("cancelled", &model);
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
@@ -2907,15 +3071,57 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// The acknowledgement itself, through a live actor: a run that a Stop ends
+    /// is reported as `Stopped` — once, and not as `Done` and not as an error.
+    /// That event is what takes the tree's row out of `⊘ cancelling…` the moment
+    /// the cancel lands, and it is the difference between a cancel that landed
+    /// and one that never will (finding B6). The scripted client answers the way
+    /// the reader does when the flag is set, so what this pins is the actor's
+    /// half of that: how a cancelled run is *reported*.
+    #[test]
+    fn a_run_that_a_stop_ends_is_acknowledged_as_stopped() {
+        let model = Arc::new(Scripted::new().cancels());
+        let events = Recorder::new();
+        let root = scratch_dir("stop-ack");
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            model,
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("work"),
+            ]))
+            .unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.stopped > 0
+                || !seen.errors.is_empty()),
+            "the run must be acknowledged: {seen:?}"
+        );
+        assert_eq!(
+            seen.stopped, 1,
+            "reported as stopped, exactly once: {seen:?}"
+        );
+        assert_eq!(seen.done, 0, "a stopped run is not a finished one");
+        assert!(seen.errors.is_empty(), "and not a failure: {seen:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// Every context window a run announced to the UI.
-    fn contexts(rx: &Receiver<Msg>) -> Vec<usize> {
-        let mut found = Vec::new();
-        while let Ok(Msg::Agent { event, .. }) = rx.try_recv() {
-            if let AgentEvent::Context { tokens } = event {
-                found.push(tokens);
-            }
-        }
-        found
+    fn contexts(events: &Recorder) -> Vec<usize> {
+        events
+            .events()
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                AgentEvent::Context { tokens } => Some(tokens),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The seam the orchestration scenarios run on: a tree spawned over a
@@ -2926,10 +3132,10 @@ mod tests {
     fn a_spawned_tree_asks_the_scripted_model() {
         let root = scratch_dir("scripted-tree");
         let scripted = Arc::new(Scripted::new().says("nothing to do"));
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let events = Recorder::new();
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
-            tx,
+            events.clone(),
             root.clone(),
             scripted.clone(),
         )
@@ -2943,7 +3149,8 @@ mod tests {
 
         let mut seen = Watched::default();
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done > 0 || !seen.errors.is_empty()),
+            seen.wait(&events, WAIT, |seen| seen.done > 0
+                || !seen.errors.is_empty()),
             "the run must end: {seen:?}"
         );
         assert_eq!(seen.errors, Vec::<String>::new());
@@ -2992,10 +3199,10 @@ mod tests {
                     }),
                 )]),
         );
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let events = Recorder::new();
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
-            tx,
+            events.clone(),
             root.clone(),
             scripted.clone(),
         )
@@ -3013,14 +3220,14 @@ mod tests {
             "the child never asked for its first turn"
         );
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done >= 1),
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
             "the root's first turn must end while the child still runs: {seen:?}"
         );
         gate.release();
         // The child finishes, and its completion wakes the root into a second
         // run: 3 Done events, root and child and woken root.
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done >= 3),
+            seen.wait(&events, WAIT, |seen| seen.done >= 3),
             "the child, then the woken root, must each finish: {seen:?}"
         );
         assert_eq!(seen.done, 3, "no other run may happen: {seen:?}");
@@ -3138,10 +3345,10 @@ mod tests {
                     }),
                 )]),
         );
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let events = Recorder::new();
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
-            tx,
+            events.clone(),
             root.clone(),
             scripted.clone(),
         )
@@ -3157,7 +3364,7 @@ mod tests {
 
         let mut seen = Watched::default();
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done >= 3),
+            seen.wait(&events, WAIT, |seen| seen.done >= 3),
             "each level must run and finish once: {seen:?}"
         );
         assert_eq!(seen.done, 3, "each level runs exactly once: {seen:?}");
@@ -3240,8 +3447,8 @@ mod tests {
         // - ctx/2) = 6000 bytes.
         cfg.context_tokens = 4_000;
         let budget = cfg.history_budget();
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let root_tx = spawn_scripted(cfg, tx, root.clone(), scripted.clone()).tx;
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
 
         // History above 3/4 of the budget but still fitting: compaction must
         // trigger instead of trimming. Built until it crosses the line, so the
@@ -3271,7 +3478,7 @@ mod tests {
         // does not care about.
         let mut seen = Watched::default();
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done >= 2),
+            seen.wait(&events, WAIT, |seen| seen.done >= 2),
             "the run must finish, and the child with it: {seen:?}"
         );
         assert_eq!(seen.errors, Vec::<String>::new());
@@ -3325,10 +3532,10 @@ mod tests {
                 .says("steered"),
         );
 
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let events = Recorder::new();
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
-            tx,
+            events.clone(),
             root.clone(),
             scripted.clone(),
         )
@@ -3352,7 +3559,7 @@ mod tests {
 
         let mut seen = Watched::default();
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done > 0),
+            seen.wait(&events, WAIT, |seen| seen.done > 0),
             "the run must finish: {seen:?}"
         );
         assert_eq!(seen.errors, Vec::<String>::new());
@@ -3393,8 +3600,8 @@ mod tests {
         // A window wide enough that this transcript never compacts: the only
         // thing that may end this run is the runaway guard.
         cfg.context_tokens = 128_000;
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let root_tx = spawn_scripted(cfg, tx, root.clone(), scripted.clone()).tx;
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
         root_tx
             .send(AgentMsg::Run(vec![
                 Message::system(prompt::system_prompt(root.to_str().unwrap())),
@@ -3404,7 +3611,8 @@ mod tests {
 
         let mut seen = Watched::default();
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done > 0 || !seen.errors.is_empty()),
+            seen.wait(&events, WAIT, |seen| seen.done > 0
+                || !seen.errors.is_empty()),
             "the run must end: {seen:?}"
         );
         assert_eq!(
@@ -3461,6 +3669,8 @@ mod tests {
     /// spent waiting for the run rather than sleeping past it.
     #[derive(Default, Debug)]
     struct Watched {
+        /// How many recorded events have been read into this one already.
+        seen: usize,
         done: usize,
         errors: Vec<String>,
         notices: Vec<String>,
@@ -3468,6 +3678,7 @@ mod tests {
         /// message that actually carried words.
         replies: Vec<String>,
         summaries: Vec<String>,
+        stopped: usize,
     }
 
     impl Watched {
@@ -3476,33 +3687,42 @@ mod tests {
         /// instead of hanging the suite.
         fn wait(
             &mut self,
-            rx: &Receiver<Msg>,
+            events: &Recorder,
             timeout: Duration,
             until: impl Fn(&Self) -> bool,
         ) -> bool {
             let deadline = Instant::now() + timeout;
-            while !until(self) {
+            loop {
+                self.drain(events);
+                if until(self) {
+                    return true;
+                }
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     return false;
                 }
-                match rx.recv_timeout(left.min(Duration::from_millis(20))) {
-                    Ok(msg) => self.note(msg),
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return false,
+                // Nothing is emitted until something happens, so the wait is on
+                // the sink, not on a poll of it.
+                if !events.wait(left) {
+                    self.drain(events);
+                    return until(self);
                 }
             }
-            true
         }
 
-        fn note(&mut self, msg: Msg) {
-            let Msg::Agent { event, .. } = msg else {
-                return;
-            };
+        fn drain(&mut self, events: &Recorder) {
+            for (id, event) in events.events().into_iter().skip(self.seen) {
+                self.seen += 1;
+                self.note(id, event);
+            }
+        }
+
+        fn note(&mut self, _id: AgentId, event: AgentEvent) {
             match event {
                 AgentEvent::Done => self.done += 1,
                 AgentEvent::Error(why) => self.errors.push(why),
                 AgentEvent::Notice(what) => self.notices.push(what),
+                AgentEvent::Stopped => self.stopped += 1,
                 AgentEvent::Compact { summary } => self.summaries.push(summary),
                 AgentEvent::Message(message)
                     if message.role == "assistant" && !message.text().is_empty() =>

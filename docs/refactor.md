@@ -248,8 +248,8 @@ no generics threading through the actor.
 | Seam | Signature (sketch) | Fake | Unlocks |
 |---|---|---|---|
 | `ModelClient` | `fn chat(&self, req: &ChatRequest, cancel: &AtomicBool) -> Result<ChatResponse, ModelError>` | scripted reply queue, including errors and cancellation | `run_loop`, compaction, the learned-context retry, cancel mid-reply, `MAX_TURNS` wrap-up (N1) — all in-process |
-| `Machine` + `Job` | `fn spawn(&self, cmd: &ShellCommand) -> Result<Box<dyn Job>, String>`; `Job::{poll, output, kill}` | scripted end states, output sizes, elapsed time | timeout, cancel, output cap, and M2.8's detach/exclusive lock without `sh`, `yes` or sleeps |
-| `Clock` | `fn now(&self) -> Instant; fn sleep(&self, d: Duration)` | advanceable | `wait_tool`'s 50 ms poll, `wait_bounded`'s 10 ms poll, `Watch`'s deadline, `INFO_TTL` ageing |
+| `Machine` + `Job` | `fn spawn(&self, cmd: &ShellCommand) -> Result<Box<dyn Job>, String>`; `Job::{poll, written, output, kill}` | scripted end states, output sizes, kills | timeout, cancel, output cap, and M2.8's detach/exclusive lock without `sh`, `yes` or sleeps — landed in 2.3, with the timeout still decided by the watcher in `agent.rs` |
+| `Clock` | `fn now(&self) -> Instant; fn sleep(&self, d: Duration)` | advanceable by hand, `sleep` returns at once | `wait_tool`'s 50 ms poll, `wait_bounded`'s 10 ms poll, `Watch`'s deadline — landed in 2.3; `INFO_TTL` ageing still reads the wall clock in `app/mod.rs` |
 | `Events` | `fn emit(&self, id: AgentId, event: AgentEvent)` | recording sink | exactly-once completion delivery, fan-out refusal, dispatch, cancel mid-batch — asserted, instead of `mem::forget(ui_rx)` |
 
 `ModelClient` is also where the retry/parse logic around `post_json` moves, so
@@ -321,6 +321,27 @@ refers to it. The only surface the production code grew is `#[cfg(test)]`:
 `agent::spawn_scripted`, which starts the same root actor over a caller-supplied
 client.
 
+**Stage 2.3 — `Machine` + `Job`, `Clock`, `Events`.** ✅ The last three seams of
+§4, plus B6. `machine.rs` holds `Machine::spawn(&ShellCommand) -> Box<dyn Job>`
+and `Job::{poll, written, output, kill}`; the real impl is the shell as it
+always was (own process group, scratch files, `kill -9 -pgid`), and `Scratch`
+and `kill_command` moved into it. `clock.rs` holds `Clock::{now, sleep}`, the
+system impl, and an advanceable fake; `wait_tool`'s 50 ms poll, `wait_bounded`'s
+10 ms poll and `Watch`'s deadline all read it through `AgentCtx`. `events.rs`
+holds `Events::emit(id, event)`: the real sink is the UI channel with the
+conversation stamped on, and the fake records — which is what retires
+`mem::forget(ui_rx)` from the actor tests. B6 is closed on both ends: only a run
+in flight is marked `⊘ cancelling…` (an idle, done or failed agent keeps its
+phase and its `busy` flag stays down), and a `Stop` that arrives behind the
+`Run` it was aimed at is no longer folded away by the wait that follows the
+`Run`. Four of the five shell tests are now driven by the fake machine and
+clock, and so are `wait_agents`' timeout and `Watch`'s deadline; the background
+job, the real output cap and the real `git` stay, each with the reason in
+place. Still on the wall clock: `INFO_TTL`/status ageing in `app/mod.rs` (whose
+commit is another agent's) and `AgentTree`'s stale-cancel window, which already
+has `age` for tests. The default suite still opens local mock sockets in
+`http.rs`.
+
 **Stage 3 — `Screen` view and intents.** `ui::draw(frame, &Screen)` where
 `Screen` is built by `App::screen()`; panes become pure functions of a value, so
 the draw sweep can assert painted text at every size instead of only "does not
@@ -375,7 +396,7 @@ the queue of record; this column says where the *fix belongs*.
 | B3 | zero-row pane still focusable | 🔄 | `Screen`/layout tiers (Stage 3) |
 | B4 | at 40×10 the only transcript row is a blank | ✅ | `Chat::visible_lines` (3.2) |
 | B5 | `Status` after `Done` restarts a finished agent | ⬜ | `AgentTree::activity` (3.1) |
-| B6 | failed/idle `Stop` leaves `Cancelling` + `busy` stuck | ⬜ | `AgentTree::cancel_requested` + a `Stop` ack from the actor |
+| B6 | failed/idle `Stop` leaves `Cancelling` + `busy` stuck | ✅ | `AgentTree::cancel_requested` (only a run in flight is marked) + the actor's end-of-run event as the ack |
 | B7 | learned window never reaches the UI, then is clobbered | 🔄 | `ConfigCell` (3.3) |
 | B8 | context meter ignores the human's own message | ⬜ | `Chat::used_tokens` derived (3.2) |
 | B9 | `fit_row` budgets columns, `truncate` counts chars | ✅ | core `text` (3.6) |
@@ -410,8 +431,10 @@ When this lands, `docs/mush.md` wants:
 - §9: **M2.75 — Seams** before M2.8, with the stage list from §5 and the
   acceptance test from §0.
 - §10: **done** — "deterministic orchestration needs `python3` and `git`" became
-  "the model is scripted; the work is real", with the default suite needing
-  neither a socket, a subprocess, nor a sleep, once Stage 2 was done.
+  "the model is scripted; the work is real". The default suite still runs a real
+  `git` (the worktree scenarios are about git), three real commands whose point
+  *is* the process group or the scratch file, and the local mock sockets in
+  `http.rs` — with their 200–600 ms read slices — left after Stage 2.3.
 - §0's acceptance test: **held** for the default suite, whose only remaining
   `#[ignore]`s are the two live-endpoint tests in `http.rs`.
 - §12: two decisions — "one owner per fact" and "a trait is justified only by a

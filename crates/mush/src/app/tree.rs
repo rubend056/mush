@@ -417,6 +417,14 @@ impl AgentTree {
     /// still there to hear it — a cancel that cannot land is a gone actor, and
     /// the row says so instead of showing work that can never finish
     /// (finding B6).
+    ///
+    /// Only a run *in flight* is marked `⊘ cancelling…`. An agent that is
+    /// idle, done, failed or already stopped has nothing to cancel: the actor
+    /// absorbs the Stop and says nothing, so the mark and the `busy` flag that
+    /// comes with it would outlive the act they describe — a row claiming work
+    /// that will never happen, until a ten-second timer quietly cleared it
+    /// (finding B6). What the actor *does* answer is a Stop on a run it really
+    /// has: the run ends and its end-of-run event clears the mark at once.
     pub fn cancel_requested(&mut self, id: AgentId) -> bool {
         if let Some(flag) = self.agent_cancel.get(&id) {
             flag.store(true, Ordering::SeqCst);
@@ -427,20 +435,29 @@ impl AgentTree {
             .map(|tx| tx.send(AgentMsg::Stop).is_ok())
             .unwrap_or(false);
         if let Some(node) = self.node_mut(id) {
-            // Say so immediately: the actor may be mid-request, and a row that
-            // keeps spinning looks like the Stop was never heard.
-            node.phase = if heard {
-                Phase::Cancelling
-            } else {
-                Phase::Stopped
-            };
-            node.since = Instant::now();
+            if node.phase.is_busy() {
+                // Say so immediately: the actor may be mid-request, and a row
+                // that keeps spinning looks like the Stop was never heard.
+                node.phase = if heard {
+                    Phase::Cancelling
+                } else {
+                    // Nothing will ever answer, so the work it was showing can
+                    // never finish.
+                    Phase::Stopped
+                };
+                node.since = Instant::now();
+            }
+            // Otherwise the phase, and its clock, are left exactly as they
+            // were: a Stop is not news about an agent that was not working.
         }
         heard
     }
 
     /// Retire `⊘` marks whose acknowledgement will never arrive, so a row
-    /// cannot spin forever (finding B6). Returns whether anything moved.
+    /// cannot spin forever (finding B6). Only a mark on a run in flight can be
+    /// here — `cancel_requested` never makes one anywhere else — so this is the
+    /// backstop for a run that ended without saying so, not the normal path.
+    /// Returns whether anything moved.
     pub fn expire_cancels(&mut self) -> bool {
         let stale: Vec<AgentId> = self
             .agents
@@ -829,6 +846,75 @@ mod tests {
         tree.agent_tx.remove(&id);
         assert!(!tree.cancel_requested(id), "a dead mailbox is a gone actor");
         assert_eq!(tree.node(id).unwrap().phase, Phase::Stopped);
+    }
+
+    /// A Stop on an agent with nothing in flight cancels nothing, so it must
+    /// not put the row into `⊘ cancelling…`: that mark is `busy`, it made the
+    /// bar claim work that was not happening, and it was only cleared ten
+    /// seconds later by the stale timer (finding B6). The phase the agent had
+    /// is the phase it keeps — a failed run's error is the thing the human
+    /// still has to read.
+    #[test]
+    fn a_stop_on_an_at_rest_agent_leaves_no_cancelling_mark() {
+        let mut tree = AgentTree::bare();
+        let (opened, _rx) = child(&mut tree, 1);
+        let id = opened.id;
+
+        tree.fail(id, "no route".into());
+        assert!(tree.cancel_requested(id), "the mailbox is alive");
+        assert_eq!(
+            tree.node(id).unwrap().phase,
+            Phase::Failed("no route".into()),
+            "the failure is not replaced by a cancel that cancelled nothing"
+        );
+        assert!(!tree.busy());
+
+        tree.idle(id);
+        tree.cancel_requested(id);
+        assert_eq!(tree.node(id).unwrap().phase, Phase::Idle);
+        assert!(!tree.busy(), "and the bar is not claiming work");
+        assert!(
+            !tree.expire_cancels(),
+            "nothing was marked, so there is nothing to retire"
+        );
+
+        // A stop the actor really made: it stays `Stopped`, and a second Stop
+        // on it cancels no more than the first did.
+        tree.stopped(id);
+        tree.cancel_requested(id);
+        assert_eq!(tree.node(id).unwrap().phase, Phase::Stopped);
+        assert!(!tree.busy());
+    }
+
+    /// A Stop that lands clears the mark at once: the actor's end-of-run event
+    /// is the acknowledgement the tree is waiting for, and it is the only thing
+    /// that ends the `⊘` — a timer is the fallback, not the mechanism
+    /// (finding B6).
+    #[test]
+    fn a_stop_that_lands_clears_the_cancelling_mark() {
+        let mut tree = AgentTree::bare();
+        let (opened, rx) = child(&mut tree, 1);
+        let id = opened.id;
+
+        assert!(tree.cancel_requested(id), "a run is in flight");
+        assert_eq!(tree.node(id).unwrap().phase, Phase::Cancelling);
+        assert!(tree.busy(), "and the run is still on");
+        assert!(matches!(rx.try_recv(), Ok(AgentMsg::Stop)));
+
+        // The actor yields with no result: `Stopped`, not `Idle` and not `Done`.
+        tree.stopped(id);
+        assert_eq!(tree.node(id).unwrap().phase, Phase::Stopped);
+        assert!(!tree.busy(), "the acknowledgement clears it at once");
+        assert!(!tree.agent_cancel.contains_key(&id));
+
+        // A run that ends with a result clears it too, and then a Stop on it
+        // cannot start a mark again.
+        tree.begin(id, None);
+        tree.cancel_requested(id);
+        assert_eq!(tree.node(id).unwrap().phase, Phase::Cancelling);
+        tree.finish(id, Some("did the thing".into()));
+        assert_eq!(tree.node(id).unwrap().phase, Phase::Done);
+        assert!(!tree.busy());
     }
 
     /// A cancel the actor never acknowledges goes quiet rather than spinning
