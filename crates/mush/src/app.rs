@@ -18,8 +18,8 @@ use serde_json::Value;
 use mush_core::message::Message;
 use mush_core::workspace::truncate_for_model;
 use mush_core::{
-    prompt, session, tools, userconfig, Config, Provider, Session, UserConfig, Workspace,
-    LIST_LIMIT, READ_CAP,
+    git, prompt, session, tools, userconfig, Config, Provider, Session, UserConfig, Workspace,
+    LIST_LIMIT,
 };
 
 use crate::agent::{self, spawn, AgentEvent, AgentMsg, RootHandle};
@@ -68,6 +68,7 @@ pub enum Mode {
 pub enum PickerKind {
     Model,
     Provider,
+    File,
 }
 
 /// A small modal list (models or providers) that grabs the keyboard until
@@ -81,8 +82,9 @@ pub struct Picker {
 impl Picker {
     pub fn title(&self) -> String {
         match self.kind {
-            PickerKind::Model => " models ".to_string(),
-            PickerKind::Provider => " provider ".to_string(),
+            PickerKind::Model => " models · Enter picks ".to_string(),
+            PickerKind::Provider => " provider · Enter picks ".to_string(),
+            PickerKind::File => " open file · Enter opens ".to_string(),
         }
     }
 }
@@ -121,6 +123,17 @@ impl Phase {
     }
 }
 
+/// `500k`, `8192`, `1M` — the way a window size wants to be read.
+pub fn tokens_label(tokens: usize) -> String {
+    if tokens >= 1_000_000 {
+        format!("{}M", tokens / 1_000_000)
+    } else if tokens >= 1_000 {
+        format!("{}k", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
+}
+
 /// An age the way a glance wants it: seconds, then minutes, then hours — never
 /// a five-digit number that takes arithmetic to read.
 pub fn short_age(elapsed: Duration) -> String {
@@ -150,6 +163,21 @@ pub struct Status {
     pub kind: StatusKind,
     pub text: String,
     pub set_at: Instant,
+}
+
+/// A line for the transcript that is not a message: a note from mush itself.
+#[derive(Clone, Debug)]
+pub struct Notice {
+    pub kind: NoticeKind,
+    pub text: String,
+}
+
+/// Only failures are red. Hints — `/help`, the git command to merge a branch —
+/// are information, and colouring them like errors is how a screen cries wolf.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NoticeKind {
+    Info,
+    Error,
 }
 
 pub struct AgentNode {
@@ -396,11 +424,19 @@ pub struct App {
     pub focus: Focus,
     pub mode: Mode,
     pub chat: Vec<Message>,
-    pub notices: Vec<String>,
+    pub notices: Vec<Notice>,
     pub input: String,
     pub chat_scroll: usize,
-    pub models: Vec<String>,
+    pub models: Vec<http::Model>,
     pub picker: Option<Picker>,
+    /// The main worktree's branch, dirty count, and uncommitted line delta.
+    pub git: Option<git::RepoStatus>,
+    /// Each isolated agent's own work, measured on its branch. Refreshed by
+    /// events, never computed while painting.
+    pub agent_stats: HashMap<u64, git::Stat>,
+    /// Bytes of the root conversation, so the context meter costs nothing to
+    /// draw. Updated whenever the transcript changes.
+    pub context_used: usize,
     pub agents: Vec<AgentNode>,
     pub agent_cursor: usize,
     /// The agent whose transcript the chat shows and whose mailbox typing targets.
@@ -420,6 +456,8 @@ pub struct App {
     /// Which conversation the live actor tree belongs to; events tagged with
     /// any other are from an abandoned tree and are ignored.
     conversation: u64,
+    /// When the git snapshot was last taken, so a long run refreshes it.
+    git_at: Option<Instant>,
     /// A transient line for the bar: what just happened, or what went wrong.
     /// Work in progress does not live here — it is derived from the phases.
     pub status: Option<Status>,
@@ -438,7 +476,7 @@ impl App {
         stored: Option<Session>,
         root: RootHandle,
         ui_tx: Sender<Msg>,
-        models: Vec<String>,
+        models: Vec<http::Model>,
         open_file: Option<String>,
     ) -> Self {
         let system = Message::system(prompt::system_prompt(&ws.root_str()));
@@ -456,6 +494,9 @@ impl App {
             chat_scroll: 0,
             models,
             picker: None,
+            git: None,
+            agent_stats: HashMap::new(),
+            context_used: 0,
             agents: vec![AgentNode {
                 id: 0,
                 parent: None,
@@ -474,6 +515,7 @@ impl App {
             cfg_shared: root.cfg,
             ui_tx,
             conversation: root.conversation,
+            git_at: None,
             status: None,
             busy: false,
             should_quit: false,
@@ -482,15 +524,52 @@ impl App {
             spin: 0,
             system,
         };
-        app.say(format!(
-            "{}  •  Tab to move around · Ctrl-P pick a model",
-            app.cfg.label()
-        ));
         app.discover_worktrees();
+        app.count_context();
+        app.refresh_git();
         if let Some(rel) = open_file {
             app.open_file(&rel);
         }
         app
+    }
+
+    /// Re-read what the repository looks like: the main worktree's branch,
+    /// dirty count and uncommitted delta, plus each isolated branch's own work.
+    /// Called on events, never from `draw` — a `git` process per frame would be
+    /// absurd (docs/mush.md §8).
+    pub fn refresh_git(&mut self) {
+        let root = self.ws.root();
+        let mut stats = HashMap::new();
+        for node in &self.agents {
+            let Some(branch) = node.branch.clone() else {
+                continue;
+            };
+            // A nested agent forked from its parent's branch, so that is what
+            // its work is measured against; a top-level one forked from HEAD.
+            let base = node
+                .parent
+                .and_then(|parent| self.agents.iter().find(|n| n.id == parent))
+                .and_then(|parent| parent.branch.clone())
+                .unwrap_or_else(|| "HEAD".to_string());
+            if let Some(stat) = git::branch_stat(root, &base, &branch) {
+                stats.insert(node.id, stat);
+            }
+        }
+        self.agent_stats = stats;
+        self.git = git::status(root);
+        self.git_at = Some(Instant::now());
+    }
+
+    /// How many tokens the root conversation is holding, roughly (the same
+    /// three-bytes-per-token heuristic the trimmer uses).
+    fn count_context(&mut self) {
+        self.context_used =
+            self.chat.iter().map(Message::weight).sum::<usize>() + self.system.weight();
+    }
+
+    /// The window in tokens, for the meter.
+    pub fn context_used_tokens(&self) -> usize {
+        self.context_used / 3
     }
 
     /// Register git worktrees left over from earlier sessions (`mush/<id>`
@@ -586,6 +665,15 @@ impl App {
         if self.busy {
             self.spin = self.spin.wrapping_add(1);
             self.dirty_screen = true;
+            // A long run keeps changing the workspace; the bar and the rows
+            // should not need a keystroke to notice.
+            if self
+                .git_at
+                .map(|at| at.elapsed() > Duration::from_secs(2))
+                .unwrap_or(true)
+            {
+                self.refresh_git();
+            }
         }
         if let Some(status) = &self.status {
             if status.kind == StatusKind::Info && status.set_at.elapsed() >= INFO_TTL {
@@ -645,6 +733,7 @@ impl App {
             AgentEvent::Message(message) => {
                 if id == 0 {
                     self.chat.push(message);
+                    self.count_context();
                     self.save_session();
                 } else if let Some(msgs) = self.agent_msgs.get_mut(&id) {
                     msgs.push(message);
@@ -664,12 +753,13 @@ impl App {
                     node.since = Instant::now();
                 }
                 self.agent_cancel.remove(&id);
+                self.refresh_git();
                 if cancelled {
                     if id == self.focused || id == 0 {
                         self.say("cancelled");
                     }
                 } else {
-                    self.notices.push(error);
+                    self.note_error(error);
                 }
                 self.chat_scroll = 0;
                 self.recompute_busy();
@@ -684,6 +774,7 @@ impl App {
                     }
                 }
                 self.agent_cancel.remove(&id);
+                self.refresh_git();
                 self.recompute_busy();
             }
             AgentEvent::Resync => self.resync_from_disk(),
@@ -694,9 +785,9 @@ impl App {
                 let carried = Message::user(prompt::compaction_message(&summary));
                 if id == 0 {
                     self.chat = vec![carried];
+                    self.count_context();
                     self.save_session();
-                    self.notices
-                        .push("context compacted — continuing from a summary".to_string());
+                    self.note("context compacted — continuing from a summary");
                 } else if let Some(msgs) = self.agent_msgs.get_mut(&id) {
                     *msgs = vec![carried];
                 }
@@ -719,6 +810,31 @@ impl App {
             text: text.into(),
             set_at: Instant::now(),
         });
+    }
+
+    /// A line for the transcript that is not a message: a hint, or a failure.
+    pub fn note(&mut self, text: impl Into<String>) {
+        self.notices.push(Notice {
+            kind: NoticeKind::Info,
+            text: text.into(),
+        });
+    }
+
+    pub fn note_error(&mut self, text: impl Into<String>) {
+        self.notices.push(Notice {
+            kind: NoticeKind::Error,
+            text: text.into(),
+        });
+    }
+
+    /// `500k`, `8192`, `1M` — one glance, no counting zeroes.
+    pub fn context_label(&self) -> String {
+        let spelling = tokens_label(self.cfg.context_tokens);
+        if self.cfg.context_explicit {
+            format!("ctx {spelling} (set)")
+        } else {
+            format!("ctx ~{spelling}")
+        }
     }
 
     /// Remember something that went wrong. Errors do not fade: they stay until
@@ -834,7 +950,7 @@ impl App {
 
     fn exec_tool(&mut self, name: &str, args: &Value) -> Result<String, String> {
         match name {
-            "list_files" => tools::list_result(&self.ws, args, LIST_LIMIT),
+            "list_files" => tools::list_result(&self.ws, args, self.cfg.list_limit()),
             "read_file" => {
                 let rel = tools::arg_string(args, "path")?;
                 self.read_live(&rel)
@@ -860,7 +976,10 @@ impl App {
     /// Read through the live buffer when the file is open, so an agent always
     /// sees what the human sees. Large files are capped for the model's benefit.
     fn read_live(&self, rel: &str) -> Result<String, String> {
-        Ok(truncate_for_model(self.read_for_edit(rel)?, READ_CAP))
+        Ok(truncate_for_model(
+            self.read_for_edit(rel)?,
+            self.cfg.read_cap(),
+        ))
     }
 
     /// The complete current text of a file: buffer first, disk second. Used by
@@ -885,6 +1004,7 @@ impl App {
         } else {
             self.ws.write_file(rel, content)?;
         }
+        self.refresh_git();
         Ok(format!("wrote {rel}{note}"))
     }
 
@@ -926,6 +1046,7 @@ impl App {
         match self.ws.write_file(&rel, &text) {
             Ok(()) => {
                 self.buffers[index].dirty = false;
+                self.refresh_git();
                 self.say(format!("saved {rel}"));
             }
             Err(error) => self.fail(error),
@@ -1048,24 +1169,49 @@ impl App {
             "/new" | "/clear" => self.new_chat(),
             "/quit" | "/q" => self.should_quit = true,
             "/help" | "/?" => {
-                self.notices.push(
+                self.note(
                     "mush: Tab cycles agents/editor/chat · Enter sends to the focused agent · \
                      Ctrl-P pick a model · Ctrl-S save · Ctrl-R reload · Ctrl-N new chat · \
-                     Ctrl-C cancel all. Commands: /provider /model /url /key /models /open \
-                     /worktrees /diff /merge /discard /new /quit"
-                        .to_string(),
+                     Ctrl-C cancel all. Commands: /provider /model /context /url /key /models \
+                     /open /worktrees /diff /merge /discard /new /quit",
                 );
             }
             "/open" => {
                 if rest.is_empty() {
-                    self.say("usage: /open <path>");
+                    self.open_file_picker();
                     return;
                 }
                 self.open_file(rest);
             }
+            "/context" => {
+                if rest.is_empty() {
+                    self.say(format!(
+                        "{} · {} tokens used · set it with /context <tokens>",
+                        self.context_label(),
+                        self.context_used_tokens()
+                    ));
+                    return;
+                }
+                let Ok(tokens) = rest.trim().parse::<usize>() else {
+                    self.say("usage: /context <tokens>");
+                    return;
+                };
+                if tokens == 0 {
+                    self.say("usage: /context <tokens>");
+                    return;
+                }
+                self.cfg.set_context(tokens);
+                self.apply_config();
+                self.save_session();
+                self.say(format!(
+                    "{} — remembered for this workspace",
+                    self.context_label()
+                ));
+            }
             "/diff" | "/merge" | "/discard" => self.worktree_command(name, rest),
             "/worktrees" => {
                 self.discover_worktrees();
+                self.refresh_git();
                 let count = self
                     .agents
                     .iter()
@@ -1128,7 +1274,7 @@ impl App {
                     )
                 });
             }
-            other => self.notices.push(format!("unknown command: {other}")),
+            other => self.note_error(format!("unknown command: {other}")),
         }
     }
 
@@ -1157,9 +1303,26 @@ impl App {
     }
 
     /// Re-fetch the model list from the current endpoint, falling back to the
-    /// provider's built-in list when the endpoint cannot answer.
+    /// provider's built-in list when the endpoint cannot answer. An advertised
+    /// context window is adopted here, so it lands before the next request.
     pub fn refresh_models(&mut self) {
         self.models = http::list_models(&self.cfg);
+        self.adopt_advertised_context();
+    }
+
+    /// Take the endpoint's word for the window of the model in use, unless the
+    /// human stated one.
+    fn adopt_advertised_context(&mut self) {
+        let advertised = self
+            .models
+            .iter()
+            .find(|model| model.id == self.cfg.model)
+            .and_then(|model| model.context);
+        if let Some(tokens) = advertised {
+            if self.cfg.adopt_context(tokens) {
+                self.apply_config();
+            }
+        }
     }
 
     fn open_model_picker(&mut self) {
@@ -1173,11 +1336,38 @@ impl App {
         let cursor = self
             .models
             .iter()
-            .position(|model| *model == self.cfg.model)
+            .position(|model| model.id == self.cfg.model)
             .unwrap_or(0);
+        let items = self
+            .models
+            .iter()
+            .map(|model| match model.context {
+                Some(tokens) => format!("{} · {}", model.id, tokens_label(tokens)),
+                None => model.id.clone(),
+            })
+            .collect();
         self.picker = Some(Picker {
             kind: PickerKind::Model,
-            items: self.models.clone(),
+            items,
+            cursor,
+        });
+    }
+
+    /// Open the workspace's files, so `/open` without a path (or a new user
+    /// wondering how to open one) has somewhere to look.
+    fn open_file_picker(&mut self) {
+        let items = self.ws.list_files(LIST_LIMIT.min(500));
+        if items.is_empty() {
+            self.fail("no files here — is this the right directory?");
+            return;
+        }
+        let cursor = self
+            .current_rel()
+            .and_then(|rel| items.iter().position(|item| item == rel))
+            .unwrap_or(0);
+        self.picker = Some(Picker {
+            kind: PickerKind::File,
+            items,
             cursor,
         });
     }
@@ -1253,12 +1443,21 @@ impl App {
     fn pick(&mut self, kind: PickerKind, item: &str) {
         match kind {
             PickerKind::Model => {
-                self.cfg.model = item.to_string();
+                // The picker labels models with their window; the id is the
+                // part before the separator.
+                let id = item.split(" · ").next().unwrap_or(item).to_string();
+                self.cfg.model = id;
+                self.adopt_advertised_context();
                 self.apply_config();
                 self.persist_user_config();
-                self.say(format!("model: {}", self.cfg.label()));
+                self.say(format!(
+                    "model: {} · {}",
+                    self.cfg.label(),
+                    self.context_label()
+                ));
             }
             PickerKind::Provider => self.apply_provider(item),
+            PickerKind::File => self.open_file(item),
         }
     }
 
@@ -1285,7 +1484,7 @@ impl App {
             _ => return,
         };
         self.say(command_text.clone());
-        self.notices.push(command_text);
+        self.note(command_text);
     }
 
     /// Reset the conversation: stop every actor in the old tree and start a
@@ -1329,6 +1528,8 @@ impl App {
         self.busy = false;
         self.spin = 0;
         self.discover_worktrees();
+        self.count_context();
+        self.refresh_git();
         self.save_session();
         self.say("new chat — agents stopped, root restarted");
     }
@@ -1349,6 +1550,9 @@ impl App {
             model: self.cfg.model.clone(),
             provider: self.cfg.provider.name().to_string(),
             base_url: self.cfg.base_url.clone(),
+            // Only a window the human stated is worth remembering; a discovered
+            // one is re-read next time, so it cannot go stale.
+            context: self.cfg.context_explicit.then_some(self.cfg.context_tokens),
             updated: session::now_secs(),
             messages: self.chat.clone(),
         };
@@ -1646,6 +1850,8 @@ mod tests {
 
     /// A real `App` on a scratch directory, with a real (idle) root actor. The
     /// returned receiver keeps the UI channel alive for the life of the test.
+    /// A real `App` on a scratch directory, with a real (idle) root actor. The
+    /// returned receiver keeps the UI channel alive for the life of the test.
     fn test_app(label: &str) -> (App, Receiver<Msg>) {
         let root = std::env::temp_dir().join(format!("mush-app-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -1660,7 +1866,10 @@ mod tests {
             None,
             handle,
             tx,
-            vec!["test-model".to_string()],
+            vec![http::Model {
+                id: "test-model".to_string(),
+                context: None,
+            }],
             None,
         );
         (app, rx)
@@ -1672,7 +1881,10 @@ mod tests {
     fn slash_new_restarts_the_root_and_clears_the_conversation() {
         let (mut app, _rx) = test_app("new");
         app.chat.push(Message::user("an old task"));
-        app.notices.push("old noise".to_string());
+        app.notices.push(Notice {
+            kind: NoticeKind::Info,
+            text: "old noise".to_string(),
+        });
         app.busy = true;
         let before = app.cfg_shared.clone();
 
@@ -1936,15 +2148,16 @@ mod tests {
     #[test]
     fn info_fades_and_errors_stay() {
         let (mut app, _rx) = test_app("status-life");
-        // A fresh app announces its model; that line ages out like any other.
-        assert!(text_of(&app).contains("test-model"));
+        // Nothing is said at startup: the bar's facts line already carries the
+        // model and the window, so a status line would only repeat it.
+        assert_eq!(text_of(&app), "");
+
+        app.say("saved src/main.rs");
+        assert_eq!(text_of(&app), "saved src/main.rs");
         age_status(&mut app, 6);
         assert_eq!(text_of(&app), "", "an info line fades");
         app.tick();
         assert!(app.status.is_none(), "and is dropped, not just hidden");
-
-        app.say("saved src/main.rs");
-        assert_eq!(text_of(&app), "saved src/main.rs");
 
         app.fail("cannot write /etc/passwd");
         age_status(&mut app, 600);
@@ -1965,6 +2178,68 @@ mod tests {
         assert_eq!(short_age(Duration::from_secs(3)), "3s");
         assert_eq!(short_age(Duration::from_secs(70)), "1m10s");
         assert_eq!(short_age(Duration::from_secs(3600 + 120)), "1h02m");
+    }
+
+    /// The layout must survive every terminal size.
+    ///
+    /// This is the regression guard for the arithmetic in `ui.rs`: subticks,
+    /// index math, and `Rect` construction all have to hold at the floor and at
+    /// sizes between the tiers — a panic there is a blank screen for the user.
+    #[test]
+    fn the_layout_survives_every_size() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let (mut app, _rx) = test_app("layout-sizes");
+        // A tree with depth, a branch, and every phase, plus an open file, so
+        // no branch of the renderer goes unexercised.
+        let conversation = app.conversation;
+        for (id, parent, depth) in [(1u64, 0u64, 1usize), (2, 1, 2)] {
+            app.update(Msg::Agent {
+                conversation,
+                id: parent,
+                event: AgentEvent::Spawned {
+                    child: id,
+                    parent,
+                    brief: "a deliberately long brief that will not fit".to_string(),
+                    depth,
+                    branch: Some(format!("mush/{id}")),
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+        }
+        app.agents[1].phase = Phase::Activity("edit_file src/lexer.rs 12s".to_string());
+        app.agents[2].phase = Phase::Failed("no route to host".to_string());
+        app.refresh_git();
+        app.open_file("notes.txt");
+
+        for (width, height) in [
+            (200u16, 50u16),
+            (160, 26),
+            (120, 32),
+            (100, 25),
+            (80, 24),
+            (79, 24),
+            (60, 20),
+            (60, 19),
+            (50, 12),
+            (40, 10),
+            (39, 9),
+            (20, 5),
+            (1, 1),
+        ] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| crate::ui::draw(frame, &mut app))
+                .unwrap_or_else(|error| panic!("draw failed at {width}x{height}: {error}"));
+            // Both focus states, since the compact tier hides the editor when
+            // it is empty and empty-but-focused is the awkward case.
+            app.focus = Focus::Editor;
+            terminal
+                .draw(|frame| crate::ui::draw(frame, &mut app))
+                .unwrap_or_else(|error| panic!("draw failed at {width}x{height}: {error}"));
+            app.focus = Focus::Chat;
+        }
     }
 
     #[test]

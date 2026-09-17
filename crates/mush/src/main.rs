@@ -38,6 +38,7 @@ struct Args {
     url: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    context: Option<usize>,
 }
 
 impl Args {
@@ -49,6 +50,7 @@ impl Args {
             model: self.model.clone(),
             provider: self.provider.clone(),
             api_key: None,
+            context: self.context,
         }
     }
 }
@@ -58,6 +60,7 @@ fn parse_args() -> Result<Args, String> {
     let mut url = None;
     let mut model = None;
     let mut provider = None;
+    let mut context = None;
     let mut args = std::env::args().skip(1);
     let mut only_flags = false;
 
@@ -75,6 +78,15 @@ fn parse_args() -> Result<Args, String> {
             "--url" => url = Some(args.next().ok_or("--url needs a value")?),
             "--model" => model = Some(args.next().ok_or("--model needs a value")?),
             "--provider" => provider = Some(args.next().ok_or("--provider needs a value")?),
+            "--context" => {
+                let value = args.next().ok_or("--context needs a value")?;
+                let tokens = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| format!("--context needs a token count, got `{value}`"))?;
+                context = Some(tokens);
+            }
             other if other.starts_with("--") && !only_flags => {
                 return Err(format!("unknown option `{other}` (try --help)"));
             }
@@ -87,6 +99,7 @@ fn parse_args() -> Result<Args, String> {
         url,
         model,
         provider,
+        context,
     })
 }
 
@@ -94,11 +107,13 @@ fn print_help() {
     println!(
         "mush {}\n\
          A small, fast, agent-agnostic terminal editor.\n\n\
-         USAGE:\n    mush [DIRECTORY] [--url URL] [--model NAME] [--provider NAME]\n\n\
+         USAGE:\n    mush [DIRECTORY] [--url URL] [--model NAME] [--provider NAME] [--context TOKENS]\n\n\
          OPTIONS:\n\
-         \x20   --url URL      OpenAI-compatible endpoint (default: $MUSH_URL or the provider default)\n\
-         \x20   --model NAME   Model id (default: $MUSH_MODEL, else auto-detected)\n\
-         \x20   --provider     deepseek or custom (default: $MUSH_PROVIDER or custom)\n\n\
+         \x20   --url URL          OpenAI-compatible endpoint (default: $MUSH_URL or the provider default)\n\
+         \x20   --model NAME       Model id (default: $MUSH_MODEL, else auto-detected)\n\
+         \x20   --provider NAME    deepseek or custom (default: $MUSH_PROVIDER or custom)\n\
+         \x20   --context TOKENS   Context window when nothing else knows it (default: $MUSH_CONTEXT,\n\
+         \x20                      else what the endpoint advertises, else the model's known window)\n\n\
          KEYS:\n\
          \x20   Tab / Shift-Tab   cycle panes (agents, editor, chat)\n\
          \x20   Enter             send message (chat) · focus agent (agents)\n\
@@ -111,10 +126,11 @@ fn print_help() {
          COMMANDS (type in the chat):\n\
          \x20   /provider [deepseek|custom]  switch provider\n\
          \x20   /model                       pick a model\n\
+         \x20   /context [TOKENS]            show or set the context window\n\
          \x20   /url http://host:port        set the endpoint\n\
          \x20   /key <secret>                set the API key (saved to the home config)\n\
          \x20   /models                      refresh the model list\n\
-         \x20   /open <path>                 open a file in the editor\n\
+         \x20   /open [path]                 open a file (no path: pick one)\n\
          \x20   /worktrees                   re-scan for leftover isolated worktrees\n\
          \x20   /diff|/merge|/discard <id>   git commands for an isolated agent\n\
          \x20   /new  /help  /quit\n\
@@ -152,16 +168,24 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     // One `/v1/models` request serves both the picker and, when nothing else
     // named a model, the initial choice. A failed lookup yields the provider's
-    // known models (empty for custom endpoints).
+    // known models (empty for custom endpoints). An endpoint that advertises a
+    // context window overrides the guess here, before the first request.
     let models = http::list_models(&config);
     if config.model.is_empty() {
         match models.first() {
-            Some(model) => config.model = model.clone(),
+            Some(model) => config.model = model.id.clone(),
             None => eprintln!(
                 "mush: no model given and none discovered at {} — pick one with /model",
                 config.models_url()
             ),
         }
+    }
+    if let Some(advertised) = models
+        .iter()
+        .find(|model| model.id == config.model)
+        .and_then(|model| model.context)
+    {
+        config.adopt_context(advertised);
     }
 
     let (tx, rx) = unbounded::<Msg>();
@@ -258,11 +282,13 @@ mod tests {
             url: Some("http://host:1".into()),
             model: None,
             provider: Some("deepseek".into()),
+            context: Some(64_000),
         };
         let overrides = args.overrides();
         assert_eq!(overrides.url.as_deref(), Some("http://host:1"));
         assert_eq!(overrides.provider.as_deref(), Some("deepseek"));
         assert_eq!(overrides.model, None);
+        assert_eq!(overrides.context, Some(64_000));
         // The key never comes from argv.
         assert_eq!(overrides.api_key, None);
     }

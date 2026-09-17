@@ -243,7 +243,7 @@ defects. They share one shape: the data exists, the pixels do not.
 10. **No environment facts.** Workspace path, branch, and dirty state are nowhere,
     so `mush` in the wrong directory looks exactly like the right one.
 
-### The plan (M2.7)
+### The plan (M2.7) — all four rules landed
 
 Four rules, no new panes, no new dependencies, and `ui.rs` stays dumb — all values
 are computed in `App`.
@@ -256,20 +256,31 @@ are computed in `App`.
   lifetime: `Info` fades after five seconds, `Error` stays, and work in progress is
   never stored at all — which is what makes `✓` on an idle agent and a lingering
   `thinking…` impossible rather than merely fixed.
+- **R1 — Ranked fields, then a footer.** `[DONE]` A row is spent in this order:
+  state (`glyph · id`), then `branch +add −del`, then the brief, then the activity —
+  facts that exist nowhere else survive longest; the brief yields first because the
+  footer and the transcript carry it. The selected row's full facts get a two-line
+  footer under the list, isolated agents included (`.mush/wt/2 · git diff
+  HEAD...mush/2 · /merge 2`). `fit_row` is a pure function with tests, and the
+  pane's title carries `agents · 2 running · Σ +324 −40`.
 
 - **R1 — Ranked fields, then a footer.** One row per agent, spent left to right in
   priority order (`glyph · id · brief · activity · branch · stat`); the *selected*
   row's full facts get a 1–2 line footer under the list. A narrow pane degrades to
   `◐ #2`; facts move, they do not disappear.
-- **R2 — One workspace bar, fixed field order.** `focus │ branch ±dirty +add −del │
-  model │ hints`, truncating only at the far right.
-- **R3 — Size tiers with a floor.** `w<40 || h<10` → a single centred
-  `mush needs at least 40×10`; a compact tier that puts the agent strip above the
-  chat and hides an empty editor; the present three panes at 80×20 and up; a
-  capped, centred transcript (≈110 cols) on very wide terminals.
-- **R4 — Truthful glyphs.** `[DONE for the row]` `·` idle/never ran, `◐` running,
-  `⏸` waiting on children, `⊘` a cancel in flight, `✓` finished, `✗` failed, `⑂`
-  isolated, with a legend in the pane title (the legend and `⑂` still to come).
+- **R2 — One bar, two lines.** `[DONE]` Line one is what just happened: the tree's
+  activity (derived, with ages) › the transient status › the hint. Line two (on
+  terminals at least 26 rows tall) is the stable facts, elided from the right:
+  `⌂ path │ branch ±dirty +add −del │ model · ctx ~500k`. The window's size is
+  never a mystery again, and the repository survives the narrowest of them.
+- **R3 — Size tiers with a floor.** `[DONE]` `w<40 || h<10` → a single centred
+  `mush needs at least 40×10`; `w<80 || h<20` → compact: the agent strip on top,
+  chat below, and an empty editor hidden; `h≥26` → the two-line bar; the
+  transcript is capped at 110 columns however wide the terminal is.
+- **R4 — Truthful glyphs.** `[DONE]` `·` idle/never ran, `◐` running, `⏸` waiting
+  on children, `⊘` a cancel in flight, `✓` finished, `✗` failed; tool calls are
+  `⚙ name summarized-args` (never raw JSON), and notices are neutral `·` unless
+  something actually failed (`!`).
 
 ```
 ┌ agents · 2 running · Σ +324 −40 ────────────┐
@@ -283,13 +294,21 @@ are computed in `App`.
 └─────────────────────────────────────────────┘
 ```
 
-The plumbing is the whole cost: a `mush-core/src/git.rs` (~80 lines plus tests,
-shell-outs like the worktree code, no new crates) exposing `status(dir)`,
-`branch(dir)`, and `shortstat(dir, base)`, plus one cached `App` snapshot refreshed
-on agent `Done`/`Error`, on writes and saves, and every ~2 s while busy.
+The plumbing is a `mush-core/src/git.rs` (shell-outs like the worktree code, no
+new crates) exposing `status(dir)`, `branch(dir)`, `branch_stat(dir, base)` and a
+`--shortstat` parser, plus one `App` snapshot (`git`, `agent_stats`) refreshed on
+agent `Done`/`Error`, on writes and saves, on `/worktrees`, and every two seconds
+while anything is running. A nested agent is measured against its *parent's*
+branch, which is what makes the Σ in the title exact.
 
-Order: M2.6 first — a branch with no commits makes the per-agent stat meaningless —
-then R1+R2+R4, then R3, then the transcript polish (items 8 and 9).
+The context window is resolved the same way: `MUSH_CONTEXT` / `--context` /
+`/context` (and a stored explicit choice) › what the endpoint advertises
+(`meta.n_ctx`, `max_model_len`, `context_length`) › the model's documented window
+(`deepseek-flash` and `deepseek-v4-pro`: 500k) › the provider default. Derived
+windows are never persisted — they are re-read, so a stale guess cannot outlive
+its cause — and the caps a tool result may use follow the window, so one
+`read_file` can never fill an 8k transcript. A server that complains about the
+context length teaches mush the number it names, and the run retries once.
 
 ---
 
@@ -538,11 +557,13 @@ Release profile uses `lto = "thin"`, `codegen-units = 1`, `strip = true`.
 
 **Next**
 
-- **M2.7 — Glance layer (P1/P2).** Ranked agent rows with a selected-row footer;
-  one workspace bar (focus · branch ±dirty · ±stat · model · hints); size tiers
-  with a 40×10 floor and a width cap; truthful glyphs; tool calls as
-  `name(summarized args)` with their results grouped; neutral notices; `/open` as
-  a picker. Backed by `mush-core/src/git.rs` and one cached snapshot (§4.5).
+- **M2.7 — Glance layer.** `[DONE]` Ranked agent rows with a selected-row footer;
+  the workspace bar (activity › status › hint, then path · branch ±dirty · stat ·
+  model · context); size tiers with a 40×10 floor and a width cap; truthful glyphs;
+  tool calls as `name(summarized args)`; neutral notices; `/open` as a picker;
+  `mush-core/src/git.rs` and one cached snapshot (§4.5). The context window is
+  discovered (endpoint → model table → provider default), shown, settable with
+  `/context`, and the tool caps scale with it.
 - **M2.8 — Concurrent work (jobs + one lock).** Detach long or explicitly
   detached commands into a job registry with ids, status, control, and the same
   completion-wake lifecycle as subagents; `all` waits for agents and commands; a
@@ -579,7 +600,10 @@ later one.
   timeout, cancellation, output cap and runaway-writer limit, URL/status-line
   parsing, the model-list timeout, cancelling a chat request mid-wait and the
   request deadline (plus the slow-but-alive body the slices must not mistake for
-  one), config precedence, schema/prompt invariants,
+  one), the git snapshot (branch, dirty count, per-branch diffstat), the
+  context-window precedence and the caps that follow it, row field priority, a
+  draw sweep over thirteen terminal sizes, config precedence, schema/prompt
+  invariants,
   word wrapping, column slicing, the actor mailbox (parked nudges, Stop vs
   Shutdown, completion delivery), and the `/new`, Ctrl-C, stale-event, and
   steering-echo state transitions.
@@ -629,10 +653,13 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
 3. `[OPEN]` Config file format: `mush.toml` in `.mush/` vs environment only.
 4. `[OPEN]` Should `run_command` be denied by default and enabled per session?
 5. `[OPEN]` Do we ship the MCP bridge ourselves, or leave it to the community?
-6. `[OPEN]` Where do the M2.7 size tiers cut? 40×10 is the floor; is the compact
-   tier 80×20, or narrower?
-7. `[OPEN]` Notices: keep them inline in the transcript with a neutral colour, or
-   give them a one-line log of their own?
+6. `[DECIDED]` The M2.7 tiers cut at 80×20: narrower or shorter stacks the agent strip
+   above the chat and hides an empty editor, and 40×10 is the floor, below which
+   mush says so instead of painting shreds. Very wide terminals cap the tree at 34
+   columns and the transcript at 110.
+7. `[DECIDED]` Notices stay inline in the transcript, neutral `·` for information
+   and `!` in red only when something actually failed; the bar's second line
+   carries the transient command results.
 8. `[OPEN]` Does the human need to *type into* a subagent's pane (today that path
    is a nudge), or is watching enough once §2 gap 3 is closed?
 9. `[OPEN]` Job output: keep the head (what the model reads first) or the tail

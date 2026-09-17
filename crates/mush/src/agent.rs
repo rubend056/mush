@@ -22,11 +22,10 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
 
+use mush_core::config::parse_context_hint;
 use mush_core::message::{ChatRequest, ChatResponse};
 use mush_core::workspace::truncate_for_model;
-use mush_core::{
-    prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_SECS, LIST_LIMIT, READ_CAP,
-};
+use mush_core::{prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_SECS};
 
 use crate::app::{Msg, ToolCallRequest};
 use crate::http;
@@ -405,6 +404,9 @@ fn run_loop(
     } else {
         prompt::tool_schemas()
     };
+    // One learning attempt per run: a context-limit complaint teaches the
+    // window, anything else is the run's error.
+    let mut learned_context = false;
 
     for _ in 0..MAX_TURNS {
         drain_mailbox(&actor.rx, cancel, messages, state);
@@ -412,7 +414,7 @@ fn run_loop(
             return Err(CANCELLED.to_string());
         }
 
-        let cfg = actor
+        let mut cfg = actor
             .ctx
             .cfg
             .lock()
@@ -473,6 +475,28 @@ fn run_loop(
             let detail = parsed
                 .and_then(|r| r.error.map(|e| e.message))
                 .unwrap_or_else(|| truncate(&response.body, 600));
+            // A hosted API advertises nothing, so its own complaint is the only
+            // current source for the window. Learn it, tell the human, retry
+            // once — and never again in this run, or a server that complains
+            // about everything becomes a loop.
+            if !learned_context {
+                if let Some(tokens) = parse_context_hint(&detail) {
+                    if tokens < cfg.context_tokens {
+                        cfg.context_tokens = tokens;
+                        if let Ok(mut shared) = actor.ctx.cfg.lock() {
+                            shared.context_tokens = tokens;
+                        }
+                        actor.ctx.emit(
+                            actor.id,
+                            AgentEvent::Status(format!(
+                                "context window is {tokens} tokens — retrying"
+                            )),
+                        );
+                        learned_context = true;
+                        continue;
+                    }
+                }
+            }
             return Err(format!("model returned HTTP {}: {detail}", response.status));
         }
 
@@ -782,7 +806,15 @@ fn exec_tool(
         "agent_status" => status_tool(state),
         "agent_control" => control_tool(state, args),
         _ if actor.ws.root() == actor.ctx.root => forward_to_ui(&actor.ctx, name, args),
-        _ => direct_tool(&actor.ws, name, args),
+        _ => {
+            let cfg = actor
+                .ctx
+                .cfg
+                .lock()
+                .map(|config| config.clone())
+                .unwrap_or_else(|_| Config::new("http://127.0.0.1:1", "", None));
+            direct_tool(&actor.ws, name, args, &cfg)
+        }
     }
 }
 
@@ -1120,12 +1152,12 @@ fn forward_to_ui(ctx: &AgentCtx, name: &str, args: &Value) -> Result<String, Str
 
 /// Same five tools, executed directly against a workspace the UI never sees
 /// (an isolated agent's worktree): plain disk I/O, no live buffers.
-fn direct_tool(ws: &Workspace, name: &str, args: &Value) -> Result<String, String> {
+fn direct_tool(ws: &Workspace, name: &str, args: &Value, cfg: &Config) -> Result<String, String> {
     match name {
-        "list_files" => tools::list_result(ws, args, LIST_LIMIT),
+        "list_files" => tools::list_result(ws, args, cfg.list_limit()),
         "read_file" => {
             let rel = tools::arg_string(args, "path")?;
-            ws.read_file(&rel, READ_CAP)
+            ws.read_file(&rel, cfg.read_cap())
         }
         "write_file" => {
             let rel = tools::arg_string(args, "path")?;
@@ -1477,6 +1509,13 @@ fn trim_history(messages: &mut Vec<Message>, budget: usize) {
         }
         messages.drain(2..keep_from);
     }
+}
+
+/// The one-word reading of a tool call's arguments, from the raw JSON the model
+/// sent: what the tree and the transcript both show.
+pub fn summarize_args(raw: &str) -> String {
+    let args: Value = serde_json::from_str(raw).unwrap_or(Value::Null);
+    summarize(&args)
 }
 
 fn summarize(args: &Value) -> String {

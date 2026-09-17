@@ -69,33 +69,61 @@ pub fn post_json(
     )
 }
 
-/// List model ids advertised by the endpoint. Falls back to the provider's
-/// known models when the endpoint is unreachable or lacks `/v1/models`.
-pub fn list_models(cfg: &Config) -> Vec<String> {
-    let known = cfg.default_models();
+/// One model the endpoint advertises. `context` is the window it reported, when
+/// it reports one at all — llama.cpp's `meta.n_ctx`, vLLM's `max_model_len`,
+/// OpenRouter's `context_length`. Hosted APIs answer with ids only.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Model {
+    pub id: String,
+    pub context: Option<usize>,
+}
+
+/// List the models an endpoint advertises. Falls back to the provider's known
+/// models when the endpoint is unreachable or lacks `/v1/models`.
+pub fn list_models(cfg: &Config) -> Vec<Model> {
+    let known = || {
+        cfg.default_models()
+            .into_iter()
+            .map(|id| Model { id, context: None })
+            .collect::<Vec<_>>()
+    };
     let response = match get_json(&cfg.models_url(), cfg.api_key.as_deref(), LIST_READ_TIMEOUT) {
         Ok(response) if response.status == 200 => response,
-        _ => return known,
+        _ => return known(),
     };
     let value: serde_json::Value = match serde_json::from_str(&response.body) {
         Ok(value) => value,
-        Err(_) => return known,
+        Err(_) => return known(),
     };
-    let ids: Vec<String> = value
+    let models: Vec<Model> = value
         .get("data")
         .and_then(serde_json::Value::as_array)
-        .map(|list| {
-            list.iter()
-                .filter_map(|m| m.get("id").and_then(serde_json::Value::as_str))
-                .map(str::to_string)
-                .collect()
-        })
+        .map(|list| list.iter().filter_map(model_of).collect())
         .unwrap_or_default();
-    if ids.is_empty() {
-        known
+    if models.is_empty() {
+        known()
     } else {
-        ids
+        models
     }
+}
+
+fn model_of(value: &serde_json::Value) -> Option<Model> {
+    let id = value.get("id").and_then(serde_json::Value::as_str)?;
+    // Every server that advertises a window uses its own spelling for it.
+    let context = ["max_model_len", "context_length", "context_window", "n_ctx"]
+        .iter()
+        .find_map(|key| {
+            value
+                .get(*key)
+                .or_else(|| value.get("meta").and_then(|meta| meta.get(*key)))
+                .and_then(serde_json::Value::as_u64)
+        })
+        .map(|tokens| tokens as usize)
+        .filter(|tokens| *tokens > 0);
+    Some(Model {
+        id: id.to_string(),
+        context,
+    })
 }
 
 fn request(
@@ -576,6 +604,7 @@ mod tests {
             model: String::new(),
             api_key: None,
             context_tokens: 8192,
+            context_explicit: false,
         };
         let response =
             get_json(&cfg.models_url(), cfg.api_key.as_deref(), CHAT_READ_TIMEOUT).unwrap();

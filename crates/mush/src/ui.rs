@@ -11,26 +11,76 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 use mush_core::message::Message;
 
 use crate::app::{
-    display_column, short_age, AgentNode, App, Focus, Mode, Phase, PickerKind, StatusKind,
+    display_column, short_age, AgentNode, App, Focus, Mode, NoticeKind, Phase, PickerKind,
+    StatusKind,
 };
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// Beyond this the transcript is unreadable, however wide the terminal is.
+const MAX_TRANSCRIPT: u16 = 110;
+/// Below this mush has no room to be honest: say so instead of painting shreds.
+const MIN_WIDTH: u16 = 40;
+const MIN_HEIGHT: u16 = 10;
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    let rows = Layout::vertical([
-        Constraint::Min(6),
-        Constraint::Percentage(45),
-        Constraint::Length(1),
-    ])
-    .split(area);
-    let columns =
-        Layout::horizontal([Constraint::Percentage(24), Constraint::Min(20)]).split(rows[0]);
+    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+        let line = Line::from(Span::styled(
+            format!("mush needs at least {MIN_WIDTH}×{MIN_HEIGHT}"),
+            Style::default().fg(Color::Yellow),
+        ));
+        frame.render_widget(Paragraph::new(line).centered(), area);
+        return;
+    }
 
-    draw_agents(frame, app, columns[0]);
-    draw_editor(frame, app, columns[1]);
-    draw_chat(frame, app, rows[1]);
-    draw_status(frame, app, rows[2]);
+    // Size tiers (docs/mush.md §4.5 R3). Narrow or short terminals stack the
+    // agent strip above the chat, because two columns starve both panes; an
+    // empty editor is hidden there rather than eating the rows chat needs.
+    let compact = area.width < 80 || area.height < 20;
+    let editor_open = app.current.is_some();
+    let bar_rows = if area.height >= 26 { 2 } else { 1 };
+
+    if compact {
+        let agent_rows = (app.agents.len() as u16 + 2).clamp(3, 6);
+        let show_editor = editor_open || app.focus == Focus::Editor;
+        // The chat pane draws its own message box, so there is no separate
+        // constraint for it here.
+        let mut constraints = vec![Constraint::Length(agent_rows)];
+        if show_editor {
+            constraints.push(Constraint::Length(4));
+        }
+        constraints.push(Constraint::Min(6)); // chat + message box
+        constraints.push(Constraint::Length(bar_rows));
+        let rows = Layout::vertical(constraints).split(area);
+        let mut index = 0;
+        draw_agents(frame, app, rows[index]);
+        index += 1;
+        if show_editor {
+            draw_editor(frame, app, rows[index]);
+            index += 1;
+        }
+        draw_chat(frame, app, rows[index]);
+        draw_status(frame, app, rows[rows.len() - 1]);
+    } else {
+        let rows = Layout::vertical([
+            Constraint::Min(6),
+            Constraint::Percentage(45),
+            Constraint::Length(bar_rows),
+        ])
+        .split(area);
+        // On a very wide terminal the tree stops growing: past a point it is
+        // empty space, and the editor is what the width belongs to.
+        let agents_pane = if area.width >= 160 {
+            Constraint::Length(34)
+        } else {
+            Constraint::Percentage(26)
+        };
+        let columns = Layout::horizontal([agents_pane, Constraint::Min(20)]).split(rows[0]);
+        draw_agents(frame, app, columns[0]);
+        draw_editor(frame, app, columns[1]);
+        draw_chat(frame, app, rows[1]);
+        draw_status(frame, app, rows[2]);
+    }
     draw_picker(frame, app);
 }
 
@@ -51,56 +101,201 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border(focused))
-        .title(" agents ");
+        .title(agents_title(app));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
     if inner.height == 0 || inner.width == 0 || app.agents.is_empty() {
         return;
     }
+
+    // The cursor row's facts live in a footer, so the list may degrade to
+    // `◐ #2` on a narrow pane without losing anything: it moves, not vanishes.
+    let footer_rows = if inner.height >= 6 {
+        3.min(inner.height - 2)
+    } else {
+        0
+    };
+    let list_area = Rect {
+        height: inner.height - footer_rows,
+        ..inner
+    };
+
+    // `List` draws `› ` outside the item's width, so the selected row would be
+    // two columns narrower than its neighbours. Budget for it up front.
+    let row_width = (inner.width as usize).saturating_sub(2);
     let items: Vec<ListItem> = app
         .agents
         .iter()
-        .map(|node| agent_item(app, node, inner.width as usize))
+        .map(|node| ListItem::new(agent_line(app, node, row_width)))
         .collect();
     let list = List::new(items)
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
         .highlight_symbol("› ");
     let mut state = ListState::default();
-    state.select(Some(
-        app.agent_cursor.min(app.agents.len().saturating_sub(1)),
-    ));
-    frame.render_stateful_widget(list, inner, &mut state);
+    let cursor = app.agent_cursor.min(app.agents.len().saturating_sub(1));
+    state.select(Some(cursor));
+    frame.render_stateful_widget(list, list_area, &mut state);
+
+    if footer_rows > 0 {
+        let node = &app.agents[cursor];
+        let lines = agent_footer(app, node, inner.width as usize);
+        let start = inner.y + inner.height - lines.len() as u16;
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "─".repeat(inner.width as usize),
+                dim(),
+            ))),
+            Rect::new(inner.x, start - 1, inner.width, 1),
+        );
+        for (offset, line) in lines.into_iter().enumerate() {
+            frame.render_widget(
+                Paragraph::new(line),
+                Rect::new(inner.x, start + offset as u16, inner.width, 1),
+            );
+        }
+    }
 }
 
-/// One tree row: indent by depth, status glyph, id, brief, activity, branch.
-/// `▶` marks the focused agent (whose chat the bottom pane shows).
-fn agent_item(app: &App, node: &AgentNode, width: usize) -> ListItem<'static> {
+/// `agents · 2 running · Σ +324 −40`: what the whole tree is doing, and how
+/// much its branches carry.
+fn agents_title(app: &App) -> String {
+    let mut title = String::from(" agents ");
+    let busy = app
+        .agents
+        .iter()
+        .filter(|node| node.phase.is_busy())
+        .count();
+    if busy > 0 {
+        title.push_str(&format!(" · {busy} running"));
+    }
+    let mut added = 0;
+    let mut removed = 0;
+    for stat in app.agent_stats.values() {
+        added += stat.added;
+        removed += stat.removed;
+    }
+    if added + removed > 0 {
+        title.push_str(&format!(" · Σ +{added} −{removed}"));
+    }
+    title
+}
+
+/// One tree row, with the fields it can afford.
+///
+/// The row answers "what is happening": activity, branch and line delta survive
+/// as long as there is any room, and the brief — which the footer and the
+/// transcript carry in full — is what yields first.
+fn agent_line(app: &App, node: &AgentNode, width: usize) -> String {
     let indent = "  ".repeat(node.depth);
     let marker = if app.focused == node.id { "▶" } else { " " };
     let waiting = app
         .agents
         .iter()
         .any(|n| n.parent == Some(node.id) && n.phase.is_busy());
-    let mut text = format!(
+    let head = format!(
         "{indent}{marker}{} #{:<3}",
         phase_glyph(&node.phase, waiting),
         node.id
     );
-    if width > text.chars().count() + 1 {
-        let tail = format!(
-            "{}  {}  {}",
-            truncate(&node.brief, 18),
-            truncate(&phase_detail(node), 18),
-            node.branch.as_deref().unwrap_or("")
-        );
-        text.push(' ');
-        text.push_str(&truncate(
-            &tail,
-            width.saturating_sub(text.chars().count() + 1),
-        ));
+
+    let mut tail = Vec::new();
+    let activity = phase_detail(node);
+    if !activity.is_empty() {
+        tail.push(activity);
     }
-    ListItem::new(text.trim_end().to_string())
+    let mut where_and_how = node.branch.clone().unwrap_or_default();
+    if let Some(stat) = app.agent_stats.get(&node.id) {
+        if !stat.is_empty() {
+            if !where_and_how.is_empty() {
+                where_and_how.push(' ');
+            }
+            where_and_how.push_str(&stat.compact());
+        }
+    }
+    fit_row(&head, &node.brief, &where_and_how, &tail, width)
+}
+
+/// Lay out one row in the width it has.
+///
+/// The row answers "what is happening": the state (glyph, id) is never
+/// sacrificed, then the branch and line delta — facts that exist nowhere else on
+/// the screen — then the brief, then the activity, which the bar already repeats
+/// for the focused agent. Fields are dropped from the right when the pane is
+/// narrow, and the cursor row's full facts are one row below in the footer.
+fn fit_row(head: &str, brief: &str, branch_stat: &str, tail: &[String], width: usize) -> String {
+    let head_width = UnicodeWidthStr::width(head);
+    if width <= head_width + 2 {
+        return head.to_string();
+    }
+    let budget = width - head_width - 1;
+    let branch_width = UnicodeWidthStr::width(branch_stat);
+    let show_branch = branch_width > 0 && branch_width + 2 <= budget.saturating_sub(4);
+    let after_branch = budget.saturating_sub(if show_branch { branch_width + 2 } else { 0 });
+
+    let mut line = head.to_string();
+    let mut remaining = budget;
+    if after_branch >= 7 && !brief.is_empty() {
+        let text = truncate(brief, after_branch - 1);
+        // `truncate` counts characters, not columns: a wide glyph can make the
+        // text one column wider than asked for, so never subtract past zero.
+        remaining = remaining.saturating_sub(UnicodeWidthStr::width(text.as_str()) + 1);
+        line.push(' ');
+        line.push_str(&text);
+    }
+    if show_branch {
+        line.push_str("  ");
+        line.push_str(branch_stat);
+        remaining = remaining.saturating_sub(branch_width + 2);
+    }
+    for cell in tail {
+        let cell_width = UnicodeWidthStr::width(cell.as_str());
+        if remaining < cell_width + 2 {
+            break;
+        }
+        line.push_str("  ");
+        line.push_str(cell);
+        remaining -= cell_width + 2;
+    }
+    line.trim_end().to_string()
+}
+
+/// The footer under the tree: the cursor row's full facts, so a narrow pane
+/// still tells the whole story.
+fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    lines.push(Line::from(vec![
+        Span::styled(format!(" #{} ", node.id), Style::default().fg(Color::Cyan)),
+        Span::styled(
+            truncate(&node.brief, width.saturating_sub(6)),
+            Style::default(),
+        ),
+    ]));
+    if node.branch.is_some() || matches!(node.phase, Phase::Idle) {
+        let mut detail = Vec::new();
+        if let Some(branch) = &node.branch {
+            // Where the work is, and the two commands that land it: this is the
+            // one place on screen that says an isolated agent exists at all.
+            detail.push(format!(".mush/wt/{}", node.id));
+            detail.push(format!("git diff HEAD...{branch}"));
+            detail.push(format!("/merge {}", node.id));
+        }
+        let activity = phase_detail(node);
+        if !activity.is_empty() {
+            detail.insert(0, activity);
+        }
+        if !detail.is_empty() {
+            lines.push(Line::from(Span::styled(
+                format!(
+                    " {}",
+                    truncate(&detail.join(" · "), width.saturating_sub(2))
+                ),
+                dim(),
+            )));
+        }
+        let _ = app;
+    }
+    lines
 }
 
 /// The glyph is derived from the phase and the tree, never stored: an agent is
@@ -163,8 +358,10 @@ fn draw_editor(frame: &mut Frame, app: &mut App, area: Rect) {
     }
     let Some(index) = app.current else {
         frame.render_widget(
-            Paragraph::new("No file open — type /open <path> in the chat pane (Tab) to open one.")
-                .style(dim()),
+            Paragraph::new(
+                "No file open — /open <path> (no path: pick one), or start mush with a file.",
+            )
+            .style(dim()),
             inner,
         );
         return;
@@ -236,7 +433,9 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(block, rows[0]);
 
     if inner.height > 0 && inner.width > 0 {
-        let width = inner.width as usize;
+        // A 200-column transcript is not read, it is skimmed. Cap the measure
+        // and leave the rest as margin.
+        let width = (inner.width as usize).min(MAX_TRANSCRIPT as usize);
         let height = inner.height as usize;
         let messages = focused_messages(app);
         let lines = transcript_lines(app, messages, width);
@@ -321,8 +520,13 @@ fn draw_picker(frame: &mut Frame, app: &App) {
     let mut items = Vec::new();
     for item in picker.items.iter().skip(start).take(visible) {
         let current = match picker.kind {
-            PickerKind::Model => *item == app.cfg.model,
+            PickerKind::Model => picker
+                .items
+                .get(picker.cursor)
+                .map(|item| item.split(" · ").next().unwrap_or(item) == app.cfg.model)
+                .unwrap_or(false),
             PickerKind::Provider => item == app.cfg.provider.name(),
+            PickerKind::File => app.current_rel() == Some(item.as_str()),
         };
         let label = if current {
             format!("• {item}")
@@ -382,7 +586,58 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled(message, style),
     ]);
-    frame.render_widget(Paragraph::new(line), area);
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
+    frame.render_widget(Paragraph::new(line), rows[0]);
+    if area.height > 1 {
+        // The facts line: where this is, what it is on, how much has moved.
+        // Elided from the right, so the repository survives longest and the
+        // hints go first.
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                facts_line(app, area.width as usize),
+                dim(),
+            ))),
+            rows[1],
+        );
+    }
+}
+
+/// `⌂ ~/p/demo │ master ±3 +12 −3 │ deepseek-flash · ctx ~500k │ /help` — the
+/// stable facts, in the order that matters, cut from the right when the
+/// terminal is narrow.
+fn facts_line(app: &App, width: usize) -> String {
+    let root = app.ws.root_str();
+    let home = std::env::var("HOME").unwrap_or_default();
+    let shown = if !home.is_empty() && root.starts_with(&home) {
+        format!("~{}", &root[home.len()..])
+    } else {
+        root
+    };
+    let mut cells = vec![format!(" ⌂ {shown}")];
+    if let Some(git) = &app.git {
+        let branch = if git.branch.is_empty() {
+            "detached".to_string()
+        } else {
+            git.branch.clone()
+        };
+        let mut cell = branch;
+        if git.dirty > 0 {
+            cell.push_str(&format!(" ±{}", git.dirty));
+        }
+        if !git.stat.is_empty() {
+            cell.push_str(&format!(" {}", git.stat.compact()));
+        }
+        cells.push(cell);
+    }
+    cells.push(format!("{} · {}", app.cfg.label(), app.context_label()));
+    while cells.len() > 1 {
+        let joined: String = cells.join(" │ ");
+        if UnicodeWidthStr::width(joined.as_str()) <= width {
+            break;
+        }
+        cells.pop();
+    }
+    cells.join(" │ ")
 }
 
 fn transcript_lines(app: &App, messages: &[Message], width: usize) -> Vec<Line<'static>> {
@@ -390,16 +645,13 @@ fn transcript_lines(app: &App, messages: &[Message], width: usize) -> Vec<Line<'
     if app.focused == 0 {
         if messages.is_empty() && app.notices.is_empty() {
             out.push(Line::from(Span::styled(
-                "Ask for a change. The agent reads and edits this workspace directly.",
+                "Ask for a change — the agent reads and edits this workspace directly.",
                 dim(),
             )));
             out.push(Line::from(""));
+            out.push(Line::from(Span::styled(app.cfg.label(), dim())));
             out.push(Line::from(Span::styled(
-                format!("model: {}", app.cfg.label()),
-                dim(),
-            )));
-            out.push(Line::from(Span::styled(
-                "Tab cycles panes · Enter sends · Ctrl-P pick a model",
+                "Tab cycles panes · Enter sends · /open <file> edits · /help lists commands",
                 dim(),
             )));
             return out;
@@ -419,11 +671,12 @@ fn transcript_lines(app: &App, messages: &[Message], width: usize) -> Vec<Line<'
         render_message(&mut out, message, width);
     }
     for notice in &app.notices {
-        for line in wrap_text(notice, width.saturating_sub(2)) {
-            out.push(Line::from(Span::styled(
-                format!("! {line}"),
-                Style::default().fg(Color::Red),
-            )));
+        let (prefix, style) = match notice.kind {
+            NoticeKind::Info => ("·", dim()),
+            NoticeKind::Error => ("!", Style::default().fg(Color::Red)),
+        };
+        for line in wrap_text(&notice.text, width.saturating_sub(2)) {
+            out.push(Line::from(Span::styled(format!("{prefix} {line}"), style)));
         }
     }
     // The spinner belongs to the transcript on screen: another agent working
@@ -474,11 +727,12 @@ fn render_message(out: &mut Vec<Line<'static>>, message: &Message, width: usize)
                 }
             }
             for call in message.tool_calls() {
-                let args = call.function.arguments.replace('\n', " ");
+                // `agent::summarize_args` is the same reading the tree shows:
+                // `edit_file src/lex.rs`, not forty lines of JSON.
                 let label = format!(
-                    "  ⚙ {}({})",
+                    "  ⚙ {} {}",
                     call.function.name,
-                    truncate(&args, width.saturating_sub(24))
+                    truncate(&crate::agent::summarize_args(&call.function.arguments), 60)
                 );
                 out.push(Line::from(Span::styled(
                     label,
@@ -566,11 +820,16 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Shorten to at most `max` characters *including* the ellipsis, so callers can
+/// budget columns with it (the old contract silently returned `max + 1`).
 fn truncate(text: &str, max: usize) -> String {
     if text.chars().count() <= max {
         return text.to_string();
     }
-    let mut out: String = text.chars().take(max).collect();
+    if max == 0 {
+        return String::new();
+    }
+    let mut out: String = text.chars().take(max - 1).collect();
     out.push('…');
     out
 }
@@ -620,6 +879,36 @@ mod tests {
             "no route"
         );
         assert_eq!(phase_detail(&node(Phase::Idle, 9)), "");
+    }
+
+    /// A row gives up its least useful field first: the activity goes before
+    /// the branch, the branch before the brief, and the state never goes.
+    #[test]
+    fn a_row_gives_up_its_brief_before_its_facts() {
+        let head = "▶◐ #2  ";
+        let activity = ["write deep.txt 3s".to_string()];
+        let wide = fit_row(head, "create a file", "mush/2 +8−0", &activity, 70);
+        assert_eq!(
+            wide,
+            "▶◐ #2   create a file  mush/2 +8−0  write deep.txt 3s"
+        );
+
+        // Narrow: the activity goes, the branch and stat stay.
+        let narrow = fit_row(head, "create a file", "mush/2 +8−0", &activity, 34);
+        assert!(narrow.contains("mush/2 +8−0"), "{narrow}");
+        assert!(!narrow.contains("write deep.txt"), "{narrow}");
+
+        // Narrower: the brief yields too, the branch still stays.
+        let tighter = fit_row(head, "create a file", "mush/2 +8−0", &activity, 26);
+        assert!(tighter.contains("mush/2 +8−0"), "{tighter}");
+        assert!(!tighter.contains("create"), "{tighter}");
+
+        // Narrowest: the state alone, which is never dropped (the row is
+        // trimmed, so the padded id loses its trailing spaces).
+        assert_eq!(
+            fit_row(head, "create a file", "mush/2 +8−0", &activity, 10),
+            head.trim_end()
+        );
     }
 
     #[test]

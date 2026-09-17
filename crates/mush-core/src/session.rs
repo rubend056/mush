@@ -57,6 +57,11 @@ pub struct Session {
     /// Base URL of the endpoint in use; empty when never customized.
     #[serde(default)]
     pub base_url: String,
+    /// A context window the human stated for this workspace (`/context`, or a
+    /// `MUSH_CONTEXT` at the time). Derived windows are never stored: they are
+    /// re-read from the endpoint, so a stale guess cannot outlive its cause.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context: Option<usize>,
     pub updated: u64,
     pub messages: Vec<Message>,
 }
@@ -108,6 +113,7 @@ mod tests {
             model: "test".into(),
             provider: "custom".into(),
             base_url: "http://localhost:9".into(),
+            context: Some(123_456),
             updated: now_secs(),
             messages: vec![Message::user("hello"), Message::assistant("hi")],
         };
@@ -116,6 +122,25 @@ mod tests {
         let loaded = Session::load(&root).unwrap();
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[0].text(), "hello");
+        assert_eq!(loaded.context, Some(123_456));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Old sessions have no context field; they must still load.
+    #[test]
+    fn a_session_without_a_context_loads() {
+        let root = std::env::temp_dir().join(format!("mush-session3-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        ensure_mush_dir(&root).unwrap();
+        fs::write(
+            session_path(&root),
+            r#"{"root":"/tmp","model":"m","provider":"custom","base_url":"","updated":1,"messages":[]}"#,
+        )
+        .unwrap();
+
+        let loaded = Session::load(&root).unwrap();
+        assert_eq!(loaded.context, None);
         let _ = fs::remove_dir_all(&root);
     }
 }

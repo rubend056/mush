@@ -10,9 +10,26 @@
 
 use crate::session::Session;
 use crate::userconfig::UserConfig;
+use crate::{CMD_CAP, LIST_LIMIT, READ_CAP};
 
-/// Context window assumed when `MUSH_CONTEXT` is unset.
+/// Context window assumed when nothing better is known: `MUSH_CONTEXT`, an
+/// endpoint's own metadata, or the provider's per-model table all beat it.
 pub const DEFAULT_CONTEXT_TOKENS: usize = 8192;
+
+/// A model's known context window, from the provider's documentation. Used when
+/// the endpoint does not advertise one (`api.deepseek.com` answers with ids
+/// only). Keep these honest: the value is shown wherever the model is chosen.
+const KNOWN_CONTEXT: &[(&str, usize)] =
+    &[("deepseek-flash", 500_000), ("deepseek-v4-pro", 500_000)];
+
+/// The window a model id is documented to have, if we know it.
+pub fn known_context(model: &str) -> Option<usize> {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    KNOWN_CONTEXT
+        .iter()
+        .find(|(known, _)| *known == model)
+        .map(|(_, tokens)| *tokens)
+}
 
 /// Where mush talks to a model. Deliberately OpenAI-compatible so it works with
 /// llama.cpp, Ollama, vLLM, LM Studio, DeepSeek, and hosted APIs alike.
@@ -64,8 +81,12 @@ pub struct Config {
     pub api_key: Option<String>,
     /// The endpoint's context window in tokens. The history trimmer keeps
     /// every request under it, reserving room for the tool schemas and the
-    /// reply. Small local models are typically 8192.
+    /// reply.
     pub context_tokens: usize,
+    /// True when the human stated the window (flag, `MUSH_CONTEXT`, `/context`,
+    /// or a stored explicit choice). Only then does it beat what the endpoint
+    /// advertises: discovery is for guessing, not for overruling.
+    pub context_explicit: bool,
 }
 
 /// A set of user-supplied values: the command line, or the `MUSH_*`
@@ -77,17 +98,19 @@ pub struct Overrides {
     pub model: Option<String>,
     pub provider: Option<String>,
     pub api_key: Option<String>,
+    pub context: Option<usize>,
 }
 
 impl Overrides {
     /// The environment layer: `MUSH_URL`, `MUSH_MODEL`, `MUSH_PROVIDER`,
-    /// `MUSH_API_KEY`. Empty variables count as unset.
+    /// `MUSH_API_KEY`, `MUSH_CONTEXT`. Empty variables count as unset.
     pub fn from_env() -> Self {
         Self {
             url: env_nonempty("MUSH_URL"),
             model: env_nonempty("MUSH_MODEL"),
             provider: env_nonempty("MUSH_PROVIDER"),
             api_key: env_nonempty("MUSH_API_KEY"),
+            context: env_nonempty("MUSH_CONTEXT").and_then(|s| s.trim().parse().ok()),
         }
     }
 }
@@ -121,17 +144,14 @@ impl Config {
             .as_deref()
             .map(normalize_url)
             .unwrap_or_else(|| provider.default_base_url().to_string());
-        let context_tokens = std::env::var("MUSH_CONTEXT")
-            .ok()
-            .and_then(|s| s.trim().parse::<usize>().ok())
-            .filter(|n| *n > 0)
-            .unwrap_or(DEFAULT_CONTEXT_TOKENS);
+        let context = env.context.filter(|n| *n > 0);
         Self {
             provider,
             base_url,
             model: env.model.unwrap_or_default(),
             api_key: env.api_key,
-            context_tokens,
+            context_tokens: context.unwrap_or(DEFAULT_CONTEXT_TOKENS),
+            context_explicit: context.is_some(),
         }
     }
 
@@ -146,7 +166,30 @@ impl Config {
             model: model.into(),
             api_key,
             context_tokens: DEFAULT_CONTEXT_TOKENS,
+            context_explicit: false,
         }
+    }
+
+    /// Set the window from the human (`/context`, a stored choice). An explicit
+    /// window beats anything an endpoint says.
+    pub fn set_context(&mut self, tokens: usize) {
+        self.context_tokens = tokens.max(1_024);
+        self.context_explicit = true;
+    }
+
+    /// Caps that derive from the window, so a small model is not handed a tool
+    /// result larger than its whole transcript: one read may take a quarter of
+    /// the budget, one command an eighth, one listing a sixty-fourth.
+    pub fn read_cap(&self) -> usize {
+        READ_CAP.min(self.history_budget() / 4).max(512)
+    }
+
+    pub fn cmd_cap(&self) -> usize {
+        CMD_CAP.min(self.history_budget() / 8).max(512)
+    }
+
+    pub fn list_limit(&self) -> usize {
+        LIST_LIMIT.min(self.history_budget() / 64).max(50)
     }
 
     /// How much conversation history (in bytes) fits alongside the tool
@@ -176,6 +219,25 @@ impl Config {
             Provider::DeepSeek => vec!["deepseek-flash".to_string(), "deepseek-v4-pro".to_string()],
             Provider::Custom => Vec::new(),
         }
+    }
+
+    /// The window to assume for the current model when the endpoint advertises
+    /// nothing: the documented one, else the provider's general default.
+    pub fn fallback_context(&self) -> usize {
+        known_context(&self.model).unwrap_or(match self.provider {
+            Provider::DeepSeek => 128_000,
+            Provider::Custom => DEFAULT_CONTEXT_TOKENS,
+        })
+    }
+
+    /// Adopt a window learned from the endpoint or the model table, unless the
+    /// human stated one explicitly.
+    pub fn adopt_context(&mut self, tokens: usize) -> bool {
+        if self.context_explicit || tokens == 0 || tokens == self.context_tokens {
+            return false;
+        }
+        self.context_tokens = tokens;
+        true
     }
 
     /// Provider-specific request knobs, applied by the agent loop.
@@ -256,6 +318,9 @@ pub fn resolve_with(
     if let Some(model) = cli.model.as_deref() {
         config.model = model.to_string();
     }
+    if let Some(context) = cli.context.filter(|n| *n > 0) {
+        config.set_context(context);
+    }
 
     // A URL, provider, or model the user stated explicitly, here or in the
     // environment, is never overridden by a stored one.
@@ -298,9 +363,51 @@ pub fn resolve_with(
         if !model_given && !session.model.is_empty() {
             config.model = session.model.clone();
         }
+        // A window the human chose for this workspace, remembered. It is an
+        // explicit statement, so it outranks anything discovered later.
+        if !config.context_explicit {
+            if let Some(tokens) = session.context.filter(|n| *n > 0) {
+                config.set_context(tokens);
+            }
+        }
+    }
+
+    // 4. Nothing was stated: assume the model's documented window, else the
+    //    provider's default. An endpoint that advertises one (llama.cpp's
+    //    `meta.n_ctx`, vLLM's `max_model_len`) overrides this at discovery.
+    if !config.context_explicit {
+        config.context_tokens = config.fallback_context();
     }
 
     Ok(config)
+}
+
+/// The number in a "context length" complaint, when a server names one. Hosted
+/// APIs are the only place mush cannot discover the window, and their error is
+/// the one source that is always current.
+pub fn parse_context_hint(message: &str) -> Option<usize> {
+    let lower = message.to_ascii_lowercase();
+    for marker in [
+        "maximum context length is ",
+        "context length is ",
+        "maximum context window of ",
+        "context window of ",
+        "max_model_len is ",
+        "maximum is ",
+        "tokens, but you requested",
+    ] {
+        let Some(at) = lower.find(marker) else {
+            continue;
+        };
+        let tail = &message[at + marker.len()..];
+        let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if let Ok(tokens) = digits.parse::<usize>() {
+            if tokens > 0 {
+                return Some(tokens);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -322,6 +429,7 @@ mod tests {
             model: model.into(),
             provider: provider.into(),
             base_url: base_url.into(),
+            context: None,
             updated: 0,
             messages: Vec::new(),
         }
@@ -334,12 +442,14 @@ mod tests {
             model: Some("cli-model".into()),
             provider: Some("deepseek".into()),
             api_key: None,
+            context: None,
         };
         let env = Overrides {
             url: Some("http://env:2".into()),
             model: Some("env-model".into()),
             provider: Some("custom".into()),
             api_key: Some("sk-env".into()),
+            context: None,
         };
         let session = stored("custom", "http://session:3", "session-model");
         let config = resolve_with(
@@ -460,6 +570,7 @@ mod tests {
             model: String::new(),
             api_key: None,
             context_tokens: 8192,
+            context_explicit: false,
         };
         assert_eq!(
             cfg.chat_url(),
@@ -513,5 +624,58 @@ mod tests {
             ..small
         };
         assert_eq!(tiny.history_budget(), 0);
+    }
+
+    /// The window comes from the model when nobody said otherwise, and the
+    /// caps follow it: one tool result must never be larger than the transcript
+    /// that has to hold it.
+    #[test]
+    fn the_window_and_the_caps_scale_together() {
+        let mut cfg = Config::new("http://x:1", "deepseek-v4-pro", None);
+        assert!(!cfg.context_explicit);
+        // `Config::new` does not resolve; the fallback is what the resolver uses.
+        assert_eq!(cfg.fallback_context(), 500_000);
+        cfg.context_tokens = cfg.fallback_context();
+        assert_eq!(cfg.read_cap(), READ_CAP, "a huge window keeps the ceiling");
+        assert_eq!(cfg.cmd_cap(), CMD_CAP);
+        assert_eq!(cfg.list_limit(), LIST_LIMIT);
+
+        // An 8k local window: a single read may take a quarter of the budget.
+        let small = Config::new("http://x:1", "m", None);
+        assert_eq!(small.read_cap(), small.history_budget() / 4);
+        assert!(
+            small.read_cap() < 4_000,
+            "a read must fit in an 8k transcript: {}",
+            small.read_cap()
+        );
+        assert!(small.cmd_cap() < small.read_cap());
+        assert!(small.list_limit() < small.cmd_cap());
+
+        // An explicit window is never overruled by discovery.
+        let mut cfg = Config::new("http://x:1", "m", None);
+        cfg.set_context(64_000);
+        assert!(!cfg.adopt_context(8_192), "the human's number stays");
+        assert_eq!(cfg.context_tokens, 64_000);
+        let mut cfg = Config::new("http://x:1", "m", None);
+        assert!(cfg.adopt_context(32_768), "discovery fills in a guess");
+        assert_eq!(cfg.context_tokens, 32_768);
+    }
+
+    #[test]
+    fn a_context_hint_is_read_from_the_server_complaint() {
+        assert_eq!(
+            parse_context_hint("This model's maximum context length is 131072 tokens"),
+            Some(131_072)
+        );
+        assert_eq!(
+            parse_context_hint("The input exceeds the context length is 32768 tokens"),
+            Some(32_768)
+        );
+        assert_eq!(
+            parse_context_hint("This endpoint's maximum context window of 8192 tokens is smaller"),
+            Some(8_192)
+        );
+        assert_eq!(parse_context_hint("429 rate limited"), None);
+        assert_eq!(parse_context_hint(""), None);
     }
 }

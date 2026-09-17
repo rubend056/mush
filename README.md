@@ -96,9 +96,11 @@ model for orchestration.
 
 The **agents** pane shows the whole tree: depth by indentation, `·` idle, `◐`
 running, `⏸` waiting on children, `⊘` a cancel in flight, `✓` done (with its final
-summary), `✗` failed, branch suffix for isolated agents. Running rows age with
-their phase (`◐ #1 edit_file src/lex.rs 12s`), and the status bar says what the
-tree is doing without ever keeping a line that has stopped being true. Enter on a
+summary), `✗` failed. A running row ages with its phase (`◐ #1 edit_file
+src/lex.rs 12s`), an isolated row carries its branch and line delta
+(`mush/2 +8−0`), the pane title totals them (`agents · 2 running · Σ +324 −40`),
+and the selected row's full facts — including the merge commands — sit in the
+footer under the list. Enter on a
 row focuses that agent — the chat below switches to its transcript and typing
 nudges it.
 `Esc` returns to the root, `c` cancels the selected agent, `Ctrl-C` cancels
@@ -145,8 +147,44 @@ trimming only cuts in when the model itself cannot produce a summary.
 | `Ctrl-C` | cancel running agents — an idle root is left alone, and a cancel reaches a model that is still thinking |
 | `Ctrl-Q` | quit (twice if there are unsaved changes) |
 
-Chat commands: `/provider`, `/model`, `/url`, `/key`, `/models`, `/open`,
-`/worktrees`, `/diff`, `/merge`, `/discard`, `/new`, `/help`, `/quit`.
+Chat commands: `/provider`, `/model`, `/context`, `/url`, `/key`, `/models`,
+`/open` (no path opens a picker), `/worktrees`, `/diff`, `/merge`, `/discard`,
+`/new`, `/help`, `/quit`.
+
+## The screen
+
+The line above the keys is a model of the workspace, not a log. Its **first
+line** is what just happened: the tree's activity (`◐ #1 edit_file src/lex.rs
+12s`), else the last command's result for a few seconds, else a hint. Its
+**second line** (on terminals at least 26 rows tall) is the stable facts, cut
+from the right when the terminal is narrow:
+
+```
+⌂ ~/p/mush │ master ±3 +12−3 │ deepseek-flash · ctx ~500k
+```
+
+`±3` counts paths with uncommitted changes, `+12−3` the line delta against
+`HEAD`. Terminals narrower than 80 columns (or shorter than 20 rows) get a
+**compact** layout: the agent strip on top, chat below, and no empty editor.
+Below 40×10 mush says so instead of painting shreds.
+
+## Context window
+
+Every request fits inside the endpoint's window, and the window comes from the
+first of these that knows:
+
+1. **You**: `--context N`, `MUSH_CONTEXT=N`, or `/context N`. A number you state
+   is remembered in `.mush/session.json` and never overruled.
+2. **The endpoint**, when it advertises one: llama.cpp's `meta.n_ctx`, vLLM's
+   `max_model_len`, OpenRouter's `context_length`.
+3. **The model's documented window** — `deepseek-flash` and `deepseek-v4-pro`
+   are 500k, so a hosted API (which answers with ids and nothing else) is not
+   silently treated as an 8k local model.
+4. **The provider default**: 128k for DeepSeek, 8192 for a custom endpoint.
+
+The tool caps (a read, command output, a listing) scale with the window, so one
+`read_file` can never fill an 8k transcript. If a server rejects a request over
+its context length, mush reads the number out of the complaint and retries once.
 
 ## What it writes
 
@@ -167,6 +205,7 @@ and the roadmap.
 crates/mush-core/   pure domain: workspace, sessions, prompt, messages, config, tools
 crates/mush/        the binary: TUI, agent actors, HTTP client
 scripts/smoke.py    end-to-end test that drives the real TUI over a pty
+scripts/screen.py   prints the painted screen as text at six terminal sizes
 scripts/mock_llm.py scripted model server for the deterministic agent tests
 docs/mush.md        the design doc
 ```
