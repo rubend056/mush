@@ -213,13 +213,24 @@ fn set_dir(dir: &mut Option<PathBuf>, value: &str) -> Result<(), String> {
 }
 
 fn print_help() {
-    // The command list is the table the parser is written against, so `--help`
-    // cannot advertise a command that does not exist, or miss one that does:
-    // `/compact` was implemented, listed by `/help` and absent here, because
-    // this paragraph was written by hand (the help/status drift half of
-    // finding B2). The provider names are still the provider module's to spell.
+    print!("{}", help_text());
+}
+
+/// The `--help` text.
+///
+/// Built as one string rather than printed line by line so a test can read it,
+/// and so both tables come from their one source: the KEYS block is
+/// [`app::keys::help_table`] (the same rows the in-app `/help` renders, so a
+/// binding cannot be advertised here and missing there) and the command list is
+/// the table the parser is written against, so `--help` cannot advertise a
+/// command that does not exist, or miss one that does. `/compact` used to be
+/// implemented, listed by `/help` and absent here, because this paragraph was
+/// written by hand (the help/status drift half of finding B2). The provider
+/// names are still the provider module's to spell.
+fn help_text() -> String {
     let commands = app::commands::table(&mush_core::provider::names_piped());
-    println!(
+    let keys = app::keys::help_table();
+    format!(
         "mush {}\n\
          A small, fast terminal surface for coding agents.\n\n\
          USAGE:\n    mush [DIRECTORY] [--url URL] [--model NAME] [--provider NAME] [--context TOKENS]\n\
@@ -247,30 +258,20 @@ fn print_help() {
          \x20   --print-config     Print the resolved config (endpoint, provider, model, window\n\
          \x20                      and whether it was stated, temperature, reasoning effort and\n\
          \x20                      thinking mode, reply-cap size and name, key masked) and exit 0\n\n\
-         KEYS:\n\
-         \x20   Tab / Shift-Tab   cycle panes (agents, chat)\n\
-         \x20   Enter             send message (chat) · focus agent (agents)\n\
-         \x20   Shift/Alt-Enter   new line in the message (multi-line messages)\n\
-         \x20   j / k · Enter     select and focus an agent\n\
-         \x20   c / Esc           cancel agent / back to the root (agents)\n\
-         \x20   Ctrl-P            model picker\n\
-         \x20   Ctrl-N            new chat    Ctrl-C  stop the focused agent\n\
-         \x20   Ctrl-X            stop every running agent\n\
-         \x20   wheel             scroll the transcript\n\
-         \x20   Ctrl-Q            quit\n\n\
+         KEYS:\n{keys}\n\n\
          COMMANDS (type in the chat):\n\
          {commands}\n\
          Endpoint, API key, model, and the request knobs live in\n\
          $MUSH_CONFIG or the platform config directory. That file is hand-editable,\n\
          every field is optional, and the one mush writes documents itself.\n\
          --print-config shows what those layers resolved to. The conversation is\n\
-         stored in <DIRECTORY>/.mush/session.json.",
+         stored in <DIRECTORY>/.mush/session.json.\n",
         env!("CARGO_PKG_VERSION"),
         mush_core::provider::names_hint(),
         mush_core::provider::DEFAULT_PROVIDER.name(),
         mush_core::provider::effort_default_hint(),
         mush_core::provider::thinking_default_hint(),
-    );
+    )
 }
 
 /// `--print-config`: the resolved config and nothing else — no workspace, no
@@ -820,5 +821,38 @@ mod tests {
         let config = config::resolve(&Overrides::default(), &UserConfig::default(), None).unwrap();
         assert!(!config.base_url.is_empty());
         assert!(config.chat_url().ends_with("/v1/chat/completions"));
+    }
+
+    /// `--help` renders the key table and the command table from their one
+    /// source, so neither can drift: a binding or a command cannot exist in the
+    /// program and be missing from `--help`.
+    #[test]
+    fn help_renders_the_key_and_command_tables() {
+        let help = help_text();
+        // The whole key table, verbatim, is in `--help` — the same string the
+        // in-app `/help` prints, so the two surfaces cannot disagree.
+        let keys = app::keys::help_table();
+        assert!(
+            help.contains(&keys),
+            "the key table is not in --help:\n{help}"
+        );
+        // The tree walk the human asked for is named here too, and the real
+        // scroll keys — not the wheel mush never takes (finding K3).
+        for want in ["←", "→", "↑ / ↓, PgUp / PgDn"] {
+            assert!(help.contains(want), "`{want}` is missing:\n{help}");
+        }
+        assert!(
+            !help.contains("wheel"),
+            "a wheel it does not scroll:\n{help}"
+        );
+
+        // And the command table, so `/compact`-style absence cannot return.
+        let commands = app::commands::table(&mush_core::provider::names_piped());
+        assert!(
+            help.contains(&commands),
+            "the command table is not in --help"
+        );
+        assert!(help.contains("KEYS:"));
+        assert!(help.contains("COMMANDS (type in the chat):"));
     }
 }

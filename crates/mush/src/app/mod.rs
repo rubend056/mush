@@ -14,7 +14,7 @@
 
 mod chat;
 pub mod commands;
-mod keys;
+pub mod keys;
 mod settings;
 mod tree;
 
@@ -105,11 +105,14 @@ impl Picker {
 
     /// What the popup's own last row says the keys do. It belongs to the picker
     /// rather than to the painter because it is the same fact as the title: what
-    /// this list is for.
+    /// this list is for. A long list is paged the same way the transcript is,
+    /// so `PgUp`/`PgDn` are named beside `j`/`k`.
     pub fn hint(&self) -> &'static str {
         match self.kind {
-            PickerKind::Model | PickerKind::Provider => " Enter pick · Esc cancel ",
-            PickerKind::Notes => " j/k scrolls · Esc closes ",
+            PickerKind::Model | PickerKind::Provider => {
+                " j/k or PgUp/PgDn · Enter pick · Esc cancel "
+            }
+            PickerKind::Notes => " j/k or PgUp/PgDn scrolls · Esc closes ",
         }
     }
 }
@@ -149,18 +152,20 @@ fn ended_on_an_answer(messages: &[Message]) -> bool {
     )
 }
 
-/// `/help`: what the keys do, then the command table.
+/// `/help`: the key table, then the command table.
 ///
-/// The table is the same one `mush --help` prints, so the two surfaces cannot
-/// advertise different commands — `/compact` used to be implemented, listed by
-/// `/help` and missing from `--help`, because each list was written by hand
-/// (the help/status drift half of finding B2). It is a notice rather than a
-/// status line: it is a thing to read, not a thing that just happened.
+/// Both tables are the same one source their CLI counterparts print —
+/// [`keys::help_table`] is `mush --help`'s KEYS block and [`commands::table`]
+/// is its COMMANDS block — so no surface can advertise a binding or a command
+/// the others do not. `/help` used to name six keys by hand and miss `j`/`k`,
+/// `Enter`, `c`, `Esc` and `Ctrl-Q`; rendering [`keys::KEYS`] here is what stops
+/// a human learning the keyboard from a subset of it (the key half of finding
+/// B2). It is a notice rather than a status line: it is a thing to read, not a
+/// thing that just happened.
 fn help_notice() -> String {
     format!(
-        "mush: Tab cycles agents/chat · Enter sends to the focused agent · \
-         Ctrl-P pick a model · Ctrl-N new chat · \
-         Ctrl-C stops the focused agent · Ctrl-X stops them all. Commands:\n{}",
+        "mush keys:\n{}\nCommands:\n{}",
+        keys::help_table(),
         commands::table(&mush_core::provider::names_piped())
     )
 }
@@ -1702,6 +1707,7 @@ impl App {
             Intent::PickerFirst => self.set_picker_cursor(0),
             Intent::PickerLast => self.set_picker_cursor(usize::MAX),
             Intent::TreeMove(step) => self.tree.move_cursor(step),
+            Intent::TreeWalk(direction) => self.tree_walk(direction),
             Intent::TreeFirst => self.tree.cursor_top(),
             Intent::TreeLast => self.tree.cursor_bottom(),
             Intent::TreeFocus => self.focus_cursor_row(),
@@ -1807,6 +1813,50 @@ impl App {
     /// Focus the row the tree's cursor is on, and say whose pane the chat now
     /// shows: `Enter` in the agent pane is a move of the *view*, so the brief
     /// goes to the bar where a human can read it before typing.
+    /// `←`/`→` in the agents pane: walk the painted rows along the parent links
+    /// (finding U10). `direction < 0` selects the selected agent's parent;
+    /// `> 0` its first child. Both read the order the pane paints and `j`/`k`
+    /// walk, so the cursor lands on the row the human sees (finding U4), and
+    /// the parent link — not the row above — is what `←` follows: a later
+    /// sibling's row sits directly above a node without being its parent.
+    ///
+    /// The root has no parent and a leaf has no child, so the cursor stays put:
+    /// an honest no-op, chosen over jumping to `g` (the root) or to a sibling,
+    /// either of which would move the selection somewhere the human did not
+    /// point.
+    fn tree_walk(&mut self, direction: i64) {
+        let Some(from) = self.tree.cursor_id() else {
+            return;
+        };
+        let target = if direction < 0 {
+            self.tree
+                .node(from)
+                .and_then(|node| node.parent)
+                .filter(|parent| self.tree.has(*parent))
+        } else {
+            // The first child in painted order: `rows` is pre-order, so the
+            // first node whose parent is `from` is the one directly under it.
+            self.tree
+                .rows()
+                .iter()
+                .find(|node| node.parent == Some(from))
+                .map(|node| node.id)
+        };
+        let Some(target) = target else {
+            return;
+        };
+        if let Some(index) = self.tree.rows().iter().position(|node| node.id == target) {
+            // The tree's only cursor setter is `move_cursor`, and it moves a
+            // *sign*, one row per call — so the walk takes one step for each row
+            // it must cross rather than a second way to write the cursor. The
+            // cursor lands on `target` exactly, because `steps` is the gap.
+            let steps = index as i64 - self.tree.cursor() as i64;
+            for _ in 0..steps.abs() {
+                self.tree.move_cursor(steps.signum());
+            }
+        }
+    }
+
     fn focus_cursor_row(&mut self) {
         if let Some(id) = self.tree.focus_cursor() {
             let brief = self
@@ -4018,6 +4068,146 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(help.contains("/compact"), "{help}");
+    }
+
+    /// `/help` renders the same key table `mush --help` does, so a human who
+    /// learns the keyboard from the notice can discover every binding instead
+    /// of the six the old hand-written line named — and discover the keys that
+    /// really scroll (finding K3), not a wheel mush never takes.
+    #[test]
+    fn help_names_the_whole_key_table() {
+        let (mut app, _rx) = test_app("keys-help");
+        run(&mut app, "/help");
+        let help = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .map(|notice| notice.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for want in [
+            "j / k, ↑ / ↓",
+            "focus the selected agent",
+            "cancel the selected agent",
+            "back to the root agent",
+            "←",
+            "→",
+            "Ctrl-Q",
+            "↑ / ↓, PgUp / PgDn",
+        ] {
+            assert!(
+                help.contains(want),
+                "`{want}` is missing from /help:\n{help}"
+            );
+        }
+        assert!(
+            !help.contains("wheel"),
+            "a wheel it does not scroll:\n{help}"
+        );
+    }
+
+    /// `←`/`→` in the agents pane walk the tree by its parent links, over the
+    /// *painted* pre-order rows, not the storage order (finding U10): from a
+    /// great-grandchild `←` reaches the root one ancestor per press, `→` walks
+    /// back down the same chain, and `←` follows the parent link rather than the
+    /// row above it.
+    #[test]
+    fn left_and_right_walk_the_tree_by_its_parent_links() {
+        let (mut app, _rx) = test_app("tree-walk");
+        app.focus = Focus::Agents;
+        // root(0) → #1 → #2 → #3, plus #4 as the root's second child, spawned
+        // *before* #2 and #3. Storage order is therefore 0,1,4,2,3, while the
+        // painted pre-order is 0,1,2,3,4 — the two orders differ, so the test
+        // can tell which one the cursor walks.
+        let mut _mailboxes = Vec::new();
+        for (id, parent, depth) in [(1u64, 0u64, 1usize), (4, 0, 1), (2, 1, 2), (3, 2, 3)] {
+            let (cmd, rx) = crossbeam_channel::unbounded::<AgentMsg>();
+            _mailboxes.push(rx);
+            app.tree.insert(Spawn {
+                id: AgentId(id),
+                parent: AgentId(parent),
+                brief: format!("child {id}"),
+                depth,
+                branch: None,
+                cmd,
+            });
+        }
+        let stored: Vec<u64> = app.tree.agents.iter().map(|node| node.id.0).collect();
+        let painted: Vec<u64> = app.tree.rows().iter().map(|node| node.id.0).collect();
+        assert_eq!(stored, vec![0, 1, 4, 2, 3], "storage is spawn order");
+        assert_eq!(
+            painted,
+            vec![0, 1, 2, 3, 4],
+            "rows are the painted pre-order"
+        );
+        // `G` walks the painted rows: the bottom row is #4, not the storage
+        // vector's last (#3).
+        app.tree.cursor_bottom();
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(4)));
+
+        let left = KeyEvent::new(KeyCode::Left, KeyModifiers::NONE);
+        let right = KeyEvent::new(KeyCode::Right, KeyModifiers::NONE);
+
+        // Select the great-grandchild #3 (painted index 3) and walk up. (The
+        // tree's `move_cursor` moves one row per call, so three calls.)
+        app.tree.cursor_top();
+        for _ in 0..3 {
+            app.tree.move_cursor(1);
+        }
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(3)));
+        app.on_key(left);
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(2)), "#3's parent");
+        app.on_key(left);
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(1)), "its grandparent");
+        app.on_key(left);
+        assert_eq!(app.tree.cursor_id(), Some(AgentId::ROOT), "three levels up");
+        // The root has no parent: the cursor stays where it is, an honest no-op.
+        app.on_key(left);
+        assert_eq!(app.tree.cursor_id(), Some(AgentId::ROOT));
+        // `→` is the companion: the root's first child, then down the chain.
+        app.on_key(right);
+        assert_eq!(
+            app.tree.cursor_id(),
+            Some(AgentId(1)),
+            "the root's first child"
+        );
+        app.on_key(right);
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(2)));
+        app.on_key(right);
+        assert_eq!(
+            app.tree.cursor_id(),
+            Some(AgentId(3)),
+            "down the same chain"
+        );
+        // A leaf has no child: the cursor stays.
+        app.on_key(right);
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(3)));
+
+        // #4's painted row is directly below #3's, but its parent is the root:
+        // `←` follows the link (root), not row-minus-one (#3).
+        app.tree.cursor_bottom();
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(4)));
+        app.on_key(left);
+        assert_eq!(
+            app.tree.cursor_id(),
+            Some(AgentId::ROOT),
+            "the parent link, not the row above"
+        );
+    }
+
+    /// `←` in the chat pane is the message box's cursor and moves nothing in the
+    /// tree: the two panes keep their own meaning for the same key.
+    #[test]
+    fn left_in_the_chat_pane_leaves_the_tree_alone() {
+        let (mut app, _rx) = test_app("chat-left");
+        app.focus = Focus::Chat;
+        app.tree.cursor_bottom();
+        let before = app.tree.cursor_id();
+        app.on_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE));
+        assert_eq!(
+            app.tree.cursor_id(),
+            before,
+            "the chat does not move the tree"
+        );
     }
 
     /// A tree `/new` abandoned can still spawn children, and their `Spawned`

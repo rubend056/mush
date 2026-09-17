@@ -19,33 +19,14 @@
 //! modes was dropped from the tree in Stage 0 — a `mode` argument here would be
 //! a value no state can produce.
 //!
-//! The whole table, which is also what `mush --help` prints in prose:
-//!
-//! | context | key | intent |
-//! |---|---|---|
-//! | anywhere, picker or not | `Ctrl-Q` | `Quit` |
-//! | anywhere, picker or not | `Ctrl-C` | `Interrupt` — the *focused* agent |
-//! | anywhere, picker or not | `Ctrl-X` | `InterruptAll` |
-//! | anywhere, picker or not | `Ctrl-N` | `NewChat` |
-//! | anywhere, picker or not | `Ctrl-P` | `OpenModelPicker` |
-//! | anywhere, picker or not | `Tab` / `Shift-Tab` | `CycleFocus(+1/-1)` |
-//! | picker open | `Esc` | `PickerClose` |
-//! | picker open | `Enter` | `PickerPick` |
-//! | picker open | `j` / `Down`, `k` / `Up` | `PickerMove(+1/-1)` |
-//! | picker open | `g` / `Home`, `G` / `End` | `PickerFirst` / `PickerLast` |
-//! | `Focus::Agents` | `j` / `Down`, `k` / `Up` | `TreeMove(+1/-1)` |
-//! | `Focus::Agents` | `g` / `Home`, `G` / `End` | `TreeFirst` / `TreeLast` |
-//! | `Focus::Agents` | `Enter` | `TreeFocus` |
-//! | `Focus::Agents` | `c` | `TreeCancel` |
-//! | `Focus::Agents` | `Esc` | `TreeBackToRoot` |
-//! | `Focus::Chat` | `Enter` | `Send` |
-//! | `Focus::Chat` | `Shift-Enter` / `Alt-Enter` | `Chat(Newline)` |
-//! | `Focus::Chat` | `Backspace`, `Delete` | `Chat(Backspace)`, `Chat(Delete)` |
-//! | `Focus::Chat` | `Left`, `Right`, `Home`, `End` | `Chat(Left…End)` |
-//! | `Focus::Chat` | any `Char` with neither `Ctrl` nor `Alt` | `Chat(Insert)` |
-//! | `Focus::Chat` | `Up` / `Down`, `PageUp` / `PageDown` | `Chat(Scroll(±1/±10))` |
-//! | `Focus::Chat` | `Esc` | `Chat(Clear)` |
-//! | everywhere | anything else, and any `Release` | `Ignore` |
+//! The whole table lives in [`KEYS`] — one row per binding — and both help
+//! surfaces render it through [`help_table`]: `mush --help`'s KEYS block and
+//! the in-app `/help` notice. A binding therefore cannot be documented in one
+//! and missing from the other, which is what the hand-written `--help` prose
+//! and the six-key `/help` line allowed (the key half of finding B2). This is
+//! the same one-source shape `commands::table` gives the slash commands. [`key`]
+//! stays the behaviour and the tests below pin it key by key; a test pins both
+//! help surfaces to [`KEYS`], so the documentation cannot drift from the rows.
 //!
 //! The tree's keys deliberately ignore modifiers, exactly as the old arms did:
 //! `Alt-C` stops a row and `Ctrl-J` moves the cursor, and both are pinned in a
@@ -54,6 +35,208 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::Focus;
+
+/// How many rows a page key moves, in the chat's scrollback and in a picker's
+/// list. One number, so "a page" is the same distance wherever a human pages.
+const PAGE: i64 = 10;
+
+/// The context a binding belongs to, so the help can group the rows the way a
+/// human reads them: what works anywhere, then the modal list, then each pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Context {
+    /// Active with a picker up and while either pane is focused.
+    Anywhere,
+    /// Only while a picker holds the keyboard.
+    Picker,
+    Agents,
+    Chat,
+}
+
+impl Context {
+    /// The heading [`help_table`] prints above this context's rows.
+    const fn label(self) -> &'static str {
+        match self {
+            Context::Anywhere => "anywhere",
+            Context::Picker => "in a picker",
+            Context::Agents => "agents pane",
+            Context::Chat => "chat pane",
+        }
+    }
+}
+
+/// One row of the key table: the keys, and what they do.
+///
+/// [`KEYS`] is the single source both `mush --help` and the in-app `/help`
+/// render — the way `COMMANDS` serves both scripts — so a binding cannot be
+/// documented in one surface and missing from the other. Every binding the
+/// program has appears here exactly once.
+pub struct Binding {
+    pub context: Context,
+    /// The keys as a human reads them, e.g. `j / k, ↑ / ↓`.
+    pub keys: &'static str,
+    /// What they do, in one clause.
+    pub help: &'static str,
+}
+
+/// The whole key table, in the order the help prints it.
+pub const KEYS: &[Binding] = &[
+    Binding {
+        context: Context::Anywhere,
+        keys: "Ctrl-Q",
+        help: "quit",
+    },
+    Binding {
+        context: Context::Anywhere,
+        keys: "Ctrl-C",
+        help: "stop the focused agent",
+    },
+    Binding {
+        context: Context::Anywhere,
+        keys: "Ctrl-X",
+        help: "stop every running agent",
+    },
+    Binding {
+        context: Context::Anywhere,
+        keys: "Ctrl-N",
+        help: "start a new chat",
+    },
+    Binding {
+        context: Context::Anywhere,
+        keys: "Ctrl-P",
+        help: "model picker",
+    },
+    Binding {
+        context: Context::Anywhere,
+        keys: "Tab / Shift-Tab",
+        help: "cycle panes (agents, chat)",
+    },
+    Binding {
+        context: Context::Picker,
+        keys: "Enter",
+        help: "take the selected row",
+    },
+    Binding {
+        context: Context::Picker,
+        keys: "Esc",
+        help: "close the picker",
+    },
+    Binding {
+        context: Context::Picker,
+        keys: "j / k, ↑ / ↓",
+        help: "move down / up the list",
+    },
+    Binding {
+        context: Context::Picker,
+        keys: "g / G, Home / End",
+        help: "first / last row",
+    },
+    Binding {
+        context: Context::Picker,
+        keys: "PgUp / PgDn",
+        help: "page the list",
+    },
+    Binding {
+        context: Context::Agents,
+        keys: "←",
+        help: "the selected agent's parent",
+    },
+    Binding {
+        context: Context::Agents,
+        keys: "→",
+        help: "the selected agent's first child",
+    },
+    Binding {
+        context: Context::Agents,
+        keys: "Enter",
+        help: "focus the selected agent",
+    },
+    Binding {
+        context: Context::Agents,
+        keys: "j / k, ↑ / ↓",
+        help: "move down / up a row",
+    },
+    Binding {
+        context: Context::Agents,
+        keys: "g / G, Home / End",
+        help: "first / last row",
+    },
+    Binding {
+        context: Context::Agents,
+        keys: "c",
+        help: "cancel the selected agent",
+    },
+    Binding {
+        context: Context::Agents,
+        keys: "Esc",
+        help: "back to the root agent",
+    },
+    Binding {
+        context: Context::Chat,
+        keys: "Enter",
+        help: "send the message",
+    },
+    Binding {
+        context: Context::Chat,
+        keys: "Shift / Alt-Enter",
+        help: "new line in the message",
+    },
+    Binding {
+        context: Context::Chat,
+        keys: "letters and symbols",
+        help: "type into the message box",
+    },
+    Binding {
+        context: Context::Chat,
+        keys: "← / →, Home / End",
+        help: "move the box cursor",
+    },
+    Binding {
+        context: Context::Chat,
+        keys: "Backspace / Delete",
+        help: "delete in the box",
+    },
+    Binding {
+        context: Context::Chat,
+        keys: "↑ / ↓, PgUp / PgDn",
+        help: "scroll the transcript",
+    },
+    Binding {
+        context: Context::Chat,
+        keys: "Esc",
+        help: "clear the box",
+    },
+];
+
+/// The key table as text: a heading per context, then `keys` and `what it does`
+/// in one aligned column.
+///
+/// Both `mush --help`'s KEYS block and the in-app `/help` notice print exactly
+/// this string, so the two cannot disagree about a binding.
+pub fn help_table() -> String {
+    let width = KEYS
+        .iter()
+        .map(|binding| binding.keys.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    let mut shown: Option<Context> = None;
+    for binding in KEYS {
+        if shown != Some(binding.context) {
+            if shown.is_some() {
+                out.push('\n');
+            }
+            out.push_str(&format!("  {}:\n", binding.context.label()));
+            shown = Some(binding.context);
+        }
+        out.push_str(&format!(
+            "    {:<width$}  {}\n",
+            binding.keys,
+            binding.help,
+            width = width
+        ));
+    }
+    out.trim_end().to_string()
+}
 
 /// What the message box and the transcript's scrollback do with a key.
 ///
@@ -107,6 +290,11 @@ pub enum Intent {
     PickerLast,
     /// Move the tree's cursor `step` rows, without leaving the pane.
     TreeMove(i64),
+    /// Walk the tree along the parent links: `-1` selects the selected agent's
+    /// parent (`←`), `+1` its first child (`→`). A root has no parent and a
+    /// leaf has no child, so the cursor stays put — an honest no-op rather than
+    /// a jump somewhere that is not the row the human asked for (finding U10).
+    TreeWalk(i64),
     TreeFirst,
     TreeLast,
     /// Focus the agent under the tree's cursor.
@@ -172,6 +360,12 @@ fn picker(key: KeyEvent) -> Intent {
         KeyCode::Char('k') | KeyCode::Up => Intent::PickerMove(-1),
         KeyCode::Char('g') | KeyCode::Home => Intent::PickerFirst,
         KeyCode::Char('G') | KeyCode::End => Intent::PickerLast,
+        // A fifty-line list is paged, not walked: `PgUp`/`PgDn` move a whole
+        // screen the way they do in the transcript, so a human does not press
+        // `j` fifty times to reach the model at the bottom (finding U10's
+        // neighbour: a deep list is walked the same way a deep tree is).
+        KeyCode::PageUp => Intent::PickerMove(-PAGE),
+        KeyCode::PageDown => Intent::PickerMove(PAGE),
         _ => Intent::Ignore,
     }
 }
@@ -186,6 +380,11 @@ fn tree(key: KeyEvent) -> Intent {
         KeyCode::Enter => Intent::TreeFocus,
         KeyCode::Char('c') => Intent::TreeCancel,
         KeyCode::Esc => Intent::TreeBackToRoot,
+        // `←`/`→` walk the parent links, `j`/`k` walk the rows. They are "up
+        // and down the tree" rather than "previous and next row": with a
+        // grandchild selected, `←` is its parent, not its uncle above it.
+        KeyCode::Left => Intent::TreeWalk(-1),
+        KeyCode::Right => Intent::TreeWalk(1),
         _ => Intent::Ignore,
     }
 }
@@ -214,8 +413,8 @@ fn chat(key: KeyEvent) -> Intent {
         KeyCode::Char(c) if !ctrl && !alt => Intent::Chat(ChatKey::Insert(c)),
         KeyCode::Up => Intent::Chat(ChatKey::Scroll(1)),
         KeyCode::Down => Intent::Chat(ChatKey::Scroll(-1)),
-        KeyCode::PageUp => Intent::Chat(ChatKey::Scroll(10)),
-        KeyCode::PageDown => Intent::Chat(ChatKey::Scroll(-10)),
+        KeyCode::PageUp => Intent::Chat(ChatKey::Scroll(PAGE)),
+        KeyCode::PageDown => Intent::Chat(ChatKey::Scroll(-PAGE)),
         KeyCode::Esc => Intent::Chat(ChatKey::Clear),
         _ => Intent::Ignore,
     }
@@ -281,6 +480,8 @@ mod tests {
             (none(KeyCode::Enter), Intent::TreeFocus),
             (none(KeyCode::Char('c')), Intent::TreeCancel),
             (none(KeyCode::Esc), Intent::TreeBackToRoot),
+            (none(KeyCode::Left), Intent::TreeWalk(-1)),
+            (none(KeyCode::Right), Intent::TreeWalk(1)),
         ];
         for (key, want) in cases {
             assert_eq!(at(Focus::Agents, false, key), want, "{key:?}");
@@ -361,6 +562,8 @@ mod tests {
             (none(KeyCode::Home), Intent::PickerFirst),
             (none(KeyCode::Char('G')), Intent::PickerLast),
             (none(KeyCode::End), Intent::PickerLast),
+            (none(KeyCode::PageUp), Intent::PickerMove(-PAGE)),
+            (none(KeyCode::PageDown), Intent::PickerMove(PAGE)),
         ];
         for (key, want) in cases {
             assert_eq!(at(Focus::Chat, true, key), want, "{key:?}");
@@ -490,6 +693,96 @@ mod tests {
         assert_eq!(
             at(Focus::Agents, false, none(KeyCode::Char(' '))),
             Intent::Ignore
+        );
+    }
+
+    /// `←`/`→` belong to whichever pane has the keyboard: the tree walks its
+    /// parent links in the agents pane, and the chat keeps them for the message
+    /// box cursor. Both halves are one row of this table, so "`←` moves the
+    /// tree" cannot quietly become "`←` moves the box too".
+    #[test]
+    fn left_and_right_belong_to_whichever_pane_has_the_keyboard() {
+        assert_eq!(
+            at(Focus::Agents, false, none(KeyCode::Left)),
+            Intent::TreeWalk(-1)
+        );
+        assert_eq!(
+            at(Focus::Agents, false, none(KeyCode::Right)),
+            Intent::TreeWalk(1)
+        );
+        assert_eq!(
+            at(Focus::Chat, false, none(KeyCode::Left)),
+            Intent::Chat(ChatKey::Left)
+        );
+        assert_eq!(
+            at(Focus::Chat, false, none(KeyCode::Right)),
+            Intent::Chat(ChatKey::Right)
+        );
+    }
+
+    /// The help both surfaces print comes from [`KEYS`], so this is where a
+    /// binding can be lost: every row must be in the rendered table, each
+    /// context must head its rows once, and the real scroll keys — not the
+    /// wheel the terminal never sends, because mouse capture is not taken
+    /// (finding K3) — must be the ones named.
+    #[test]
+    fn the_help_table_shows_every_binding_once() {
+        let table = help_table();
+        for binding in KEYS {
+            assert!(!binding.keys.is_empty(), "a row with no keys");
+            assert!(
+                table.contains(binding.keys),
+                "{} is missing from the help table:\n{table}",
+                binding.keys
+            );
+            assert!(
+                table.contains(binding.help),
+                "{} is missing from the help table:\n{table}",
+                binding.help
+            );
+        }
+        for context in [
+            Context::Anywhere,
+            Context::Picker,
+            Context::Agents,
+            Context::Chat,
+        ] {
+            assert_eq!(
+                table.matches(context.label()).count(),
+                1,
+                "{:?} does not head its rows exactly once:\n{table}",
+                context
+            );
+        }
+        assert!(
+            table.contains("↑ / ↓, PgUp / PgDn"),
+            "the transcript's real scroll keys are named:\n{table}"
+        );
+        assert!(
+            !table.contains("wheel"),
+            "`--help` advertised a wheel it never scrolls:\n{table}"
+        );
+    }
+
+    /// The two stop keys name their scope, so the help cannot repeat the doc's
+    /// old "`Ctrl-C` cancel running agents" (plural): `Ctrl-C` stops the
+    /// *focused* agent and `Ctrl-X` stops every running one (the code side of
+    /// finding K5). A doc that swaps them is then contradicted by the surface a
+    /// human reads.
+    #[test]
+    fn the_two_stop_keys_name_their_scope() {
+        let help = |keys: &str| {
+            KEYS.iter()
+                .find(|binding| binding.keys == keys)
+                .unwrap_or_else(|| panic!("no `{keys}` row"))
+                .help
+        };
+        assert_eq!(help("Ctrl-C"), "stop the focused agent");
+        assert_eq!(help("Ctrl-X"), "stop every running agent");
+        assert_ne!(
+            help("Ctrl-C"),
+            help("Ctrl-X"),
+            "the two scopes are not the same key's job"
         );
     }
 }
