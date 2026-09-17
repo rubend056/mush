@@ -763,4 +763,26 @@ mod tests {
             "`--help` advertised a wheel it never scrolls:\n{table}"
         );
     }
+
+    /// The two stop keys name their scope, so the help cannot repeat the doc's
+    /// old "`Ctrl-C` cancel running agents" (plural): `Ctrl-C` stops the
+    /// *focused* agent and `Ctrl-X` stops every running one (the code side of
+    /// finding K5). A doc that swaps them is then contradicted by the surface a
+    /// human reads.
+    #[test]
+    fn the_two_stop_keys_name_their_scope() {
+        let help = |keys: &str| {
+            KEYS.iter()
+                .find(|binding| binding.keys == keys)
+                .unwrap_or_else(|| panic!("no `{keys}` row"))
+                .help
+        };
+        assert_eq!(help("Ctrl-C"), "stop the focused agent");
+        assert_eq!(help("Ctrl-X"), "stop every running agent");
+        assert_ne!(
+            help("Ctrl-C"),
+            help("Ctrl-X"),
+            "the two scopes are not the same key's job"
+        );
+    }
 }
