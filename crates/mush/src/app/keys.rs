@@ -18,6 +18,38 @@
 //! the caller holds as a bool, and the editor pane that had insert and normal
 //! modes was dropped from the tree in Stage 0 — a `mode` argument here would be
 //! a value no state can produce.
+//!
+//! The whole table, which is also what `mush --help` prints in prose:
+//!
+//! | context | key | intent |
+//! |---|---|---|
+//! | anywhere, picker or not | `Ctrl-Q` | `Quit` |
+//! | anywhere, picker or not | `Ctrl-C` | `Interrupt` — the *focused* agent |
+//! | anywhere, picker or not | `Ctrl-X` | `InterruptAll` |
+//! | anywhere, picker or not | `Ctrl-N` | `NewChat` |
+//! | anywhere, picker or not | `Ctrl-P` | `OpenModelPicker` |
+//! | anywhere, picker or not | `Tab` / `Shift-Tab` | `CycleFocus(+1/-1)` |
+//! | picker open | `Esc` | `PickerClose` |
+//! | picker open | `Enter` | `PickerPick` |
+//! | picker open | `j` / `Down`, `k` / `Up` | `PickerMove(+1/-1)` |
+//! | picker open | `g` / `Home`, `G` / `End` | `PickerFirst` / `PickerLast` |
+//! | `Focus::Agents` | `j` / `Down`, `k` / `Up` | `TreeMove(+1/-1)` |
+//! | `Focus::Agents` | `g` / `Home`, `G` / `End` | `TreeFirst` / `TreeLast` |
+//! | `Focus::Agents` | `Enter` | `TreeFocus` |
+//! | `Focus::Agents` | `c` | `TreeCancel` |
+//! | `Focus::Agents` | `Esc` | `TreeBackToRoot` |
+//! | `Focus::Chat` | `Enter` | `Send` |
+//! | `Focus::Chat` | `Shift-Enter` / `Alt-Enter` | `Chat(Newline)` |
+//! | `Focus::Chat` | `Backspace`, `Delete` | `Chat(Backspace)`, `Chat(Delete)` |
+//! | `Focus::Chat` | `Left`, `Right`, `Home`, `End` | `Chat(Left…End)` |
+//! | `Focus::Chat` | any `Char` with neither `Ctrl` nor `Alt` | `Chat(Insert)` |
+//! | `Focus::Chat` | `Up` / `Down`, `PageUp` / `PageDown` | `Chat(Scroll(±1/±10))` |
+//! | `Focus::Chat` | `Esc` | `Chat(Clear)` |
+//! | everywhere | anything else, and any `Release` | `Ignore` |
+//!
+//! The tree's keys deliberately ignore modifiers, exactly as the old arms did:
+//! `Alt-C` stops a row and `Ctrl-J` moves the cursor, and both are pinned in a
+//! test so that a future change to either is a decision rather than an accident.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 

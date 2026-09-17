@@ -14,6 +14,30 @@
 //! themselves are only ever read here — `App` matches on the variant and uses
 //! the typed value — so a usage line cannot promise a shape the executor does
 //! not accept.
+//!
+//! The whole list, spelled as a human types it (a name in brackets is an alias
+//! the parser accepts and help does not advertise):
+//!
+//! | command | argument | what it does |
+//! |---|---|---|
+//! | `/provider [PROVIDERS]` | optional | switch provider, or open the picker |
+//! | `/model` | ignored | open the model picker |
+//! | `/context [TOKENS]` | optional, a positive count | show or set the window |
+//! | `/url <url>` | required | point at another endpoint |
+//! | `/key [SECRET]` | optional | show the key in use, or set one |
+//! | `/models` | ignored | re-read the endpoint's model list |
+//! | `/worktrees` | ignored | re-scan for leftover isolated worktrees |
+//! | `/diff <id>` | required, an id | print the git command that reads the work |
+//! | `/merge <id>` | required, an id | merge it into HEAD and reclaim it |
+//! | `/discard <id>` | required, an id | throw it away and reclaim it |
+//! | `/forget <id>` | required, an id | drop the agent from this session |
+//! | `/compact` | ignored | fold the focused conversation into a summary |
+//! | `/new` [`/clear`] | ignored | start a new chat |
+//! | `/help` [`/?`] | ignored | list the keys and the commands |
+//! | `/quit` [`/q`] | ignored | leave mush |
+//!
+//! Anything else is an error value: an unknown slash, or a real command whose
+//! argument does not read.
 
 use std::fmt;
 
