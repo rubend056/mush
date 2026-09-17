@@ -622,13 +622,16 @@ transitions.
   resize (needs nothing), cancel (needs nothing — a socket that accepts the chat
   request and never answers must be abandoned by a single Ctrl-C, which is only
   observable from outside the process).
-- **Deterministic orchestration.** `cargo test -- --ignored` starts
-  `scripts/mock_llm.py` and runs a root → child → grandchild chain, an isolated
-  child whose run must commit its worktree (the test then merges it, removes the
-  worktree, and deletes the branch — the documented commands, executed), a
-  context overflow that must compact, a nudge that lands mid-reply, and a run
-  that hits its turn limit and must end with a wrap-up summary. No network, but
-  it needs `python3` and `git`.
+- **Deterministic orchestration.** Five `cargo test` scenarios run a real agent
+  tree in process, on a scripted `ModelClient` rather than a server: a root →
+  child → grandchild chain, an isolated child whose run must commit its worktree
+  (the test then merges it, removes the worktree, and deletes the branch — the
+  documented commands, executed), a context overflow that must compact, a nudge
+  that arrives mid-reply and must be answered, and a run that hits its runaway
+  guard and must end with a summary. The model is scripted; the work — git
+  worktrees, files, the commit, the merge — is real, so they need neither a
+  socket, nor `python3`, nor a sleep over 20 ms. `scripts/mock_llm.py` is kept
+  for the pty smoke scenarios; no test refers to it.
 - **Live.** Two `#[ignore]`d tests talk to the configured endpoint (one of them
   proves the TLS path), so the default suite stays green offline.
 - **The checks.** `cargo fmt --all --check`, `cargo clippy --all-targets --
@@ -646,7 +649,7 @@ Run it:
 
 ```sh
 cargo test                 # offline, fast
-cargo test -- --ignored    # scripted mock model + a live-endpoint check
+cargo test -- --ignored    # the two live-endpoint checks
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --resize
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
 ```

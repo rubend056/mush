@@ -329,17 +329,43 @@ pub struct RootHandle {
 
 /// Start the root actor.
 pub fn spawn(cfg: Config, tx: Sender<Msg>, root: PathBuf) -> RootHandle {
+    let shared = Arc::new(Mutex::new(cfg));
+    // The real endpoint, behind the seam: every agent in this tree calls it
+    // through `AgentCtx::model`, children included.
+    let model: Arc<dyn ModelClient> = Arc::new(HttpModel::new(shared.clone()));
+    root_actor(shared, model, tx, root)
+}
+
+/// The same tree, with its model calls served by the caller instead of the
+/// real endpoint.
+///
+/// Children inherit the client through the cloned context, so one scripted
+/// model serves a whole tree: a test can drive a parent, its children and its
+/// grandchildren through one script, with no socket, no server and no sleep.
+#[cfg(test)]
+pub(crate) fn spawn_scripted(
+    cfg: Config,
+    tx: Sender<Msg>,
+    root: PathBuf,
+    model: Arc<dyn ModelClient>,
+) -> RootHandle {
+    root_actor(Arc::new(Mutex::new(cfg)), model, tx, root)
+}
+
+/// Start the root actor of one conversation over a given model.
+fn root_actor(
+    shared: Arc<Mutex<Config>>,
+    model: Arc<dyn ModelClient>,
+    tx: Sender<Msg>,
+    root: PathBuf,
+) -> RootHandle {
     // One conversation per `/new`, so stale events can be told apart.
     static CONVERSATIONS: AtomicU64 = AtomicU64::new(1);
     let conversation = CONVERSATIONS.fetch_add(1, Ordering::SeqCst);
-    let shared = Arc::new(Mutex::new(cfg));
     // Root agent is id 0; children start at 1. The UI holds a clone so it can
     // raise the floor above leftover worktree ids.
     let ids = Arc::new(AtomicU64::new(1));
     let live = Arc::new(AtomicU64::new(0));
-    // The real endpoint, behind the seam: every agent in this tree calls it
-    // through `AgentCtx::model`, children included.
-    let model: Arc<dyn ModelClient> = Arc::new(HttpModel::new(shared.clone()));
     let ctx = Arc::new(AgentCtx {
         cfg: shared.clone(),
         model,
@@ -1810,7 +1836,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::fake::{tool_call, Scripted};
+    use crate::model::fake::{tool_call, Asked, Gate, Scripted};
     use mush_core::{FunctionCall, ToolCall};
     use serde_json::json;
     use std::fs;
@@ -2615,52 +2641,136 @@ mod tests {
         found
     }
 
-    /// The full orchestration path, headless: root spawns an isolated child,
-    /// the child writes into its own worktree, the parent waits and collects
-    /// the summary. The model is `scripts/mock_llm.py` — deterministic.
+    /// The seam the orchestration scenarios run on: a tree spawned over a
+    /// scripted client asks *it*. The endpoint in the config is a port nothing
+    /// listens on, so a run that finished cannot have used one — which is what
+    /// keeps these tests off the socket, off `python3` and off the clock.
     #[test]
-    #[ignore = "needs python3 + git; spawns a local mock model server"]
-    fn isolated_subagent_writes_its_worktree() {
-        use std::fs;
-
-        const PORT: u16 = 18_731;
-        let mock = start_mock(PORT);
-
-        // A real git repo so `create_worktree` has something to branch from.
-        let root = init_git_repo("iso");
-
-        let cfg = Config::new(format!("http://127.0.0.1:{PORT}"), "mock", None);
+    fn a_spawned_tree_asks_the_scripted_model() {
+        let root = scratch_dir("scripted-tree");
+        let scripted = Arc::new(Scripted::new().says("nothing to do"));
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let root_tx = spawn(cfg, tx, root.clone()).tx;
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            tx,
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("say something".to_string()),
+            ]))
+            .unwrap();
 
-        let messages = vec![
-            Message::system(prompt::system_prompt(root.to_str().unwrap())),
-            Message::user("delegate: create iso.txt via an isolated subagent".to_string()),
-        ];
-        root_tx.send(AgentMsg::Run(messages)).unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&rx, WAIT, |seen| seen.done > 0 || !seen.errors.is_empty()),
+            "the run must end: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+        assert_eq!(seen.replies, vec!["nothing to do"]);
+        assert_eq!(
+            scripted.asked().len(),
+            1,
+            "the tree's one turn must have gone to the scripted client"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 
-        // The isolated child must write into `.mush/wt/1/`, not the main root.
-        let target = root.join(".mush/wt/1/iso.txt");
-        let mut found = None;
-        for _ in 0..300 {
-            if target.exists() {
-                found = fs::read_to_string(&target).ok();
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+    /// The full orchestration path, headless: the root spawns an isolated
+    /// child, the child writes into its own worktree and its completion wakes
+    /// the parent. The model is scripted; the work — the git worktree, the
+    /// file, the commit, the merge — is real.
+    #[test]
+    fn isolated_subagent_writes_its_worktree() {
+        let root = init_git_repo("iso");
+        // The child's first reply is held until the root's turn has ended, so
+        // "the parent was woken by its child" is the only way this run can
+        // finish — not a race the test happens to win.
+        let gate = Arc::new(Gate::new());
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.depth() == Some(1) && !asked.saw("wrote iso.txt"))
+                .held(gate.clone())
+                .calls(vec![tool_call(
+                    "c1",
+                    "write_file",
+                    json!({ "path": "iso.txt", "content": "isolated work" }),
+                )])
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .says("created iso.txt in my worktree")
+                .when(|asked: &Asked| asked.saw("#1 done"))
+                .says("child finished")
+                .when(|asked: &Asked| asked.saw("spawned agent"))
+                .says("child left running — I will handle its result when it finishes")
+                // The root's first turn: delegate and let the child work.
+                .calls(vec![tool_call(
+                    "c0",
+                    "spawn_agent",
+                    json!({
+                        "brief": "create a file called iso.txt containing exactly: isolated work",
+                        "isolated": true
+                    }),
+                )]),
+        );
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            tx,
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user("delegate: create iso.txt via an isolated subagent".to_string()),
+            ]))
+            .unwrap();
 
-        // The mock ends the root's first turn while the child still runs, so
-        // the orchestrator must be woken by the child's completion: expect the
-        // root to run twice (3 Done events total: root, child, woken root).
-        let done_events = count_done_events(&rx, 3);
+        let mut seen = Watched::default();
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the child never asked for its first turn"
+        );
+        assert!(
+            seen.wait(&rx, WAIT, |seen| seen.done >= 1),
+            "the root's first turn must end while the child still runs: {seen:?}"
+        );
+        gate.release();
+        // The child finishes, and its completion wakes the root into a second
+        // run: 3 Done events, root and child and woken root.
+        assert!(
+            seen.wait(&rx, WAIT, |seen| seen.done >= 3),
+            "the child, then the woken root, must each finish: {seen:?}"
+        );
+        assert_eq!(seen.done, 3, "no other run may happen: {seen:?}");
+        assert_eq!(seen.errors, Vec::<String>::new());
+
+        // The isolated child worked in `.mush/wt/1`, not the main root.
+        assert_eq!(
+            fs::read_to_string(root.join(".mush/wt/1/iso.txt"))
+                .ok()
+                .as_deref(),
+            Some("isolated work")
+        );
         // The run's end commits the worktree, so the branch mush advertises for
         // the child (and tells the human to diff and merge) carries the file.
         let branch_files =
             git::run(&root, &["diff", "--name-only", "HEAD...mush/1"]).unwrap_or_default();
+        assert!(
+            branch_files.contains("iso.txt"),
+            "the branch must carry the child's work, got {branch_files:?}"
+        );
         // …and nothing is left behind as an uncommitted change.
         let worktree_status = git::run(&root.join(".mush/wt/1"), &["status", "--porcelain"])
             .unwrap_or_else(|error| error);
+        assert!(
+            worktree_status.is_empty(),
+            "the worktree must be left clean, got {worktree_status:?}"
+        );
         // The three commands mush prints must now do what they say: merge the
         // work back, then let go of the worktree and the branch.
         let merged = git::run(
@@ -2675,133 +2785,186 @@ mod tests {
                 "mush/1",
             ],
         );
-        let merged_into_workspace = root.join("iso.txt").exists();
-        let removed = git::run(&root, &["worktree", "remove", ".mush/wt/1"]);
-        let deleted = git::run(&root, &["branch", "-D", "mush/1"]);
-        stop_mock(mock);
-        let _ = fs::remove_dir_all(&root);
-        assert_eq!(found.as_deref(), Some("isolated work"));
-        assert_eq!(done_events, 3, "root must be woken when its child finishes");
-        assert!(
-            branch_files.contains("iso.txt"),
-            "the branch must carry the child's work, got {branch_files:?}"
-        );
-        assert!(
-            worktree_status.is_empty(),
-            "the worktree must be left clean, got {worktree_status:?}"
-        );
         assert!(merged.is_ok(), "/merge must merge: {merged:?}");
         assert!(
-            merged_into_workspace,
+            root.join("iso.txt").exists(),
             "after /merge the file must be in the human's workspace"
         );
+        let removed = git::run(&root, &["worktree", "remove", ".mush/wt/1"]);
         assert!(
             removed.is_ok(),
             "/discard must remove the worktree: {removed:?}"
         );
+        let deleted = git::run(&root, &["branch", "-D", "mush/1"]);
         assert!(
             deleted.is_ok(),
             "/discard must delete the branch: {deleted:?}"
         );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Root -> child -> grandchild, each isolated: the grandchild's file must
     /// land in `.mush/wt/2/` on a branch that carries it, branched off the
     /// child's worktree (`mush/2` based on `mush/1`), and the summaries bubble up
-    /// through wait_agents.
+    /// through wait_agents. Three actors ask one scripted model at once; each
+    /// reply says which of them it is for.
     #[test]
-    #[ignore = "needs python3 + git; spawns a local mock model server"]
     fn deep_chain_writes_nested_worktrees() {
-        use std::fs;
-
-        const PORT: u16 = 18_732;
-        let mock = start_mock(PORT);
         let root = init_git_repo("chain");
-
-        let cfg = Config::new(format!("http://127.0.0.1:{PORT}"), "mock", None);
+        let scripted = Arc::new(
+            Scripted::new()
+                // The grandchild is the leaf that writes.
+                .when(|asked: &Asked| asked.depth() == Some(2) && !asked.saw("wrote deep.txt"))
+                .calls(vec![tool_call(
+                    "c2",
+                    "write_file",
+                    json!({ "path": "deep.txt", "content": "deep work" }),
+                )])
+                .when(|asked: &Asked| asked.depth() == Some(2))
+                .says("created deep.txt")
+                // The child only delegates: spawn its own, wait, report.
+                .when(|asked: &Asked| asked.depth() == Some(1) && asked.saw("#2 done"))
+                .says("chain child done")
+                .when(|asked: &Asked| asked.depth() == Some(1) && asked.saw("spawned agent"))
+                .calls(vec![tool_call(
+                    "c1b",
+                    "wait_agents",
+                    json!({ "ids": [2], "timeout": 30 }),
+                )])
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .calls(vec![tool_call(
+                    "c1a",
+                    "spawn_agent",
+                    json!({
+                        "brief": "create a file called deep.txt containing exactly: deep work; \
+                                  you must delegate this to your own subagent",
+                        "isolated": true
+                    }),
+                )])
+                // The root: delegate, wait for the child, report.
+                .when(|asked: &Asked| asked.saw("#1 done"))
+                .says("chain root done")
+                .when(|asked: &Asked| asked.saw("spawned agent"))
+                .calls(vec![tool_call(
+                    "c0b",
+                    "wait_agents",
+                    json!({ "ids": [1], "timeout": 30 }),
+                )])
+                .calls(vec![tool_call(
+                    "c0a",
+                    "spawn_agent",
+                    json!({
+                        "brief": "delegate file creation to your own subagent: spawn one with \
+                                  brief 'create a file called deep.txt containing exactly: deep \
+                                  work' and isolated true, then wait for it, then report",
+                        "isolated": true
+                    }),
+                )]),
+        );
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let root_tx = spawn(cfg, tx, root.clone()).tx;
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            tx,
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user(
+                    "CHAIN: delegate the file creation through two levels of subagents".to_string(),
+                ),
+            ]))
+            .unwrap();
 
-        let messages = vec![
-            Message::system(prompt::system_prompt(root.to_str().unwrap())),
-            Message::user(
-                "CHAIN: delegate the file creation through two levels of subagents".to_string(),
-            ),
-        ];
-        root_tx.send(AgentMsg::Run(messages)).unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&rx, WAIT, |seen| seen.done >= 3),
+            "each level must run and finish once: {seen:?}"
+        );
+        assert_eq!(seen.done, 3, "each level runs exactly once: {seen:?}");
+        assert_eq!(seen.errors, Vec::<String>::new());
 
-        // The grandchild (agent #2) writes into its own worktree.
-        let target = root.join(".mush/wt/2/deep.txt");
-        let mut found = None;
-        for _ in 0..600 {
-            if target.exists() {
-                found = fs::read_to_string(&target).ok();
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-
-        // Every level ran exactly once and reported: root, child, grandchild.
-        let done_events = count_done_events(&rx, 3);
-
+        // The grandchild (agent #2) wrote into its own worktree.
+        assert_eq!(
+            fs::read_to_string(root.join(".mush/wt/2/deep.txt"))
+                .ok()
+                .as_deref(),
+            Some("deep work"),
+            "the grandchild must write its own worktree"
+        );
         // Nested worktree, now with real history: the grandchild's branch
         // carries its work and is based on the child's branch, which — because
         // the child only delegated — still sits at the branch point. And the
         // child's worktree must NOT contain the grandchild's file.
         let grandchild_files =
             git::run(&root, &["diff", "--name-only", "HEAD...mush/2"]).unwrap_or_default();
-        let child_head = git_rev_parse(&root, "mush/1");
-        let base_head = git_rev_parse(&root, "HEAD");
-        let branched_from_child =
-            git::run(&root, &["merge-base", "--is-ancestor", "mush/1", "mush/2"]).is_ok();
-        let child_has_file = root.join(".mush/wt/1/deep.txt").exists();
-
-        stop_mock(mock);
-        let _ = fs::remove_dir_all(&root);
-        assert_eq!(
-            found.as_deref(),
-            Some("deep work"),
-            "grandchild must write its own worktree"
-        );
-        assert_eq!(done_events, 3, "each level must run and finish once");
         assert!(
             grandchild_files.contains("deep.txt"),
             "mush/2 must carry the grandchild's work, got {grandchild_files:?}"
         );
         assert_eq!(
-            child_head.as_deref(),
-            base_head.as_deref(),
+            git_rev_parse(&root, "mush/1").as_deref(),
+            git_rev_parse(&root, "HEAD").as_deref(),
             "the child delegated, so its own branch stays at the branch point"
         );
         assert!(
-            branched_from_child,
+            git::run(&root, &["merge-base", "--is-ancestor", "mush/1", "mush/2"]).is_ok(),
             "mush/2 must be based on mush/1 (nested, not re-rooted)"
         );
         assert!(
-            !child_has_file,
+            !root.join(".mush/wt/1/deep.txt").exists(),
             "the child's worktree must stay clean of grandchild work"
         );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A transcript that fills the (tiny, configured) context window must be
-    /// folded into a summary — not dropped — and the run continues from it.
+    /// folded into a summary — not dropped — and the run continues from it,
+    /// with the task still worth doing: the isolated child does the work it was
+    /// asked for before the fold.
     #[test]
-    #[ignore = "needs python3 + git; spawns a local mock model server"]
     fn compaction_folds_overflowing_history_into_a_summary() {
-        use std::fs;
-
-        const PORT: u16 = 18_733;
-        let mock = start_mock(PORT);
         let root = init_git_repo("compact");
+        let summary =
+            "the task was to create iso.txt via an isolated subagent; nothing is done yet";
+        let scripted = Arc::new(
+            Scripted::new()
+                // The compaction ask carries the instruction, the transcript
+                // search works without a server's help.
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary)
+                .when(|asked: &Asked| asked.depth() == Some(1) && !asked.saw("wrote iso.txt"))
+                .calls(vec![tool_call(
+                    "c1",
+                    "write_file",
+                    json!({ "path": "iso.txt", "content": "isolated work" }),
+                )])
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .says("created iso.txt in my worktree")
+                .when(|asked: &Asked| asked.saw("#1 done"))
+                .says("done")
+                .when(|asked: &Asked| asked.saw("spawned agent"))
+                .says("child left running — I will handle its result when it finishes")
+                // The first thing the run does after the fold: the task again.
+                .calls(vec![tool_call(
+                    "c0",
+                    "spawn_agent",
+                    json!({
+                        "brief": "create a file called iso.txt containing exactly: isolated work",
+                        "isolated": true
+                    }),
+                )]),
+        );
 
-        let mut cfg = Config::new(format!("http://127.0.0.1:{PORT}"), "mock", None);
+        let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
         // Tight window: the reserve scales with it, so the budget is 3 * (ctx
         // - ctx/2) = 6000 bytes.
         cfg.context_tokens = 4_000;
         let budget = cfg.history_budget();
-
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let root_tx = spawn(cfg, tx, root.clone()).tx;
+        let root_tx = spawn_scripted(cfg, tx, root.clone(), scripted.clone()).tx;
 
         // History above 3/4 of the budget but still fitting: compaction must
         // trigger instead of trimming. Built until it crosses the line, so the
@@ -2826,211 +2989,268 @@ mod tests {
         );
         root_tx.send(AgentMsg::Run(messages)).unwrap();
 
-        // Expect a Compact event, then the run continuing (the mock resumes
-        // the DEFAULT scenario from the summary and spawns the iso child).
-        let mut compact = 0usize;
-        let mut done = 0usize;
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while (compact == 0 || done == 0) && Instant::now() < deadline {
-            while let Ok(msg) = rx.try_recv() {
-                if let Msg::Agent { event, .. } = msg {
-                    if matches!(event, AgentEvent::Compact { .. }) {
-                        compact += 1;
-                    }
-                    if matches!(event, AgentEvent::Done) {
-                        done += 1;
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        let iso = root.join(".mush/wt/1/iso.txt");
-        let iso_ok =
-            iso.exists() && fs::read_to_string(&iso).ok().as_deref() == Some("isolated work");
-
-        stop_mock(mock);
-        let _ = fs::remove_dir_all(&root);
-        assert!(compact >= 1, "history must be compacted into a summary");
-        assert!(done >= 1, "the run must finish after compaction");
+        // The root's run and the child's, in either order: whether the child
+        // finished before the root's next message boundary is a race the test
+        // does not care about.
+        let mut seen = Watched::default();
         assert!(
-            iso_ok,
-            "the task must survive compaction (iso.txt in the worktree)"
+            seen.wait(&rx, WAIT, |seen| seen.done >= 2),
+            "the run must finish, and the child with it: {seen:?}"
         );
+        assert_eq!(seen.errors, Vec::<String>::new());
+        assert_eq!(
+            seen.summaries,
+            vec![summary.to_string()],
+            "the overflowing history must be folded into a summary, once"
+        );
+
+        // “The run continues from it” means the next request is the task again,
+        // and it is built from the summary alone — not from the history that no
+        // longer fits.
+        let asked = scripted.asked();
+        assert_eq!(
+            asked[0].messages.last().map(Message::text),
+            Some(COMPACT_INSTRUCTION),
+            "the first request is the summary ask"
+        );
+        assert_eq!(
+            asked[1].messages.len(),
+            2,
+            "system + the summary, nothing else: {:?}",
+            asked[1].messages
+        );
+        assert_eq!(
+            asked[1].messages[1].text(),
+            prompt::compaction_message(summary)
+        );
+        // …and the work survives the fold: the child was asked afterwards.
+        assert_eq!(
+            fs::read_to_string(root.join(".mush/wt/1/iso.txt"))
+                .ok()
+                .as_deref(),
+            Some("isolated work")
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The human types while the model is answering: the nudge must land after
     /// that reply and be answered, never silently swallowed when the run would
-    /// otherwise end. The mock holds its first reply open — writing a marker,
-    /// so the nudge is provably in flight — and answers "steered" only once it
-    /// receives the nudge.
+    /// otherwise end. The first reply is held open, so the nudge is provably in
+    /// flight — no sleep, and no marker file to poll for.
     #[test]
-    #[ignore = "needs python3; spawns a local mock model server"]
     fn a_nudge_that_arrives_mid_reply_is_answered() {
-        use std::fs;
+        let root = scratch_dir("steer");
+        let gate = Arc::new(Gate::new());
+        let scripted = Arc::new(
+            Scripted::new()
+                .held(gate.clone())
+                .says("first reply")
+                .says("steered"),
+        );
 
-        const PORT: u16 = 18_734;
-        let root = std::env::temp_dir().join(format!("mush-steer-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let marker = root.join("in-flight");
-        let mock = start_mock_with(PORT, &[marker.to_str().unwrap()]);
-
-        let cfg = Config::new(format!("http://127.0.0.1:{PORT}"), "mock", None);
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let root_tx = spawn(cfg, tx, root.clone()).tx;
-
-        let messages = vec![
-            Message::system("you are mush"),
-            Message::user("STEER: answer this, then whatever else I say".to_string()),
-        ];
-        root_tx.send(AgentMsg::Run(messages)).unwrap();
-
-        // Only nudge once the mock has the reply in hand.
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while !marker.exists() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        assert!(marker.exists(), "the first request never reached the mock");
-        root_tx
-            .send(AgentMsg::Nudge("STEERME".to_string()))
-            .unwrap();
-
-        let (mut first, mut steered) = (false, false);
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !(first && steered) && Instant::now() < deadline {
-            while let Ok(msg) = rx.try_recv() {
-                if let Msg::Agent {
-                    event: AgentEvent::Message(message),
-                    ..
-                } = msg
-                {
-                    match message.text().trim() {
-                        "first reply" => first = true,
-                        "steered" => steered = true,
-                        _ => {}
-                    }
-                }
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-
-        stop_mock(mock);
-        let _ = fs::remove_dir_all(&root);
-        assert!(first, "the first reply should arrive while the nudge waits");
-        assert!(steered, "the nudge must be answered, not swallowed");
-    }
-
-    /// Hitting the turn limit must end with a summary, not a bare `stopped
-    /// after 24 turns without finishing`: the safety valve stays, the failure
-    /// goes (finding N1).
-    #[test]
-    #[ignore = "needs python3; spawns a local mock model server"]
-    fn the_turn_limit_ends_with_a_summary() {
-        const PORT: u16 = 18_735;
-        let mock = start_mock(PORT);
-        let root = std::env::temp_dir().join(format!("mush-turns-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-
-        let cfg = Config::new(format!("http://127.0.0.1:{PORT}"), "mock", None);
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let root_tx = spawn(cfg, tx, root.clone()).tx;
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            tx,
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
         root_tx
             .send(AgentMsg::Run(vec![
-                Message::system(prompt::system_prompt(root.to_str().unwrap())),
-                Message::user("TURNS"),
+                Message::system("you are mush"),
+                Message::user("STEER: answer this, then whatever else I say".to_string()),
             ]))
             .unwrap();
 
-        let mut done = false;
-        let mut error = None;
-        let mut wrapped_up = false;
-        let deadline = Instant::now() + Duration::from_secs(60);
-        while !done && error.is_none() && Instant::now() < deadline {
-            match rx.recv_timeout(Duration::from_millis(100)) {
-                Ok(Msg::Agent { event, .. }) => match event {
-                    AgentEvent::Done => done = true,
-                    AgentEvent::Error(why) => error = Some(why),
-                    AgentEvent::Message(message) if message.role == "assistant" => {
-                        wrapped_up |= message.text().contains("wrapped up");
-                    }
-                    _ => {}
-                },
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                // Input events belong to the UI; this test only listens to actors.
-                Ok(_) => {}
-            }
-        }
-        stop_mock(mock);
-        let _ = fs::remove_dir_all(&root);
+        // The reply is in flight: the human types while the model answers.
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the first request never reached the model"
+        );
+        root_tx
+            .send(AgentMsg::Nudge("STEERME".to_string()))
+            .unwrap();
+        gate.release();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&rx, WAIT, |seen| seen.done > 0),
+            "the run must finish: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
         assert_eq!(
-            error, None,
+            seen.replies,
+            vec!["first reply".to_string(), "steered".to_string()],
+            "the first reply arrives, and the nudge is answered after it"
+        );
+        // Answered *because* the model was given it: the second request carries
+        // the nudge, so it is not a reply to the same words again.
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 2, "one turn for the reply, one for the nudge");
+        assert!(asked[1].saw("STEERME"), "{:?}", asked[1].messages);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Hitting the turn limit must end with a summary, not a bare `stopped
+    /// after 200 turns without finishing`: the safety valve stays, the failure
+    /// goes (finding N1). Every turn before the guard does real work — one
+    /// `write_file`, with the arguments differing each turn so the run is not
+    /// stopped early as a loop instead.
+    #[test]
+    fn the_turn_limit_ends_with_a_summary() {
+        const WRAPPED_UP: &str = "wrapped up: the work done so far is in the workspace";
+        let root = scratch_dir("turns");
+
+        let mut scripted = Scripted::new();
+        for turn in 0..RUNAWAY_TURNS - 1 {
+            scripted = scripted.calls(vec![tool_call(
+                "call",
+                "write_file",
+                json!({ "path": "notes.txt", "content": format!("turn {turn}") }),
+            )]);
+        }
+        let scripted = Arc::new(scripted.says(WRAPPED_UP));
+
+        let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
+        // A window wide enough that this transcript never compacts: the only
+        // thing that may end this run is the runaway guard.
+        cfg.context_tokens = 128_000;
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let root_tx = spawn_scripted(cfg, tx, root.clone(), scripted.clone()).tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user("TURNS: keep working until you are done".to_string()),
+            ]))
+            .unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&rx, WAIT, |seen| seen.done > 0 || !seen.errors.is_empty()),
+            "the run must end: {seen:?}"
+        );
+        assert_eq!(
+            seen.errors,
+            Vec::<String>::new(),
             "the turn limit must not be reported as an error"
         );
-        assert!(done, "the run must finish normally");
-        assert!(wrapped_up, "the wrap-up turn's summary must be the result");
-    }
-
-    /// Start the scripted mock model server and wait until it answers.
-    fn start_mock(port: u16) -> Child {
-        start_mock_with(port, &[])
-    }
-
-    /// Same, with extra script arguments (the STEER scenario takes a marker
-    /// path so the test knows when its first reply is in flight).
-    fn start_mock_with(port: u16, extra: &[&str]) -> Child {
-        use std::process::Command;
-
-        const MOCK: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../scripts/mock_llm.py");
-        let mock = Command::new("python3")
-            .arg(MOCK)
-            .arg(port.to_string())
-            .args(extra)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("mock server starts");
-
-        let probe = format!(
-            "import urllib.request;urllib.request.urlopen(\
-             'http://127.0.0.1:{port}/v1/models', timeout=0.2)"
+        assert_eq!(seen.done, 1, "the run must finish normally: {seen:?}");
+        assert_eq!(
+            seen.replies,
+            vec![WRAPPED_UP.to_string()],
+            "the wrap-up turn's summary must be the result"
         );
-        let mut ready = false;
-        for _ in 0..100 {
-            let status = Command::new("python3")
-                .args(["-c", &probe])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status()
-                .map(|s| s.success())
-                .unwrap_or(false);
-            if status {
-                ready = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        assert!(ready, "mock model server (port {port}) did not come up");
-        mock
+        assert!(
+            seen.notices
+                .iter()
+                .any(|notice| notice.contains("runaway guard")),
+            "the human must be told why the tools went away: {:?}",
+            seen.notices
+        );
+
+        // Every turn ran: one request per turn, and the last one asked for the
+        // summary with the tools withdrawn rather than failing the run.
+        let asked = scripted.asked();
+        assert_eq!(
+            asked.len(),
+            RUNAWAY_TURNS,
+            "the run must use every turn before the guard"
+        );
+        assert_eq!(
+            asked[RUNAWAY_TURNS - 1].tools,
+            0,
+            "the wrap-up turn must be asked without tools"
+        );
+        assert!(
+            asked[RUNAWAY_TURNS - 1].saw("runaway guard"),
+            "the wrap-up request must say why the tools went away"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("notes.txt")).ok().as_deref(),
+            Some(format!("turn {}", RUNAWAY_TURNS - 2).as_str()),
+            "the last turn before the guard must have done its work"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
-    /// Kill the mock server and reap it, so the suite leaves no zombies.
-    fn stop_mock(mut mock: Child) {
-        let _ = mock.kill();
-        let _ = mock.wait();
+    /// How long a scenario waits for something the run is *supposed* to do.
+    /// Only ever spent waiting for an event, never asserting on it.
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// What the actors told the UI, as a test watches a run.
+    ///
+    /// One pass over the event channel answers all of it, so a deadline is
+    /// spent waiting for the run rather than sleeping past it.
+    #[derive(Default, Debug)]
+    struct Watched {
+        done: usize,
+        errors: Vec<String>,
+        notices: Vec<String>,
+        /// What the model said, in the empty-reply-free sense: an assistant
+        /// message that actually carried words.
+        replies: Vec<String>,
+        summaries: Vec<String>,
+    }
+
+    impl Watched {
+        /// Read events until `until` holds or `timeout` passes; the return says
+        /// whether it held, so a run that never finishes fails an assertion
+        /// instead of hanging the suite.
+        fn wait(
+            &mut self,
+            rx: &Receiver<Msg>,
+            timeout: Duration,
+            until: impl Fn(&Self) -> bool,
+        ) -> bool {
+            let deadline = Instant::now() + timeout;
+            while !until(self) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                match rx.recv_timeout(left.min(Duration::from_millis(20))) {
+                    Ok(msg) => self.note(msg),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return false,
+                }
+            }
+            true
+        }
+
+        fn note(&mut self, msg: Msg) {
+            let Msg::Agent { event, .. } = msg else {
+                return;
+            };
+            match event {
+                AgentEvent::Done => self.done += 1,
+                AgentEvent::Error(why) => self.errors.push(why),
+                AgentEvent::Notice(what) => self.notices.push(what),
+                AgentEvent::Compact { summary } => self.summaries.push(summary),
+                AgentEvent::Message(message)
+                    if message.role == "assistant" && !message.text().is_empty() =>
+                {
+                    self.replies.push(message.text().to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// A scratch workspace, empty: for a scenario whose work is not files.
+    fn scratch_dir(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("mush-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 
     /// A scratch git repo with one initial commit, ready for worktrees. The
     /// label keeps parallel tests from sharing a directory.
     fn init_git_repo(label: &str) -> PathBuf {
-        use std::fs;
         use std::process::Command;
 
-        let root = std::env::temp_dir().join(format!("mush-chain-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = scratch_dir(&format!("git-{label}"));
         let git = |args: &[&str]| {
             let status = Command::new("git")
                 .arg("-C")
@@ -3062,26 +3282,5 @@ mod tests {
             return None;
         }
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-
-    /// Drain the event channel until `target` Done events have been seen.
-    fn count_done_events(rx: &Receiver<Msg>, target: usize) -> usize {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut done_events = 0usize;
-        while done_events < target && Instant::now() < deadline {
-            while let Ok(msg) = rx.try_recv() {
-                if matches!(
-                    msg,
-                    Msg::Agent {
-                        event: AgentEvent::Done,
-                        ..
-                    }
-                ) {
-                    done_events += 1;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        done_events
     }
 }
