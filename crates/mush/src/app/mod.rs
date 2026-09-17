@@ -200,6 +200,30 @@ const INFO_TTL: Duration = Duration::from_secs(5);
 /// in `on_agent`).
 const SESSION_DEBOUNCE: Duration = Duration::from_secs(1);
 
+/// How wide a job's handle may be: the same bound as an agent's title, for the
+/// same reason — a handle, whose full text is the report in the transcript.
+const JOB_TITLE_COLUMNS: usize = 30;
+
+/// `short_age`'s companion for a job: the command's own work, on one line.
+///
+/// A `command` the model wrote can be thirty lines of heredoc with a
+/// `cd /w &&` in front of it, and the bar and the row's footer each have one
+/// row to name it in: what is left is the last clause of the first line
+/// (`cargo build` out of `cd /w && cargo build --release`), collapsed and
+/// bounded like an agent's title. One derivation, so the two surfaces cannot
+/// spell the same job differently.
+fn job_title(command: &str) -> String {
+    let first = command
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let clause = first.rsplit("&&").next().unwrap_or(&first).trim();
+    mush_core::text::truncate(clause, JOB_TITLE_COLUMNS)
+}
+
 #[derive(Clone, Debug)]
 pub struct Status {
     pub kind: StatusKind,
@@ -706,7 +730,20 @@ impl App {
                 // The durable half of the same fact: the row's `✗` is derived and
                 // dies with the next run, while this line is tagged, stamped and
                 // written to the session, so a restart still says what broke.
-                self.chat.note_error_for(id, error);
+                self.chat.note_error_for(id, error.clone());
+                // A failure is the third way a run can end, and it is the one
+                // that did not reach the bar: `Stopped` says so, `Failed` fell
+                // back to the idle hint, so the newest thing that had happened
+                // could be a crash under a line advertising Ctrl-P. A guard-stop
+                // is this same event (the runaway guard's `stopped after N
+                // turns…` is the run's error), so both are said here. Only the
+                // agent the human is reading needs the bar — another agent's
+                // failure is on its own row's `✗` and in its own pane's foot —
+                // and the sentence names the agent, which the foot's `!` line
+                // (already in front of the human) does not.
+                if id == self.tree.focused {
+                    self.fail(format!("agent #{id} failed — {error}"));
+                }
             }
             AgentEvent::Done => {
                 let summary = self.last_assistant_text(id);
@@ -721,7 +758,11 @@ impl App {
                 // rows read every frame — is what says what is running now. No
                 // copy of the job is kept here: the row's `⚙N` count is derived
                 // from the registry on every frame, so it cannot go stale.
-                let note = format!("{} detached · {}", crate::jobs::label(job), command);
+                let note = format!(
+                    "{} detached · {}",
+                    crate::jobs::label(job),
+                    job_title(&command)
+                );
                 if id == self.tree.focused {
                     self.say(note);
                 } else {
@@ -798,7 +839,7 @@ impl App {
                 format!(
                     "{} {} {}{held}",
                     crate::jobs::label(job.id),
-                    job.command,
+                    job_title(&job.command),
                     short_age(job.age)
                 )
             })
@@ -856,45 +897,39 @@ impl App {
         }
     }
 
-    /// What the tree is doing, in one line — derived every frame from the
-    /// phases, never stored. When nothing is busy there is nothing to say, and
-    /// the bar falls back to the transient line or the idle hint.
-    pub fn activity_line(&self) -> Option<String> {
-        let busy: Vec<&AgentNode> = self
+    /// The one derived line about the *tree*, when the rows cannot say it
+    /// themselves.
+    ///
+    /// This used to be the focused agent's newest activity
+    /// (`#0 edit_file src/lib.rs 12s`), which the agent's own row had said
+    /// (`◐ #0 edit_file src/lib.rs 12s`) and the transcript had said again
+    /// (`⚙ edit_file src/lib.rs`): one fact, three homes, and the bar's only
+    /// line spent on a sentence the human had already read twice (finding U5).
+    /// What survives is the fact no row states even though its `⏸N` implies
+    /// it: an orchestrator that has ended its turn with children still working
+    /// is napping and *will* resume by itself (§5.5), which is a promise about
+    /// what happens next rather than a report of what is happening now.
+    ///
+    /// Everything else the bar's line one carries is an event with no other
+    /// home — a failure, a stop, a job's report, a command's answer — and the
+    /// newest of those is the status, not this.
+    pub fn tree_line(&self) -> Option<String> {
+        let working = self
             .tree
             .agents
             .iter()
             .filter(|node| node.phase.is_busy())
-            .collect();
-        if busy.is_empty() {
+            .count();
+        let root_is_working = self
+            .tree
+            .node(AgentId::ROOT)
+            .is_some_and(|root| root.phase.is_busy());
+        if working == 0 || root_is_working {
             return None;
         }
-        // The root napped and its children still work: what matters is that the
-        // root will come back, not which child is typing.
-        if !busy.iter().any(|node| node.id == AgentId::ROOT) {
-            return Some(format!(
-                "waiting on {} subagent(s) — the root resumes as they finish",
-                busy.len()
-            ));
-        }
-        let shown = busy
-            .iter()
-            .find(|node| node.id == self.tree.focused)
-            .copied()
-            .unwrap_or(busy[0]);
-        let age = short_age(shown.since.elapsed());
-        let what = match &shown.phase {
-            Phase::Thinking => "thinking".to_string(),
-            Phase::Activity(what) => what.clone(),
-            Phase::Cancelling => "cancelling".to_string(),
-            Phase::Stopped => "stopped".to_string(),
-            _ => return None,
-        };
-        let mut line = format!("#{} {what} {age}", shown.id);
-        if busy.len() > 1 {
-            line.push_str(&format!(" · {} agents working", busy.len()));
-        }
-        Some(line)
+        Some(format!(
+            "waiting on {working} subagent(s) — the root resumes as they finish"
+        ))
     }
 
     /// The last assistant reply in an agent's transcript (its final summary).
@@ -1338,19 +1373,12 @@ impl App {
             }
             Some(node) => (node.branch.clone(), node.phase.is_busy(), node.landed),
         };
-        let Some(branch) = branch else {
-            self.fail(format!("agent #{id} has no worktree branch (not isolated)"));
-            return;
-        };
-        // The read is the one verb that changes nothing, so it goes first: it
-        // is the answer to "what would merging this do", and neither of the
-        // refusals below applies to looking.
-        if verb == Verb::Diff {
-            let text = format!("git diff HEAD...{branch}");
-            self.say(text.clone());
-            self.chat.note(text);
-            return;
-        }
+        // A landed agent has nothing left to look at: `land` took its branch
+        // with the worktree, so what happened must be asked *before* the branch
+        // it no longer has is read — a `let Some(branch)` guard first would
+        // answer a landed agent with "has no worktree branch (not isolated)",
+        // which is false. Where the work went is the answer, not a `git diff`
+        // against a branch that is gone.
         if let Some(landed) = landed {
             self.say(format!(
                 "agent #{id} was already {}",
@@ -1359,6 +1387,18 @@ impl App {
                     Landed::Discarded => "discarded",
                 }
             ));
+            return;
+        }
+        let Some(branch) = branch else {
+            self.fail(format!("agent #{id} has no worktree branch (not isolated)"));
+            return;
+        };
+        // The read is the one verb that changes nothing, so it goes first: it
+        // is the answer to "what would merging this do".
+        if verb == Verb::Diff {
+            let text = format!("git diff HEAD...{branch}");
+            self.say(text.clone());
+            self.chat.note(text);
             return;
         }
         if busy {
@@ -2150,8 +2190,26 @@ mod tests {
             .find(|node| node.id == AgentId(1))
             .unwrap();
         assert_eq!(node.landed, Some(Landed::Merged));
-        // A second /merge must not re-run git or claim a second merge.
+        assert!(
+            node.branch.is_none(),
+            "the branch git deleted must leave the row with it"
+        );
+        // A second /merge must not re-run git or claim a second merge. It says
+        // what happened — `land` cleared the branch, so a landed agent must be
+        // asked first, or this reports a missing branch that was never missing.
         run(&mut app, "/merge 1");
+        assert!(
+            text_of(&app).contains("was already merged"),
+            "a second /merge reports the merge, not a branch: {}",
+            text_of(&app)
+        );
+        // `/diff` too: it used to name a branch git had already deleted.
+        run(&mut app, "/diff 1");
+        assert!(
+            text_of(&app).contains("was already merged") && !text_of(&app).contains("git diff"),
+            "/diff must not offer a branch that is gone: {}",
+            text_of(&app)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -3179,6 +3237,180 @@ mod tests {
         );
     }
 
+    /// A tree bigger than its pane, which is the case the size tiers exist for:
+    /// the compact strip wants two rows more than it has agents.
+    fn crowd(app: &mut App, agents: u64) {
+        let conversation = app.tree.conversation();
+        for id in 1..=agents {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId::ROOT,
+                event: AgentEvent::Spawned {
+                    child: id,
+                    parent: 0,
+                    brief: format!("task {id}"),
+                    depth: 1,
+                    branch: None,
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+        }
+    }
+
+    /// The bar keeps a row whatever else is on screen. In compact mode it was
+    /// the trailing constraint behind a `Min(6)` chat, and at 40×10 the panes
+    /// above it took the row it was owed: the frame painted the tree, the
+    /// transcript and the message box, and the ` chat ` row — the focus badge,
+    /// the key hint, and the only home an Info line or a command's usage error
+    /// has — was simply not there.
+    #[test]
+    fn the_bar_keeps_a_row_on_the_shortest_terminals() {
+        let (mut app, _rx) = test_app("bar-floor");
+        crowd(&mut app, 3);
+        // `/diff 9` is a failure with no other home: it is not a message, so it
+        // is never in the transcript, and the row it is about does not exist.
+        run(&mut app, "/diff 9");
+        assert!(
+            text_of(&app).contains("no agent #9"),
+            "the line the bar is supposed to carry: {}",
+            text_of(&app)
+        );
+
+        for (width, height) in [(40u16, 10u16), (40, 11), (40, 12), (60, 12), (120, 12)] {
+            let rows = screen(&mut app, width, height);
+            assert_eq!(rows.len(), height as usize, "{width}x{height}");
+            let bar = rows.last().unwrap();
+            assert!(
+                bar.contains(" chat ") && bar.contains("no agent #9"),
+                "the bar is missing its only row at {width}x{height}: {rows:?}"
+            );
+        }
+    }
+
+    /// Two children whose briefs open identically are two agents on the screen,
+    /// named by what they were asked to make — without opening either (finding
+    /// U6).
+    #[test]
+    fn the_row_names_an_agent_by_its_derived_title() {
+        let (mut app, _rx) = test_app("agent-titles");
+        let conversation = app.tree.conversation();
+        for (id, path) in [(1u64, "deep.txt"), (2, "wide.txt")] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId::ROOT,
+                event: AgentEvent::Spawned {
+                    child: id,
+                    parent: 0,
+                    depth: 1,
+                    brief: format!("create a file called {path} containing exactly: work"),
+                    branch: None,
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+        }
+        let rows = screen(&mut app, 120, 32);
+        assert!(
+            rows.iter().any(|row| row.contains("#1 deep.txt")),
+            "the row names the agent by what it was asked to make: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("#2 wide.txt")),
+            "and its sibling by its own: {rows:?}"
+        );
+    }
+
+    /// A job's handle is its own command on one line: a `command` can be a
+    /// thirty-line heredoc with a `cd` in front of it, and the footer and the
+    /// bar each have one row to name it in.
+    #[test]
+    fn a_job_is_named_by_its_command_on_one_line() {
+        assert_eq!(job_title("cargo build --release"), "cargo build --release");
+        assert_eq!(job_title("cd /w && cargo test -q"), "cargo test -q");
+        assert_eq!(
+            job_title("python3 - <<'PY'\nimport io\nprint('x')\nPY"),
+            "python3 - <<'PY'"
+        );
+        assert!(job_title("").is_empty());
+        assert!(job_title(&"x".repeat(80)).chars().count() <= JOB_TITLE_COLUMNS);
+    }
+
+    /// A failure is the third way a run can end, and it reaches the bar the way
+    /// a stop does. `Stopped` said what happened and `Failed` did not, so the
+    /// newest thing on screen could be a crash (`✗ #0` on the row, `! cannot
+    /// reach …` in the foot) under a line advertising Ctrl-P. A guard-stop is
+    /// this same event — the runaway guard's complaint is the run's error — so
+    /// one arm covers both endings.
+    #[test]
+    fn a_failure_reaches_the_bar_like_a_stop_does() {
+        let (mut app, _rx) = test_app("failure-bar");
+        let conversation = app.tree.conversation();
+        let guard = "stopped after 40 turns without finishing (runaway guard)";
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Error(guard.to_string()),
+        });
+        assert_eq!(app.tree.agents[0].phase, Phase::Failed(guard.to_string()));
+        let rows = screen(&mut app, 40, 10);
+        let bar = rows.last().expect("the bar is painted");
+        assert!(
+            bar.contains("agent #0 failed"),
+            "the smallest terminal still says what happened: {rows:?}"
+        );
+
+        // The stop that already worked, for comparison: the two endings are
+        // told the same way.
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Stopped,
+        });
+        let rows = screen(&mut app, 40, 10);
+        let bar = rows.last().expect("the bar is painted");
+        assert!(
+            bar.contains("agent #0 stopped"),
+            "a stop says so too: {rows:?}"
+        );
+    }
+
+    /// A run parked in a wait is not a model call. The transcript foot's
+    /// spinner may only claim work in flight, so `wait_agents` must not paint
+    /// `working…` over an agent that is waiting for a child's result — and the
+    /// row says what it is waiting for instead (finding U7).
+    #[test]
+    fn a_waiting_agent_is_not_drawn_working() {
+        let (mut app, _rx) = test_app("waiting-foot");
+        app.tree.begin(AgentId::ROOT, None);
+        // The label the actor emits for `wait_agents` with no arguments.
+        app.tree.activity(AgentId::ROOT, "wait_agents ");
+        app.tree.age(AgentId::ROOT, Duration::from_secs(5));
+
+        let rows = screen(&mut app, 120, 32);
+        assert!(
+            !rows.join("\n").contains("working…"),
+            "nothing is being computed, so nothing spins: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("waiting on agents 5s")),
+            "the row says what it is waiting for: {rows:?}"
+        );
+        assert!(
+            !rows.join("\n").contains("wait_agents"),
+            "and not the tool's name, which reads like work: {rows:?}"
+        );
+
+        // A model that really has not answered still says so: the point is the
+        // distinction, not the silence.
+        app.tree.begin(AgentId::ROOT, None);
+        app.tree.age(AgentId::ROOT, Duration::from_secs(2));
+        let rows = screen(&mut app, 120, 32);
+        assert!(
+            rows.iter().any(|row| row.contains("thinking 2s")),
+            "{rows:?}"
+        );
+        assert!(rows.join("\n").contains("working…"), "{rows:?}");
+    }
+
     /// `/notes` is the other half of the cap: the lines the foot ceded are read
     /// in full, oldest first, with the cursor on the newest.
     #[test]
@@ -3845,7 +4077,12 @@ mod tests {
             Phase::Cancelling,
             "the row must show that a cancel is in flight"
         );
-        assert_eq!(app.activity_line().as_deref(), Some("#0 cancelling 0s"));
+        let rows = screen(&mut app, 120, 32);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("⊘ #0") && row.contains("cancelling…")),
+            "the row is where a cancel in flight is drawn: {rows:?}"
+        );
     }
 
     /// The cancel mark lasts exactly as long as the cancel does: the actor
@@ -3892,18 +4129,24 @@ mod tests {
         let (app, _rx) = test_app("idle-phase");
         assert_eq!(app.tree.agents[0].phase, Phase::Idle);
         assert!(!app.busy());
-        assert_eq!(app.activity_line(), None, "nothing to report");
+        assert_eq!(app.tree_line(), None, "nothing to report");
     }
 
-    /// The stale-status defect: a finished run must leave nothing behind. The
-    /// bar derives from the phases, so when the run ends the line is gone.
+    /// The stale-status defect: a finished run must leave nothing behind. Every
+    /// line about work in progress is derived from the phase, so when the run
+    /// ends they all stop existing at once.
     #[test]
     fn a_finished_run_leaves_nothing_behind() {
         let (mut app, _rx) = test_app("finished-phase");
         let conversation = app.tree.conversation();
         app.tree.begin(AgentId::ROOT, None);
         app.tree.age(AgentId::ROOT, Duration::from_secs(70));
-        assert_eq!(app.activity_line().as_deref(), Some("#0 thinking 1m10s"));
+        assert!(
+            screen(&mut app, 120, 32)
+                .iter()
+                .any(|row| row.contains("◐ #0") && row.contains("thinking 1m10s")),
+            "a run in flight names its age"
+        );
 
         app.update(Msg::Agent {
             conversation,
@@ -3912,7 +4155,8 @@ mod tests {
         });
         assert_eq!(app.tree.agents[0].phase, Phase::Done);
         assert!(!app.busy());
-        assert_eq!(app.activity_line(), None, "no `thinking` survives the run");
+        let rows = screen(&mut app, 120, 32).join("\n");
+        assert!(!rows.contains("thinking"), "no `thinking` survives: {rows}");
     }
 
     /// The pane title counts the phases it names, and no agent is in two of its
@@ -3979,9 +4223,9 @@ mod tests {
     }
 
     /// A clause that does not fit is dropped whole, and the totals are the last
-    /// to go: a pane 32 columns wide cannot hold ` agents · 3 working · 1
-    /// waiting · Σ +324 −40`, and the half of it that would fit (`Σ +324 −`) is
-    /// a total that is not the total.
+    /// to go: the pane is at most 46 columns wide, and ` agents · 1 working · 1
+    /// waiting · Σ +324 −40` is 44 of them — the half of it that would fit
+    /// (`Σ +324 −`) is a total that is not the total.
     #[test]
     fn the_title_elides_clauses_instead_of_cutting_numbers() {
         let (mut app, _rx) = test_app("title-elides");
@@ -3993,17 +4237,24 @@ mod tests {
                 removed: 40,
             },
         );
+        // A running child: one agent working, and a root that is waiting on it.
+        crowd(&mut app, 1);
 
-        // Widest pane `draw` ever gives this pane, and nobody working: the
-        // totals fit and are shown in full.
+        // Widest pane `draw` ever gives this pane: every clause fits, totals
+        // included, and each one is whole.
         let wide = screen(&mut app, 200, 50);
-        assert!(wide[0].contains(" agents · Σ +324 −40"), "{}", wide[0]);
+        assert!(
+            wide[0].contains(" agents · 1 working · 1 waiting · Σ +324 −40"),
+            "{}",
+            wide[0]
+        );
 
-        // Too narrow for that clause: it goes entirely, rather than painting
-        // `Σ +324 −`.
+        // The narrow pane (80 columns, where the tree keeps its thirty): the
+        // totals go first, then the waiting count, and never mid-number.
         let narrow = screen(&mut app, 80, 24);
         assert!(!narrow[0].contains("Σ"), "{}", narrow[0]);
-        assert!(narrow[0].contains(" agents "), "{}", narrow[0]);
+        assert!(!narrow[0].contains("waiting"), "{}", narrow[0]);
+        assert!(narrow[0].contains(" agents · 1 working"), "{}", narrow[0]);
     }
 
     /// The pane paints tree order, and every key that moves or reads the cursor
@@ -4106,7 +4357,7 @@ mod tests {
         });
         assert_eq!(app.tree.agents[0].phase, Phase::Idle, "the root napped");
         assert_eq!(
-            app.activity_line().as_deref(),
+            app.tree_line().as_deref(),
             Some("waiting on 1 subagent(s) — the root resumes as they finish")
         );
     }
@@ -4232,17 +4483,27 @@ mod tests {
         );
     }
 
-    /// Busy agents are named with their age: a model that has thought for two
-    /// minutes should look different from one that has thought for a second.
+    /// Busy agents are named with their age, on their own row: a model that
+    /// has thought for two minutes should look different from one that has
+    /// thought for a second, and the row is where that is read.
     #[test]
     fn busy_agents_are_named_with_their_age() {
         let (mut app, _rx) = test_app("activity-age");
         app.tree.begin(AgentId::ROOT, None);
         app.tree.activity(AgentId::ROOT, "edit_file src/lib.rs");
         app.tree.age(AgentId::ROOT, Duration::from_secs(12));
-        assert_eq!(
-            app.activity_line().as_deref(),
-            Some("#0 edit_file src/lib.rs 12s")
+        let rows = screen(&mut app, 120, 32);
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("◐ #0") && row.contains("edit_file src/lib.rs 12s")),
+            "the row names the work and its age: {rows:?}"
+        );
+        // And the first line of the bar says something else: the activity has
+        // two homes already, and the bar has only one line (finding U5).
+        let bar = rows.last().expect("the bar is painted");
+        assert!(
+            !bar.contains("edit_file"),
+            "the bar does not repeat the row: {bar:?}"
         );
     }
 

@@ -21,6 +21,22 @@ use crate::app::{
 pub(crate) const HINT: &str = "Tab cycles panes · /help lists commands · Ctrl-P picks a model";
 /// Beyond this the transcript is unreadable, however wide the terminal is.
 const MAX_TRANSCRIPT: u16 = 110;
+/// How many columns the agent pane is given, and why it is a length rather than
+/// a share of the terminal.
+///
+/// R1's row spends its fields left to right — `state · branch +delta · what it
+/// is doing · its title` — and that is about forty-five columns of real labels.
+/// Below thirty the chat is the better use of a narrow screen; past fifty the
+/// tree has nothing else to put there (a tool label is the widest field it has)
+/// while a wider terminal is what the transcript's measure is for (it is capped
+/// at 110 columns anyway). The share this replaced was 26%, which is 31 columns
+/// at 120: `▶◐ #0` left 22 for a 23-column `edit_file src/lib.rs 12s`, so a busy
+/// agent's tool call and its age were dropped there — every frame, on the size
+/// the audit photographs.
+const AGENTS_MIN_COLUMNS: u16 = 30;
+const AGENTS_MAX_COLUMNS: u16 = 50;
+/// The chat below this is a column of broken words, whatever the tree wants.
+const CHAT_MIN_COLUMNS: u16 = 40;
 /// Below this mush has no room to be honest: say so instead of painting shreds.
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 10;
@@ -34,6 +50,16 @@ const PICKER_MAX_WIDTH: u16 = 80;
 
 fn picker_width(terminal_width: u16) -> u16 {
     (terminal_width * 60 / 100).clamp(PICKER_MIN_WIDTH, PICKER_MAX_WIDTH)
+}
+
+/// The columns the agent pane is painted in — see the constants above for why
+/// this is a length: a row's four ranked fields need about forty of them, the
+/// chat keeps its own floor, and past the cap the extra columns are empty.
+fn agents_columns(terminal_width: u16) -> u16 {
+    let share = (terminal_width as u32 * 34 / 100) as u16;
+    share
+        .clamp(AGENTS_MIN_COLUMNS, AGENTS_MAX_COLUMNS)
+        .min(terminal_width.saturating_sub(CHAT_MIN_COLUMNS))
 }
 
 /// The columns the picker's list gives one item's text. The term carries the
@@ -63,10 +89,26 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let bar_rows = if area.height >= 26 { 2 } else { 1 };
 
     if compact {
-        let agent_rows = (app.tree.agents.len() as u16 + 2).clamp(3, 6);
+        // Every pane's height is computed here, and every constraint is a
+        // `Length`, so the three add up to the terminal exactly and none of
+        // them can lose rows to another. The bar used to be a trailing
+        // `Length` behind a `Min(6)` chat, and at 40×10 the chat took the row
+        // the bar was owed: the frame painted the tree, the transcript and the
+        // message box, and the ` chat ` row — the focus badge, the key hint,
+        // and the only home an Info line or a command's usage error has — was
+        // simply absent.
+        // Six is the least the chat can be and still hold what it is for: a
+        // three-row transcript over a message box that has a row to type in.
+        // The box lost that row instead after the bar's floor was added, which
+        // is the same defect one pane over (§4.5's audit, defect 7).
+        let chat_min = 6;
+        let agent_rows = (app.tree.agents.len() as u16 + 2)
+            .clamp(3, 6)
+            .min(area.height.saturating_sub(bar_rows + chat_min));
+        let chat_rows = area.height - agent_rows - bar_rows;
         let rows = Layout::vertical([
             Constraint::Length(agent_rows),
-            Constraint::Min(6), // chat transcript + message box
+            Constraint::Length(chat_rows),
             Constraint::Length(bar_rows),
         ])
         .split(area);
@@ -74,14 +116,16 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_chat(frame, app, rows[1]);
         draw_status(frame, app, rows[2]);
     } else {
-        let rows = Layout::vertical([Constraint::Min(6), Constraint::Length(bar_rows)]).split(area);
+        let rows = Layout::vertical([
+            Constraint::Length(area.height - bar_rows),
+            Constraint::Length(bar_rows),
+        ])
+        .split(area);
         // On a very wide terminal the tree stops growing: past a point it is
-        // empty space, and the chat is what the width belongs to.
-        let agents_pane = if area.width >= 160 {
-            Constraint::Length(34)
-        } else {
-            Constraint::Percentage(26)
-        };
+        // empty space, and the chat is what the width belongs to. Below that it
+        // gets the columns R1's row needs, so the fields the row is built from
+        // are the fields it can paint.
+        let agents_pane = Constraint::Length(agents_columns(area.width));
         let columns = Layout::horizontal([agents_pane, Constraint::Min(20)]).split(rows[0]);
         draw_agents(frame, app, columns[0]);
         draw_chat(frame, app, columns[1]);
@@ -211,9 +255,13 @@ fn agents_title(app: &App, width: usize) -> String {
 
 /// One tree row, with the fields it can afford.
 ///
-/// The row answers "what is happening": activity, branch and line delta survive
-/// as long as there is any room, and the brief — which the footer and the
-/// transcript carry in full — is what yields first.
+/// The row answers "what is happening" with the fields that answer it: the
+/// state, the branch and delta, what the agent is doing — and, when there is
+/// room, which agent this is. The name it spends those columns on is the node's
+/// derived *title* (`lexer`, `deep.txt`) rather than its brief: the brief opens
+/// with the boilerplate a model was asked in (`create a file called …`), which
+/// is the same words for two different children, and its full text is one row
+/// below in the footer and again as the transcript's opening line.
 fn agent_line(app: &App, node: &AgentNode, width: usize) -> String {
     let indent = "  ".repeat(node.depth);
     let marker = if app.tree.focused == node.id {
@@ -263,7 +311,7 @@ fn agent_line(app: &App, node: &AgentNode, width: usize) -> String {
         }
         where_and_how.push_str(&format!("⚙{jobs}"));
     }
-    fit_row(&head, &node.brief, &where_and_how, &tail, width)
+    fit_row(&head, &node.title(), &where_and_how, &tail, width)
 }
 
 /// The footer under the tree: the cursor row's full facts, so a narrow pane
@@ -277,24 +325,25 @@ fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>>
             Style::default(),
         ),
     ]));
-    if node.landed.is_some()
-        || node.branch.is_some()
-        || matches!(node.phase, Phase::Idle | Phase::Stopped)
-    {
-        let mut detail = agent_detail(node);
-        let activity = phase_detail(node);
-        if !activity.is_empty() {
-            detail.insert(0, activity);
-        }
-        if !detail.is_empty() {
-            lines.push(Line::from(Span::styled(
-                format!(
-                    " {}",
-                    truncate(&detail.join(" · "), width.saturating_sub(2))
-                ),
-                dim(),
-            )));
-        }
+    // The cursor row's facts in full, and always: the row above may have had to
+    // give up its activity or its brief to fit, and this is where they are not
+    // lost — what the agent is doing *now*, where its work is, and the commands
+    // that land it. It used to be painted only for a landed, isolated, idle or
+    // stopped agent, so the one row the human is reading was the one whose
+    // activity could vanish from the screen entirely (finding P4).
+    let mut detail = agent_detail(node);
+    let activity = phase_detail(node);
+    if !activity.is_empty() {
+        detail.insert(0, activity);
+    }
+    if !detail.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {}",
+                truncate(&detail.join(" · "), width.saturating_sub(2))
+            ),
+            dim(),
+        )));
     }
     // The selected row's jobs, in full: which command, how long, and whether it
     // is the one holding the machine. Read from the same registry the row's
@@ -358,11 +407,22 @@ fn phase_glyph(phase: &Phase) -> &'static str {
 
 /// What the row says the agent is doing, ageing with the phase so a slow model
 /// is visible as `thinking 42s` rather than a static word.
+///
+/// A run parked in a wait says so instead of naming the tool: `wait_agents 3s`
+/// reads like a model call in flight, and the human asked for an hourglass for
+/// the case where nothing is being computed — a napping orchestrator was the
+/// one agent on the screen claiming work it was not doing (finding U7).
 fn phase_detail(node: &AgentNode) -> String {
     let age = short_age(node.since.elapsed());
     match &node.phase {
         Phase::Thinking => format!("thinking {age}"),
-        Phase::Activity(what) => format!("{what} {age}"),
+        Phase::Activity(what) => match node.phase.waiting() {
+            Some(waiting) => format!("waiting on {} {age}", waiting.noun()),
+            // The actor's label is the tool name and its summarized arguments;
+            // with no arguments it ends in a space, which the row would paint
+            // as a double one (`wait_agents  3s`).
+            None => format!("{} {age}", what.trim_end()),
+        },
         Phase::Cancelling => "cancelling…".to_string(),
         // A stopped run has no result to show: its last summary belongs to a
         // run that was interrupted, so showing it would claim work that was
@@ -401,10 +461,16 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             agent: app.tree.focused,
             // A run in flight is what the pane's own activity line is derived
             // from, and the spinner is the frame `App::tick` advanced.
+            //
+            // A run parked in a wait is *not* one: the foot's `working…` may
+            // only claim a model call, and `wait_agents` is not one — the
+            // agent is waiting for somebody else's result, and the row says so
+            // (`waiting on agents 3s`). Painting the spinner over that was
+            // exactly the lie finding U7 named.
             busy: app
                 .tree
                 .node(app.tree.focused)
-                .map(|node| node.phase.is_busy())
+                .map(|node| node.phase.is_busy() && node.phase.waiting().is_none())
                 .unwrap_or(false),
             spin: app.spin,
             label: &label,
@@ -534,9 +600,10 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Focus::Chat => "chat",
     };
     // Priority: a failure first (the Ctrl-Q warning included, so it is never
-    // hidden behind work in progress), then what the tree is doing (derived),
-    // then what just happened (fades), then the static hint.
-    let (message, style) = bar_line(app.status_line(), app.activity_line());
+    // hidden behind work in progress), then what the whole tree is doing that
+    // its rows cannot say, then what just happened (fades), then the static
+    // hint.
+    let (message, style) = bar_line(app.status_line(), app.tree_line());
     let line = Line::from(vec![
         Span::styled(
             format!(" {focus} "),
@@ -565,14 +632,22 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 /// testable without a frame: an error must never lose to work in progress
 /// (finding B12 — the Ctrl-Q warning included). The order itself is
 /// `chat::Rank`, the one table; this only maps it to a colour.
-fn bar_line(status: Option<(&str, StatusKind)>, activity: Option<String>) -> (String, Style) {
+///
+/// The focused agent's activity is deliberately not a candidate here. It has
+/// two homes already — the row's own tail, with its age, and the transcript's
+/// `⚙` line — and a bar that repeated it spent its only row on the same
+/// sentence a third time (finding U5). What the bar says instead is what no row
+/// and no transcript can: the newest *event* (a failure, a stop, a job's
+/// report, a command's answer) or the one derived state the rows only imply
+/// (`tree_line`'s napping root).
+fn bar_line(status: Option<(&str, StatusKind)>, tree: Option<String>) -> (String, Style) {
     let alert = status
         .filter(|(_, kind)| *kind == StatusKind::Error)
         .map(|(text, _)| text);
     let said = status
         .filter(|(_, kind)| *kind == StatusKind::Info)
         .map(|(text, _)| text);
-    match Rank::last_word(alert, activity.as_deref(), said) {
+    match Rank::last_word(alert, tree.as_deref(), said) {
         Some((rank, text)) => (
             text.to_string(),
             match rank {
@@ -635,10 +710,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn an_error_outranks_activity() {
+    fn an_error_outranks_the_tree_line() {
         let (text, _) = bar_line(
             Some(("cannot reach http://127.0.0.1:1", StatusKind::Error)),
-            Some("#0 thinking 3s".to_string()),
+            Some("waiting on 1 subagent(s) — the root resumes as they finish".to_string()),
         );
         assert_eq!(
             text, "cannot reach http://127.0.0.1:1",
@@ -649,7 +724,10 @@ mod tests {
             Some(("opened notes.txt", StatusKind::Info)),
             Some("#0 thinking 3s".to_string()),
         );
-        assert_eq!(text, "#0 thinking 3s", "activity beats a fading info line");
+        assert_eq!(
+            text, "#0 thinking 3s",
+            "derived state beats a fading info line"
+        );
 
         let (text, _) = bar_line(Some(("opened notes.txt", StatusKind::Info)), None);
         assert_eq!(text, "opened notes.txt");
