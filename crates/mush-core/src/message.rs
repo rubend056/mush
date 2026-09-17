@@ -96,13 +96,24 @@ pub struct ChatRequest<'a> {
     pub tool_choice: &'a str,
     pub stream: bool,
     pub temperature: f32,
+    /// The reply cap, as the field every OpenAI-compatible endpoint documents.
+    /// One of this and `max_completion_tokens` is sent, never both: OpenAI's
+    /// reasoning models reject `max_tokens`, and other servers only know it.
+    #[serde(skip_serializing_if = "is_zero")]
     pub max_tokens: u32,
+    /// The same cap under the newer name, for endpoints that require it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub max_completion_tokens: Option<u32>,
     /// Provider-specific: enable the model's thinking mode (DeepSeek).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<serde_json::Value>,
     /// Provider-specific: reasoning effort lever (DeepSeek).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
+}
+
+fn is_zero(value: &u32) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,6 +153,7 @@ mod tests {
             stream: false,
             temperature: 0.2,
             max_tokens: 100,
+            max_completion_tokens: None,
             thinking: None,
             reasoning_effort: None,
         };

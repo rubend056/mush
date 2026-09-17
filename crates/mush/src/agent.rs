@@ -840,11 +840,20 @@ fn run_loop(
             // `auto` keeps models that ignore tools working: they simply answer.
             tool_choice: if wrap_up { "none" } else { "auto" },
             stream: false,
-            temperature: 0.2,
+            temperature: cfg.temperature(),
             max_tokens: reply_cap(&cfg),
+            max_completion_tokens: None,
             thinking: None,
             reasoning_effort: None,
         };
+        // The cap travels as `max_completion_tokens` only where that is the
+        // name the endpoint takes (OpenAI's reasoning models reject the old
+        // one); everywhere else keeps the field every OpenAI-compatible server
+        // documents.
+        if cfg.uses_max_completion_tokens() {
+            request.max_completion_tokens = Some(request.max_tokens);
+            request.max_tokens = 0;
+        }
         // Provider-specific knobs (DeepSeek thinking mode), only for providers
         // that advertise them; other endpoints see a plain request.
         if cfg.thinking_enabled() {
@@ -1197,8 +1206,9 @@ fn compact_history(
         tools: &[],
         tool_choice: "none",
         stream: false,
-        temperature: 0.2,
+        temperature: cfg.temperature(),
         max_tokens: COMPACT_REPLY_TOKENS,
+        max_completion_tokens: None,
         thinking: if cfg.thinking_enabled() {
             Some(json!({ "type": "enabled" }))
         } else {

@@ -848,6 +848,8 @@ mod tests {
             api_key: None,
             context_tokens: 8192,
             context_explicit: false,
+            temperature: mush_core::config::DEFAULT_TEMPERATURE,
+            max_completion_tokens: false,
         };
         let response =
             get_json(&cfg.models_url(), cfg.api_key.as_deref(), CHAT_READ_TIMEOUT).unwrap();

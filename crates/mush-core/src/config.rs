@@ -105,7 +105,19 @@ pub struct Config {
     /// or a stored explicit choice). Only then does it beat what the endpoint
     /// advertises: discovery is for guessing, not for overruling.
     pub context_explicit: bool,
+    /// Sampling temperature sent with every request. Coding wants the model's
+    /// own best judgement, not mush's idea of a cautious one, so the default is
+    /// 1.0 — the value every OpenAI-compatible endpoint documents as "use the
+    /// model's default" — and a human who wants a cooler model sets it.
+    pub temperature: f32,
+    /// Send the reply cap as `max_completion_tokens` instead of `max_tokens`.
+    /// OpenAI's reasoning models reject the old name, everything else only
+    /// documents it, so this is opt-in rather than guessed.
+    pub max_completion_tokens: bool,
 }
+
+/// The temperature every request carries unless the human says otherwise.
+pub const DEFAULT_TEMPERATURE: f32 = 1.0;
 
 /// A set of user-supplied values: the command line, or the `MUSH_*`
 /// environment. `None` means "not given", which is what lets a lower-priority
@@ -214,6 +226,8 @@ impl Config {
             api_key: env.api_key,
             context_tokens: context.unwrap_or(DEFAULT_CONTEXT_TOKENS),
             context_explicit: context.is_some(),
+            temperature: DEFAULT_TEMPERATURE,
+            max_completion_tokens: false,
         }
     }
 
@@ -229,7 +243,23 @@ impl Config {
             api_key,
             context_tokens: DEFAULT_CONTEXT_TOKENS,
             context_explicit: false,
+            temperature: DEFAULT_TEMPERATURE,
+            max_completion_tokens: false,
         }
+    }
+
+    /// What every request samples at: the configured temperature, clamped to
+    /// the range endpoints accept, so a typo in a config file is a value mush
+    /// can still send rather than a request an endpoint rejects.
+    pub fn temperature(&self) -> f32 {
+        self.temperature.clamp(0.0, 2.0)
+    }
+
+    /// Whether the reply cap travels as `max_completion_tokens`. OpenAI's
+    /// reasoning models reject `max_tokens`; every other endpoint documents it,
+    /// so the choice is the human's (or a provider default), never a guess.
+    pub fn uses_max_completion_tokens(&self) -> bool {
+        self.max_completion_tokens
     }
 
     /// Set the window from the human (`/context`, a stored choice). An explicit
@@ -681,6 +711,45 @@ mod tests {
         assert_eq!(Provider::parse("claude"), None);
     }
 
+    /// Every request samples at 1.0 unless the human says otherwise — the value
+    /// endpoints document as "the model's default" — and a value a config file
+    /// got wrong is clamped rather than sent.
+    #[test]
+    fn the_temperature_defaults_to_one_and_is_clamped() {
+        let cfg = Config::new("http://x:1", "m", None);
+        assert_eq!(cfg.temperature(), 1.0);
+        assert_eq!(DEFAULT_TEMPERATURE, 1.0);
+
+        let cold = Config {
+            temperature: 0.0,
+            ..cfg.clone()
+        };
+        assert_eq!(cold.temperature(), 0.0, "0 is a value, not an absence");
+
+        let wild = Config {
+            temperature: 9.5,
+            ..cfg.clone()
+        };
+        assert_eq!(wild.temperature(), 2.0, "clamped, so it can still be sent");
+        let negative = Config {
+            temperature: -3.0,
+            ..cfg
+        };
+        assert_eq!(negative.temperature(), 0.0);
+    }
+
+    /// The reply cap travels under one name or the other, never both: OpenAI's
+    /// reasoning models reject `max_tokens`, and everything else only knows it.
+    #[test]
+    fn the_reply_cap_is_sent_under_exactly_one_name() {
+        let cfg = Config::new("http://x:1", "m", None);
+        assert!(!cfg.uses_max_completion_tokens(), "the documented default");
+
+        let mut cfg = cfg;
+        cfg.max_completion_tokens = true;
+        assert!(cfg.uses_max_completion_tokens());
+    }
+
     #[test]
     fn deepseek_has_preset_defaults() {
         let cfg = Config {
@@ -690,6 +759,8 @@ mod tests {
             api_key: None,
             context_tokens: 8192,
             context_explicit: false,
+            temperature: DEFAULT_TEMPERATURE,
+            max_completion_tokens: false,
         };
         assert_eq!(
             cfg.chat_url(),
@@ -733,6 +804,8 @@ mod tests {
         // A big window leaves a much larger budget.
         let big = Config {
             context_tokens: 128_000,
+            temperature: DEFAULT_TEMPERATURE,
+            max_completion_tokens: false,
             ..small.clone()
         };
         assert!(big.history_budget() > 300_000);
