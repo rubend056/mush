@@ -1104,7 +1104,9 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].id, id);
         assert_eq!(jobs[0].command, "cargo build");
-        assert_eq!(jobs[0].age, Duration::from_secs(1));
+        // At least: the job's own thread sleeps on the same clock, so how far
+        // it has moved is not this test's business.
+        assert!(jobs[0].age >= Duration::from_secs(1), "{:?}", jobs[0].age);
         assert!(!jobs[0].exclusive);
         assert!(
             registry.live_for(8).is_empty(),

@@ -1391,7 +1391,7 @@ fn run_loop(
             // being waited on: deliver their lines and keep going instead of
             // ending. (Completions that arrive after this run returns wake the
             // idle actor instead — see actor_main.)
-            if deliver_completions(state, messages) {
+            if fold_completions(state, messages) {
                 continue;
             }
             // Answer the steering instead of ending the run without it: the
@@ -1466,7 +1466,7 @@ fn run_loop(
         // rather than whenever it next stops calling them (§5.5). The call
         // comes *after* the batch's tool results, which is what keeps the
         // transcript a shape a strict server accepts.
-        deliver_completions(state, messages);
+        fold_completions(state, messages);
     }
 
     Err(format!(
@@ -1803,7 +1803,7 @@ fn note_job(state: &mut ActorState, id: u64, line: String, news: bool) -> String
 /// tool calls and their results. A *nudge* is not: the human's words between an
 /// assistant's calls and their results are the shape strict servers reject, so
 /// nudges keep parking for the tool-free boundary (`drain_mailbox`).
-fn deliver_completions(state: &mut ActorState, messages: &mut Vec<Message>) -> bool {
+fn fold_completions(state: &mut ActorState, messages: &mut Vec<Message>) -> bool {
     // Jobs first: they are the newest actors, and a job's line is only news if
     // the job ended on its own — one mush killed is the human's or the model's
     // own doing, and its line waits for the next run instead of paying for one.
@@ -4415,7 +4415,8 @@ mod tests {
         let (actor, _mailbox) = scripted_tools_actor("detach-now", machine.clone(), clock.clone());
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
-        let call = |tool: ToolName, args: Value| exec_tool(&actor, &mut state, tool, &args, &cancel);
+        let mut call =
+            |tool: ToolName, args: Value| exec_tool(&actor, &mut state, tool, &args, &cancel);
 
         let started = call(
             ToolName::RunCommand,
@@ -4425,13 +4426,18 @@ mod tests {
         assert!(started.contains("detached as #c1"), "{started}");
         assert_eq!(actor.ctx.registry.running(), 1);
 
-        // The job's own tools: status names it, its age and its command.
-        clock.advance(Duration::from_secs(20));
+        // The job's own tools: status names it, what it is doing, and how long
+        // — the age itself is asserted on the pure formatter, because the job's
+        // own thread is advancing the same clock as this test reads.
         let status = call(ToolName::CommandStatus, json!({})).unwrap();
-        assert!(status.contains("#c1 running 20s"), "{status}");
+        assert!(status.contains("#c1 running "), "{status}");
         assert!(status.contains("npm run dev"), "{status}");
 
-        let stopped = call(ToolName::CommandControl, json!({ "id": 1, "action": "stop" })).unwrap();
+        let stopped = call(
+            ToolName::CommandControl,
+            json!({ "id": 1, "action": "stop" }),
+        )
+        .unwrap();
         assert_eq!(stopped, "stopping job #c1");
         // A stop is a request to the job's own thread; the report is what the
         // owner reads next, and `command_status` then says it ended.
@@ -4443,8 +4449,16 @@ mod tests {
         assert!(status.contains("stopped after"), "{status}");
         // An id that was never a job is an error the model can correct, and
         // another action is one it cannot use.
-        assert!(call(ToolName::CommandControl, json!({ "id": 99, "action": "stop" })).is_err());
-        assert!(call(ToolName::CommandControl, json!({ "id": 1, "action": "poke" })).is_err());
+        assert!(call(
+            ToolName::CommandControl,
+            json!({ "id": 99, "action": "stop" })
+        )
+        .is_err());
+        assert!(call(
+            ToolName::CommandControl,
+            json!({ "id": 1, "action": "poke" })
+        )
+        .is_err());
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -4507,7 +4521,7 @@ mod tests {
     /// and their results are the shape strict servers reject, so they keep
     /// waiting for `drain_mailbox` on a tool-free turn.
     #[test]
-    fn deliver_completions_folds_results_and_leaves_nudges_parked() {
+    fn fold_completions_folds_results_and_leaves_nudges_parked() {
         let mut state = ActorState::default();
         state.deferred.push(AgentMsg::Nudge("steer".into()));
         state
@@ -4519,7 +4533,7 @@ mod tests {
         ];
 
         assert!(
-            deliver_completions(&mut state, &mut messages),
+            fold_completions(&mut state, &mut messages),
             "a child's result is worth a turn"
         );
         assert_eq!(messages.last().unwrap().text(), "#1 done: did the thing");
@@ -4544,20 +4558,24 @@ mod tests {
             },
         );
         assert!(
-            deliver_completions(&mut state, &mut messages),
+            fold_completions(&mut state, &mut messages),
             "a job's result is work to answer"
         );
-        assert_eq!(
-            messages.last().unwrap().text(),
-            "#c3 stopped after 1s · npm run dev",
-            "and a kill is folded in behind it, without paying for a turn"
+        let folded: Vec<&str> = messages.iter().map(Message::text).collect();
+        assert!(
+            folded.contains(&"#c2 done: exit 0 · 12s · npm test — ok"),
+            "the result is folded in: {folded:?}"
+        );
+        assert!(
+            folded.contains(&"#c3 stopped after 1s · npm run dev"),
+            "and so is the kill, without a turn being paid for it: {folded:?}"
         );
         assert!(state.delivered_jobs.contains(&2) && state.delivered_jobs.contains(&3));
 
         // Delivered once: the next boundary has nothing new to say, and the
         // human's parked words are still parked.
         let before = messages.len();
-        assert!(!deliver_completions(&mut state, &mut messages));
+        assert!(!fold_completions(&mut state, &mut messages));
         assert_eq!(messages.len(), before, "a completion is never repeated");
         assert_eq!(
             state.deferred.len(),
