@@ -7,19 +7,23 @@
 //!
 //! The agents themselves live in [`tree`], which owns their ids, phases and
 //! focus; the conversation lives in [`chat`], which owns every transcript the
-//! screen shows, the notices, the message box and the context meter. This
-//! module routes messages into both and renders what they say.
+//! screen shows, the notices, the message box and the context meter; and the
+//! endpoint, model, key and context window live in [`settings`], whose one cell
+//! the agents read too. This module routes messages into all of them and
+//! renders what they say.
 
 mod chat;
 pub mod commands;
 mod keys;
+mod settings;
 mod tree;
 
 pub use chat::{Chat, Pane, Rank};
+pub use settings::{ConfigCell, ConfigHandle, WindowSource};
 pub use tree::{AgentId, AgentNode, AgentTree, ConversationId, Existing, Landed, Phase, Spawn};
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
@@ -43,6 +47,14 @@ pub enum Msg {
     /// Pasted text, delivered whole by the terminal's bracketed paste. Inserted
     /// in one update: a paste must not cost one message per character.
     Paste(String),
+    /// A model list that finished fetching on its own thread. `endpoint` is the
+    /// endpoint it was fetched from: a fetch outlives the human who typed
+    /// `/url`, and a list from the endpoint they left must not land
+    /// (finding A9).
+    Models {
+        endpoint: String,
+        models: Vec<http::Model>,
+    },
     /// A repository read that finished on its own thread.
     Git {
         stats: HashMap<AgentId, git::Stat>,
@@ -182,7 +194,9 @@ pub struct Status {
 
 pub struct App {
     pub ws: Workspace,
-    pub cfg: Config,
+    /// The endpoint, the model, the key and the context window: the copy the
+    /// screen reads and the cell every actor reads, in one owner.
+    pub cell: ConfigCell,
     pub focus: Focus,
     /// The conversation: the transcripts the screen shows, the notices, the
     /// message box and the context meter, in one value.
@@ -194,8 +208,6 @@ pub struct App {
     /// The agents, their phases, the focus and the per-agent mailboxes,
     /// cancel flags and git stats.
     pub tree: AgentTree,
-    /// Shared with the agent actors so runtime config changes apply everywhere.
-    pub cfg_shared: Arc<Mutex<Config>>,
     /// Where a snapshot of this conversation goes. The serialization and the
     /// write happen on the writer's own thread; this thread only hands the
     /// state over.
@@ -220,13 +232,17 @@ pub struct App {
 }
 
 impl App {
+    /// The configuration every screen reads: the UI's copy of the cell.
+    pub fn cfg(&self) -> &Config {
+        self.cell.ui()
+    }
+
     pub fn new(
         ws: Workspace,
-        cfg: Config,
+        cell: ConfigCell,
         stored: Option<Session>,
         root: RootHandle,
         ui_tx: Sender<Msg>,
-        models: Vec<http::Model>,
         session_save: Arc<dyn SessionSave>,
     ) -> Self {
         let system = Message::system(prompt::system_prompt(&ws.root_str()));
@@ -234,17 +250,19 @@ impl App {
             Some(session) => (session.messages, session.agents),
             None => (Vec::new(), Vec::new()),
         };
-        let cfg_shared = root.cfg.clone();
         let mut app = Self {
             ws,
-            cfg,
+            cell,
             focus: Focus::Chat,
             chat: Chat::new(system, messages),
-            models,
+            // Empty until a fetch says otherwise: the model list is discovered
+            // on its own thread so nothing about an endpoint delays the first
+            // frame (finding A9), and `/model` refetches if this is still
+            // empty when the human asks.
+            models: Vec::new(),
             picker: None,
             git: None,
             tree: AgentTree::rooted(root),
-            cfg_shared,
             session_save,
             session_dirty_at: None,
             ui_tx,
@@ -271,7 +289,7 @@ impl App {
         if stored.is_empty() {
             return;
         }
-        let cfg = self.cfg_shared.clone();
+        let cfg = self.cell.handle();
         let ui_tx = self.ui_tx.clone();
         let conversation = self.tree.conversation().0;
         let ids = self.tree.ids();
@@ -488,6 +506,7 @@ impl App {
 
     pub fn update(&mut self, msg: Msg) {
         match msg {
+            Msg::Models { endpoint, models } => self.adopt_models(endpoint, models),
             Msg::Git { stats, status } => self.adopt_git(stats, status),
             Msg::Paste(text) => {
                 // A paste is something the human wants to say, so it lands in
@@ -650,15 +669,14 @@ impl App {
                 self.mark_session_dirty();
                 self.refresh_git();
             }
-            AgentEvent::Context { tokens } => {
+            AgentEvent::Context { tokens, source } => {
                 // The actor learned the endpoint's real window from a server
                 // complaint; the UI owns the copy the bar, `/context`, and the
                 // tool caps read, so it has to adopt the same number or the
-                // next `/model` clobbers it (finding B7).
-                if !self.cfg.context_explicit && tokens != self.cfg.context_tokens {
-                    self.cfg.context_tokens = tokens;
-                    self.apply_config();
-                }
+                // next `/model` clobbers it (finding B7). The cell is the one
+                // path: this is the UI adopting on the same terms the actor
+                // did, and it writes the actors' copy with it.
+                self.cell.learn_context(tokens, source);
             }
             AgentEvent::Compact { summary } => {
                 // The actor's transcript is now [system, user(summary)];
@@ -699,8 +717,8 @@ impl App {
 
     /// `500k`, `8192`, `1M` — one glance, no counting zeroes.
     pub fn context_label(&self) -> String {
-        let spelling = tokens_label(self.cfg.context_tokens);
-        if self.cfg.context_explicit {
+        let spelling = tokens_label(self.cfg().context_tokens);
+        if self.cfg().context_explicit {
             format!("ctx {spelling} (set)")
         } else {
             format!("ctx ~{spelling}")
@@ -713,8 +731,8 @@ impl App {
     /// be a subagent's, whose own next request is what this number measures.
     pub fn context_meter(&self) -> String {
         let used = self.context_used_tokens();
-        let window = tokens_label(self.cfg.context_tokens);
-        let mark = if self.cfg.context_explicit { "" } else { "~" };
+        let window = tokens_label(self.cfg().context_tokens);
+        let mark = if self.cfg().context_explicit { "" } else { "~" };
         format!("ctx {used}/{mark}{window}", used = tokens_label(used))
     }
 
@@ -822,6 +840,17 @@ impl App {
 
     /// A typed message, from the human to the focused agent.
     fn deliver(&mut self, text: String) {
+        // A request without a model is a guaranteed refusal from the endpoint,
+        // and since discovery runs after the first frame this state is
+        // reachable for as long as one fetch takes (finding A9). Saying so is
+        // better than the endpoint's own complaint about an empty model id —
+        // and the words go back in the box, because a message that cannot be
+        // sent is not something the human should have to retype.
+        if self.cfg().model.is_empty() {
+            self.chat.insert(&text);
+            self.fail("no model yet — /model picks one, /url points mush at an endpoint");
+            return;
+        }
         let target = self.tree.focused;
         if target == AgentId::ROOT {
             // The human's words belong in the transcript they can see, whether
@@ -902,8 +931,7 @@ impl App {
                 tokens_label(self.context_used_tokens())
             )),
             Command::Context(Some(tokens)) => {
-                self.cfg.set_context(tokens);
-                self.apply_config();
+                self.cell.edit(|cfg| cfg.set_context(tokens));
                 // A stated window is remembered for this workspace, so it is on
                 // disk before the command returns.
                 self.flush_session();
@@ -929,20 +957,18 @@ impl App {
             Command::Provider(Some(name)) => self.apply_provider(&name),
             Command::Model => self.open_model_picker(),
             Command::Url(url) => {
-                self.cfg.set_base_url(&url);
                 // A new endpoint may host a different model with a different
                 // window; re-derive it unless the human stated one (finding A5).
-                self.cfg.rederive_context();
+                self.switch_endpoint(&url);
                 self.refresh_models();
                 self.say(format!(
                     "endpoint: {} · {}",
-                    self.cfg.base_url,
+                    self.cfg().base_url,
                     self.context_label()
                 ));
-                self.apply_config();
                 self.persist_user_config();
             }
-            Command::ApiKey(None) => match &self.cfg.api_key {
+            Command::ApiKey(None) => match &self.cell.ui().api_key {
                 Some(key) => self.say(format!("api key set ({}…)", mask_key(key))),
                 None => self.say("no api key — /key <secret> sets one (memory only)"),
             },
@@ -950,8 +976,7 @@ impl App {
                 // Masked before it is moved: the message quotes the same secret
                 // the config now holds, and only its head is ever printed.
                 let shown = mask_key(&secret);
-                self.cfg.api_key = Some(secret);
-                self.apply_config();
+                self.cell.edit(|cfg| cfg.api_key = Some(secret));
                 self.persist_user_config();
                 self.say(format!(
                     "api key set ({shown}…) — saved to {}",
@@ -961,12 +986,12 @@ impl App {
             Command::Models => {
                 self.refresh_models();
                 self.say(if self.models.is_empty() {
-                    format!("no models from {}", self.cfg.models_url())
+                    format!("no models from {}", self.cfg().models_url())
                 } else {
                     format!(
                         "{} models from {}",
                         self.models.len(),
-                        self.cfg.models_url()
+                        self.cfg().models_url()
                     )
                 });
             }
@@ -975,22 +1000,14 @@ impl App {
 
     // ------------------------------------------------------------ providers
 
-    /// The config is shared with every agent actor, so a runtime change here
-    /// applies to the root *and* all subagents on their next request.
-    fn apply_config(&self) {
-        if let Ok(mut shared) = self.cfg_shared.lock() {
-            *shared = self.cfg.clone();
-        }
-    }
-
     /// Remember the current setup in the home config file so the API key (and
     /// endpoint defaults) survive restarts. Never writes to the workspace.
     fn persist_user_config(&mut self) {
         let user = UserConfig {
-            api_key: self.cfg.api_key.clone(),
-            provider: self.cfg.provider.name().to_string(),
-            base_url: self.cfg.base_url.clone(),
-            model: self.cfg.model.clone(),
+            api_key: self.cfg().api_key.clone(),
+            provider: self.cfg().provider.name().to_string(),
+            base_url: self.cfg().base_url.clone(),
+            model: self.cfg().model.clone(),
             // The fields this save does not state — the window, the temperature,
             // the reply cap's name, and the two thinking knobs — keep whatever
             // the file already holds.
@@ -1005,22 +1022,55 @@ impl App {
     /// provider's built-in list when the endpoint cannot answer. An advertised
     /// context window is adopted here, so it lands before the next request.
     pub fn refresh_models(&mut self) {
-        self.models = http::list_models(&self.cfg);
+        self.models = http::list_models(self.cfg());
+        self.adopt_advertised_context();
+    }
+
+    /// Adopt a model list that finished fetching on its own thread.
+    ///
+    /// The first entry is only a guess, and only when nothing has named a
+    /// model: that is the one case that sent the fetch in the first place
+    /// (finding A9). A model the human picked, or one the startup precedence
+    /// stated, is not overwritten by whatever the endpoint lists first — and a
+    /// list from an endpoint the human has since left is dropped, because the
+    /// picker is about the endpoint in use.
+    fn adopt_models(&mut self, endpoint: String, models: Vec<http::Model>) {
+        if endpoint != self.cfg().base_url {
+            return;
+        }
+        self.models = models;
+        if self.cfg().model.is_empty() {
+            match self.models.first().map(|model| model.id.clone()) {
+                Some(id) => {
+                    self.cell.edit(|cfg| cfg.set_model(&id));
+                    self.say(format!(
+                        "model: {} · {}",
+                        self.cfg().label(),
+                        self.context_label()
+                    ));
+                }
+                None => self.fail(format!(
+                    "no model given and none discovered at {} — pick one with /model",
+                    self.cfg().models_url()
+                )),
+            }
+        }
+        // The endpoint's advertised window can only be adopted from a fetch
+        // that happened, and this one just did.
         self.adopt_advertised_context();
     }
 
     /// Take the endpoint's word for the window of the model in use, unless the
-    /// human stated one.
+    /// human stated one: a model list is metadata, so it is taken as stated —
+    /// the clamp and the refusal of a stated window are the cell's.
     fn adopt_advertised_context(&mut self) {
         let advertised = self
             .models
             .iter()
-            .find(|model| model.id == self.cfg.model)
+            .find(|model| model.id == self.cfg().model)
             .and_then(|model| model.context);
         if let Some(tokens) = advertised {
-            if self.cfg.adopt_context(tokens) {
-                self.apply_config();
-            }
+            self.cell.learn_context(tokens, WindowSource::Advertised);
         }
     }
 
@@ -1035,7 +1085,7 @@ impl App {
         let cursor = self
             .models
             .iter()
-            .position(|model| model.id == self.cfg.model)
+            .position(|model| model.id == self.cfg().model)
             .unwrap_or(0);
         let items = self
             .models
@@ -1056,7 +1106,7 @@ impl App {
         let items: Vec<String> = Provider::ALL.iter().map(|p| p.name().to_string()).collect();
         let cursor = items
             .iter()
-            .position(|name| Provider::parse(name) == Some(self.cfg.provider))
+            .position(|name| Provider::parse(name) == Some(self.cfg().provider))
             .unwrap_or(0);
         self.picker = Some(Picker {
             kind: PickerKind::Provider,
@@ -1073,30 +1123,46 @@ impl App {
             ));
             return;
         };
-        self.cfg.provider = provider;
-        // A provider that owns an endpoint points at it; one that stands for
-        // "wherever the human pointed mush" keeps the endpoint already set.
-        if provider.spec().switches_endpoint {
-            self.cfg.base_url = provider.default_base_url().to_string();
-        }
-        let known = self.cfg.default_models();
-        let mut model = self.cfg.model.clone();
-        if !known.contains(&model) {
-            if let Some(first) = known.first() {
-                model = first.clone();
-            }
-        }
-        // The new provider means a new window; re-derive it unless the human
-        // stated one (finding A5).
-        self.cfg.set_model(&model);
+        self.switch_provider(provider);
         self.refresh_models();
-        self.apply_config();
         self.persist_user_config();
         self.say(format!(
             "provider: {} · {}",
             provider.name(),
             self.context_label()
         ));
+    }
+
+    /// Point mush at another endpoint, re-deriving the window for it (finding
+    /// A5). One write, so no actor sees the new endpoint with the old window.
+    fn switch_endpoint(&mut self, url: &str) {
+        self.cell.edit(|cfg| {
+            cfg.set_base_url(url);
+            cfg.rederive_context();
+        });
+    }
+
+    /// Select a provider: the endpoint it owns, the model mush knows for it,
+    /// and the window that goes with both — in one write, so a request cannot
+    /// go out against the new provider with the old one's model or window
+    /// (finding A5; a window the human stated is kept by `rederive_context`).
+    fn switch_provider(&mut self, provider: Provider) {
+        self.cell.edit(|cfg| {
+            cfg.provider = provider;
+            // A provider that owns an endpoint points at it; one that stands for
+            // "wherever the human pointed mush" keeps the endpoint already set.
+            if provider.spec().switches_endpoint {
+                cfg.base_url = provider.default_base_url().to_string();
+            }
+            let known = cfg.default_models();
+            let mut model = cfg.model.clone();
+            if !known.contains(&model) {
+                if let Some(first) = known.first() {
+                    model = first.clone();
+                }
+            }
+            cfg.set_model(&model);
+        });
     }
 
     fn pick(&mut self, kind: PickerKind, item: &str) {
@@ -1107,13 +1173,12 @@ impl App {
                 let id = item.split(" · ").next().unwrap_or(item);
                 // A new model means a new documented window, unless the human
                 // stated one (finding A5).
-                self.cfg.set_model(id);
+                self.cell.edit(|cfg| cfg.set_model(id));
                 self.adopt_advertised_context();
-                self.apply_config();
                 self.persist_user_config();
                 self.say(format!(
                     "model: {} · {}",
-                    self.cfg.label(),
+                    self.cfg().label(),
                     self.context_label()
                 ));
             }
@@ -1294,16 +1359,15 @@ impl App {
     /// (and a busy flag) while the UI shows an empty one.
     fn new_chat(&mut self) {
         self.stop_all();
+        // The respawned root owns its own config cell, conversation tag, and id
+        // counter; the UI adopts the handle with the fresh tree, or a later
+        // /model would never reach the agent.
         let root = spawn(
-            self.cfg.clone(),
+            ConfigHandle::own(self.cell.ui().clone()),
             self.ui_tx.clone(),
             self.ws.root().to_path_buf(),
         );
-        // The respawned root owns its own config cell, conversation tag, and id
-        // counter; adopt all of them with a fresh tree, or a later /model would
-        // never reach the agent, its events would look stale, and a spawn could
-        // reuse an id.
-        self.cfg_shared = root.cfg.clone();
+        self.cell.adopt_handle(root.cfg.clone());
         self.tree = AgentTree::rooted(root);
         // Running agents vanish with the old conversation; worktrees they left
         // behind are still reviewable (they are re-listed below).
@@ -1414,12 +1478,15 @@ impl App {
             .collect();
         Session {
             root: self.ws.root_str(),
-            model: self.cfg.model.clone(),
-            provider: self.cfg.provider.name().to_string(),
-            base_url: self.cfg.base_url.clone(),
+            model: self.cfg().model.clone(),
+            provider: self.cfg().provider.name().to_string(),
+            base_url: self.cfg().base_url.clone(),
             // Only a window the human stated is worth remembering; a discovered
             // one is re-read next time, so it cannot go stale.
-            context: self.cfg.context_explicit.then_some(self.cfg.context_tokens),
+            context: self
+                .cfg()
+                .context_explicit
+                .then_some(self.cfg().context_tokens),
             updated: session::now_secs(),
             messages: self.chat.transcript(AgentId::ROOT).to_vec(),
             agents,
@@ -1705,14 +1772,14 @@ mod tests {
         let ws = Workspace::new(&root).unwrap();
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let cell = ConfigCell::own(cfg);
+        let handle = spawn(cell.handle(), tx.clone(), root.clone());
         App::new(
             ws,
-            cfg,
+            cell,
             None,
             handle,
             tx,
-            Vec::new(),
             session_save::fake::Recorder::new(),
         )
     }
@@ -1724,9 +1791,10 @@ mod tests {
         let ws = Workspace::new(root).unwrap();
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let handle = spawn(cfg.clone(), tx.clone(), root.to_path_buf());
+        let cell = ConfigCell::own(cfg);
+        let handle = spawn(cell.handle(), tx.clone(), root.to_path_buf());
         let writer = Arc::new(session_save::Writer::new(root.to_path_buf()));
-        let app = App::new(ws, cfg, None, handle, tx, Vec::new(), writer.clone());
+        let app = App::new(ws, cell, None, handle, tx, writer.clone());
         (app, writer)
     }
 
@@ -1737,9 +1805,10 @@ mod tests {
         let ws = Workspace::new(&root).unwrap();
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let cell = ConfigCell::own(cfg);
+        let handle = spawn(cell.handle(), tx.clone(), root.clone());
         let recorder = session_save::fake::Recorder::new();
-        let app = App::new(ws, cfg, None, handle, tx, Vec::new(), recorder.clone());
+        let app = App::new(ws, cell, None, handle, tx, recorder.clone());
         (app, recorder)
     }
 
@@ -1982,7 +2051,8 @@ mod tests {
         let ws = Workspace::new(&root).unwrap();
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let cell = ConfigCell::own(cfg);
+        let handle = spawn(cell.handle(), tx.clone(), root.clone());
         let stored = Session {
             root: root.display().to_string(),
             model: "test-model".into(),
@@ -2007,11 +2077,10 @@ mod tests {
 
         let app = App::new(
             ws,
-            cfg,
+            cell,
             Some(stored),
             handle,
             tx,
-            Vec::new(),
             session_save::fake::Recorder::new(),
         );
 
@@ -2107,7 +2176,8 @@ mod tests {
         // events this test reads.
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let cell = ConfigCell::own(cfg);
+        let handle = spawn(cell.handle(), tx.clone(), root.clone());
         let stored = stored_with_agent(
             &root,
             session::StoredStatus::Done,
@@ -2116,11 +2186,10 @@ mod tests {
 
         let app = App::new(
             ws,
-            cfg,
+            cell,
             Some(stored),
             handle,
             tx,
-            Vec::new(),
             session_save::fake::Recorder::new(),
         );
 
@@ -2160,7 +2229,8 @@ mod tests {
         let ws = Workspace::new(&root).unwrap();
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let cell = ConfigCell::own(cfg);
+        let handle = spawn(cell.handle(), tx.clone(), root.clone());
         let refusal = "model returned HTTP 400: The `reasoning_content` in the thinking \
                        mode must be passed back to the API.";
         let stored = stored_with_agent(
@@ -2171,11 +2241,10 @@ mod tests {
 
         let app = App::new(
             ws,
-            cfg,
+            cell,
             Some(stored),
             handle,
             tx,
-            Vec::new(),
             session_save::fake::Recorder::new(),
         );
 
@@ -2201,7 +2270,8 @@ mod tests {
         let ws = Workspace::new(&root).unwrap();
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let cell = ConfigCell::own(cfg);
+        let handle = spawn(cell.handle(), tx.clone(), root.clone());
         let stored = stored_with_agent(
             &root,
             session::StoredStatus::Failed("the endpoint stopped responding".into()),
@@ -2214,11 +2284,10 @@ mod tests {
 
         let app = App::new(
             ws,
-            cfg,
+            cell,
             Some(stored),
             handle,
             tx,
-            Vec::new(),
             session_save::fake::Recorder::new(),
         );
 
@@ -2489,8 +2558,9 @@ mod tests {
         let ws = Workspace::new(&root).unwrap();
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
-        let mut app = App::new(ws, cfg, None, handle, tx, Vec::new(), recorder);
+        let cell = ConfigCell::own(cfg);
+        let handle = spawn(cell.handle(), tx.clone(), root.clone());
+        let mut app = App::new(ws, cell, None, handle, tx, recorder);
         streamed(&mut app, "lost");
 
         // The debounce hands it over; the scripted write fails; the next tick is
@@ -2555,17 +2625,14 @@ mod tests {
         let ws = Workspace::new(&root).unwrap();
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let cell = ConfigCell::own(cfg);
+        let handle = spawn(cell.handle(), tx.clone(), root.clone());
         let app = App::new(
             ws,
-            cfg,
+            cell,
             None,
             handle,
             tx,
-            vec![http::Model {
-                id: "test-model".to_string(),
-                context: None,
-            }],
             session_save::fake::Recorder::new(),
         );
         (app, rx)
@@ -2579,7 +2646,7 @@ mod tests {
         app.chat
             .push_message(AgentId::ROOT, Message::user("an old task"));
         app.chat.note_for(AgentId::ROOT, "old noise");
-        let before = app.cfg_shared.clone();
+        let before = app.cell.handle();
 
         run(&mut app, "/new");
 
@@ -2593,9 +2660,19 @@ mod tests {
         );
         assert_eq!(app.tree.agents.len(), 1, "the tree is reset to the root");
         assert!(!app.busy());
-        // The respawned root owns a fresh config cell and the UI adopted it;
-        // without that, a later /model would never reach the agent.
-        assert!(!Arc::ptr_eq(&before, &app.cfg_shared));
+        // The respawned root owns a fresh config cell and the UI adopted its
+        // handle; without that, a later /model would write the old tree's cell
+        // and the live actor would never hear about it.
+        assert!(
+            !before.same_cell(&app.cell.handle()),
+            "the UI moved to the new tree's cell"
+        );
+        app.cell.edit(|cfg| cfg.set_model("after-the-restart"));
+        assert_ne!(
+            before.config().unwrap().model,
+            "after-the-restart",
+            "and the old tree's cell is no longer the one it writes"
+        );
 
         // Its mailbox is alive, so the next message starts a run instead of
         // reporting that the root is gone.
@@ -2721,7 +2798,7 @@ mod tests {
         let empty = app.context_meter();
         assert!(
             empty.starts_with("ctx ")
-                && empty.ends_with(&format!("~{}", tokens_label(app.cfg.context_tokens))),
+                && empty.ends_with(&format!("~{}", tokens_label(app.cfg().context_tokens))),
             "{empty}"
         );
 
@@ -2732,7 +2809,7 @@ mod tests {
 
         // A window the human stated is not marked as derived, and is shown as
         // the number it is: 32,768 tokens is `32.8k`, not `32k`.
-        app.cfg.set_context(32_768);
+        app.cell.edit(|cfg| cfg.set_context(32_768));
         assert!(
             app.context_meter().ends_with("32.8k"),
             "{}",
@@ -2742,6 +2819,214 @@ mod tests {
             !app.context_meter().contains('~'),
             "{}",
             app.context_meter()
+        );
+    }
+
+    /// A window an actor learned reaches the UI's cell, through the event that
+    /// announced it — not as a mutex write the UI never hears about (finding
+    /// B7). The bar, `/context` and the tool caps read one number, and the
+    /// actors holding a handle from before the event measure against the same
+    /// one.
+    #[test]
+    fn a_window_learned_by_an_actor_reaches_the_ui_cell() {
+        let (mut app, _rx) = test_app("learned-window");
+        // Taken first, the way the root actor's context holds it for the life
+        // of the tree.
+        let handle = app.cell.handle();
+        let first = app.cfg().context_tokens;
+        assert_ne!(first, 4_096, "the test wants a window that changes");
+
+        app.update(Msg::Agent {
+            conversation: app.tree.conversation(),
+            id: AgentId::ROOT,
+            event: AgentEvent::Context {
+                tokens: 4_096,
+                source: WindowSource::Complaint,
+            },
+        });
+
+        assert_eq!(
+            app.cfg().context_tokens,
+            4_096,
+            "the bar, /context and the caps read the learned window"
+        );
+        assert!(
+            !app.cfg().context_explicit,
+            "and they still read it as learned, not as the human's"
+        );
+        assert_eq!(
+            handle.config().unwrap().context_tokens,
+            4_096,
+            "the actors read the same one"
+        );
+    }
+
+    /// A window the human stated is not the endpoint's to overwrite, whichever
+    /// side learns the number first (finding B7's other half).
+    #[test]
+    fn a_stated_window_survives_what_an_actor_learns() {
+        let (mut app, _rx) = test_app("stated-window");
+        app.cell.edit(|cfg| cfg.set_context(32_768));
+        let handle = app.cell.handle();
+
+        app.update(Msg::Agent {
+            conversation: app.tree.conversation(),
+            id: AgentId::ROOT,
+            event: AgentEvent::Context {
+                tokens: 4_096,
+                source: WindowSource::Complaint,
+            },
+        });
+
+        assert_eq!(app.cfg().context_tokens, 32_768);
+        assert_eq!(handle.config().unwrap().context_tokens, 32_768);
+    }
+
+    /// The runtime switches re-derive the window: a window mush only *learned*
+    /// belongs to the endpoint that taught it, and a new endpoint or provider
+    /// means a new one (finding A5).
+    ///
+    /// The switch itself, not `/url` and `/provider`: those arms fetch the
+    /// model list after switching, which is a socket the default suite does not
+    /// take. The arms call exactly these two functions and nothing else, so the
+    /// behaviour they have is the behaviour pinned here.
+    #[test]
+    fn a_runtime_switch_rederives_the_window() {
+        let (mut app, _rx) = test_app("rederive");
+        let fallback = app.cfg().fallback_context();
+        app.cell.learn_context(4_096, WindowSource::Advertised);
+        assert_eq!(app.cfg().context_tokens, 4_096, "learned, not stated");
+
+        app.switch_endpoint("http://127.0.0.1:9999");
+        assert_eq!(
+            app.cfg().context_tokens,
+            fallback,
+            "a new endpoint re-derives the window"
+        );
+        assert_eq!(
+            app.cell.handle().config().unwrap().context_tokens,
+            fallback,
+            "and the actors measure against the re-derived one"
+        );
+
+        app.switch_provider(Provider::DeepSeek);
+        assert_eq!(app.cfg().base_url, "https://api.deepseek.com");
+        assert_eq!(app.cfg().model, "deepseek-flash", "the vendor's own model");
+        assert_eq!(
+            app.cfg().context_tokens,
+            500_000,
+            "and the window documented for it"
+        );
+        assert_eq!(
+            app.cell.handle().config().unwrap().context_tokens,
+            500_000,
+            "the actors follow the switch"
+        );
+
+        // A window the human stated is theirs: neither switch touches it.
+        app.cell.edit(|cfg| cfg.set_context(32_768));
+        app.switch_endpoint("http://127.0.0.1:9998");
+        app.switch_provider(Provider::Custom);
+        assert_eq!(
+            app.cfg().context_tokens,
+            32_768,
+            "what the human said stays"
+        );
+    }
+
+    /// The model list is discovered on its own thread, so it arrives after the
+    /// first frame (finding A9). Its first entry is the guess only when nothing
+    /// else named a model, its advertised window comes with it, and a model the
+    /// human picked is never overwritten by whatever the endpoint lists first.
+    #[test]
+    fn a_late_model_list_names_a_model_only_when_nothing_did() {
+        let (mut app, _rx) = test_app("late-models");
+        let endpoint = app.cfg().base_url.clone();
+        // What "no model given and none known yet" looks like after the
+        // precedence chain: mush started without one.
+        app.cell.edit(|cfg| cfg.model.clear());
+
+        app.update(Msg::Models {
+            endpoint: endpoint.clone(),
+            models: vec![http::Model {
+                id: "found".to_string(),
+                context: Some(4_096),
+            }],
+        });
+
+        assert_eq!(app.cfg().model, "found", "the endpoint's first model");
+        assert_eq!(
+            app.cfg().context_tokens,
+            4_096,
+            "and the window it advertised for it"
+        );
+        assert_eq!(
+            app.cell.handle().config().unwrap().model,
+            "found",
+            "the actors ask for the model the UI shows"
+        );
+        assert!(
+            text_of(&app).contains("found"),
+            "a model that appeared on its own is said out loud: {}",
+            text_of(&app)
+        );
+
+        app.cell.edit(|cfg| cfg.set_model("mine"));
+        app.update(Msg::Models {
+            endpoint,
+            models: vec![http::Model {
+                id: "other".to_string(),
+                context: None,
+            }],
+        });
+        assert_eq!(app.cfg().model, "mine", "a stated model wins over the list");
+    }
+
+    /// A list fetched from the endpoint the human has since left must not land:
+    /// the picker, and the model it would name, are about the endpoint in use.
+    #[test]
+    fn a_model_list_from_an_endpoint_mush_left_is_dropped() {
+        let (mut app, _rx) = test_app("stale-models");
+        app.cell.edit(|cfg| cfg.model.clear());
+
+        app.update(Msg::Models {
+            endpoint: "http://127.0.0.1:2".to_string(),
+            models: vec![http::Model {
+                id: "from-elsewhere".to_string(),
+                context: None,
+            }],
+        });
+
+        assert!(app.models.is_empty(), "nothing was adopted");
+        assert!(app.cfg().model.is_empty(), "and no model was named");
+    }
+
+    /// A request with no model is a guaranteed refusal, and discovery now runs
+    /// after the first frame, so this state is reachable for as long as a fetch
+    /// takes: the human is told, rather than reading the endpoint's complaint
+    /// about an empty model id (finding A9).
+    #[test]
+    fn a_message_with_no_model_says_so_instead_of_asking() {
+        let (mut app, _rx) = test_app("no-model");
+        app.cell.edit(|cfg| cfg.model.clear());
+
+        app.chat.insert("hello");
+        app.send_message();
+
+        assert!(!app.busy(), "no run was started");
+        assert!(
+            app.chat.transcript(AgentId::ROOT).is_empty(),
+            "and nothing was put in the transcript an endpoint would be sent"
+        );
+        assert!(
+            text_of(&app).contains("no model"),
+            "the bar says why: {}",
+            text_of(&app)
+        );
+        assert_eq!(
+            app.chat.input().text(),
+            "hello",
+            "and the words are still in the box to retry"
         );
     }
 
@@ -3246,14 +3531,14 @@ mod tests {
         let ws = Workspace::new(&root).unwrap();
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let cell = ConfigCell::own(cfg);
+        let handle = spawn(cell.handle(), tx.clone(), root.clone());
         let mut app = App::new(
             ws,
-            cfg,
+            cell,
             None,
             handle,
             tx,
-            Vec::new(),
             session_save::fake::Recorder::new(),
         );
 

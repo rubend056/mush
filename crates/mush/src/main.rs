@@ -36,7 +36,7 @@ use ratatui::Terminal;
 use mush_core::text::mask_key;
 use mush_core::{config, session, Config, Overrides, Session, UserConfig, Workspace};
 
-use app::{App, Msg};
+use app::{App, ConfigCell, Msg};
 
 /// `-y` / `--yes`: this session's human pre-approved work that a feature would
 /// otherwise stop and ask about. Nothing asks yet — the design doc's
@@ -390,41 +390,48 @@ fn run() -> Result<(), Box<dyn Error>> {
     // CLI flags > environment > saved session > home config > defaults; the
     // whole precedence lives in one tested function in mush-core.
     let stored = Session::load(workspace.root());
-    let mut config = config::resolve(&overrides, &UserConfig::load(), stored.as_ref())?;
+    let config = config::resolve(&overrides, &UserConfig::load(), stored.as_ref())?;
 
-    // One `/v1/models` request serves the picker, and picks the initial model
-    // only when nothing else named one. A known model skips the fetch — a slow
-    // or silent endpoint must not delay the first paint (finding A9); `/model`
-    // and `/url` refetch on demand. The endpoint's advertised window can only
-    // be adopted from a fetch that happened.
-    let models = if config.model.is_empty() {
-        let models = http::list_models(&config);
-        match models.first() {
-            Some(model) => config.model = model.id.clone(),
-            None => eprintln!(
-                "mush: no model given and none discovered at {} — pick one with /model",
-                config.models_url()
-            ),
-        }
-        models
-    } else {
-        Vec::new()
-    };
-    if let Some(advertised) = models
-        .iter()
-        .find(|model| model.id == config.model)
-        .and_then(|model| model.context)
-    {
-        config.adopt_context(advertised);
-    }
+    // Model discovery happens *after* the first frame, on its own thread. A
+    // model from the startup precedence skips it entirely; when one has to be
+    // discovered, the terminal must not wait for an endpoint that may be slow,
+    // silent or unreachable before it paints anything (finding A9). The list
+    // arrives as `Msg::Models`, and the app picks its first entry only if
+    // nothing else named a model. `/model` and `/url` refetch on demand.
+    let discovery = config.model.is_empty().then(|| config.clone());
 
     let (tx, rx) = unbounded::<Msg>();
-    let root = agent::spawn(config.clone(), tx.clone(), workspace.root().to_path_buf());
+    // One cell for the whole tree: the UI reads it, the root actor — and every
+    // agent under it — reads the same one, so a runtime `/model` cannot reach
+    // the screen without reaching the actors (finding B7).
+    let cell = ConfigCell::own(config);
+    let root = agent::spawn(cell.handle(), tx.clone(), workspace.root().to_path_buf());
     // The session goes out through its own thread: the UI thread hands a
     // snapshot over and keeps painting (see `session_save`). `App`'s drop is the
     // exit flush.
     let save = Arc::new(session_save::Writer::new(workspace.root().to_path_buf()));
-    let mut app = App::new(workspace, config, stored, root, tx.clone(), models, save);
+    let mut app = App::new(workspace, cell, stored, root, tx.clone(), save);
+
+    if let Some(cfg) = discovery {
+        let tx = tx.clone();
+        let endpoint = cfg.base_url.clone();
+        let started = std::thread::Builder::new()
+            .name("mush-models".to_string())
+            .spawn(move || {
+                let models = http::list_models(&cfg);
+                let _ = tx.send(Msg::Models { endpoint, models });
+            });
+        if started.is_err() {
+            // No thread to discover on means no list at all; the human is told
+            // the same thing an endpoint that listed nothing would tell them,
+            // rather than being left with a bar that says "no model".
+            let endpoint = app.cfg().base_url.clone();
+            app.update(Msg::Models {
+                endpoint,
+                models: Vec::new(),
+            });
+        }
+    }
 
     install_panic_hook();
     let mut guard = TerminalGuard::enter()?;

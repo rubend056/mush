@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -30,7 +30,7 @@ use mush_core::transcript::{
 };
 use mush_core::{prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_SECS};
 
-use crate::app::{tokens_label, AgentId, ConversationId, Msg};
+use crate::app::{tokens_label, AgentId, ConfigHandle, ConversationId, Msg, WindowSource};
 use crate::clock;
 use crate::events::{Events, Ui};
 use crate::machine::{Job, Machine, Shell, ShellCommand};
@@ -338,9 +338,11 @@ pub enum AgentEvent {
     Error(String),
     /// The window the endpoint itself named when it rejected a request; the UI
     /// adopts it so the bar, `/context`, and the tool caps agree with the agent
-    /// (finding B7).
+    /// (finding B7). `source` travels with the number so the UI trusts it on the
+    /// same terms the actor did.
     Context {
         tokens: usize,
+        source: WindowSource,
     },
     /// The transcript was folded into a summary (context compaction); the
     /// conversation is now `[system, user(summary)]`.
@@ -352,8 +354,9 @@ pub enum AgentEvent {
 /// Shared by every actor: config, the UI channel, and the budgets.
 pub struct AgentCtx {
     /// Shared so a runtime `/provider` / `/url` / `/model` / `/key` applies to
-    /// every agent immediately.
-    pub cfg: Arc<Mutex<Config>>,
+    /// every agent immediately. A handle rather than the lock itself: an actor
+    /// reads it and may learn one window, and has no other write (finding B7).
+    pub cfg: ConfigHandle,
     /// Where this agent's model calls go. Shared by the whole tree — a child
     /// gets its parent's client — so one endpoint serves every agent, and one
     /// scripted client can serve a whole tree in a test.
@@ -381,6 +384,20 @@ impl AgentCtx {
     /// Report something that happened to agent `id`.
     fn emit(&self, id: u64, event: AgentEvent) {
         self.events.emit(AgentId(id), event);
+    }
+
+    /// Adopt a window the endpoint named, for the whole tree at once.
+    ///
+    /// One call writes the copy the actors read and tells the UI, so the two
+    /// cannot disagree (finding B7): the number cannot travel as a mutex write
+    /// the UI never hears about. `Ok(false)` is the cell refusing a number —
+    /// the human stated a window, or it was not plausible.
+    fn learn_context(&self, id: u64, tokens: usize, source: WindowSource) -> Result<bool, String> {
+        if !self.cfg.learn_context(tokens, source)? {
+            return Ok(false);
+        }
+        self.emit(id, AgentEvent::Context { tokens, source });
+        Ok(true)
     }
 }
 
@@ -436,9 +453,9 @@ struct Actor {
 pub struct RootHandle {
     /// The root's mailbox.
     pub tx: Sender<AgentMsg>,
-    /// The config cell every actor in this tree reads, so a runtime `/model`
-    /// reaches them all.
-    pub cfg: Arc<Mutex<Config>>,
+    /// The cell every actor in this tree reads, so a runtime `/model` reaches
+    /// them all — and so the UI can hold the same one (finding B7).
+    pub cfg: ConfigHandle,
     /// Identifies this conversation in events; see `agent::next_conversation`.
     pub conversation: u64,
     /// The tree's id counter, so the UI can raise its floor to the highest id
@@ -450,14 +467,13 @@ pub struct RootHandle {
 }
 
 /// Start the root actor.
-pub fn spawn(cfg: Config, tx: Sender<Msg>, root: PathBuf) -> RootHandle {
-    let shared = Arc::new(Mutex::new(cfg));
+pub fn spawn(cfg: ConfigHandle, tx: Sender<Msg>, root: PathBuf) -> RootHandle {
     // The real endpoint, behind the seam: every agent in this tree calls it
     // through `AgentCtx::model`, children included.
-    let model: Arc<dyn ModelClient> = Arc::new(HttpModel::new(shared.clone()));
+    let model: Arc<dyn ModelClient> = Arc::new(HttpModel::new(cfg.clone()));
     let conversation = next_conversation();
     let ui: Arc<dyn Events> = Arc::new(Ui::new(tx, conversation));
-    root_actor(shared, model, ui, conversation, root)
+    root_actor(cfg, model, ui, conversation, root)
 }
 
 /// The same tree, with its model calls served by the caller instead of the
@@ -475,7 +491,7 @@ pub(crate) fn spawn_scripted(
     model: Arc<dyn ModelClient>,
 ) -> RootHandle {
     let conversation = next_conversation();
-    root_actor(Arc::new(Mutex::new(cfg)), model, events, conversation, root)
+    root_actor(ConfigHandle::own(cfg), model, events, conversation, root)
 }
 
 /// One conversation per `/new`, so stale events can be told apart: an actor
@@ -488,7 +504,7 @@ fn next_conversation() -> ConversationId {
 
 /// Start the root actor of one conversation over a given model and sink.
 fn root_actor(
-    shared: Arc<Mutex<Config>>,
+    shared: ConfigHandle,
     model: Arc<dyn ModelClient>,
     events: Arc<dyn Events>,
     conversation: ConversationId,
@@ -555,7 +571,7 @@ pub struct ReviveSpec {
 /// channel, so reviving a child never wakes the root with news it did not ask
 /// for.
 pub fn revive(
-    cfg: Arc<Mutex<Config>>,
+    cfg: ConfigHandle,
     tx: Sender<Msg>,
     conversation: u64,
     ids: Arc<AtomicU64>,
@@ -971,12 +987,7 @@ fn run_loop(
             return Err(CANCELLED.to_string());
         }
 
-        let mut cfg = actor
-            .ctx
-            .cfg
-            .lock()
-            .map(|config| config.clone())
-            .map_err(|_| "shared configuration poisoned".to_string())?;
+        let cfg = actor.ctx.cfg.config()?;
 
         let budget = cfg.history_budget();
         // Approaching the context window — or asked for outright by a
@@ -1078,16 +1089,15 @@ fn run_loop(
                 // tokens (finding A3).
                 if !learned_context && !cfg.context_explicit {
                     if let Some(tokens) = parse_context_hint(&detail) {
-                        let plausible = tokens < cfg.context_tokens
-                            && tokens.saturating_mul(8) >= cfg.context_tokens;
-                        if plausible {
-                            cfg.context_tokens = tokens;
-                            if let Ok(mut shared) = actor.ctx.cfg.lock() {
-                                shared.context_tokens = tokens;
-                            }
-                            // The UI owns the copy every surface reads, so it
-                            // gets the number too (finding B7).
-                            actor.ctx.emit(actor.id, AgentEvent::Context { tokens });
+                        // The cell decides whether the number is worth taking
+                        // (a plausible one, and never over a window the human
+                        // stated, finding A3); this call is also what tells the
+                        // UI, so the learned window cannot reach one side and
+                        // not the other (finding B7).
+                        if actor
+                            .ctx
+                            .learn_context(actor.id, tokens, WindowSource::Complaint)?
+                        {
                             actor.ctx.emit(
                                 actor.id,
                                 AgentEvent::Status(format!(
@@ -1529,8 +1539,7 @@ fn compact_now(actor: &Actor, state: &mut ActorState, transcript: &mut Vec<Messa
     let cfg = actor
         .ctx
         .cfg
-        .lock()
-        .map(|cfg| cfg.clone())
+        .config()
         .unwrap_or_else(|_| Config::new("http://127.0.0.1:1", "", None));
     // A fresh flag: an idle agent has no run for a Stop to cancel. One that
     // arrives while the summary is in flight still ends the request early,
@@ -1669,8 +1678,7 @@ fn exec_tool(
             let cfg = actor
                 .ctx
                 .cfg
-                .lock()
-                .map(|config| config.clone())
+                .config()
                 .unwrap_or_else(|_| Config::new("http://127.0.0.1:1", "", None));
             direct_tool(&actor.ws, tool, args, &cfg)
         }
@@ -2777,8 +2785,8 @@ mod tests {
 
     /// A scratch config cell. The endpoint is deliberately unreachable: every
     /// test that uses it must go through a scripted model.
-    fn test_cfg() -> Arc<Mutex<Config>> {
-        Arc::new(Mutex::new(Config::new("http://127.0.0.1:1", "test", None)))
+    fn test_cfg() -> ConfigHandle {
+        ConfigHandle::own(Config::new("http://127.0.0.1:1", "test", None))
     }
 
     /// A standalone actor over a scratch workspace, with `model` as its client
@@ -2787,7 +2795,7 @@ mod tests {
     fn build_actor(
         label: &str,
         model: Arc<dyn ModelClient>,
-        cfg: Arc<Mutex<Config>>,
+        cfg: ConfigHandle,
     ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
         build_actor_about(label, model, cfg, Arc::new(Shell), Arc::new(clock::System))
     }
@@ -2818,7 +2826,7 @@ mod tests {
     fn build_actor_about(
         label: &str,
         model: Arc<dyn ModelClient>,
-        cfg: Arc<Mutex<Config>>,
+        cfg: ConfigHandle,
         machine: Arc<dyn Machine>,
         clock: Arc<dyn clock::Clock>,
     ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
@@ -3331,7 +3339,7 @@ mod tests {
         local.reasoning_effort = Some(ReasoningEffort::Medium);
         local.thinking = Some(ThinkingMode::Off);
         let (actor, _events, _mailbox) =
-            build_actor("knobs", scripted.clone(), Arc::new(Mutex::new(local)));
+            build_actor("knobs", scripted.clone(), ConfigHandle::own(local));
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
         let mut messages = vec![Message::system("you are mush"), Message::user("hi")];
@@ -3972,11 +3980,17 @@ mod tests {
         assert_eq!(result.as_deref(), Some("done"));
         assert_eq!(model.asked().len(), 2, "the run re-asked after learning");
         assert_eq!(
-            actor.ctx.cfg.lock().unwrap().context_tokens,
+            actor.ctx.cfg.config().unwrap().context_tokens,
             4_096,
             "the learned window reaches the shared config"
         );
-        assert_eq!(contexts(&events), vec![4_096], "and the UI is told");
+        // The number reaching the shared cell and the number the UI is told
+        // are the same event: that pairing is the whole of finding B7.
+        assert_eq!(
+            contexts(&events),
+            vec![(4_096, WindowSource::Complaint)],
+            "and the UI is told, on the terms the run trusted it"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -4040,13 +4054,13 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Every context window a run announced to the UI.
-    fn contexts(events: &Recorder) -> Vec<usize> {
+    /// Every context window a run announced to the UI, and on what terms.
+    fn contexts(events: &Recorder) -> Vec<(usize, WindowSource)> {
         events
             .events()
             .into_iter()
             .filter_map(|(_, event)| match event {
-                AgentEvent::Context { tokens } => Some(tokens),
+                AgentEvent::Context { tokens, source } => Some((tokens, source)),
                 _ => None,
             })
             .collect()
