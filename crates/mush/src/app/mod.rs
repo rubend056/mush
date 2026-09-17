@@ -13,7 +13,7 @@
 mod chat;
 mod tree;
 
-pub use chat::{Chat, Notice, NoticeKind};
+pub use chat::{Chat, Footnote, NoticeKind, Rank};
 pub use tree::{AgentId, AgentNode, AgentTree, ConversationId, Existing, Landed, Phase, Spawn};
 
 use std::collections::HashMap;
@@ -1868,7 +1868,10 @@ mod tests {
             app.chat.transcript(AgentId::ROOT).is_empty(),
             "the conversation is gone"
         );
-        assert!(app.chat.notices().is_empty(), "notices are gone");
+        assert!(
+            app.chat.notices_for(AgentId::ROOT).next().is_none(),
+            "notices are gone"
+        );
         assert_eq!(app.tree.agents.len(), 1, "the tree is reset to the root");
         assert!(!app.busy());
         // The respawned root owns a fresh config cell and the UI adopted it;

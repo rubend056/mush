@@ -21,7 +21,7 @@ use crate::input::Input;
 /// A line for the transcript that is not a message: a note from mush itself.
 /// It is tagged with the agent it concerns, so a root-level failure is not
 /// rendered into every child's transcript (finding B19).
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Notice {
     pub agent: AgentId,
     pub kind: NoticeKind,
@@ -34,6 +34,62 @@ pub struct Notice {
 pub enum NoticeKind {
     Info,
     Error,
+}
+
+/// What wins when more than one line wants to be a pane's last (finding B12):
+/// a failure first, then derived activity, then what mush merely said.
+///
+/// This is the one precedence table. The bar (`ui::bar_line`) and a transcript
+/// pane both rank their lines through it, so the two cannot disagree about
+/// which of two things the human needs to see first — which is how an `Error`
+/// status came to lose to a `thinking…` line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Rank {
+    /// A line mush wrote: a hint, `opened notes.txt`, a merge that landed.
+    Said,
+    /// Derived from the phases: a run in flight, a tree still working.
+    Activity,
+    /// A failure: the thing the human has to read.
+    Alert,
+}
+
+impl Rank {
+    /// The line that wins between these, with its rank. `None` when there is
+    /// nothing to say at all.
+    pub fn last_word<'a>(
+        alert: Option<&'a str>,
+        activity: Option<&'a str>,
+        said: Option<&'a str>,
+    ) -> Option<(Rank, &'a str)> {
+        if let Some(alert) = alert {
+            return Some((Rank::Alert, alert));
+        }
+        if let Some(activity) = activity {
+            return Some((Rank::Activity, activity));
+        }
+        said.map(|said| (Rank::Said, said))
+    }
+}
+
+impl Notice {
+    /// Where this line sits in the precedence table. Only failures are alerts.
+    pub fn rank(&self) -> Rank {
+        match self.kind {
+            NoticeKind::Error => Rank::Alert,
+            NoticeKind::Info => Rank::Said,
+        }
+    }
+}
+
+/// One of the lines a pane paints under its transcript, bottom of the pane
+/// first. Which of them is last is not the pane's decision: it is the
+/// precedence table's (finding B12).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Footnote<'a> {
+    /// Derived from the phases: the agent's run has not answered yet.
+    Activity,
+    /// A line mush wrote about this agent.
+    Notice(&'a Notice),
 }
 
 /// One conversation: what has been said, what mush added to it, and what the
@@ -177,8 +233,42 @@ impl Chat {
         });
     }
 
-    pub fn notices(&self) -> &[Notice] {
-        &self.notices
+    /// The lines mush wrote about one agent, oldest first. Scoped by
+    /// construction: a pane asks for its own agent and can get no other's, so
+    /// a root-level failure cannot be rendered into a child's transcript
+    /// (finding B19). There is deliberately no unscoped read: a list of every
+    /// notice is a list a pane could paint into the wrong transcript.
+    pub fn notices_for(&self, agent: AgentId) -> impl Iterator<Item = &Notice> {
+        self.notices
+            .iter()
+            .filter(move |notice| notice.agent == agent)
+    }
+
+    /// The lines a pane paints under the transcript, bottom of the pane first:
+    /// the agent's own notices, and — while its run is in flight — one derived
+    /// activity line.
+    ///
+    /// A failure is ranked last, so a spinner cannot push it off the bottom of
+    /// the pane, and the rest follow newest first — the same order the bar
+    /// ranks by (finding B12).
+    pub fn footnotes(&self, agent: AgentId, busy: bool) -> Vec<Footnote<'_>> {
+        let notices: Vec<&Notice> = self.notices_for(agent).collect();
+        let alert = notices
+            .iter()
+            .rposition(|notice| notice.rank() == Rank::Alert);
+        let mut foot = Vec::with_capacity(notices.len() + 1);
+        if let Some(at) = alert {
+            foot.push(Footnote::Notice(notices[at]));
+        }
+        if busy {
+            foot.push(Footnote::Activity);
+        }
+        for (at, notice) in notices.iter().enumerate().rev() {
+            if Some(at) != alert {
+                foot.push(Footnote::Notice(notice));
+            }
+        }
+        foot
     }
 
     /// Follow the newest line: a message, a notice, or the end of a run puts
@@ -294,6 +384,84 @@ mod tests {
             "a plain Enter must reach the agents"
         );
         assert!(!chat.key(key(KeyCode::Tab)), "and so must the pane keys");
+    }
+
+    /// A notice belongs to one agent: a root failure must not be painted into a
+    /// child's pane, and a child's line must not turn up in a sibling's
+    /// (finding B19).
+    #[test]
+    fn a_notice_belongs_to_one_agent_only() {
+        let mut chat = Chat::bare();
+        chat.note_error("cannot reach the endpoint");
+        chat.note_for(AgentId(1), "the lexer subagent hit its turn limit");
+        chat.note_for(AgentId(2), "compacted its own history");
+
+        let of = |agent: AgentId| -> Vec<String> {
+            chat.notices_for(agent).map(|n| n.text.clone()).collect()
+        };
+        assert_eq!(of(AgentId::ROOT), vec!["cannot reach the endpoint"]);
+        assert_eq!(
+            of(AgentId(1)),
+            vec!["the lexer subagent hit its turn limit"],
+            "a child sees its own line and nobody else's"
+        );
+        assert_eq!(of(AgentId(2)), vec!["compacted its own history"]);
+        assert!(
+            of(AgentId(3)).is_empty(),
+            "an agent nothing was said about has no lines"
+        );
+
+        // The pane reads through the same accessor, so it inherits the scope.
+        let foot = chat.footnotes(AgentId(1), false);
+        assert_eq!(foot.len(), 1, "the root failure is not in this pane");
+        assert!(matches!(foot[0], Footnote::Notice(notice) if notice.agent == AgentId(1)));
+    }
+
+    /// The one precedence table (finding B12): a failure outranks derived
+    /// activity, which outranks what mush merely said.
+    #[test]
+    fn a_failure_outranks_the_activity_line() {
+        let (alert, activity, said) = (
+            Some("no route to host"),
+            Some("#0 thinking 3s"),
+            Some("opened notes.txt"),
+        );
+        assert_eq!(
+            Rank::last_word(alert, activity, said),
+            Some((Rank::Alert, "no route to host"))
+        );
+        assert_eq!(
+            Rank::last_word(None, activity, said),
+            Some((Rank::Activity, "#0 thinking 3s"))
+        );
+        assert_eq!(
+            Rank::last_word(None, None, said),
+            Some((Rank::Said, "opened notes.txt"))
+        );
+        assert_eq!(Rank::last_word(None, None, None), None);
+
+        // And the pane ranks the same way: while a run is in flight, the
+        // failure is the last line it paints, so a spinner cannot push it off
+        // the bottom.
+        let mut chat = Chat::bare();
+        chat.note_for(AgentId(1), "reading the lexer");
+        chat.note_error_for(AgentId(1), "no route to host");
+
+        let foot = chat.footnotes(AgentId(1), true);
+        assert!(
+            matches!(foot[0], Footnote::Notice(notice) if notice.kind == NoticeKind::Error),
+            "the bottom of the pane is the failure, not the run in flight"
+        );
+        assert!(
+            foot.iter().any(|line| matches!(line, Footnote::Activity)),
+            "the run in flight is still shown — ranked below the failure, not hidden"
+        );
+        assert_eq!(foot.len(), 3, "nothing was dropped off the pane");
+
+        // At rest, the activity line is what the pane adds.
+        let idle = chat.footnotes(AgentId(1), false);
+        assert_eq!(idle.len(), 2);
+        assert!(!idle.iter().any(|line| matches!(line, Footnote::Activity)));
     }
 
     /// The context meter is derived from the conversation, not counted beside

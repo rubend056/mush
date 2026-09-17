@@ -13,7 +13,8 @@ use mush_core::message::Message;
 use mush_core::text::{fit_row, truncate, wrap_text, wrap_text_capped};
 
 use crate::app::{
-    short_age, AgentId, AgentNode, App, Focus, Landed, NoticeKind, Phase, PickerKind, StatusKind,
+    short_age, AgentId, AgentNode, App, Focus, Landed, NoticeKind, Phase, PickerKind, Rank,
+    StatusKind,
 };
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -506,17 +507,25 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 
 /// What the bar's first line says, and how it looks. Pure so the priority is
 /// testable without a frame: an error must never lose to work in progress
-/// (finding B12 — the Ctrl-Q warning included).
+/// (finding B12 — the Ctrl-Q warning included). The order itself is
+/// `chat::Rank`, the one table; this only maps it to a colour.
 fn bar_line(status: Option<(&str, StatusKind)>, activity: Option<String>) -> (String, Style) {
-    match status {
-        Some((text, StatusKind::Error)) => (text.to_string(), Style::default().fg(Color::Red)),
-        _ => match activity {
-            Some(activity) => (activity, Style::default().fg(Color::Cyan)),
-            None => match status {
-                Some((text, _)) => (text.to_string(), Style::default().fg(Color::Gray)),
-                None => (HINT.to_string(), dim()),
+    let alert = status
+        .filter(|(_, kind)| *kind == StatusKind::Error)
+        .map(|(text, _)| text);
+    let said = status
+        .filter(|(_, kind)| *kind == StatusKind::Info)
+        .map(|(text, _)| text);
+    match Rank::last_word(alert, activity.as_deref(), said) {
+        Some((rank, text)) => (
+            text.to_string(),
+            match rank {
+                Rank::Alert => Style::default().fg(Color::Red),
+                Rank::Activity => Style::default().fg(Color::Cyan),
+                Rank::Said => Style::default().fg(Color::Gray),
             },
-        },
+        ),
+        None => (HINT.to_string(), dim()),
     }
 }
 
@@ -577,16 +586,11 @@ fn transcript_tail(
     width: usize,
     want: usize,
 ) -> Vec<Line<'static>> {
-    // Notices are tagged with the agent they concern, so a root-level failure
-    // is not painted into a focused child's transcript (finding B19).
-    let notices: Vec<&crate::app::Notice> = app
-        .chat
-        .notices()
-        .iter()
-        .filter(|notice| notice.agent == app.tree.focused)
-        .collect();
+    // Notices are scoped to the agent they concern, so a root-level failure is
+    // not painted into a focused child's transcript (finding B19).
+    let has_notices = app.chat.notices_for(app.tree.focused).next().is_some();
     if app.tree.focused == AgentId::ROOT {
-        if messages.is_empty() && notices.is_empty() {
+        if messages.is_empty() && !has_notices {
             return vec![
                 Line::from(Span::styled(
                     "Ask for a change — the agent reads and edits this workspace directly.",
@@ -615,27 +619,32 @@ fn transcript_tail(
     let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
     let mut count = 0usize;
 
-    // What is painted last is collected first.
+    // What is painted last is collected first: the pane's own lines, bottom of
+    // the pane first, in the order the one precedence table puts them — a
+    // failure below the activity line it used to lose to (finding B12).
     let focused_busy = app
         .tree
         .node(app.tree.focused)
         .map(|node| node.phase.is_busy())
         .unwrap_or(false);
-    if focused_busy {
-        chunks.push(vec![
-            Line::from(""),
-            Line::from(Span::styled(
-                format!("{} working…", SPINNER[(app.spin as usize) % SPINNER.len()]),
-                Style::default().fg(Color::Cyan),
-            )),
-        ]);
-        count += 2;
-    }
-
-    for notice in notices.iter().rev() {
+    for footnote in app.chat.footnotes(app.tree.focused, focused_busy) {
         if count >= want {
             break;
         }
+        let notice = match footnote {
+            crate::app::Footnote::Notice(notice) => notice,
+            crate::app::Footnote::Activity => {
+                chunks.push(vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("{} working…", SPINNER[(app.spin as usize) % SPINNER.len()]),
+                        Style::default().fg(Color::Cyan),
+                    )),
+                ]);
+                count += 2;
+                continue;
+            }
+        };
         let (prefix, style) = match notice.kind {
             NoticeKind::Info => ("·", dim()),
             NoticeKind::Error => ("!", Style::default().fg(Color::Red)),
