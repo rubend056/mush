@@ -1334,6 +1334,23 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     ))
 }
 
+/// Whether the human's words are waiting behind a blocking tool call: a
+/// `Nudge`, or a whole transcript the UI sent because it believed the agent was
+/// idle (whose last message is the one the human just typed).
+///
+/// A blocking tool call is the one place a human message would otherwise sit
+/// unread for as long as the call takes, so this is what it uses to end the
+/// wait — see `wait_tool`.
+fn parked_message(state: &ActorState) -> bool {
+    state.deferred.iter().any(|command| match command {
+        AgentMsg::Nudge(_) => true,
+        AgentMsg::Run(messages) => messages
+            .last()
+            .is_some_and(|message| message.role == "user"),
+        _ => false,
+    })
+}
+
 fn wait_tool(
     actor: &Actor,
     state: &mut ActorState,
@@ -1384,6 +1401,17 @@ fn wait_tool(
         drain_signals(actor, cancel, state);
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.to_string());
+        }
+        // And it must notice the human. Parking their words is not enough when
+        // the wait can last the whole timeout: the model would not see them
+        // until the child it was waiting on finished, which is the opposite of
+        // steering. The wait ends, the words stay parked for the next message
+        // boundary, and the model answers them in this run.
+        if parked_message(state) {
+            return Ok("interrupted — the human wrote to you while you waited; their message is in \
+                       your transcript. Answer them; your agents are still running. Use wait_agents \
+                       again when you need a result."
+                .to_string());
         }
         for id in &candidates {
             if let Some(outcome) = state.completed.get(id) {
@@ -2313,6 +2341,83 @@ mod tests {
             rx,
         };
         (actor, ui_rx, my_tx)
+    }
+
+    /// The root napping on `wait_agents` must hear the human. Parking their
+    /// words is not enough when the wait can last the whole timeout: the model
+    /// would not see them until the child it was waiting on finished, which is
+    /// the opposite of steering. The wait ends, and the words stay parked so
+    /// the next message boundary folds them in.
+    #[test]
+    fn a_human_message_ends_a_wait_on_children() {
+        let (actor, mailbox) = test_actor("wake-wait");
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        // A child that exists and has not finished: the state a parent is in
+        // for the whole of a long wait.
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+        state.running.insert(1);
+
+        mailbox
+            .send(AgentMsg::Nudge("what about the tests?".into()))
+            .unwrap();
+        let started = Instant::now();
+        let result = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 5 })).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the message ends the wait, not the 600 s timeout ({:?})",
+            started.elapsed()
+        );
+        assert!(result.contains("interrupted"), "{result}");
+        assert!(
+            result.contains("still running"),
+            "the model is told the wait was cut short, not that the child finished: {result}"
+        );
+        // Not eaten by the interruption: the boundary that follows folds the
+        // words in, which is what makes the model answer them in this run.
+        assert!(
+            matches!(state.deferred.first(), Some(AgentMsg::Nudge(text)) if text == "what about the tests?"),
+            "the message must survive the interrupted wait: {:?}",
+            state.deferred.len()
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The other shape a human message arrives in: the UI believed the agent
+    /// was idle and sent the whole transcript, whose last message is what the
+    /// human just typed. That must end a blocking wait too — an actor that only
+    /// listened for `Nudge` would sit here until the child finished.
+    #[test]
+    fn a_transcript_sent_as_a_message_also_ends_a_wait() {
+        let (actor, mailbox) = test_actor("wake-wait-run");
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+
+        let transcript = vec![
+            Message::system("you are mush"),
+            Message::user("carry on without me"),
+        ];
+        mailbox.send(AgentMsg::Run(transcript)).unwrap();
+        let started = Instant::now();
+        let result = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 5 })).unwrap();
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "a newer transcript ends the wait ({:?})",
+            started.elapsed()
+        );
+        assert!(result.contains("interrupted"), "{result}");
+
+        // A `Run` whose last message is not the human's (a pure re-sync) is
+        // not a reason to stop waiting: nothing was said.
+        let mut quiet = ActorState::default();
+        quiet
+            .deferred
+            .push(AgentMsg::Run(vec![Message::assistant("hm")]));
+        assert!(!parked_message(&quiet));
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// The bug this guards: re-queuing a parked nudge into the actor's own
