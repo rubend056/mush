@@ -17,7 +17,10 @@ use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Receiver};
 use ratatui::backend::CrosstermBackend;
-use ratatui::crossterm::event::{self, Event, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+    Event, KeyEventKind,
+};
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
@@ -138,11 +141,13 @@ fn print_help() {
          KEYS:\n\
          \x20   Tab / Shift-Tab   cycle panes (agents, chat)\n\
          \x20   Enter             send message (chat) · focus agent (agents)\n\
+         \x20   Shift/Alt-Enter   new line in the message (multi-line messages)\n\
          \x20   j / k · Enter     select and focus an agent\n\
          \x20   c / Esc           cancel agent / back to the root (agents)\n\
          \x20   Ctrl-P            model picker\n\
          \x20   Ctrl-N            new chat    Ctrl-C  stop the focused agent\n\
          \x20   Ctrl-X            stop every running agent\n\
+         \x20   wheel             scroll the transcript\n\
          \x20   Ctrl-Q            quit\n\n\
          COMMANDS (type in the chat):\n\
          \x20   /provider [deepseek|custom]  switch provider\n\
@@ -152,7 +157,9 @@ fn print_help() {
          \x20   /key <secret>                set the API key (saved to the home config)\n\
          \x20   /models                      refresh the model list\n\
          \x20   /worktrees                   re-scan for leftover isolated worktrees\n\
-         \x20   /diff|/merge|/discard <id>   git commands for an isolated agent\n\
+         \x20   /diff <id>                   print the diff command for an isolated agent\n\
+         \x20   /merge|/discard <id>         merge or throw away its work, and reclaim it\n\
+         \x20   /forget <id>                 drop the agent from this session (its branch stays)\n\
          \x20   /new  /help  /quit\n\
          Endpoint, API key, and model defaults live in\n\
          $MUSH_CONFIG or the platform config directory. The conversation is stored\n\
@@ -230,21 +237,47 @@ fn event_loop(
     app: &mut App,
     rx: &Receiver<Msg>,
 ) -> Result<(), Box<dyn Error>> {
-    while !app.should_quit {
-        while let Ok(msg) = rx.try_recv() {
-            app.update(msg);
-        }
+    /// The most input events consumed before a frame is painted. A pasted
+    /// megabyte is thousands of key events, and painting once at the end is
+    /// what makes it instant; this cap is only so a firehose cannot starve the
+    /// draw forever.
+    const MAX_EVENTS_PER_FRAME: usize = 4096;
 
-        if event::poll(Duration::from_millis(30))? {
+    while !app.should_quit {
+        drain_actors(app, rx);
+
+        // Read one event, then every event that is already available, and paint
+        // *once*. Reading one event per frame is what made a paste crawl in one
+        // character at a time and a held arrow key scroll on after the human let
+        // go: each keystroke cost a full repaint, so the backlog drained at
+        // frame rate while the terminal's own buffer kept filling.
+        let mut timeout = Duration::from_millis(30);
+        let mut handled = 0usize;
+        while event::poll(timeout)? {
+            // Something is queued: do not wait again inside this frame.
+            timeout = Duration::ZERO;
             match event::read()? {
                 Event::Key(key) if key.kind != KeyEventKind::Release => {
                     app.update(Msg::Key(key));
                 }
+                // The whole paste, in one event.
+                Event::Paste(text) => app.update(Msg::Paste(text)),
+                // A wheel notch is a scroll, not a keypress: one event moves
+                // several lines at once, which is what makes the wheel feel
+                // like a wheel instead of a very slow arrow key.
+                Event::Mouse(mouse) => app.update(Msg::Mouse(mouse)),
                 // The terminal changed size: schedule a redraw. ratatui's
                 // `terminal.draw` re-queries the size first, so the next
                 // frame already paints at the new dimensions.
                 Event::Resize(_, _) => app.dirty_screen = true,
                 _ => {}
+            }
+            handled += 1;
+            // Results that arrived while the burst was being drained must not
+            // wait behind it.
+            drain_actors(app, rx);
+            if app.should_quit || handled >= MAX_EVENTS_PER_FRAME {
+                break;
             }
         }
 
@@ -257,6 +290,51 @@ fn event_loop(
     Ok(())
 }
 
+/// Fold in everything the agent actors have already said.
+fn drain_actors(app: &mut App, rx: &Receiver<Msg>) {
+    while let Ok(msg) = rx.try_recv() {
+        app.update(msg);
+    }
+}
+
+/// The terminal's modes, entered and left in one place.
+///
+/// Each mode is a promise to the human's shell: leaving raw mode on breaks their
+/// typing, and leaving bracketed paste on makes their own pastes arrive wrapped
+/// in escape codes. Everything that can end the program — a clean quit, a panic,
+/// an error on the way out — has to undo all of them, so they are entered here
+/// and undone by [`restore_terminal_modes`].
+fn enter_terminal_modes() -> io::Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    // Bracketed paste is what turns Ctrl-Shift-V from a stream of individual
+    // keystrokes — one event, one repaint, and a redraw per character — into a
+    // single `Event::Paste` carrying the whole paste.
+    //
+    // Mouse capture is the same fix for the wheel: it arrives as `Event::Mouse`
+    // instead of as arrow keys, so mush scrolls by a notch rather than by one
+    // keystroke per wheel event, and a wheel event cannot be queued behind
+    // pending input. The cost is the terminal's own drag-to-select, which comes
+    // back with Shift held.
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )
+}
+
+/// Undo every mode [`enter_terminal_modes`] turned on.
+fn restore_terminal_modes() {
+    let _ = disable_raw_mode();
+    let _ = execute!(
+        io::stdout(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        DisableMouseCapture
+    );
+}
+
 /// Restores the terminal on both clean exit (Drop) and panic.
 struct TerminalGuard {
     terminal: Terminal<CrosstermBackend<Stdout>>,
@@ -264,18 +342,15 @@ struct TerminalGuard {
 
 impl TerminalGuard {
     fn enter() -> io::Result<Self> {
-        enable_raw_mode()?;
-        let mut stdout = io::stdout();
-        execute!(stdout, EnterAlternateScreen)?;
-        let terminal = Terminal::new(CrosstermBackend::new(stdout))?;
+        enter_terminal_modes()?;
+        let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
         Ok(Self { terminal })
     }
 }
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
-        let _ = disable_raw_mode();
-        let _ = execute!(self.terminal.backend_mut(), LeaveAlternateScreen);
+        restore_terminal_modes();
         let _ = self.terminal.show_cursor();
     }
 }
@@ -283,8 +358,9 @@ impl Drop for TerminalGuard {
 fn install_panic_hook() {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        // Every mode, or a panic leaves the human's shell in raw mode, or
+        // swallowing its own pastes.
+        restore_terminal_modes();
         previous(info);
     }));
 }

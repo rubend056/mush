@@ -1651,7 +1651,11 @@ fn run_shell(
     let stdout = out.read(CMD_CAP);
     let stderr = err.read(CMD_CAP);
 
-    let mut report = format!("$ {command}\n");
+    // No `$ {command}` echo: the tool call is already rendered from the
+    // assistant message that made it (`⚙ run_command …`), so printing it here
+    // again put the same command in the transcript twice — and, because tool
+    // results are stored, in the saved session twice as well.
+    let mut report = String::new();
     if !stdout.trim().is_empty() {
         report.push_str(stdout.trim_end());
         report.push('\n');
@@ -2683,7 +2687,8 @@ mod tests {
                 },
                 Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
                 Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
-                Ok(Msg::Key(_)) => {}
+                // Input events belong to the UI; this test only listens to actors.
+                Ok(_) => {}
             }
         }
         stop_mock(mock);

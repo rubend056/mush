@@ -294,7 +294,13 @@ fn phase_detail(node: &AgentNode) -> String {
 
 fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Chat;
-    let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
+    // The box grows with the message: a multi-line draft has to be visible, not
+    // hidden behind a one-line window. It stops growing so the transcript keeps
+    // the screen.
+    const MAX_INPUT_LINES: u16 = 6;
+    let input_lines = (app.input.line_count() as u16).clamp(1, MAX_INPUT_LINES);
+    let rows =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(input_lines + 2)]).split(area);
 
     let title = if app.focused == 0 {
         " mush ".to_string()
@@ -338,16 +344,28 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         let prompt_width = UnicodeWidthStr::width(prompt.as_str());
         let field = (input_inner.width as usize).saturating_sub(prompt_width);
         // The box scrolls with the cursor instead of clipping its tail: what
-        // the human is editing is always the part on screen.
-        let (text, column) = app.input.window(field);
-        let line = Line::from(vec![
-            Span::styled(prompt, Style::default().fg(Color::Cyan)),
-            Span::raw(text),
-        ]);
-        frame.render_widget(Paragraph::new(line), input_inner);
+        // the human is editing is always the part on screen. Multi-line drafts
+        // are painted line by line, so the cursor's own line is the one kept in
+        // view.
+        let (lines, cursor_row, column) = app.input.view(input_inner.height as usize, field);
+        let mut rendered: Vec<Line> = Vec::with_capacity(lines.len());
+        for (index, line) in lines.into_iter().enumerate() {
+            let (lead, style) = if index == 0 {
+                (prompt.clone(), Style::default().fg(Color::Cyan))
+            } else {
+                // Continuation lines line up under the first, so the prompt
+                // reads as a margin rather than as part of the message.
+                (" ".repeat(prompt_width), Style::default())
+            };
+            rendered.push(Line::from(vec![Span::styled(lead, style), Span::raw(line)]));
+        }
+        frame.render_widget(Paragraph::new(Text::from(rendered)), input_inner);
         if focused {
-            let offset = (prompt_width + column).min(input_inner.width.saturating_sub(1) as usize);
-            frame.set_cursor_position(Position::new(input_inner.x + offset as u16, input_inner.y));
+            let x = input_inner.x
+                + ((prompt_width + column).min(input_inner.width.saturating_sub(1) as usize)
+                    as u16);
+            let y = input_inner.y + (cursor_row as u16).min(input_inner.height.saturating_sub(1));
+            frame.set_cursor_position(Position::new(x, y));
         }
     }
 }

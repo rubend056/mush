@@ -12,7 +12,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
-use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui::crossterm::event::{
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
+};
 
 use mush_core::message::Message;
 use mush_core::{
@@ -26,6 +28,11 @@ use crate::input::Input;
 
 pub enum Msg {
     Key(KeyEvent),
+    /// Pasted text, delivered whole by the terminal's bracketed paste. Inserted
+    /// in one update: a paste must not cost one message per character.
+    Paste(String),
+    /// A mouse event: today only the wheel, which scrolls the transcript.
+    Mouse(MouseEvent),
     /// An event from an agent actor. `conversation` identifies the tree that
     /// sent it, so an actor left over from `/new` cannot write into the new
     /// chat: events are tagged and the UI drops the stale ones.
@@ -520,6 +527,26 @@ impl App {
 
     pub fn update(&mut self, msg: Msg) {
         match msg {
+            Msg::Mouse(mouse) => {
+                // One notch is several lines: a wheel event carries no repeat, unlike a
+                // held arrow key, so the amount has to come from mush.
+                const NOTCH: i64 = 3;
+                match mouse.kind {
+                    MouseEventKind::ScrollUp => self.scroll_chat(NOTCH),
+                    MouseEventKind::ScrollDown => self.scroll_chat(-NOTCH),
+                    _ => {}
+                }
+            }
+            Msg::Paste(text) => {
+                // A paste is something the human wants to say, so it lands in
+                // the message box whichever pane has focus. An open picker is
+                // the one place a paste has no meaning.
+                if self.picker.is_none() {
+                    // Terminals disagree about line endings in a paste.
+                    let text = text.replace("\r\n", "\n").replace('\r', "\n");
+                    self.input.insert(&text);
+                }
+            }
             Msg::Key(key) => self.on_key(key),
             Msg::Agent {
                 conversation,
@@ -1724,6 +1751,13 @@ impl App {
     /// prompt can be edited instead of backspaced away.
     fn key_chat(&mut self, key: KeyEvent, ctrl: bool, alt: bool) {
         match key.code {
+            // A new line instead of sending. Only terminals that report the
+            // modifier can deliver Shift+Enter (kitty, WezTerm, foot, Ghostty,
+            // recent Alacritty); elsewhere it arrives as a plain Enter, which is
+            // why Alt+Enter does the same thing and is the reliable one.
+            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) || alt => {
+                self.input.insert("\n")
+            }
             KeyCode::Enter => self.send_message(),
             KeyCode::Backspace => self.input.backspace(),
             KeyCode::Delete => self.input.delete_forward(),
@@ -2036,6 +2070,31 @@ mod tests {
             "the restored actor must still be listening"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A paste lands in the message box as one insert and is *not* sent: mush
+    /// must never decide for the human that what they pasted was a message.
+    #[test]
+    fn a_paste_fills_the_box_without_sending() {
+        let (mut app, _rx) = test_app("paste");
+        app.focus = Focus::Chat;
+        app.update(Msg::Paste("line one\r\nline two\n".into()));
+        // Line endings are normalised, and the whole paste arrives at once.
+        assert_eq!(app.input.text(), "line one\nline two\n");
+        assert!(app.chat.is_empty(), "a paste is not a send");
+    }
+
+    /// Enter sends; Shift+Enter and Alt+Enter start a new line instead, so a
+    /// multi-line message can be written before it goes.
+    #[test]
+    fn a_modified_enter_starts_a_new_line_a_plain_one_sends() {
+        let (mut app, _rx) = test_app("multiline-key");
+        app.focus = Focus::Chat;
+        for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
+            app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, modifiers)));
+        }
+        assert_eq!(app.input.text(), "\n\n");
+        assert!(app.chat.is_empty(), "a modified Enter must not send");
     }
 
     fn test_app(label: &str) -> (App, Receiver<Msg>) {
