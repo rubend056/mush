@@ -2446,6 +2446,130 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// The same rule, end to end: the root delegates, parks in `wait_agents`,
+    /// the human types, and the model answers their words in that run — while
+    /// the child is still working, not after it finishes.
+    ///
+    /// The child is held inside a real shell command that waits for a file the
+    /// test only writes at the very end, so "the answer came back while the
+    /// child still ran" is proven by that file's absence rather than by a race.
+    #[test]
+    fn a_human_message_reaches_a_root_napping_on_wait_agents() {
+        let root = std::env::temp_dir().join(format!("mush-wake-e2e-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let gate = root.join("open-the-gate");
+        let block = format!(
+            "while [ ! -f {} ]; do sleep 0.05; done; echo released",
+            gate.display()
+        );
+
+        let scripted = Arc::new(
+            Scripted::new()
+                // The root: delegate, then wait on the child for a long time.
+                .when(|asked: &Asked| asked.depth().is_none() && !asked.saw("spawned agent"))
+                .calls(vec![tool_call(
+                    "c0",
+                    "spawn_agent",
+                    json!({ "brief": "hold the gate until the test opens it" }),
+                )])
+                .when(|asked: &Asked| asked.depth().is_none() && !asked.saw("what about the tests"))
+                .calls(vec![tool_call(
+                    "c1",
+                    "wait_agents",
+                    json!({ "timeout": 60 }),
+                )])
+                // Woken by the child's own result, after the human was served.
+                .when(|asked: &Asked| asked.depth().is_none() && asked.saw("#1 done"))
+                .says("thanks — carrying on")
+                // Only reachable if the human's words arrived during this run.
+                .when(|asked: &Asked| asked.depth().is_none())
+                .says("answered the human")
+                // The child: really block, then report.
+                .when(|asked: &Asked| asked.depth() == Some(1) && !asked.saw("released"))
+                .calls(vec![tool_call(
+                    "k0",
+                    "run_command",
+                    json!({ "command": block }),
+                )])
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .says("gate opened"),
+        );
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            tx,
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user("delegate, then wait for it".to_string()),
+            ]))
+            .unwrap();
+
+        // The wait is in flight once the root's second request carries the
+        // spawn result — the request whose answer calls `wait_agents`.
+        let parked = |needle: &str| {
+            let asked = scripted.asked();
+            asked
+                .iter()
+                .any(|ask| ask.depth().is_none() && ask.saw(needle))
+        };
+        let deadline = Instant::now() + WAIT;
+        while !parked("spawned agent") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            parked("spawned agent"),
+            "the root never asked for the wait: {:?}",
+            scripted.asked().len()
+        );
+
+        let started = Instant::now();
+        root_tx
+            .send(AgentMsg::Nudge("what about the tests?".into()))
+            .unwrap();
+
+        let deadline = Instant::now() + WAIT;
+        while !parked("what about the tests") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            parked("what about the tests"),
+            "a message must reach the model during the run, not at the wait's end: {:?}",
+            scripted
+                .asked()
+                .iter()
+                .map(|ask| (ask.depth(), ask.messages.len()))
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            !gate.exists(),
+            "the child was still blocked in its command when the human was answered"
+        );
+        assert!(
+            started.elapsed() < WAIT,
+            "answered promptly, not at the 60 s wait ({:?})",
+            started.elapsed()
+        );
+
+        // The human's words are what the model answered, in this run.
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&rx, WAIT, |seen| seen.done >= 1),
+            "the interrupted run must finish so the answer is delivered: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+
+        // Let the child go, then take the tree down.
+        fs::write(&gate, "go").unwrap();
+        let _ = root_tx.send(AgentMsg::Shutdown);
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// The bug this guards: re-queuing a parked nudge into the actor's own
     /// mailbox spins forever, because `my_tx` *is* the queue being drained.
     #[test]
