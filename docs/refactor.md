@@ -1,9 +1,10 @@
 # mush — refactor plan: seams and owners
 
-> Status: **in progress.** Wave 0 (**Stage 0**: `transcript.rs`, `text.rs`) has
-> landed on master, and the delegation-honesty family below (N1, N3–N6) is closed.
-> Stages 1–3 are untouched. The plan still says "not yet started" further down
-> where it describes the *findings pass* sequencing — that part is history.
+> Status: **Stage 0 complete.** All four moves are on master: `transcript.rs`,
+> `text.rs`, `ToolName` and the git verbs. The delegation-honesty family below
+> (N1, N3–N6) is closed. Stages 1–3 are untouched. The plan still says "not yet
+> started" further down where it describes the *findings pass* sequencing — that
+> part is history.
 >
 > Written 2026-09-17 against `d4f80ae` plus the
 > in-flight findings pass (`input.rs`, `config.rs`, `git.rs`, `http.rs`,
@@ -215,6 +216,27 @@ built-in one cannot get different semantics.
 messages, the binary is about this session's UI. (If the editor does not come
 back, skip it.)
 
+**Landed (Stage 0).** Three notes where the tree ended up differing from the
+table above, so Stage 1 starts from what is really there:
+
+- `ToolName` is real: `tools::ToolName::{as_str, parse, ALL, ORCHESTRATION}`,
+  with `TOOL_NAMES` derived from `ALL` and `prompt::tool_schemas` keyed by the
+  variant. `TOOL_NAMES` was *not* made a compile-time error to extend — the
+  schema table's own test is what keeps a new tool from being forgotten.
+- The git verbs are module-level functions in `git.rs` (`WORKTREE_DIR`,
+  `worktree_path`, `branch_name`, `worktree_id`, `Worktree` + `worktrees`/
+  `parse_worktrees`, `has_commits`, `worktree_add`, `commit_all`), not a `Git`
+  newtype: every caller already names a directory first, so a struct would hold
+  one field and add ceremony, not an invariant. `git::run` is the one mutating
+  invocation style and `git` (private) the one read-only one; `agent.rs`'s
+  `git_output` copy is gone. The subject of an isolated agent's commit is still
+  built in `agent.rs` (`commit_subject`), because that is where the id, brief and
+  outcome are.
+- `app.rs` has no `exec_tool` and no editor pane, so 3.4's "triplicated" is now
+  two dispatchers (`agent::exec_tool` for orchestration + shell,
+  `agent::direct_tool` for the four file tools); `ToolHost` in Stage 1 is a move
+  of the second one, not a merge of three.
+
 ---
 
 ## 4. The four seams
@@ -246,10 +268,12 @@ both**; every stage ends green on the existing gate (`cargo fmt --all --check`,
 `cargo clippy --all-targets -- -D warnings`, `cargo test`, the pty resize and
 cancel scenarios).
 
-**Stage 0 — moves only.** `transcript.rs`, then `text.rs`, `ToolName`, git verbs.
-~700 lines leave `agent.rs`, ~250 leave `ui.rs`/`app.rs`, no behavior change, tests move
-with the code. *Done when* the new modules' tests are the old tests and the gate
-is green with no assertion edits.
+**Stage 0 — moves only.** ✅ 
+`transcript.rs`, then `text.rs`, `ToolName`, git verbs. ~700 lines left `agent.rs`,
+~250 left `ui.rs`/`app.rs`, no behavior change, tests moved with the code. *Done
+when* the new modules' tests are the old tests and the gate is green with no
+assertion edits — both held (the two later commits added tests; no existing
+assertion was edited).
 
 **Stage 1 — one owner per fact.** `AgentTree`, then `Chat`, then `ConfigCell`,
 each landing with the transition rules as unit tests, including a regression per
