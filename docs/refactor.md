@@ -281,11 +281,13 @@ finding in its row of §6. *Done when* nothing outside `tree.rs` writes
 `node.phase`, `node.summary`, `focused` or `agent_cursor`, `busy` is a method,
 and the context meter is a method.
 
-**Stage 2 — the seams.** Rewrite the four `#[ignore]`d actor tests in-process and
+**Stage 2 — the seams.** ✅ Rewrite the `#[ignore]`d actor tests in-process and
 delete `scripts/mock_llm.py` from the test path (keep it for the pty smoke
 scenarios if they still want a scripted model). *Done when* the default suite
 needs no socket, no subprocess and no sleep over 50 ms, and `--ignored` contains
-only live-endpoint tests.
+only live-endpoint tests — held: the five actor scenarios it used to hold (five,
+not the four this line claimed) run in the default suite, and `--ignored` is now
+exactly the two live-endpoint tests in `http.rs`.
 
 **Stage 2.1 — `ModelClient`.** ✅ `crates/mush/src/model.rs` holds one trait
 (`chat(&ChatRequest, &AtomicBool) -> Result<ChatResponse, ModelError>`), the
@@ -298,8 +300,26 @@ whole tree (and one scripted client can too). `run_loop` and `compact_history`
 go through it with every branch and every error string unchanged; `http.rs` is
 untouched. Three in-process tests: a scripted run that runs its tool call and
 ends with the answer, the learned-context retry, and a cancellation mid-reply.
-**Still open (2.2):** the `#[ignore]`d actor tests — the plan above says four,
-the tree has five — their `start_mock*` helpers, and `scripts/mock_llm.py`.
+
+**Stage 2.2 — the `#[ignore]`d actor tests.** ✅ All five now run in process on
+`fake::Scripted`. A scripted reply may say which request it answers (the depth
+in the system prompt picks the asker, what the transcript holds picks the turn),
+because a tree's actors ask concurrently, and may be held open until the test
+releases it — which is what makes "the nudge arrived while the reply was in
+flight" and "the parent's turn ended before its child finished" facts rather
+than races. The work stayed real: git worktrees, files, the commit, the merge
+and the discard the UI advertises, and one `write_file` per turn in the
+turn-limit scenario. The tests now wait on the `Done`/`Compact`/`Message` events
+they assert on instead of polling for a file, and each one asserts what it
+pinned before — the child's work on `mush/1` in `.mush/wt/1`, `mush/2` based on
+`mush/1`, the folded summary as the next request's only user message, the nudge
+in the second request, a wrap-up summary rather than a bare failure. Gone with
+them: `start_mock*`, `stop_mock`, the four port constants (18731–18735), the
+`python3` readiness probe, and every sleep over 20 ms in these tests.
+`scripts/mock_llm.py` stays in the tree for the pty smoke scenarios; no test
+refers to it. The only surface the production code grew is `#[cfg(test)]`:
+`agent::spawn_scripted`, which starts the same root actor over a caller-supplied
+client.
 
 **Stage 3 — `Screen` view and intents.** `ui::draw(frame, &Screen)` where
 `Screen` is built by `App::screen()`; panes become pure functions of a value, so
@@ -389,9 +409,11 @@ When this lands, `docs/mush.md` wants:
   crate must *replace* hand-rolled code that drifted, not sit beside it.
 - §9: **M2.75 — Seams** before M2.8, with the stage list from §5 and the
   acceptance test from §0.
-- §10: replace "deterministic orchestration needs `python3` and `git`" with "the
-  default suite needs neither a socket, a subprocess, nor a sleep", once Stage 2
-  is done.
+- §10: **done** — "deterministic orchestration needs `python3` and `git`" became
+  "the model is scripted; the work is real", with the default suite needing
+  neither a socket, a subprocess, nor a sleep, once Stage 2 was done.
+- §0's acceptance test: **held** for the default suite, whose only remaining
+  `#[ignore]`s are the two live-endpoint tests in `http.rs`.
 - §12: two decisions — "one owner per fact" and "a trait is justified only by a
   fake that a test actually uses".
 
