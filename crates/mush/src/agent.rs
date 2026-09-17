@@ -639,11 +639,20 @@ fn wait_for_work(
         // Idle: block until there is something to do. A stray Stop carries no
         // work, so it just means waiting again.
         loop {
-            // A `/compact` folded in below — or left over from a run that
-            // ended before it reached a boundary — is honoured here rather
-            // than in the run that follows, because there is no run: the
-            // human asked for a summary, not for an answer turn. The actor
-            // folds its conversation and goes back to waiting.
+            // A command parked *while a run was in flight* is folded in here,
+            // before waiting: that run may have ended without reaching a
+            // message boundary (a cancel mid-tool-call does), and a parked
+            // command that waits for the human's *next* message is a command
+            // they watched do nothing — a `/compact` whose status line never
+            // ends, or words they typed that nobody reads until later.
+            match fold_parked(state, transcript) {
+                Some(Fold::End) => return false,
+                Some(Fold::Run) => break,
+                _ => {}
+            }
+            // The human asked for a fold now. Not work to answer, so not a run:
+            // the flag is honoured here, and by the next turn of a run already
+            // in flight.
             if state.compact_requested {
                 compact_now(actor, state, transcript);
                 if state.shutdown {
@@ -696,8 +705,30 @@ fn run_cancel(state: &mut ActorState) -> Arc<AtomicBool> {
     Arc::new(AtomicBool::new(std::mem::take(&mut state.stop_requested)))
 }
 
+/// Fold every command a run parked in `state.deferred`, in order, and report
+/// what the last one meant for an actor that is now idle.
+///
+/// `None` is "nothing was parked". A `Run` is why this returns anything else:
+/// words the human typed, or a completion that arrived, are work to answer even
+/// though the run they interrupted is over.
+fn fold_parked(state: &mut ActorState, transcript: &mut Vec<Message>) -> Option<Fold> {
+    if state.deferred.is_empty() {
+        return None;
+    }
+    let parked = std::mem::take(&mut state.deferred);
+    let mut last = Fold::Idle;
+    for command in parked {
+        match absorb(state, transcript, command) {
+            Fold::End => return Some(Fold::End),
+            Fold::Run => last = Fold::Run,
+            Fold::Idle => {}
+        }
+    }
+    Some(last)
+}
+
 /// What a command means for an actor that is not running.
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Fold {
     /// Folded in; stay idle.
     Idle,
@@ -2976,6 +3007,120 @@ mod tests {
         // Never zero, however tiny the window: a request for no reply is not a
         // request.
         assert_eq!(reply_cap(&window(512)), 1_024);
+    }
+
+    /// A command parked while a run was in flight must not wait for the
+    /// human's *next* message: a run can end without reaching a boundary (a
+    /// cancel mid-tool-call does), and then the actor is idle with the human's
+    /// words — or their `/compact` — sitting in `deferred`.
+    #[test]
+    fn a_command_parked_by_a_finished_run_is_folded_in_at_once() {
+        let (actor, _mailbox) = test_actor("fold-parked");
+        let mut state = ActorState::default();
+        let mut messages = vec![Message::system("you are mush")];
+        assert_eq!(
+            fold_parked(&mut state, &mut messages),
+            None,
+            "nothing parked is not a reason to wake"
+        );
+
+        // A `/compact` parked mid-tool-call: a fold to do, not a run to start.
+        state.deferred.push(AgentMsg::Compact);
+        assert_eq!(fold_parked(&mut state, &mut messages), Some(Fold::Idle));
+        assert!(state.compact_requested, "the request survives the fold");
+        assert!(state.deferred.is_empty(), "and is not folded twice");
+
+        // The human's words are work to answer, so they start a run.
+        state.compact_requested = false;
+        state
+            .deferred
+            .push(AgentMsg::Nudge("are you there?".into()));
+        assert_eq!(fold_parked(&mut state, &mut messages), Some(Fold::Run));
+        assert_eq!(messages.last().unwrap().text(), "are you there?");
+
+        // A shutdown outranks whatever was parked behind it.
+        state
+            .deferred
+            .push(AgentMsg::Nudge("one more thing".into()));
+        state.deferred.push(AgentMsg::Shutdown);
+        assert_eq!(fold_parked(&mut state, &mut messages), Some(Fold::End));
+
+        // A stray Stop is not work, and must not wake anyone.
+        state.deferred.push(AgentMsg::Stop);
+        assert_eq!(fold_parked(&mut state, &mut messages), Some(Fold::Idle));
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The stall `fold_parked` closes, through the real actor loop.
+    ///
+    /// The vehicle matters. A cancel usually reaches the run at a message
+    /// boundary, where everything parked is folded in first — but not when it
+    /// lands while a *model call* is in flight: that path drains, sees the
+    /// Stop, and drops the stale reply, returning with the parked `/compact`
+    /// still in `deferred`. The actor is idle then, and must fold there rather
+    /// than wait for the human's next message.
+    #[test]
+    fn a_compact_parked_by_a_cancelled_reply_still_folds() {
+        let root = std::env::temp_dir().join(format!("mush-compact-parked-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let summary = "folded after the cancel";
+        // The first reply is held inside the model call, so the test can act
+        // while it is genuinely in flight.
+        let gate = Arc::new(Gate::new());
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary)
+                .when(|asked: &Asked| asked.depth().is_none())
+                .held(gate.clone())
+                .says("a reply the human cancelled"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("say something"),
+                Message::assistant("something"),
+                Message::user("and again"),
+            ]))
+            .unwrap();
+
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the first request never reached the model"
+        );
+        // Both arrive while the model is thinking: the cancel is honoured as
+        // soon as the reply comes back, and the fold is left parked.
+        root_tx.send(AgentMsg::Compact).unwrap();
+        root_tx.send(AgentMsg::Stop).unwrap();
+        gate.release();
+
+        let folded = |events: &Recorder| {
+            events
+                .events_for(AgentId::ROOT)
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Compact { summary } if summary == summary))
+        };
+        let deadline = Instant::now() + WAIT;
+        while !folded(&events) && Instant::now() < deadline {
+            let _ = events.wait(Duration::from_millis(50));
+        }
+        assert!(
+            folded(&events),
+            "a /compact parked by the cancelled reply must fold once the actor is idle: {:?}",
+            events.events_for(AgentId::ROOT)
+        );
+
+        let _ = root_tx.send(AgentMsg::Shutdown);
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The bug this guards: re-queuing a parked nudge into the actor's own
