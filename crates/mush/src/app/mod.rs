@@ -3836,6 +3836,41 @@ mod tests {
         assert!(help.contains("/compact"), "{help}");
     }
 
+    /// `/help` renders the same key table `mush --help` does, so a human who
+    /// learns the keyboard from the notice can discover every binding instead
+    /// of the six the old hand-written line named — and discover the keys that
+    /// really scroll (finding K3), not a wheel mush never takes.
+    #[test]
+    fn help_names_the_whole_key_table() {
+        let (mut app, _rx) = test_app("keys-help");
+        run(&mut app, "/help");
+        let help = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .map(|notice| notice.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        for want in [
+            "j / k, ↑ / ↓",
+            "focus the selected agent",
+            "cancel the selected agent",
+            "back to the root agent",
+            "←",
+            "→",
+            "Ctrl-Q",
+            "↑ / ↓, PgUp / PgDn",
+        ] {
+            assert!(
+                help.contains(want),
+                "`{want}` is missing from /help:\n{help}"
+            );
+        }
+        assert!(
+            !help.contains("wheel"),
+            "a wheel it does not scroll:\n{help}"
+        );
+    }
+
     /// `←`/`→` in the agents pane walk the tree by its parent links, over the
     /// *painted* pre-order rows, not the storage order (finding U10): from a
     /// great-grandchild `←` reaches the root one ancestor per press, `→` walks

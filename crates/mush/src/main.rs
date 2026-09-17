@@ -836,10 +836,15 @@ mod tests {
             help.contains(&keys),
             "the key table is not in --help:\n{help}"
         );
-        // The tree walk the human asked for is named here too.
-        for want in ["←", "→"] {
+        // The tree walk the human asked for is named here too, and the real
+        // scroll keys — not the wheel mush never takes (finding K3).
+        for want in ["←", "→", "↑ / ↓, PgUp / PgDn"] {
             assert!(help.contains(want), "`{want}` is missing:\n{help}");
         }
+        assert!(
+            !help.contains("wheel"),
+            "a wheel it does not scroll:\n{help}"
+        );
 
         // And the command table, so `/compact`-style absence cannot return.
         let commands = app::commands::table(&mush_core::provider::names_piped());

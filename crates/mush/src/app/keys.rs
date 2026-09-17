@@ -188,7 +188,7 @@ pub const KEYS: &[Binding] = &[
     },
     Binding {
         context: Context::Chat,
-        keys: "wheel",
+        keys: "↑ / ↓, PgUp / PgDn",
         help: "scroll the transcript",
     },
     Binding {
@@ -700,6 +700,50 @@ mod tests {
         assert_eq!(
             at(Focus::Chat, false, none(KeyCode::Right)),
             Intent::Chat(ChatKey::Right)
+        );
+    }
+
+    /// The help both surfaces print comes from [`KEYS`], so this is where a
+    /// binding can be lost: every row must be in the rendered table, each
+    /// context must head its rows once, and the real scroll keys — not the
+    /// wheel the terminal never sends, because mouse capture is not taken
+    /// (finding K3) — must be the ones named.
+    #[test]
+    fn the_help_table_shows_every_binding_once() {
+        let table = help_table();
+        for binding in KEYS {
+            assert!(!binding.keys.is_empty(), "a row with no keys");
+            assert!(
+                table.contains(binding.keys),
+                "{} is missing from the help table:\n{table}",
+                binding.keys
+            );
+            assert!(
+                table.contains(binding.help),
+                "{} is missing from the help table:\n{table}",
+                binding.help
+            );
+        }
+        for context in [
+            Context::Anywhere,
+            Context::Picker,
+            Context::Agents,
+            Context::Chat,
+        ] {
+            assert_eq!(
+                table.matches(context.label()).count(),
+                1,
+                "{:?} does not head its rows exactly once:\n{table}",
+                context
+            );
+        }
+        assert!(
+            table.contains("↑ / ↓, PgUp / PgDn"),
+            "the transcript's real scroll keys are named:\n{table}"
+        );
+        assert!(
+            !table.contains("wheel"),
+            "`--help` advertised a wheel it never scrolls:\n{table}"
         );
     }
 }
