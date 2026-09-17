@@ -2380,21 +2380,23 @@ fn run_command(
             .map_err(|held| Refused::Machine(held).message(actor.id))?;
     }
     // `detach: true` asks for a job from the start: the model knows it started
-    // a server, and waiting sixty seconds to be told so is not an answer.
-    let spawned = actor
-        .ctx
-        .machine
-        .spawn(&ShellCommand {
-            command,
-            root: actor.ws.root(),
-        })
-        .map_err(|error| {
-            if exclusive {
-                registry.release_machine(actor.id);
-            }
-            error
-        })?;
+    // a server, and waiting sixty seconds to be told so is not an answer. This
+    // is the *only* path that spawns here — every other command is spawned once,
+    // by `run_shell`, which is the thing that watches it.
     if detach {
+        let spawned = actor
+            .ctx
+            .machine
+            .spawn(&ShellCommand {
+                command,
+                root: actor.ws.root(),
+            })
+            .map_err(|error| {
+                if exclusive {
+                    registry.release_machine(actor.id);
+                }
+                error
+            })?;
         let id = detach_now(actor, &registry, command, exclusive, spawned)?;
         state.running_jobs.insert(id);
         return Ok(detached_line(id));
@@ -4477,6 +4479,75 @@ mod tests {
             json!({ "id": 1, "action": "poke" })
         )
         .is_err());
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A foreground `run_command` is *one* command. It used to be two: the tool
+    /// box spawned a process to hand to the registry and the foreground path
+    /// spawned its own, so every side-effecting command (a `git` write, an `rm`,
+    /// a migration) ran twice — and the first copy belonged to nobody, so
+    /// `kill_all` could not reach it and it outlived mush.
+    ///
+    /// This one is a real `sh`, because the thing being asserted is that only
+    /// one process is started: the fake machine counts spawns, and this counts
+    /// side effects on disk.
+    #[test]
+    fn a_foreground_run_command_runs_the_command_once() {
+        let (actor, _mailbox) = test_actor("run-once");
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let hits = actor.ws.root().join("hits");
+        // The foreground copy is the one that sleeps, so a second copy that
+        // nobody waited for has certainly written before this returns.
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": format!("echo hit >> {} && sleep 0.2", hits.display()) }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(report.contains("[exit 0]"), "{report}");
+        assert_eq!(
+            fs::read_to_string(&hits).unwrap(),
+            "hit\n",
+            "the command ran exactly once"
+        );
+        assert_eq!(
+            actor.ctx.registry.running(),
+            0,
+            "and nothing was left over as a job"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The same fact without a subprocess: a foreground `run_command` asks the
+    /// machine for one job. The fake machine refuses to invent a script for a
+    /// second spawn, so a double start fails loudly rather than silently.
+    #[test]
+    fn a_foreground_run_command_spawns_one_job() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::exits(0).says("ok")));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("one-spawn", machine.clone(), clock);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "make" }),
+            &cancel,
+        )
+        .unwrap();
+
+        assert!(report.contains("ok"), "{report}");
+        assert_eq!(
+            machine.spawned(),
+            vec!["make".to_string()],
+            "one command, not two"
+        );
+        assert_eq!(actor.ctx.registry.running(), 0);
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
