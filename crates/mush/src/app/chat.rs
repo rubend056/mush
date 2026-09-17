@@ -400,14 +400,14 @@ impl Chat {
         }
         trim_trailing_blanks(&mut lines);
 
-        let start = if lines.len() >= want {
-            // There is more above, so what was built already *is* the window.
-            0
-        } else {
-            // The whole transcript fits: the original top-index arithmetic.
-            let max_scroll = lines.len().saturating_sub(height);
-            max_scroll.saturating_sub(self.scroll.min(max_scroll))
-        };
+        // Anchor the window at the bottom: the newest `height` rows, with
+        // `scroll` rows of older ones above them. Building backwards means the
+        // last chunk can overshoot `want`, so the window cannot be assumed to
+        // be exactly `want` rows — deriving the start from what was built is
+        // the only arithmetic that is right in both cases. Taking `0` when it
+        // overshot painted the *oldest* rows of the window, which made a
+        // message taller than the pane freeze the view and hide its own end.
+        let start = lines.len().saturating_sub(height + self.scroll);
         lines.into_iter().skip(start).take(height).collect()
     }
 
@@ -671,6 +671,56 @@ mod tests {
             "a plain Enter must reach the agents"
         );
         assert!(!chat.key(key(KeyCode::Tab)), "and so must the pane keys");
+    }
+
+    /// A message taller than the pane must show its *end*, not its start: the
+    /// pane is anchored at the bottom (scroll 0), so the newest rows are the
+    /// ones a human is looking for — and with scroll 0 there is no other way to
+    /// reach them.
+    #[test]
+    fn a_message_taller_than_the_pane_shows_its_end() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::user("aaaa bbbb cccc dddd"));
+        let pane = pane(AgentId::ROOT);
+        let one = chat.visible_lines(&pane, 5, 1);
+        assert_eq!(one.len(), 1);
+        assert!(
+            one[0].to_string().contains("dddd"),
+            "the last row of the message, not its first: {:?}",
+            one[0].to_string()
+        );
+
+        // A tall reply under a short one: the reply's own end, again.
+        chat.push_message(AgentId::ROOT, Message::assistant("aaaa bbbb cccc dddd"));
+        let two = chat.visible_lines(&pane, 5, 2);
+        let painted: Vec<String> = two.iter().map(|line| line.to_string()).collect();
+        assert_eq!(painted.len(), 2);
+        assert!(
+            painted.last().unwrap().contains("dddd"),
+            "the newest row is the message's end: {painted:?}"
+        );
+    }
+
+    /// Scrolling up moves the window without changing its size, and the bottom
+    /// stays reachable at 0.
+    #[test]
+    fn scrolling_moves_the_window_not_its_size() {
+        let mut chat = Chat::bare();
+        for index in 0..6 {
+            chat.push_message(AgentId::ROOT, Message::user(format!("line {index}")));
+        }
+        let pane = pane(AgentId::ROOT);
+        let bottom = chat.visible_lines(&pane, 40, 3);
+        let text: Vec<String> = bottom.iter().map(|l| l.to_string()).collect();
+        assert!(text.last().unwrap().contains("line 5"), "{text:?}");
+
+        chat.scroll_by(2);
+        let scrolled = chat.visible_lines(&pane, 40, 3);
+        assert_eq!(scrolled.len(), 3, "the window is the pane's height");
+        assert!(
+            scrolled[0].to_string() != text[0],
+            "scrolling showed older rows"
+        );
     }
 
     /// A notice belongs to one agent: a root failure must not be painted into a

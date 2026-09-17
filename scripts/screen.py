@@ -190,6 +190,12 @@ class Screen:
                 for x in range(self.x, min(self.cols, self.x + first)):
                     self.grid[self.y][x] = " "
 
+        # A terminal clamps the cursor to the screen, whatever a program asks
+        # for: `\x1b[999;1H` puts it on the last row. Without this the next
+        # character was silently dropped by the writer's bounds check, so the
+        # review tool hid a whole paint instead of showing it on the bottom row.
+        self.clamp()
+
     def text(self) -> str:
         return "\n".join("".join(row).rstrip() for row in self.grid)
 
@@ -343,14 +349,22 @@ def self_test() -> int:
     screen = painted(b"\x1b[2J\x1b[1;1Ha\x1b[1;3Hc")
     check("cursor addressing paints where it says", screen.text().splitlines()[0] == "a c")
 
-    screen = painted(b"\x1b[999;1H\x1b[X")
-    check("a row past the bottom is clamped, not a crash", screen.text() != "")
+    screen = painted(b"\x1b[999;1Hx")
+    check(
+        "a row past the bottom is clamped onto the last one",
+        screen.text().splitlines()[-1] == "x",
+        repr(screen.text()),
+    )
 
     screen = Screen(20, 20)
     screen.feed(b"\x1b[15;5H")
     screen.resize(20, 5)
-    screen.feed(b"\x1b[X")
-    check("a shrink under a low cursor does not crash", screen.text() != "")
+    screen.feed(b"x")
+    check(
+        "a shrink under a low cursor paints on the last row",
+        screen.text().splitlines()[-1].strip() == "x",
+        repr(screen.text()),
+    )
 
     screen = painted(b"\x1b[2;3H\x1b[Kfilled")
     lines = screen.text().splitlines()

@@ -703,9 +703,14 @@ fn absorb(state: &mut ActorState, transcript: &mut Vec<Message>, command: AgentM
             // hand the model the same words twice at the next boundary. (That is
             // the cancelled-run case: the run ended before the nudge was folded
             // in, and the human has since written again.)
+            // A `Run` is parked here for the same reason a nudge is: the
+            // transcript it carries has already replaced ours, so re-folding it
+            // would hand the model the human's words twice — and the stale copy
+            // would land *after* the newer transcript, reading as the newest
+            // message.
             state
                 .deferred
-                .retain(|command| !matches!(command, AgentMsg::Nudge(_)));
+                .retain(|command| !matches!(command, AgentMsg::Nudge(_) | AgentMsg::Run(_)));
             // The human may have typed while a tool batch was running, which
             // puts their words between an assistant's calls and their results;
             // strict servers reject that shape.

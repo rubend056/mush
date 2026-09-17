@@ -305,6 +305,14 @@ impl App {
 
     /// Adopt a repository read that finished on its own thread.
     fn adopt_git(&mut self, stats: HashMap<AgentId, git::Stat>, status: Option<git::RepoStatus>) {
+        // A reap can land between the read and this adoption (`/forget`, or a
+        // stale leftover going away), and the row title sums every entry: a
+        // stat for an id with no node would be counted as a ghost. The tree
+        // owns which ids exist, so ask it rather than trusting the snapshot.
+        let stats = stats
+            .into_iter()
+            .filter(|(id, _)| self.tree.has(*id))
+            .collect();
         self.tree.agent_stats = stats;
         self.git = status;
         self.git_at = Some(Instant::now());
