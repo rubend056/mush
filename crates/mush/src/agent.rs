@@ -2146,6 +2146,9 @@ mod tests {
     use crate::machine::fake::{Script, Scripted as ScriptedMachine};
     use crate::model::fake::{tool_call, Asked, Gate, Scripted};
     use mush_core::config::{ReasoningEffort, ThinkingMode};
+    // The fold's trigger is core's formula, not this file's: the test below
+    // crosses it instead of restating it.
+    use mush_core::transcript::compaction_trigger;
     use mush_core::{FunctionCall, ToolCall};
     use serde_json::json;
     use std::fs;
@@ -4290,7 +4293,7 @@ mod tests {
         ];
         let mut total: usize = messages.iter().map(Message::weight).sum();
         let mut index = 0;
-        while total <= budget * 3 / 4 {
+        while total <= compaction_trigger(budget) {
             let assistant = Message::assistant(format!("reply {index} {}", "x".repeat(280)));
             let user = Message::user(format!("again {index}"));
             total += assistant.weight() + user.weight();
@@ -4299,7 +4302,7 @@ mod tests {
             index += 1;
         }
         assert!(
-            total > budget * 3 / 4 && total <= budget,
+            total > compaction_trigger(budget) && total <= budget,
             "test transcript must sit in the compaction window (total {total}, budget {budget})"
         );
         root_tx.send(AgentMsg::Run(messages)).unwrap();

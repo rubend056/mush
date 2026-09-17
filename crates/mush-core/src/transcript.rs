@@ -32,13 +32,35 @@ changed, open issues, and the current state. This summary replaces the \
 conversation, so include every fact the task still depends on. Reply with \
 just the summary, as plain text, and end your turn: call no tool.";
 
+/// The history size at which compaction fires: three quarters of the budget,
+/// in bytes.
+///
+/// `budget_bytes` is the same unit [`Message::weight`] counts and the same unit
+/// [`Config::history_budget`](crate::config::Config::history_budget) returns —
+/// the bytes-per-token conversion lives there, once, and is saturating too. The
+/// multiply saturates rather than wrapping, because nothing downstream can
+/// tell a budget that was never converted from one that was: `usize::MAX` from
+/// a caller that forgot the conversion (or a window a hostile endpoint
+/// advertised) would otherwise wrap `* 3` down to nearly nothing and mark a
+/// two-message transcript as needing a fold.
+pub fn compaction_trigger(budget_bytes: usize) -> usize {
+    budget_bytes.saturating_mul(3) / 4
+}
+
 /// Approaching the context window: fold the conversation into a summary
 /// instead of dropping old turns, so long-running tasks keep their state. The
 /// summarize request re-sends the history, so only fire while it still fits;
 /// beyond that, trimming stays the last resort.
-pub fn needs_compaction(messages: &[Message], budget: usize) -> bool {
+///
+/// `budget_bytes` is in bytes, the unit [`Message::weight`] weighs a transcript
+/// in. The lower bound is strict — a transcript *at* the trigger is not yet
+/// worth folding — and the upper one is inclusive: a transcript at exactly the
+/// whole budget is still one the summarize request can carry, and anything past
+/// it belongs to [`trim_history`], which drops turns instead of asking a model
+/// to read history the endpoint would reject.
+pub fn needs_compaction(messages: &[Message], budget_bytes: usize) -> bool {
     let history: usize = messages.iter().map(Message::weight).sum();
-    history > budget * 3 / 4 && history <= budget
+    history > compaction_trigger(budget_bytes) && history <= budget_bytes
 }
 
 /// A transcript adopted from the UI can interleave the human's steering with a
@@ -169,6 +191,66 @@ pub fn trim_history(messages: &mut Vec<Message>, budget: usize) {
 mod tests {
     use super::*;
     use crate::{FunctionCall, ToolCall};
+
+    /// A one-message transcript weighing exactly `weight` bytes. `Message::weight`
+    /// counts the role plus the text, so the text is sized to land on the
+    /// number instead of being padded until the assertion happens to hold.
+    fn transcript_of_weight(weight: usize) -> Vec<Message> {
+        vec![Message::user("x".repeat(weight - "user".len()))]
+    }
+
+    /// The trigger is computed, not written a second time: three quarters of
+    /// the budget, saturating.
+    #[test]
+    fn the_trigger_is_three_quarters_of_the_budget() {
+        assert_eq!(compaction_trigger(0), 0);
+        assert_eq!(compaction_trigger(1_000), 750);
+        assert_eq!(compaction_trigger(7_501), 5_625);
+    }
+
+    /// A budget that is not bytes at all — `usize::MAX`, what a caller that
+    /// skipped the bytes-per-token conversion in `Config::history_budget`
+    /// hands over — must neither panic nor lie. `budget * 3 / 4` panicked here
+    /// in a debug build, and in a release one it wrapped: at
+    /// `6_148_914_691_236_517_206` three times the budget wraps to 2, so the
+    /// old expression returned 0 and marked *every* transcript, however small,
+    /// as needing a fold. Saturating, the trigger stays a quarter of the
+    /// budget and an ordinary transcript is nowhere near it.
+    #[test]
+    fn a_nonsense_budget_does_not_wrap_the_trigger_to_zero() {
+        assert_eq!(compaction_trigger(usize::MAX), usize::MAX / 4);
+        assert_eq!(
+            compaction_trigger(6_148_914_691_236_517_206),
+            usize::MAX / 4
+        );
+        let messages = vec![Message::system("you are mush"), Message::user("task")];
+        assert!(!needs_compaction(&messages, usize::MAX));
+        assert!(!needs_compaction(&messages, 6_148_914_691_236_517_206));
+    }
+
+    /// The fold fires strictly past the trigger: one byte over folds, and the
+    /// trigger itself — the boundary the comparison has always had — does not,
+    /// so a transcript parked exactly on it is not re-summarized forever.
+    #[test]
+    fn compaction_fires_one_byte_past_the_trigger_and_not_at_it() {
+        let budget = 1_000;
+        let trigger = compaction_trigger(budget);
+        assert!(!needs_compaction(&transcript_of_weight(trigger), budget));
+        assert!(needs_compaction(&transcript_of_weight(trigger + 1), budget));
+    }
+
+    /// Past the whole budget the fold must not fire: the summarize request
+    /// re-sends the history, and one the endpoint will reject is not a
+    /// summary, it is a failed request. Trimming is what handles that range.
+    #[test]
+    fn a_transcript_past_the_whole_budget_does_not_fold() {
+        let budget = 1_000;
+        assert!(needs_compaction(
+            &transcript_of_weight(compaction_trigger(budget) + 1),
+            budget
+        ));
+        assert!(!needs_compaction(&transcript_of_weight(budget + 1), budget));
+    }
 
     #[test]
     fn trim_history_keeps_recent_turns_and_pairs() {
