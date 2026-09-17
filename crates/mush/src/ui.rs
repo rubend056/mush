@@ -308,7 +308,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     // hidden behind a one-line window. It stops growing so the transcript keeps
     // the screen.
     const MAX_INPUT_LINES: u16 = 6;
-    let input_lines = (app.input.line_count() as u16).clamp(1, MAX_INPUT_LINES);
+    let input_lines = (app.chat.input().line_count() as u16).clamp(1, MAX_INPUT_LINES);
     let rows =
         Layout::vertical([Constraint::Min(3), Constraint::Length(input_lines + 2)]).split(area);
 
@@ -334,7 +334,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         // which is where the transcript is anchored. Building the whole
         // scrollback to display forty lines cost 55 ms a frame on a long
         // session, and `tick` repaints every frame while an agent works.
-        let want = height + app.chat_scroll;
+        let want = height + app.chat.scrollback();
         let mut lines = transcript_tail(app, messages, width, want);
         trim_trailing_blanks(&mut lines);
         let start = if lines.len() >= want {
@@ -343,7 +343,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             // The whole transcript fits: the original top-index arithmetic.
             let max_scroll = lines.len().saturating_sub(height);
-            max_scroll.saturating_sub(app.chat_scroll.min(max_scroll))
+            max_scroll.saturating_sub(app.chat.scrollback().min(max_scroll))
         };
         let visible: Vec<Line> = lines.into_iter().skip(start).take(height).collect();
         frame.render_widget(Paragraph::new(Text::from(visible)), inner);
@@ -368,7 +368,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         // the human is editing is always the part on screen. Multi-line drafts
         // are painted line by line, so the cursor's own line is the one kept in
         // view.
-        let (lines, cursor_row, column) = app.input.view(input_inner.height as usize, field);
+        let (lines, cursor_row, column) = app.chat.input().view(input_inner.height as usize, field);
         let mut rendered: Vec<Line> = Vec::with_capacity(lines.len());
         for (index, line) in lines.into_iter().enumerate() {
             let (lead, style) = if index == 0 {
@@ -403,16 +403,8 @@ fn trim_trailing_blanks(lines: &mut Vec<Line<'static>>) {
 /// The transcript the chat pane shows: the root's conversation by default,
 /// otherwise the focused agent's.
 fn focused_messages(app: &App) -> &[Message] {
-    if app.tree.focused == AgentId::ROOT {
-        &app.chat
-    } else {
-        app.tree
-            .transcript(app.tree.focused)
-            .unwrap_or(EMPTY_MESSAGES)
-    }
+    app.chat.transcript(app.tree.focused)
 }
-
-const EMPTY_MESSAGES: &[Message] = &[];
 
 /// A centered modal list for `/model` and `/provider`. The current selection
 /// is marked with a bullet; Enter picks, Esc cancels.
@@ -588,7 +580,8 @@ fn transcript_tail(
     // Notices are tagged with the agent they concern, so a root-level failure
     // is not painted into a focused child's transcript (finding B19).
     let notices: Vec<&crate::app::Notice> = app
-        .notices
+        .chat
+        .notices()
         .iter()
         .filter(|notice| notice.agent == app.tree.focused)
         .collect();

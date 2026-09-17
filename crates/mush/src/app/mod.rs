@@ -5,12 +5,15 @@
 //! the focused transcript, the git facts, and the message box. Every input — a
 //! keystroke, an agent event — becomes a `Msg` and flows through `App::update`.
 //!
-//! The agents themselves live in [`tree`], which owns their ids, phases, focus
-//! and per-id maps; this module routes messages into it and renders what it
-//! says.
+//! The agents themselves live in [`tree`], which owns their ids, phases and
+//! focus; the conversation lives in [`chat`], which owns every transcript the
+//! screen shows, the notices, the message box and the context meter. This
+//! module routes messages into both and renders what they say.
 
+mod chat;
 mod tree;
 
+pub use chat::{Chat, Notice, NoticeKind};
 pub use tree::{AgentId, AgentNode, AgentTree, ConversationId, Existing, Landed, Phase, Spawn};
 
 use std::collections::HashMap;
@@ -28,7 +31,6 @@ use mush_core::{
 
 use crate::agent::{self, spawn, AgentEvent, AgentMsg, RootHandle};
 use crate::http;
-use crate::input::Input;
 
 pub enum Msg {
     Key(KeyEvent),
@@ -121,34 +123,13 @@ pub struct Status {
     pub set_at: Instant,
 }
 
-/// A line for the transcript that is not a message: a note from mush itself.
-/// It is tagged with the agent it concerns, so a root-level failure is not
-/// rendered into every child's transcript (finding B19).
-#[derive(Clone, Debug)]
-pub struct Notice {
-    pub agent: AgentId,
-    pub kind: NoticeKind,
-    pub text: String,
-}
-
-/// Only failures are red. Hints — `/help`, the git command to merge a branch —
-/// are information, and colouring them like errors is how a screen cries wolf.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum NoticeKind {
-    Info,
-    Error,
-}
-
 pub struct App {
     pub ws: Workspace,
     pub cfg: Config,
     pub focus: Focus,
-    pub chat: Vec<Message>,
-    pub notices: Vec<Notice>,
-    /// The message box: text plus a grapheme cursor, so editing is not
-    /// append-and-backspace.
-    pub input: Input,
-    pub chat_scroll: usize,
+    /// The conversation: the transcripts the screen shows, the notices, the
+    /// message box and the context meter, in one value.
+    pub chat: Chat,
     pub models: Vec<http::Model>,
     pub picker: Option<Picker>,
     /// The main worktree's branch, dirty count, and uncommitted line delta.
@@ -174,7 +155,6 @@ pub struct App {
     pub should_quit: bool,
     pub dirty_screen: bool,
     pub spin: u64,
-    system: Message,
 }
 
 impl App {
@@ -187,7 +167,7 @@ impl App {
         models: Vec<http::Model>,
     ) -> Self {
         let system = Message::system(prompt::system_prompt(&ws.root_str()));
-        let (chat, stored_agents) = match stored {
+        let (messages, stored_agents) = match stored {
             Some(session) => (session.messages, session.agents),
             None => (Vec::new(), Vec::new()),
         };
@@ -196,10 +176,7 @@ impl App {
             ws,
             cfg,
             focus: Focus::Chat,
-            chat,
-            notices: Vec::new(),
-            input: Input::default(),
-            chat_scroll: 0,
+            chat: Chat::new(system, messages),
             models,
             picker: None,
             git: None,
@@ -213,7 +190,6 @@ impl App {
             should_quit: false,
             dirty_screen: true,
             spin: 0,
-            system,
         };
         app.restore_agents(stored_agents);
         app.discover_worktrees();
@@ -278,9 +254,11 @@ impl App {
                 summary: agent.summary,
                 leftover: agent.leftover,
                 landed,
-                messages: agent.messages,
                 tx: Some(tx),
             });
+            // What it said in the previous conversation is where it resumes.
+            self.chat
+                .replace_transcript(AgentId(agent.id), agent.messages);
         }
         self.tree.repair_focus();
     }
@@ -342,8 +320,13 @@ impl App {
     /// How many tokens the root conversation is holding, roughly (the same
     /// three-bytes-per-token heuristic the trimmer uses).
     fn count_context(&mut self) {
-        self.context_used =
-            self.chat.iter().map(Message::weight).sum::<usize>() + self.system.weight();
+        self.context_used = self
+            .chat
+            .transcript(AgentId::ROOT)
+            .iter()
+            .map(Message::weight)
+            .sum::<usize>()
+            + self.chat.system().weight();
     }
 
     /// The window in tokens, for the meter.
@@ -421,7 +404,6 @@ impl App {
                 summary: Some(summary.to_string()),
                 leftover: true,
                 landed: None,
-                messages: Vec::new(),
                 tx: None,
             });
         }
@@ -440,7 +422,7 @@ impl App {
                 if self.picker.is_none() {
                     // Terminals disagree about line endings in a paste.
                     let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                    self.input.insert(&text);
+                    self.chat.insert(&text);
                 }
             }
             Msg::Key(key) => self.on_key(key),
@@ -503,7 +485,7 @@ impl App {
                 branch,
                 cmd,
             } => {
-                self.tree.insert(Spawn {
+                let opened = self.tree.insert(Spawn {
                     id: AgentId(child),
                     parent: AgentId(parent),
                     brief,
@@ -511,6 +493,9 @@ impl App {
                     branch,
                     cmd,
                 });
+                // The brief opens the child's transcript: the model sees the
+                // brief, so the human should too (finding B13).
+                self.chat.push_message(opened.id, opened.opening);
             }
             AgentEvent::Running { cancel } => {
                 // A run started, possibly one the UI did not ask for (an idle
@@ -529,18 +514,16 @@ impl App {
                 // A limit the run reached (it still produced a result), or a
                 // reply that was empty: a line in the transcript, tagged with
                 // the agent it concerns (finding B19).
-                self.note_for(id, text);
-                self.chat_scroll = 0;
+                self.chat.note_for(id, text);
+                self.chat.scroll_to_bottom();
             }
             AgentEvent::Message(message) => {
+                self.chat.push_message(id, message);
                 if id == AgentId::ROOT {
-                    self.chat.push(message);
                     self.count_context();
                     self.save_session();
-                } else {
-                    self.tree.push_message(id, message);
                 }
-                self.chat_scroll = 0;
+                self.chat.scroll_to_bottom();
             }
             AgentEvent::Stopped => {
                 // Stopped is not failed and not done: the run produced nothing,
@@ -553,13 +536,13 @@ impl App {
                 if id == self.tree.focused {
                     self.say(format!("agent #{id} stopped — send a message to resume it"));
                 }
-                self.chat_scroll = 0;
+                self.chat.scroll_to_bottom();
             }
             AgentEvent::Error(error) => {
                 self.tree.fail(id, error.clone());
                 self.refresh_git();
-                self.note_error_for(id, error);
-                self.chat_scroll = 0;
+                self.chat.note_error_for(id, error);
+                self.chat.scroll_to_bottom();
             }
             AgentEvent::Done => {
                 let summary = self.last_assistant_text(id);
@@ -583,15 +566,14 @@ impl App {
                 // mirror it so nudges, saves, and the visible chat stay in
                 // sync with what the model actually sees.
                 let carried = Message::user(prompt::compaction_message(&summary));
+                self.chat.replace_transcript(id, vec![carried]);
                 if id == AgentId::ROOT {
-                    self.chat = vec![carried];
                     self.count_context();
                     self.save_session();
-                    self.note("context compacted — continuing from a summary");
-                } else {
-                    self.tree.replace_transcript(id, vec![carried]);
+                    self.chat
+                        .note("context compacted — continuing from a summary");
                 }
-                self.chat_scroll = 0;
+                self.chat.scroll_to_bottom();
             }
         }
     }
@@ -609,32 +591,6 @@ impl App {
             kind: StatusKind::Info,
             text: text.into(),
             set_at: Instant::now(),
-        });
-    }
-
-    /// A line for the transcript that is not a message: a hint, or a failure.
-    /// It concerns the root conversation unless tagged otherwise.
-    pub fn note(&mut self, text: impl Into<String>) {
-        self.note_for(AgentId::ROOT, text);
-    }
-
-    pub fn note_for(&mut self, agent: AgentId, text: impl Into<String>) {
-        self.notices.push(Notice {
-            agent,
-            kind: NoticeKind::Info,
-            text: text.into(),
-        });
-    }
-
-    pub fn note_error(&mut self, text: impl Into<String>) {
-        self.note_error_for(AgentId::ROOT, text);
-    }
-
-    pub fn note_error_for(&mut self, agent: AgentId, text: impl Into<String>) {
-        self.notices.push(Notice {
-            agent,
-            kind: NoticeKind::Error,
-            text: text.into(),
         });
     }
 
@@ -711,12 +667,8 @@ impl App {
 
     /// The last assistant reply in an agent's transcript (its final summary).
     fn last_assistant_text(&self, id: AgentId) -> Option<String> {
-        let messages: &[Message] = if id == AgentId::ROOT {
-            &self.chat
-        } else {
-            self.tree.transcript(id)?
-        };
-        messages
+        self.chat
+            .transcript(id)
             .iter()
             .rev()
             .find(|message| message.role == "assistant")
@@ -727,7 +679,7 @@ impl App {
     // ------------------------------------------------------------- chat / LLM
 
     fn send_message(&mut self) {
-        let text = self.input.take().trim().to_string();
+        let text = self.chat.take_input().trim().to_string();
         if text.is_empty() {
             return;
         }
@@ -739,11 +691,10 @@ impl App {
         if target == AgentId::ROOT {
             // The human's words belong in the transcript they can see, whether
             // the root is starting a run or already in one.
-            self.chat.push(Message::user(text.clone()));
-            // The meter counts the root's conversation, the human's own words
-            // included (finding B8).
+            self.chat
+                .push_message(AgentId::ROOT, Message::user(text.clone()));
             self.count_context();
-            self.chat_scroll = 0;
+            self.chat.scroll_to_bottom();
             self.save_session();
             // The root's own phase, not the tree's: a napping orchestrator is
             // idle, and its next message starts a run rather than nudging a
@@ -769,9 +720,7 @@ impl App {
                 }
                 self.tree.idle(AgentId::ROOT);
             }
-            let mut messages = Vec::with_capacity(self.chat.len() + 1);
-            messages.push(self.system.clone());
-            messages.extend(self.chat.iter().cloned());
+            let messages = self.chat.conversation();
             match self.tree.agent_tx.get(&AgentId::ROOT) {
                 Some(tx) if tx.send(AgentMsg::Run(messages)).is_ok() => {
                     // The run starts now as far as the human is concerned; the
@@ -788,7 +737,7 @@ impl App {
             // If the mailbox is gone the node's phase is put back exactly as it
             // was, instead of leaving a lie on the row (finding B10).
             let previous = self.tree.nudge(target);
-            self.tree.push_message(target, Message::user(text.clone()));
+            self.chat.push_message(target, Message::user(text.clone()));
             match self.tree.agent_tx.get(&target) {
                 Some(tx) if tx.send(AgentMsg::Nudge(text)).is_ok() => {}
                 _ => {
@@ -808,7 +757,7 @@ impl App {
             "/new" | "/clear" => self.new_chat(),
             "/quit" | "/q" => self.should_quit = true,
             "/help" | "/?" => {
-                self.note(
+                self.chat.note(
                     "mush: Tab cycles agents/chat · Enter sends to the focused agent · \
                      Ctrl-P pick a model · Ctrl-N new chat · \
                      Ctrl-C stops the focused agent · Ctrl-X stops them all. \
@@ -919,7 +868,7 @@ impl App {
                     )
                 });
             }
-            other => self.note_error(format!("unknown command: {other}")),
+            other => self.chat.note_error(format!("unknown command: {other}")),
         }
     }
 
@@ -1122,7 +1071,7 @@ impl App {
         if command == "/diff" {
             let text = format!("git diff HEAD...{branch}");
             self.say(text.clone());
-            self.note(text);
+            self.chat.note(text);
             return;
         }
         if let Some(landed) = landed {
@@ -1167,7 +1116,8 @@ impl App {
                         Err(error) => format!("branch kept: {error}"),
                     };
                     self.tree.land(id, Landed::Merged);
-                    self.note(format!("merged {branch} into HEAD · {branch_note}"));
+                    self.chat
+                        .note(format!("merged {branch} into HEAD · {branch_note}"));
                     self.refresh_git();
                     self.save_session();
                 }
@@ -1191,7 +1141,7 @@ impl App {
                     self.fail(format!("cannot discard agent #{id}: {outcome}"));
                 } else {
                     self.tree.land(id, Landed::Discarded);
-                    self.note(format!(
+                    self.chat.note(format!(
                         "discarded agent #{id} — its work is gone · {outcome}"
                     ));
                     self.refresh_git();
@@ -1225,8 +1175,9 @@ impl App {
         }
         let unmerged = node.branch.clone().filter(|_| node.landed.is_none());
         self.tree.reap(&[id]);
+        self.chat.forget(id);
         match unmerged {
-            Some(branch) => self.note(format!(
+            Some(branch) => self.chat.note(format!(
                 "forgot agent #{id} — {branch} is untouched, so /worktrees lists it again"
             )),
             None => self.say(format!("forgot agent #{id}")),
@@ -1255,8 +1206,6 @@ impl App {
         // Running agents vanish with the old conversation; worktrees they left
         // behind are still reviewable (they are re-listed below).
         self.chat.clear();
-        self.notices.clear();
-        self.chat_scroll = 0;
         self.spin = 0;
         self.discover_worktrees();
         self.count_context();
@@ -1307,16 +1256,12 @@ impl App {
                 // The system prompt is regenerated on the way back in, since it
                 // names a workspace that may have moved.
                 messages: self
-                    .tree
+                    .chat
                     .transcript(node.id)
-                    .map(|messages| {
-                        messages
-                            .iter()
-                            .filter(|message| message.role != "system")
-                            .cloned()
-                            .collect()
-                    })
-                    .unwrap_or_default(),
+                    .iter()
+                    .filter(|message| message.role != "system")
+                    .cloned()
+                    .collect(),
             })
             .collect();
         let session = Session {
@@ -1328,17 +1273,12 @@ impl App {
             // one is re-read next time, so it cannot go stale.
             context: self.cfg.context_explicit.then_some(self.cfg.context_tokens),
             updated: session::now_secs(),
-            messages: self.chat.clone(),
+            messages: self.chat.transcript(AgentId::ROOT).to_vec(),
             agents,
         };
         if let Err(error) = session.save(self.ws.root()) {
             self.fail(format!("could not save session: {error}"));
         }
-    }
-
-    pub fn scroll_chat(&mut self, delta: i64) {
-        let next = self.chat_scroll as i64 + delta;
-        self.chat_scroll = next.max(0) as usize;
     }
 
     // ------------------------------------------------------------------ input
@@ -1348,7 +1288,6 @@ impl App {
             return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
-        let alt = key.modifiers.contains(KeyModifiers::ALT);
 
         if ctrl {
             match key.code {
@@ -1374,7 +1313,7 @@ impl App {
 
         match self.focus {
             Focus::Agents => self.key_agents(key),
-            Focus::Chat => self.key_chat(key, ctrl, alt),
+            Focus::Chat => self.key_chat(key),
         }
     }
 
@@ -1504,32 +1443,17 @@ impl App {
         }
     }
 
-    /// The message box: a plain text field with a real cursor, so a long
-    /// prompt can be edited instead of backspaced away.
-    fn key_chat(&mut self, key: KeyEvent, ctrl: bool, alt: bool) {
-        match key.code {
-            // A new line instead of sending. Only terminals that report the
-            // modifier can deliver Shift+Enter (kitty, WezTerm, foot, Ghostty,
-            // recent Alacritty); elsewhere it arrives as a plain Enter, which is
-            // why Alt+Enter does the same thing and is the reliable one.
-            KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) || alt => {
-                self.input.insert("\n")
-            }
-            KeyCode::Enter => self.send_message(),
-            KeyCode::Backspace => self.input.backspace(),
-            KeyCode::Delete => self.input.delete_forward(),
-            KeyCode::Left => self.input.move_left(),
-            KeyCode::Right => self.input.move_right(),
-            KeyCode::Home => self.input.move_home(),
-            KeyCode::End => self.input.move_end(),
-            KeyCode::Char(c) if !ctrl && !alt => self.input.insert(&c.to_string()),
-            KeyCode::Up => self.scroll_chat(1),
-            KeyCode::Down => self.scroll_chat(-1),
-            KeyCode::PageUp => self.scroll_chat(10),
-            KeyCode::PageDown => self.scroll_chat(-10),
-            KeyCode::Esc => self.input.clear(),
-            _ => {}
+    /// The chat pane's keys: the message box and the transcript's scrollback
+    /// belong to the [`Chat`], so they are routed to it whole. `<Enter>` is the
+    /// one key it cannot own: sending is the agents' business.
+    fn key_chat(&mut self, key: KeyEvent) {
+        let modified = key.modifiers.contains(KeyModifiers::SHIFT)
+            || key.modifiers.contains(KeyModifiers::ALT);
+        if key.code == KeyCode::Enter && !modified {
+            self.send_message();
+            return;
         }
+        let _ = self.chat.key(key);
     }
 }
 
@@ -1751,13 +1675,16 @@ mod tests {
         let root = repo("forget");
         isolated_work(&root, 6, "leave me");
         let mut app = app_at(root.clone());
-        app.tree
+        app.chat
             .replace_transcript(AgentId(6), vec![Message::user("hello")]);
 
         app.forget_agent(AgentId(6));
 
         assert!(app.tree.agents.iter().all(|node| node.id != AgentId(6)));
-        assert!(!app.tree.agent_msgs.contains_key(&AgentId(6)));
+        assert!(
+            app.chat.transcript(AgentId(6)).is_empty(),
+            "its transcript goes with it"
+        );
         assert!(
             root.join(".mush/wt/6").exists(),
             "forgetting is not discarding"
@@ -1837,8 +1764,8 @@ mod tests {
         assert_eq!(node.summary.as_deref(), Some("finished it"));
         // The transcript is what makes a follow-up possible: without it the
         // human is back to writing the brief from scratch.
-        assert_eq!(app.tree.agent_msgs[&AgentId(2)].len(), 2);
-        assert_eq!(app.tree.agent_msgs[&AgentId(2)][1].text(), "done");
+        assert_eq!(app.chat.transcript(AgentId(2)).len(), 2);
+        assert_eq!(app.chat.transcript(AgentId(2))[1].text(), "done");
         // A live mailbox: a follow-up is delivered rather than dropped, which is
         // what "revive" has to mean to be worth anything.
         let tx_to_child = app
@@ -1863,8 +1790,11 @@ mod tests {
         app.focus = Focus::Chat;
         app.update(Msg::Paste("line one\r\nline two\n".into()));
         // Line endings are normalised, and the whole paste arrives at once.
-        assert_eq!(app.input.text(), "line one\nline two\n");
-        assert!(app.chat.is_empty(), "a paste is not a send");
+        assert_eq!(app.chat.input().text(), "line one\nline two\n");
+        assert!(
+            app.chat.transcript(AgentId::ROOT).is_empty(),
+            "a paste is not a send"
+        );
     }
 
     /// Enter sends; Shift+Enter and Alt+Enter start a new line instead, so a
@@ -1876,8 +1806,11 @@ mod tests {
         for modifiers in [KeyModifiers::SHIFT, KeyModifiers::ALT] {
             app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, modifiers)));
         }
-        assert_eq!(app.input.text(), "\n\n");
-        assert!(app.chat.is_empty(), "a modified Enter must not send");
+        assert_eq!(app.chat.input().text(), "\n\n");
+        assert!(
+            app.chat.transcript(AgentId::ROOT).is_empty(),
+            "a modified Enter must not send"
+        );
     }
 
     /// How long one frame costs on a session the size of a real one. A frame
@@ -1891,11 +1824,16 @@ mod tests {
         // Roughly what a long session looks like: hundreds of messages, with
         // multi-kilobyte tool results in among them.
         for i in 0..300 {
-            app.chat.push(Message::user(format!("message {i}")));
             app.chat
-                .push(Message::assistant("a reply a few words long"));
-            app.chat
-                .push(Message::tool(format!("c{i}"), "x".repeat(2000)));
+                .push_message(AgentId::ROOT, Message::user(format!("message {i}")));
+            app.chat.push_message(
+                AgentId::ROOT,
+                Message::assistant("a reply a few words long"),
+            );
+            app.chat.push_message(
+                AgentId::ROOT,
+                Message::tool(format!("c{i}"), "x".repeat(2000)),
+            );
         }
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
         terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
@@ -1939,18 +1877,18 @@ mod tests {
     #[test]
     fn slash_new_restarts_the_root_and_clears_the_conversation() {
         let (mut app, _rx) = test_app("new");
-        app.chat.push(Message::user("an old task"));
-        app.notices.push(Notice {
-            agent: AgentId::ROOT,
-            kind: NoticeKind::Info,
-            text: "old noise".to_string(),
-        });
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("an old task"));
+        app.chat.note_for(AgentId::ROOT, "old noise");
         let before = app.cfg_shared.clone();
 
         app.run_command("/new");
 
-        assert!(app.chat.is_empty(), "the conversation is gone");
-        assert!(app.notices.is_empty(), "notices are gone");
+        assert!(
+            app.chat.transcript(AgentId::ROOT).is_empty(),
+            "the conversation is gone"
+        );
+        assert!(app.chat.notices().is_empty(), "notices are gone");
         assert_eq!(app.tree.agents.len(), 1, "the tree is reset to the root");
         assert!(!app.busy());
         // The respawned root owns a fresh config cell and the UI adopted it;
@@ -1959,7 +1897,7 @@ mod tests {
 
         // Its mailbox is alive, so the next message starts a run instead of
         // reporting that the root is gone.
-        app.input.insert("hello");
+        app.chat.insert("hello");
         app.send_message();
         assert!(app.busy());
         assert_eq!(app.tree.agents[0].phase, Phase::Thinking);
@@ -1974,7 +1912,8 @@ mod tests {
         let abandoned = app.tree.conversation();
         app.run_command("/new");
         assert_ne!(app.tree.conversation(), abandoned, "a new conversation tag");
-        app.chat.push(Message::user("current work"));
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("current work"));
 
         app.update(Msg::Agent {
             conversation: abandoned,
@@ -1988,14 +1927,22 @@ mod tests {
                 summary: "stale summary".to_string(),
             },
         });
-        assert_eq!(app.chat.len(), 1, "the stale reply and summary are dropped");
+        assert_eq!(
+            app.chat.transcript(AgentId::ROOT).len(),
+            1,
+            "the stale reply and summary are dropped"
+        );
 
         app.update(Msg::Agent {
             conversation: app.tree.conversation(),
             id: AgentId::ROOT,
             event: AgentEvent::Message(Message::assistant("fresh reply")),
         });
-        assert_eq!(app.chat.len(), 2, "the live conversation still lands");
+        assert_eq!(
+            app.chat.transcript(AgentId::ROOT).len(),
+            2,
+            "the live conversation still lands"
+        );
     }
 
     /// A steering message sent while the root is busy is folded into the run,
@@ -2004,12 +1951,19 @@ mod tests {
     fn steering_text_is_echoed_in_the_chat() {
         let (mut app, _rx) = test_app("steer");
         app.tree.begin(AgentId::ROOT, None);
-        app.input.insert("also rename the module");
+        app.chat.insert("also rename the module");
 
         app.send_message();
 
-        assert_eq!(app.chat.len(), 1, "the steering message is echoed");
-        assert_eq!(app.chat[0].text(), "also rename the module");
+        assert_eq!(
+            app.chat.transcript(AgentId::ROOT).len(),
+            1,
+            "the steering message is echoed"
+        );
+        assert_eq!(
+            app.chat.transcript(AgentId::ROOT)[0].text(),
+            "also rename the module"
+        );
         assert_eq!(text_of(&app), "noted — folded in as the agent continues");
     }
 
@@ -2019,8 +1973,7 @@ mod tests {
     fn the_context_meter_counts_the_human_message() {
         let (mut app, _rx) = test_app("meter");
         let before = app.context_used_tokens();
-        app.input
-            .insert("a question long enough to weigh something");
+        app.chat.insert("a question long enough to weigh something");
         app.send_message();
         assert!(
             app.context_used_tokens() > before,
@@ -2048,7 +2001,7 @@ mod tests {
             .finish(AgentId(1), Some("did the work".to_string()));
         app.tree.agent_tx.remove(&AgentId(1));
         app.tree.focus(AgentId(1));
-        app.input.insert("one more thing");
+        app.chat.insert("one more thing");
 
         app.send_message();
 
@@ -2101,7 +2054,7 @@ mod tests {
             "nothing running · Ctrl-Q quits · Ctrl-N starts a new chat"
         );
 
-        app.input.insert("hello");
+        app.chat.insert("hello");
         app.send_message();
         assert_eq!(
             app.tree.agents[0].phase,
@@ -2380,7 +2333,7 @@ mod tests {
                 cmd: crossbeam_channel::unbounded().0,
             },
         });
-        let messages = &app.tree.agent_msgs[&AgentId(1)];
+        let messages = app.chat.transcript(AgentId(1));
         assert_eq!(messages.len(), 1, "the brief opens the transcript");
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].text(), "count the lexer tokens");
@@ -2392,7 +2345,8 @@ mod tests {
     fn a_rows_summary_follows_the_latest_run() {
         let (mut app, _rx) = test_app("summary");
         let conversation = app.tree.conversation();
-        app.chat.push(Message::assistant("first result"));
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("first result"));
         app.update(Msg::Agent {
             conversation,
             id: AgentId::ROOT,
@@ -2410,7 +2364,8 @@ mod tests {
             app.tree.agents[0].summary, None,
             "a new run clears the old one"
         );
-        app.chat.push(Message::assistant("second result"));
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("second result"));
         app.update(Msg::Agent {
             conversation,
             id: AgentId::ROOT,

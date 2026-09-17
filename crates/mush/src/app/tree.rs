@@ -2,10 +2,11 @@
 //!
 //! Every fact about an agent's life lives here — which ids exist, what each one
 //! is doing now, what it produced, which mailbox steers it, where the focus and
-//! the cursor are. "There is a node with id N" and "there is a transcript,
-//! mailbox, cancel flag and stat for N" therefore cannot disagree, and a phase
-//! only ever moves through a transition this module defines: `app::mod` routes
-//! events into these methods, it never writes a node's fields itself.
+//! the cursor are. "There is a node with id N" and "there is a mailbox, cancel
+//! flag and stat for N" therefore cannot disagree, and a phase only ever moves
+//! through a transition this module defines: `app::mod` routes events into
+//! these methods, it never writes a node's fields itself. What each agent has
+//! said is not here: that is the conversation, and it lives in [`super::chat`].
 
 use std::collections::HashMap;
 use std::fmt;
@@ -126,9 +127,19 @@ pub struct Spawn {
     pub cmd: Sender<AgentMsg>,
 }
 
+/// A child that now exists: the row the tree gave it, and the line that opens
+/// its transcript. The brief is that line — the model sees the brief, so the
+/// human should too (finding B13) — and the conversation is handed it with
+/// [`super::chat::Chat::push_message`], because the text of a conversation is
+/// not the tree's to keep.
+pub struct Opened {
+    pub id: AgentId,
+    pub opening: Message,
+}
+
 /// A node that already exists outside this session: an agent restored from a
-/// stored session (with its transcript and a live mailbox) or a leftover
-/// worktree found on disk (with neither).
+/// stored session (with a live mailbox) or a leftover worktree found on disk
+/// (with none).
 pub struct Existing {
     pub id: AgentId,
     pub parent: Option<AgentId>,
@@ -139,7 +150,6 @@ pub struct Existing {
     pub summary: Option<String>,
     pub leftover: bool,
     pub landed: Option<Landed>,
-    pub messages: Vec<Message>,
     pub tx: Option<Sender<AgentMsg>>,
 }
 
@@ -158,8 +168,6 @@ pub struct AgentTree {
     /// The agent whose transcript the chat shows and whose mailbox typing
     /// targets.
     pub focused: AgentId,
-    /// Transcripts of non-root agents; the root's lives in the chat.
-    pub agent_msgs: HashMap<AgentId, Vec<Message>>,
     /// Steering handles: one mailbox per agent, keyed by id.
     pub agent_tx: HashMap<AgentId, Sender<AgentMsg>>,
     /// Each running agent's cancellation flag. The HTTP reader polls it, so a
@@ -223,7 +231,6 @@ impl AgentTree {
             agents: Vec::new(),
             agent_cursor: 0,
             focused: AgentId::ROOT,
-            agent_msgs: HashMap::new(),
             agent_tx: HashMap::from([(AgentId::ROOT, tx)]),
             agent_cancel: HashMap::new(),
             agent_stats: HashMap::new(),
@@ -272,17 +279,15 @@ impl AgentTree {
 
     /// A child actor now exists. It is thinking (its parent just started it),
     /// it has no summary of its own yet, and its brief opens its transcript:
-    /// the model sees the brief, so the human should too (finding B13).
-    pub fn insert(&mut self, spawn: Spawn) -> AgentId {
+    /// the model sees the brief, so the human should too (finding B13). The
+    /// opening line is handed back rather than stored: transcripts belong to
+    /// the conversation, not to the tree.
+    pub fn insert(&mut self, spawn: Spawn) -> Opened {
         let opening = if spawn.brief.trim().is_empty() {
             "Begin the task now.".to_string()
         } else {
             spawn.brief.clone()
         };
-        self.agent_msgs
-            .entry(spawn.id)
-            .or_default()
-            .push(Message::user(opening));
         self.agent_tx.insert(spawn.id, spawn.cmd);
         self.agents.push(AgentNode {
             id: spawn.id,
@@ -296,7 +301,10 @@ impl AgentTree {
             leftover: false,
             landed: None,
         });
-        spawn.id
+        Opened {
+            id: spawn.id,
+            opening: Message::user(opening),
+        }
     }
 
     /// Adopt a node that already exists: a subagent restored from a stored
@@ -306,7 +314,6 @@ impl AgentTree {
         if let Some(tx) = node.tx {
             self.agent_tx.insert(node.id, tx);
         }
-        self.agent_msgs.insert(node.id, node.messages);
         self.agents.push(AgentNode {
             id: node.id,
             parent: node.parent,
@@ -485,7 +492,6 @@ impl AgentTree {
         }
         self.agents.retain(|node| !gone.contains(&node.id));
         for id in gone {
-            self.agent_msgs.remove(id);
             // Dropping the last sender ends the actor: an idle agent whose
             // mailbox is gone has nothing left to wait for.
             self.agent_tx.remove(id);
@@ -568,21 +574,6 @@ impl AgentTree {
             .unwrap_or(false)
     }
 
-    /// Append a line to an agent's transcript.
-    pub fn push_message(&mut self, id: AgentId, message: Message) {
-        self.agent_msgs.entry(id).or_default().push(message);
-    }
-
-    /// Replace an agent's transcript: context compaction leaves
-    /// `[system, user(summary)]` and nothing else.
-    pub fn replace_transcript(&mut self, id: AgentId, messages: Vec<Message>) {
-        self.agent_msgs.insert(id, messages);
-    }
-
-    pub fn transcript(&self, id: AgentId) -> Option<&[Message]> {
-        self.agent_msgs.get(&id).map(Vec::as_slice)
-    }
-
     /// Age a node, so the tests that assert a rendered age do not have to wait.
     #[cfg(test)]
     pub fn age(&mut self, id: AgentId, by: Duration) {
@@ -600,9 +591,9 @@ mod tests {
     /// A child with a live mailbox (the receive half is kept alive by the
     /// caller), so the rules about a mailbox that is really there can be told
     /// apart from the ones about a mailbox that is not.
-    fn child(tree: &mut AgentTree, id: u64) -> (AgentId, Receiver<AgentMsg>) {
+    fn child(tree: &mut AgentTree, id: u64) -> (Opened, Receiver<AgentMsg>) {
         let (tx, rx) = crossbeam_channel::unbounded::<AgentMsg>();
-        let id = tree.insert(Spawn {
+        let opened = tree.insert(Spawn {
             id: AgentId(id),
             parent: AgentId::ROOT,
             brief: "lexer".to_string(),
@@ -610,7 +601,7 @@ mod tests {
             branch: None,
             cmd: tx,
         });
-        (id, rx)
+        (opened, rx)
     }
 
     fn leftover(id: u64) -> Existing {
@@ -624,7 +615,6 @@ mod tests {
             summary: Some("found on startup".to_string()),
             leftover: true,
             landed: None,
-            messages: Vec::new(),
             tx: None,
         }
     }
@@ -634,7 +624,8 @@ mod tests {
     #[test]
     fn an_inserted_child_is_thinking_with_its_brief_as_the_opening_line() {
         let mut tree = AgentTree::bare();
-        let (id, _rx) = child(&mut tree, 1);
+        let (opened, _rx) = child(&mut tree, 1);
+        let id = opened.id;
 
         let node = tree.node(id).unwrap();
         assert_eq!(node.phase, Phase::Thinking);
@@ -642,7 +633,10 @@ mod tests {
         assert_eq!(node.depth, 1);
         assert!(!node.leftover);
         assert_eq!(node.summary, None);
-        assert_eq!(tree.transcript(id).unwrap()[0].text(), "lexer");
+        // The brief is the opening line of the child's transcript, and it is
+        // handed to the conversation rather than stored here (finding B13).
+        assert_eq!(opened.opening.role, "user");
+        assert_eq!(opened.opening.text(), "lexer");
         assert!(tree.busy());
     }
 
@@ -653,7 +647,8 @@ mod tests {
         let mut tree = AgentTree::bare();
         assert!(!tree.busy(), "an idle root is not work");
 
-        let (id, _rx) = child(&mut tree, 1);
+        let (opened, _rx) = child(&mut tree, 1);
+        let id = opened.id;
         assert!(tree.busy());
 
         tree.finish(id, Some("done".to_string()));
@@ -674,7 +669,8 @@ mod tests {
     #[test]
     fn a_status_after_the_run_ended_is_ignored() {
         let mut tree = AgentTree::bare();
-        let (id, _rx) = child(&mut tree, 1);
+        let (opened, _rx) = child(&mut tree, 1);
+        let id = opened.id;
 
         tree.activity(id, "edit_file src/lex.rs");
         assert_eq!(
@@ -742,7 +738,8 @@ mod tests {
     #[test]
     fn a_nudge_that_cannot_be_delivered_restores_the_previous_phase() {
         let mut tree = AgentTree::bare();
-        let (id, _rx) = child(&mut tree, 1);
+        let (opened, _rx) = child(&mut tree, 1);
+        let id = opened.id;
         tree.finish(id, Some("did the work".to_string()));
         // The actor is gone: its mailbox went with it, so the nudge cannot land.
         tree.agent_tx.remove(&id);
@@ -797,7 +794,7 @@ mod tests {
         let mut tree = AgentTree::bare();
         let (kept, _kept_rx) = child(&mut tree, 1);
         let (gone, _gone_rx) = child(&mut tree, 2);
-        tree.push_message(gone, Message::user("a follow-up"));
+        let (kept, gone) = (kept.id, gone.id);
         tree.agent_stats.insert(gone, git::Stat::default());
         tree.focus(gone);
         tree.cursor_bottom();
@@ -812,7 +809,6 @@ mod tests {
             "the focus cannot stay on a ghost"
         );
         assert_eq!(tree.cursor(), tree.agents.len().saturating_sub(1));
-        assert!(!tree.agent_msgs.contains_key(&gone));
         assert!(!tree.agent_tx.contains_key(&gone));
         assert!(!tree.agent_stats.contains_key(&gone));
     }
@@ -823,7 +819,8 @@ mod tests {
     #[test]
     fn a_cancel_that_cannot_be_heard_marks_the_row_stopped() {
         let mut tree = AgentTree::bare();
-        let (id, rx) = child(&mut tree, 1);
+        let (opened, rx) = child(&mut tree, 1);
+        let id = opened.id;
 
         assert!(tree.cancel_requested(id), "a live mailbox hears the Stop");
         assert!(matches!(rx.try_recv(), Ok(AgentMsg::Stop)));
@@ -839,7 +836,8 @@ mod tests {
     #[test]
     fn a_cancel_that_is_never_acknowledged_goes_quiet() {
         let mut tree = AgentTree::bare();
-        let (id, _rx) = child(&mut tree, 1);
+        let (opened, _rx) = child(&mut tree, 1);
+        let id = opened.id;
         tree.cancel_requested(id);
 
         tree.age(id, Duration::from_secs(11));
@@ -857,7 +855,8 @@ mod tests {
     fn the_cursor_stays_inside_the_tree() {
         let mut tree = AgentTree::bare();
         child(&mut tree, 1);
-        let (id, _rx) = child(&mut tree, 2);
+        let (opened, _rx) = child(&mut tree, 2);
+        let id = opened.id;
 
         tree.move_cursor(1);
         assert_eq!(tree.cursor(), 1);
