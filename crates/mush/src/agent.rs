@@ -285,8 +285,16 @@ pub enum AgentMsg {
     /// Adopt these messages and run. The actor keeps the transcript, so later
     /// nudges continue the same conversation.
     Run(Vec<Message>),
-    /// Append a user message; if idle, run again.
+    /// Append a user message the human typed; if idle, run again. The UI echoed
+    /// these words before sending them, so the actor folds them in without
+    /// telling it to add them again.
     Nudge(String),
+    /// A steering message from another agent — what `agent_control message`
+    /// sends (`docs/findings.md` B22). It is the same kind of work as a nudge
+    /// and travels the same roads, but it is *not* the human's own typing: the
+    /// UI has never seen these words, so the actor emits the line as it folds
+    /// them in, and the human can read what their model was told.
+    Steer(String),
     /// Fold this agent's conversation into a summary now, instead of waiting
     /// for the window to fill (`/compact`). A summarize request and a
     /// transcript replacement, not work to answer: an idle agent does it at
@@ -994,6 +1002,13 @@ fn absorb(
         }
         AgentMsg::Nudge(text) => {
             transcript.push(Message::user(text));
+            Fold::Run
+        }
+        // A parent's steering: work to answer, like a nudge, and told to the UI
+        // like a completion — the human has no other way to see the words their
+        // subagent was given.
+        AgentMsg::Steer(text) => {
+            push_line(actor, transcript, text);
             Fold::Run
         }
         // The human asked for a fold now. Not work to answer, so not a run:
@@ -1714,6 +1729,9 @@ fn drain_mailbox(
             // The human's own words: the UI echoed them before sending, so the
             // actor folds them in without telling the UI to add them again.
             AgentMsg::Nudge(text) => messages.push(Message::user(text)),
+            // A parent's steering was never echoed anywhere: this is the only
+            // way it reaches the human's copy of this agent's transcript.
+            AgentMsg::Steer(text) => push_line(actor, messages, text),
             // A message-boundary job like a nudge: the transcript is folded
             // into a summary at the next turn, never between an assistant's
             // tool calls and their results.
@@ -1987,21 +2005,40 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     ))
 }
 
-/// Whether the human's words are waiting behind a blocking tool call: a
-/// `Nudge`, or a whole transcript the UI sent because it believed the agent was
-/// idle (whose last message is the one the human just typed).
+/// Who is waiting behind a blocking tool call.
 ///
-/// A blocking tool call is the one place a human message would otherwise sit
-/// unread for as long as the call takes, so this is what it uses to end the
-/// wait — see `wait_tool`.
-fn parked_message(state: &ActorState) -> bool {
-    state.deferred.iter().any(|command| match command {
-        AgentMsg::Nudge(_) => true,
-        AgentMsg::Run(messages) => messages
-            .last()
-            .is_some_and(|message| message.role == "user"),
-        _ => false,
-    })
+/// The human's words (a `Nudge`, or a whole transcript the UI sent because it
+/// believed this agent idle) and a parent's steering (`Steer`) both end the
+/// wait — words the model does not see until the deadline are not steering —
+/// but the sentence the model reads names which, because "the human wrote to
+/// you" is not true of a sibling's note.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Waiting {
+    Human,
+    Parent,
+}
+
+/// Whether anything said to this agent is waiting behind a blocking tool call,
+/// and who said it. A blocking call is the one place a message would otherwise
+/// sit unread for as long as the call takes, so this is what ends the wait —
+/// see `wait_tool`.
+fn parked_message(state: &ActorState) -> Option<Waiting> {
+    let mut said = None;
+    for command in &state.deferred {
+        match command {
+            AgentMsg::Nudge(_) => return Some(Waiting::Human),
+            AgentMsg::Run(messages)
+                if messages
+                    .last()
+                    .is_some_and(|message| message.role == "user") =>
+            {
+                return Some(Waiting::Human)
+            }
+            AgentMsg::Steer(_) => said = Some(Waiting::Parent),
+            _ => {}
+        }
+    }
+    said
 }
 
 fn wait_tool(
@@ -2093,15 +2130,19 @@ fn wait_for_results(
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.to_string());
         }
-        // And it must notice the human. Parking their words is not enough when
-        // the wait can last the whole timeout: the model would not see them
-        // until the thing it was waiting on finished, which is the opposite of
-        // steering. The wait ends, the words stay parked for the next message
-        // boundary, and the model answers them in this run.
-        if parked_message(state) {
+        // And it must notice anything said to it. Parking those words is not
+        // enough when the wait can last the whole timeout: the model would not
+        // see them until the thing it was waiting on finished, which is the
+        // opposite of steering. The wait ends, the words stay parked for the
+        // next message boundary, and the model answers them in this run.
+        if let Some(waiting) = parked_message(state) {
+            let who = match waiting {
+                Waiting::Human => "the human wrote to you",
+                Waiting::Parent => "your parent sent you a message",
+            };
             return Ok(format!(
-                "interrupted — the human wrote to you while you waited; their message is in \
-                 your transcript. Answer them; your {} are still running. Use {} again when \
+                "interrupted — {who} while you waited; it is in \
+                 your transcript. Answer it; your {} are still running. Use {} again when \
                  you need a result.",
                 waiting_for.noun(),
                 waiting_for.tool()
@@ -2176,7 +2217,7 @@ fn control_tool(state: &mut ActorState, args: &Value) -> Result<String, String> 
         "stop" => cmd.send(AgentMsg::Stop).map_err(|_| (id, "stop")),
         "message" => {
             let text = tools::arg_string(args, "text")?;
-            cmd.send(AgentMsg::Nudge(text)).map_err(|_| (id, "message"))
+            cmd.send(AgentMsg::Steer(text)).map_err(|_| (id, "message"))
         }
         other => return Err(format!("unknown action `{other}` (stop or message)")),
     };
@@ -2922,6 +2963,130 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// Steering a subagent is visible (`docs/findings.md` B22). The words a
+    /// parent's `agent_control message` puts in a child's transcript are
+    /// emitted to the UI, which routes them into that child's transcript — the
+    /// human reads what their model was told, and the session file keeps it.
+    ///
+    /// The human's own words are deliberately *not* emitted: the UI echoed them
+    /// before sending them, and a second copy would put the same sentence in
+    /// that transcript twice.
+    #[test]
+    fn a_parents_steering_reaches_the_child_and_the_ui() {
+        let (actor, events, _mailbox) = recording_actor("steer");
+        let mut state = ActorState::default();
+        let mut messages = vec![Message::system("you are mush")];
+        let text = "stop spawning subagents";
+
+        // Sent the way `agent_control message` sends it.
+        let (child_tx, child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child_tx);
+        let sent = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::AgentControl,
+            &json!({ "id": 1, "action": "message", "text": text }),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert_eq!(sent, "messaged agent #1");
+        match child_rx.try_recv() {
+            Ok(AgentMsg::Steer(words)) => assert_eq!(words, text),
+            _ => panic!("steering must travel as steering, not as the human's own words"),
+        }
+
+        // Folding it in: the model reads the line, and the UI was told to put it
+        // in the same transcript.
+        let folded = absorb(
+            &actor,
+            &mut state,
+            &mut messages,
+            AgentMsg::Steer(text.into()),
+        );
+        assert!(matches!(folded, Fold::Run), "steering is work to answer");
+        assert_eq!(messages.last().unwrap().text(), text);
+        let ui = ui_copy(&events);
+        assert!(
+            ui.iter().any(|message| message.text() == text),
+            "the human sees the words their model read: {ui:?}"
+        );
+
+        // The mid-run road is the same road.
+        _mailbox.send(AgentMsg::Steer("keep going".into())).unwrap();
+        drain_mailbox(&actor, &AtomicBool::new(false), &mut messages, &mut state);
+        let ui = ui_copy(&events);
+        assert!(
+            ui.iter().any(|message| message.text() == "keep going"),
+            "a mid-run fold is visible too: {ui:?}"
+        );
+
+        // And a parked steering message survives adoption: it is not in the
+        // UI's copy yet — unlike the human's own words, which that copy echoes.
+        let mut parked = ActorState::default();
+        parked.deferred.push(AgentMsg::Steer("kept".into()));
+        let mut transcript = vec![Message::system("you are mush")];
+        absorb(
+            &actor,
+            &mut parked,
+            &mut transcript,
+            AgentMsg::Run(vec![Message::system("you are mush")]),
+        );
+        assert!(
+            matches!(parked.deferred.first(), Some(AgentMsg::Steer(words)) if words == "kept"),
+            "steering is not the UI's to echo, so adoption must not drop it"
+        );
+
+        // The human's own typing is never emitted: the UI has it already.
+        let before = events.len();
+        absorb(
+            &actor,
+            &mut state,
+            &mut messages,
+            AgentMsg::Nudge("my own words".into()),
+        );
+        assert_eq!(events.len(), before, "a typed nudge is not echoed twice");
+        assert_eq!(messages.last().unwrap().text(), "my own words");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// Steering that arrives during a blocking wait ends it — words the model
+    /// does not see until the deadline are not steering — and the sentence it
+    /// reads names who wrote, because "the human wrote to you" is not true of a
+    /// parent's note.
+    #[test]
+    fn a_parents_steering_ends_a_wait_and_names_the_speaker() {
+        let (actor, mailbox) = test_actor("steer-wait");
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        // A child that has not finished: the state a parent waits in.
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+        state.running.insert(1);
+        mailbox.send(AgentMsg::Steer("stop".into())).unwrap();
+
+        let started = Instant::now();
+        let result = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 600 })).unwrap();
+
+        assert!(
+            result.contains("your parent sent you a message"),
+            "{result}"
+        );
+        assert!(
+            result.contains("still running"),
+            "and does not claim the child finished: {result}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the wait ended on the message, not the timeout ({:?})",
+            started.elapsed()
+        );
+        assert!(
+            matches!(state.deferred.first(), Some(AgentMsg::Steer(words)) if words == "stop"),
+            "and the words stay parked for the boundary that folds them in"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// A child that was stopped and then resumed finishes later; the stale
     /// `stopped` must not outlive the result, or the parent waits on a stop
     /// forever.
@@ -3660,7 +3825,7 @@ mod tests {
         quiet
             .deferred
             .push(AgentMsg::Run(vec![Message::assistant("hm")]));
-        assert!(!parked_message(&quiet));
+        assert_eq!(parked_message(&quiet), None);
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
