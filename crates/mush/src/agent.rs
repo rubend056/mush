@@ -55,9 +55,24 @@ const RUNAWAY_TURNS: usize = 200;
 const LOOP_ROUNDS: usize = 5;
 /// Ceiling on one model reply, in tokens. It has to cover a thinking model's
 /// reasoning too: when the cap is spent before the visible answer, the reply
-/// arrives cut off (`finish_reason: length`) and the run fails loudly instead
-/// of ending as if the work were done.
+/// arrives cut off (`finish_reason: length`).
 const MAX_REPLY_TOKENS: u32 = 20_480;
+
+/// What one reply may use, given the endpoint's window. Asking for more than a
+/// fraction of the window is how a reply arrives cut off: the endpoint cannot
+/// deliver it, or spends the cap on reasoning and never reaches the answer.
+/// A quarter of the window is the same share `Config::history_budget` reserves
+/// for the reply, so the two cannot disagree about what "one reply" means.
+fn reply_cap(cfg: &Config) -> u32 {
+    let share = (cfg.context_tokens / 4) as u64;
+    MAX_REPLY_TOKENS.min(share.max(1024) as u32)
+}
+/// Consecutive cut-off replies before the run gives up. A cut reply is usually
+/// a *too big* answer — a whole file in one `write_file`, or a long reasoning
+/// pass — not a broken model, so the run asks for smaller pieces and carries
+/// on. It is bounded because a model that cannot write small enough is not
+/// going to start now.
+const TRUNCATION_ROUNDS: usize = 3;
 /// How deep subagent chains may go (0 = root agent only).
 pub const MAX_DEPTH: usize = 3;
 /// Hard ceiling on simultaneously running agents across the whole tree.
@@ -713,6 +728,8 @@ fn run_loop(
     // progress, not a turn count.
     let mut last_batch = String::new();
     let mut repeats = 0usize;
+    // Consecutive replies the endpoint cut off at the token cap.
+    let mut cut_offs = 0usize;
 
     for turn in 0..RUNAWAY_TURNS {
         // The last turn is a wrap-up: no tools, and a request for a summary.
@@ -776,7 +793,7 @@ fn run_loop(
             tool_choice: if wrap_up { "none" } else { "auto" },
             stream: false,
             temperature: 0.2,
-            max_tokens: MAX_REPLY_TOKENS,
+            max_tokens: reply_cap(&cfg),
             thinking: None,
             reasoning_effort: None,
         };
@@ -880,22 +897,39 @@ fn run_loop(
             // Every call in the emitted message must be answered or the
             // transcript keeps a dangling tool call, but a call cut off at the
             // token cap must never run: its arguments are whatever JSON
-            // survived. Answer them with the reason, then end the run saying
-            // why — a reply that stopped mid-sentence must not look finished.
+            // survived. Answer them with the reason instead of running them.
             for call in &tool_calls {
                 let message = Message::tool(
                     call.id.clone(),
                     format!(
-                        "error: the model's reply was cut off at {MAX_REPLY_TOKENS} tokens; this call was not run"
+                        "error: the model's reply was cut off at {} tokens; this call was not run",
+                        reply_cap(&cfg)
                     ),
                 );
                 messages.push(message.clone());
                 actor.ctx.emit(actor.id, AgentEvent::Message(message));
             }
-            return Err(format!(
-                "the model's reply was cut off at the {MAX_REPLY_TOKENS}-token limit \
-                 (finish_reason: length) — nothing after it ran"
-            ));
+            // A cut-off reply is not a result, but it is usually a *big* answer
+            // rather than a broken model (a whole file in one `write_file`, or
+            // a long reasoning pass). Ask for smaller pieces and carry on;
+            // only keep failing if the model will not write that small.
+            cut_offs += 1;
+            if cut_offs > TRUNCATION_ROUNDS {
+                return Err(format!(
+                    "the model's reply was cut off at the {}-token limit \
+                     (finish_reason: length) {cut_offs} times in a row — nothing after it ran",
+                    reply_cap(&cfg)
+                ));
+            }
+            actor.ctx.emit(
+                actor.id,
+                AgentEvent::Notice(format!(
+                    "reply cut off at {} tokens — asking for smaller steps",
+                    reply_cap(&cfg)
+                )),
+            );
+            messages.push(Message::user(TRUNCATION_INSTRUCTION));
+            continue;
         }
 
         // The same batch of calls, twice in a row with nothing changed in
@@ -1063,6 +1097,16 @@ You have reached this run's runaway guard, which is meant to be far past any \
 real task. Stop using tools now — they are no longer available. Reply with a \
 concise summary of what has been done, what still remains, and anything the \
 next run needs to know.";
+
+/// What the model is told after a reply was cut off at the token cap. A cut
+/// reply is usually a *big* answer — a whole file in one call, or a long
+/// reasoning pass — so the instruction is about size, and about not re-doing
+/// work that was already written before the cut.
+const TRUNCATION_INSTRUCTION: &str = "\
+Your previous reply was cut off by the endpoint's length limit, so none of it \
+ran. Do the same work in smaller steps: one file per call, a few hundred lines \
+at a time (write the first part with write_file, then add the rest with \
+edit_file). Do not repeat work you already completed in earlier calls.";
 
 /// Fold the transcript into a summary: ask the model to condense it, then
 /// replace the conversation with `[system, user(summary)]` — the summary is
@@ -2568,6 +2612,115 @@ mod tests {
         fs::write(&gate, "go").unwrap();
         let _ = root_tx.send(AgentMsg::Shutdown);
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A reply cut off at the token cap is not a result, but it is usually a
+    /// *too big* answer rather than a broken model (a whole file in one
+    /// `write_file`, or a long reasoning pass). The run must not die on it: it
+    /// answers the dangling calls, asks for smaller steps, and carries on.
+    #[test]
+    fn a_cut_off_reply_is_answered_with_smaller_steps() {
+        let scripted = Arc::new(
+            Scripted::new()
+                // The first reply is cut off mid-tool-call: the half-written
+                // call it started must never run.
+                .cut_off_call(
+                    "write_file",
+                    "{\"path\": \"big.rs\", \"content\": \"fn main(",
+                )
+                // The model then does as it was told, in smaller pieces.
+                .calls(vec![tool_call(
+                    "c1",
+                    "write_file",
+                    json!({ "path": "big.rs", "content": "fn main() {}\n" }),
+                )])
+                .says("wrote it in one small piece"),
+        );
+        let (actor, rx, mailbox) = scripted_actor("cut-off", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("write big.rs"),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("wrote it in one small piece"));
+
+        // The cut-off call never ran, and the model was told to go smaller.
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 3, "cut-off, then the work, then the answer");
+        assert!(
+            asked[0]
+                .messages
+                .iter()
+                .all(|m| !m.text().contains("content") || m.role != "tool"),
+            "nothing from the cut-off reply reaches the model as a result"
+        );
+        assert!(
+            asked[1]
+                .messages
+                .iter()
+                .any(|m| m.text().contains("cut off by the endpoint's length limit")),
+            "the model is told why, and how to fix it"
+        );
+        assert!(
+            asked[1]
+                .messages
+                .iter()
+                .any(|m| m.role == "tool" && m.text().contains("was not run")),
+            "the half-written call is answered, never run"
+        );
+        // The file the model *did* write in one piece is on disk.
+        assert_eq!(
+            fs::read_to_string(actor.ws.root().join("big.rs")).unwrap(),
+            "fn main() {}\n"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = rx;
+        let _ = mailbox;
+    }
+
+    /// A model that keeps answering too big has to end the run: the bounded
+    /// retry is a kindness, not an infinite loop.
+    #[test]
+    fn a_model_that_never_writes_small_enough_still_fails() {
+        let mut scripted = Scripted::new();
+        for _ in 0..=TRUNCATION_ROUNDS {
+            scripted = scripted.cut_off("still writing the whole world");
+        }
+        let scripted = Arc::new(scripted);
+        let (actor, _rx, _mailbox) = scripted_actor("always-cut", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::user("write everything")];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+        assert!(error.contains("cut off"), "{error}");
+        assert!(error.contains("in a row"), "{error}");
+        assert_eq!(scripted.asked().len(), TRUNCATION_ROUNDS + 1);
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// One reply may never be asked for more than a share of the window: an
+    /// endpoint cannot deliver what it does not have, and a thinking model
+    /// spends the cap before it reaches the answer.
+    #[test]
+    fn a_reply_never_asks_for_more_than_the_window_has() {
+        let window = |tokens: usize| {
+            let mut cfg = Config::new("http://127.0.0.1:1", "m", None);
+            cfg.set_context(tokens);
+            cfg
+        };
+        assert_eq!(reply_cap(&window(8_192)), 2_048, "a quarter of 8k, not 20k");
+        assert_eq!(
+            reply_cap(&window(128_000)),
+            MAX_REPLY_TOKENS,
+            "a big window keeps the cap"
+        );
+        // Never zero, however tiny the window: a request for no reply is not a
+        // request.
+        assert_eq!(reply_cap(&window(512)), 1_024);
     }
 
     /// The bug this guards: re-queuing a parked nudge into the actor's own

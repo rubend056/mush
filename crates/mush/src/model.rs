@@ -281,6 +281,35 @@ pub(crate) mod fake {
             self
         }
 
+        /// The next reply is cut off at the token cap: the endpoint stopped it
+        /// mid-answer (`finish_reason: length`), which is what a model does when
+        /// it tries to write a whole file in one call.
+        pub fn cut_off(mut self, content: &str) -> Self {
+            self.script(Ok(reply(Message::assistant(content), "length")));
+            self
+        }
+
+        /// The same, but the cut lands inside a tool call: the arguments are
+        /// whatever JSON survived, which is exactly what must never be run.
+        pub fn cut_off_call(mut self, name: &str, arguments: &str) -> Self {
+            self.script(Ok(reply(
+                Message {
+                    role: "assistant".into(),
+                    tool_calls: Some(vec![ToolCall {
+                        id: "cut".into(),
+                        kind: "function".into(),
+                        function: FunctionCall {
+                            name: name.into(),
+                            arguments: arguments.into(),
+                        },
+                    }]),
+                    ..Default::default()
+                },
+                "length",
+            )));
+            self
+        }
+
         /// The next call fails the way an endpoint does: a status other than
         /// 200, and its own complaint as the body.
         pub fn fails_with(mut self, status: u16, body: &str) -> Self {
