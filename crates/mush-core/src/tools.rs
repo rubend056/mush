@@ -26,12 +26,15 @@ pub enum ToolName {
     WaitAgents,
     AgentStatus,
     AgentControl,
+    CommandStatus,
+    CommandControl,
+    WaitCommands,
 }
 
 impl ToolName {
     /// Every tool, in schema order. `prompt::tool_schemas` is tested against
     /// this list, so a schema and its executor cannot drift.
-    pub const ALL: [ToolName; 9] = [
+    pub const ALL: [ToolName; 12] = [
         ToolName::ListFiles,
         ToolName::ReadFile,
         ToolName::WriteFile,
@@ -41,15 +44,23 @@ impl ToolName {
         ToolName::WaitAgents,
         ToolName::AgentStatus,
         ToolName::AgentControl,
+        ToolName::CommandStatus,
+        ToolName::CommandControl,
+        ToolName::WaitCommands,
     ];
 
     /// The tools that exist for delegation only. A leaf agent (at `MAX_DEPTH`)
-    /// does not receive them, which is what bounds the tree.
-    pub const ORCHESTRATION: [ToolName; 4] = [
+    /// does not receive them, which is what bounds the tree. A *job's* tools are
+    /// workspace tools: an agent with no children can still start one, so they
+    /// are not in this list.
+    pub const ORCHESTRATION: [ToolName; 7] = [
         ToolName::SpawnAgent,
         ToolName::WaitAgents,
         ToolName::AgentStatus,
         ToolName::AgentControl,
+        ToolName::CommandStatus,
+        ToolName::CommandControl,
+        ToolName::WaitCommands,
     ];
 
     /// The name the model calls this tool by.
@@ -64,6 +75,9 @@ impl ToolName {
             ToolName::WaitAgents => "wait_agents",
             ToolName::AgentStatus => "agent_status",
             ToolName::AgentControl => "agent_control",
+            ToolName::CommandStatus => "command_status",
+            ToolName::CommandControl => "command_control",
+            ToolName::WaitCommands => "wait_commands",
         }
     }
 
@@ -97,10 +111,10 @@ const fn names<const N: usize>(tools: [ToolName; N]) -> [&'static str; N] {
 
 /// Every tool name, in schema order. Derived from [`ToolName::ALL`], so the two
 /// cannot disagree.
-pub const TOOL_NAMES: [&str; 9] = names(ToolName::ALL);
+pub const TOOL_NAMES: [&str; 12] = names(ToolName::ALL);
 
 /// The names of the delegation-only tools.
-pub const ORCHESTRATION_TOOLS: [&str; 4] = names(ToolName::ORCHESTRATION);
+pub const ORCHESTRATION_TOOLS: [&str; 7] = names(ToolName::ORCHESTRATION);
 
 /// A required string argument.
 pub fn arg_string(args: &Value, key: &str) -> Result<String, String> {
@@ -331,6 +345,12 @@ mod tests {
             .iter()
             .skip(5)
             .all(|tool| tool.is_orchestration()));
+        // A job is a second-class actor, so its tools travel with the agent
+        // tools: a leaf at `MAX_DEPTH` does not get them, and a leaf's job still
+        // reports to it by waking it.
+        assert!(ToolName::CommandStatus.is_orchestration());
+        assert!(ToolName::CommandControl.is_orchestration());
+        assert!(ToolName::WaitCommands.is_orchestration());
     }
 
     #[test]

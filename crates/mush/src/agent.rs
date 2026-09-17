@@ -33,6 +33,7 @@ use mush_core::{prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_
 use crate::app::{tokens_label, AgentId, ConversationId, Msg};
 use crate::clock;
 use crate::events::{Events, Ui};
+use crate::jobs::{self, Refused};
 use crate::machine::{Job, Machine, Shell, ShellCommand};
 use crate::model::{HttpModel, ModelClient, ModelError};
 
@@ -300,6 +301,11 @@ pub enum AgentMsg {
     Shutdown,
     /// A child's run ended. The outcome says *how*: a stop is not a result.
     ChildDone { id: u64, outcome: Outcome },
+    /// A job this agent started ended. `line` is the report its owner reads,
+    /// rendered once by the registry; `news` says whether it is worth waking a
+    /// napping agent for (`ChildDone` and `Outcome::is_news` again: a job mush
+    /// killed is the human's doing, not a result).
+    CommandDone { id: u64, line: String, news: bool },
 }
 
 /// Events streamed to the UI thread, tagged with the emitting agent's id.
@@ -336,6 +342,19 @@ pub enum AgentEvent {
     /// still alive, so the row goes quiet instead of claiming a failure.
     Stopped,
     Error(String),
+    /// A job this agent started began running in the background. The registry
+    /// is where a job lives; this is only what tells the screen to look at it.
+    JobStarted {
+        job: u64,
+        command: String,
+    },
+    /// A job ended, with the line its owner reads (`#c2 done: exit 0 · 3m12s ·
+    /// cargo test — …`). Emitted by the job's own thread, so a job that ends
+    /// while its owner naps still updates the screen.
+    JobDone {
+        job: u64,
+        line: String,
+    },
     /// The window the endpoint itself named when it rejected a request; the UI
     /// adopts it so the bar, `/context`, and the tool caps agree with the agent
     /// (finding B7).
@@ -366,6 +385,11 @@ pub struct AgentCtx {
     /// its own process group; a test scripts the end state instead, so the
     /// timeout, the cancellation and the output cap need no subprocess.
     pub machine: Arc<dyn Machine>,
+    /// Every job this tree started, and the machine-wide lock. One registry for
+    /// the whole tree, because a job is a fact about the *machine*: the budget
+    /// is machine-wide, the lock is machine-wide, and `/new` kills what the old
+    /// tree left running (`crate::jobs`).
+    pub registry: Arc<jobs::Registry>,
     /// The clock every wait is measured against. `wait_agents` and a running
     /// command are the two places mush spends real time, so both read it here:
     /// a test can reach a timeout or a deadline by advancing a fake instead of
@@ -392,6 +416,13 @@ struct ActorState {
     completed: HashMap<u64, Outcome>,
     /// Completions already handed to the model (via wait_agents or delivery).
     delivered: HashSet<u64>,
+    /// The jobs this agent started and has not yet read a report about, and the
+    /// reports it has read. The same three books as `running`/`completed`/
+    /// `delivered` above, because a job's completion travels the same road as a
+    /// child's: delivered once, folded into the transcript, never twice.
+    running_jobs: HashSet<u64>,
+    done_jobs: HashMap<u64, JobReport>,
+    delivered_jobs: HashSet<u64>,
     /// Commands parked while a blocking tool call was in flight; folded in at
     /// the next message boundary (see `drain_signals`).
     deferred: Vec<AgentMsg>,
@@ -405,6 +436,14 @@ struct ActorState {
     /// A `Stop` arrived with the work this actor is about to start; the run it
     /// points at is born cancelled (finding B6).
     stop_requested: bool,
+}
+
+/// A job's completion, as its owner keeps it: the line the model reads, and
+/// whether it was worth waking a napping agent for.
+#[derive(Clone)]
+struct JobReport {
+    line: String,
+    news: bool,
 }
 
 /// One agent: its identity, its workspace, and the mailboxes it is wired to.
@@ -428,6 +467,17 @@ struct Actor {
     rx: Receiver<AgentMsg>,
 }
 
+/// The handles every actor in one tree shares: the id counter it draws from,
+/// the running-agent count it respects, and the job registry it starts commands
+/// in. They travel together, because an agent given two of the three is living
+/// in a tree of its own — ids that collide, or a job nobody else can see.
+#[derive(Clone)]
+pub struct TreeHandles {
+    pub ids: Arc<AtomicU64>,
+    pub live: Arc<AtomicU64>,
+    pub jobs: Arc<jobs::Registry>,
+}
+
 /// The UI's handle on the root actor of one conversation.
 pub struct RootHandle {
     /// The root's mailbox.
@@ -443,6 +493,10 @@ pub struct RootHandle {
     /// The tree-wide count of running agents, shared so a revived agent is
     /// counted against `MAX_AGENTS` like any other.
     pub live: Arc<AtomicU64>,
+    /// The tree's job registry. The UI holds it for two reasons: to show what is
+    /// running on the machine (a derived count and state, read from the one
+    /// place jobs live), and to kill every process group on the way out.
+    pub jobs: Arc<jobs::Registry>,
 }
 
 /// Start the root actor.
@@ -494,12 +548,15 @@ fn root_actor(
     // raise the floor above leftover worktree ids.
     let ids = Arc::new(AtomicU64::new(1));
     let live = Arc::new(AtomicU64::new(0));
+    let clock = Arc::new(clock::System);
+    let registry = jobs::Registry::new(clock.clone(), events.clone(), ids.clone());
     let ctx = Arc::new(AgentCtx {
         cfg: shared.clone(),
         model,
         events,
         machine: Arc::new(Shell),
-        clock: Arc::new(clock::System),
+        clock,
+        registry: registry.clone(),
         root,
         ids: ids.clone(),
         live: live.clone(),
@@ -528,6 +585,7 @@ fn root_actor(
         conversation: conversation.0,
         ids: ids.clone(),
         live,
+        jobs: registry,
     }
 }
 
@@ -549,16 +607,21 @@ pub struct ReviveSpec {
 ///
 /// The human owns this agent, not the root: its completion goes to a dead
 /// channel, so reviving a child never wakes the root with news it did not ask
-/// for.
+/// for. It joins the same tree as the root, which is why its handles come in one
+/// value (see [`TreeHandles`]).
 pub fn revive(
+    handles: TreeHandles,
     cfg: Arc<Mutex<Config>>,
     tx: Sender<Msg>,
     conversation: u64,
-    ids: Arc<AtomicU64>,
-    live: Arc<AtomicU64>,
     root: PathBuf,
     spec: ReviveSpec,
 ) -> Sender<AgentMsg> {
+    let TreeHandles {
+        ids,
+        live,
+        jobs: registry,
+    } = handles;
     let ReviveSpec {
         id,
         depth,
@@ -586,6 +649,7 @@ pub fn revive(
         events: Arc::new(Ui::new(tx, ConversationId(conversation))),
         machine: Arc::new(Shell),
         clock: Arc::new(clock::System),
+        registry,
         root,
         ids,
         live,
@@ -735,7 +799,7 @@ fn wait_for_work(
             // command that waits for the human's *next* message is a command
             // they watched do nothing — a `/compact` whose status line never
             // ends, or words they typed that nobody reads until later.
-            match fold_parked(state, transcript) {
+            match fold_parked(actor, state, transcript) {
                 Some(Fold::End) => return false,
                 Some(Fold::Run) => break,
                 _ => {}
@@ -753,7 +817,7 @@ fn wait_for_work(
             match actor.rx.recv() {
                 // Every handle to this agent is gone; so is any reason to live.
                 Err(_) => return false,
-                Ok(command) => match absorb(state, transcript, command) {
+                Ok(command) => match absorb(actor, state, transcript, command) {
                     Fold::End => return false,
                     Fold::Run => break,
                     Fold::Idle => continue,
@@ -775,7 +839,7 @@ fn wait_for_work(
                 // for its model calls and the human waits for the row to stop
                 // saying `⊘` on its own (finding B6).
                 let aimed_at_this_run = matches!(command, AgentMsg::Stop);
-                match absorb(state, transcript, command) {
+                match absorb(actor, state, transcript, command) {
                     Fold::End => return false,
                     _ if aimed_at_this_run => state.stop_requested = true,
                     Fold::Run | Fold::Idle => {}
@@ -801,14 +865,18 @@ fn run_cancel(state: &mut ActorState) -> Arc<AtomicBool> {
 /// `None` is "nothing was parked". A `Run` is why this returns anything else:
 /// words the human typed, or a completion that arrived, are work to answer even
 /// though the run they interrupted is over.
-fn fold_parked(state: &mut ActorState, transcript: &mut Vec<Message>) -> Option<Fold> {
+fn fold_parked(
+    actor: &Actor,
+    state: &mut ActorState,
+    transcript: &mut Vec<Message>,
+) -> Option<Fold> {
     if state.deferred.is_empty() {
         return None;
     }
     let parked = std::mem::take(&mut state.deferred);
     let mut last = Fold::Idle;
     for command in parked {
-        match absorb(state, transcript, command) {
+        match absorb(actor, state, transcript, command) {
             Fold::End => return Some(Fold::End),
             Fold::Run => last = Fold::Run,
             Fold::Idle => {}
@@ -829,12 +897,23 @@ enum Fold {
 }
 
 /// Fold one mailbox command into the actor's transcript.
-fn absorb(state: &mut ActorState, transcript: &mut Vec<Message>, command: AgentMsg) -> Fold {
+fn absorb(
+    actor: &Actor,
+    state: &mut ActorState,
+    transcript: &mut Vec<Message>,
+    command: AgentMsg,
+) -> Fold {
     match command {
-        // An idle agent has nothing to cancel, so a Stop is a no-op here.
-        // Ending an agent is what Shutdown is for.
-        AgentMsg::Stop => Fold::Idle,
-        AgentMsg::Shutdown => Fold::End,
+        // An idle agent has nothing to cancel — but it may still own a job,
+        // and a Stop aimed at an agent means "stop the work in flight".
+        AgentMsg::Stop => {
+            actor.ctx.registry.kill_owned(actor.id);
+            Fold::Idle
+        }
+        AgentMsg::Shutdown => {
+            actor.ctx.registry.kill_owned(actor.id);
+            Fold::End
+        }
         AgentMsg::Run(messages) => {
             // The UI's transcript is newer than ours; it wins. Mark as already
             // delivered whatever completion lines it carries (the model reads
@@ -871,6 +950,20 @@ fn absorb(state: &mut ActorState, transcript: &mut Vec<Message>, command: AgentM
                 .copied()
                 .collect();
             state.delivered = announced.into_iter().collect();
+            // The same question for jobs, answered on the line itself: it
+            // carries the job's id, its exit status, its command and its tail,
+            // so a transcript that holds it is a transcript that has read it.
+            let announced_jobs: Vec<u64> = state
+                .done_jobs
+                .iter()
+                .filter(|(_, report)| {
+                    transcript
+                        .iter()
+                        .any(|message| message.text().contains(&report.line))
+                })
+                .map(|(id, _)| *id)
+                .collect();
+            state.delivered_jobs = announced_jobs.into_iter().collect();
             Fold::Run
         }
         AgentMsg::Nudge(text) => {
@@ -897,6 +990,18 @@ fn absorb(state: &mut ActorState, transcript: &mut Vec<Message>, command: AgentM
             // A stopped child is the human's doing, not news that warrants
             // waking a napping parent into a fresh (paid) run: the line is in
             // the transcript for whenever the parent runs next.
+            if news {
+                Fold::Run
+            } else {
+                Fold::Idle
+            }
+        }
+        AgentMsg::CommandDone { id, line, news } => {
+            // `ChildDone` for a job: the same wake, the same once-only
+            // delivery, the same "the human's stop is not a result".
+            let line = note_job(state, id, line, news);
+            transcript.push(Message::user(line));
+            state.delivered_jobs.insert(id);
             if news {
                 Fold::Run
             } else {
@@ -962,7 +1067,14 @@ fn run_loop(
                 )),
             );
         }
-        drain_mailbox(&actor.rx, cancel, messages, state);
+        drain_mailbox(
+            &actor.ctx.registry,
+            actor.id,
+            &actor.rx,
+            cancel,
+            messages,
+            state,
+        );
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.to_string());
         }
@@ -1263,27 +1375,23 @@ fn run_loop(
             // Parked nudges belong after the reply; the human wrote them while
             // it was in flight, so the model has not answered them yet.
             let before = messages.len();
-            drain_mailbox(&actor.rx, cancel, messages, state);
+            drain_mailbox(
+                &actor.ctx.registry,
+                actor.id,
+                &actor.rx,
+                cancel,
+                messages,
+                state,
+            );
             if cancel.load(Ordering::SeqCst) {
                 return Err(CANCELLED.to_string());
             }
             let steered = messages.len() > before;
-            // Children may have finished while we were working without being
-            // waited on: deliver their summaries and keep going instead of
+            // Children and jobs may have finished while we were working without
+            // being waited on: deliver their lines and keep going instead of
             // ending. (Completions that arrive after this run returns wake the
             // idle actor instead — see actor_main.)
-            let pending: Vec<(u64, Outcome)> = state
-                .completed
-                .iter()
-                .filter(|(child, _)| !state.delivered.contains(child))
-                .map(|(child, outcome)| (*child, outcome.clone()))
-                .collect();
-            if !pending.is_empty() {
-                for (child, outcome) in &pending {
-                    let line = note_completion(state, *child, outcome.clone());
-                    messages.push(Message::user(line));
-                    state.delivered.insert(*child);
-                }
+            if deliver_completions(state, messages) {
                 continue;
             }
             // Answer the steering instead of ending the run without it: the
@@ -1342,10 +1450,23 @@ fn run_loop(
         }
         // Fold mailbox commands in at the message boundary, and honour a
         // cancellation now that every call has a result.
-        drain_mailbox(&actor.rx, cancel, messages, state);
+        drain_mailbox(
+            &actor.ctx.registry,
+            actor.id,
+            &actor.rx,
+            cancel,
+            messages,
+            state,
+        );
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.to_string());
         }
+        // The same boundary as a tool-free turn, so the same deliveries: a
+        // parent that keeps calling tools hears its children's results here
+        // rather than whenever it next stops calling them (§5.5). The call
+        // comes *after* the batch's tool results, which is what keeps the
+        // transcript a shape a strict server accepts.
+        deliver_completions(state, messages);
     }
 
     Err(format!(
@@ -1427,7 +1548,14 @@ fn compact_history(
         .emit(actor_id, AgentEvent::Status(why.to_string()));
 
     // Fold pending nudges/completions in first; a Stop cancels the run.
-    drain_mailbox(&actor.rx, cancel, messages, state);
+    drain_mailbox(
+        &actor.ctx.registry,
+        actor.id,
+        &actor.rx,
+        cancel,
+        messages,
+        state,
+    );
     if cancel.load(Ordering::SeqCst) {
         return Err(CANCELLED.to_string());
     }
@@ -1555,13 +1683,22 @@ fn compact_now(actor: &Actor, state: &mut ActorState, transcript: &mut Vec<Messa
 fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
     for command in actor.rx.try_iter() {
         match command {
-            AgentMsg::Stop => cancel.store(true, Ordering::SeqCst),
+            AgentMsg::Stop => {
+                cancel.store(true, Ordering::SeqCst);
+                // A Stop means "stop the work in flight", and a job is work in
+                // flight: whatever this agent started keeps running otherwise.
+                actor.ctx.registry.kill_owned(actor.id);
+            }
             AgentMsg::Shutdown => {
                 cancel.store(true, Ordering::SeqCst);
                 state.shutdown = true;
+                actor.ctx.registry.kill_owned(actor.id);
             }
             AgentMsg::ChildDone { id, outcome } => {
                 note_completion(state, id, outcome);
+            }
+            AgentMsg::CommandDone { id, line, news } => {
+                note_job(state, id, line, news);
             }
             parked => state.deferred.push(parked),
         }
@@ -1572,6 +1709,8 @@ fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
 /// messages, stops set the cancel flag, child completions update the registry.
 /// Everything parked by `drain_signals` goes in first, in order.
 fn drain_mailbox(
+    registry: &jobs::Registry,
+    owner: u64,
     rx: &Receiver<AgentMsg>,
     cancel: &AtomicBool,
     messages: &mut Vec<Message>,
@@ -1585,14 +1724,26 @@ fn drain_mailbox(
             // into a summary at the next turn, never between an assistant's
             // tool calls and their results.
             AgentMsg::Compact => state.compact_requested = true,
-            AgentMsg::Stop => cancel.store(true, Ordering::SeqCst),
+            AgentMsg::Stop => {
+                cancel.store(true, Ordering::SeqCst);
+                registry.kill_owned(owner);
+            }
             AgentMsg::Shutdown => {
                 // Cancel now, and remember: the run ends, and so does the actor.
                 cancel.store(true, Ordering::SeqCst);
                 state.shutdown = true;
+                registry.kill_owned(owner);
             }
             AgentMsg::ChildDone { id, outcome } => {
                 note_completion(state, id, outcome);
+            }
+            // A job's report is folded into the transcript as a user message:
+            // the model reads `#c2 done: exit 0 · …` in the next request, and
+            // the line is marked delivered so it is never injected twice.
+            AgentMsg::CommandDone { id, line, news } => {
+                let line = note_job(state, id, line, news);
+                messages.push(Message::user(line));
+                state.delivered_jobs.insert(id);
             }
             // The UI sends a whole transcript when it believes we are idle.
             // We are mid-run, so the only new information is the message the
@@ -1622,6 +1773,71 @@ fn note_completion(state: &mut ActorState, id: u64, outcome: Outcome) -> String 
     line
 }
 
+/// The same bookkeeping for a job: it is no longer running, its report is the
+/// line the model reads, and it has not been delivered yet.
+fn note_job(state: &mut ActorState, id: u64, line: String, news: bool) -> String {
+    state.running_jobs.remove(&id);
+    state.done_jobs.insert(
+        id,
+        JobReport {
+            line: line.clone(),
+            news,
+        },
+    );
+    state.delivered_jobs.remove(&id);
+    line
+}
+
+/// Fold into the transcript every completion the run has heard about but the
+/// model has not read — a child's summary, or a job's report — and say whether
+/// any of them is *news* (a result, which the model still has to answer).
+///
+/// This is the one home of "a result is never lost just because nobody called
+/// `wait_agents` in time" (docs/mush.md §5.5), and it runs at *every* message
+/// boundary: after a batch of tool results, and on a tool-free turn. It used to
+/// run only on the tool-free turn, so a parent in a long chain of tool calls —
+/// sixty turns of reading, editing and running the gate — never heard that its
+/// child had finished, however long the child had been done.
+///
+/// A completion is a legal user message exactly here, after the assistant's
+/// tool calls and their results. A *nudge* is not: the human's words between an
+/// assistant's calls and their results are the shape strict servers reject, so
+/// nudges keep parking for the tool-free boundary (`drain_mailbox`).
+fn deliver_completions(state: &mut ActorState, messages: &mut Vec<Message>) -> bool {
+    // Jobs first: they are the newest actors, and a job's line is only news if
+    // the job ended on its own — one mush killed is the human's or the model's
+    // own doing, and its line waits for the next run instead of paying for one.
+    let jobs: Vec<(u64, String, bool)> = state
+        .done_jobs
+        .iter()
+        .filter(|(job, _)| !state.delivered_jobs.contains(job))
+        .map(|(job, report)| (*job, report.line.clone(), report.news))
+        .collect();
+    let mut news = false;
+    for (job, line, job_news) in jobs {
+        messages.push(Message::user(note_job(state, job, line, job_news)));
+        state.delivered_jobs.insert(job);
+        news |= job_news;
+    }
+    // A child's completion is always worth a turn: the model has to read a
+    // summary it asked for, even of a child that was stopped (`Outcome::is_news`
+    // decides that only for an *idle* actor, where the run it wakes has a
+    // price).
+    let children: Vec<(u64, Outcome)> = state
+        .completed
+        .iter()
+        .filter(|(child, _)| !state.delivered.contains(child))
+        .map(|(child, outcome)| (*child, outcome.clone()))
+        .collect();
+    for (child, outcome) in children {
+        let line = note_completion(state, child, outcome);
+        messages.push(Message::user(line));
+        state.delivered.insert(child);
+        news = true;
+    }
+    news
+}
+
 fn exec_tool(
     actor: &Actor,
     state: &mut ActorState,
@@ -1635,6 +1851,9 @@ fn exec_tool(
         ToolName::WaitAgents => wait_tool(actor, state, cancel, args),
         ToolName::AgentStatus => status_tool(state),
         ToolName::AgentControl => control_tool(state, args),
+        ToolName::CommandStatus => command_status_tool(actor),
+        ToolName::CommandControl => command_control_tool(actor, args),
+        ToolName::WaitCommands => wait_commands_tool(actor, state, cancel, args),
         // The file tools read and write the workspace directly.
         ToolName::ListFiles | ToolName::ReadFile | ToolName::WriteFile | ToolName::EditFile => {
             let cfg = actor
@@ -1812,6 +2031,43 @@ fn wait_tool(
             unknown.join(", ")
         ));
     }
+    wait_for_results(
+        actor,
+        state,
+        cancel,
+        args,
+        &candidates,
+        jobs::Waited::Agents,
+        |state, id| {
+            // Not always `done`: a stopped child is reported as stopped, so a
+            // waiter knows there is no result yet rather than receiving one that
+            // says "cancelled".
+            let outcome = state.completed.get(&id)?.clone();
+            state.delivered.insert(id);
+            Some(outcome.line(id))
+        },
+    )
+}
+
+/// The one blocking wait `wait_agents` and `wait_commands` both run: poll the
+/// mailbox, honour a cancellation, notice the human, stop at the deadline, and
+/// return whatever results are ready. The two tools differ only in what "a
+/// result" is — a child's outcome or a job's report line — which the caller
+/// supplies, so the subtle parts (the deadline, the parked human, the cancel)
+/// exist once.
+fn wait_for_results(
+    actor: &Actor,
+    state: &mut ActorState,
+    cancel: &AtomicBool,
+    args: &Value,
+    candidates: &[u64],
+    waiting_for: jobs::Waited,
+    mut result: impl FnMut(&mut ActorState, u64) -> Option<String>,
+) -> Result<String, String> {
+    // `all` asks for every result instead of the first one: the first is what an
+    // orchestrator wants the moment one delegate is free, and `all` is what it
+    // wants before it proceeds with the whole set.
+    let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
     let timeout = args
         .get("timeout")
         .and_then(Value::as_u64)
@@ -1825,34 +2081,50 @@ fn wait_tool(
 
     loop {
         // This is the one tool that blocks for minutes, so it is also the one
-        // that must notice a cancellation (and a child's result) promptly.
+        // that must notice a cancellation (and a completion) promptly.
         drain_signals(actor, cancel, state);
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.to_string());
         }
         // And it must notice the human. Parking their words is not enough when
         // the wait can last the whole timeout: the model would not see them
-        // until the child it was waiting on finished, which is the opposite of
+        // until the thing it was waiting on finished, which is the opposite of
         // steering. The wait ends, the words stay parked for the next message
         // boundary, and the model answers them in this run.
         if parked_message(state) {
-            return Ok("interrupted — the human wrote to you while you waited; their message is in \
-                       your transcript. Answer them; your agents are still running. Use wait_agents \
-                       again when you need a result."
-                .to_string());
+            return Ok(format!(
+                "interrupted — the human wrote to you while you waited; their message is in \
+                 your transcript. Answer them; your {} are still running. Use {} again when \
+                 you need a result.",
+                waiting_for.noun(),
+                waiting_for.tool()
+            ));
         }
-        for id in &candidates {
-            if let Some(outcome) = state.completed.get(id) {
-                state.delivered.insert(*id);
-                // Not always `done`: a stopped child is reported as stopped, so
-                // a waiter knows there is no result yet rather than receiving
-                // one that says "cancelled".
-                return Ok(outcome.line(*id));
+        let mut ready = Vec::new();
+        let mut waiting = Vec::new();
+        for id in candidates {
+            match result(state, *id) {
+                Some(line) => ready.push(line),
+                None => waiting.push(waiting_for.label(*id)),
             }
+        }
+        if (!all && !ready.is_empty()) || (all && waiting.is_empty()) {
+            return Ok(if all {
+                ready.join("\n")
+            } else {
+                ready.remove(0)
+            });
         }
         if let Some(deadline) = deadline {
             if clock.now() >= deadline {
-                return Ok("wait timed out — your agents are still running".to_string());
+                // What is known is returned, and what is not is named: a wait
+                // that timed out is not a wait that lost the results.
+                let note = format!("wait timed out — {} still running", waiting.join(", "));
+                return Ok(if ready.is_empty() {
+                    note
+                } else {
+                    format!("{}\n{note}", ready.join("\n"))
+                });
             }
         }
         clock.sleep(Duration::from_millis(50));
@@ -1908,14 +2180,93 @@ fn control_tool(state: &mut ActorState, args: &Value) -> Result<String, String> 
     }
 }
 
+/// `command_status`: what this agent's commands are doing, live from the one
+/// registry that holds them. A running job is read through its own window, so
+/// this is always current and never a copy.
+fn command_status_tool(actor: &Actor) -> Result<String, String> {
+    Ok(actor.ctx.registry.status_for(actor.id))
+}
+
+/// `command_control`: stop a job this agent started.
+fn command_control_tool(actor: &Actor, args: &Value) -> Result<String, String> {
+    let id = args
+        .get("id")
+        .and_then(Value::as_u64)
+        .ok_or_else(|| "missing `id`".to_string())?;
+    let action = tools::arg_string(args, "action")?;
+    match action.as_str() {
+        "stop" => actor.ctx.registry.stop(actor.id, id),
+        other => Err(format!("unknown action `{other}` (stop)")),
+    }
+}
+
+/// `wait_commands`: the same wait as `wait_agents`, over jobs. A job's report
+/// arrives in the owner's mailbox like a child's completion, so waiting is the
+/// same act — and `all` means the same thing.
+fn wait_commands_tool(
+    actor: &Actor,
+    state: &mut ActorState,
+    cancel: &AtomicBool,
+    args: &Value,
+) -> Result<String, String> {
+    let ids: Vec<u64> = args
+        .get("ids")
+        .and_then(Value::as_array)
+        .map(|list| list.iter().filter_map(Value::as_u64).collect())
+        .unwrap_or_default();
+    let mut candidates: Vec<u64> = if ids.is_empty() {
+        // Every job this agent started: the running ones and the ones whose
+        // reports it has already been given.
+        let mut mine: Vec<u64> = state
+            .running_jobs
+            .iter()
+            .chain(state.done_jobs.keys())
+            .copied()
+            .collect();
+        mine.sort_unstable();
+        mine.dedup();
+        mine
+    } else {
+        ids
+    };
+    candidates.dedup();
+    if candidates.is_empty() {
+        return Ok("no jobs to wait for".to_string());
+    }
+    let unknown: Vec<String> = candidates
+        .iter()
+        .filter(|id| !state.running_jobs.contains(id) && !state.done_jobs.contains_key(id))
+        .map(|id| jobs::label(*id))
+        .collect();
+    if !unknown.is_empty() {
+        return Err(format!(
+            "no such job(s): {} — command_status lists yours",
+            unknown.join(", ")
+        ));
+    }
+    wait_for_results(
+        actor,
+        state,
+        cancel,
+        args,
+        &candidates,
+        jobs::Waited::Jobs,
+        |state, id| {
+            // A report is delivered once: the first wait (or the fold-in at a
+            // message boundary) consumes it, and a later one is told the job is
+            // already reported instead of reading it twice.
+            let report = state.done_jobs.get(&id)?.line.clone();
+            state.delivered_jobs.insert(id);
+            Some(report)
+        },
+    )
+}
+
 /// Commit whatever an isolated agent left in its worktree, so the branch that
 /// `/diff`, `/merge`, and `/discard` name actually carries the work. Returns the
 /// short revision when something was committed, `None` when the run changed
-/// nothing.
-///
-/// The subject is built here, next to the id, brief and outcome it is made of;
-/// the commit itself is one of the core git verbs, so an isolated agent commits
-/// by the same rules as everything else that touches a repository.
+/// nothing. The subject is built above, next to the id, brief and outcome it is
+/// made of.
 fn commit_worktree(
     root: &Path,
     id: u64,
@@ -1992,13 +2343,137 @@ fn run_command(
         .get("command")
         .and_then(Value::as_str)
         .ok_or_else(|| "missing `command`".to_string())?;
-    run_shell(
+    let detach = args.get("detach").and_then(Value::as_bool).unwrap_or(false);
+    let exclusive = args
+        .get("exclusive")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let registry = actor.ctx.registry.clone();
+    // Two decisions, both made *before* a process exists: whether this command
+    // may use the machine at all (the lock), and whether a long one has
+    // somewhere to go (the budget). A command that cannot be watched or may not
+    // run must never be started.
+    if let Err(held) = registry.machine_free_for(actor.id) {
+        return Err(Refused::Machine(held).message(actor.id));
+    }
+    if detach && !registry.has_room() {
+        return Err(Refused::Budget.message(actor.id));
+    }
+    if exclusive {
+        registry
+            .take_machine(actor.id, command)
+            .map_err(|held| Refused::Machine(held).message(actor.id))?;
+    }
+    // `detach: true` asks for a job from the start: the model knows it started
+    // a server, and waiting sixty seconds to be told so is not an answer.
+    let spawned = actor
+        .ctx
+        .machine
+        .spawn(&ShellCommand {
+            command,
+            root: actor.ws.root(),
+        })
+        .map_err(|error| {
+            if exclusive {
+                registry.release_machine(actor.id);
+            }
+            error
+        })?;
+    if detach {
+        let id = detach_now(actor, &registry, command, exclusive, spawned)?;
+        state.running_jobs.insert(id);
+        return Ok(detached_line(id));
+    }
+    // A foreground command that outlives `CMD_DETACH_AFTER` becomes a job too —
+    // unless there is no room for one, in which case the 120 s timeout and the
+    // output cap are the whole story.
+    let detach = if registry.has_room() {
+        Detach::Job {
+            registry: &registry,
+            exclusive,
+        }
+    } else {
+        Detach::No
+    };
+    let report = run_shell(
         command,
         actor.ws.root(),
         Duration::from_secs(CMD_TIMEOUT_SECS),
+        detach,
         cancel,
         actor,
         state,
+    );
+    // The lock is released either way: a command that ended releases it here,
+    // and a command that detached handed it to its job, which releases it when
+    // *it* ends (`Registry::finish`).
+    if exclusive {
+        registry.release_machine(actor.id);
+    }
+    report
+}
+
+/// Whether a foreground command may become a job when it outlives
+/// `CMD_DETACH_AFTER`, and what it hands over if it does.
+#[derive(Clone, Copy)]
+enum Detach<'a> {
+    /// It may not: the machine-wide budget is full, so the timeout is the only
+    /// bound and the job registry is not involved.
+    No,
+    /// Hand its process group to the registry, lock and all.
+    Job {
+        registry: &'a Arc<jobs::Registry>,
+        exclusive: bool,
+    },
+}
+
+impl Detach<'_> {
+    /// When the watcher stops treating this as a tool call.
+    fn after(&self) -> Option<Duration> {
+        match self {
+            Detach::No => None,
+            Detach::Job { .. } => Some(jobs::CMD_DETACH_AFTER),
+        }
+    }
+}
+
+/// Hand a running command to the registry and return its id.
+fn detach_now(
+    actor: &Actor,
+    registry: &Arc<jobs::Registry>,
+    command: &str,
+    exclusive: bool,
+    job: Box<dyn Job>,
+) -> Result<u64, String> {
+    let id = registry
+        .launch(jobs::Launch {
+            owner: actor.id,
+            command: command.to_string(),
+            exclusive,
+            job,
+            mailbox: actor.my_tx.clone(),
+        })
+        .map_err(|refused| {
+            registry.release_machine(actor.id);
+            refused.message(actor.id)
+        })?;
+    actor.ctx.emit(
+        actor.id,
+        AgentEvent::JobStarted {
+            job: id,
+            command: command.to_string(),
+        },
+    );
+    Ok(id)
+}
+
+/// The answer a detach gives the model, in the words the spec uses. The job's
+/// id is in it because every later tool call about it (status, stop, wait) needs
+/// the id, and the model has nothing else to go on.
+fn detached_line(id: u64) -> String {
+    format!(
+        "[still running — detached as {}; you will be told when it finishes]",
+        jobs::label(id)
     )
 }
 
@@ -2006,8 +2481,9 @@ fn run_command(
 /// only ever sees the first `CMD_CAP` bytes, so a command that gets here is not
 /// communicating, it is running away — and it must not fill the disk. The size
 /// is checked every few milliseconds (see `wait_bounded`), so a fast writer can
-/// overshoot by a few tens of MB before the kill lands.
-const CMD_OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
+/// overshoot by a few tens of MB before the kill lands. It lives in
+/// `crate::jobs` beside the other rule a job and a tool call share.
+use crate::jobs::CMD_OUTPUT_LIMIT;
 
 /// Why a command stopped running.
 enum Ended {
@@ -2016,24 +2492,39 @@ enum Ended {
     TimedOut,
     Cancelled,
     TooMuchOutput,
+    /// It outlived `CMD_DETACH_AFTER` and is now a job; the caller hands the
+    /// still-running process group over instead of killing it.
+    Detached,
 }
 
 /// Run a shell command in `root` and return a report the model can read.
 ///
 /// The command itself is the [`Machine`]'s: how to start one, how it is
-/// watched, and the three ways it stops (its time is up, a Stop arrived, it
-/// wrote too much) are this function's, which is what makes all three
-/// assertable with a scripted machine and a scripted clock.
+/// watched, and the ways it stops (its time is up, a Stop arrived, it wrote too
+/// much, it outlived `CMD_DETACH_AFTER`) are this function's, which is what
+/// makes all four assertable with a scripted machine and a scripted clock.
 fn run_shell(
     command: &str,
     root: &Path,
     timeout: Duration,
+    detach: Detach<'_>,
     cancel: &AtomicBool,
     actor: &Actor,
     state: &mut ActorState,
 ) -> Result<String, String> {
     let mut job = actor.ctx.machine.spawn(&ShellCommand { command, root })?;
-    let ended = wait_bounded(job.as_mut(), timeout, cancel, actor, state)?;
+    let ended = wait_bounded(job.as_mut(), timeout, detach.after(), cancel, actor, state)?;
+    if matches!(ended, Ended::Detached) {
+        if let Detach::Job {
+            registry,
+            exclusive,
+        } = detach
+        {
+            let id = detach_now(actor, registry, command, exclusive, job)?;
+            state.running_jobs.insert(id);
+            return Ok(detached_line(id));
+        }
+    }
     let (stdout, stderr) = job.output(CMD_CAP);
 
     // No `$ {command}` echo: the tool call is already rendered from the
@@ -2057,15 +2548,22 @@ fn run_shell(
         Ended::TooMuchOutput => report.push_str(&format!(
             "[killed: output passed {CMD_OUTPUT_LIMIT} bytes; the first {CMD_CAP} are above]"
         )),
+        // Only reachable without a `Detach::Job`, which returns above.
+        Ended::Detached => report.push_str(&format!("[timed out after {}s]", timeout.as_secs())),
     }
     Ok(report)
 }
 
-/// Wait for a command, stopping it when the timeout, a cancellation, or the
-/// output limit arrives first.
+/// Wait for a command, stopping it when its time is up, a cancellation arrives,
+/// it writes too much, or it has outlived `CMD_DETACH_AFTER`.
+///
+/// The four ways out are decided by [`jobs::stopping`] plus the detach deadline,
+/// so the foreground watcher and a job's own thread cannot disagree about what
+/// ends a command.
 fn wait_bounded(
     job: &mut dyn Job,
     timeout: Duration,
+    detach_after: Option<Duration>,
     cancel: &AtomicBool,
     actor: &Actor,
     state: &mut ActorState,
@@ -2086,18 +2584,24 @@ fn wait_bounded(
         // mailbox is polled here only for signals: nudges are parked for the
         // next message boundary, never folded in mid-batch.
         drain_signals(actor, cancel, state);
-        let ended = if actor.ctx.clock.now().saturating_duration_since(started) > timeout {
-            Some(Ended::TimedOut)
-        } else if cancel.load(Ordering::SeqCst) {
-            Some(Ended::Cancelled)
-        } else if job.written() > CMD_OUTPUT_LIMIT {
-            Some(Ended::TooMuchOutput)
-        } else {
-            None
-        };
-        if let Some(ended) = ended {
+        let waited = actor.ctx.clock.now().saturating_duration_since(started);
+        if detach_after.is_some_and(|after| waited > after) {
+            // Not killed: the process keeps its group, and the registry takes
+            // over watching it (`run_shell`'s caller does the handover).
+            return Ok(Ended::Detached);
+        }
+        if let Some(stopped) = jobs::stopping(
+            job.written(),
+            waited,
+            Some(timeout),
+            cancel.load(Ordering::SeqCst),
+        ) {
             job.kill();
-            return Ok(ended);
+            return Ok(match stopped {
+                jobs::Stopped::TimedOut => Ended::TimedOut,
+                jobs::Stopped::Cancelled => Ended::Cancelled,
+                jobs::Stopped::TooMuchOutput => Ended::TooMuchOutput,
+            });
         }
         actor.ctx.clock.sleep(Duration::from_millis(10));
     }
@@ -2179,6 +2683,7 @@ mod tests {
     /// must not deliver the parked copy a second time.
     #[test]
     fn adopting_a_transcript_drops_parked_nudges() {
+        let (actor, _mailbox) = test_actor("parked-nudge");
         let mut state = ActorState::default();
         let mut transcript = vec![Message::system("sys")];
         state
@@ -2187,7 +2692,7 @@ mod tests {
 
         let carried = vec![Message::system("sys"), Message::user("said once")];
         assert!(matches!(
-            absorb(&mut state, &mut transcript, AgentMsg::Run(carried)),
+            absorb(&actor, &mut state, &mut transcript, AgentMsg::Run(carried)),
             Fold::Run
         ));
         assert_eq!(transcript.len(), 2, "the UI's transcript wins");
@@ -2197,8 +2702,16 @@ mod tests {
         // would answer the same sentence twice.
         let (_tx, rx) = crossbeam_channel::unbounded();
         let mut messages = Vec::new();
-        drain_mailbox(&rx, &AtomicBool::new(false), &mut messages, &mut state);
+        drain_mailbox(
+            &actor.ctx.registry,
+            actor.id,
+            &rx,
+            &AtomicBool::new(false),
+            &mut messages,
+            &mut state,
+        );
         assert!(messages.is_empty(), "no duplicate user message");
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     fn call(id: &str) -> ToolCall {
@@ -2275,6 +2788,7 @@ mod tests {
     /// into a fresh (paid) run. A finish is news and must wake it.
     #[test]
     fn a_stop_does_not_wake_a_napping_parent_but_a_finish_does() {
+        let (actor, _mailbox) = test_actor("napping");
         let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
         let mut state = ActorState::default();
         state.children.insert(1, tx.clone());
@@ -2282,6 +2796,7 @@ mod tests {
 
         assert!(matches!(
             absorb(
+                &actor,
                 &mut state,
                 &mut messages,
                 AgentMsg::ChildDone {
@@ -2295,6 +2810,7 @@ mod tests {
 
         assert!(matches!(
             absorb(
+                &actor,
                 &mut state,
                 &mut messages,
                 AgentMsg::ChildDone {
@@ -2391,7 +2907,7 @@ mod tests {
             Message::user("steer"),
             Message::tool("a", "result"),
         ];
-        let folded = absorb(&mut state, &mut messages, AgentMsg::Run(fresh));
+        let folded = absorb(&actor, &mut state, &mut messages, AgentMsg::Run(fresh));
         assert!(matches!(folded, Fold::Run));
         assert_eq!(
             roles(&messages),
@@ -2420,7 +2936,7 @@ mod tests {
         ];
 
         assert!(matches!(
-            absorb(&mut state, &mut messages, AgentMsg::Run(fresh)),
+            absorb(&actor, &mut state, &mut messages, AgentMsg::Run(fresh)),
             Fold::Run
         ));
         assert!(
@@ -2449,6 +2965,7 @@ mod tests {
             "sleep 30 & echo started",
             &std::env::temp_dir(),
             Duration::from_secs(10),
+            Detach::No,
             &cancel,
             &actor,
             &mut state,
@@ -2484,6 +3001,7 @@ mod tests {
             "sleep 30",
             &std::env::temp_dir(),
             timeout,
+            Detach::No,
             &cancel,
             &actor,
             &mut state,
@@ -2527,6 +3045,7 @@ mod tests {
             "false",
             &std::env::temp_dir(),
             Duration::from_secs(5),
+            Detach::No,
             &cancel,
             &actor,
             &mut state,
@@ -2561,6 +3080,7 @@ mod tests {
             "sleep 30",
             &std::env::temp_dir(),
             Duration::from_secs(30),
+            Detach::No,
             &cancel,
             &actor,
             &mut state,
@@ -2593,6 +3113,7 @@ mod tests {
             "echo starting; sleep 30",
             &std::env::temp_dir(),
             Duration::from_secs(30),
+            Detach::No,
             &cancel,
             &actor,
             &mut state,
@@ -2628,6 +3149,7 @@ mod tests {
             "yes mush",
             &std::env::temp_dir(),
             Duration::from_secs(30),
+            Detach::No,
             &cancel,
             &actor,
             &mut state,
@@ -2661,6 +3183,7 @@ mod tests {
             "yes mush | head -c 40000",
             &std::env::temp_dir(),
             Duration::from_secs(10),
+            Detach::No,
             &cancel,
             &actor,
             &mut state,
@@ -2797,14 +3320,20 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let recorder = Recorder::new();
+        let ids = Arc::new(AtomicU64::new(1));
+        // The tree's one registry, over the same scripted machine and clock:
+        // a job a test starts is watched in process, and its events land in the
+        // same recording sink as the actor's.
+        let registry = jobs::Registry::new(clock.clone(), recorder.clone(), ids.clone());
         let ctx = Arc::new(AgentCtx {
             cfg,
             model,
             events: recorder.clone(),
             machine,
             clock,
+            registry,
             root: root.clone(),
-            ids: Arc::new(AtomicU64::new(1)),
+            ids,
             live: Arc::new(AtomicU64::new(0)),
         });
         let (my_tx, rx) = crossbeam_channel::unbounded::<AgentMsg>();
@@ -3569,14 +4098,17 @@ mod tests {
         let mut state = ActorState::default();
         let mut messages = vec![Message::system("you are mush")];
         assert_eq!(
-            fold_parked(&mut state, &mut messages),
+            fold_parked(&actor, &mut state, &mut messages),
             None,
             "nothing parked is not a reason to wake"
         );
 
         // A `/compact` parked mid-tool-call: a fold to do, not a run to start.
         state.deferred.push(AgentMsg::Compact);
-        assert_eq!(fold_parked(&mut state, &mut messages), Some(Fold::Idle));
+        assert_eq!(
+            fold_parked(&actor, &mut state, &mut messages),
+            Some(Fold::Idle)
+        );
         assert!(state.compact_requested, "the request survives the fold");
         assert!(state.deferred.is_empty(), "and is not folded twice");
 
@@ -3585,7 +4117,10 @@ mod tests {
         state
             .deferred
             .push(AgentMsg::Nudge("are you there?".into()));
-        assert_eq!(fold_parked(&mut state, &mut messages), Some(Fold::Run));
+        assert_eq!(
+            fold_parked(&actor, &mut state, &mut messages),
+            Some(Fold::Run)
+        );
         assert_eq!(messages.last().unwrap().text(), "are you there?");
 
         // A shutdown outranks whatever was parked behind it.
@@ -3593,11 +4128,17 @@ mod tests {
             .deferred
             .push(AgentMsg::Nudge("one more thing".into()));
         state.deferred.push(AgentMsg::Shutdown);
-        assert_eq!(fold_parked(&mut state, &mut messages), Some(Fold::End));
+        assert_eq!(
+            fold_parked(&actor, &mut state, &mut messages),
+            Some(Fold::End)
+        );
 
         // A stray Stop is not work, and must not wake anyone.
         state.deferred.push(AgentMsg::Stop);
-        assert_eq!(fold_parked(&mut state, &mut messages), Some(Fold::Idle));
+        assert_eq!(
+            fold_parked(&actor, &mut state, &mut messages),
+            Some(Fold::Idle)
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -3693,7 +4234,14 @@ mod tests {
 
         // The next message boundary folds it in, in order.
         let mut messages = vec![Message::assistant("working")];
-        drain_mailbox(&actor.rx, &cancel, &mut messages, &mut state);
+        drain_mailbox(
+            &actor.ctx.registry,
+            actor.id,
+            &actor.rx,
+            &cancel,
+            &mut messages,
+            &mut state,
+        );
         assert!(state.deferred.is_empty());
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].text(), "steer left");
@@ -3711,12 +4259,26 @@ mod tests {
 
         mailbox.send(AgentMsg::Stop).unwrap();
         let cancel = AtomicBool::new(false);
-        drain_mailbox(&actor.rx, &cancel, &mut messages, &mut state);
+        drain_mailbox(
+            &actor.ctx.registry,
+            actor.id,
+            &actor.rx,
+            &cancel,
+            &mut messages,
+            &mut state,
+        );
         assert!(cancel.load(Ordering::SeqCst), "a Stop cancels the run");
         assert!(!state.shutdown, "a Stop must not end the actor");
 
         mailbox.send(AgentMsg::Shutdown).unwrap();
-        drain_mailbox(&actor.rx, &cancel, &mut messages, &mut state);
+        drain_mailbox(
+            &actor.ctx.registry,
+            actor.id,
+            &actor.rx,
+            &cancel,
+            &mut messages,
+            &mut state,
+        );
         assert!(
             state.shutdown,
             "a Shutdown ends the actor once the run stops"
@@ -3725,11 +4287,11 @@ mod tests {
         // Idle: the same split, expressed as what the actor should do next.
         let mut state = ActorState::default();
         assert!(matches!(
-            absorb(&mut state, &mut messages, AgentMsg::Stop),
+            absorb(&actor, &mut state, &mut messages, AgentMsg::Stop),
             Fold::Idle
         ));
         assert!(matches!(
-            absorb(&mut state, &mut messages, AgentMsg::Shutdown),
+            absorb(&actor, &mut state, &mut messages, AgentMsg::Shutdown),
             Fold::End
         ));
         let _ = fs::remove_dir_all(actor.ws.root());
@@ -3770,7 +4332,7 @@ mod tests {
         // stopped while it was idle must still run when they later ask it to.
         let mut state = ActorState::default();
         assert!(matches!(
-            absorb(&mut state, &mut transcript, AgentMsg::Stop),
+            absorb(&actor, &mut state, &mut transcript, AgentMsg::Stop),
             Fold::Idle
         ));
         assert!(
@@ -3778,6 +4340,319 @@ mod tests {
             "a Stop folded away while idle cancels nothing"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A command that outlives `CMD_DETACH_AFTER` stops being a tool call and
+    /// becomes a job: not killed, and its owner is told how it ends. This is the
+    /// 120-second kill replaced — the thing that was exactly wrong for a fresh
+    /// worktree's cold build.
+    #[test]
+    fn a_command_that_outlives_the_detach_deadline_becomes_a_job() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("detach", machine.clone(), clock.clone());
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+
+        let report = run_shell(
+            "cargo build",
+            &std::env::temp_dir(),
+            Duration::from_secs(CMD_TIMEOUT_SECS),
+            Detach::Job {
+                registry: &actor.ctx.registry,
+                exclusive: false,
+            },
+            &cancel,
+            &actor,
+            &mut state,
+        )
+        .unwrap();
+
+        assert!(report.contains("detached as #c1"), "{report}");
+        assert!(
+            report.contains("you will be told when it finishes"),
+            "{report}"
+        );
+        assert_eq!(
+            machine.kills(),
+            0,
+            "the command keeps running in its own process group"
+        );
+        assert_eq!(actor.ctx.registry.running(), 1, "and it is a live job");
+        assert!(
+            state.running_jobs.contains(&1),
+            "the owner's books know about it"
+        );
+        assert!(
+            clock.elapsed() >= jobs::CMD_DETACH_AFTER,
+            "the deadline is what moved it, not the end of the command: {:?}",
+            clock.elapsed()
+        );
+
+        // And its end lands in the owner's own mailbox, once, saying it was
+        // stopped rather than blamed on an exit code.
+        let stopped = actor.ctx.registry.stop(actor.id, 1).unwrap();
+        assert_eq!(stopped, "stopping job #c1");
+        match actor.rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(AgentMsg::CommandDone { id, line, news }) => {
+                assert_eq!(id, 1);
+                assert!(!news, "a job mush killed wakes nobody: {line}");
+                assert!(line.contains("stopped after"), "{line}");
+                assert!(line.contains("cargo build"), "{line}");
+            }
+            other => panic!("the owner must be told: {:?}", other.is_ok()),
+        }
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// `detach: true` asks for a job from the start, which is what a server
+    /// needs: waiting sixty seconds to be told `npm run dev` started is not an
+    /// answer. The job is then visible, and stoppable, through its own tools.
+    #[test]
+    fn detach_true_returns_at_once_and_the_job_tools_see_it() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("detach-now", machine.clone(), clock.clone());
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let call = |tool: ToolName, args: Value| exec_tool(&actor, &mut state, tool, &args, &cancel);
+
+        let started = call(
+            ToolName::RunCommand,
+            json!({ "command": "npm run dev", "detach": true }),
+        )
+        .unwrap();
+        assert!(started.contains("detached as #c1"), "{started}");
+        assert_eq!(actor.ctx.registry.running(), 1);
+
+        // The job's own tools: status names it, its age and its command.
+        clock.advance(Duration::from_secs(20));
+        let status = call(ToolName::CommandStatus, json!({})).unwrap();
+        assert!(status.contains("#c1 running 20s"), "{status}");
+        assert!(status.contains("npm run dev"), "{status}");
+
+        let stopped = call(ToolName::CommandControl, json!({ "id": 1, "action": "stop" })).unwrap();
+        assert_eq!(stopped, "stopping job #c1");
+        // A stop is a request to the job's own thread; the report is what the
+        // owner reads next, and `command_status` then says it ended.
+        match actor.rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(AgentMsg::CommandDone { line, .. }) => assert!(line.contains("stopped after")),
+            other => panic!("the stop must be reported: {:?}", other.is_ok()),
+        }
+        let status = call(ToolName::CommandStatus, json!({})).unwrap();
+        assert!(status.contains("stopped after"), "{status}");
+        // An id that was never a job is an error the model can correct, and
+        // another action is one it cannot use.
+        assert!(call(ToolName::CommandControl, json!({ "id": 99, "action": "stop" })).is_err());
+        assert!(call(ToolName::CommandControl, json!({ "id": 1, "action": "poke" })).is_err());
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A job's completion is `ChildDone`'s twin: it wakes a napping owner when
+    /// there is a result, and folds quietly into the transcript when mush killed
+    /// the job.
+    #[test]
+    fn a_job_completion_wakes_a_napping_owner_only_when_it_is_a_result() {
+        let (actor, _mailbox) = test_actor("job-wake");
+        let mut state = ActorState::default();
+        state.running_jobs.insert(1);
+        state.running_jobs.insert(2);
+        let mut messages = vec![Message::system("you are mush")];
+
+        let folded = absorb(
+            &actor,
+            &mut state,
+            &mut messages,
+            AgentMsg::CommandDone {
+                id: 1,
+                line: "#c1 done: exit 0 · 3m12s · cargo test — test result: ok".into(),
+                news: true,
+            },
+        );
+        assert!(matches!(folded, Fold::Run), "a result is work to answer");
+        assert_eq!(
+            messages.last().unwrap().text(),
+            "#c1 done: exit 0 · 3m12s · cargo test — test result: ok"
+        );
+        assert!(state.delivered_jobs.contains(&1), "and it counts as read");
+        assert!(!state.running_jobs.contains(&1), "and as no longer running");
+
+        let folded = absorb(
+            &actor,
+            &mut state,
+            &mut messages,
+            AgentMsg::CommandDone {
+                id: 2,
+                line: "#c2 stopped after 4s · npm run dev".into(),
+                news: false,
+            },
+        );
+        assert!(
+            matches!(folded, Fold::Idle),
+            "a kill is the human's doing, not a reason to pay for a run"
+        );
+        assert_eq!(
+            messages.last().unwrap().text(),
+            "#c2 stopped after 4s · npm run dev",
+            "it is in the transcript all the same"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// One home, one rule: a completion is folded in, a nudge stays parked.
+    ///
+    /// The two are different kinds of user message. A completion belongs *after*
+    /// the results of a tool batch — the model has to read it before it decides
+    /// what to do next — while the human's words between an assistant's calls
+    /// and their results are the shape strict servers reject, so they keep
+    /// waiting for `drain_mailbox` on a tool-free turn.
+    #[test]
+    fn deliver_completions_folds_results_and_leaves_nudges_parked() {
+        let mut state = ActorState::default();
+        state.deferred.push(AgentMsg::Nudge("steer".into()));
+        state
+            .completed
+            .insert(1, Outcome::Finished("did the thing".into()));
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::assistant("working"),
+        ];
+
+        assert!(
+            deliver_completions(&mut state, &mut messages),
+            "a child's result is worth a turn"
+        );
+        assert_eq!(messages.last().unwrap().text(), "#1 done: did the thing");
+        assert!(state.delivered.contains(&1), "and it counts as delivered");
+
+        // A job's report travels the same road, and is news only when the job
+        // ended on its own.
+        state.running_jobs.insert(2);
+        state.done_jobs.insert(
+            2,
+            JobReport {
+                line: "#c2 done: exit 0 · 12s · npm test — ok".into(),
+                news: true,
+            },
+        );
+        state.running_jobs.insert(3);
+        state.done_jobs.insert(
+            3,
+            JobReport {
+                line: "#c3 stopped after 1s · npm run dev".into(),
+                news: false,
+            },
+        );
+        assert!(
+            deliver_completions(&mut state, &mut messages),
+            "a job's result is work to answer"
+        );
+        assert_eq!(
+            messages.last().unwrap().text(),
+            "#c3 stopped after 1s · npm run dev",
+            "and a kill is folded in behind it, without paying for a turn"
+        );
+        assert!(state.delivered_jobs.contains(&2) && state.delivered_jobs.contains(&3));
+
+        // Delivered once: the next boundary has nothing new to say, and the
+        // human's parked words are still parked.
+        let before = messages.len();
+        assert!(!deliver_completions(&mut state, &mut messages));
+        assert_eq!(messages.len(), before, "a completion is never repeated");
+        assert_eq!(
+            state.deferred.len(),
+            1,
+            "a nudge is not this function's to fold"
+        );
+    }
+
+    /// A parent that keeps calling tools must still hear its children.
+    ///
+    /// The bug this guards was seen live: a root made sixty-seven consecutive
+    /// tool-calling turns and never learned that its child had finished eight
+    /// turns in, because `ChildDone` was *recorded* between tool calls (into
+    /// `state.completed`) but only folded into the transcript on a turn with no
+    /// tool calls. A parent in a long chain therefore ran past its child's
+    /// result indefinitely — the one thing §5.5 promises cannot happen.
+    #[test]
+    fn a_parent_in_a_tool_chain_still_hears_its_child() {
+        let root = std::env::temp_dir().join(format!("mush-chain-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        // Three replies: a tool call, a tool call held open so the completion
+        // can land while the model is thinking, and an answer.
+        let gate = Arc::new(Gate::new());
+        let scripted = Arc::new(
+            Scripted::new()
+                .calls(vec![tool_call("c1", "list_files", json!({}))])
+                .held(gate.clone())
+                .calls(vec![tool_call("c2", "list_files", json!({}))])
+                .says("read it"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("do the work"),
+            ]))
+            .unwrap();
+
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the second request never reached the model"
+        );
+        // The child finishes mid-run, between two tool-calling turns. Nobody
+        // asks for it: `wait_agents` is never called.
+        root_tx
+            .send(AgentMsg::ChildDone {
+                id: 1,
+                outcome: Outcome::Finished("did the thing".into()),
+            })
+            .unwrap();
+        gate.release();
+
+        let finished = |events: &Recorder| {
+            events
+                .events_for(AgentId::ROOT)
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Done))
+        };
+        let deadline = Instant::now() + WAIT;
+        while !finished(&events) && Instant::now() < deadline {
+            let _ = events.wait(Duration::from_millis(50));
+        }
+        assert!(finished(&events), "the run never ended");
+
+        let asked = scripted.asked();
+        assert_eq!(
+            asked.len(),
+            3,
+            "the run ended on the model's answer, not by waiting: {:?}",
+            asked.iter().map(|a| a.messages.len()).collect::<Vec<_>>()
+        );
+        assert!(
+            !asked[1].saw("#1 done:"),
+            "the request already in flight cannot carry it"
+        );
+        assert!(
+            asked[2].saw("#1 done: did the thing"),
+            "the very next request must carry the child's result: {:?}",
+            asked[2]
+                .messages
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>()
+        );
+
+        let _ = root_tx.send(AgentMsg::Shutdown);
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A completion that the model has not read yet must be delivered when the
@@ -3794,7 +4669,7 @@ mod tests {
 
         let fresh = vec![Message::system("you are mush"), Message::user("carry on")];
         assert!(matches!(
-            absorb(&mut state, &mut messages, AgentMsg::Run(fresh)),
+            absorb(&actor, &mut state, &mut messages, AgentMsg::Run(fresh)),
             Fold::Run
         ));
         assert!(

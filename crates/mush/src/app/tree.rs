@@ -19,7 +19,8 @@ use crossbeam_channel::Sender;
 use mush_core::git;
 use mush_core::message::Message;
 
-use crate::agent::{AgentMsg, RootHandle};
+use crate::agent::{AgentMsg, RootHandle, TreeHandles};
+use crate::jobs::{self, JobView};
 
 /// Which agent, in the tree.
 ///
@@ -188,6 +189,11 @@ pub struct AgentTree {
     /// Which conversation the live actor tree belongs to; events tagged with
     /// any other are from an abandoned tree and are ignored.
     conversation: ConversationId,
+    /// Every job this tree's agents started, shared with the actors. The tree
+    /// holds it for the same two reasons it holds `ids` and `live`: a row reads
+    /// its owner's jobs from the one registry (so the badge cannot disagree
+    /// with the machine), and quitting kills them through it.
+    jobs: Arc<jobs::Registry>,
 }
 
 impl AgentTree {
@@ -198,6 +204,7 @@ impl AgentTree {
             ConversationId(root.conversation),
             root.ids.clone(),
             root.live.clone(),
+            root.jobs.clone(),
             root.tx,
         )
     }
@@ -217,6 +224,7 @@ impl AgentTree {
             ConversationId(1),
             Arc::new(AtomicU64::new(1)),
             Arc::new(AtomicU64::new(0)),
+            jobs::Registry::bare(),
             tx,
         )
     }
@@ -225,6 +233,7 @@ impl AgentTree {
         conversation: ConversationId,
         ids: Arc<AtomicU64>,
         live: Arc<AtomicU64>,
+        jobs: Arc<jobs::Registry>,
         tx: Sender<AgentMsg>,
     ) -> Self {
         let mut tree = Self {
@@ -237,6 +246,7 @@ impl AgentTree {
             ids,
             live,
             conversation,
+            jobs,
         };
         tree.agents.push(AgentNode {
             id: AgentId::ROOT,
@@ -260,14 +270,22 @@ impl AgentTree {
         self.conversation
     }
 
-    /// The id counter, for the actors that allocate ids.
-    pub fn ids(&self) -> Arc<AtomicU64> {
-        self.ids.clone()
+    /// Everything an actor revived into this tree needs to join it: the id
+    /// counter, the running count and the job registry, in one value so it
+    /// cannot be half-joined ([`TreeHandles`]).
+    pub fn handles(&self) -> TreeHandles {
+        TreeHandles {
+            ids: self.ids.clone(),
+            live: self.live.clone(),
+            jobs: self.jobs.clone(),
+        }
     }
 
-    /// The tree-wide running count, for the actors that enforce the ceiling.
-    pub fn live(&self) -> Arc<AtomicU64> {
-        self.live.clone()
+    /// The jobs `id` still has running, straight from the registry. Derived on
+    /// read, so a count on a row and a list in a footer are one fact rather
+    /// than two.
+    pub fn live_jobs(&self, id: AgentId) -> Vec<JobView> {
+        self.jobs.live_for(id.0)
     }
 
     /// Keep the id counter above `floor`. A leftover worktree or a restored
@@ -792,13 +810,13 @@ mod tests {
         assert_eq!(node.summary.as_deref(), Some("found on startup"));
 
         assert!(
-            tree.ids().load(Ordering::SeqCst) < 8,
+            tree.handles().ids.load(Ordering::SeqCst) < 8,
             "registering a node does not move the counter"
         );
         tree.reserve_ids(8);
-        assert!(tree.ids().load(Ordering::SeqCst) >= 8);
+        assert!(tree.handles().ids.load(Ordering::SeqCst) >= 8);
         assert_ne!(
-            tree.ids().fetch_add(1, Ordering::SeqCst),
+            tree.handles().ids.fetch_add(1, Ordering::SeqCst),
             7,
             "the next spawn must not reuse the leftover's id"
         );

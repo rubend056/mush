@@ -253,8 +253,7 @@ impl App {
         let cfg = self.cfg_shared.clone();
         let ui_tx = self.ui_tx.clone();
         let conversation = self.tree.conversation().0;
-        let ids = self.tree.ids();
-        let live = self.tree.live();
+        let handles = self.tree.handles();
         let root = self.ws.root().to_path_buf();
         for agent in stored {
             // Keep the counter above every restored id, or the next spawn hands
@@ -286,11 +285,10 @@ impl App {
                 session::StoredLanded::Discarded => Landed::Discarded,
             });
             let tx = agent::revive(
+                handles.clone(),
                 cfg.clone(),
                 ui_tx.clone(),
                 conversation,
-                ids.clone(),
-                live.clone(),
                 root.clone(),
                 agent::ReviveSpec {
                     id: agent.id,
@@ -629,6 +627,29 @@ impl App {
                 self.mark_session_dirty();
                 self.refresh_git();
             }
+            AgentEvent::JobStarted { job, command } => {
+                // The bar says what just happened, and the registry — which the
+                // rows read every frame — is what says what is running now. No
+                // copy of the job is kept here: the badge is derived (see
+                // `JobBadge`), so it cannot go stale.
+                let note = format!("{} detached · {}", crate::jobs::label(job), command);
+                if id == self.tree.focused {
+                    self.say(note);
+                } else {
+                    self.say(format!("agent #{id}: {note}"));
+                }
+            }
+            AgentEvent::JobDone { job, line } => {
+                // A job's report is the owner's to read in its transcript (the
+                // actor folds it in); on the screen it is the bar's line, and
+                // the badge the job was on goes out with it.
+                let _ = job;
+                if id == self.tree.focused {
+                    self.say(line);
+                } else {
+                    self.say(format!("agent #{id}: {line}"));
+                }
+            }
             AgentEvent::Context { tokens } => {
                 // The actor learned the endpoint's real window from a server
                 // complaint; the UI owns the copy the bar, `/context`, and the
@@ -661,9 +682,40 @@ impl App {
     }
 
     /// Whether anything in the tree is working: derived from the phases, so it
-    /// cannot disagree with the rows.
+    /// cannot disagree with the rows. A detached job counts: the agent may be
+    /// napping, but the machine is not idle, and the tick uses this to keep the
+    /// git snapshot fresh while something runs.
     pub fn busy(&self) -> bool {
         self.tree.busy()
+            || self
+                .tree
+                .agents
+                .iter()
+                .any(|node| !self.tree.live_jobs(node.id).is_empty())
+    }
+
+    /// The jobs `id` has running, read from the one registry that holds them.
+    /// Every place the screen mentions a job goes through here, so the row's
+    /// count, the footer's list and the bar's line cannot disagree about what
+    /// is running on this machine.
+    pub fn live_jobs(&self, id: AgentId) -> Vec<crate::jobs::JobView> {
+        self.tree.live_jobs(id)
+    }
+
+    /// `#c2 cargo build 1m20s` — one job, as the footer and the bar read it.
+    pub fn job_lines(&self, id: AgentId) -> Vec<String> {
+        self.live_jobs(id)
+            .into_iter()
+            .map(|job| {
+                let held = if job.exclusive { " · the machine" } else { "" };
+                format!(
+                    "{} {} {}{held}",
+                    crate::jobs::label(job.id),
+                    job.command,
+                    short_age(job.age)
+                )
+            })
+            .collect()
     }
 
     /// Remember a transient line for the bar: what a command just did, what the
@@ -1502,15 +1554,10 @@ impl App {
     /// work was lost with them. Stopping one agent is what the key should do;
     /// stopping the whole tree is `interrupt_all`.
     fn interrupt(&mut self) {
-        // What the human is looking at: the focused agent if it is busy, else
-        // the one agent that is busy (there is nothing to disambiguate).
-        let busy: Vec<AgentId> = self
-            .tree
-            .agents
-            .iter()
-            .filter(|node| node.phase.is_busy())
-            .map(|node| node.id)
-            .collect();
+        // What the human is looking at: the focused agent if it is working, else
+        // the one agent that is — and "working" includes a detached job, which
+        // is work in flight even while its owner naps.
+        let busy = self.working_agents();
         let target = if busy.contains(&self.tree.focused) {
             Some(self.tree.focused)
         } else if busy.len() == 1 {
@@ -1538,13 +1585,7 @@ impl App {
     /// Stop every busy agent. The old Ctrl-C, now on its own key: it is the
     /// emergency brake, not the everyday one.
     fn interrupt_all(&mut self) {
-        let targets: Vec<AgentId> = self
-            .tree
-            .agents
-            .iter()
-            .filter(|node| node.phase.is_busy())
-            .map(|node| node.id)
-            .collect();
+        let targets = self.working_agents();
         if targets.is_empty() {
             self.say("nothing running · Ctrl-Q quits · Ctrl-N starts a new chat");
             return;
@@ -1559,6 +1600,18 @@ impl App {
             .collect::<Vec<_>>()
             .join(", ");
         self.say(format!("stopped {} agents ({list})", ids.len()));
+    }
+
+    /// The agents with work in flight: a run, or a job. `Stop` is aimed at the
+    /// work, not at the phase, so both count — an agent whose run ended while
+    /// its `cargo bench` still runs is not idle on the machine.
+    fn working_agents(&self) -> Vec<AgentId> {
+        self.tree
+            .agents
+            .iter()
+            .filter(|node| node.phase.is_busy() || !self.tree.live_jobs(node.id).is_empty())
+            .map(|node| node.id)
+            .collect()
     }
 
     /// Ask one agent to stop and show it immediately. A dead mailbox is a gone
@@ -1640,6 +1693,11 @@ impl Drop for App {
         if self.session_dirty_at.is_some() {
             self.flush_session();
         }
+        // Jobs die with mush itself. Each one is a process group, and a build an
+        // agent started used to outlive a clean quit — the human's next `cargo
+        // build` then fought a ghost for the target directory. Killing here,
+        // on the way out of the process, is the last moment it can happen.
+        self.tree.handles().jobs.kill_all();
     }
 }
 
@@ -3257,7 +3315,7 @@ mod tests {
             "the leftover is registered"
         );
         assert!(
-            app.tree.ids().load(Ordering::SeqCst) >= 8,
+            app.tree.handles().ids.load(Ordering::SeqCst) >= 8,
             "the next spawn must not reuse #7"
         );
 
