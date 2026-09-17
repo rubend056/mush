@@ -60,6 +60,14 @@ fn git(dir: &Path, args: &[&str]) -> Option<String> {
     Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// The reason `run` gives when the git process could not be started at all.
+///
+/// It is a constant because [`has_commits`] has to tell "git answered no" from
+/// "git never answered", and comparing a bare string literal would make that
+/// decision depend on a copy of the text: rename the message in `run` and a
+/// machine with no git would report itself as a repository without commits.
+pub const GIT_UNAVAILABLE: &str = "git binary unavailable";
+
 /// Run a git command that *changes* the repository and return its trimmed
 /// stdout. Unlike [`status`] and friends this can fail for a reason the human
 /// needs to read (a merge conflict, a worktree that is still checked out), so
@@ -74,7 +82,7 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
         .args(args)
         .env("LC_ALL", "C")
         .output()
-        .map_err(|_| "git binary unavailable".to_string())?;
+        .map_err(|_| GIT_UNAVAILABLE.to_string())?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -222,10 +230,18 @@ pub fn parse_worktrees(text: &str) -> Vec<Worktree> {
 /// binary). The two want different words in front of a human, so they are not
 /// collapsed into one `bool`.
 pub fn has_commits(dir: &Path) -> Option<bool> {
-    match run(dir, &["rev-parse", "--verify", "-q", "HEAD"]) {
+    head_answer(run(dir, &["rev-parse", "--verify", "-q", "HEAD"]))
+}
+
+/// Read the answer to the HEAD probe. Split out so the three outcomes are
+/// testable without a machine that has no git: the point of the ternary is that
+/// the two failures mean different things, and that distinction is what this
+/// function *is*.
+fn head_answer(probe: Result<String, String>) -> Option<bool> {
+    match probe {
         Ok(_) => Some(true),
-        // `run` says exactly this when the process could not be started.
-        Err(error) if error == "git binary unavailable" => None,
+        // See `GIT_UNAVAILABLE`.
+        Err(error) if error == GIT_UNAVAILABLE => None,
         Err(_) => Some(false),
     }
 }
@@ -249,7 +265,7 @@ pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf,
         }
         // A missing git is not a missing commit, and saying so would send a
         // human looking for a `git commit` they cannot run either.
-        (None, None) => return Err("git binary unavailable".to_string()),
+        (None, None) => return Err(GIT_UNAVAILABLE.to_string()),
         _ => {}
     }
     let path = worktree_path(dir, id);
@@ -520,6 +536,24 @@ mod tests {
         assert_eq!(worktree_id("mush/x"), None);
         assert_eq!(worktree_id("main"), None);
         assert_eq!(worktree_id("refs/heads/mush/1"), None);
+    }
+
+    /// "No commits yet" and "no git at all" are different answers for a human:
+    /// one is a command they can run, the other is a program that is not
+    /// installed. They must not collapse into one `false` — which is what a
+    /// renamed message in `run` would do, silently, so the distinction is
+    /// pinned here rather than left to a string comparison nobody tests.
+    #[test]
+    fn a_missing_git_is_not_a_repository_without_commits() {
+        assert_eq!(head_answer(Ok("abc123".into())), Some(true));
+        assert_eq!(head_answer(Err(GIT_UNAVAILABLE.to_string())), None);
+        assert_eq!(
+            head_answer(Err("fatal: Needed a single revision".to_string())),
+            Some(false),
+            "git answered: the repository is just empty"
+        );
+        // The message `has_commits` compares against is the one `run` writes.
+        assert_eq!(GIT_UNAVAILABLE, "git binary unavailable");
     }
 
     /// The two mutating worktree verbs against a real repository: a worktree is
