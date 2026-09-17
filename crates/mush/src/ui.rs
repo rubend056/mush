@@ -209,7 +209,7 @@ fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>>
             Style::default(),
         ),
     ]));
-    if node.branch.is_some() || matches!(node.phase, Phase::Idle) {
+    if node.branch.is_some() || matches!(node.phase, Phase::Idle | Phase::Stopped) {
         let mut detail = Vec::new();
         if let Some(branch) = &node.branch {
             // Where the work is, and the two commands that land it: this is the
@@ -242,7 +242,9 @@ fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>>
 fn phase_glyph(phase: &Phase, waiting_on_children: bool) -> &'static str {
     match phase {
         Phase::Failed(_) => "✗",
-        Phase::Cancelling => "⊘",
+        // `⊘` while a cancel is in flight and after it lands: a stopped agent
+        // is not a finished one, and must not borrow `✓`.
+        Phase::Cancelling | Phase::Stopped => "⊘",
         Phase::Idle => "·",
         Phase::Done => "✓",
         Phase::Thinking | Phase::Activity(_) => {
@@ -263,6 +265,10 @@ fn phase_detail(node: &AgentNode) -> String {
         Phase::Thinking => format!("thinking {age}"),
         Phase::Activity(what) => format!("{what} {age}"),
         Phase::Cancelling => "cancelling…".to_string(),
+        // A stopped run has no result to show: its last summary belongs to a
+        // run that was interrupted, so showing it would claim work that was
+        // never delivered. `node.summary` is deliberately not consulted.
+        Phase::Stopped => "stopped · re-send to resume".to_string(),
         Phase::Failed(error) => error.clone(),
         Phase::Idle | Phase::Done => node.summary.clone().unwrap_or_default(),
     }
@@ -676,6 +682,8 @@ mod tests {
         assert_eq!(phase_glyph(&Phase::Cancelling, false), "⊘");
         assert_eq!(phase_glyph(&Phase::Done, false), "✓");
         assert_eq!(phase_glyph(&Phase::Failed("boom".into()), false), "✗");
+        // A stopped agent is not a finished one, and must not borrow the tick.
+        assert_eq!(phase_glyph(&Phase::Stopped, false), "⊘");
     }
 
     /// The detail line carries the age of the *phase*, so a slow model looks
@@ -703,5 +711,15 @@ mod tests {
             "no route"
         );
         assert_eq!(phase_detail(&node(Phase::Idle, 9)), "");
+
+        // A stopped run has no result; showing the interrupted run's summary
+        // would claim work that was never delivered.
+        let mut stopped = node(Phase::Stopped, 9);
+        stopped.summary = Some("wrote half the parser".to_string());
+        assert_eq!(phase_detail(&stopped), "stopped · re-send to resume");
+        assert!(
+            !phase_detail(&stopped).contains("half the parser"),
+            "a stop must not show the previous run's summary"
+        );
     }
 }

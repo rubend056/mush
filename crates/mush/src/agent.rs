@@ -35,11 +35,22 @@ use mush_core::{prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_
 use crate::app::Msg;
 use crate::http;
 
-/// Safety valve: how many model turns one run may take. The final turn is a
-/// wrap-up turn — tools are withdrawn and the model is asked to summarize — so
-/// hitting the limit produces a result, not an error (finding N1). The human
-/// still gets an explicit notice when the limit is reached.
-const MAX_TURNS: usize = 24;
+/// Backstop against a model that never stops — *not* a budget for the work.
+///
+/// This used to be 24 and acted as a task budget, which turned honest long work
+/// (read a 2,500-line file, edit it, run the gate, edit again) into a truncated
+/// run: the agent was stopped mid-task for being thorough. A run is really
+/// bounded by the endpoint's context window (compaction and `trim_history`) and
+/// by `LOOP_ROUNDS` below, so this is only the last line of defence against a
+/// model that answers forever. Set past any real task on purpose.
+const RUNAWAY_TURNS: usize = 200;
+/// Identical consecutive tool batches before the run is called a loop.
+///
+/// The honest reason to stop a run *early* is that it stopped making progress,
+/// not that it took a certain number of turns. Repeating the same call with the
+/// same arguments and nothing changed in between is that signal; a long task
+/// that keeps changing something never trips it, however long it runs.
+const LOOP_ROUNDS: usize = 5;
 /// Ceiling on one model reply, in tokens. It has to cover a thinking model's
 /// reasoning too: when the cap is spent before the visible answer, the reply
 /// arrives cut off (`finish_reason: length`) and the run fails loudly instead
@@ -51,8 +62,50 @@ pub const MAX_DEPTH: usize = 3;
 const MAX_AGENTS: u64 = 16;
 /// Default `wait_agents` timeout in seconds; 0 means forever.
 const WAIT_TIMEOUT_SECS: u64 = 600;
-/// Why a cancelled run ends. The UI shows this one as a status, not a failure.
-pub const CANCELLED: &str = "cancelled";
+/// Why a cancelled run ends. Internal to the actor: a run that ends with this
+/// becomes `Outcome::Stopped` at the actor boundary, so no other layer has to
+/// compare result text to know what happened.
+const CANCELLED: &str = "cancelled";
+
+/// How a run ended, as the actor reports it to its parent and to its own row.
+///
+/// Three outcomes, because they mean three different things: a finished run
+/// produced a result, a failed run produced an error, and a *stopped* run
+/// produced neither — the actor is still alive and a nudge resumes it. A bare
+/// summary string could not tell them apart, so a stopped child was reported
+/// through the same path as a finished one and read as `done`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Outcome {
+    /// The run finished; the string is its summary.
+    Finished(String),
+    /// The run was stopped (Ctrl-C, `agent_control stop`, `/new`). Not a
+    /// result and not a failure: the actor is idle and resumable.
+    Stopped,
+    /// The run failed; the string is the error.
+    Failed(String),
+}
+
+impl Outcome {
+    /// The line a parent reads. Each outcome names itself, so a stop can never
+    /// be mistaken for a result.
+    fn line(&self, id: u64) -> String {
+        match self {
+            Outcome::Finished(summary) => format!("#{id} done: {summary}"),
+            Outcome::Stopped => format!(
+                "#{id} stopped: the run ended before it finished — this agent is idle, \
+                 not done; agent_control message resumes it"
+            ),
+            Outcome::Failed(error) => format!("#{id} failed: {error}"),
+        }
+    }
+
+    /// Whether this is news worth waking a napping parent for. A stop is the
+    /// human's doing, not news, so it waits in the transcript instead of
+    /// paying for a fresh run.
+    fn is_news(&self) -> bool {
+        !matches!(self, Outcome::Stopped)
+    }
+}
 
 /// Commands sent into an agent actor's mailbox.
 pub enum AgentMsg {
@@ -68,8 +121,8 @@ pub enum AgentMsg {
     /// actor holds its own mailbox open, so it never learns that everyone else
     /// let go — it has to be told.
     Shutdown,
-    /// A child sent this parent its final summary.
-    ChildDone { id: u64, summary: String },
+    /// A child's run ended. The outcome says *how*: a stop is not a result.
+    ChildDone { id: u64, outcome: Outcome },
 }
 
 /// Events streamed to the UI thread, tagged with the emitting agent's id.
@@ -98,6 +151,9 @@ pub enum AgentEvent {
     Notice(String),
     Message(Message),
     Done,
+    /// The run was stopped by a request (a Stop, Ctrl-C, `/new`). The actor is
+    /// still alive, so the row goes quiet instead of claiming a failure.
+    Stopped,
     Error(String),
     /// The window the endpoint itself named when it rejected a request; the UI
     /// adopts it so the bar, `/context`, and the tool caps agree with the agent
@@ -144,7 +200,7 @@ impl AgentCtx {
 struct ActorState {
     children: HashMap<u64, Sender<AgentMsg>>,
     running: HashSet<u64>,
-    completed: HashMap<u64, String>,
+    completed: HashMap<u64, Outcome>,
     /// Completions already handed to the model (via wait_agents or delivery).
     delivered: HashSet<u64>,
     /// Commands parked while a blocking tool call was in flight; folded in at
@@ -240,9 +296,12 @@ fn start(actor: Actor, initial: Vec<Message>, start_immediately: bool) {
     let parent_tx = actor.parent_tx.clone();
     let builder = std::thread::Builder::new().name(format!("mush-agent-{id}"));
     if let Err(error) = builder.spawn(move || actor_main(actor, initial, start_immediately)) {
-        let summary = format!("error: agent #{id} could not start ({error})");
+        let summary = format!("agent #{id} could not start ({error})");
         ctx.emit(id, AgentEvent::Error(summary.clone()));
-        let _ = parent_tx.send(AgentMsg::ChildDone { id, summary });
+        let _ = parent_tx.send(AgentMsg::ChildDone {
+            id,
+            outcome: Outcome::Failed(summary),
+        });
     }
 }
 
@@ -269,12 +328,21 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         actor.ctx.live.fetch_add(1, Ordering::SeqCst);
         let result = run_loop(&actor, &mut state, &mut transcript, &cancel);
         actor.ctx.live.fetch_sub(1, Ordering::SeqCst);
+        // How the run ended decides both the commit subject and what the parent
+        // is told. A stopped run still has work worth keeping, but its commit
+        // must not read like a finished one.
+        let outcome = match result {
+            Ok(Some(text)) => Outcome::Finished(text),
+            Ok(None) => Outcome::Finished("(finished)".to_string()),
+            Err(error) if error == CANCELLED => Outcome::Stopped,
+            Err(error) => Outcome::Failed(error),
+        };
         // An isolated agent's branch *is* the deliverable mush documents for it
         // (`/diff`, `/merge`, `/discard`), so its work is committed here instead
         // of being left as untracked files in the worktree. Before the parent is
         // told, so a diff or merge it triggers already sees the work.
         if let Some(branch) = actor.branch.clone() {
-            match commit_worktree(actor.ws.root(), actor.id, &actor.brief) {
+            match commit_worktree(actor.ws.root(), actor.id, &actor.brief, &outcome) {
                 Ok(Some(revision)) => {
                     actor.ctx.emit(
                         actor.id,
@@ -290,18 +358,14 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
                 }
             }
         }
-        let (summary, error) = match result {
-            Ok(Some(text)) => (text, None),
-            Ok(None) => ("(finished)".to_string(), None),
-            Err(error) => (error.clone(), Some(error)),
-        };
         let _ = actor.parent_tx.send(AgentMsg::ChildDone {
             id: actor.id,
-            summary,
+            outcome: outcome.clone(),
         });
-        match error {
-            Some(error) => actor.ctx.emit(actor.id, AgentEvent::Error(error)),
-            None => actor.ctx.emit(actor.id, AgentEvent::Done),
+        match outcome {
+            Outcome::Failed(error) => actor.ctx.emit(actor.id, AgentEvent::Error(error)),
+            Outcome::Stopped => actor.ctx.emit(actor.id, AgentEvent::Stopped),
+            Outcome::Finished(_) => actor.ctx.emit(actor.id, AgentEvent::Done),
         }
         // A Shutdown arrived while this run was winding down: it is over, and
         // so is this actor.
@@ -404,23 +468,23 @@ fn absorb(state: &mut ActorState, transcript: &mut Vec<Message>, command: AgentM
             transcript.push(Message::user(text));
             Fold::Run
         }
-        AgentMsg::ChildDone { id, summary } => {
+        AgentMsg::ChildDone { id, outcome } => {
             // The parent ended (or napped) while a child still ran: waking it
             // with the completion restarts its run with the result folded in,
             // so an early End is not a lost result, it is a nap. The
             // completion counts as delivered because the model is about to
             // read it in this very run.
-            let cancelled = summary == CANCELLED;
-            let line = note_completion(state, id, summary);
+            let news = outcome.is_news();
+            let line = note_completion(state, id, outcome);
             transcript.push(Message::user(line));
             state.delivered.insert(id);
-            // A cancelled child is the human's doing, not news that warrants
+            // A stopped child is the human's doing, not news that warrants
             // waking a napping parent into a fresh (paid) run: the line is in
             // the transcript for whenever the parent runs next.
-            if cancelled {
-                Fold::Idle
-            } else {
+            if news {
                 Fold::Run
+            } else {
+                Fold::Idle
             }
         }
     }
@@ -442,18 +506,23 @@ fn run_loop(
     // window, anything else is the run's error.
     let mut learned_context = false;
 
-    for turn in 0..MAX_TURNS {
+    // Loop detection: what justifies stopping a run early is a lack of
+    // progress, not a turn count.
+    let mut last_batch = String::new();
+    let mut repeats = 0usize;
+
+    for turn in 0..RUNAWAY_TURNS {
         // The last turn is a wrap-up: no tools, and a request for a summary.
         // A long task then ends with a report of what was done and what is
-        // left, instead of a bare `stopped after 24 turns` (finding N1).
-        let wrap_up = turn + 1 == MAX_TURNS;
+        // left, instead of a bare `stopped after N turns` (finding N1).
+        let wrap_up = turn + 1 == RUNAWAY_TURNS;
         if wrap_up {
             // The wrap-up turn still ends the run with a summary (finding N1),
             // but the human should learn why tools suddenly went away.
             actor.ctx.emit(
                 actor.id,
                 AgentEvent::Notice(format!(
-                    "turn limit reached ({MAX_TURNS} turns) — asking the model to wrap up"
+                    "runaway guard reached ({RUNAWAY_TURNS} turns) — asking the model to wrap up"
                 )),
             );
         }
@@ -631,6 +700,45 @@ fn run_loop(
             ));
         }
 
+        // The same batch of calls, twice in a row with nothing changed in
+        // between, means the model is repeating itself rather than working.
+        // This — not a turn count — is the honest reason to stop a run early.
+        if !tool_calls.is_empty() {
+            let batch = tool_calls
+                .iter()
+                .map(|call| format!("{}:{}", call.function.name, call.function.arguments))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if batch == last_batch {
+                repeats += 1;
+            } else {
+                repeats = 0;
+                last_batch = batch;
+            }
+            if repeats >= LOOP_ROUNDS {
+                for call in &tool_calls {
+                    let message = Message::tool(
+                        call.id.clone(),
+                        "error: this call was not run — the run was stopped as a loop",
+                    );
+                    messages.push(message.clone());
+                    actor.ctx.emit(actor.id, AgentEvent::Message(message));
+                }
+                let count = repeats + 1;
+                actor.ctx.emit(
+                    actor.id,
+                    AgentEvent::Notice(format!(
+                        "the run repeated the same tool call {count} times without changing \
+                         anything — stopping it as a loop"
+                    )),
+                );
+                return Err(format!(
+                    "the run was stopped as a loop: the same tool call repeated {count} times \
+                     with nothing changed in between"
+                ));
+            }
+        }
+
         if wrap_up {
             // Whatever the model wrote is the run's result. If it tried to keep
             // calling tools, answer the calls so the transcript stays valid,
@@ -638,13 +746,15 @@ fn run_loop(
             for call in &tool_calls {
                 let message = Message::tool(
                     call.id.clone(),
-                    format!("error: the run hit its {MAX_TURNS}-turn limit; tools are no longer available"),
+                    format!("error: the run hit its {RUNAWAY_TURNS}-turn runaway guard; tools are no longer available"),
                 );
                 messages.push(message.clone());
                 actor.ctx.emit(actor.id, AgentEvent::Message(message));
             }
             return if content.is_empty() {
-                Err(format!("stopped after {MAX_TURNS} turns without finishing"))
+                Err(format!(
+                    "stopped after {RUNAWAY_TURNS} turns without finishing (runaway guard)"
+                ))
             } else {
                 Ok(Some(content))
             };
@@ -669,15 +779,15 @@ fn run_loop(
             // waited on: deliver their summaries and keep going instead of
             // ending. (Completions that arrive after this run returns wake the
             // idle actor instead — see actor_main.)
-            let pending: Vec<(u64, String)> = state
+            let pending: Vec<(u64, Outcome)> = state
                 .completed
                 .iter()
                 .filter(|(child, _)| !state.delivered.contains(child))
-                .map(|(child, summary)| (*child, summary.clone()))
+                .map(|(child, outcome)| (*child, outcome.clone()))
                 .collect();
             if !pending.is_empty() {
-                for (child, summary) in &pending {
-                    let line = note_completion(state, *child, summary.clone());
+                for (child, outcome) in &pending {
+                    let line = note_completion(state, *child, outcome.clone());
                     messages.push(Message::user(line));
                     state.delivered.insert(*child);
                 }
@@ -738,14 +848,17 @@ fn run_loop(
         }
     }
 
-    Err(format!("stopped after {MAX_TURNS} turns without finishing"))
+    Err(format!(
+        "stopped after {RUNAWAY_TURNS} turns without finishing (runaway guard)"
+    ))
 }
 
 /// The instruction appended to the request on the run's final turn.
 const WRAP_UP_INSTRUCTION: &str = "\
-You have reached this run's turn limit. Stop using tools now — they are no \
-longer available. Reply with a concise summary of what has been done, what \
-still remains, and anything the next run needs to know.";
+You have reached this run's runaway guard, which is meant to be far past any \
+real task. Stop using tools now — they are no longer available. Reply with a \
+concise summary of what has been done, what still remains, and anything the \
+next run needs to know.";
 
 /// Fold the transcript into a summary: ask the model to condense it, then
 /// replace the conversation with `[system, user(summary)]` — the summary is
@@ -850,8 +963,8 @@ fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
                 cancel.store(true, Ordering::SeqCst);
                 state.shutdown = true;
             }
-            AgentMsg::ChildDone { id, summary } => {
-                note_completion(state, id, summary);
+            AgentMsg::ChildDone { id, outcome } => {
+                note_completion(state, id, outcome);
             }
             parked => state.deferred.push(parked),
         }
@@ -877,8 +990,8 @@ fn drain_mailbox(
                 cancel.store(true, Ordering::SeqCst);
                 state.shutdown = true;
             }
-            AgentMsg::ChildDone { id, summary } => {
-                note_completion(state, id, summary);
+            AgentMsg::ChildDone { id, outcome } => {
+                note_completion(state, id, outcome);
             }
             // The UI sends a whole transcript when it believes we are idle.
             // We are mid-run, so the only new information is the message the
@@ -898,11 +1011,14 @@ fn drain_mailbox(
 
 /// Record a child's completion and return the line the model reads. A fresh
 /// completion also supersedes any earlier delivery of the same child.
-fn note_completion(state: &mut ActorState, id: u64, summary: String) -> String {
+fn note_completion(state: &mut ActorState, id: u64, outcome: Outcome) -> String {
     state.running.remove(&id);
-    state.completed.insert(id, summary.clone());
+    // Always the latest outcome: a child that was stopped and then nudged
+    // finishes later, and the stale `stopped` must not outlive the result.
+    let line = outcome.line(id);
+    state.completed.insert(id, outcome);
     state.delivered.remove(&id);
-    format!("#{id} done: {summary}")
+    line
 }
 
 fn exec_tool(
@@ -939,7 +1055,10 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         ));
     }
     if ctx.live.load(Ordering::SeqCst) >= MAX_AGENTS {
-        return Err(format!("too many agents running (max {MAX_AGENTS})"));
+        return Err(format!(
+            "cannot spawn: {MAX_AGENTS} agents are already running tree-wide (the limit). \
+             Wait for one with wait_agents before spawning another."
+        ));
     }
     let brief = tools::arg_string(args, "brief")?;
     let isolated = args
@@ -947,9 +1066,13 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         .and_then(Value::as_bool)
         .unwrap_or(false);
     if !isolated && !state.running.is_empty() {
+        // Decide this *before* writing the brief: the check can only fail after
+        // the brief exists, so the rule is stated in the tool schema and the
+        // system prompt as well.
         return Err(
-            "a sibling agent already runs in this shared workspace; set isolated=true \
-             (its own git worktree) to work in parallel"
+            "cannot spawn: a sibling agent already runs in this shared workspace, and only one \
+             non-isolated child may run at a time. Set isolated=true (its own git worktree) to \
+             run siblings in parallel, or wait_agents for the running one first."
                 .to_string(),
         );
     }
@@ -1022,7 +1145,14 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
 
     state.children.insert(id, cmd_tx);
     state.running.insert(id);
-    Ok(format!("spawned agent #{id}"))
+    // A run is bounded by progress, not by a turn count: it ends when the model
+    // stops calling tools, and is cut short only if it starts looping
+    // (`LOOP_ROUNDS` identical rounds). The only hard ceiling is a runaway
+    // guard far past any real task, so this is not a budget to size a brief
+    // against any more.
+    Ok(format!(
+        "spawned agent #{id} · runs until it stops calling tools · wait_agents returns its summary"
+    ))
 }
 
 fn wait_tool(
@@ -1077,9 +1207,12 @@ fn wait_tool(
             return Err(CANCELLED.to_string());
         }
         for id in &candidates {
-            if let Some(summary) = state.completed.get(id) {
+            if let Some(outcome) = state.completed.get(id) {
                 state.delivered.insert(*id);
-                return Ok(format!("#{id} done: {summary}"));
+                // Not always `done`: a stopped child is reported as stopped, so
+                // a waiter knows there is no result yet rather than receiving
+                // one that says "cancelled".
+                return Ok(outcome.line(*id));
             }
         }
         if let Some(deadline) = deadline {
@@ -1099,12 +1232,16 @@ fn status_tool(state: &ActorState) -> Result<String, String> {
     let mut ids: Vec<u64> = state.children.keys().copied().collect();
     ids.sort_unstable();
     for id in ids {
-        if let Some(summary) = state.completed.get(&id) {
-            // A cancelled child was stopped, not finished.
-            let mark = if summary == CANCELLED { "✗" } else { "✓" };
-            lines.push(format!("#{id} {mark} {summary}"));
-        } else {
-            lines.push(format!("#{id} ◐ running"));
+        match state.completed.get(&id) {
+            // Each state gets its own mark: a stopped child was neither
+            // finished (✓) nor failed (✗), and a parent that cannot tell them
+            // apart treats a stop as a result.
+            Some(Outcome::Finished(summary)) => lines.push(format!("#{id} ✓ {summary}")),
+            Some(Outcome::Failed(error)) => lines.push(format!("#{id} ✗ {error}")),
+            Some(Outcome::Stopped) => lines.push(format!(
+                "#{id} ⊘ stopped — idle and resumable (agent_control message resumes it)"
+            )),
+            None => lines.push(format!("#{id} ◐ running")),
         }
     }
     Ok(lines.join("\n"))
@@ -1145,13 +1282,32 @@ fn control_tool(state: &mut ActorState, args: &Value) -> Result<String, String> 
 /// `--no-verify`) so a commit never depends on the human's git configuration and
 /// never runs their hooks. The index belongs to this worktree, so committing
 /// here cannot contend with the human's own git commands in the main checkout.
-fn commit_worktree(root: &Path, id: u64, brief: &str) -> Result<Option<String>, String> {
+fn commit_worktree(
+    root: &Path,
+    id: u64,
+    brief: &str,
+    outcome: &Outcome,
+) -> Result<Option<String>, String> {
     let status = git_output(root, &["status", "--porcelain"])?;
     if status.is_empty() {
         return Ok(None);
     }
     git_output(root, &["add", "-A"])?;
-    let subject = format!("mush #{id}: {}", truncate(brief, 60));
+    // The subject carries the outcome: an interrupted run commits its work in
+    // progress too, and a log full of identically-formatted "mush #3: <brief>"
+    // subjects cannot be told apart from finished work.
+    let subject = match outcome {
+        Outcome::Finished(_) => format!("mush #{id}: {}", truncate(brief, 60)),
+        Outcome::Stopped => format!(
+            "mush #{id} (stopped, work in progress): {}",
+            truncate(brief, 60)
+        ),
+        Outcome::Failed(error) => format!(
+            "mush #{id} (failed: {}): {}",
+            truncate(error, 40),
+            truncate(brief, 60)
+        ),
+    };
     git_output(
         root,
         &[
@@ -1572,20 +1728,101 @@ mod tests {
             .collect()
     }
 
-    /// A stopped child is not a finished one; agent_status must say so, or the
-    /// parent treats a cancelled result as a successful one.
+    /// Stopped, finished and failed are three different things, and a parent
+    /// that cannot tell them apart treats a stop as a result. Each gets its own
+    /// mark: `✓` only ever means a run produced something.
     #[test]
-    fn agent_status_marks_a_cancelled_child() {
+    fn agent_status_distinguishes_stopped_from_done_and_failed() {
         let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
         let mut state = ActorState::default();
         state.children.insert(1, tx.clone());
-        state.completed.insert(1, CANCELLED.to_string());
-        state.children.insert(2, tx);
-        state.completed.insert(2, "did the thing".to_string());
+        state.completed.insert(1, Outcome::Stopped);
+        state.children.insert(2, tx.clone());
+        state
+            .completed
+            .insert(2, Outcome::Finished("did the thing".into()));
+        state.children.insert(3, tx);
+        state
+            .completed
+            .insert(3, Outcome::Failed("no route".into()));
 
         let lines = status_tool(&state).unwrap();
-        assert!(lines.contains("#1 ✗ cancelled"), "{lines}");
+        assert!(lines.contains("#1 ⊘ stopped"), "a stop is not a ✓: {lines}");
         assert!(lines.contains("#2 ✓ did the thing"), "{lines}");
+        assert!(lines.contains("#3 ✗ no route"), "{lines}");
+        // The old shape — a sentinel string leaking into the parent's view —
+        // reported a stopped child as a *finished* one.
+        assert!(!lines.contains("#1 ✓"), "{lines}");
+        assert!(!lines.contains("cancelled"), "{lines}");
+    }
+
+    /// The line a parent reads must name the outcome. A stopped run has no
+    /// result, and reporting one as `done` is how a lost agent passes for a
+    /// finished one.
+    #[test]
+    fn only_a_finished_run_reports_itself_as_done() {
+        assert_eq!(
+            Outcome::Finished("wrote the parser".into()).line(3),
+            "#3 done: wrote the parser"
+        );
+        let stopped = Outcome::Stopped.line(3);
+        assert!(stopped.starts_with("#3 stopped"), "{stopped}");
+        // It must not be *formatted* as a done line. (The words "not done" do
+        // appear, deliberately: they are what tells the parent it is not one.)
+        assert!(!stopped.starts_with("#3 done"), "{stopped}");
+        let failed = Outcome::Failed("no route".into()).line(3);
+        assert!(failed.starts_with("#3 failed"), "{failed}");
+    }
+
+    /// A stop is the human's doing, not news: it must not wake a napping parent
+    /// into a fresh (paid) run. A finish is news and must wake it.
+    #[test]
+    fn a_stop_does_not_wake_a_napping_parent_but_a_finish_does() {
+        let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let mut state = ActorState::default();
+        state.children.insert(1, tx.clone());
+        let mut messages = vec![Message::system("you are mush")];
+
+        assert!(matches!(
+            absorb(
+                &mut state,
+                &mut messages,
+                AgentMsg::ChildDone {
+                    id: 1,
+                    outcome: Outcome::Stopped
+                }
+            ),
+            Fold::Idle
+        ));
+        assert!(messages.last().unwrap().text().contains("stopped"));
+
+        assert!(matches!(
+            absorb(
+                &mut state,
+                &mut messages,
+                AgentMsg::ChildDone {
+                    id: 1,
+                    outcome: Outcome::Finished("all done".into())
+                }
+            ),
+            Fold::Run
+        ));
+    }
+
+    /// A child that was stopped and then resumed finishes later; the stale
+    /// `stopped` must not outlive the result, or the parent waits on a stop
+    /// forever.
+    #[test]
+    fn a_later_finish_replaces_a_stale_stop() {
+        let mut state = ActorState::default();
+        note_completion(&mut state, 1, Outcome::Stopped);
+        assert_eq!(state.completed.get(&1), Some(&Outcome::Stopped));
+        let line = note_completion(&mut state, 1, Outcome::Finished("done now".into()));
+        assert_eq!(
+            state.completed.get(&1),
+            Some(&Outcome::Finished("done now".into()))
+        );
+        assert_eq!(line, "#1 done: done now");
     }
 
     /// The repair must be wired into the one path that adopts a transcript
@@ -1619,7 +1856,9 @@ mod tests {
         let (actor, _mailbox) = test_actor("delivered-yes");
         let mut state = ActorState::default();
         let mut messages = Vec::new();
-        state.completed.insert(1, "did the thing".to_string());
+        state
+            .completed
+            .insert(1, Outcome::Finished("did the thing".into()));
         state.delivered.insert(1);
         let fresh = vec![
             Message::system("you are mush"),
@@ -1896,7 +2135,9 @@ mod tests {
         let (actor, _mailbox) = test_actor("deliver");
         let mut state = ActorState::default();
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
-        state.completed.insert(1, "did the thing".to_string());
+        state
+            .completed
+            .insert(1, Outcome::Finished("did the thing".into()));
         state.delivered.insert(1);
 
         let fresh = vec![Message::system("you are mush"), Message::user("carry on")];

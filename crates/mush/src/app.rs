@@ -20,7 +20,7 @@ use mush_core::{
     Workspace,
 };
 
-use crate::agent::{self, spawn, AgentEvent, AgentMsg, RootHandle};
+use crate::agent::{spawn, AgentEvent, AgentMsg, RootHandle};
 use crate::http;
 use crate::input::Input;
 
@@ -83,6 +83,12 @@ pub enum Phase {
     Activity(String),
     /// A Stop is on its way and the actor has not yielded yet.
     Cancelling,
+    /// A Stop landed: the run ended with no result, but the actor is still
+    /// alive and a nudge resumes it. Its own state, because `Idle` (never ran),
+    /// `Done` (produced a result) and `Stopped` (produced nothing, resumable)
+    /// are three different things and blanking a stop to `Idle` lost the one
+    /// fact the human needed: that work was interrupted mid-flight.
+    Stopped,
     /// The run finished; `summary` holds what it produced.
     Done,
     /// The run failed; the payload is what the human needs to read.
@@ -563,27 +569,32 @@ impl App {
                 }
                 self.chat_scroll = 0;
             }
-            AgentEvent::Error(error) => {
-                let cancelled = error == agent::CANCELLED;
+            AgentEvent::Stopped => {
+                // Stopped is not failed and not done: the run produced nothing,
+                // and the actor is idle and resumable. Saying which one it is
+                // is the difference between a lost agent and a parked one.
                 if let Some(node) = self.agent_node_mut(id) {
-                    // A cancelled run produced nothing to show: it is over, not
-                    // finished, so the row goes quiet instead of claiming `✓`.
-                    node.phase = if cancelled {
-                        Phase::Idle
-                    } else {
-                        Phase::Failed(error.clone())
-                    };
+                    node.phase = Phase::Stopped;
                     node.since = Instant::now();
                 }
                 self.agent_cancel.remove(&id);
                 self.refresh_git();
-                if cancelled {
-                    if id == self.focused || id == 0 {
-                        self.say("cancelled");
-                    }
-                } else {
-                    self.note_error_for(id, error);
+                // Only the agent the human is looking at needs the bar; a
+                // stop they did not ask for still shows as ⊘ on its row.
+                if id == self.focused {
+                    self.say(format!("agent #{id} stopped — send a message to resume it"));
                 }
+                self.chat_scroll = 0;
+                self.recompute_busy();
+            }
+            AgentEvent::Error(error) => {
+                if let Some(node) = self.agent_node_mut(id) {
+                    node.phase = Phase::Failed(error.clone());
+                    node.since = Instant::now();
+                }
+                self.agent_cancel.remove(&id);
+                self.refresh_git();
+                self.note_error_for(id, error);
                 self.chat_scroll = 0;
                 self.recompute_busy();
             }
@@ -730,6 +741,7 @@ impl App {
             Phase::Thinking => "thinking".to_string(),
             Phase::Activity(what) => what.clone(),
             Phase::Cancelling => "cancelling".to_string(),
+            Phase::Stopped => "stopped".to_string(),
             _ => return None,
         };
         let mut line = format!("#{} {what} {age}", shown.id);
@@ -857,7 +869,8 @@ impl App {
                 self.note(
                     "mush: Tab cycles agents/chat · Enter sends to the focused agent · \
                      Ctrl-P pick a model · Ctrl-N new chat · \
-                     Ctrl-C cancel all. Commands: /provider /model /context /url /key /models \
+                     Ctrl-C stops the focused agent · Ctrl-X stops them all. \
+                     Commands: /provider /model /context /url /key /models \
                      /worktrees /diff /merge /discard /new /quit",
                 );
             }
@@ -1255,6 +1268,7 @@ impl App {
             match key.code {
                 KeyCode::Char('q') => return self.request_quit(),
                 KeyCode::Char('c') => return self.interrupt(),
+                KeyCode::Char('x') => return self.interrupt_all(),
                 KeyCode::Char('n') => return self.new_chat(),
                 KeyCode::Char('p') => return self.open_model_picker(),
                 _ => {}
@@ -1295,36 +1309,83 @@ impl App {
             .unwrap_or(false)
     }
 
-    /// Cancel the work that is actually running. An idle agent has nothing to
-    /// cancel, and stopping it would kill the root for good (it only comes back
-    /// with `/new`), so Ctrl-C leaves idle agents alone.
+    /// Stop the agent the human is looking at. Ctrl-C used to stop *every*
+    /// busy agent at once, which is the wrong default: the agents it killed
+    /// were usually the ones already finished and about to report, and their
+    /// work was lost with them. Stopping one agent is what the key should do;
+    /// stopping the whole tree is `interrupt_all`.
     fn interrupt(&mut self) {
+        // What the human is looking at: the focused agent if it is busy, else
+        // the one agent that is busy (there is nothing to disambiguate).
+        let busy: Vec<u64> = self
+            .agents
+            .iter()
+            .filter(|node| node.phase.is_busy())
+            .map(|node| node.id)
+            .collect();
+        let target = if busy.contains(&self.focused) {
+            Some(self.focused)
+        } else if busy.len() == 1 {
+            Some(busy[0])
+        } else {
+            None
+        };
+        let Some(id) = target else {
+            if busy.is_empty() {
+                self.say("nothing running · Ctrl-Q quits · Ctrl-N starts a new chat");
+            } else {
+                // Several agents are busy and the focused one is not among
+                // them: stopping the wrong one silently would be worse than
+                // asking, so name the scope instead.
+                self.say(format!(
+                    "{} agents running · Enter picks one to stop · Ctrl-X stops them all",
+                    busy.len()
+                ));
+            }
+            return;
+        };
+        self.stop_one(id);
+    }
+
+    /// Stop every busy agent. The old Ctrl-C, now on its own key: it is the
+    /// emergency brake, not the everyday one.
+    fn interrupt_all(&mut self) {
         let targets: Vec<u64> = self
             .agents
             .iter()
             .filter(|node| node.phase.is_busy())
             .map(|node| node.id)
             .collect();
-        let mut stopped = 0usize;
-        for id in targets {
-            // A dead mailbox is a gone actor: mark the row so it stops showing
-            // work that can never finish (finding B6).
-            let alive = self.stop_agent(id);
-            stopped += 1;
-            if let Some(node) = self.agent_node_mut(id) {
-                if alive {
-                    // Say so immediately: the actor may be mid-request, and a
-                    // row that keeps spinning looks like the Stop was never
-                    // heard.
-                    node.phase = Phase::Cancelling;
-                } else {
-                    node.phase = Phase::Idle;
-                }
-                node.since = Instant::now();
-            }
-        }
-        if stopped == 0 {
+        if targets.is_empty() {
             self.say("nothing running · Ctrl-Q quits · Ctrl-N starts a new chat");
+            return;
+        }
+        let ids = targets.clone();
+        for id in targets {
+            self.stop_one(id);
+        }
+        let list = ids
+            .iter()
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.say(format!("stopped {} agents ({list})", ids.len()));
+    }
+
+    /// Ask one agent to stop and show it immediately. A dead mailbox is a gone
+    /// actor: mark the row so it stops showing work that can never finish
+    /// (finding B6).
+    fn stop_one(&mut self, id: u64) {
+        let alive = self.stop_agent(id);
+        if let Some(node) = self.agent_node_mut(id) {
+            // Say so immediately: the actor may be mid-request, and a row that
+            // keeps spinning looks like the Stop was never heard.
+            node.phase = if alive {
+                Phase::Cancelling
+            } else {
+                Phase::Stopped
+            };
+            node.since = Instant::now();
         }
         self.recompute_busy();
     }
@@ -1368,14 +1429,9 @@ impl App {
                         self.say(format!("agent #{id} is not running"));
                         return;
                     }
-                    if self.stop_agent(id) {
-                        // The row's own `⊘` is the feedback; the bar shows what
-                        // the tree as a whole is doing.
-                        if let Some(node) = self.agent_node_mut(id) {
-                            node.phase = Phase::Cancelling;
-                            node.since = Instant::now();
-                        }
-                    }
+                    // The row's own `⊘` is the feedback; the bar shows what the
+                    // tree as a whole is doing.
+                    self.stop_one(id);
                 }
             }
             KeyCode::Esc => {
@@ -1644,9 +1700,13 @@ mod tests {
         app.update(Msg::Agent {
             conversation,
             id: 0,
-            event: AgentEvent::Error(agent::CANCELLED.to_string()),
+            event: AgentEvent::Stopped,
         });
-        assert_eq!(app.agents[0].phase, Phase::Idle, "the actor has stopped");
+        assert_eq!(
+            app.agents[0].phase,
+            Phase::Stopped,
+            "a stopped run is its own state, not Idle and not Done"
+        );
 
         app.agents[0].phase = Phase::Thinking;
         app.interrupt();

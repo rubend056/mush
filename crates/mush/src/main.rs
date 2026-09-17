@@ -141,7 +141,8 @@ fn print_help() {
          \x20   j / k · Enter     select and focus an agent\n\
          \x20   c / Esc           cancel agent / back to the root (agents)\n\
          \x20   Ctrl-P            model picker\n\
-         \x20   Ctrl-N            new chat    Ctrl-C  cancel running agents\n\
+         \x20   Ctrl-N            new chat    Ctrl-C  stop the focused agent\n\
+         \x20   Ctrl-X            stop every running agent\n\
          \x20   Ctrl-Q            quit\n\n\
          COMMANDS (type in the chat):\n\
          \x20   /provider [deepseek|custom]  switch provider\n\

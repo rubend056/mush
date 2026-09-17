@@ -180,9 +180,16 @@ fn normalize_url(url: &str) -> String {
 }
 
 /// Tokens every request reserves for the tool schemas. The root's nine
-/// schemas measure ~3.1 KB (~1.0 K tokens at the 3 bytes/token heuristic),
+/// schemas measure ~3.4 KB (~1.1 K tokens at the 3 bytes/token heuristic),
 /// so the reserve rounds up; `prompt` tests that they keep fitting.
-pub const SCHEMA_TOKENS: usize = 1_100;
+///
+/// The schemas are context paid on *every* request, so this is a real cost and
+/// the descriptions are kept to the rules a model must read to obey them (the
+/// one-non-isolated-sibling limit, and that stopping a child is not finishing
+/// it). They grew from ~3.1 KB when those rules were made explicit; the
+/// `schemas_fit_the_budget_reserve` test is what makes that a decision rather
+/// than a silent drift.
+pub const SCHEMA_TOKENS: usize = 1_200;
 
 impl Config {
     /// Built-in defaults with the `MUSH_*` environment applied.
@@ -712,11 +719,12 @@ mod tests {
 
     #[test]
     fn history_budget_fits_the_context_window() {
-        // 8192 tokens: the full reserve (1100 schemas + 2048 reply + 200
-        // margin) leaves 14_532 bytes of history.
+        // 8192 tokens: the full reserve (1200 schemas + 2048 reply + 200
+        // margin) leaves 14_232 bytes of history. The schema reserve grew from
+        // 1100 when the delegation contract became explicit; see SCHEMA_TOKENS.
         let small = Config::new("http://x:1", "m", None);
         assert_eq!(small.context_tokens, DEFAULT_CONTEXT_TOKENS);
-        assert_eq!(small.history_budget(), 14_532);
+        assert_eq!(small.history_budget(), 14_232);
 
         // A big window leaves a much larger budget.
         let big = Config {

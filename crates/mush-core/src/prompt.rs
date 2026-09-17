@@ -25,6 +25,11 @@ pub fn system_prompt(root: &str) -> String {
          Delegation:\n\
          - spawn_agent(brief, isolated?) starts a subagent that has NO memory of this conversation: \
          the brief must carry every fact, file, and the exact deliverable.\n\
+         - A subagent gets a bounded number of turns and the spawn result names it. Size the brief \
+         so the work fits in that budget: a brief too big for its budget ends mid-task, not early.\n\
+         - Only one non-isolated subagent may run at a time in a shared workspace. Decide up front: \
+         pass isolated=true for siblings that should run in parallel, or wait_agents for the running \
+         one first. (The check can only fail after the brief exists, so decide before writing it.)\n\
          - Delegate independent, large, or context-heavy subtasks; do single edits and lookups yourself. \
          Prefer a few big delegations over many small ones.\n\
          - wait_agents blocks until a child finishes and returns its summary; agent_status lists your \
@@ -137,12 +142,12 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             "spawn_agent",
-            "Delegate a self-contained task to a subagent. The subagent starts with no memory of this conversation, so the brief must contain all context, the exact deliverable, and the expected output. Returns the new agent's id.",
+            "Delegate a self-contained task to a subagent. It has no memory of this conversation, so the brief must carry all context, the exact deliverable, and the expected output. Only one non-isolated subagent may run at a time. Returns its id.",
             json!({
                 "type": "object",
                 "properties": {
                     "brief": { "type": "string", "description": "Self-contained task for the subagent." },
-                    "isolated": { "type": "boolean", "description": "Run the subagent in its own git worktree so parallel agents never collide. Default false." }
+                    "isolated": { "type": "boolean", "description": "Run in its own git worktree (.mush/wt/<id>, branch mush/<id>). Required to run siblings in parallel: a non-isolated subagent shares this workspace and only one may run at a time. Default false." }
                 },
                 "required": ["brief"]
             }),
@@ -160,12 +165,12 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             "agent_status",
-            "Describe your child agents: id, running or finished with summary.",
+            "Describe your children: running, finished with a summary, failed, or stopped (no result; idle until you message it again).",
             json!({ "type": "object", "properties": {} }),
         ),
         tool(
             "agent_control",
-            "Stop a child agent, or message it (a nudge appears in its conversation as a user message).",
+            "Stop a child, or message it (a nudge appears in its conversation as a user message). Stopping is not finishing: the child keeps its context and its work in progress, and a later message resumes it.",
             json!({
                 "type": "object",
                 "properties": {
