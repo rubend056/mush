@@ -2007,6 +2007,23 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A count a human has to count digits in says nothing at a glance, and the
+    /// endpoint's real numbers are large ones.
+    #[test]
+    fn token_counts_read_at_a_glance() {
+        assert_eq!(tokens_label(842), "842");
+        assert_eq!(tokens_label(3_100), "3.1k");
+        assert_eq!(tokens_label(32_000), "32k", "a whole number keeps no `.0`");
+        assert_eq!(tokens_label(500_000), "500k");
+        assert_eq!(tokens_label(999_900), "999.9k");
+        assert_eq!(
+            tokens_label(999_999),
+            "1M",
+            "the last stretch before a million is not `1000k`"
+        );
+        assert_eq!(tokens_label(1_213_866), "1.2M");
+    }
+
     /// A paste lands in the message box as one insert and is *not* sent: mush
     /// must never decide for the human that what they pasted was a message.
     #[test]

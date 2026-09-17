@@ -30,7 +30,7 @@ use mush_core::transcript::{
 };
 use mush_core::{prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_SECS};
 
-use crate::app::{AgentId, ConversationId, Msg};
+use crate::app::{tokens_label, AgentId, ConversationId, Msg};
 use crate::clock;
 use crate::events::{Events, Ui};
 use crate::machine::{Job, Machine, Shell, ShellCommand};
@@ -100,8 +100,10 @@ impl RunUsage {
             self.total
         };
         format!(
-            "the endpoint counted {} prompt + {} completion tokens this run ({total} total)",
-            self.prompt, self.completion
+            "the endpoint counted {} prompt + {} completion tokens this run ({} total)",
+            tokens_label(self.prompt as usize),
+            tokens_label(self.completion as usize),
+            tokens_label(total as usize),
         )
     }
 }
@@ -3357,7 +3359,7 @@ mod tests {
         assert_eq!(usage.len(), 1, "one line per run: {usage:?}");
         assert_eq!(
             usage[0],
-            "the endpoint counted 1200 prompt + 34 completion tokens this run (1234 total)"
+            "the endpoint counted 1.2k prompt + 34 completion tokens this run (1.2k total)"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
         let _ = mailbox;
@@ -3386,7 +3388,7 @@ mod tests {
         assert_eq!(usage.len(), 1, "{usage:?}");
         assert_eq!(
             usage[0],
-            "the endpoint counted 3300 prompt + 33 completion tokens this run (3333 total)"
+            "the endpoint counted 3.3k prompt + 33 completion tokens this run (3.3k total)"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
         let _ = mailbox;
