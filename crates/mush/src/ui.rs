@@ -544,7 +544,7 @@ fn facts_line(app: &App, width: usize) -> String {
         }
         cells.push(cell);
     }
-    cells.push(format!("{} · {}", app.cfg.label(), app.context_label()));
+    cells.push(format!("{} · {}", app.cfg.label(), app.context_meter()));
     while cells.len() > 1 {
         let joined: String = cells.join(" │ ");
         if UnicodeWidthStr::width(joined.as_str()) <= width {

@@ -315,7 +315,7 @@ impl App {
     /// The window in tokens, for the meter. The number is the conversation's,
     /// not a copy of it: nothing can go stale between a push and a draw.
     pub fn context_used_tokens(&self) -> usize {
-        self.chat.used_tokens()
+        self.chat.used_tokens_for(self.tree.focused)
     }
 
     /// Register git worktrees left over from earlier sessions (`mush/<id>`
@@ -584,6 +584,17 @@ impl App {
         } else {
             format!("ctx ~{spelling}")
         }
+    }
+
+    /// How full the conversation in the open pane is, against the window it is
+    /// being sent to: `ctx 3.1k/500k`. The window alone says how much room there
+    /// is, never how much of it this conversation has taken — and the pane can
+    /// be a subagent's, whose own next request is what this number measures.
+    pub fn context_meter(&self) -> String {
+        let used = self.context_used_tokens();
+        let window = tokens_label(self.cfg.context_tokens);
+        let mark = if self.cfg.context_explicit { "" } else { "~" };
+        format!("ctx {used}/{mark}{window}", used = tokens_label(used))
     }
 
     /// Remember something that went wrong. Errors do not fade: they stay until
@@ -1961,6 +1972,67 @@ mod tests {
         assert!(
             app.context_used_tokens() > before,
             "the meter ignores the human's message"
+        );
+    }
+
+    /// The meter follows the pane: a subagent's conversation is weighed against
+    /// its own transcript, not the root's, because that transcript is what its
+    /// next request will send.
+    #[test]
+    fn the_meter_measures_the_open_conversation() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::user("x".repeat(300)));
+        let root = chat.used_tokens_for(AgentId::ROOT);
+        assert!(root > 0);
+        assert_eq!(
+            chat.used_tokens_for(AgentId(7)),
+            0,
+            "nothing has been said to that agent"
+        );
+
+        chat.push_message(AgentId(7), Message::user("y".repeat(900)));
+        assert!(
+            chat.used_tokens_for(AgentId(7)) > root,
+            "a longer child conversation weighs more than the root's"
+        );
+        assert_eq!(
+            chat.used_tokens_for(AgentId::ROOT),
+            root,
+            "the root's own number is unchanged by a child's"
+        );
+    }
+
+    /// The facts line says how full the conversation is as well as how big the
+    /// window is: the window alone cannot tell a human whether the next message
+    /// will compact.
+    #[test]
+    fn the_context_meter_shows_used_over_window() {
+        let (mut app, _rx) = test_app("meter-label");
+        // The system prompt is part of every request, so the meter starts at its
+        // weight — never at zero.
+        let empty = app.context_meter();
+        assert!(
+            empty.starts_with("ctx ")
+                && empty.ends_with(&format!("~{}", tokens_label(app.cfg.context_tokens))),
+            "{empty}"
+        );
+
+        app.chat.insert("a question long enough to weigh something");
+        app.send_message();
+        let meter = app.context_meter();
+        assert_ne!(meter, empty, "the human's words are counted: {meter}");
+
+        // A window the human stated is not marked as derived.
+        app.cfg.set_context(32_768);
+        assert!(
+            app.context_meter().ends_with("32k"),
+            "{}",
+            app.context_meter()
+        );
+        assert!(
+            !app.context_meter().contains('~'),
+            "{}",
+            app.context_meter()
         );
     }
 

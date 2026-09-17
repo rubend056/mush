@@ -213,15 +213,24 @@ impl Chat {
         self.agents.remove(&agent);
     }
 
-    /// How many tokens the root conversation is holding, roughly — the same
+    /// How big one conversation is, in tokens, roughly — the same
     /// three-bytes-per-token heuristic the trimmer uses.
     ///
-    /// Derived on read, from the system prompt and the transcript, and never
-    /// counted beside them: there is no push site left to forget, and the
-    /// human's own words weigh as soon as they are in the transcript they are
-    /// in (finding B8).
-    pub fn used_tokens(&self) -> usize {
-        let bytes = self.system.weight() + self.root.iter().map(Message::weight).sum::<usize>();
+    /// Derived on read, per agent, and never counted beside the transcript:
+    /// there is no push site left to forget, and the human's own words weigh as
+    /// soon as they are in the transcript they are in (finding B8). Per agent
+    /// because the pane a human is looking at can be a subagent's, and its own
+    /// next request is what this number measures.
+    pub fn used_tokens_for(&self, id: AgentId) -> usize {
+        let transcript = if id == AgentId::ROOT {
+            &self.root
+        } else {
+            match self.agents.get(&id) {
+                Some(messages) => messages,
+                None => return 0,
+            }
+        };
+        let bytes = self.system.weight() + transcript.iter().map(Message::weight).sum::<usize>();
         bytes / 3
     }
 
@@ -749,7 +758,7 @@ mod tests {
     #[test]
     fn the_context_meter_is_derived_from_the_conversation() {
         let mut chat = Chat::bare();
-        let idle = chat.used_tokens();
+        let idle = chat.used_tokens_for(AgentId::ROOT);
         assert_eq!(
             idle,
             chat.system().weight() / 3,
@@ -759,7 +768,7 @@ mod tests {
         let asked = Message::user("a question long enough to weigh something");
         chat.push_message(AgentId::ROOT, asked.clone());
         assert!(
-            chat.used_tokens() > idle,
+            chat.used_tokens_for(AgentId::ROOT) > idle,
             "the meter must count the human's own message"
         );
 
@@ -768,7 +777,7 @@ mod tests {
         let summary = Message::user("a summary");
         chat.replace_transcript(AgentId::ROOT, vec![summary.clone()]);
         assert_eq!(
-            chat.used_tokens(),
+            chat.used_tokens_for(AgentId::ROOT),
             (chat.system().weight() + summary.weight()) / 3,
             "the meter reads what is there now"
         );
@@ -777,7 +786,7 @@ mod tests {
         // not weigh on it.
         chat.push_message(AgentId(1), Message::assistant("x".repeat(1000)));
         assert_eq!(
-            chat.used_tokens(),
+            chat.used_tokens_for(AgentId::ROOT),
             (chat.system().weight() + summary.weight()) / 3
         );
     }
