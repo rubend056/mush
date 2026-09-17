@@ -31,6 +31,7 @@ use mush_core::{prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_
 
 use crate::app::{AgentId, ConversationId, Msg};
 use crate::clock;
+use crate::events::{Events, Ui};
 use crate::machine::{Job, Machine, Shell, ShellCommand};
 use crate::model::{HttpModel, ModelClient, ModelError};
 
@@ -198,7 +199,11 @@ pub enum AgentMsg {
 }
 
 /// Events streamed to the UI thread, tagged with the emitting agent's id.
-#[derive(Debug)]
+///
+/// `Clone` so a test's recording sink can hand out what it saw (see
+/// `crate::events::fake`): an event carries no state of its own — a mailbox or
+/// a cancellation flag is a handle, not a copy.
+#[derive(Clone, Debug)]
 pub enum AgentEvent {
     /// A child actor now exists (sent by its parent), with the handle to steer it.
     Spawned {
@@ -249,11 +254,10 @@ pub struct AgentCtx {
     /// gets its parent's client — so one endpoint serves every agent, and one
     /// scripted client can serve a whole tree in a test.
     pub model: Arc<dyn ModelClient>,
-    pub tx: Sender<Msg>,
-    /// Which conversation this tree belongs to. The UI drops events stamped
-    /// with another one: after `/new`, an abandoned actor can still be
-    /// finishing a request, and its events must not land in the new chat.
-    pub conversation: u64,
+    /// Where this tree's events go: the UI thread's channel, or a recording
+    /// sink in a test. Carried here rather than reached for directly, so an
+    /// actor cannot quietly take a second path to the UI.
+    pub events: Arc<dyn Events>,
     /// How a `run_command` is started and watched. The real one runs `sh` in
     /// its own process group; a test scripts the end state instead, so the
     /// timeout, the cancellation and the output cap need no subprocess.
@@ -270,13 +274,9 @@ pub struct AgentCtx {
 }
 
 impl AgentCtx {
-    /// Send an id-tagged event to the UI, stamped with this conversation.
+    /// Report something that happened to agent `id`.
     fn emit(&self, id: u64, event: AgentEvent) {
-        let _ = self.tx.send(Msg::Agent {
-            conversation: ConversationId(self.conversation),
-            id: AgentId(id),
-            event,
-        });
+        self.events.emit(AgentId(id), event);
     }
 }
 
@@ -323,7 +323,7 @@ pub struct RootHandle {
     /// The config cell every actor in this tree reads, so a runtime `/model`
     /// reaches them all.
     pub cfg: Arc<Mutex<Config>>,
-    /// Identifies this conversation in events; see `AgentCtx::conversation`.
+    /// Identifies this conversation in events; see `agent::next_conversation`.
     pub conversation: u64,
     /// The tree's id counter, so the UI can raise its floor to the highest id
     /// a leftover worktree already occupies (finding B1).
@@ -339,35 +339,45 @@ pub fn spawn(cfg: Config, tx: Sender<Msg>, root: PathBuf) -> RootHandle {
     // The real endpoint, behind the seam: every agent in this tree calls it
     // through `AgentCtx::model`, children included.
     let model: Arc<dyn ModelClient> = Arc::new(HttpModel::new(shared.clone()));
-    root_actor(shared, model, tx, root)
+    let conversation = next_conversation();
+    let ui: Arc<dyn Events> = Arc::new(Ui::new(tx, conversation));
+    root_actor(shared, model, ui, conversation, root)
 }
 
 /// The same tree, with its model calls served by the caller instead of the
-/// real endpoint.
+/// real endpoint, and its events recorded instead of shown.
 ///
-/// Children inherit the client through the cloned context, so one scripted
-/// model serves a whole tree: a test can drive a parent, its children and its
-/// grandchildren through one script, with no socket, no server and no sleep.
+/// Children inherit the client and the sink through the cloned context, so one
+/// scripted model serves a whole tree — a test can drive a parent, its children
+/// and its grandchildren through one script, with no socket, no server and no
+/// sleep — and one recorder sees every event the whole tree emits.
 #[cfg(test)]
 pub(crate) fn spawn_scripted(
     cfg: Config,
-    tx: Sender<Msg>,
+    events: Arc<dyn Events>,
     root: PathBuf,
     model: Arc<dyn ModelClient>,
 ) -> RootHandle {
-    root_actor(Arc::new(Mutex::new(cfg)), model, tx, root)
+    let conversation = next_conversation();
+    root_actor(Arc::new(Mutex::new(cfg)), model, events, conversation, root)
 }
 
-/// Start the root actor of one conversation over a given model.
+/// One conversation per `/new`, so stale events can be told apart: an actor
+/// left over from a replaced tree can still be finishing a request, and its
+/// events must not land in the new chat.
+fn next_conversation() -> ConversationId {
+    static CONVERSATIONS: AtomicU64 = AtomicU64::new(1);
+    ConversationId(CONVERSATIONS.fetch_add(1, Ordering::SeqCst))
+}
+
+/// Start the root actor of one conversation over a given model and sink.
 fn root_actor(
     shared: Arc<Mutex<Config>>,
     model: Arc<dyn ModelClient>,
-    tx: Sender<Msg>,
+    events: Arc<dyn Events>,
+    conversation: ConversationId,
     root: PathBuf,
 ) -> RootHandle {
-    // One conversation per `/new`, so stale events can be told apart.
-    static CONVERSATIONS: AtomicU64 = AtomicU64::new(1);
-    let conversation = CONVERSATIONS.fetch_add(1, Ordering::SeqCst);
     // Root agent is id 0; children start at 1. The UI holds a clone so it can
     // raise the floor above leftover worktree ids.
     let ids = Arc::new(AtomicU64::new(1));
@@ -375,8 +385,7 @@ fn root_actor(
     let ctx = Arc::new(AgentCtx {
         cfg: shared.clone(),
         model,
-        tx,
-        conversation,
+        events,
         machine: Arc::new(Shell),
         clock: Arc::new(clock::System),
         root,
@@ -404,7 +413,7 @@ fn root_actor(
     RootHandle {
         tx: cmd_tx,
         cfg: shared,
-        conversation,
+        conversation: conversation.0,
         ids: ids.clone(),
         live,
     }
@@ -462,8 +471,7 @@ pub fn revive(
     let ctx = Arc::new(AgentCtx {
         cfg: cfg.clone(),
         model: Arc::new(HttpModel::new(cfg)),
-        tx,
-        conversation,
+        events: Arc::new(Ui::new(tx, ConversationId(conversation))),
         machine: Arc::new(Shell),
         clock: Arc::new(clock::System),
         root,
@@ -1094,11 +1102,11 @@ fn compact_history(
     if messages.len() <= 2 {
         return Ok(());
     }
-    let _ = actor.ctx.tx.send(Msg::Agent {
-        conversation: ConversationId(actor.ctx.conversation),
-        id: AgentId(actor.id),
-        event: AgentEvent::Status("context nearly full — summarizing…".to_string()),
-    });
+    let actor_id = actor.id;
+    actor.ctx.emit(
+        actor_id,
+        AgentEvent::Status("context nearly full — summarizing…".to_string()),
+    );
 
     // Fold pending nudges/completions in first; a Stop cancels the run.
     drain_mailbox(&actor.rx, cancel, messages, state);
@@ -1760,6 +1768,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::fake::Recorder;
     use crate::model::fake::{tool_call, Asked, Gate, Scripted};
     use mush_core::{FunctionCall, ToolCall};
     use serde_json::json;
@@ -2234,10 +2243,8 @@ mod tests {
 
     fn test_actor(label: &str) -> (Actor, Sender<AgentMsg>) {
         let cfg = test_cfg();
-        let (actor, ui, mailbox) = build_actor(label, Arc::new(HttpModel::new(cfg.clone())), cfg);
-        // Nothing here reads the UI; the receiver is leaked so the channel
-        // stays open for the events a run emits into it.
-        std::mem::forget(ui);
+        let (actor, _events, mailbox) =
+            build_actor(label, Arc::new(HttpModel::new(cfg.clone())), cfg);
         (actor, mailbox)
     }
 
@@ -2246,7 +2253,7 @@ mod tests {
     fn scripted_actor(
         label: &str,
         model: &Arc<Scripted>,
-    ) -> (Actor, Receiver<Msg>, Sender<AgentMsg>) {
+    ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
         build_actor(label, model.clone(), test_cfg())
     }
 
@@ -2257,22 +2264,21 @@ mod tests {
     }
 
     /// A standalone actor over a scratch workspace, with `model` as its client
-    /// and `cfg` as the tree's shared configuration. The UI receiver comes back
-    /// so a test can read the events the run emits.
+    /// and `cfg` as the tree's shared configuration. Its events go to a
+    /// recording sink, which comes back so a test can read what the run said.
     fn build_actor(
         label: &str,
         model: Arc<dyn ModelClient>,
         cfg: Arc<Mutex<Config>>,
-    ) -> (Actor, Receiver<Msg>, Sender<AgentMsg>) {
+    ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
         let root = std::env::temp_dir().join(format!("mush-actor-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let (ui_tx, ui_rx) = crossbeam_channel::unbounded::<Msg>();
+        let recorder = Recorder::new();
         let ctx = Arc::new(AgentCtx {
             cfg,
             model,
-            tx: ui_tx.clone(),
-            conversation: 1,
+            events: recorder.clone(),
             machine: Arc::new(Shell),
             clock: Arc::new(clock::System),
             root: root.clone(),
@@ -2293,7 +2299,7 @@ mod tests {
             parent_tx: dead_tx,
             rx,
         };
-        (actor, ui_rx, my_tx)
+        (actor, recorder, my_tx)
     }
 
     /// The root napping on `wait_agents` must hear the human. Parking their
@@ -2422,10 +2428,10 @@ mod tests {
                 .when(|asked: &Asked| asked.depth() == Some(1))
                 .says("gate opened"),
         );
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let events = Recorder::new();
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
-            tx,
+            events.clone(),
             root.clone(),
             scripted.clone(),
         )
@@ -2486,7 +2492,7 @@ mod tests {
         // The human's words are what the model answered, in this run.
         let mut seen = Watched::default();
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done >= 1),
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
             "the interrupted run must finish so the answer is delivered: {seen:?}"
         );
         assert_eq!(seen.errors, Vec::<String>::new());
@@ -2682,14 +2688,15 @@ mod tests {
     }
 
     /// Every context window a run announced to the UI.
-    fn contexts(rx: &Receiver<Msg>) -> Vec<usize> {
-        let mut found = Vec::new();
-        while let Ok(Msg::Agent { event, .. }) = rx.try_recv() {
-            if let AgentEvent::Context { tokens } = event {
-                found.push(tokens);
-            }
-        }
-        found
+    fn contexts(events: &Recorder) -> Vec<usize> {
+        events
+            .events()
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                AgentEvent::Context { tokens } => Some(tokens),
+                _ => None,
+            })
+            .collect()
     }
 
     /// The seam the orchestration scenarios run on: a tree spawned over a
@@ -2700,10 +2707,10 @@ mod tests {
     fn a_spawned_tree_asks_the_scripted_model() {
         let root = scratch_dir("scripted-tree");
         let scripted = Arc::new(Scripted::new().says("nothing to do"));
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let events = Recorder::new();
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
-            tx,
+            events.clone(),
             root.clone(),
             scripted.clone(),
         )
@@ -2717,7 +2724,8 @@ mod tests {
 
         let mut seen = Watched::default();
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done > 0 || !seen.errors.is_empty()),
+            seen.wait(&events, WAIT, |seen| seen.done > 0
+                || !seen.errors.is_empty()),
             "the run must end: {seen:?}"
         );
         assert_eq!(seen.errors, Vec::<String>::new());
@@ -2766,10 +2774,10 @@ mod tests {
                     }),
                 )]),
         );
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let events = Recorder::new();
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
-            tx,
+            events.clone(),
             root.clone(),
             scripted.clone(),
         )
@@ -2787,14 +2795,14 @@ mod tests {
             "the child never asked for its first turn"
         );
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done >= 1),
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
             "the root's first turn must end while the child still runs: {seen:?}"
         );
         gate.release();
         // The child finishes, and its completion wakes the root into a second
         // run: 3 Done events, root and child and woken root.
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done >= 3),
+            seen.wait(&events, WAIT, |seen| seen.done >= 3),
             "the child, then the woken root, must each finish: {seen:?}"
         );
         assert_eq!(seen.done, 3, "no other run may happen: {seen:?}");
@@ -2912,10 +2920,10 @@ mod tests {
                     }),
                 )]),
         );
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let events = Recorder::new();
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
-            tx,
+            events.clone(),
             root.clone(),
             scripted.clone(),
         )
@@ -2931,7 +2939,7 @@ mod tests {
 
         let mut seen = Watched::default();
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done >= 3),
+            seen.wait(&events, WAIT, |seen| seen.done >= 3),
             "each level must run and finish once: {seen:?}"
         );
         assert_eq!(seen.done, 3, "each level runs exactly once: {seen:?}");
@@ -3014,8 +3022,8 @@ mod tests {
         // - ctx/2) = 6000 bytes.
         cfg.context_tokens = 4_000;
         let budget = cfg.history_budget();
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let root_tx = spawn_scripted(cfg, tx, root.clone(), scripted.clone()).tx;
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
 
         // History above 3/4 of the budget but still fitting: compaction must
         // trigger instead of trimming. Built until it crosses the line, so the
@@ -3045,7 +3053,7 @@ mod tests {
         // does not care about.
         let mut seen = Watched::default();
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done >= 2),
+            seen.wait(&events, WAIT, |seen| seen.done >= 2),
             "the run must finish, and the child with it: {seen:?}"
         );
         assert_eq!(seen.errors, Vec::<String>::new());
@@ -3099,10 +3107,10 @@ mod tests {
                 .says("steered"),
         );
 
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let events = Recorder::new();
         let root_tx = spawn_scripted(
             Config::new("http://127.0.0.1:1", "scripted", None),
-            tx,
+            events.clone(),
             root.clone(),
             scripted.clone(),
         )
@@ -3126,7 +3134,7 @@ mod tests {
 
         let mut seen = Watched::default();
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done > 0),
+            seen.wait(&events, WAIT, |seen| seen.done > 0),
             "the run must finish: {seen:?}"
         );
         assert_eq!(seen.errors, Vec::<String>::new());
@@ -3167,8 +3175,8 @@ mod tests {
         // A window wide enough that this transcript never compacts: the only
         // thing that may end this run is the runaway guard.
         cfg.context_tokens = 128_000;
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let root_tx = spawn_scripted(cfg, tx, root.clone(), scripted.clone()).tx;
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
         root_tx
             .send(AgentMsg::Run(vec![
                 Message::system(prompt::system_prompt(root.to_str().unwrap())),
@@ -3178,7 +3186,8 @@ mod tests {
 
         let mut seen = Watched::default();
         assert!(
-            seen.wait(&rx, WAIT, |seen| seen.done > 0 || !seen.errors.is_empty()),
+            seen.wait(&events, WAIT, |seen| seen.done > 0
+                || !seen.errors.is_empty()),
             "the run must end: {seen:?}"
         );
         assert_eq!(
@@ -3235,6 +3244,8 @@ mod tests {
     /// spent waiting for the run rather than sleeping past it.
     #[derive(Default, Debug)]
     struct Watched {
+        /// How many recorded events have been read into this one already.
+        seen: usize,
         done: usize,
         errors: Vec<String>,
         notices: Vec<String>,
@@ -3242,6 +3253,7 @@ mod tests {
         /// message that actually carried words.
         replies: Vec<String>,
         summaries: Vec<String>,
+        stopped: usize,
     }
 
     impl Watched {
@@ -3250,33 +3262,42 @@ mod tests {
         /// instead of hanging the suite.
         fn wait(
             &mut self,
-            rx: &Receiver<Msg>,
+            events: &Recorder,
             timeout: Duration,
             until: impl Fn(&Self) -> bool,
         ) -> bool {
             let deadline = Instant::now() + timeout;
-            while !until(self) {
+            loop {
+                self.drain(events);
+                if until(self) {
+                    return true;
+                }
                 let left = deadline.saturating_duration_since(Instant::now());
                 if left.is_zero() {
                     return false;
                 }
-                match rx.recv_timeout(left.min(Duration::from_millis(20))) {
-                    Ok(msg) => self.note(msg),
-                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
-                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return false,
+                // Nothing is emitted until something happens, so the wait is on
+                // the sink, not on a poll of it.
+                if !events.wait(left) {
+                    self.drain(events);
+                    return until(self);
                 }
             }
-            true
         }
 
-        fn note(&mut self, msg: Msg) {
-            let Msg::Agent { event, .. } = msg else {
-                return;
-            };
+        fn drain(&mut self, events: &Recorder) {
+            for (id, event) in events.events().into_iter().skip(self.seen) {
+                self.seen += 1;
+                self.note(id, event);
+            }
+        }
+
+        fn note(&mut self, _id: AgentId, event: AgentEvent) {
             match event {
                 AgentEvent::Done => self.done += 1,
                 AgentEvent::Error(why) => self.errors.push(why),
                 AgentEvent::Notice(what) => self.notices.push(what),
+                AgentEvent::Stopped => self.stopped += 1,
                 AgentEvent::Compact { summary } => self.summaries.push(summary),
                 AgentEvent::Message(message)
                     if message.role == "assistant" && !message.text().is_empty() =>
