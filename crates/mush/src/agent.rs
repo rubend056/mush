@@ -2708,6 +2708,48 @@ fn read_args(args: &Value) -> String {
     if let Some(brief) = args.get("brief").and_then(Value::as_str) {
         return truncate(&first_line(brief), 40);
     }
+    // The orchestration tools, which name none of the three above: the tools a
+    // human watching a tree most needs to read are exactly the ones that
+    // rendered as a bare `⚙ agent_control` — R4's "`⚙ name summarized-args`"
+    // vacuous for the calls that steer the run.
+    //
+    // `agent_control {id, action, text?}` and `command_control {id, action}`
+    // share a shape, so they share an arm: the id is the target and the action
+    // is what is being done to it.
+    if let Some(id) = args.get("id").and_then(Value::as_u64) {
+        let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+        let mut label = format!("#{id}");
+        if !action.is_empty() {
+            label.push(' ');
+            label.push_str(action);
+        }
+        if let Some(text) = args.get("text").and_then(Value::as_str) {
+            label.push_str(&format!(" \"{}\"", truncate(&first_line(text), 30)));
+        }
+        return label;
+    }
+    // `wait_agents {ids?, timeout?}` and `wait_commands {ids?, timeout?}`: which
+    // ids are being waited on, and how long. An empty list is not "nothing" —
+    // the schema reads it as *all* of them.
+    if let Some(ids) = args.get("ids").and_then(Value::as_array) {
+        let list: Vec<String> = ids
+            .iter()
+            .filter_map(Value::as_u64)
+            .map(|id| format!("#{id}"))
+            .collect();
+        let mut label = if list.is_empty() {
+            "all".to_string()
+        } else {
+            list.join(" ")
+        };
+        if let Some(timeout) = args.get("timeout").and_then(Value::as_u64) {
+            label.push_str(&format!(" {timeout}s"));
+        }
+        return label;
+    }
+    if let Some(timeout) = args.get("timeout").and_then(Value::as_u64) {
+        return format!("{timeout}s");
+    }
     String::new()
 }
 
@@ -2767,6 +2809,32 @@ mod tests {
             summarize_args(r#"{"brief":"do\u0007 this\rplease"}"#),
             "do this please"
         );
+    }
+
+    /// The orchestration tools carry no path, command or brief, so they rendered
+    /// as a bare `⚙ agent_control` — for exactly the calls an orchestrator uses
+    /// to steer a tree, which is where a human most needs to know *whom*.
+    #[test]
+    fn an_orchestration_call_summarizes_its_target() {
+        assert_eq!(
+            summarize(&json!({"id": 2, "action": "message", "text": "keep the steps small"})),
+            "#2 message \"keep the steps small\""
+        );
+        assert_eq!(
+            summarize(&json!({"id": 3, "action": "stop"})),
+            "#3 stop",
+            "command_control and agent_control share one shape"
+        );
+        assert_eq!(summarize(&json!({"ids": [1, 2]})), "#1 #2");
+        assert_eq!(
+            summarize(&json!({"ids": [], "timeout": 60})),
+            "all 60s",
+            "an empty id list is the schema's `all`, not nothing"
+        );
+        assert_eq!(summarize(&json!({"timeout": 30})), "30s");
+        // A tool with no arguments has nothing to summarize, and says so by
+        // summarizing nothing: `command_status`, `agent_status`.
+        assert_eq!(summarize(&json!({})), "");
     }
 
     /// A tool label is one line by definition. Truncating a command's raw text
