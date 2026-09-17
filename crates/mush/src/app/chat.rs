@@ -83,14 +83,21 @@ pub struct Notice {
 pub enum NoticeKind {
     Info,
     Error,
+    /// A run mush itself stopped — the loop guard ending a model that kept
+    /// repeating one call. Nothing the model did *failed*: R4 reserves `!` for
+    /// the things that did, and the stop is the honest mark — `⊘`, the same
+    /// reading `agent_status` gives a stopped child.
+    Stopped,
 }
 
 impl NoticeKind {
     /// The mark a line of this kind leads with, and how it is painted: `·` for a
-    /// line mush wrote, `!` in red for one it failed to do.
+    /// line mush wrote, `⊘` for a run it stopped, `!` in red for one it failed
+    /// to do.
     fn mark(self) -> (&'static str, Style) {
         match self {
             NoticeKind::Info => ("· ", dim()),
+            NoticeKind::Stopped => ("⊘ ", Style::default().fg(Color::Yellow)),
             NoticeKind::Error => ("! ", Style::default().fg(Color::Red)),
         }
     }
@@ -171,10 +178,12 @@ impl Rank {
 }
 
 impl Notice {
-    /// Where this line sits in the precedence table. Only failures are alerts.
+    /// Where this line sits in the precedence table. A failure and a run mush
+    /// stopped are both the thing the human has to read; only a line mush merely
+    /// wrote yields.
     pub fn rank(&self) -> Rank {
         match self.kind {
-            NoticeKind::Error => Rank::Alert,
+            NoticeKind::Error | NoticeKind::Stopped => Rank::Alert,
             NoticeKind::Info => Rank::Said,
         }
     }
@@ -449,10 +458,31 @@ impl Chat {
     /// own record of its last failure, so a new one replaces the old rather
     /// than piling up beside it — two failures for one agent would disagree
     /// about which is current, and the pane would print both.
+    ///
+    /// A run the loop guard stopped arrives here too, because that is the shape
+    /// an ended run has on the wire. It is not a failure — mush stopped it, and
+    /// nothing the model did broke — so it lands as a stop, and it takes the
+    /// notice the guard wrote about the same event with it: one event, one line,
+    /// and the line that survives is the one that says what happened to the run.
     pub fn note_error_for(&mut self, agent: AgentId, text: impl Into<String>) {
-        self.notices
-            .retain(|notice| !(notice.agent == agent && notice.kind == NoticeKind::Error));
-        self.push_notice(agent, NoticeKind::Error, text);
+        let text = text.into();
+        let stopped = text.starts_with(LOOP_STOP);
+        let kind = if stopped {
+            NoticeKind::Stopped
+        } else {
+            NoticeKind::Error
+        };
+        self.notices.retain(|notice| {
+            if notice.agent != agent {
+                return true;
+            }
+            // One failure per agent, and one stop: the newest.
+            if notice.kind != NoticeKind::Info {
+                return false;
+            }
+            !(stopped && notice.text.starts_with(LOOP_NOTICE))
+        });
+        self.push_notice(agent, kind, text);
     }
 
     /// Forget what mush said about one agent, and say whether it said anything.
@@ -526,6 +556,7 @@ impl Chat {
         for notice in self.notices_for(agent) {
             let marker = match notice.kind {
                 NoticeKind::Info => "·",
+                NoticeKind::Stopped => "⊘",
                 NoticeKind::Error => "!",
             };
             let age = short_age(Duration::from_secs(now.saturating_sub(notice.at)));
@@ -901,6 +932,11 @@ const MIN_BODY: usize = 4;
 /// not forty lines of JSON (`docs/mush.md` §4.5 R4).
 const LABEL_ARGS: usize = 60;
 
+/// How a tool result that never happened is spelled. `agent.rs` prefixes every
+/// refused or failed call's result with exactly this (`format!("error: {error}")`),
+/// so a result either is one or merely starts like one.
+const FAILED: &str = "error:";
+
 /// One tool call's row: `  ⚙ name summarized-args`, budgeted to the pane.
 ///
 /// The arguments are what a path or a command is read from, so the columns they
@@ -986,6 +1022,13 @@ fn trim_trailing_blanks(lines: &mut Vec<Line<'static>>) {
 /// (`prompt::compaction_message`): the model's own summary, carried as the next
 /// conversation's first message. It is mush's line, not the human's words.
 const FOLDED: &str = "Context compacted";
+
+/// The two lines one loop guard writes, in its own vocabulary: the notice it
+/// emits as it stops the run, and the failure the run then ends with
+/// (`agent.rs`'s guard, which the run has no other way to report). They are one
+/// event, so the pane paints one line for it — see [`Chat::note_error_for`].
+const LOOP_NOTICE: &str = "the run repeated the same tool call";
+const LOOP_STOP: &str = "the run was stopped as a loop";
 
 /// Who said a user line when nothing recorded it: a transcript restored from the
 /// session file, or the one a fold just replaced. Everything mush writes into a
@@ -1082,13 +1125,38 @@ fn render_message(
             // wrapped; the ninth is what tells us to print the `…`. Wrapping
             // the whole result was most of a frame's cost on a long session.
             const SHOWN: usize = 8;
-            let wrapped = wrap_text_capped(message.text(), width.saturating_sub(2), SHOWN + 1);
+            // A result that came back `error: …` — mush's own spelling for a
+            // call that was refused or that failed — is not a result, and it was
+            // painted exactly like one, with only the word at the front to tell
+            // them apart. The mark is the difference now, and it is red, because
+            // this is the one kind of line in the transcript that reports
+            // something did not happen.
+            let failed = message.text().trim_start().starts_with(FAILED);
+            let (mark, style) = if failed {
+                ("! ", Style::default().fg(Color::Red))
+            } else {
+                ("", dim())
+            };
+            // The lead is the block's indent plus the mark's own columns, and
+            // the text is wrapped inside what is left: a flagged result is not
+            // `mark` columns wider than a successful one.
+            const INDENT: usize = 2;
+            let lead = INDENT + mark.width();
+            let wrapped = wrap_text_capped(message.text(), width.saturating_sub(lead), SHOWN + 1);
             let clipped = wrapped.len() > SHOWN;
-            for line in wrapped.iter().take(SHOWN) {
-                out.push(Line::from(Span::styled(format!("  {line}"), dim())));
+            for (index, line) in wrapped.iter().take(SHOWN).enumerate() {
+                let head = if index == 0 {
+                    format!("{}{mark}", " ".repeat(INDENT))
+                } else {
+                    " ".repeat(lead)
+                };
+                out.push(Line::from(Span::styled(format!("{head}{line}"), style)));
             }
             if clipped {
-                out.push(Line::from(Span::styled("  …", dim())));
+                out.push(Line::from(Span::styled(
+                    format!("{}…", " ".repeat(lead)),
+                    style,
+                )));
             }
             out.push(Line::from(""));
         }
@@ -1568,6 +1636,108 @@ mod tests {
         );
         let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 4)).join("\n");
         assert!(rows.contains("⚙ run_command cat log"), "{rows:?}");
+    }
+
+    /// A result that came back `error: …` is not a result. Painting it exactly
+    /// like one left the word at the front as the only difference, so a call
+    /// that was refused or failed — "this call was not run" — read as work that
+    /// happened.
+    #[test]
+    fn a_failed_tool_result_is_not_painted_as_a_success() {
+        let mut chat = Chat::bare();
+        chat.push_message(
+            AgentId::ROOT,
+            Message::tool(
+                "call_1",
+                "error: this call was not run — the run was stopped as a loop",
+            ),
+        );
+        chat.push_message(AgentId::ROOT, Message::tool("call_2", "wrote 3 lines"));
+
+        let rows = pane_rows(&chat, &pane(AgentId::ROOT), 60, 8);
+        let painted = shown(&rows);
+        assert!(
+            painted.iter().any(|row| row.starts_with("  ! error:")),
+            "{painted:?}"
+        );
+        assert!(
+            painted.iter().any(|row| row == "  wrote 3 lines"),
+            "{painted:?}"
+        );
+
+        let failed = rows
+            .iter()
+            .find(|line| line.to_string().contains("! error:"))
+            .expect("the failed result");
+        assert_eq!(
+            failed.spans.first().map(|span| span.style.fg),
+            Some(Some(Color::Red)),
+            "the failure is the red one: {failed:?}"
+        );
+        let ok = rows
+            .iter()
+            .find(|line| line.to_string().contains("wrote 3 lines"))
+            .expect("the result");
+        assert_ne!(
+            ok.spans.first().map(|span| span.style.fg),
+            Some(Some(Color::Red))
+        );
+    }
+
+    /// One loop guard writes two lines — the notice it emits as it stops the
+    /// run, and the failure the run then ends with — and the pane painted both,
+    /// one of them with a red `!`, though nothing the model did failed. One
+    /// event is one line, and it is marked as the stop R4 says it is.
+    #[test]
+    fn a_guard_stop_is_one_line_marked_as_a_stop() {
+        let notice = "the run repeated the same tool call 5 times without changing \
+                      anything — stopping it as a loop";
+        let stop = "the run was stopped as a loop: the same tool call repeated 5 times \
+                    with nothing changed in between";
+        let mut chat = Chat::bare();
+        // The order the two arrive in: the notice as the guard fires, the
+        // failure when the run ends a moment later.
+        chat.note_for(AgentId::ROOT, notice);
+        chat.note_error_for(AgentId::ROOT, stop);
+
+        let texts: Vec<&str> = chat
+            .notices_for(AgentId::ROOT)
+            .map(|notice| notice.text.as_str())
+            .collect();
+        assert_eq!(texts, vec![stop], "one event, one line");
+        let notice = chat.notices_for(AgentId::ROOT).next().unwrap();
+        assert_eq!(notice.kind, NoticeKind::Stopped);
+        assert_eq!(
+            notice.rank(),
+            Rank::Alert,
+            "a run that stopped is the thing the human has to read"
+        );
+
+        let rows = pane_rows(&chat, &pane(AgentId::ROOT), 70, 7);
+        let painted = shown(&rows).join("\n");
+        assert!(
+            painted.contains("⊘ the run was stopped as a loop"),
+            "{painted}"
+        );
+        let row = rows
+            .iter()
+            .find(|line| line.to_string().contains("⊘"))
+            .expect("the stop line");
+        assert_eq!(
+            row.spans.first().map(|span| span.style.fg),
+            Some(Some(Color::Yellow)),
+            "a stop is not a failure and is not painted like one: {row:?}"
+        );
+
+        // A real failure is still the red `!` it was, and it takes the agent's
+        // older outcome with it: an agent has one *last run*, so it has one line
+        // about how that run ended.
+        chat.note_error_for(AgentId::ROOT, "no route to host");
+        let texts: Vec<&str> = chat
+            .notices_for(AgentId::ROOT)
+            .map(|notice| notice.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["no route to host"]);
     }
 
     /// A line the human did not say is not painted in the human's voice. Three
