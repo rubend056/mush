@@ -3136,6 +3136,9 @@ mod tests {
     #[test]
     fn the_foot_caps_at_two_rows_and_counts_the_rest() {
         let (mut app, _rx) = test_app("foot-sizes");
+        // The line is pushed straight in, without the box: a user message that
+        // is not the echo of what the human sent is somebody else's — the
+        // voice is `chat.rs`'s business and this test is about the foot.
         app.chat
             .push_message(AgentId::ROOT, Message::user("port the parser"));
         for index in 0..6 {
@@ -3147,7 +3150,7 @@ mod tests {
         let small = screen(&mut app, 40, 10);
         assert_eq!(small.len(), 10);
         assert!(
-            small[4].contains("you › port the parser"),
+            small[4].contains("› port the parser"),
             "the one transcript row is the conversation, not a foot: {:?}",
             &small[3..6]
         );
@@ -3165,11 +3168,7 @@ mod tests {
         // 60×17: two rows of notes, then one that says four lines are not
         // there. Six lines were written, two are painted, four are counted.
         let roomy = screen(&mut app, 60, 17);
-        assert!(
-            roomy[4].contains("you › port the parser"),
-            "{:?}",
-            &roomy[3..9]
-        );
+        assert!(roomy[4].contains("› port the parser"), "{:?}", &roomy[3..9]);
         assert_eq!(roomy[5], "  +4 more lines · /notes", "{:?}", &roomy[3..9]);
         assert_eq!(roomy[6], "· note 4", "{:?}", &roomy[3..9]);
         assert_eq!(roomy[7], "· note 5", "{:?}", &roomy[3..9]);
