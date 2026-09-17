@@ -1785,7 +1785,9 @@ impl App {
     /// because it has no work in flight to cancel. Ending an agent is `/new`'s
     /// job.
     fn cancel_cursor_row(&mut self) {
-        let Some(id) = self.tree.agents.get(self.tree.cursor()).map(|node| node.id) else {
+        // The painted row under the cursor, not the storage vector: they are
+        // different orders (finding U4).
+        let Some(id) = self.tree.cursor_id() else {
             return;
         };
         // The same question `working_agents` answers: a run *or* a job is work
@@ -3977,6 +3979,81 @@ mod tests {
         let narrow = screen(&mut app, 80, 24);
         assert!(!narrow[0].contains("Σ"), "{}", narrow[0]);
         assert!(narrow[0].contains(" agents "), "{}", narrow[0]);
+    }
+
+    /// The pane paints tree order, and every key that moves or reads the cursor
+    /// follows what it paints: `j`/`k` walk the rows, `g`/`G` land on the first
+    /// and last of them, `Enter` focuses the agent under the highlight, and the
+    /// footer under the list names that same agent (finding U4).
+    #[test]
+    fn the_cursor_walks_the_rows_the_pane_paints() {
+        let (mut app, _rx) = test_app("row-order");
+        let conversation = app.tree.conversation();
+        // Spawn order that is not tree order: the root's second child is spawned
+        // before the first child's own child, so `#3` belongs under `#1` and
+        // above `#2`.
+        for (id, parent, depth) in [(1u64, 0u64, 1usize), (2, 0, 1), (3, 1, 2)] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId(parent),
+                event: AgentEvent::Spawned {
+                    child: id,
+                    parent,
+                    brief: format!("agent {id}"),
+                    depth,
+                    branch: None,
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+        }
+        app.focus = Focus::Agents;
+        // The pane's own columns only: the bar under it names agents too.
+        let pane = |app: &mut App| -> Vec<String> {
+            screen(app, 120, 32)
+                .into_iter()
+                .map(|row| row.chars().take(31).collect())
+                .collect()
+        };
+        let key = |app: &mut App, c: char| {
+            app.update(Msg::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )));
+        };
+
+        // Painted order: the root, #1, #3 (its child), then #2 — while the
+        // storage order is the spawn order 0, 1, 2, 3.
+        let rows = pane(&mut app);
+        for (row, id) in rows[1..=4].iter().zip(["#0", "#1", "#3", "#2"]) {
+            assert!(row.contains(id), "the row for {id} is not there: {row:?}");
+        }
+
+        // `j` twice lands on the third painted row, which is #3: storage order
+        // would have put its sibling #2 there.
+        key(&mut app, 'j');
+        key(&mut app, 'j');
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(3)));
+        assert_eq!(app.tree.agents[2].id, AgentId(2), "storage order is not it");
+
+        // `Enter` focuses the row the highlight is on, and the footer under the
+        // list is that same row's facts.
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(app.tree.focused, AgentId(3));
+        assert_eq!(text_of(&app), "agent #3: agent 3");
+        let rows = pane(&mut app);
+        assert!(
+            rows.iter().any(|row| row.contains("#3 agent 3")),
+            "the footer names the cursor row: {rows:?}"
+        );
+
+        // `k` back up one row is #1, and `G` is the last painted row — the
+        // root's second child, whose storage index is 2 of 3.
+        key(&mut app, 'k');
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(1)));
+        key(&mut app, 'G');
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(2)));
+        key(&mut app, 'g');
+        assert_eq!(app.tree.cursor_id(), Some(AgentId::ROOT));
     }
 
     /// A napping root with live children is derived from the tree: nobody has

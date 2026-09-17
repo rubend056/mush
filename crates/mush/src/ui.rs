@@ -129,9 +129,11 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
     // `List` draws `› ` outside the item's width, so the selected row would be
     // two columns narrower than its neighbours. Budget for it up front.
     let row_width = (inner.width as usize).saturating_sub(2);
-    let items: Vec<ListItem> = app
-        .tree
-        .agents
+    // The rows in painted order: pre-order over the parent links, so a child is
+    // drawn under its parent rather than after everything spawned before it
+    // (finding U4). The tree derives that order, this only paints it.
+    let rows = app.tree.rows();
+    let items: Vec<ListItem> = rows
         .iter()
         .map(|node| ListItem::new(agent_line(app, node, row_width)))
         .collect();
@@ -144,7 +146,7 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, list_area, &mut state);
 
     if footer_rows > 0 {
-        let node = &app.tree.agents[cursor];
+        let node = rows[cursor];
         let lines = agent_footer(app, node, inner.width as usize);
         let start = inner.y + inner.height - lines.len() as u16;
         frame.render_widget(
