@@ -316,6 +316,61 @@ the window, so one `read_file` can never fill an 8k transcript. A server that
 complains about the context length teaches mush the number it names, and the run
 retries once.
 
+### Known rough edge: notices and errors have no lifetime `[OPEN]`
+
+Everything else on the screen is derived from a fact and ages with it. The lines
+mush writes *about* a conversation are the exception, and it shows.
+`Chat::notices` is a plain list: the line `RunUsage` reports at the end of every
+run (`the endpoint counted 12.3k prompt + 1.1k completion tokens`), the `git diff
+HEAD...mush/2` that `/diff` prints, `context compacted — continuing from a
+summary`, `/help`, a reply cut off at the token cap, a run that failed — appended
+by `note`/`note_error`, removed by nothing except `/new` (`Chat::clear`, which is
+the only caller of `notices.clear()`). `/forget` drops an agent's transcript and
+keeps its notices, invisibly, for the life of the session. They are not stored in
+`session.json` either, so a restart keeps no failure at all — backwards for the
+one line a human wants after coming back to a broken run.
+
+The pane then paints *all* of them, under the transcript (`Chat::footnotes` →
+`visible_lines`): the last failure first, then the spinner while a run is in
+flight, then the rest newest-first. They are rows of the same bottom-anchored
+window as the messages, so the foot is spent from the conversation's budget —
+enough of them and the transcript is pushed out of the pane entirely, while on a
+short pane the oldest are cut off without saying so. And because the foot sits
+*under* the newest message, a failure from twenty runs ago is still painted at
+the bottom of the pane — below messages that arrived after it, right above the
+message box — so it reads as the newest thing said. That is the "notices never
+leave and interleave with the conversation" complaint, and it is fair.
+
+The same fact also has three other homes with three other lifetimes, none of
+which says *when* it happened: the tree row keeps `Phase::Failed(error)` (and its
+`✗`) until that agent runs again, the bar's `Status` fades after `INFO_TTL` — five
+seconds — unless it is an `Error`, which stays until something replaces it, and
+the row's activity and stat are derived from the phases, so they cannot go stale
+at all. §11.7's decision still holds (notices belong in the transcript pane,
+not the bar); what it never decided is how long one lasts or where in the pane
+it belongs. A fix has to decide:
+
+1. **Whose line is it?** Either a row of the conversation — timestamped, tagged
+   with the agent it concerns, read together with the messages — or a status
+   line with a lifetime, read at a glance. Today it is neither: it lives in a
+   list of its own and is painted as if it were the last message.
+2. **What is the lifetime, per kind?** A line that answers a command the human
+   just typed belongs to that moment and may go; a run's failure belongs to that
+   run and has to outlive it, across a restart if the workspace is about that
+   run. One lifetime for both is why `/diff` output is as permanent as a crash.
+3. **How many rows may the foot take?** The transcript is the point of the pane;
+   a foot of twenty lines is a transcript of four. A cap (say two rows, then
+   `+3 more`, with a way to read the rest) keeps the conversation visible and the
+   foot honest about being an excerpt.
+4. **Does an old failure yield to a newer, truer row?** Once the agent has run
+   again and finished, a stale failure notice and a `✓` row disagree about the
+   same agent. The row is derived from the phase and cannot lie, so the notice is
+   the one that must age out — or be reachable somewhere that is plainly
+   history.
+5. **How are they read once there are hundreds?** §11.1 asks about `/find` over
+   the transcript; notices are the other half of it. "Scroll the pane and hope"
+   is not an answer for the lines that say what mush itself did.
+
 ---
 
 ## 5. Persistence: everything in `.mush/`
@@ -747,6 +802,11 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
     running on their machine.
 11. `[OPEN]` How many jobs may live at once: a per-agent cap, a machine-wide one,
     or both — and does a heavy build count against `MAX_AGENTS` too?
+12. `[OPEN]` The lifetime and home of notices and errors (§4.5): a line that
+    answers a command, a run's failure, and the row's `✗` are three different
+    facts about the same agent with nothing saying which one the human is
+    looking at. Today every notice is painted under the newest message and stays
+    until `/new`, and none of them survive a restart.
 
 ---
 
