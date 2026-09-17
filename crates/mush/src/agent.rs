@@ -11,17 +11,13 @@
 //! sync. An isolated agent works in its own git worktree.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::File;
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
-use tempfile::NamedTempFile;
 
 use mush_core::config::parse_context_hint;
 use mush_core::git;
@@ -31,10 +27,10 @@ use mush_core::transcript::{
     needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
     COMPACT_REPLY_TOKENS,
 };
-use mush_core::workspace::truncate_for_model;
 use mush_core::{prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_SECS};
 
 use crate::app::{AgentId, ConversationId, Msg};
+use crate::machine::{Job, Machine, Shell, ShellCommand};
 use crate::model::{HttpModel, ModelClient, ModelError};
 
 /// Backstop against a model that never stops — *not* a budget for the work.
@@ -257,6 +253,10 @@ pub struct AgentCtx {
     /// with another one: after `/new`, an abandoned actor can still be
     /// finishing a request, and its events must not land in the new chat.
     pub conversation: u64,
+    /// How a `run_command` is started and watched. The real one runs `sh` in
+    /// its own process group; a test scripts the end state instead, so the
+    /// timeout, the cancellation and the output cap need no subprocess.
+    pub machine: Arc<dyn Machine>,
     /// The main workspace root; agents whose root differs are isolated.
     pub root: PathBuf,
     pub ids: Arc<AtomicU64>,
@@ -371,6 +371,7 @@ fn root_actor(
         model,
         tx,
         conversation,
+        machine: Arc::new(Shell),
         root,
         ids: ids.clone(),
         live: live.clone(),
@@ -456,6 +457,7 @@ pub fn revive(
         model: Arc::new(HttpModel::new(cfg)),
         tx,
         conversation,
+        machine: Arc::new(Shell),
         root,
         ids,
         live,
@@ -1609,7 +1611,8 @@ const CMD_OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
 
 /// Why a command stopped running.
 enum Ended {
-    Exited(ExitStatus),
+    /// It ended by itself, with this exit code (`-1` when a signal ended it).
+    Exited(i32),
     TimedOut,
     Cancelled,
     TooMuchOutput,
@@ -1617,11 +1620,10 @@ enum Ended {
 
 /// Run a shell command in `root` and return a report the model can read.
 ///
-/// Output goes to scratch files rather than pipes on purpose: a pipe is only
-/// complete once *every* process holding it exits, so a command that leaves a
-/// background job behind (`npm run dev &`) would otherwise pin this thread
-/// forever — past the timeout and past any cancellation. Files can be read
-/// whenever we stop waiting, so the timeout is a real bound.
+/// The command itself is the [`Machine`]'s: how to start one, how it is
+/// watched, and the three ways it stops (its time is up, a Stop arrived, it
+/// wrote too much) are this function's, which is what makes all three
+/// assertable with a scripted machine and a scripted clock.
 fn run_shell(
     command: &str,
     root: &Path,
@@ -1630,29 +1632,9 @@ fn run_shell(
     actor: &Actor,
     state: &mut ActorState,
 ) -> Result<String, String> {
-    let out = Scratch::new("out")?;
-    let err = Scratch::new("err")?;
-    let mut cmd = Command::new("sh");
-    cmd.arg("-c")
-        .arg(command)
-        .current_dir(root)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(out.writer()?))
-        .stderr(Stdio::from(err.writer()?));
-    // Its own process group, so a signal aimed at mush never lands on a build
-    // and cleanup can target everything the command started.
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
-    }
-    let mut child = cmd
-        .spawn()
-        .map_err(|e| format!("could not run command: {e}"))?;
-
-    let ended = wait_bounded(&mut child, timeout, cancel, &out, &err, actor, state)?;
-    let stdout = out.read(CMD_CAP);
-    let stderr = err.read(CMD_CAP);
+    let mut job = actor.ctx.machine.spawn(&ShellCommand { command, root })?;
+    let ended = wait_bounded(job.as_mut(), timeout, cancel, actor, state)?;
+    let (stdout, stderr) = job.output(CMD_CAP);
 
     // No `$ {command}` echo: the tool call is already rendered from the
     // assistant message that made it (`⚙ run_command …`), so printing it here
@@ -1669,9 +1651,7 @@ fn run_shell(
         report.push('\n');
     }
     match ended {
-        Ended::Exited(status) => {
-            report.push_str(&format!("[exit {}]", status.code().unwrap_or(-1)))
-        }
+        Ended::Exited(code) => report.push_str(&format!("[exit {code}]")),
         Ended::TimedOut => report.push_str(&format!("[timed out after {}s]", timeout.as_secs())),
         Ended::Cancelled => report.push_str("[cancelled]"),
         Ended::TooMuchOutput => report.push_str(&format!(
@@ -1681,27 +1661,24 @@ fn run_shell(
     Ok(report)
 }
 
-/// Wait for a child, stopping it when the timeout, a cancellation, or the
+/// Wait for a command, stopping it when the timeout, a cancellation, or the
 /// output limit arrives first.
 fn wait_bounded(
-    child: &mut Child,
+    job: &mut dyn Job,
     timeout: Duration,
     cancel: &AtomicBool,
-    out: &Scratch,
-    err: &Scratch,
     actor: &Actor,
     state: &mut ActorState,
 ) -> Result<Ended, String> {
     let started = Instant::now();
     loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(Ended::Exited(status)),
+        match job.poll() {
+            Ok(Some(code)) => return Ok(Ended::Exited(code)),
             Ok(None) => {}
             Err(error) => {
-                // Never leave a half-reaped child (or a running process)
-                // behind on an error path.
-                kill_command(child);
-                return Err(format!("could not wait for command: {error}"));
+                // Never leave a running process behind on an error path.
+                job.kill();
+                return Err(error);
             }
         }
         // A Stop or Shutdown has to reach a command *while* it runs, or Ctrl-C
@@ -1713,78 +1690,16 @@ fn wait_bounded(
             Some(Ended::TimedOut)
         } else if cancel.load(Ordering::SeqCst) {
             Some(Ended::Cancelled)
-        } else if out.size() + err.size() > CMD_OUTPUT_LIMIT {
+        } else if job.written() > CMD_OUTPUT_LIMIT {
             Some(Ended::TooMuchOutput)
         } else {
             None
         };
         if let Some(ended) = ended {
-            kill_command(child);
+            job.kill();
             return Ok(ended);
         }
         std::thread::sleep(Duration::from_millis(10));
-    }
-}
-
-/// Stop a command and everything it started. The direct child is always
-/// killed; its process group catches background jobs it left behind (and, on
-/// Unix, keeps them from filling the scratch file forever).
-fn kill_command(child: &mut Child) {
-    let group = child.id();
-    let _ = child.kill();
-    #[cfg(unix)]
-    {
-        let _ = Command::new("kill")
-            .args(["-9", &format!("-{group}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
-    let _ = child.wait();
-}
-
-/// A command's output file, removed when it is dropped.
-///
-/// `NamedTempFile` picks the name and creates it exclusively, so a guessable
-/// name in a shared temp directory can never redirect or read what a command
-/// prints — the property the hand-rolled counter and `0600` tried to buy. It is
-/// named (rather than an O_TMPFILE handle) because the child needs its own file
-/// description: `reopen` gives one for reading without moving the writer's
-/// offset.
-struct Scratch {
-    file: NamedTempFile,
-}
-
-impl Scratch {
-    fn new(kind: &str) -> Result<Self, String> {
-        NamedTempFile::with_prefix(format!("mush-cmd-{kind}-"))
-            .map(|file| Self { file })
-            .map_err(|error| format!("cannot create a scratch file: {error}"))
-    }
-
-    /// An independent write handle for the child to inherit.
-    fn writer(&self) -> Result<File, String> {
-        self.file
-            .reopen()
-            .map_err(|error| format!("cannot open the scratch file: {error}"))
-    }
-
-    /// What was written, capped for the model. Reads one byte past the cap so
-    /// a truncated result is marked as such.
-    fn read(&self, cap: usize) -> String {
-        let mut bytes = Vec::new();
-        if let Ok(file) = self.file.reopen() {
-            let _ = file.take(cap as u64 + 1).read_to_end(&mut bytes);
-        }
-        truncate_for_model(String::from_utf8_lossy(&bytes).into_owned(), cap)
-    }
-
-    fn size(&self) -> u64 {
-        self.file
-            .as_file()
-            .metadata()
-            .map(|meta| meta.len())
-            .unwrap_or(0)
     }
 }
 
@@ -2348,6 +2263,7 @@ mod tests {
             model,
             tx: ui_tx.clone(),
             conversation: 1,
+            machine: Arc::new(Shell),
             root: root.clone(),
             ids: Arc::new(AtomicU64::new(1)),
             live: Arc::new(AtomicU64::new(0)),

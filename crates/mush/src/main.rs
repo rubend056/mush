@@ -8,6 +8,7 @@ mod agent;
 mod app;
 mod http;
 mod input;
+mod machine;
 mod model;
 mod ui;
 
