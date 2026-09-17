@@ -1009,8 +1009,10 @@ fn run_loop(
             request.max_completion_tokens = Some(request.max_tokens);
             request.max_tokens = 0;
         }
-        // Provider-specific knobs (DeepSeek thinking mode), only for providers
-        // that advertise them; other endpoints see a plain request.
+        // The thinking knobs. Unstated, they are the provider's own: DeepSeek
+        // asks for its thinking mode and `high`, every other endpoint gets
+        // neither field. Stated (flag, environment, or home config), they are
+        // the human's, wherever they pointed mush.
         if cfg.thinking_enabled() {
             request.thinking = Some(json!({ "type": "enabled" }));
         }
@@ -1413,7 +1415,9 @@ fn compact_history(
 
     let mut ask = messages.clone();
     ask.push(Message::user(COMPACT_INSTRUCTION));
-    // A plain, tool-free request: the summary, nothing else.
+    // A plain, tool-free request: the summary, nothing else. It carries the
+    // same thinking knobs as the real requests — an endpoint that only answers
+    // with its thinking mode on must not be asked for a summary without it.
     let request = ChatRequest {
         model: &cfg.model,
         messages: &ask,
@@ -2109,6 +2113,7 @@ mod tests {
     use crate::events::fake::Recorder;
     use crate::machine::fake::{Script, Scripted as ScriptedMachine};
     use crate::model::fake::{tool_call, Asked, Gate, Scripted};
+    use mush_core::config::{ReasoningEffort, ThinkingMode};
     use mush_core::{FunctionCall, ToolCall};
     use serde_json::json;
     use std::fs;
@@ -3254,7 +3259,45 @@ mod tests {
         let _ = mailbox;
     }
 
-    /// `length` is not the only reason a reply is not an answer.
+    /// The thinking knobs are the human's: what the config states is what the
+    /// request carries, on an endpoint no provider default would send it to
+    /// (that is what stating a value means), and an unstated custom endpoint
+    /// still gets neither field.
+    #[test]
+    fn a_stated_effort_and_thinking_mode_reach_the_request() {
+        let scripted = Arc::new(Scripted::new().says("done"));
+        let mut local = Config::new("http://localhost:11434", "local-thinker", None);
+        local.reasoning_effort = Some(ReasoningEffort::Medium);
+        local.thinking = Some(ThinkingMode::Off);
+        let (actor, _events, _mailbox) =
+            build_actor("knobs", scripted.clone(), Arc::new(Mutex::new(local)));
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::system("you are mush"), Message::user("hi")];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("done"));
+        let asked = scripted.asked();
+        assert_eq!(asked[0].reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(
+            asked[0].thinking, None,
+            "stating off sends no `thinking` field at all"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+
+        // The same code path with nothing stated: a custom endpoint sees a
+        // plain request, exactly as it did before these knobs were
+        // configurable.
+        let scripted = Arc::new(Scripted::new().says("done"));
+        let (actor, _events, _mailbox) = scripted_actor("no-knobs", &scripted);
+        let mut state = ActorState::default();
+        let mut messages = vec![Message::system("you are mush"), Message::user("hi")];
+        run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        let asked = scripted.asked();
+        assert_eq!(asked[0].reasoning_effort, None);
+        assert_eq!(asked[0].thinking, None);
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
     /// `content_filter` is the endpoint saying it refused to hand over what the
     /// model wrote, and an unknown reason is no more a normal end — neither may
     /// be reported as if the model had simply had nothing to say.

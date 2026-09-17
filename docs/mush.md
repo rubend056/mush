@@ -334,24 +334,41 @@ The API key is never stored here — it lives in the machine-global home config
 
 That file is meant to be hand-edited, and it documents itself. Every field is
 optional — `api_key`, `provider`, `base_url`, `model`, `context` (a stated
-window), `temperature`, and `max_completion_tokens` (the reply cap's name) —
-and the file mush writes opens with a `_comment` header naming the precedence
-and each field, as plain JSON rather than a JSONC dialect. Unknown keys are
-ignored *and kept* when mush rewrites the file, and so is any field a particular
-writer leaves unstated: `/key` saves the connection without erasing what a human
-typed by hand. There is no `param_style`, because the only parameter-name switch
-mush has is the reply cap, and no `history_budget_multiplier`, because the
-window is the knob that budget derives from.
+window), `temperature`, `max_completion_tokens` (the reply cap's name),
+`reasoning_effort` (`"low"`, `"medium"`, `"high"`, or `"none"` for no
+`reasoning_effort` field at all), and `thinking` (`true` asks for the provider's
+thinking mode, `false` sends no `thinking` field and leaves the model's own
+default) — and the file mush writes opens with a `_comment` header naming the
+precedence and each field, as plain JSON rather than a JSONC dialect. Unknown
+keys are ignored *and kept* when mush rewrites the file, and so is any field a
+particular writer leaves unstated: `/key` saves the connection without erasing
+what a human typed by hand. There is no `param_style`, because the only
+parameter-name switch mush has is the reply cap, and no
+`history_budget_multiplier`, because the window is the knob that budget derives
+from.
+
+The two thinking knobs are the same kind of setting: unstated, the provider's
+own default applies (DeepSeek asks for `{"type":"enabled"}` and
+`reasoning_effort: high`; every other endpoint gets neither field), and stated,
+the human's value is sent wherever they pointed mush — that is what makes a
+local thinking model configurable at all. `--thinking off` is the honest off: it
+sends *no* `thinking` field rather than a `{"type":"disabled"}` mush has no
+documentation for, so the model's own default stands. A value mush does not know
+is rejected at startup by name, never sent and never quietly replaced by a
+default.
 
 `mush --print-config` prints what those layers resolved to — endpoint, provider,
-model, window and whether a human stated it, temperature, the reply cap's name,
-and the key masked — and exits 0 without opening the terminal or creating
-`.mush/`. It is the honest view of the precedence, and what makes a hand-edited
-file debuggable. The other flags a human would type are `--temperature F`,
-`--max-completion-tokens`, and `-y`/`--yes`, which *records* that this session's
-human pre-approved the work: mush has no approval prompt yet (the single-owner
-rule above), so the flag is a record for the features that will ask, and today
-it changes nothing.
+model, window and whether a human stated it, temperature, reasoning effort and
+thinking mode (each with whether a human stated it), the reply cap's name, and
+the key masked — and exits 0 without opening the terminal or creating `.mush/`.
+It is the honest view of the precedence, and what makes a hand-edited file
+debuggable. The other flags a human would type are `--temperature F`,
+`--reasoning-effort LEVEL` (`low`, `medium`, `high`, or `none`; also
+`MUSH_REASONING_EFFORT`), `--thinking MODE` (`on` or `off`; also
+`MUSH_THINKING`), `--max-completion-tokens`, and `-y`/`--yes`, which *records*
+that this session's human pre-approved the work: mush has no approval prompt yet
+(the single-owner rule above), so the flag is a record for the features that
+will ask, and today it changes nothing.
 
 Resolution order on startup: CLI flags > env > saved session > home config >
 built-in defaults.

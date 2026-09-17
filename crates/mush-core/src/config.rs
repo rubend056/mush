@@ -91,6 +91,67 @@ impl Provider {
     }
 }
 
+/// The reasoning effort a request asks for. `Off` is a statement rather than a
+/// value: no `reasoning_effort` field is sent at all, which leaves the model's
+/// own default even on an endpoint whose provider default would ask for more.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ReasoningEffort {
+    Off,
+    Low,
+    Medium,
+    High,
+}
+
+impl ReasoningEffort {
+    /// The value as the endpoint spells it. `Off` has no spelling: it *is* the
+    /// absent field.
+    pub fn as_str(&self) -> Option<&'static str> {
+        match self {
+            ReasoningEffort::Off => None,
+            ReasoningEffort::Low => Some("low"),
+            ReasoningEffort::Medium => Some("medium"),
+            ReasoningEffort::High => Some("high"),
+        }
+    }
+
+    /// Parse what a human stated. `off` and `none` are the same statement —
+    /// the field is not sent — and neither is quietly mapped to an effort.
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "off" | "none" => Ok(ReasoningEffort::Off),
+            "low" => Ok(ReasoningEffort::Low),
+            "medium" => Ok(ReasoningEffort::Medium),
+            "high" => Ok(ReasoningEffort::High),
+            _ => Err(format!(
+                "unknown reasoning effort `{value}` (try low, medium, high or none)"
+            )),
+        }
+    }
+}
+
+/// What a request says about the provider's thinking mode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ThinkingMode {
+    /// Send no `thinking` field at all: the model's own default stands. The
+    /// honest "off" — DeepSeek documents `{"type":"enabled"}` and mush knows
+    /// no documented `{"type":"disabled"}` — so stating off never invents a
+    /// shape an endpoint may reject.
+    Off,
+    /// Ask for the thinking mode: DeepSeek's `{"type":"enabled"}`.
+    On,
+}
+
+impl ThinkingMode {
+    /// Parse what a human stated (`--thinking on|off`).
+    pub fn parse(value: &str) -> Result<Self, String> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "on" => Ok(ThinkingMode::On),
+            "off" => Ok(ThinkingMode::Off),
+            _ => Err(format!("unknown thinking mode `{value}` (try on or off)")),
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub provider: Provider,
@@ -114,6 +175,16 @@ pub struct Config {
     /// OpenAI's reasoning models reject the old name, everything else only
     /// documents it, so this is opt-in rather than guessed.
     pub max_completion_tokens: bool,
+    /// The reasoning effort every request asks for. `None` is "not stated":
+    /// the provider's own default applies (DeepSeek asks for `high`).
+    /// `Some(ReasoningEffort::Off)` is a statement too — no `reasoning_effort`
+    /// field is sent at all — and a statement is honoured wherever the human
+    /// pointed mush, which is the whole point of stating one.
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// The provider's thinking mode. `None` is "not stated": DeepSeek's mode is
+    /// asked for, and any other endpoint gets no `thinking` field. Stated, the
+    /// human's choice is sent wherever they pointed mush.
+    pub thinking: Option<ThinkingMode>,
 }
 
 /// The temperature every request carries unless the human says otherwise.
@@ -140,15 +211,23 @@ pub struct Overrides {
     /// (`--max-completion-tokens`). `None` is "not stated", which is what keeps
     /// a deliberate `false` distinguishable from silence.
     pub max_completion_tokens: Option<bool>,
+    /// Reasoning effort (`--reasoning-effort` or `MUSH_REASONING_EFFORT`),
+    /// including the statement that none is sent: `Some(Off)` is as much a
+    /// statement as `Some(High)`, and only `None` means "not stated".
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// Provider thinking mode (`--thinking` or `MUSH_THINKING`). A stated `off`
+    /// is a decision, not silence.
+    pub thinking: Option<ThinkingMode>,
 }
 
 impl Overrides {
     /// The environment layer: `MUSH_URL`, `MUSH_MODEL`, `MUSH_PROVIDER`,
-    /// `MUSH_API_KEY`, `MUSH_CONTEXT`. Empty variables count as unset. The
-    /// temperature and the reply cap's name have no environment spelling: they
-    /// are stated on a command line or in the home config. A malformed
-    /// `MUSH_CONTEXT` is ignored here; [`Self::from_env_checked`] is the form
-    /// startup uses, so it is reported instead.
+    /// `MUSH_API_KEY`, `MUSH_CONTEXT`, `MUSH_REASONING_EFFORT`, `MUSH_THINKING`.
+    /// Empty variables count as unset. The temperature and the reply cap's name
+    /// have no environment spelling: they are stated on a command line or in
+    /// the home config. A malformed `MUSH_CONTEXT` (or effort, or thinking
+    /// mode) is ignored here; [`Self::from_env_checked`] is the form startup
+    /// uses, so it is reported instead.
     pub fn from_env() -> Self {
         Self {
             url: env_nonempty("MUSH_URL"),
@@ -159,12 +238,16 @@ impl Overrides {
             // No environment spelling for these two: see the doc comment.
             temperature: None,
             max_completion_tokens: None,
+            reasoning_effort: env_nonempty("MUSH_REASONING_EFFORT")
+                .and_then(|value| ReasoningEffort::parse(&value).ok()),
+            thinking: env_nonempty("MUSH_THINKING")
+                .and_then(|value| ThinkingMode::parse(&value).ok()),
         }
     }
 
-    /// [`Self::from_env`] with a malformed `MUSH_CONTEXT` reported instead of
-    /// silently dropped, so a typo costs a message at startup rather than a
-    /// window nobody asked for.
+    /// [`Self::from_env`] with a malformed `MUSH_CONTEXT`, `MUSH_REASONING_EFFORT`
+    /// or `MUSH_THINKING` reported instead of silently dropped, so a typo costs
+    /// a message at startup rather than a window or a knob nobody asked for.
     pub fn from_env_checked() -> Result<Self, String> {
         let mut overrides = Self::from_env();
         if let Some(name) = overrides.provider.as_deref() {
@@ -172,6 +255,12 @@ impl Overrides {
         }
         overrides.context = env_nonempty("MUSH_CONTEXT")
             .map(|value| parse_context_env(&value))
+            .transpose()?;
+        overrides.reasoning_effort = env_nonempty("MUSH_REASONING_EFFORT")
+            .map(|value| parse_effort_env(&value))
+            .transpose()?;
+        overrides.thinking = env_nonempty("MUSH_THINKING")
+            .map(|value| parse_thinking_env(&value))
             .transpose()?;
         Ok(overrides)
     }
@@ -199,6 +288,21 @@ pub fn parse_provider_env(value: &str) -> Result<Provider, String> {
     Provider::parse(value).ok_or_else(|| {
         format!("MUSH_PROVIDER: unknown provider `{value}` (try deepseek or custom)")
     })
+}
+
+/// Validate `MUSH_REASONING_EFFORT` the way the command line is validated. A
+/// typo is reported by name rather than ignored, for the same reason
+/// `MUSH_CONTEXT`'s is: a value the human stated must never travel to an
+/// endpoint as some other value, nor be silently dropped in favour of a
+/// provider default they were trying to overrule.
+pub fn parse_effort_env(value: &str) -> Result<ReasoningEffort, String> {
+    ReasoningEffort::parse(value).map_err(|error| format!("MUSH_REASONING_EFFORT: {error}"))
+}
+
+/// Validate `MUSH_THINKING`, for the same reason: `MUSH_THINKING=of` must say
+/// so, not quietly leave the thinking mode on.
+pub fn parse_thinking_env(value: &str) -> Result<ThinkingMode, String> {
+    ThinkingMode::parse(value).map_err(|error| format!("MUSH_THINKING: {error}"))
 }
 
 /// Endpoints are stored without a trailing slash so `chat_url` and
@@ -244,6 +348,10 @@ impl Config {
             context_explicit: context.is_some(),
             temperature: DEFAULT_TEMPERATURE,
             max_completion_tokens: false,
+            // The `MUSH_*` values are already in `env`; `resolve` applies them
+            // over this base like every other layer.
+            reasoning_effort: None,
+            thinking: None,
         }
     }
 
@@ -261,6 +369,10 @@ impl Config {
             context_explicit: false,
             temperature: DEFAULT_TEMPERATURE,
             max_completion_tokens: false,
+            // Unstated: see the field docs for what the provider's own default
+            // then is.
+            reasoning_effort: None,
+            thinking: None,
         }
     }
 
@@ -384,16 +496,44 @@ impl Config {
         }
     }
 
-    /// Provider-specific request knobs, applied by the agent loop.
+    /// Whether a request asks for the provider's thinking mode. A mode the
+    /// human stated is honoured wherever they pointed mush — a local endpoint
+    /// running a thinking model is exactly why the knob exists; unstated, only
+    /// the provider that documents the field gets it.
     pub fn thinking_enabled(&self) -> bool {
-        self.provider == Provider::DeepSeek
+        match self.thinking {
+            Some(mode) => mode == ThinkingMode::On,
+            None => self.provider == Provider::DeepSeek,
+        }
     }
 
+    /// Whether the human stated the thinking mode (flag, `MUSH_THINKING`, or
+    /// the home config) rather than leaving the provider's default. Only
+    /// `--print-config` needs the difference: it is what lets the line say
+    /// whose value a request is about to carry.
+    pub fn thinking_stated(&self) -> bool {
+        self.thinking.is_some()
+    }
+
+    /// What a request sends as `reasoning_effort`, `None` for no such field at
+    /// all. A stated value reaches any endpoint; unstated, the provider's own
+    /// default applies — DeepSeek asks for `high`, and no other endpoint is
+    /// given a field its provider never documented.
     pub fn reasoning_effort(&self) -> Option<&'static str> {
-        match self.provider {
-            Provider::DeepSeek => Some("high"),
-            Provider::Custom => None,
+        match self.reasoning_effort {
+            Some(effort) => effort.as_str(),
+            None => match self.provider {
+                Provider::DeepSeek => Some("high"),
+                Provider::Custom => None,
+            },
         }
+    }
+
+    /// Whether the human stated the effort rather than the provider's default
+    /// being sent. `Some(ReasoningEffort::Off)` counts: sending no field is
+    /// what a stated `none` asked for.
+    pub fn reasoning_effort_stated(&self) -> bool {
+        self.reasoning_effort.is_some()
     }
 
     /// Point at a different endpoint, normalizing the URL the same way every
@@ -473,6 +613,12 @@ pub fn resolve_with(
     if let Some(max_completion_tokens) = cli.max_completion_tokens.or(env.max_completion_tokens) {
         config.max_completion_tokens = max_completion_tokens;
     }
+    if let Some(effort) = cli.reasoning_effort.or(env.reasoning_effort) {
+        config.reasoning_effort = Some(effort);
+    }
+    if let Some(mode) = cli.thinking.or(env.thinking) {
+        config.thinking = Some(mode);
+    }
 
     // A URL, provider, or model the user stated explicitly, here or in the
     // environment, is never overridden by a stored one.
@@ -481,6 +627,8 @@ pub fn resolve_with(
     let model_given = cli.model.is_some() || env.model.is_some();
     let temperature_given = cli.temperature.is_some() || env.temperature.is_some();
     let cap_given = cli.max_completion_tokens.is_some() || env.max_completion_tokens.is_some();
+    let effort_given = cli.reasoning_effort.is_some() || env.reasoning_effort.is_some();
+    let thinking_given = cli.thinking.is_some() || env.thinking.is_some();
 
     // 2. Home config: machine-global defaults, and where the API key lives.
     if config.api_key.is_none() {
@@ -510,6 +658,26 @@ pub fn resolve_with(
     if !cap_given {
         if let Some(max_completion_tokens) = home.max_completion_tokens {
             config.max_completion_tokens = max_completion_tokens;
+        }
+    }
+    if !effort_given {
+        if let Some(value) = home.reasoning_effort.as_deref() {
+            // A value the file got wrong is reported rather than dropped: an
+            // effort mush does not know must never reach an endpoint, and a
+            // silent fallback would send an effort nobody asked for. This is
+            // the same rule the flags and `MUSH_*` follow.
+            config.reasoning_effort = Some(
+                ReasoningEffort::parse(value).map_err(|error| format!("home config: {error}"))?,
+            );
+        }
+    }
+    if !thinking_given {
+        if let Some(on) = home.thinking {
+            config.thinking = Some(if on {
+                ThinkingMode::On
+            } else {
+                ThinkingMode::Off
+            });
         }
     }
 
@@ -869,6 +1037,163 @@ mod tests {
         assert!(!untouched.uses_max_completion_tokens());
     }
 
+    /// Nothing stated means today's request, bit for bit: DeepSeek asks for its
+    /// thinking mode and `high`, and every other endpoint gets neither field.
+    /// The knobs are only the human's when the human states one.
+    #[test]
+    fn nothing_stated_keeps_the_preset_knobs() {
+        let deepseek = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides {
+                provider: Some("deepseek".into()),
+                ..Overrides::default()
+            },
+            &Overrides::default(),
+            &UserConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(deepseek.provider, Provider::DeepSeek);
+        assert!(deepseek.thinking_enabled());
+        assert_eq!(deepseek.reasoning_effort(), Some("high"));
+        assert!(!deepseek.thinking_stated());
+        assert!(!deepseek.reasoning_effort_stated());
+
+        let custom = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &UserConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(custom.provider, Provider::Custom);
+        assert!(!custom.thinking_enabled());
+        assert_eq!(custom.reasoning_effort(), None);
+        assert!(!custom.thinking_stated());
+        assert!(!custom.reasoning_effort_stated());
+    }
+
+    /// The thinking knobs rank like every other setting: the flag over the
+    /// environment over the home config, each layer filling only what the one
+    /// above it left unstated.
+    #[test]
+    fn the_effort_and_thinking_layers_rank_like_every_other() {
+        let base = || Config::new("http://base:0", "m", None);
+        let home = UserConfig {
+            reasoning_effort: Some("low".into()),
+            thinking: Some(true),
+            ..UserConfig::default()
+        };
+        let env = Overrides {
+            reasoning_effort: Some(ReasoningEffort::Medium),
+            thinking: Some(ThinkingMode::Off),
+            ..Overrides::default()
+        };
+        let cli = Overrides {
+            reasoning_effort: Some(ReasoningEffort::High),
+            thinking: Some(ThinkingMode::On),
+            ..Overrides::default()
+        };
+
+        // Command line: beats both.
+        let config = resolve_with(base(), &cli, &env, &home, None).unwrap();
+        assert_eq!(config.reasoning_effort(), Some("high"));
+        assert!(config.thinking_enabled(), "the flag said on, the env off");
+
+        // Environment: fills what the flag left alone.
+        let config = resolve_with(base(), &Overrides::default(), &env, &home, None).unwrap();
+        assert_eq!(config.reasoning_effort(), Some("medium"));
+        assert!(!config.thinking_enabled(), "the env said off, the file on");
+        assert!(config.reasoning_effort_stated());
+
+        // Home config: the last statement before the built-in default.
+        let config = resolve_with(
+            base(),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.reasoning_effort(), Some("low"));
+        assert!(config.thinking_enabled());
+        assert!(config.thinking_stated());
+
+        // The home config's `none`/`false` are statements too: on DeepSeek they
+        // overrule the preset, which is exactly why they are worth stating.
+        let config = resolve_with(
+            base(),
+            &Overrides {
+                provider: Some("deepseek".into()),
+                ..Overrides::default()
+            },
+            &Overrides::default(),
+            &UserConfig {
+                reasoning_effort: Some("none".into()),
+                thinking: Some(false),
+                ..UserConfig::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.provider, Provider::DeepSeek);
+        assert_eq!(
+            config.reasoning_effort(),
+            None,
+            "stated none sends no field"
+        );
+        assert!(!config.thinking_enabled(), "stated off sends no field");
+        assert!(config.reasoning_effort_stated());
+        assert!(config.thinking_stated());
+    }
+
+    /// A value the human states is honoured wherever they point mush — a local
+    /// endpoint running a thinking model is the reason the knob exists — while
+    /// the *provider's* default still never follows a URL it does not own (the
+    /// test below).
+    #[test]
+    fn a_stated_knob_is_honoured_on_a_custom_endpoint() {
+        let config = resolve_with(
+            Config::new("http://localhost:11434", "qwen", None),
+            &Overrides {
+                url: Some("http://localhost:11434".into()),
+                ..Overrides::default()
+            },
+            &Overrides::default(),
+            &UserConfig {
+                provider: "deepseek".into(),
+                reasoning_effort: Some("low".into()),
+                thinking: Some(true),
+                ..UserConfig::default()
+            },
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.provider, Provider::Custom, "the URL is the human's");
+        assert_eq!(config.reasoning_effort(), Some("low"));
+        assert!(config.thinking_enabled());
+
+        // And the reverse: a stated `none`/`off` suppresses the DeepSeek
+        // preset rather than being mistaken for silence.
+        let config = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides {
+                provider: Some("deepseek".into()),
+                reasoning_effort: Some(ReasoningEffort::Off),
+                thinking: Some(ThinkingMode::Off),
+                ..Overrides::default()
+            },
+            &Overrides::default(),
+            &UserConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.provider, Provider::DeepSeek);
+        assert_eq!(config.reasoning_effort(), None);
+        assert!(!config.thinking_enabled());
+    }
+
     #[test]
     fn provider_parses_names_and_aliases() {
         assert_eq!(Provider::parse("deepseek"), Some(Provider::DeepSeek));
@@ -931,6 +1256,8 @@ mod tests {
             context_explicit: false,
             temperature: DEFAULT_TEMPERATURE,
             max_completion_tokens: false,
+            reasoning_effort: None,
+            thinking: None,
         };
         assert_eq!(
             cfg.chat_url(),
@@ -1241,5 +1568,51 @@ mod tests {
             let error = parse_provider_env(value).unwrap_err();
             assert!(error.contains(value), "{error}");
         }
+    }
+
+    /// The thinking knobs' environment spellings report a typo by name, the way
+    /// `MUSH_CONTEXT` does: a value mush cannot use must never travel to an
+    /// endpoint, and dropping it would send the provider's default instead of
+    /// the setting the human stated. `off` and `none` are statements, not
+    /// typos: they mean the field is not sent.
+    #[test]
+    fn a_bad_effort_or_thinking_environment_value_is_reported() {
+        assert_eq!(parse_effort_env("high"), Ok(ReasoningEffort::High));
+        assert_eq!(parse_effort_env(" MEDIUM "), Ok(ReasoningEffort::Medium));
+        assert_eq!(parse_effort_env("off"), Ok(ReasoningEffort::Off));
+        assert_eq!(parse_effort_env("none"), Ok(ReasoningEffort::Off));
+        let error = parse_effort_env("very").unwrap_err();
+        assert!(
+            error.contains("MUSH_REASONING_EFFORT") && error.contains("very"),
+            "{error}"
+        );
+
+        assert_eq!(parse_thinking_env("on"), Ok(ThinkingMode::On));
+        assert_eq!(parse_thinking_env("OFF"), Ok(ThinkingMode::Off));
+        let error = parse_thinking_env("of").unwrap_err();
+        assert!(
+            error.contains("MUSH_THINKING") && error.contains("of"),
+            "{error}"
+        );
+    }
+
+    /// The same rule one layer down: a hand-edited effort the human got wrong
+    /// is named by startup instead of being sent, and instead of being ignored
+    /// in favour of a default they were trying to overrule.
+    #[test]
+    fn a_bad_effort_in_the_home_config_is_reported() {
+        let error = resolve_with(
+            Config::new("http://x:1", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &UserConfig {
+                reasoning_effort: Some("very".into()),
+                ..UserConfig::default()
+            },
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("very"), "{error}");
+        assert!(error.contains("home config"), "{error}");
     }
 }
