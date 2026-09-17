@@ -287,6 +287,20 @@ scenarios if they still want a scripted model). *Done when* the default suite
 needs no socket, no subprocess and no sleep over 50 ms, and `--ignored` contains
 only live-endpoint tests.
 
+**Stage 2.1 — `ModelClient`.** ✅ `crates/mush/src/model.rs` holds one trait
+(`chat(&ChatRequest, &AtomicBool) -> Result<ChatResponse, ModelError>`), the
+real `HttpModel` over `http::post_json` (body encoding, and the classification
+of a cancellation, a refusal, a transport failure, a status the endpoint chose
+and an unreadable body), and a `#[cfg(test)]` `fake::Scripted` — a reply queue
+that also scripts a refusal and a cancellation, and records the requests it was
+given. `AgentCtx::model` carries it, children inherit it, so one client serves a
+whole tree (and one scripted client can too). `run_loop` and `compact_history`
+go through it with every branch and every error string unchanged; `http.rs` is
+untouched. Three in-process tests: a scripted run that runs its tool call and
+ends with the answer, the learned-context retry, and a cancellation mid-reply.
+**Still open (2.2):** the `#[ignore]`d actor tests — the plan above says four,
+the tree has five — their `start_mock*` helpers, and `scripts/mock_llm.py`.
+
 **Stage 3 — `Screen` view and intents.** `ui::draw(frame, &Screen)` where
 `Screen` is built by `App::screen()`; panes become pure functions of a value, so
 the draw sweep can assert painted text at every size instead of only "does not
