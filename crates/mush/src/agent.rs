@@ -615,7 +615,14 @@ pub fn revive(
     } else {
         transcript.extend(messages);
     }
-    start(actor, transcript, true);
+    // It comes back at rest, not running: a restart is not a request. Starting
+    // a run here replayed every restored agent's task against the endpoint the
+    // moment mush opened — thirteen agents, thirteen requests nobody asked for,
+    // and a tree full of ✗ when the endpoint refused a replayed turn (a
+    // thinking model rejects one without its `reasoning_content`). Whatever an
+    // agent was doing when the process ended, its transcript is where it
+    // resumes, and the human's next message is what starts it.
+    start(actor, transcript, false);
     cmd_tx
 }
 

@@ -81,15 +81,39 @@ impl Picker {
     }
 }
 
-/// `500k`, `8192`, `1M` — the way a window size wants to be read.
+/// `500k`, `8192`, `1.2M` — the way a token count wants to be read. A run's
+/// real numbers come from the endpoint and are large (`1213866`), and a number
+/// a human has to count digits in says nothing at a glance.
 pub fn tokens_label(tokens: usize) -> String {
-    if tokens >= 1_000_000 {
-        format!("{}M", tokens / 1_000_000)
+    /// One decimal of the unit, and no `.0`: `500k` stays `500k`, and 1,213,866
+    /// reads as `1.2M` rather than as `1M` (the first is the size, the second is
+    /// a rounding that hides it).
+    fn scaled(tokens: usize, divisor: f64, unit: &str) -> String {
+        let text = format!("{:.1}", tokens as f64 / divisor);
+        format!("{}{unit}", text.strip_suffix(".0").unwrap_or(&text))
+    }
+    // 999,950 is the last count that rounds to `1000k`; above it the million
+    // unit is the honest one.
+    if tokens >= 999_950 {
+        scaled(tokens, 1_000_000.0, "M")
     } else if tokens >= 1_000 {
-        format!("{}k", tokens / 1_000)
+        scaled(tokens, 1_000.0, "k")
     } else {
         tokens.to_string()
     }
+}
+
+/// Whether a stored transcript ends where a finished run left it: the last
+/// message is an assistant turn that asked for no tools, which is an answer and
+/// nothing else. A run that failed before it changed the transcript — the
+/// endpoint refusing the first request of a resumed agent — leaves one behind,
+/// so this is what tells a restored agent's own work apart from a later
+/// refusal (see `restore_agents`).
+fn ended_on_an_answer(messages: &[Message]) -> bool {
+    matches!(
+        messages.last(),
+        Some(message) if message.role == "assistant" && message.tool_calls().is_empty()
+    )
 }
 
 /// An age the way a glance wants it: seconds, then minutes, then hours — never
@@ -213,12 +237,26 @@ impl App {
             // Keep the counter above every restored id, or the next spawn hands
             // a live child an id a restored agent already holds (finding B1).
             self.tree.reserve_ids(agent.id + 1);
-            let phase = match &agent.status {
-                session::StoredStatus::Done => Phase::Done,
-                session::StoredStatus::Stopped => Phase::Stopped,
-                session::StoredStatus::Failed(error) => Phase::Failed(error.clone()),
+            let (phase, summary) = match &agent.status {
+                session::StoredStatus::Done => (Phase::Done, agent.summary.clone()),
+                session::StoredStatus::Stopped => (Phase::Stopped, agent.summary.clone()),
+                // A stored failure is only the last thing that happened if the
+                // transcript still ends where a failure would have left it. A
+                // run that fails on its first request appends nothing, so an
+                // agent that had already answered (its transcript ends on a
+                // plain assistant turn) is restored as done, with the refusal
+                // as its line. Showing `✗` over a transcript that ends
+                // "Done." claims the agent lost work it still has — which is
+                // how a wall of `✗` appeared over finished work when a
+                // thinking endpoint refused a replayed turn.
+                session::StoredStatus::Failed(error) if ended_on_an_answer(&agent.messages) => {
+                    (Phase::Done, Some(format!("last attempt refused: {error}")))
+                }
+                session::StoredStatus::Failed(error) => {
+                    (Phase::Failed(error.clone()), agent.summary.clone())
+                }
                 // A run that was still in flight at shutdown is not a result.
-                session::StoredStatus::Idle => Phase::Idle,
+                session::StoredStatus::Idle => (Phase::Idle, agent.summary.clone()),
             };
             let landed = agent.landed.map(|landed| match landed {
                 session::StoredLanded::Merged => Landed::Merged,
@@ -246,7 +284,7 @@ impl App {
                 brief: agent.brief,
                 phase,
                 branch: agent.branch,
-                summary: agent.summary,
+                summary,
                 leftover: agent.leftover,
                 landed,
                 tx: Some(tx),
@@ -773,7 +811,7 @@ impl App {
                     self.say(format!(
                         "{} · {} tokens used · set it with /context <tokens>",
                         self.context_label(),
-                        self.context_used_tokens()
+                        crate::app::tokens_label(self.context_used_tokens())
                     ));
                     return;
                 }
@@ -1807,6 +1845,168 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A stored conversation with one agent, for the restore path.
+    fn stored_with_agent(
+        root: &std::path::Path,
+        status: session::StoredStatus,
+        messages: Vec<Message>,
+    ) -> Session {
+        Session {
+            root: root.display().to_string(),
+            model: "test-model".into(),
+            provider: "custom".into(),
+            base_url: "http://127.0.0.1:1".into(),
+            context: None,
+            updated: 0,
+            messages: vec![Message::user("the root task")],
+            agents: vec![session::AgentSession {
+                id: 2,
+                parent: Some(0),
+                depth: 1,
+                brief: "port the parser".into(),
+                branch: None,
+                status,
+                landed: None,
+                leftover: false,
+                summary: None,
+                messages,
+            }],
+        }
+    }
+
+    /// Everything the restore heard from one agent, as text, for a test that
+    /// has to prove what did *not* happen.
+    fn events_from(rx: &Receiver<Msg>, id: AgentId, within: Duration) -> Vec<String> {
+        let deadline = Instant::now() + within;
+        let mut seen = Vec::new();
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(Msg::Agent {
+                    id: from, event, ..
+                }) if from == id => {
+                    seen.push(format!("{event:?}"));
+                }
+                Ok(_) | Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        seen
+    }
+
+    /// Opening mush is not a request. A restored agent comes back with its
+    /// transcript and its mailbox and does nothing until the human asks.
+    ///
+    /// Reviving an agent by *running* it replayed every stored task against the
+    /// endpoint the moment mush opened — thirteen agents, thirteen requests
+    /// nobody asked for — and a thinking endpoint refusing a replayed turn left
+    /// the whole tree marked `✗` over work that had finished.
+    #[test]
+    fn a_restored_agent_comes_back_at_rest() {
+        let root = repo("restore-at-rest");
+        let ws = Workspace::new(&root).unwrap();
+        // Nothing answers here: an agent that ran would fail, loudly, in the
+        // events this test reads.
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let stored = stored_with_agent(
+            &root,
+            session::StoredStatus::Done,
+            vec![Message::user("port the parser"), Message::assistant("done")],
+        );
+
+        let app = App::new(ws, cfg, Some(stored), handle, tx, Vec::new());
+
+        let seen = events_from(&rx, AgentId(2), Duration::from_millis(300));
+        assert!(
+            seen.is_empty(),
+            "a restored agent must not run at startup: {seen:?}"
+        );
+        assert_eq!(
+            app.tree.node(AgentId(2)).map(|node| node.phase.clone()),
+            Some(Phase::Done),
+            "and its row still says what it did last"
+        );
+        // The mailbox is live, so the *human's* next message is what starts it.
+        assert!(
+            app.tree.agent_tx[&AgentId(2)]
+                .send(AgentMsg::Nudge("carry on".into()))
+                .is_ok(),
+            "a restored agent is idle, not dead"
+        );
+        let started = events_from(&rx, AgentId(2), Duration::from_millis(500));
+        assert!(
+            started.iter().any(|event| event.contains("Running")),
+            "the message it was sent starts the run: {started:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The stored transcript is the evidence of what an agent produced; the
+    /// stored status is only the last thing that happened. An attempt the
+    /// endpoint refused before it could touch the transcript (a resumed agent's
+    /// first request) must not turn a finished agent into a `✗`, and the
+    /// refusal belongs on the row either way.
+    #[test]
+    fn a_refused_attempt_does_not_turn_a_finished_agent_into_a_failure() {
+        let root = repo("restore-refused");
+        let ws = Workspace::new(&root).unwrap();
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let refusal = "model returned HTTP 400: The `reasoning_content` in the thinking \
+                       mode must be passed back to the API.";
+        let stored = stored_with_agent(
+            &root,
+            session::StoredStatus::Failed(refusal.to_string()),
+            vec![Message::user("port the parser"), Message::assistant("done")],
+        );
+
+        let app = App::new(ws, cfg, Some(stored), handle, tx, Vec::new());
+
+        let node = app.tree.node(AgentId(2)).expect("the agent is restored");
+        assert_eq!(
+            node.phase,
+            Phase::Done,
+            "the transcript ends on the answer the agent produced"
+        );
+        assert_eq!(
+            node.summary.as_deref(),
+            Some(format!("last attempt refused: {refusal}").as_str()),
+            "the refusal is still on the row"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half of that rule: an agent whose stored transcript stops
+    /// mid-task has no answer to fall back on, so a stored failure stays one.
+    #[test]
+    fn a_failure_that_left_the_transcript_mid_task_is_still_a_failure() {
+        let root = repo("restore-mid-task");
+        let ws = Workspace::new(&root).unwrap();
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let stored = stored_with_agent(
+            &root,
+            session::StoredStatus::Failed("the endpoint stopped responding".into()),
+            vec![
+                Message::user("port the parser"),
+                Message::assistant("starting now"),
+                Message::user("and make it fast"),
+            ],
+        );
+
+        let app = App::new(ws, cfg, Some(stored), handle, tx, Vec::new());
+
+        assert_eq!(
+            app.tree.node(AgentId(2)).map(|node| node.phase.clone()),
+            Some(Phase::Failed("the endpoint stopped responding".into())),
+            "an unfinished transcript keeps its failure"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A paste lands in the message box as one insert and is *not* sent: mush
     /// must never decide for the human that what they pasted was a message.
     #[test]
@@ -2056,10 +2256,11 @@ mod tests {
         let meter = app.context_meter();
         assert_ne!(meter, empty, "the human's words are counted: {meter}");
 
-        // A window the human stated is not marked as derived.
+        // A window the human stated is not marked as derived, and is shown as
+        // the number it is: 32,768 tokens is `32.8k`, not `32k`.
         app.cfg.set_context(32_768);
         assert!(
-            app.context_meter().ends_with("32k"),
+            app.context_meter().ends_with("32.8k"),
             "{}",
             app.context_meter()
         );

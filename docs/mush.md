@@ -363,6 +363,12 @@ needs to be added to the project's own `.gitignore`.
 `session.json` is rewritten after every message, so quitting (or crashing) loses
 nothing. On startup the conversation resumes where it left off. `/new` clears it.
 
+It carries every subagent's transcript too, so a relaunch brings the tree back
+with its briefs and its context. A restored agent comes back **at rest**: its row
+shows how its last run ended, its mailbox is live, and the human's next message
+is what starts it. Opening mush is not a request — an agent that was mid-run when
+the process ended resumes from the transcript it had.
+
 ---
 
 ## 5.5 Subagents: actors, not a framework
