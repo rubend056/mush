@@ -1,6 +1,11 @@
 # mush — refactor plan: seams and owners
 
-> Status: **plan, not yet started.** Written 2026-09-17 against `d4f80ae` plus the
+> Status: **in progress.** Wave 0 (**Stage 0**: `transcript.rs`, `text.rs`) has
+> landed on master, and the delegation-honesty family below (N1, N3–N6) is closed.
+> Stages 1–3 are untouched. The plan still says "not yet started" further down
+> where it describes the *findings pass* sequencing — that part is history.
+>
+> Written 2026-09-17 against `d4f80ae` plus the
 > in-flight findings pass (`input.rs`, `config.rs`, `git.rs`, `http.rs`,
 > `workspace.rs`, `userconfig.rs`, `ui.rs`, `app.rs` all dirty). References are by
 > symbol, not line, because that tree was moving while this was written.
@@ -280,6 +285,12 @@ Status at the time of writing: ✅ verified closed in the working tree, 🔄 the
 concurrent pass is in those files, ⬜ open or unverified. The findings doc stays
 the queue of record; this column says where the *fix belongs*.
 
+> **Drift:** `docs/findings.md` — the "queue of record" this section defers to —
+> is not in the tree (only `docs/mush.md` and this file are). Rows N3–N6 and A20
+> below were therefore recorded here, against this table, because there was
+> nowhere else for them to go. Either restore `findings.md` or stop pointing at
+> it.
+
 | ID | What | Status | Structural home |
 |---|---|---|---|
 | A1 | cancel/deadline only consulted on read timeout | ✅ | http `Watch` (regression test) |
@@ -320,8 +331,13 @@ the queue of record; this column says where the *fix belongs*.
 | B17 | the layout sweep never exercises an open file | 🔄 | `Screen` sweep (Stage 3) |
 | B18 | `~` elision matches a prefix, not a directory | ✅ | `ui::facts_line` |
 | B19 | global notices render into every transcript | ⬜ | agent-scoped notices (3.2) |
-| N1 | `MAX_TURNS` turns "long" into "failed" | ⬜ | `agent/run.rs`: last turn is a wrap-up turn |
+| N1 | `MAX_TURNS` turns "long" into "failed" | ✅ | `agent/run.rs`: `RUNAWAY_TURNS` + `LOOP_ROUNDS` (a run ends when it stops calling tools; only a *loop* ends it early) |
 | N2 | message box is append-only and clips at the right edge | 🔄 | `app/input.rs` (already extracted) |
+| N3 | a stopped child is reported to its parent as `#N done: cancelled` | ✅ | `agent::Outcome` (one enum, not a `summary == CANCELLED` string sentinel) |
+| N4 | Ctrl-C stopped *every* busy agent, and blanked a stopped one to `Idle` | ✅ | `App::interrupt` (focused) + `Ctrl-X` (`interrupt_all`); `Phase::Stopped` |
+| N5 | the one-non-isolated-sibling rule fails only *after* the brief is written | ✅ | `spawn_tool` message + the rule stated in `prompt` schemas and the system prompt |
+| N6 | an interrupted run commits under the same subject as a finished one | ✅ | `commit_worktree` subject carries the `Outcome` |
+| A20 | `needs_compaction` compares byte weights against a *token* budget, and `budget * 3 / 4` can overflow `usize` | ⬜ | `mush-core::transcript`; same shape as A2 (`clamp_context`) |
 
 ---
 
@@ -341,9 +357,11 @@ When this lands, `docs/mush.md` wants:
 - §12: two decisions — "one owner per fact" and "a trait is justified only by a
   fake that a test actually uses".
 
-Housekeeping: `.mush/wt/2` is still registered, and `mush/2` points at `d4f80ae`
-= master with a clean worktree, so `/discard 2` loses nothing and stops every
-`find`, grep and dependency audit from counting the source twice.
+Housekeeping: `.mush/wt/2` was still registered, and `mush/2` pointed at `d4f80ae`
+= master with a clean worktree, so `/discard 2` lost nothing. **Done**: wave 0
+removed it along with every other leftover worktree and branch, so `find`, grep
+and dependency audits no longer count the source twice. The working tree now has
+exactly one worktree (the main checkout).
 
 ---
 
