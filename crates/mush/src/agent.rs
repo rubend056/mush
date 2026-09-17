@@ -22,6 +22,7 @@ use serde_json::{json, Value};
 use mush_core::config::parse_context_hint;
 use mush_core::git;
 use mush_core::message::{ChatRequest, ChatResponse};
+use mush_core::text::truncate;
 use mush_core::tools::ToolName;
 use mush_core::transcript::{
     needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
@@ -1828,16 +1829,6 @@ fn first_line(text: &str) -> String {
         .join(" ")
 }
 
-fn truncate(text: &str, max: usize) -> String {
-    let text = text.trim();
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
-    let mut out: String = text.chars().take(max).collect();
-    out.push('…');
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2025,6 +2016,26 @@ mod tests {
             assert_eq!(ended, expected, "{subject}");
             assert_eq!(brief, "port the parser", "{subject}");
         }
+    }
+
+    /// A brief cut to a budget is cut by *columns*, not characters: a CJK brief
+    /// counted by characters is twice as wide as the subject that holds it
+    /// (finding B9). This module used to carry its own character-counting
+    /// `truncate`, which is exactly how the two meanings drifted apart.
+    #[test]
+    fn a_brief_is_measured_in_columns() {
+        use unicode_width::UnicodeWidthStr;
+        let wide = "编码是这样的".repeat(20);
+        let subject = commit_subject(7, &wide, &Outcome::Finished("done".into()));
+        let brief = subject.strip_prefix("mush #7: ").expect("the prefix");
+        assert!(
+            UnicodeWidthStr::width(brief) <= 60,
+            "a wide brief overshot its column budget: {brief:?}"
+        );
+        assert!(
+            brief.ends_with('…'),
+            "a cut brief says it was cut: {brief:?}"
+        );
     }
 
     /// A branch the human committed to by hand is not evidence about an agent,
