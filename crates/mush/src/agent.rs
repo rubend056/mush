@@ -34,7 +34,7 @@ use mush_core::transcript::{
 use mush_core::workspace::truncate_for_model;
 use mush_core::{prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_SECS};
 
-use crate::app::Msg;
+use crate::app::{AgentId, ConversationId, Msg};
 use crate::http;
 
 /// Backstop against a model that never stops — *not* a budget for the work.
@@ -263,8 +263,8 @@ impl AgentCtx {
     /// Send an id-tagged event to the UI, stamped with this conversation.
     fn emit(&self, id: u64, event: AgentEvent) {
         let _ = self.tx.send(Msg::Agent {
-            conversation: self.conversation,
-            id,
+            conversation: ConversationId(self.conversation),
+            id: AgentId(id),
             event,
         });
     }
@@ -1055,8 +1055,8 @@ fn compact_history(
         return Ok(());
     }
     let _ = actor.ctx.tx.send(Msg::Agent {
-        conversation: actor.ctx.conversation,
-        id: actor.id,
+        conversation: ConversationId(actor.ctx.conversation),
+        id: AgentId(actor.id),
         event: AgentEvent::Status("context nearly full — summarizing…".to_string()),
     });
 

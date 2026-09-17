@@ -13,7 +13,7 @@ use mush_core::message::Message;
 use mush_core::text::{fit_row, truncate, wrap_text, wrap_text_capped};
 
 use crate::app::{
-    short_age, AgentNode, App, Focus, Landed, NoticeKind, Phase, PickerKind, StatusKind,
+    short_age, AgentId, AgentNode, App, Focus, Landed, NoticeKind, Phase, PickerKind, StatusKind,
 };
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -42,7 +42,7 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     let bar_rows = if area.height >= 26 { 2 } else { 1 };
 
     if compact {
-        let agent_rows = (app.agents.len() as u16 + 2).clamp(3, 6);
+        let agent_rows = (app.tree.agents.len() as u16 + 2).clamp(3, 6);
         let rows = Layout::vertical([
             Constraint::Length(agent_rows),
             Constraint::Min(6), // chat transcript + message box
@@ -90,7 +90,7 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
-    if inner.height == 0 || inner.width == 0 || app.agents.is_empty() {
+    if inner.height == 0 || inner.width == 0 || app.tree.agents.is_empty() {
         return;
     }
 
@@ -110,6 +110,7 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
     // two columns narrower than its neighbours. Budget for it up front.
     let row_width = (inner.width as usize).saturating_sub(2);
     let items: Vec<ListItem> = app
+        .tree
         .agents
         .iter()
         .map(|node| ListItem::new(agent_line(app, node, row_width)))
@@ -118,12 +119,12 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
         .highlight_symbol("› ");
     let mut state = ListState::default();
-    let cursor = app.agent_cursor.min(app.agents.len().saturating_sub(1));
+    let cursor = app.tree.cursor();
     state.select(Some(cursor));
     frame.render_stateful_widget(list, list_area, &mut state);
 
     if footer_rows > 0 {
-        let node = &app.agents[cursor];
+        let node = &app.tree.agents[cursor];
         let lines = agent_footer(app, node, inner.width as usize);
         let start = inner.y + inner.height - lines.len() as u16;
         frame.render_widget(
@@ -147,6 +148,7 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
 fn agents_title(app: &App) -> String {
     let mut title = String::from(" agents ");
     let busy = app
+        .tree
         .agents
         .iter()
         .filter(|node| node.phase.is_busy())
@@ -156,7 +158,7 @@ fn agents_title(app: &App) -> String {
     }
     let mut added = 0;
     let mut removed = 0;
-    for stat in app.agent_stats.values() {
+    for stat in app.tree.agent_stats.values() {
         added += stat.added;
         removed += stat.removed;
     }
@@ -173,8 +175,13 @@ fn agents_title(app: &App) -> String {
 /// transcript carry in full — is what yields first.
 fn agent_line(app: &App, node: &AgentNode, width: usize) -> String {
     let indent = "  ".repeat(node.depth);
-    let marker = if app.focused == node.id { "▶" } else { " " };
+    let marker = if app.tree.focused == node.id {
+        "▶"
+    } else {
+        " "
+    };
     let waiting = app
+        .tree
         .agents
         .iter()
         .any(|n| n.parent == Some(node.id) && n.phase.is_busy());
@@ -190,7 +197,7 @@ fn agent_line(app: &App, node: &AgentNode, width: usize) -> String {
         tail.push(activity);
     }
     let mut where_and_how = node.branch.clone().unwrap_or_default();
-    if let Some(stat) = app.agent_stats.get(&node.id) {
+    if let Some(stat) = app.tree.agent_stats.get(&node.id) {
         if !stat.is_empty() {
             if !where_and_how.is_empty() {
                 where_and_how.push(' ');
@@ -305,10 +312,10 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     let rows =
         Layout::vertical([Constraint::Min(3), Constraint::Length(input_lines + 2)]).split(area);
 
-    let title = if app.focused == 0 {
+    let title = if app.tree.focused == AgentId::ROOT {
         " mush ".to_string()
     } else {
-        format!(" agent #{} ", app.focused)
+        format!(" agent #{} ", app.tree.focused)
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -350,10 +357,10 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(input_block, rows[1]);
 
     if input_inner.height > 0 && input_inner.width > 0 {
-        let prompt = if app.focused == 0 {
+        let prompt = if app.tree.focused == AgentId::ROOT {
             "› ".to_string()
         } else {
-            format!("#{} › ", app.focused)
+            format!("#{} › ", app.tree.focused)
         };
         let prompt_width = UnicodeWidthStr::width(prompt.as_str());
         let field = (input_inner.width as usize).saturating_sub(prompt_width);
@@ -396,12 +403,11 @@ fn trim_trailing_blanks(lines: &mut Vec<Line<'static>>) {
 /// The transcript the chat pane shows: the root's conversation by default,
 /// otherwise the focused agent's.
 fn focused_messages(app: &App) -> &[Message] {
-    if app.focused == 0 {
+    if app.tree.focused == AgentId::ROOT {
         &app.chat
     } else {
-        app.agent_msgs
-            .get(&app.focused)
-            .map(Vec::as_slice)
+        app.tree
+            .transcript(app.tree.focused)
             .unwrap_or(EMPTY_MESSAGES)
     }
 }
@@ -584,9 +590,9 @@ fn transcript_tail(
     let notices: Vec<&crate::app::Notice> = app
         .notices
         .iter()
-        .filter(|notice| notice.agent == app.focused)
+        .filter(|notice| notice.agent == app.tree.focused)
         .collect();
-    if app.focused == 0 {
+    if app.tree.focused == AgentId::ROOT {
         if messages.is_empty() && notices.is_empty() {
             return vec![
                 Line::from(Span::styled(
@@ -605,7 +611,7 @@ fn transcript_tail(
         return vec![Line::from(Span::styled(
             format!(
                 "Agent #{} has no messages yet — typing here sends it a nudge.",
-                app.focused
+                app.tree.focused
             ),
             dim(),
         ))];
@@ -618,9 +624,8 @@ fn transcript_tail(
 
     // What is painted last is collected first.
     let focused_busy = app
-        .agents
-        .iter()
-        .find(|node| node.id == app.focused)
+        .tree
+        .node(app.tree.focused)
         .map(|node| node.phase.is_busy())
         .unwrap_or(false);
     if focused_busy {
@@ -781,7 +786,7 @@ mod tests {
     /// A node carrying nothing but the facts a row test needs.
     fn node(phase: Phase, age: u64) -> AgentNode {
         AgentNode {
-            id: 2,
+            id: AgentId(2),
             parent: None,
             depth: 0,
             brief: "lexer".to_string(),

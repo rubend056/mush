@@ -4,9 +4,16 @@
 //! themselves, and this module is the human's view of them — the agent tree,
 //! the focused transcript, the git facts, and the message box. Every input — a
 //! keystroke, an agent event — becomes a `Msg` and flows through `App::update`.
+//!
+//! The agents themselves live in [`tree`], which owns their ids, phases, focus
+//! and per-id maps; this module routes messages into it and renders what it
+//! says.
+
+mod tree;
+
+pub use tree::{AgentId, AgentNode, AgentTree, ConversationId, Existing, Landed, Phase, Spawn};
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,15 +37,15 @@ pub enum Msg {
     Paste(String),
     /// A repository read that finished on its own thread.
     Git {
-        stats: HashMap<u64, git::Stat>,
+        stats: HashMap<AgentId, git::Stat>,
         status: Option<git::RepoStatus>,
     },
     /// An event from an agent actor. `conversation` identifies the tree that
     /// sent it, so an actor left over from `/new` cannot write into the new
     /// chat: events are tagged and the UI drops the stale ones.
     Agent {
-        conversation: u64,
-        id: u64,
+        conversation: ConversationId,
+        id: AgentId,
         event: AgentEvent,
     },
 }
@@ -69,46 +76,6 @@ impl Picker {
             PickerKind::Model => " models · Enter picks ".to_string(),
             PickerKind::Provider => " provider · Enter picks ".to_string(),
         }
-    }
-}
-
-/// One entry in the agent tree. Order in the vector is tree order; ids are
-/// stable, so positions do not shift while agents are alive.
-/// What an agent is doing *now*, as opposed to what it last said it was doing.
-///
-/// The row glyph, the activity text, and the status bar all render this, so a
-/// finished or cancelled run cannot leave a `thinking…` behind: when a phase
-/// ends, the lines that described it stop existing. Nothing here is a string
-/// mirror of the transcript.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Phase {
-    /// Nothing in flight: never ran, or its run ended without a result.
-    Idle,
-    /// A request is in flight and the model has not named a tool yet.
-    Thinking,
-    /// The last thing the agent reported doing: `edit_file src/lib.rs`, `run_command cargo test`, `summarizing…`.
-    Activity(String),
-    /// A Stop is on its way and the actor has not yielded yet.
-    Cancelling,
-    /// A Stop landed: the run ended with no result, but the actor is still
-    /// alive and a nudge resumes it. Its own state, because `Idle` (never ran),
-    /// `Done` (produced a result) and `Stopped` (produced nothing, resumable)
-    /// are three different things and blanking a stop to `Idle` lost the one
-    /// fact the human needed: that work was interrupted mid-flight.
-    Stopped,
-    /// The run finished; `summary` holds what it produced.
-    Done,
-    /// The run failed; the payload is what the human needs to read.
-    Failed(String),
-}
-
-impl Phase {
-    /// Whether work is in flight. `Idle`, `Done`, and `Failed` are at rest.
-    pub fn is_busy(&self) -> bool {
-        matches!(
-            self,
-            Phase::Thinking | Phase::Activity(_) | Phase::Cancelling
-        )
     }
 }
 
@@ -159,7 +126,7 @@ pub struct Status {
 /// rendered into every child's transcript (finding B19).
 #[derive(Clone, Debug)]
 pub struct Notice {
-    pub agent: u64,
+    pub agent: AgentId,
     pub kind: NoticeKind,
     pub text: String,
 }
@@ -170,36 +137,6 @@ pub struct Notice {
 pub enum NoticeKind {
     Info,
     Error,
-}
-
-/// Where an isolated agent's work ended up, once the human landed it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Landed {
-    /// Merged into the main branch; the worktree and the branch were reclaimed.
-    Merged,
-    /// Thrown away on purpose; the worktree and the branch were reclaimed.
-    Discarded,
-}
-
-pub struct AgentNode {
-    pub id: u64,
-    pub parent: Option<u64>,
-    pub depth: usize,
-    pub brief: String,
-    /// What it is doing now, and since when — the row and the bar derive from
-    /// this instead of storing rendered text.
-    pub phase: Phase,
-    pub since: Instant,
-    pub branch: Option<String>,
-    /// The agent's result once it has one (a leftover worktree has one too).
-    pub summary: Option<String>,
-    /// Found on disk rather than spawned in this session. An explicit flag, not
-    /// a sentinel `brief`: the brief is now recovered from the commit subject,
-    /// so matching on its text would stop recognising leftovers the moment they
-    /// learned their real names.
-    pub leftover: bool,
-    /// Set once `/merge` or `/discard` reclaimed the worktree.
-    pub landed: Option<Landed>,
 }
 
 pub struct App {
@@ -216,38 +153,16 @@ pub struct App {
     pub picker: Option<Picker>,
     /// The main worktree's branch, dirty count, and uncommitted line delta.
     pub git: Option<git::RepoStatus>,
-    /// Each isolated agent's own work, measured on its branch. Refreshed by
-    /// events, never computed while painting.
-    pub agent_stats: HashMap<u64, git::Stat>,
     /// Bytes of the root conversation, so the context meter costs nothing to
     /// draw. Updated whenever the transcript changes.
     pub context_used: usize,
-    pub agents: Vec<AgentNode>,
-    pub agent_cursor: usize,
-    /// The agent whose transcript the chat shows and whose mailbox typing targets.
-    pub focused: u64,
-    /// Transcripts of non-root agents; the root's lives in `chat`.
-    pub agent_msgs: HashMap<u64, Vec<Message>>,
-    /// Steering handles: one mailbox per agent, keyed by id.
-    pub agent_tx: HashMap<u64, Sender<AgentMsg>>,
-    /// Each running agent's cancellation flag. The HTTP reader polls it, so a
-    /// Ctrl-C stops a model call that has not answered yet — the mailbox alone
-    /// cannot: the actor is blocked inside the request.
-    pub agent_cancel: HashMap<u64, Arc<AtomicBool>>,
+    /// The agents, their phases, the focus and the per-agent mailboxes,
+    /// transcripts, cancel flags and git stats.
+    pub tree: AgentTree,
     /// Shared with the agent actors so runtime config changes apply everywhere.
     pub cfg_shared: Arc<Mutex<Config>>,
-    /// The tree's id counter. Leftover worktrees are registered under their own
-    /// ids, so the next spawn must start above them or two nodes share an id
-    /// and every id-keyed lookup hits the wrong one (finding B1).
-    agent_ids: Arc<AtomicU64>,
     /// The UI event channel, needed to respawn the root actor on /new.
     ui_tx: Sender<Msg>,
-    /// The tree-wide running count, shared with the actors so an agent revived
-    /// from a stored session is counted against the ceiling like any other.
-    agent_live: Arc<AtomicU64>,
-    /// Which conversation the live actor tree belongs to; events tagged with
-    /// any other are from an abandoned tree and are ignored.
-    conversation: u64,
     /// When the git snapshot was last taken, so a long run refreshes it.
     git_at: Option<Instant>,
     /// A `git` read is already running on its own thread; asking again would
@@ -256,7 +171,6 @@ pub struct App {
     /// A transient line for the bar: what just happened, or what went wrong.
     /// Work in progress does not live here — it is derived from the phases.
     pub status: Option<Status>,
-    pub busy: bool,
     pub should_quit: bool,
     pub dirty_screen: bool,
     pub spin: u64,
@@ -277,6 +191,7 @@ impl App {
             Some(session) => (session.messages, session.agents),
             None => (Vec::new(), Vec::new()),
         };
+        let cfg_shared = root.cfg.clone();
         let mut app = Self {
             ws,
             cfg,
@@ -288,34 +203,13 @@ impl App {
             models,
             picker: None,
             git: None,
-            agent_stats: HashMap::new(),
             context_used: 0,
-            agents: vec![AgentNode {
-                id: 0,
-                parent: None,
-                depth: 0,
-                brief: "you (root agent)".to_string(),
-                phase: Phase::Idle,
-                since: Instant::now(),
-                branch: None,
-                summary: None,
-                leftover: false,
-                landed: None,
-            }],
-            agent_cursor: 0,
-            focused: 0,
-            agent_msgs: HashMap::new(),
-            agent_tx: HashMap::from([(0, root.tx)]),
-            agent_cancel: HashMap::new(),
-            cfg_shared: root.cfg,
-            agent_ids: root.ids.clone(),
-            agent_live: root.live.clone(),
+            tree: AgentTree::rooted(root),
+            cfg_shared,
             ui_tx,
-            conversation: root.conversation,
             git_at: None,
             git_in_flight: false,
             status: None,
-            busy: false,
             should_quit: false,
             dirty_screen: true,
             spin: 0,
@@ -340,14 +234,14 @@ impl App {
         }
         let cfg = self.cfg_shared.clone();
         let ui_tx = self.ui_tx.clone();
-        let conversation = self.conversation;
-        let ids = self.agent_ids.clone();
-        let live = self.agent_live.clone();
+        let conversation = self.tree.conversation().0;
+        let ids = self.tree.ids();
+        let live = self.tree.live();
         let root = self.ws.root().to_path_buf();
         for agent in stored {
             // Keep the counter above every restored id, or the next spawn hands
             // a live child an id a restored agent already holds (finding B1).
-            self.agent_ids.fetch_max(agent.id + 1, Ordering::SeqCst);
+            self.tree.reserve_ids(agent.id + 1);
             let phase = match &agent.status {
                 session::StoredStatus::Done => Phase::Done,
                 session::StoredStatus::Stopped => Phase::Stopped,
@@ -374,22 +268,21 @@ impl App {
                     messages: agent.messages.clone(),
                 },
             );
-            self.agent_msgs.insert(agent.id, agent.messages);
-            self.agent_tx.insert(agent.id, tx);
-            self.agents.push(AgentNode {
-                id: agent.id,
-                parent: agent.parent,
+            self.tree.register(Existing {
+                id: AgentId(agent.id),
+                parent: agent.parent.map(AgentId),
                 depth: agent.depth.max(1),
                 brief: agent.brief,
                 phase,
-                since: Instant::now(),
                 branch: agent.branch,
                 summary: agent.summary,
                 leftover: agent.leftover,
                 landed,
+                messages: agent.messages,
+                tx: Some(tx),
             });
         }
-        self.repair_focus();
+        self.tree.repair_focus();
     }
 
     /// Re-read what the repository looks like: the main worktree's branch,
@@ -410,14 +303,15 @@ impl App {
         // Resolved here: the tree is UI state, and the worker must not touch it.
         // A nested agent forked from its parent's branch, so that is what its
         // work is measured against; a top-level one forked from HEAD.
-        let branches: Vec<(u64, String, String)> = self
+        let branches: Vec<(AgentId, String, String)> = self
+            .tree
             .agents
             .iter()
             .filter_map(|node| {
                 let branch = node.branch.clone()?;
                 let base = node
                     .parent
-                    .and_then(|parent| self.agents.iter().find(|n| n.id == parent))
+                    .and_then(|parent| self.tree.node(parent))
                     .and_then(|parent| parent.branch.clone())
                     .unwrap_or_else(|| "HEAD".to_string());
                 Some((node.id, base, branch))
@@ -437,8 +331,8 @@ impl App {
     }
 
     /// Adopt a repository read that finished on its own thread.
-    fn adopt_git(&mut self, stats: HashMap<u64, git::Stat>, status: Option<git::RepoStatus>) {
-        self.agent_stats = stats;
+    fn adopt_git(&mut self, stats: HashMap<AgentId, git::Stat>, status: Option<git::RepoStatus>) {
+        self.tree.agent_stats = stats;
         self.git = status;
         self.git_at = Some(Instant::now());
         self.git_in_flight = false;
@@ -468,28 +362,34 @@ impl App {
         let Some(worktrees) = git::worktrees(&root) else {
             return;
         };
-        // Drop stale leftovers whose worktree no longer exists.
-        self.agents.retain(|node| {
-            if !node.leftover {
-                return true;
-            }
-            let Some(id) = node.branch.as_deref().and_then(git::worktree_id) else {
-                return false;
-            };
-            git::worktree_path(&root, id).exists()
-        });
+        // Drop stale leftovers whose worktree no longer exists. Reaping takes
+        // the focus and the cursor off a ghost with them (finding B11).
+        let gone: Vec<AgentId> = self
+            .tree
+            .agents
+            .iter()
+            .filter(|node| node.leftover)
+            .filter(
+                |node| match node.branch.as_deref().and_then(git::worktree_id) {
+                    Some(id) => !git::worktree_path(&root, id).exists(),
+                    None => true,
+                },
+            )
+            .map(|node| node.id)
+            .collect();
+        self.tree.reap(&gone);
         for worktree in worktrees {
             let Some(id) = worktree.id else {
                 continue;
             };
-            if self.agents.iter().any(|node| node.id == id) {
+            if self.tree.has(AgentId(id)) {
                 continue;
             }
             let full = git::branch_name(id);
             // Keep the tree's counter above every registered id, or the next
             // `spawn_agent` hands a live child an id a leftover already holds
             // (finding B1).
-            self.agent_ids.fetch_max(id + 1, Ordering::SeqCst);
+            self.tree.reserve_ids(id + 1);
             // The commit mush made for this worktree names the task and how the
             // run ended, so a leftover is shown as the work it is instead of an
             // anonymous placeholder. A branch the human committed to by hand
@@ -511,30 +411,21 @@ impl App {
                         "found on startup",
                     ),
                 };
-            self.agents.push(AgentNode {
-                id,
+            self.tree.register(Existing {
+                id: AgentId(id),
                 parent: None,
                 depth: 1,
                 brief,
                 phase,
-                since: Instant::now(),
                 branch: Some(full),
                 summary: Some(summary.to_string()),
                 leftover: true,
                 landed: None,
+                messages: Vec::new(),
+                tx: None,
             });
         }
-        self.repair_focus();
-    }
-
-    /// Reaping a leftover node leaves `focused` (and the cursor) pointing at a
-    /// ghost: the pane would stay titled `agent #4` while typing reports that
-    /// the agent is gone (finding B11).
-    fn repair_focus(&mut self) {
-        if !self.agents.iter().any(|node| node.id == self.focused) {
-            self.focused = 0;
-        }
-        self.agent_cursor = self.agent_cursor.min(self.agents.len().saturating_sub(1));
+        self.tree.repair_focus();
     }
 
     // ---------------------------------------------------------------- updates
@@ -558,7 +449,7 @@ impl App {
                 id,
                 event,
             } => {
-                if conversation == self.conversation {
+                if conversation == self.tree.conversation() {
                     self.on_agent(id, event);
                 } else if let AgentEvent::Spawned { cmd, .. } = &event {
                     // A tree `/new` abandoned can still spawn children. They are
@@ -576,7 +467,7 @@ impl App {
     /// a line that has outlived its welcome leaves the screen even when nothing
     /// else is happening.
     pub fn tick(&mut self) {
-        if self.busy {
+        if self.busy() {
             self.spin = self.spin.wrapping_add(1);
             self.dirty_screen = true;
             // A long run keeps changing the workspace; the bar and the rows
@@ -595,38 +486,14 @@ impl App {
                 self.dirty_screen = true;
             }
         }
-        self.age_stale_cancels();
+        // A `⊘` whose acknowledgement never arrives leaves a row spinning
+        // forever, which is worse than an idle one (finding B6).
+        if self.tree.expire_cancels() {
+            self.dirty_screen = true;
+        }
     }
 
-    /// A cancel is acknowledged quickly — the actor yields, or the run ends. A
-    /// `⊘` older than this means the acknowledgement will never arrive (the
-    /// actor's mailbox is dead), and a row that spins forever is worse than an
-    /// idle one (finding B6).
-    fn age_stale_cancels(&mut self) {
-        const STALE_CANCEL: Duration = Duration::from_secs(10);
-        let stale: Vec<u64> = self
-            .agents
-            .iter()
-            .filter(|node| {
-                matches!(node.phase, Phase::Cancelling) && node.since.elapsed() > STALE_CANCEL
-            })
-            .map(|node| node.id)
-            .collect();
-        if stale.is_empty() {
-            return;
-        }
-        for id in stale {
-            if let Some(node) = self.agent_node_mut(id) {
-                node.phase = Phase::Idle;
-                node.since = Instant::now();
-            }
-            self.agent_cancel.remove(&id);
-        }
-        self.recompute_busy();
-        self.dirty_screen = true;
-    }
-
-    fn on_agent(&mut self, id: u64, event: AgentEvent) {
+    fn on_agent(&mut self, id: AgentId, event: AgentEvent) {
         match event {
             AgentEvent::Spawned {
                 child,
@@ -636,68 +503,27 @@ impl App {
                 branch,
                 cmd,
             } => {
-                self.agent_tx.insert(child, cmd);
-                // The child's first user message is its brief — the model sees
-                // it, so the transcript should too; otherwise a focused child
-                // looks as if it started from nothing (finding B13).
-                let opening = if brief.trim().is_empty() {
-                    "Begin the task now.".to_string()
-                } else {
-                    brief.clone()
-                };
-                self.agent_msgs
-                    .entry(child)
-                    .or_default()
-                    .push(Message::user(opening));
-                self.agents.push(AgentNode {
-                    id: child,
-                    parent: Some(parent),
-                    depth,
+                self.tree.insert(Spawn {
+                    id: AgentId(child),
+                    parent: AgentId(parent),
                     brief,
-                    phase: Phase::Thinking,
-                    since: Instant::now(),
+                    depth,
                     branch,
-                    summary: None,
-                    leftover: false,
-                    landed: None,
+                    cmd,
                 });
-                self.busy = true;
             }
             AgentEvent::Running { cancel } => {
                 // A run started, possibly one the UI did not ask for (an idle
                 // agent woken by a child's result). Mark it so `busy`, the
                 // spinner, and Ctrl-C agree with the actor. The last run's
                 // summary belongs to that run, not this one (finding B14).
-                if let Some(node) = self.agent_node_mut(id) {
-                    node.phase = Phase::Thinking;
-                    node.since = Instant::now();
-                    node.summary = None;
-                }
-                // Keep the run's flag: a Stop must be able to reach a model
-                // call that is still waiting, not just the actor's mailbox.
-                self.agent_cancel.insert(id, cancel);
-                self.recompute_busy();
+                self.tree.begin(id, Some(cancel));
             }
             AgentEvent::Status(status) => {
                 // A status that arrives after the run's own end (a late or
                 // duplicated commit line) must not put a finished agent back to
                 // work (finding B5).
-                let at_rest = self
-                    .agents
-                    .iter()
-                    .find(|node| node.id == id)
-                    .map(|node| !node.phase.is_busy())
-                    .unwrap_or(true);
-                if !at_rest {
-                    if let Some(node) = self.agent_node_mut(id) {
-                        node.phase = Phase::Activity(status);
-                        node.since = Instant::now();
-                    }
-                }
-                // A status can arrive after the run's work is done (a commit
-                // message, say) and before `Done`: keep `busy` in step with the
-                // phases it is derived from.
-                self.recompute_busy();
+                self.tree.activity(id, status);
             }
             AgentEvent::Notice(text) => {
                 // A limit the run reached (it still produced a result), or a
@@ -707,12 +533,12 @@ impl App {
                 self.chat_scroll = 0;
             }
             AgentEvent::Message(message) => {
-                if id == 0 {
+                if id == AgentId::ROOT {
                     self.chat.push(message);
                     self.count_context();
                     self.save_session();
-                } else if let Some(msgs) = self.agent_msgs.get_mut(&id) {
-                    msgs.push(message);
+                } else {
+                    self.tree.push_message(id, message);
                 }
                 self.chat_scroll = 0;
             }
@@ -720,43 +546,27 @@ impl App {
                 // Stopped is not failed and not done: the run produced nothing,
                 // and the actor is idle and resumable. Saying which one it is
                 // is the difference between a lost agent and a parked one.
-                if let Some(node) = self.agent_node_mut(id) {
-                    node.phase = Phase::Stopped;
-                    node.since = Instant::now();
-                }
-                self.agent_cancel.remove(&id);
+                self.tree.stopped(id);
                 self.refresh_git();
                 // Only the agent the human is looking at needs the bar; a
                 // stop they did not ask for still shows as ⊘ on its row.
-                if id == self.focused {
+                if id == self.tree.focused {
                     self.say(format!("agent #{id} stopped — send a message to resume it"));
                 }
                 self.chat_scroll = 0;
-                self.recompute_busy();
             }
             AgentEvent::Error(error) => {
-                if let Some(node) = self.agent_node_mut(id) {
-                    node.phase = Phase::Failed(error.clone());
-                    node.since = Instant::now();
-                }
-                self.agent_cancel.remove(&id);
+                self.tree.fail(id, error.clone());
                 self.refresh_git();
                 self.note_error_for(id, error);
                 self.chat_scroll = 0;
-                self.recompute_busy();
             }
             AgentEvent::Done => {
                 let summary = self.last_assistant_text(id);
-                if let Some(node) = self.agent_node_mut(id) {
-                    node.phase = Phase::Done;
-                    node.since = Instant::now();
-                    // Every Done replaces the row's summary; keeping the first
-                    // one described a run that ended long ago (finding B14).
-                    node.summary = summary;
-                }
-                self.agent_cancel.remove(&id);
+                // Every Done replaces the row's summary; keeping the first one
+                // described a run that ended long ago (finding B14).
+                self.tree.finish(id, summary);
                 self.refresh_git();
-                self.recompute_busy();
             }
             AgentEvent::Context { tokens } => {
                 // The actor learned the endpoint's real window from a server
@@ -773,23 +583,23 @@ impl App {
                 // mirror it so nudges, saves, and the visible chat stay in
                 // sync with what the model actually sees.
                 let carried = Message::user(prompt::compaction_message(&summary));
-                if id == 0 {
+                if id == AgentId::ROOT {
                     self.chat = vec![carried];
                     self.count_context();
                     self.save_session();
                     self.note("context compacted — continuing from a summary");
-                } else if let Some(msgs) = self.agent_msgs.get_mut(&id) {
-                    *msgs = vec![carried];
+                } else {
+                    self.tree.replace_transcript(id, vec![carried]);
                 }
                 self.chat_scroll = 0;
             }
         }
     }
 
-    /// An agent stopped working: we are busy while any agent in the tree is
-    /// running. Derived from the phases, so it cannot disagree with the rows.
-    fn recompute_busy(&mut self) {
-        self.busy = self.agents.iter().any(|node| node.phase.is_busy());
+    /// Whether anything in the tree is working: derived from the phases, so it
+    /// cannot disagree with the rows.
+    pub fn busy(&self) -> bool {
+        self.tree.busy()
     }
 
     /// Remember a transient line for the bar: what a command just did, what the
@@ -805,10 +615,10 @@ impl App {
     /// A line for the transcript that is not a message: a hint, or a failure.
     /// It concerns the root conversation unless tagged otherwise.
     pub fn note(&mut self, text: impl Into<String>) {
-        self.note_for(0, text);
+        self.note_for(AgentId::ROOT, text);
     }
 
-    pub fn note_for(&mut self, agent: u64, text: impl Into<String>) {
+    pub fn note_for(&mut self, agent: AgentId, text: impl Into<String>) {
         self.notices.push(Notice {
             agent,
             kind: NoticeKind::Info,
@@ -817,10 +627,10 @@ impl App {
     }
 
     pub fn note_error(&mut self, text: impl Into<String>) {
-        self.note_error_for(0, text);
+        self.note_error_for(AgentId::ROOT, text);
     }
 
-    pub fn note_error_for(&mut self, agent: u64, text: impl Into<String>) {
+    pub fn note_error_for(&mut self, agent: AgentId, text: impl Into<String>) {
         self.notices.push(Notice {
             agent,
             kind: NoticeKind::Error,
@@ -863,6 +673,7 @@ impl App {
     /// the bar falls back to the transient line or the idle hint.
     pub fn activity_line(&self) -> Option<String> {
         let busy: Vec<&AgentNode> = self
+            .tree
             .agents
             .iter()
             .filter(|node| node.phase.is_busy())
@@ -872,7 +683,7 @@ impl App {
         }
         // The root napped and its children still work: what matters is that the
         // root will come back, not which child is typing.
-        if !busy.iter().any(|node| node.id == 0) {
+        if !busy.iter().any(|node| node.id == AgentId::ROOT) {
             return Some(format!(
                 "waiting on {} subagent(s) — the root resumes as they finish",
                 busy.len()
@@ -880,7 +691,7 @@ impl App {
         }
         let shown = busy
             .iter()
-            .find(|node| node.id == self.focused)
+            .find(|node| node.id == self.tree.focused)
             .copied()
             .unwrap_or(busy[0]);
         let age = short_age(shown.since.elapsed());
@@ -899,11 +710,11 @@ impl App {
     }
 
     /// The last assistant reply in an agent's transcript (its final summary).
-    fn last_assistant_text(&self, id: u64) -> Option<String> {
-        let messages: &[Message] = if id == 0 {
+    fn last_assistant_text(&self, id: AgentId) -> Option<String> {
+        let messages: &[Message] = if id == AgentId::ROOT {
             &self.chat
         } else {
-            self.agent_msgs.get(&id).map(Vec::as_slice)?
+            self.tree.transcript(id)?
         };
         messages
             .iter()
@@ -911,10 +722,6 @@ impl App {
             .find(|message| message.role == "assistant")
             .map(|message| message.text().trim().to_string())
             .filter(|text| !text.is_empty())
-    }
-
-    fn agent_node_mut(&mut self, id: u64) -> Option<&mut AgentNode> {
-        self.agents.iter_mut().find(|node| node.id == id)
     }
 
     // ------------------------------------------------------------- chat / LLM
@@ -928,8 +735,8 @@ impl App {
             self.run_command(&text);
             return;
         }
-        let target = self.focused;
-        if target == 0 {
+        let target = self.tree.focused;
+        if target == AgentId::ROOT {
             // The human's words belong in the transcript they can see, whether
             // the root is starting a run or already in one.
             self.chat.push(Message::user(text.clone()));
@@ -942,38 +749,35 @@ impl App {
             // idle, and its next message starts a run rather than nudging a
             // conversation that is not in flight.
             let root_busy = self
-                .agents
-                .iter()
-                .any(|node| node.id == 0 && node.phase.is_busy());
+                .tree
+                .node(AgentId::ROOT)
+                .map(|node| node.phase.is_busy())
+                .unwrap_or(false);
             if root_busy {
                 // Human steering while the root runs: queued as a nudge. If the
                 // root's mailbox is dead (it was cancelled), fall through and
                 // start a fresh run instead of spinning forever on a ghost.
                 let alive = self
+                    .tree
                     .agent_tx
-                    .get(&0)
+                    .get(&AgentId::ROOT)
                     .map(|tx| tx.send(AgentMsg::Nudge(text.clone())).is_ok())
                     .unwrap_or(false);
                 if alive {
                     self.say("noted — folded in as the agent continues");
                     return;
                 }
-                if let Some(node) = self.agent_node_mut(0) {
-                    node.phase = Phase::Idle;
-                }
+                self.tree.idle(AgentId::ROOT);
             }
             let mut messages = Vec::with_capacity(self.chat.len() + 1);
             messages.push(self.system.clone());
             messages.extend(self.chat.iter().cloned());
-            match self.agent_tx.get(&0) {
+            match self.tree.agent_tx.get(&AgentId::ROOT) {
                 Some(tx) if tx.send(AgentMsg::Run(messages)).is_ok() => {
                     // The run starts now as far as the human is concerned; the
-                    // actor's `Running` event will agree with this.
-                    if let Some(node) = self.agent_node_mut(0) {
-                        node.phase = Phase::Thinking;
-                        node.since = Instant::now();
-                    }
-                    self.recompute_busy();
+                    // actor's `Running` event will agree with this, and brings
+                    // the run's cancel flag with it.
+                    self.tree.begin(AgentId::ROOT, None);
                 }
                 _ => {
                     self.fail("root agent is gone — /new restarts it");
@@ -983,24 +787,15 @@ impl App {
             // Nudge a specific agent; running ones fold it in, idle ones rerun.
             // If the mailbox is gone the node's phase is put back exactly as it
             // was, instead of leaving a lie on the row (finding B10).
-            let previous = self.agent_node_mut(target).map(|node| node.phase.clone());
-            if let Some(msgs) = self.agent_msgs.get_mut(&target) {
-                msgs.push(Message::user(text.clone()));
-            }
-            if let Some(node) = self.agent_node_mut(target) {
-                node.phase = Phase::Thinking;
-                node.since = Instant::now();
-            }
-            match self.agent_tx.get(&target) {
+            let previous = self.tree.nudge(target);
+            self.tree.push_message(target, Message::user(text.clone()));
+            match self.tree.agent_tx.get(&target) {
                 Some(tx) if tx.send(AgentMsg::Nudge(text)).is_ok() => {}
                 _ => {
-                    if let (Some(node), Some(previous)) = (self.agent_node_mut(target), previous) {
-                        node.phase = previous;
-                    }
+                    self.tree.nudge_failed(target, previous);
                     self.fail(format!("agent #{target} is gone"));
                 }
             }
-            self.recompute_busy();
         }
     }
 
@@ -1054,12 +849,12 @@ impl App {
                     self.say("usage: /forget <agent id>");
                     return;
                 };
-                self.forget_agent(id);
+                self.forget_agent(AgentId(id));
             }
             "/worktrees" => {
                 self.discover_worktrees();
                 self.refresh_git();
-                let count = self.agents.iter().filter(|n| n.leftover).count();
+                let count = self.tree.agents.iter().filter(|n| n.leftover).count();
                 self.say(if count > 0 {
                     format!("{count} leftover worktree(s) registered — /diff, /merge, /discard work on them")
                 } else {
@@ -1308,11 +1103,12 @@ impl App {
     /// the only thing that ever reclaims a worktree and its branch is doing it
     /// here — which is why the pane stayed cluttered with leftovers.
     fn worktree_command(&mut self, command: &str, rest: &str) {
-        let Ok(id) = rest.trim().parse::<u64>() else {
+        let Ok(raw) = rest.trim().parse::<u64>() else {
             self.say(format!("usage: {command} <agent id>"));
             return;
         };
-        let (branch, busy, landed) = match self.agents.iter().find(|node| node.id == id) {
+        let id = AgentId(raw);
+        let (branch, busy, landed) = match self.tree.node(id) {
             None => {
                 self.fail(format!("no agent #{id}"));
                 return;
@@ -1351,7 +1147,7 @@ impl App {
         // The path git removes and the path the note names are one string: the
         // core formatter, made relative to the root `-C` already resolves it
         // against, so a discard cannot remove one worktree and report another.
-        let worktree = git::worktree_path(&root, id);
+        let worktree = git::worktree_path(&root, id.0);
         let worktree = worktree
             .strip_prefix(&root)
             .unwrap_or(&worktree)
@@ -1370,9 +1166,7 @@ impl App {
                         Ok(_) => format!("{branch} deleted"),
                         Err(error) => format!("branch kept: {error}"),
                     };
-                    if let Some(node) = self.agent_node_mut(id) {
-                        node.landed = Some(Landed::Merged);
-                    }
+                    self.tree.land(id, Landed::Merged);
                     self.note(format!("merged {branch} into HEAD · {branch_note}"));
                     self.refresh_git();
                     self.save_session();
@@ -1396,9 +1190,7 @@ impl App {
                 if removed.is_err() && deleted.is_err() {
                     self.fail(format!("cannot discard agent #{id}: {outcome}"));
                 } else {
-                    if let Some(node) = self.agent_node_mut(id) {
-                        node.landed = Some(Landed::Discarded);
-                    }
+                    self.tree.land(id, Landed::Discarded);
                     self.note(format!(
                         "discarded agent #{id} — its work is gone · {outcome}"
                     ));
@@ -1416,12 +1208,12 @@ impl App {
     /// are left alone, so forgetting a live one only means `/worktrees` lists it
     /// again (which is the honest outcome — forgetting is about the
     /// conversation, not the disk).
-    fn forget_agent(&mut self, id: u64) {
-        if id == 0 {
+    fn forget_agent(&mut self, id: AgentId) {
+        if id == AgentId::ROOT {
             self.fail("the root agent cannot be forgotten — /new restarts it");
             return;
         }
-        let Some(node) = self.agents.iter().find(|node| node.id == id) else {
+        let Some(node) = self.tree.node(id) else {
             self.fail(format!("no agent #{id}"));
             return;
         };
@@ -1432,15 +1224,7 @@ impl App {
             return;
         }
         let unmerged = node.branch.clone().filter(|_| node.landed.is_none());
-        self.agents.retain(|node| node.id != id);
-        self.agent_msgs.remove(&id);
-        // Dropping the last sender ends the actor: an idle agent whose mailbox
-        // is gone has nothing left to wait for.
-        self.agent_tx.remove(&id);
-        self.agent_cancel.remove(&id);
-        self.agent_stats.remove(&id);
-        self.repair_focus();
-        self.recompute_busy();
+        self.tree.reap(&[id]);
         match unmerged {
             Some(branch) => self.note(format!(
                 "forgot agent #{id} — {branch} is untouched, so /worktrees lists it again"
@@ -1463,34 +1247,16 @@ impl App {
             self.ws.root().to_path_buf(),
         );
         // The respawned root owns its own config cell, conversation tag, and id
-        // counter; adopt all three, or a later /model would never reach the
-        // agent, its events would look stale, and a spawn could reuse an id.
+        // counter; adopt all of them with a fresh tree, or a later /model would
+        // never reach the agent, its events would look stale, and a spawn could
+        // reuse an id.
         self.cfg_shared = root.cfg.clone();
-        self.conversation = root.conversation;
-        self.agent_ids = root.ids.clone();
-        self.agent_tx = HashMap::from([(0, root.tx)]);
-        self.agent_cancel.clear();
-        self.agent_msgs.clear();
+        self.tree = AgentTree::rooted(root);
         // Running agents vanish with the old conversation; worktrees they left
         // behind are still reviewable (they are re-listed below).
-        self.agents = vec![AgentNode {
-            id: 0,
-            parent: None,
-            depth: 0,
-            brief: "you (root agent)".to_string(),
-            phase: Phase::Idle,
-            since: Instant::now(),
-            branch: None,
-            summary: None,
-            leftover: false,
-            landed: None,
-        }];
-        self.agent_cursor = 0;
         self.chat.clear();
         self.notices.clear();
         self.chat_scroll = 0;
-        self.focused = 0;
-        self.busy = false;
         self.spin = 0;
         self.discover_worktrees();
         self.count_context();
@@ -1504,7 +1270,7 @@ impl App {
     /// should do), while `/new` needs the threads to be gone — and an actor
     /// holds its own mailbox open, so it never notices that the UI let go.
     fn stop_all(&self) {
-        for tx in self.agent_tx.values() {
+        for tx in self.tree.agent_tx.values() {
             let _ = tx.send(AgentMsg::Shutdown);
         }
     }
@@ -1514,12 +1280,13 @@ impl App {
         // each child's context, and "continue that agent" meant writing the
         // brief again from scratch.
         let agents = self
+            .tree
             .agents
             .iter()
-            .filter(|node| node.id != 0)
+            .filter(|node| node.id != AgentId::ROOT)
             .map(|node| session::AgentSession {
-                id: node.id,
-                parent: node.parent,
+                id: node.id.0,
+                parent: node.parent.map(|parent| parent.0),
                 depth: node.depth,
                 brief: node.brief.clone(),
                 branch: node.branch.clone(),
@@ -1540,8 +1307,8 @@ impl App {
                 // The system prompt is regenerated on the way back in, since it
                 // names a workspace that may have moved.
                 messages: self
-                    .agent_msgs
-                    .get(&node.id)
+                    .tree
+                    .transcript(node.id)
                     .map(|messages| {
                         messages
                             .iter()
@@ -1618,16 +1385,6 @@ impl App {
     /// Ask one agent's current run to stop: flip the flag its in-flight model
     /// call polls, and leave a Stop in the mailbox for everything else (a
     /// parked wait, a shell command, the next message boundary).
-    fn stop_agent(&mut self, id: u64) -> bool {
-        if let Some(flag) = self.agent_cancel.get(&id) {
-            flag.store(true, Ordering::SeqCst);
-        }
-        self.agent_tx
-            .get(&id)
-            .map(|tx| tx.send(AgentMsg::Stop).is_ok())
-            .unwrap_or(false)
-    }
-
     /// Stop the agent the human is looking at. Ctrl-C used to stop *every*
     /// busy agent at once, which is the wrong default: the agents it killed
     /// were usually the ones already finished and about to report, and their
@@ -1636,14 +1393,15 @@ impl App {
     fn interrupt(&mut self) {
         // What the human is looking at: the focused agent if it is busy, else
         // the one agent that is busy (there is nothing to disambiguate).
-        let busy: Vec<u64> = self
+        let busy: Vec<AgentId> = self
+            .tree
             .agents
             .iter()
             .filter(|node| node.phase.is_busy())
             .map(|node| node.id)
             .collect();
-        let target = if busy.contains(&self.focused) {
-            Some(self.focused)
+        let target = if busy.contains(&self.tree.focused) {
+            Some(self.tree.focused)
         } else if busy.len() == 1 {
             Some(busy[0])
         } else {
@@ -1669,7 +1427,8 @@ impl App {
     /// Stop every busy agent. The old Ctrl-C, now on its own key: it is the
     /// emergency brake, not the everyday one.
     fn interrupt_all(&mut self) {
-        let targets: Vec<u64> = self
+        let targets: Vec<AgentId> = self
+            .tree
             .agents
             .iter()
             .filter(|node| node.phase.is_busy())
@@ -1694,19 +1453,8 @@ impl App {
     /// Ask one agent to stop and show it immediately. A dead mailbox is a gone
     /// actor: mark the row so it stops showing work that can never finish
     /// (finding B6).
-    fn stop_one(&mut self, id: u64) {
-        let alive = self.stop_agent(id);
-        if let Some(node) = self.agent_node_mut(id) {
-            // Say so immediately: the actor may be mid-request, and a row that
-            // keeps spinning looks like the Stop was never heard.
-            node.phase = if alive {
-                Phase::Cancelling
-            } else {
-                Phase::Stopped
-            };
-            node.since = Instant::now();
-        }
-        self.recompute_busy();
+    fn stop_one(&mut self, id: AgentId) {
+        self.tree.cancel_requested(id);
     }
 
     fn cycle_focus(&mut self, direction: i64) {
@@ -1721,26 +1469,22 @@ impl App {
 
     fn key_agents(&mut self, key: KeyEvent) {
         match key.code {
-            KeyCode::Char('j') | KeyCode::Down => {
-                if self.agent_cursor + 1 < self.agents.len() {
-                    self.agent_cursor += 1;
-                }
-            }
-            KeyCode::Char('k') | KeyCode::Up => {
-                self.agent_cursor = self.agent_cursor.saturating_sub(1);
-            }
-            KeyCode::Char('g') | KeyCode::Home => self.agent_cursor = 0,
-            KeyCode::Char('G') | KeyCode::End => {
-                self.agent_cursor = self.agents.len().saturating_sub(1)
-            }
+            KeyCode::Char('j') | KeyCode::Down => self.tree.move_cursor(1),
+            KeyCode::Char('k') | KeyCode::Up => self.tree.move_cursor(-1),
+            KeyCode::Char('g') | KeyCode::Home => self.tree.cursor_top(),
+            KeyCode::Char('G') | KeyCode::End => self.tree.cursor_bottom(),
             KeyCode::Enter => {
-                if let Some(node) = self.agents.get(self.agent_cursor) {
-                    self.focused = node.id;
-                    self.say(format!("agent #{}: {}", node.id, node.brief));
+                if let Some(id) = self.tree.focus_cursor() {
+                    let brief = self
+                        .tree
+                        .node(id)
+                        .map(|node| node.brief.clone())
+                        .unwrap_or_default();
+                    self.say(format!("agent #{id}: {brief}"));
                 }
             }
             KeyCode::Char('c') => {
-                if let Some(node) = self.agents.get(self.agent_cursor) {
+                if let Some(node) = self.tree.agents.get(self.tree.cursor()) {
                     let id = node.id;
                     if !node.phase.is_busy() {
                         // Stop cancels work; an idle agent has none. Ending one
@@ -1754,7 +1498,7 @@ impl App {
                 }
             }
             KeyCode::Esc => {
-                self.focused = 0;
+                self.tree.focus(AgentId::ROOT);
             }
             _ => {}
         }
@@ -1792,6 +1536,8 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     use crossbeam_channel::Receiver;
 
     /// The transient line the bar would show, or the empty string.
@@ -1882,9 +1628,10 @@ mod tests {
         let app = app_at(root.clone());
 
         let node = app
+            .tree
             .agents
             .iter()
-            .find(|node| node.id == 3)
+            .find(|node| node.id == AgentId(3))
             .expect("the worktree must be registered");
         assert_eq!(node.brief, "port the parser module");
         assert!(node.leftover);
@@ -1905,7 +1652,12 @@ mod tests {
         git(&worktree, &["commit", "-qm", "my own commit message"]);
 
         let app = app_at(root.clone());
-        let node = app.agents.iter().find(|node| node.id == 5).unwrap();
+        let node = app
+            .tree
+            .agents
+            .iter()
+            .find(|node| node.id == AgentId(5))
+            .unwrap();
         assert_eq!(node.brief, "leftover worktree");
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1936,7 +1688,12 @@ mod tests {
             String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
             "the branch is reclaimed"
         );
-        let node = app.agents.iter().find(|node| node.id == 1).unwrap();
+        let node = app
+            .tree
+            .agents
+            .iter()
+            .find(|node| node.id == AgentId(1))
+            .unwrap();
         assert_eq!(node.landed, Some(Landed::Merged));
         // A second /merge must not re-run git or claim a second merge.
         app.worktree_command("/merge", "1");
@@ -1954,7 +1711,12 @@ mod tests {
 
         assert!(!root.join(".mush/wt/2").exists());
         assert!(!root.join("work.txt").exists(), "the work did not land");
-        let node = app.agents.iter().find(|node| node.id == 2).unwrap();
+        let node = app
+            .tree
+            .agents
+            .iter()
+            .find(|node| node.id == AgentId(2))
+            .unwrap();
         assert_eq!(node.landed, Some(Landed::Discarded));
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1966,13 +1728,18 @@ mod tests {
         let root = repo("busy");
         isolated_work(&root, 4, "still working");
         let mut app = app_at(root.clone());
-        app.agents.iter_mut().find(|n| n.id == 4).unwrap().phase = Phase::Thinking;
+        app.tree.begin(AgentId(4), None);
 
         app.worktree_command("/merge", "4");
         app.worktree_command("/discard", "4");
 
         assert!(root.join(".mush/wt/4").exists(), "nothing was reclaimed");
-        let node = app.agents.iter().find(|node| node.id == 4).unwrap();
+        let node = app
+            .tree
+            .agents
+            .iter()
+            .find(|node| node.id == AgentId(4))
+            .unwrap();
         assert_eq!(node.landed, None);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -1984,17 +1751,22 @@ mod tests {
         let root = repo("forget");
         isolated_work(&root, 6, "leave me");
         let mut app = app_at(root.clone());
-        app.agent_msgs.insert(6, vec![Message::user("hello")]);
+        app.tree
+            .replace_transcript(AgentId(6), vec![Message::user("hello")]);
 
-        app.forget_agent(6);
+        app.forget_agent(AgentId(6));
 
-        assert!(app.agents.iter().all(|node| node.id != 6));
-        assert!(!app.agent_msgs.contains_key(&6));
+        assert!(app.tree.agents.iter().all(|node| node.id != AgentId(6)));
+        assert!(!app.tree.agent_msgs.contains_key(&AgentId(6)));
         assert!(
             root.join(".mush/wt/6").exists(),
             "forgetting is not discarding"
         );
-        assert_eq!(app.focused, 0, "focus cannot point at a ghost");
+        assert_eq!(
+            app.tree.focused,
+            AgentId::ROOT,
+            "focus cannot point at a ghost"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
@@ -2002,24 +1774,20 @@ mod tests {
     #[test]
     fn forgetting_refuses_the_root_and_a_running_agent() {
         let (mut app, _rx) = test_app("forget-guards");
-        app.forget_agent(0);
-        assert!(app.agents.iter().any(|node| node.id == 0));
+        app.forget_agent(AgentId::ROOT);
+        assert!(app.tree.agents.iter().any(|node| node.id == AgentId::ROOT));
 
-        app.agents.push(AgentNode {
-            id: 9,
-            parent: Some(0),
-            depth: 1,
+        app.tree.insert(Spawn {
+            id: AgentId(9),
+            parent: AgentId::ROOT,
             brief: "busy".to_string(),
-            phase: Phase::Thinking,
-            since: Instant::now(),
+            depth: 1,
             branch: None,
-            summary: None,
-            leftover: false,
-            landed: None,
+            cmd: crossbeam_channel::unbounded().0,
         });
-        app.forget_agent(9);
+        app.forget_agent(AgentId(9));
         assert!(
-            app.agents.iter().any(|node| node.id == 9),
+            app.tree.agents.iter().any(|node| node.id == AgentId(9)),
             "a running agent is not forgotten under itself"
         );
     }
@@ -2059,22 +1827,24 @@ mod tests {
         let app = App::new(ws, cfg, Some(stored), handle, tx, Vec::new());
 
         let node = app
+            .tree
             .agents
             .iter()
-            .find(|node| node.id == 2)
+            .find(|node| node.id == AgentId(2))
             .expect("the stored agent comes back");
         assert_eq!(node.brief, "port the parser");
         assert_eq!(node.phase, Phase::Done);
         assert_eq!(node.summary.as_deref(), Some("finished it"));
         // The transcript is what makes a follow-up possible: without it the
         // human is back to writing the brief from scratch.
-        assert_eq!(app.agent_msgs[&2].len(), 2);
-        assert_eq!(app.agent_msgs[&2][1].text(), "done");
+        assert_eq!(app.tree.agent_msgs[&AgentId(2)].len(), 2);
+        assert_eq!(app.tree.agent_msgs[&AgentId(2)][1].text(), "done");
         // A live mailbox: a follow-up is delivered rather than dropped, which is
         // what "revive" has to mean to be worth anything.
         let tx_to_child = app
+            .tree
             .agent_tx
-            .get(&2)
+            .get(&AgentId(2))
             .expect("a restored agent gets a mailbox");
         assert!(
             tx_to_child
@@ -2171,19 +1941,18 @@ mod tests {
         let (mut app, _rx) = test_app("new");
         app.chat.push(Message::user("an old task"));
         app.notices.push(Notice {
-            agent: 0,
+            agent: AgentId::ROOT,
             kind: NoticeKind::Info,
             text: "old noise".to_string(),
         });
-        app.busy = true;
         let before = app.cfg_shared.clone();
 
         app.run_command("/new");
 
         assert!(app.chat.is_empty(), "the conversation is gone");
         assert!(app.notices.is_empty(), "notices are gone");
-        assert_eq!(app.agents.len(), 1, "the tree is reset to the root");
-        assert!(!app.busy);
+        assert_eq!(app.tree.agents.len(), 1, "the tree is reset to the root");
+        assert!(!app.busy());
         // The respawned root owns a fresh config cell and the UI adopted it;
         // without that, a later /model would never reach the agent.
         assert!(!Arc::ptr_eq(&before, &app.cfg_shared));
@@ -2192,8 +1961,8 @@ mod tests {
         // reporting that the root is gone.
         app.input.insert("hello");
         app.send_message();
-        assert!(app.busy);
-        assert_eq!(app.agents[0].phase, Phase::Thinking);
+        assert!(app.busy());
+        assert_eq!(app.tree.agents[0].phase, Phase::Thinking);
     }
 
     /// An actor `/new` abandoned can still be finishing a request (up to the
@@ -2202,19 +1971,19 @@ mod tests {
     #[test]
     fn events_from_an_abandoned_conversation_are_ignored() {
         let (mut app, _rx) = test_app("stale");
-        let abandoned = app.conversation;
+        let abandoned = app.tree.conversation();
         app.run_command("/new");
-        assert_ne!(app.conversation, abandoned, "a new conversation tag");
+        assert_ne!(app.tree.conversation(), abandoned, "a new conversation tag");
         app.chat.push(Message::user("current work"));
 
         app.update(Msg::Agent {
             conversation: abandoned,
-            id: 0,
+            id: AgentId::ROOT,
             event: AgentEvent::Message(Message::assistant("stale reply")),
         });
         app.update(Msg::Agent {
             conversation: abandoned,
-            id: 0,
+            id: AgentId::ROOT,
             event: AgentEvent::Compact {
                 summary: "stale summary".to_string(),
             },
@@ -2222,8 +1991,8 @@ mod tests {
         assert_eq!(app.chat.len(), 1, "the stale reply and summary are dropped");
 
         app.update(Msg::Agent {
-            conversation: app.conversation,
-            id: 0,
+            conversation: app.tree.conversation(),
+            id: AgentId::ROOT,
             event: AgentEvent::Message(Message::assistant("fresh reply")),
         });
         assert_eq!(app.chat.len(), 2, "the live conversation still lands");
@@ -2234,8 +2003,7 @@ mod tests {
     #[test]
     fn steering_text_is_echoed_in_the_chat() {
         let (mut app, _rx) = test_app("steer");
-        app.busy = true;
-        app.agents[0].phase = Phase::Thinking;
+        app.tree.begin(AgentId::ROOT, None);
         app.input.insert("also rename the module");
 
         app.send_message();
@@ -2266,25 +2034,29 @@ mod tests {
     fn a_failed_nudge_restores_the_phase() {
         let (mut app, _rx) = test_app("nudge-restore");
         app.focus = Focus::Agents;
-        app.agent_tx.remove(&1);
-        app.agents.push(AgentNode {
-            id: 1,
-            parent: Some(0),
-            depth: 1,
+        // A finished child with a summary, whose actor is gone: the nudge below
+        // cannot be delivered, and the row must not end up claiming work.
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
             brief: "lexer".to_string(),
-            phase: Phase::Done,
-            since: Instant::now(),
+            depth: 1,
             branch: None,
-            summary: Some("did the work".to_string()),
-            leftover: false,
-            landed: None,
+            cmd: crossbeam_channel::unbounded().0,
         });
-        app.focused = 1;
+        app.tree
+            .finish(AgentId(1), Some("did the work".to_string()));
+        app.tree.agent_tx.remove(&AgentId(1));
+        app.tree.focus(AgentId(1));
         app.input.insert("one more thing");
 
         app.send_message();
 
-        assert_eq!(app.agents[1].phase, Phase::Done, "the ✓ is not rewritten");
+        assert_eq!(
+            app.tree.node(AgentId(1)).unwrap().phase,
+            Phase::Done,
+            "the ✓ is not rewritten"
+        );
         assert_eq!(text_of(&app), "agent #1 is gone");
     }
 
@@ -2294,13 +2066,13 @@ mod tests {
     #[test]
     fn a_child_spawned_by_an_abandoned_tree_is_shut_down() {
         let (mut app, _rx) = test_app("stale-child");
-        let abandoned = app.conversation;
+        let abandoned = app.tree.conversation();
         app.run_command("/new");
         let (child_tx, child_rx) = crossbeam_channel::unbounded::<AgentMsg>();
 
         app.update(Msg::Agent {
             conversation: abandoned,
-            id: 1,
+            id: AgentId(1),
             event: AgentEvent::Spawned {
                 child: 1,
                 parent: 0,
@@ -2315,7 +2087,7 @@ mod tests {
             matches!(child_rx.recv().unwrap(), AgentMsg::Shutdown),
             "the stray child is told to end"
         );
-        assert_eq!(app.agents.len(), 1, "and it never joins the new tree");
+        assert_eq!(app.tree.agents.len(), 1, "and it never joins the new tree");
     }
 
     /// Ctrl-C cancels work; it must not end an idle root, which only comes
@@ -2332,17 +2104,16 @@ mod tests {
         app.input.insert("hello");
         app.send_message();
         assert_eq!(
-            app.agents[0].phase,
+            app.tree.agents[0].phase,
             Phase::Thinking,
             "the idle root is usable"
         );
 
         let (mut app, _rx) = test_app("interrupt-running");
-        app.agents[0].phase = Phase::Thinking;
-        app.recompute_busy();
+        app.tree.begin(AgentId::ROOT, None);
         app.interrupt();
         assert_eq!(
-            app.agents[0].phase,
+            app.tree.agents[0].phase,
             Phase::Cancelling,
             "the row must show that a cancel is in flight"
         );
@@ -2354,32 +2125,36 @@ mod tests {
     #[test]
     fn a_cancel_mark_clears_when_the_actor_yields() {
         let (mut app, _rx) = test_app("cancel-mark");
-        let conversation = app.conversation;
-        app.agents[0].phase = Phase::Thinking;
+        let conversation = app.tree.conversation();
+        app.tree.begin(AgentId::ROOT, None);
         app.interrupt();
-        assert_eq!(app.agents[0].phase, Phase::Cancelling);
+        assert_eq!(app.tree.agents[0].phase, Phase::Cancelling);
 
         app.update(Msg::Agent {
             conversation,
-            id: 0,
+            id: AgentId::ROOT,
             event: AgentEvent::Stopped,
         });
         assert_eq!(
-            app.agents[0].phase,
+            app.tree.agents[0].phase,
             Phase::Stopped,
             "a stopped run is its own state, not Idle and not Done"
         );
 
-        app.agents[0].phase = Phase::Thinking;
+        app.tree.begin(AgentId::ROOT, None);
         app.interrupt();
         app.update(Msg::Agent {
             conversation,
-            id: 0,
+            id: AgentId::ROOT,
             event: AgentEvent::Running {
                 cancel: Arc::new(AtomicBool::new(false)),
             },
         });
-        assert_eq!(app.agents[0].phase, Phase::Thinking, "a new run is running");
+        assert_eq!(
+            app.tree.agents[0].phase,
+            Phase::Thinking,
+            "a new run is running"
+        );
     }
 
     /// An agent that has not run is not done, and it is not busy: the row must
@@ -2387,8 +2162,8 @@ mod tests {
     #[test]
     fn an_idle_agent_is_neither_done_nor_busy() {
         let (app, _rx) = test_app("idle-phase");
-        assert_eq!(app.agents[0].phase, Phase::Idle);
-        assert!(!app.busy);
+        assert_eq!(app.tree.agents[0].phase, Phase::Idle);
+        assert!(!app.busy());
         assert_eq!(app.activity_line(), None, "nothing to report");
     }
 
@@ -2397,19 +2172,18 @@ mod tests {
     #[test]
     fn a_finished_run_leaves_nothing_behind() {
         let (mut app, _rx) = test_app("finished-phase");
-        let conversation = app.conversation;
-        app.agents[0].phase = Phase::Thinking;
-        app.agents[0].since = Instant::now() - Duration::from_secs(70);
-        app.recompute_busy();
+        let conversation = app.tree.conversation();
+        app.tree.begin(AgentId::ROOT, None);
+        app.tree.age(AgentId::ROOT, Duration::from_secs(70));
         assert_eq!(app.activity_line().as_deref(), Some("#0 thinking 1m10s"));
 
         app.update(Msg::Agent {
             conversation,
-            id: 0,
+            id: AgentId::ROOT,
             event: AgentEvent::Done,
         });
-        assert_eq!(app.agents[0].phase, Phase::Done);
-        assert!(!app.busy);
+        assert_eq!(app.tree.agents[0].phase, Phase::Done);
+        assert!(!app.busy());
         assert_eq!(app.activity_line(), None, "no `thinking` survives the run");
     }
 
@@ -2418,10 +2192,10 @@ mod tests {
     #[test]
     fn a_napping_root_reports_its_children() {
         let (mut app, _rx) = test_app("napping-root");
-        let conversation = app.conversation;
+        let conversation = app.tree.conversation();
         app.update(Msg::Agent {
             conversation,
-            id: 1,
+            id: AgentId(1),
             event: AgentEvent::Spawned {
                 child: 1,
                 parent: 0,
@@ -2433,10 +2207,10 @@ mod tests {
         });
         app.update(Msg::Agent {
             conversation,
-            id: 1,
+            id: AgentId(1),
             event: AgentEvent::Status("edit_file src/lex.rs".to_string()),
         });
-        assert_eq!(app.agents[0].phase, Phase::Idle, "the root napped");
+        assert_eq!(app.tree.agents[0].phase, Phase::Idle, "the root napped");
         assert_eq!(
             app.activity_line().as_deref(),
             Some("waiting on 1 subagent(s) — the root resumes as they finish")
@@ -2448,9 +2222,9 @@ mod tests {
     #[test]
     fn busy_agents_are_named_with_their_age() {
         let (mut app, _rx) = test_app("activity-age");
-        app.agents[0].phase = Phase::Activity("edit_file src/lib.rs".to_string());
-        app.agents[0].since = Instant::now() - Duration::from_secs(12);
-        app.recompute_busy();
+        app.tree.begin(AgentId::ROOT, None);
+        app.tree.activity(AgentId::ROOT, "edit_file src/lib.rs");
+        app.tree.age(AgentId::ROOT, Duration::from_secs(12));
         assert_eq!(
             app.activity_line().as_deref(),
             Some("#0 edit_file src/lib.rs 12s")
@@ -2507,11 +2281,11 @@ mod tests {
         let (mut app, _rx) = test_app("layout-sizes");
         // A tree with depth, a branch, and every phase, so no branch of the
         // renderer goes unexercised.
-        let conversation = app.conversation;
+        let conversation = app.tree.conversation();
         for (id, parent, depth) in [(1u64, 0u64, 1usize), (2, 1, 2)] {
             app.update(Msg::Agent {
                 conversation,
-                id: parent,
+                id: AgentId(parent),
                 event: AgentEvent::Spawned {
                     child: id,
                     parent,
@@ -2522,8 +2296,8 @@ mod tests {
                 },
             });
         }
-        app.agents[1].phase = Phase::Activity("edit_file src/lexer.rs 12s".to_string());
-        app.agents[2].phase = Phase::Failed("no route to host".to_string());
+        app.tree.activity(AgentId(1), "edit_file src/lexer.rs 12s");
+        app.tree.fail(AgentId(2), "no route to host".to_string());
         app.refresh_git();
 
         for (width, height) in [
@@ -2560,20 +2334,20 @@ mod tests {
     #[test]
     fn a_late_status_does_not_restart_a_finished_agent() {
         let (mut app, _rx) = test_app("late-status");
-        let conversation = app.conversation;
+        let conversation = app.tree.conversation();
         app.update(Msg::Agent {
             conversation,
-            id: 0,
+            id: AgentId::ROOT,
             event: AgentEvent::Done,
         });
-        assert_eq!(app.agents[0].phase, Phase::Done);
+        assert_eq!(app.tree.agents[0].phase, Phase::Done);
         app.update(Msg::Agent {
             conversation,
-            id: 0,
+            id: AgentId::ROOT,
             event: AgentEvent::Status("committed abc123 on mush/1".to_string()),
         });
-        assert_eq!(app.agents[0].phase, Phase::Done, "the ✓ must survive");
-        assert!(!app.busy);
+        assert_eq!(app.tree.agents[0].phase, Phase::Done, "the ✓ must survive");
+        assert!(!app.busy());
     }
 
     /// A `⊘` whose acknowledgement can never arrive goes quiet instead of
@@ -2581,12 +2355,11 @@ mod tests {
     #[test]
     fn a_stale_cancel_falls_back_to_idle() {
         let (mut app, _rx) = test_app("stale-cancel");
-        app.agents[0].phase = Phase::Cancelling;
-        app.agents[0].since = Instant::now() - Duration::from_secs(11);
-        app.busy = true;
+        app.tree.cancel_requested(AgentId::ROOT);
+        app.tree.age(AgentId::ROOT, Duration::from_secs(11));
         app.tick();
-        assert_eq!(app.agents[0].phase, Phase::Idle);
-        assert!(!app.busy, "the bar must stop claiming work");
+        assert_eq!(app.tree.agents[0].phase, Phase::Idle);
+        assert!(!app.busy(), "the bar must stop claiming work");
     }
 
     /// The child's brief is the first thing its transcript shows, exactly as
@@ -2594,10 +2367,10 @@ mod tests {
     #[test]
     fn a_childs_brief_is_the_start_of_its_transcript() {
         let (mut app, _rx) = test_app("brief");
-        let conversation = app.conversation;
+        let conversation = app.tree.conversation();
         app.update(Msg::Agent {
             conversation,
-            id: 0,
+            id: AgentId::ROOT,
             event: AgentEvent::Spawned {
                 child: 1,
                 parent: 0,
@@ -2607,7 +2380,7 @@ mod tests {
                 cmd: crossbeam_channel::unbounded().0,
             },
         });
-        let messages = &app.agent_msgs[&1];
+        let messages = &app.tree.agent_msgs[&AgentId(1)];
         assert_eq!(messages.len(), 1, "the brief opens the transcript");
         assert_eq!(messages[0].role, "user");
         assert_eq!(messages[0].text(), "count the lexer tokens");
@@ -2618,29 +2391,32 @@ mod tests {
     #[test]
     fn a_rows_summary_follows_the_latest_run() {
         let (mut app, _rx) = test_app("summary");
-        let conversation = app.conversation;
+        let conversation = app.tree.conversation();
         app.chat.push(Message::assistant("first result"));
         app.update(Msg::Agent {
             conversation,
-            id: 0,
+            id: AgentId::ROOT,
             event: AgentEvent::Done,
         });
-        assert_eq!(app.agents[0].summary.as_deref(), Some("first result"));
+        assert_eq!(app.tree.agents[0].summary.as_deref(), Some("first result"));
         app.update(Msg::Agent {
             conversation,
-            id: 0,
+            id: AgentId::ROOT,
             event: AgentEvent::Running {
                 cancel: Arc::new(AtomicBool::new(false)),
             },
         });
-        assert_eq!(app.agents[0].summary, None, "a new run clears the old one");
+        assert_eq!(
+            app.tree.agents[0].summary, None,
+            "a new run clears the old one"
+        );
         app.chat.push(Message::assistant("second result"));
         app.update(Msg::Agent {
             conversation,
-            id: 0,
+            id: AgentId::ROOT,
             event: AgentEvent::Done,
         });
-        assert_eq!(app.agents[0].summary.as_deref(), Some("second result"));
+        assert_eq!(app.tree.agents[0].summary.as_deref(), Some("second result"));
     }
 
     /// Leftover worktrees keep their ids, and the tree's counter is raised
@@ -2678,22 +2454,26 @@ mod tests {
         let mut app = App::new(ws, cfg, None, handle, tx, Vec::new());
 
         assert!(
-            app.agents.iter().any(|node| node.id == 7),
+            app.tree.agents.iter().any(|node| node.id == AgentId(7)),
             "the leftover is registered"
         );
         assert!(
-            app.agent_ids.load(Ordering::SeqCst) >= 8,
+            app.tree.ids().load(Ordering::SeqCst) >= 8,
             "the next spawn must not reuse #7"
         );
 
-        app.focused = 7;
+        app.tree.focus(AgentId(7));
         git(&["worktree", "remove", "--force", ".mush/wt/7"]);
         app.discover_worktrees();
         assert!(
-            !app.agents.iter().any(|node| node.id == 7),
+            !app.tree.agents.iter().any(|node| node.id == AgentId(7)),
             "the reaped leftover is gone"
         );
-        assert_eq!(app.focused, 0, "focus cannot point at a ghost");
+        assert_eq!(
+            app.tree.focused,
+            AgentId::ROOT,
+            "focus cannot point at a ghost"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }
