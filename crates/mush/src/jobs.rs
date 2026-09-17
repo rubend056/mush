@@ -51,6 +51,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 
 use mush_core::workspace::tail_for_model;
+use mush_core::CMD_CAP;
 
 use crate::agent::{AgentEvent, AgentMsg};
 use crate::app::{short_age, AgentId};
@@ -80,6 +81,14 @@ const JOB_LINE_TAIL: usize = 400;
 /// does not need to stay forever; what is running and what just ended is what
 /// anyone asks about.
 const JOB_HISTORY: usize = 8;
+
+/// How much of the jobs' own windows one `command_status` result carries, in
+/// total: every job's headline plus this much output, however many jobs there
+/// are. `CMD_CAP` is the per-result cap the other tools keep (`READ_CAP`,
+/// `LIST_LIMIT` are their own), and this is the same bound on the same kind of
+/// tool result — spent on the windows rather than on the list, so no job is
+/// ever dropped from a status for being old.
+pub const STATUS_WINDOW: usize = CMD_CAP;
 
 /// How often a running command is polled. Ten milliseconds is the latency
 /// between a `Stop` and a process group dying, and costs nothing while idle.
@@ -276,13 +285,15 @@ impl Live {
         }
     }
 
-    /// The end of what it has written so far.
-    fn tail(&self) -> String {
+    /// The end of what it has written so far, at most `cap` bytes of it: the
+    /// window a completion keeps is `JOB_TAIL`, and a `command_status` that
+    /// lists several jobs reads a smaller one for each (see `status_for`).
+    fn tail(&self, cap: usize) -> String {
         let Ok(job) = self.job.lock() else {
             return String::new();
         };
-        let (stdout, stderr) = job.tail(JOB_TAIL);
-        preview(&stdout, &stderr)
+        let (stdout, stderr) = job.tail(cap);
+        preview(&stdout, &stderr, cap)
     }
 }
 
@@ -636,10 +647,17 @@ impl Registry {
             return "no jobs".to_string();
         }
         let mut lines = Vec::new();
+        // The windows share one budget: every job's headline — what the model
+        // actually acts on — always fits, while `MAX_JOBS` running plus
+        // `JOB_HISTORY` finished jobs at a full `JOB_TAIL` each would be 32 KB
+        // of tool result, past every other cap in the tree. A status is a list
+        // to choose from, not a log to read, so a lone job still gets the whole
+        // window it always did and sixteen get a slice each.
+        let per_job = (STATUS_WINDOW / mine.len()).min(JOB_TAIL);
         for record in mine {
             let tail = match &record.live {
-                Some(live) => live.tail(),
-                None => record.tail.clone(),
+                Some(live) => live.tail(per_job),
+                None => tail_for_model(&record.tail, per_job),
             };
             let head = match (&record.live, &record.line) {
                 (Some(_), _) => {
@@ -821,7 +839,7 @@ fn watch(
             None => registry.clock.sleep(POLL),
         }
     };
-    let mut tail = live.tail();
+    let mut tail = live.tail(JOB_TAIL);
     if !note.is_empty() {
         tail = if tail.is_empty() {
             note
@@ -849,10 +867,10 @@ fn watch(
     });
 }
 
-/// Render the two streams of a command into one window: stdout, then stderr
-/// under a heading, exactly as a foreground result reads — so the same bytes
-/// describe a command however it ended.
-fn preview(stdout: &str, stderr: &str) -> String {
+/// Render the two streams of a command into one window of at most `cap` bytes:
+/// stdout, then stderr under a heading, exactly as a foreground result reads —
+/// so the same bytes describe a command however it ended and whoever asks.
+fn preview(stdout: &str, stderr: &str, cap: usize) -> String {
     let mut out = String::new();
     if !stdout.trim().is_empty() {
         out.push_str(stdout.trim_end());
@@ -864,7 +882,7 @@ fn preview(stdout: &str, stderr: &str) -> String {
         out.push_str("--- stderr ---\n");
         out.push_str(stderr.trim_end());
     }
-    tail_for_model(&out, JOB_TAIL)
+    tail_for_model(&out, cap)
 }
 
 #[cfg(test)]
@@ -1113,6 +1131,79 @@ mod tests {
         );
         assert!(registry.machine_free_for(9).is_ok());
         registry.kill_all();
+    }
+
+    /// `command_status` is one bounded tool result, however many jobs there
+    /// are. It used to carry the full `JOB_TAIL` window of every job: sixteen
+    /// jobs — `MAX_JOBS` running plus `JOB_HISTORY` finished — were 32 KB in
+    /// one answer, while every other tool in the tree stops at `CMD_CAP`.
+    ///
+    /// Every job keeps its headline, because what the model does with a status
+    /// is choose one to wait for or stop, and a job dropped from the list
+    /// cannot be chosen. The windows share the rest.
+    #[test]
+    fn a_status_is_one_bounded_result_however_many_jobs_there_are() {
+        let window = "0123456789".repeat(400); // 4000 bytes, past JOB_TAIL
+        let mut scripted = ScriptedMachine::new();
+        for _ in 0..MAX_JOBS {
+            scripted = scripted.runs(Script::exits(0).says("done"));
+        }
+        for _ in 0..MAX_JOBS {
+            scripted = scripted.runs(Script::hangs().says(&window));
+        }
+        let machine = Arc::new(scripted);
+        let (registry, _events, _clock) = registry();
+
+        // Eight jobs that have ended, then eight that are still running: the
+        // whole list a status can be asked for.
+        let mut ends = Vec::new();
+        for _ in 0..MAX_JOBS {
+            let (_, mailbox) = launch(&registry, &machine, 7);
+            ends.push(mailbox);
+        }
+        for mailbox in ends {
+            assert!(matches!(
+                mailbox.recv_timeout(Duration::from_secs(5)),
+                Ok(AgentMsg::CommandDone { .. })
+            ));
+        }
+        for _ in 0..MAX_JOBS {
+            launch(&registry, &machine, 7);
+        }
+
+        let status = registry.status_for(7);
+        for id in 1..=2 * MAX_JOBS as u64 {
+            assert!(
+                status.contains(&label(id)),
+                "{} is missing from a {}-byte status",
+                label(id),
+                status.len()
+            );
+        }
+        assert!(
+            status.len() <= CMD_CAP,
+            "one status must stay inside the tree's per-result cap: {} bytes",
+            status.len()
+        );
+        assert!(
+            !status.contains(&"0123456789".repeat(100)),
+            "the windows were shared, not each shown whole: {} bytes",
+            status.len()
+        );
+        registry.kill_all();
+
+        // A lone job still gets the window it always had — the budget is a
+        // ceiling, not a tax on the ordinary case.
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs().says(&window)));
+        let lone = Registry::bare();
+        launch(&lone, &machine, 7);
+        let status = lone.status_for(7);
+        assert!(
+            status.contains(&"0123456789".repeat(100)),
+            "a single job's window is the full JOB_TAIL: {} bytes",
+            status.len()
+        );
+        lone.kill_all();
     }
 
     /// The budget is the machine's, not one agent's: `MAX_JOBS` live jobs are
