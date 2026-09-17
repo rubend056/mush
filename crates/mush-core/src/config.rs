@@ -16,6 +16,21 @@ use crate::{CMD_CAP, LIST_LIMIT, READ_CAP};
 /// endpoint's own metadata, or the provider's per-model table all beat it.
 pub const DEFAULT_CONTEXT_TOKENS: usize = 8192;
 
+/// The largest window that can be stored. A window is untrusted input — a
+/// `MUSH_CONTEXT`, or an endpoint's advertised metadata — and one past this is
+/// a lie that would only make the derived budget meaningless.
+pub const MAX_CONTEXT_TOKENS: usize = 10_000_000;
+
+/// The smallest window that can be stored. Below this the request reserve
+/// (schemas, reply, margin) would swallow the whole window, and every request
+/// would exceed it however much history was trimmed.
+const MIN_CONTEXT_TOKENS: usize = 1_024;
+
+/// Keep a window inside the range mush can work with, whatever its source.
+fn clamp_context(tokens: usize) -> usize {
+    tokens.clamp(MIN_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS)
+}
+
 /// A model's known context window, from the provider's documentation. Used when
 /// the endpoint does not advertise one (`api.deepseek.com` answers with ids
 /// only). Keep these honest: the value is shown wherever the model is chosen.
@@ -54,7 +69,10 @@ impl Provider {
     pub fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "deepseek" => Some(Provider::DeepSeek),
-            "custom" | "openai" | "openai-compatible" => Some(Provider::Custom),
+            // Deliberately no `openai`/`openai-compatible` aliases: they would
+            // land on `Custom`, whose default endpoint is a LAN host, and the
+            // request (and the API key) would go there.
+            "custom" => Some(Provider::Custom),
             _ => None,
         }
     }
@@ -103,20 +121,56 @@ pub struct Overrides {
 
 impl Overrides {
     /// The environment layer: `MUSH_URL`, `MUSH_MODEL`, `MUSH_PROVIDER`,
-    /// `MUSH_API_KEY`, `MUSH_CONTEXT`. Empty variables count as unset.
+    /// `MUSH_API_KEY`, `MUSH_CONTEXT`. Empty variables count as unset. A
+    /// malformed `MUSH_CONTEXT` is ignored here; [`Self::from_env_checked`] is
+    /// the form startup uses, so it is reported instead.
     pub fn from_env() -> Self {
         Self {
             url: env_nonempty("MUSH_URL"),
             model: env_nonempty("MUSH_MODEL"),
             provider: env_nonempty("MUSH_PROVIDER"),
             api_key: env_nonempty("MUSH_API_KEY"),
-            context: env_nonempty("MUSH_CONTEXT").and_then(|s| s.trim().parse().ok()),
+            context: env_nonempty("MUSH_CONTEXT").and_then(|value| parse_context_env(&value).ok()),
         }
+    }
+
+    /// [`Self::from_env`] with a malformed `MUSH_CONTEXT` reported instead of
+    /// silently dropped, so a typo costs a message at startup rather than a
+    /// window nobody asked for.
+    pub fn from_env_checked() -> Result<Self, String> {
+        let mut overrides = Self::from_env();
+        if let Some(name) = overrides.provider.as_deref() {
+            parse_provider_env(name)?;
+        }
+        overrides.context = env_nonempty("MUSH_CONTEXT")
+            .map(|value| parse_context_env(&value))
+            .transpose()?;
+        Ok(overrides)
     }
 }
 
 fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
+}
+
+/// Parse `MUSH_CONTEXT`. A value that is present but wrong is an error rather
+/// than a silent fallback: the variable is how a human states the window, and
+/// running with a different one than asked for is the harder bug to notice.
+pub fn parse_context_env(value: &str) -> Result<usize, String> {
+    match value.trim().parse::<usize>() {
+        Ok(tokens) if tokens > 0 => Ok(tokens),
+        _ => Err(format!("MUSH_CONTEXT needs a token count, got `{value}`")),
+    }
+}
+
+/// Validate `MUSH_PROVIDER` the way the command line is validated. Ignoring a
+/// typo would leave the provider at its default — `Custom`, whose default
+/// endpoint is a LAN host — so a key meant for somewhere else would be sent
+/// there (finding A17).
+pub fn parse_provider_env(value: &str) -> Result<Provider, String> {
+    Provider::parse(value).ok_or_else(|| {
+        format!("MUSH_PROVIDER: unknown provider `{value}` (try deepseek or custom)")
+    })
 }
 
 /// Endpoints are stored without a trailing slash so `chat_url` and
@@ -144,7 +198,7 @@ impl Config {
             .as_deref()
             .map(normalize_url)
             .unwrap_or_else(|| provider.default_base_url().to_string());
-        let context = env.context.filter(|n| *n > 0);
+        let context = env.context.filter(|n| *n > 0).map(clamp_context);
         Self {
             provider,
             base_url,
@@ -173,35 +227,48 @@ impl Config {
     /// Set the window from the human (`/context`, a stored choice). An explicit
     /// window beats anything an endpoint says.
     pub fn set_context(&mut self, tokens: usize) {
-        self.context_tokens = tokens.max(1_024);
+        self.context_tokens = clamp_context(tokens);
         self.context_explicit = true;
     }
 
     /// Caps that derive from the window, so a small model is not handed a tool
     /// result larger than its whole transcript: one read may take a quarter of
-    /// the budget, one command an eighth, one listing a sixty-fourth.
+    /// the budget, one command an eighth, one listing a sixty-fourth. They are
+    /// ceilings and floors at once — the floor is also capped by the budget, so
+    /// a small window never gets a tool result it cannot hold.
     pub fn read_cap(&self) -> usize {
-        READ_CAP.min(self.history_budget() / 4).max(512)
+        READ_CAP
+            .min(self.history_budget() / 4)
+            .max(512)
+            .min(self.history_budget())
     }
 
     pub fn cmd_cap(&self) -> usize {
-        CMD_CAP.min(self.history_budget() / 8).max(512)
+        CMD_CAP
+            .min(self.history_budget() / 8)
+            .max(512)
+            .min(self.history_budget())
     }
 
     pub fn list_limit(&self) -> usize {
-        LIST_LIMIT.min(self.history_budget() / 64).max(50)
+        LIST_LIMIT
+            .min(self.history_budget() / 64)
+            .max(50)
+            .min(self.history_budget())
     }
 
     /// How much conversation history (in bytes) fits alongside the tool
-    /// schemas and the reply inside `context_tokens`. Rough heuristic:
-    /// ~3 bytes per token, `SCHEMA_TOKENS` of schemas, 2048 tokens of reply.
+    /// schemas and the reply inside `context_tokens`. Rough heuristic: ~3
+    /// bytes per token, `SCHEMA_TOKENS` of schemas, 2048 tokens of reply. The
+    /// reserve is itself capped at half the window: a small window shrinks it
+    /// (half the window is always history) instead of leaving no budget at all.
     pub fn history_budget(&self) -> usize {
         const REPLY_TOKENS: usize = 2048;
         const MARGIN_TOKENS: usize = 200;
-        let tokens = self
-            .context_tokens
-            .saturating_sub(SCHEMA_TOKENS + REPLY_TOKENS + MARGIN_TOKENS);
-        tokens * 3
+        let reserve = (SCHEMA_TOKENS + REPLY_TOKENS + MARGIN_TOKENS).min(self.context_tokens / 2);
+        self.context_tokens
+            .saturating_sub(reserve)
+            .saturating_mul(3)
     }
 
     pub fn chat_url(&self) -> String {
@@ -231,13 +298,36 @@ impl Config {
     }
 
     /// Adopt a window learned from the endpoint or the model table, unless the
-    /// human stated one explicitly.
+    /// human stated one explicitly. The value is endpoint metadata, i.e.
+    /// untrusted: a window below the floor is raised to it (the server is
+    /// saying the window is small, not that it is one token), and one past the
+    /// ceiling is lowered.
     pub fn adopt_context(&mut self, tokens: usize) -> bool {
-        if self.context_explicit || tokens == 0 || tokens == self.context_tokens {
+        if self.context_explicit || tokens == 0 {
+            return false;
+        }
+        let tokens = clamp_context(tokens);
+        if tokens == self.context_tokens {
             return false;
         }
         self.context_tokens = tokens;
         true
+    }
+
+    /// Point at a different model: the window is re-derived from the new model's
+    /// documented size unless the human stated one.
+    pub fn set_model(&mut self, model: &str) {
+        self.model = model.to_string();
+        self.rederive_context();
+    }
+
+    /// Re-derive the window from the model/provider table. A window the human
+    /// stated explicitly is never touched; a window merely learned from the
+    /// previous endpoint is replaced.
+    pub fn rederive_context(&mut self) {
+        if !self.context_explicit {
+            self.context_tokens = self.fallback_context();
+        }
     }
 
     /// Provider-specific request knobs, applied by the agent loop.
@@ -282,19 +372,15 @@ impl Config {
 /// built-in defaults**. The API key comes from the environment or the home
 /// config, never from the session — that file is workspace-local.
 ///
-/// Returns an error only for an unknown provider name on the command line.
+/// Returns an error for an unknown provider name on the command line, and for a
+/// `MUSH_CONTEXT` that is not a token count.
 pub fn resolve(
     cli: &Overrides,
     home: &UserConfig,
     session: Option<&Session>,
 ) -> Result<Config, String> {
-    resolve_with(
-        Config::from_env(),
-        cli,
-        &Overrides::from_env(),
-        home,
-        session,
-    )
+    let env = Overrides::from_env_checked()?;
+    resolve_with(Config::from_env(), cli, &env, home, session)
 }
 
 /// The pure half of [`resolve`]: apply the layers to an already-built base
@@ -314,6 +400,12 @@ pub fn resolve_with(
     if let Some(provider) = cli.provider.as_deref() {
         config.provider = Provider::parse(provider)
             .ok_or_else(|| format!("unknown provider `{provider}` (try deepseek or custom)"))?;
+        // Naming a provider on the command line selects its own endpoint — the
+        // flag must reach `api.deepseek.com`, not whatever the environment's
+        // provider defaulted to — unless a URL was named too.
+        if cli.url.is_none() && env.url.is_none() {
+            config.base_url = config.provider.default_base_url().to_string();
+        }
     }
     if let Some(model) = cli.model.as_deref() {
         config.model = model.to_string();
@@ -372,7 +464,15 @@ pub fn resolve_with(
         }
     }
 
-    // 4. Nothing was stated: assume the model's documented window, else the
+    // 4. An endpoint named on the command line or in the environment is a
+    //    *custom* endpoint: a stored provider must not leak its DeepSeek-only
+    //    knobs (`reasoning_effort`, `thinking`) to a URL it does not own. A
+    //    provider named alongside the URL keeps its knobs.
+    if (cli.url.is_some() || env.url.is_some()) && !provider_given {
+        config.provider = Provider::Custom;
+    }
+
+    // 5. Nothing was stated: assume the model's documented window, else the
     //    provider's default. An endpoint that advertises one (llama.cpp's
     //    `meta.n_ctx`, vLLM's `max_model_len`) overrides this at discovery.
     if !config.context_explicit {
@@ -385,6 +485,9 @@ pub fn resolve_with(
 /// The number in a "context length" complaint, when a server names one. Hosted
 /// APIs are the only place mush cannot discover the window, and their error is
 /// the one source that is always current.
+///
+/// The number only counts when the text around it is about context: a generic
+/// `the maximum is 10` (a 429 body, say) must not be read as a 10-token window.
 pub fn parse_context_hint(message: &str) -> Option<usize> {
     let lower = message.to_ascii_lowercase();
     for marker in [
@@ -393,8 +496,10 @@ pub fn parse_context_hint(message: &str) -> Option<usize> {
         "maximum context window of ",
         "context window of ",
         "max_model_len is ",
-        "maximum is ",
-        "tokens, but you requested",
+        // llama.cpp: `context size (2048 tokens)`, and Anthropic/Gemini-style
+        // `205404 tokens > 200000 maximum` (the number after `>` is the limit).
+        "context size (",
+        "tokens > ",
     ] {
         let Some(at) = lower.find(marker) else {
             continue;
@@ -402,7 +507,9 @@ pub fn parse_context_hint(message: &str) -> Option<usize> {
         let tail = &message[at + marker.len()..];
         let digits: String = tail.chars().take_while(|c| c.is_ascii_digit()).collect();
         if let Ok(tokens) = digits.parse::<usize>() {
-            if tokens > 0 {
+            // Only a plausible window qualifies: anything smaller or larger is
+            // some other number that happened to follow the same words.
+            if (MIN_CONTEXT_TOKENS..=MAX_CONTEXT_TOKENS).contains(&tokens) {
                 return Some(tokens);
             }
         }
@@ -558,7 +665,10 @@ mod tests {
         assert_eq!(Provider::parse("deepseek"), Some(Provider::DeepSeek));
         assert_eq!(Provider::parse("DEEPSEEK "), Some(Provider::DeepSeek));
         assert_eq!(Provider::parse("custom"), Some(Provider::Custom));
-        assert_eq!(Provider::parse("openai-compatible"), Some(Provider::Custom));
+        // No OpenAI aliases: `Custom` defaults to a LAN host, so mapping them
+        // there would send someone else's key to it.
+        assert_eq!(Provider::parse("openai"), None);
+        assert_eq!(Provider::parse("openai-compatible"), None);
         assert_eq!(Provider::parse("claude"), None);
     }
 
@@ -602,14 +712,11 @@ mod tests {
 
     #[test]
     fn history_budget_fits_the_context_window() {
-        // 8192 tokens: schema + reply reserve leaves ~14.5 KB of history.
+        // 8192 tokens: the full reserve (1100 schemas + 2048 reply + 200
+        // margin) leaves 14_532 bytes of history.
         let small = Config::new("http://x:1", "m", None);
         assert_eq!(small.context_tokens, DEFAULT_CONTEXT_TOKENS);
-        let budget = small.history_budget();
-        assert!(
-            (14_000..=15_000).contains(&budget),
-            "unexpected budget {budget}"
-        );
+        assert_eq!(small.history_budget(), 14_532);
 
         // A big window leaves a much larger budget.
         let big = Config {
@@ -618,12 +725,17 @@ mod tests {
         };
         assert!(big.history_budget() > 300_000);
 
-        // A tiny window never undershoots below the reserve.
+        // A tiny window shrinks the reserve to half the window instead of
+        // ignoring it: history still gets 1536 bytes, and no cap — which has
+        // a floor of its own — is larger than the budget that holds it.
         let tiny = Config {
             context_tokens: 1024,
             ..small
         };
-        assert_eq!(tiny.history_budget(), 0);
+        assert_eq!(tiny.history_budget(), 1_536);
+        assert!(tiny.read_cap() <= tiny.history_budget());
+        assert!(tiny.cmd_cap() <= tiny.history_budget());
+        assert!(tiny.list_limit() <= tiny.history_budget());
     }
 
     /// The window comes from the model when nobody said otherwise, and the
@@ -651,6 +763,19 @@ mod tests {
         assert!(small.cmd_cap() < small.read_cap());
         assert!(small.list_limit() < small.cmd_cap());
 
+        // Under a window smaller than the caps' own floors, the budget wins:
+        // a 1k window is never handed a 512-byte read it cannot hold.
+        let tiny = Config {
+            context_tokens: 1_024,
+            ..Config::new("http://x:1", "m", None)
+        };
+        assert_eq!(tiny.history_budget(), 1_536);
+        assert_eq!(tiny.read_cap(), 512);
+        assert!(tiny.read_cap() <= tiny.history_budget());
+        assert!(tiny.cmd_cap() <= tiny.history_budget());
+        assert!(tiny.list_limit() <= tiny.history_budget());
+        assert!(tiny.list_limit() >= 50, "the floor still applies within it");
+
         // An explicit window is never overruled by discovery.
         let mut cfg = Config::new("http://x:1", "m", None);
         cfg.set_context(64_000);
@@ -675,7 +800,191 @@ mod tests {
             parse_context_hint("This endpoint's maximum context window of 8192 tokens is smaller"),
             Some(8_192)
         );
+        assert_eq!(
+            parse_context_hint("max_model_len is 4096 and the request needs 5000"),
+            Some(4_096)
+        );
+        // llama.cpp names the window in parentheses.
+        assert_eq!(
+            parse_context_hint(
+                "the request exceeds the available context size (2048 tokens), try increasing it"
+            ),
+            Some(2_048)
+        );
+        // Anthropic/Gemini-style: the number after `>` is the limit, not the
+        // size of the request that just blew past it.
+        assert_eq!(
+            parse_context_hint("prompt is too long: 205404 tokens > 200000 maximum"),
+            Some(200_000)
+        );
+        // Generic text is not a window: this once collapsed an 8k window to 10
+        // tokens, throwing the run's history away.
+        assert_eq!(
+            parse_context_hint(
+                "Rate limit reached for requests: the maximum is 10 requests per minute."
+            ),
+            None
+        );
         assert_eq!(parse_context_hint("429 rate limited"), None);
         assert_eq!(parse_context_hint(""), None);
+        // Neither a number below any real window nor one above the ceiling.
+        assert_eq!(
+            parse_context_hint("maximum context length is 512 tokens"),
+            None
+        );
+        assert_eq!(
+            parse_context_hint("maximum context length is 999999999999 tokens"),
+            None
+        );
+    }
+
+    /// A window from anywhere is clamped into the range mush can work with, so
+    /// a bogus number can never overflow the budget it derives.
+    #[test]
+    fn a_stated_window_is_clamped() {
+        let mut cfg = Config::new("http://x:1", "m", None);
+        cfg.set_context(usize::MAX);
+        assert!(cfg.context_explicit);
+        assert_eq!(cfg.context_tokens, MAX_CONTEXT_TOKENS);
+        assert_eq!(
+            cfg.history_budget(),
+            (MAX_CONTEXT_TOKENS - SCHEMA_TOKENS - 2048 - 200) * 3
+        );
+
+        cfg.set_context(1);
+        assert_eq!(cfg.context_tokens, 1_024);
+        assert!(cfg.history_budget() > 0);
+    }
+
+    /// The window an endpoint advertises is untrusted too: a 1-token window
+    /// would otherwise leave the caps above a zero budget.
+    #[test]
+    fn an_adopted_window_is_clamped_like_a_stated_one() {
+        let mut cfg = Config::new("http://x:1", "m", None);
+        assert!(cfg.adopt_context(1), "raised to the floor, not ignored");
+        assert_eq!(cfg.context_tokens, 1_024);
+        assert!(cfg.history_budget() > 0);
+        assert!(!cfg.adopt_context(0), "zero is still no answer");
+        assert!(!cfg.adopt_context(1), "nothing changed");
+
+        let mut cfg = Config::new("http://x:1", "m", None);
+        assert!(cfg.adopt_context(usize::MAX));
+        assert_eq!(cfg.context_tokens, MAX_CONTEXT_TOKENS);
+
+        // An explicit window is never touched, whatever the endpoint claims.
+        let mut cfg = Config::new("http://x:1", "m", None);
+        cfg.set_context(8_192);
+        assert!(!cfg.adopt_context(1));
+        assert!(!cfg.adopt_context(usize::MAX));
+        assert_eq!(cfg.context_tokens, 8_192);
+    }
+
+    /// The window follows the model at runtime, unless the human stated one.
+    #[test]
+    fn a_model_change_rederives_the_window() {
+        let mut cfg = Config::new("http://x:1", "", None);
+        assert_eq!(cfg.context_tokens, DEFAULT_CONTEXT_TOKENS);
+        cfg.set_model("deepseek-v4-pro");
+        assert_eq!(cfg.model, "deepseek-v4-pro");
+        assert_eq!(cfg.context_tokens, 500_000, "the documented window");
+
+        // A stated window survives every later model/provider change.
+        cfg.set_context(8_192);
+        cfg.set_model("deepseek-flash");
+        assert_eq!(cfg.context_tokens, 8_192);
+
+        // A window merely learned from the previous endpoint does not: a 4k
+        // local server's answer must not survive `/provider deepseek`.
+        let mut cfg = Config::new("http://x:1", "m", None);
+        assert!(cfg.adopt_context(4_096));
+        cfg.provider = Provider::DeepSeek;
+        cfg.rederive_context();
+        assert_eq!(cfg.context_tokens, 128_000, "the new provider's default");
+    }
+
+    /// A provider named on the command line reaches its own endpoint; a URL
+    /// named there makes the endpoint custom, so a stored provider's
+    /// DeepSeek-only knobs never leak to it.
+    #[test]
+    fn a_named_provider_selects_its_endpoint_and_a_named_url_is_custom() {
+        let base = || Config::new("http://rubendpc:8078", "m", None);
+
+        // `--provider deepseek` with no URL anywhere: the flag wins the URL
+        // too, instead of keeping the Custom default from the environment.
+        let config = resolve_with(
+            base(),
+            &Overrides {
+                provider: Some("deepseek".into()),
+                ..Overrides::default()
+            },
+            &Overrides::default(),
+            &UserConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.provider, Provider::DeepSeek);
+        assert_eq!(config.base_url, "https://api.deepseek.com");
+
+        // `--url localhost:11434` with a stored DeepSeek provider: the stored
+        // provider does not own that URL, so its knobs do not apply.
+        let config = resolve_with(
+            base(),
+            &Overrides {
+                url: Some("http://localhost:11434".into()),
+                ..Overrides::default()
+            },
+            &Overrides::default(),
+            &home("deepseek", "", ""),
+            Some(&stored("deepseek", "", "")),
+        )
+        .unwrap();
+        assert_eq!(config.base_url, "http://localhost:11434");
+        assert_eq!(config.provider, Provider::Custom);
+        assert!(!config.thinking_enabled());
+        assert_eq!(config.reasoning_effort(), None);
+
+        // A provider named alongside the URL keeps its knobs.
+        let config = resolve_with(
+            base(),
+            &Overrides {
+                url: Some("http://localhost:11434".into()),
+                provider: Some("deepseek".into()),
+                ..Overrides::default()
+            },
+            &Overrides::default(),
+            &UserConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.base_url, "http://localhost:11434");
+        assert_eq!(config.provider, Provider::DeepSeek);
+        assert_eq!(config.reasoning_effort(), Some("high"));
+    }
+
+    /// `MUSH_CONTEXT` is stated by a human: a typo is reported by name rather
+    /// than silently running a different window.
+    #[test]
+    fn a_bad_context_environment_value_is_reported() {
+        for value in ["abc", "-1", "0", "8k"] {
+            assert_eq!(
+                parse_context_env(value).unwrap_err(),
+                format!("MUSH_CONTEXT needs a token count, got `{value}`")
+            );
+        }
+        assert!(parse_context_env("").is_err(), "empty is not a count");
+        assert_eq!(parse_context_env(" 8192 "), Ok(8_192));
+    }
+
+    /// A misspelled `MUSH_PROVIDER` must be reported, not quietly left at the
+    /// default: `Custom`'s default endpoint is a LAN host, so a key meant for
+    /// a hosted API would be sent there (finding A17).
+    #[test]
+    fn a_bad_provider_environment_value_is_reported() {
+        assert_eq!(parse_provider_env("deepseek"), Ok(Provider::DeepSeek));
+        assert_eq!(parse_provider_env(" custom "), Ok(Provider::Custom));
+        for value in ["openai", "openai-compatible", "claude"] {
+            let error = parse_provider_env(value).unwrap_err();
+            assert!(error.contains(value), "{error}");
+        }
     }
 }

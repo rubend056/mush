@@ -33,6 +33,9 @@ const LIST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_SLICE: Duration = Duration::from_millis(200);
 /// A request body is small; a write that blocks this long is a dead endpoint.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+/// A response body larger than this is refused while it is being read, so a
+/// server cannot make mush allocate without bound (docs §8).
+const MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
 
 #[derive(Debug)]
 pub struct Response {
@@ -175,7 +178,14 @@ fn request(
         }
         let lower = line.to_ascii_lowercase();
         if let Some(value) = lower.strip_prefix("content-length:") {
-            content_length = value.trim().parse().ok();
+            // A length we cannot parse is a broken message, not an absent one:
+            // guessing "read to EOF" would silently change the framing.
+            content_length = Some(value.trim().parse().map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("malformed Content-Length: {:?}", value.trim()),
+                )
+            })?);
         } else if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
             chunked = true;
         }
@@ -216,8 +226,9 @@ impl<'a> Watch<'a> {
             .unwrap_or(false)
     }
 
-    /// A read timed out: keep waiting unless the human cancelled or the
-    /// endpoint has been silent for longer than the whole request may take.
+    /// Consulted after every successful read *and* on every read timeout: a
+    /// cancellation or a deadline has to be able to stop a body that keeps
+    /// arriving in slices, not only a silent one.
     fn check(&self) -> io::Result<()> {
         if self.cancelled() {
             return Err(io::Error::new(
@@ -249,11 +260,18 @@ fn is_timeout(error: &io::Error) -> bool {
 /// `read_line`/`read_exact`: a timeout leaves the buffer untouched, so the
 /// retry cannot lose a half-read line — which is exactly what a cancellation
 /// arriving mid-body would otherwise do.
+///
+/// The watch is checked after every successful read too, not only on timeout:
+/// a server dribbling one byte per slice would otherwise never let a
+/// cancellation or the deadline through.
 fn fill<'b, R: BufRead>(reader: &'b mut R, watch: &Watch) -> io::Result<Option<&'b [u8]>> {
     loop {
         match reader.fill_buf() {
             Ok([]) => return Ok(None),
-            Ok(buffer) => return Ok(Some(buffer)),
+            Ok(buffer) => {
+                watch.check()?;
+                return Ok(Some(buffer));
+            }
             Err(error) if is_timeout(&error) => watch.check()?,
             Err(error) => return Err(error),
         }
@@ -292,6 +310,9 @@ fn read_line<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<Option<Str
 
 /// Exactly `len` bytes, or an error if the body ends early.
 fn read_exact<R: BufRead>(reader: &mut R, len: usize, watch: &Watch) -> io::Result<Vec<u8>> {
+    if len > MAX_BODY_BYTES {
+        return Err(body_too_large());
+    }
     let mut out = Vec::with_capacity(len.min(64 * 1024));
     while out.len() < len {
         let Some(chunk) = fill(reader, watch)? else {
@@ -307,10 +328,13 @@ fn read_exact<R: BufRead>(reader: &mut R, len: usize, watch: &Watch) -> io::Resu
     Ok(out)
 }
 
-/// Everything up to end of stream.
+/// Everything up to end of stream, refusing to grow past the body cap.
 fn read_to_end<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     while let Some(chunk) = fill(reader, watch)? {
+        if out.len() + chunk.len() > MAX_BODY_BYTES {
+            return Err(body_too_large());
+        }
         out.extend_from_slice(chunk);
         let take = chunk.len();
         reader.consume(take);
@@ -318,6 +342,18 @@ fn read_to_end<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<Vec<u8>>
     Ok(out)
 }
 
+fn body_too_large() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("the response body is larger than {MAX_BODY_BYTES} bytes"),
+    )
+}
+
+/// Connect to the endpoint. Every step here is bounded except one: resolving
+/// `host` has no timeout, because std's `to_socket_addrs` cannot be given one.
+/// The TCP connect, the write, and every read are bounded (`CONNECT_TIMEOUT`,
+/// `WRITE_TIMEOUT`, the read watch); a resolver that hangs is the one known way
+/// this call can outlive its deadline (docs/mush.md §8).
 fn connect(
     host: &str,
     port: u16,
@@ -393,14 +429,32 @@ fn parse_url(url: &str) -> io::Result<(String, u16, String, bool)> {
         Some(index) => (&rest[..index], rest[index..].to_string()),
         None => (rest, "/".to_string()),
     };
-    let (host, port) = match authority.rsplit_once(':') {
-        Some((host, port)) => (
-            host.to_string(),
-            port.parse::<u16>().map_err(|_| {
-                io::Error::new(io::ErrorKind::InvalidInput, format!("bad port in {url}"))
-            })?,
-        ),
-        None => (authority.to_string(), if tls { 443 } else { 80 }),
+    let default_port = if tls { 443 } else { 80 };
+    // An IPv6 literal is bracketed, and the colons inside it are not a port
+    // separator: `[::1]` and `[::1]:8080` are both valid authorities.
+    let (host, port) = if let Some(bracketed) = authority.strip_prefix('[') {
+        let (host, tail) = bracketed.split_once(']').ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("bad IPv6 host in {url}"),
+            )
+        })?;
+        let port = match tail.strip_prefix(':') {
+            Some(port) => Some(parse_port(port, url)?),
+            None if tail.is_empty() => None,
+            None => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("bad authority in {url}"),
+                ))
+            }
+        };
+        (host.to_string(), port.unwrap_or(default_port))
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host.to_string(), parse_port(port, url)?),
+            None => (authority.to_string(), default_port),
+        }
     };
     if host.is_empty() {
         return Err(io::Error::new(
@@ -409,6 +463,11 @@ fn parse_url(url: &str) -> io::Result<(String, u16, String, bool)> {
         ));
     }
     Ok((host, port, path, tls))
+}
+
+fn parse_port(port: &str, url: &str) -> io::Result<u16> {
+    port.parse::<u16>()
+        .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("bad port in {url}")))
 }
 
 fn parse_status(line: &str) -> io::Result<u16> {
@@ -436,6 +495,9 @@ fn read_chunked<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<String>
         })?;
         if size == 0 {
             break;
+        }
+        if out.len() + size > MAX_BODY_BYTES {
+            return Err(body_too_large());
         }
         out.extend_from_slice(&read_exact(reader, size, watch)?);
         let _crlf = read_exact(reader, 2, watch)?;
@@ -471,6 +533,17 @@ mod tests {
             parse_url("https://api.deepseek.com:8443").unwrap(),
             ("api.deepseek.com".to_string(), 8443, "/".to_string(), true)
         );
+        // An IPv6 literal's colons are not a port separator.
+        assert_eq!(
+            parse_url("http://[::1]/v1/models").unwrap(),
+            ("::1".to_string(), 80, "/v1/models".to_string(), false)
+        );
+        assert_eq!(
+            parse_url("https://[::1]:8443/x").unwrap(),
+            ("::1".to_string(), 8443, "/x".to_string(), true)
+        );
+        assert!(parse_url("http://[::1").is_err());
+        assert!(parse_url("http://[::1]:abc").is_err());
         assert!(parse_url("ftp://example.com").is_err());
     }
 
@@ -579,6 +652,131 @@ mod tests {
         let response = get_json(&url, None, Duration::from_secs(5)).unwrap();
         assert_eq!(response.status, 200);
         assert_eq!(response.body, "hello");
+    }
+
+    /// A server that keeps a byte per slice flowing must still be stopped by
+    /// the deadline: the watch is consulted after every successful read, not
+    /// only when a read times out (finding A1).
+    #[test]
+    fn a_dribbling_endpoint_still_hits_the_deadline() {
+        let (url, handle) = dribbling_endpoint(60, 40);
+        let started = Instant::now();
+        let error = get_json(&url, None, Duration::from_millis(300)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        handle.join().unwrap();
+    }
+
+    /// The same for a cancellation: a Stop has to reach a body that is still
+    /// arriving, not wait for it to end.
+    #[test]
+    fn a_cancelled_dribbling_response_stops() {
+        let (url, handle) = dribbling_endpoint(200, 40);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            setter.store(true, Ordering::SeqCst);
+        });
+        let started = Instant::now();
+        let error = post_json(&url, "{}", None, &cancel).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "took {:?}",
+            started.elapsed()
+        );
+        handle.join().unwrap();
+    }
+
+    /// A server that announces a long body and dribbles it a byte at a time
+    /// with a short pause between slices. The connection is closed on drop.
+    fn dribbling_endpoint(
+        declared_len: usize,
+        writes: usize,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut connection, _)) = listener.accept() {
+                let mut scratch = [0u8; 1024];
+                let _ = connection.read(&mut scratch);
+                let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {declared_len}\r\n\r\n");
+                let _ = connection.write_all(head.as_bytes());
+                for _ in 0..writes {
+                    if connection.write_all(b".").is_err() {
+                        return;
+                    }
+                    let _ = connection.flush();
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        });
+        let url = format!("http://127.0.0.1:{port}/v1/chat/completions");
+        (url, handle)
+    }
+
+    /// A `Content-Length` that cannot be parsed is a broken message, not an
+    /// absent one: falling back to read-to-EOF would silently change framing.
+    #[test]
+    fn a_malformed_content_length_is_refused() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut connection, _)) = listener.accept() {
+                let mut scratch = [0u8; 1024];
+                let _ = connection.read(&mut scratch);
+                let _ = connection.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: abc\r\n\r\nbody");
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/v1/models");
+        let error = get_json(&url, None, Duration::from_secs(5)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+    }
+
+    /// A body past the cap is refused while it is being read, however honest
+    /// the framing is.
+    #[test]
+    fn an_oversized_body_is_refused() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((mut connection, _)) = listener.accept() {
+                let mut scratch = [0u8; 1024];
+                let _ = connection.read(&mut scratch);
+                // Announced length, and a chunked variant; neither body is sent.
+                let _ = connection.write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                        MAX_BODY_BYTES + 1
+                    )
+                    .as_bytes(),
+                );
+                let _ = connection.flush();
+                std::thread::sleep(Duration::from_secs(5));
+            }
+        });
+
+        let url = format!("http://127.0.0.1:{port}/v1/models");
+        let started = Instant::now();
+        let error = get_json(&url, None, Duration::from_secs(5)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 
     /// Talks to the configured endpoint; run with `--ignored`.

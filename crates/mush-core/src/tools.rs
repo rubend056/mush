@@ -1,10 +1,8 @@
 //! The text-only half of the agent's tools.
 //!
-//! mush executes the workspace tools in two places: through the UI thread for
-//! agents in the main workspace (so they see live, unsaved buffers) and
-//! directly against disk for isolated agents (whose worktree the editor never
-//! opens). Everything that is not *where the bytes come from* lives here, so
-//! the two paths cannot drift apart.
+//! Every tool result is produced here, so the executor and the schemas cannot
+//! drift apart. The bytes always come from disk: mush holds no open file, so
+//! there is no second copy for a tool result to disagree with.
 
 use serde_json::Value;
 

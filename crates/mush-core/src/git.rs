@@ -8,12 +8,13 @@
 use std::path::Path;
 use std::process::Command;
 
-/// The line delta of some change set.
+/// The line delta of some change set. git's counts are 64-bit, so a diff of
+/// billions of lines is reported, not truncated to `±0` by a failed parse.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Stat {
-    pub files: u32,
-    pub added: u32,
-    pub removed: u32,
+    pub files: u64,
+    pub added: u64,
+    pub removed: u64,
 }
 
 impl Stat {
@@ -42,11 +43,15 @@ pub struct RepoStatus {
 
 /// One `git` call with the terminal untouched (`output()`, never `status()`:
 /// the TUI owns stdout). `None` on any failure, including a missing git.
+///
+/// `LC_ALL=C` keeps the output parseable: a localized `--shortstat` would not
+/// match the English words the parser knows, and would read as `±0`.
 fn git(dir: &Path, args: &[&str]) -> Option<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
         .args(args)
+        .env("LC_ALL", "C")
         .output()
         .ok()?;
     if !output.status.success() {
@@ -83,8 +88,33 @@ pub fn status(dir: &Path) -> Option<RepoStatus> {
 /// The work a branch adds on top of its base: exactly that branch's own commits,
 /// even when it was branched from another agent's branch (the merge-base is the
 /// point it forked from, so nested work is never counted twice).
+///
+/// Both names are resolved to commit ids first: a branch name is untrusted
+/// input, and git would read one that begins with `-` (say
+/// `--output=/tmp/x`) as an option to `diff` rather than as a revision.
 pub fn branch_stat(dir: &Path, base: &str, branch: &str) -> Option<Stat> {
+    let base = commit(dir, base)?;
+    let branch = commit(dir, branch)?;
     diff_stat(dir, &["diff", "--shortstat", &format!("{base}...{branch}")])
+}
+
+/// A revision resolved to its commit id, or `None` when it does not exist.
+/// The id is what gets passed on: it cannot be mistaken for an option.
+fn commit(dir: &Path, name: &str) -> Option<String> {
+    let sha = git(
+        dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{name}^{{commit}}"),
+        ],
+    )?;
+    if sha.is_empty() {
+        None
+    } else {
+        Some(sha)
+    }
 }
 
 fn diff_stat(dir: &Path, args: &[&str]) -> Option<Stat> {
@@ -170,6 +200,37 @@ mod tests {
         assert_eq!(Stat::default().compact(), "±0");
     }
 
+    #[test]
+    fn a_huge_diff_keeps_its_count() {
+        let stat = parse_shortstat(" 1 file changed, 5000000000 insertions(+)").unwrap();
+        assert_eq!(stat.files, 1);
+        assert_eq!(stat.added, 5_000_000_000, "u32 would have read this as 0");
+        assert_eq!(stat.removed, 0);
+    }
+
+    /// A branch name is untrusted input: it must reach git as a revision, never
+    /// as an option. `--output=…` used to make git write a file and report a
+    /// silent zero diff.
+    #[test]
+    fn a_ref_name_is_never_read_as_an_option() {
+        let dir = init_repo("options");
+        assert_eq!(branch_stat(&dir, "-x", "master"), None);
+        assert_eq!(branch_stat(&dir, "master", "-x"), None);
+        assert_eq!(
+            branch_stat(&dir, "--output=evil", "master"),
+            None,
+            "an option-shaped ref must not reach the diff"
+        );
+        assert!(
+            !dir.join("evil...master").exists(),
+            "git wrote a file named after a ref"
+        );
+        // The ordinary case still works.
+        let stat = branch_stat(&dir, "HEAD", "master").unwrap();
+        assert!(stat.is_empty(), "HEAD is master here: {stat:?}");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     fn init_repo(name: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("mush-git-{name}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
@@ -182,7 +243,7 @@ mod tests {
                 .output()
                 .unwrap();
         };
-        run(&["init", "-q"]);
+        run(&["-c", "init.defaultBranch=master", "init", "-q"]);
         run(&["config", "user.email", "mush@test"]);
         run(&["config", "user.name", "mush"]);
         fs::write(dir.join("a.txt"), "one\n").unwrap();

@@ -1,20 +1,22 @@
 # mush
 
-A small, fast, agent-agnostic terminal editor. Open a folder, talk to an agent,
-and watch it edit the files you have open — without either of you clobbering the
-other.
+A small, fast terminal surface for coding agents. Open a folder, give the root
+agent a task, and watch the tree of agents work — with the repository's branch,
+dirty count, and line delta always in view.
+
+mush does not edit files itself. The agents do, and mush is how you steer them
+and see what changed.
 
 ```
-┌ agents ─────────┬ src/main.rs ─────────────────────┐
-│ ▶ #0 ✓ you      │  1 fn main() {                  │
-│   #1 ✓ lexer    │  2     println!("hi");          │
-│   #2 ◐ tests    │  3 }                             │
-├─────────────────┴──────────────────────────────────┤
-│ #1 › (focused agent's chat)                        │
-│ mush ›  ⚙ edit_file({"path":"src/main.rs",...})   │
-│ message (#1) › _                                    │
-└────────────────────────────────────────────────────┘
- agents · chat     deepseek-flash @ deepseek.com
+┌ agents · 1 running · Σ +12 −3 ───┬ mush ──────────────────────────────┐
+│ ▶ · #0   you (root agent)        │ you › rename the lexer module       │
+│   ◐ #1   lexer    edit lex.rs 4s │ mush › Starting with the rename.    │
+│   ✓ #2   docs     wrote README   │       ⚙ edit_file src/lex.rs        │
+│                                  ├─────────────────────────────────────┤
+│                                  │ › _                                 │
+└──────────────────────────────────┴─────────────────────────────────────┘
+ chat  #1 edit lex.rs 4s
+ ⌂ ~/p/demo │ master ±3 +12−3 │ deepseek-flash · ctx ~500k
 ```
 
 ## Quick start
@@ -22,12 +24,11 @@ other.
 ```sh
 cargo build --release
 ./target/release/mush /path/to/project    # or just: mush
-./target/release/mush src/main.rs         # opens a file
 ```
 
-`Tab` moves between the **agents** (tree), **editor**, and **chat** panes. Type
-in the message box and press `Enter`. The agent reads and edits this workspace
-through five file tools plus four delegation tools — see *Subagents* below.
+`Tab` moves between the **agents** tree and the **chat**. Type in the message
+box and press `Enter`. The agent reads and edits the workspace through five file
+tools plus four delegation tools — see *Subagents* below.
 
 It talks to any OpenAI-compatible endpoint with function calling:
 
@@ -60,8 +61,8 @@ Resolution order on startup: **CLI flags > env vars (`MUSH_*`) > saved session
 > home config > built-in defaults**. `MUSH_CONTEXT` sets the endpoint's
 context window in tokens (default 8192); history is trimmed to fit it, so
 requests never overflow small local models. The home config file lives at
-`$MUSH_CONFIG`, else `$XDG_CONFIG_HOME/mush/config.json`, else
-`~/.config/mush/config.json` — it is *machine-global*:
+`$MUSH_CONFIG`, else the platform config directory (`~/.config/mush/config.json`
+on Linux) — it is *machine-global*:
 
 ```json
 {
@@ -94,26 +95,34 @@ worktrees) but they need a model that actually delegates: small local models
 tend to flatten the chain and do the leaf work themselves. Prefer a capable
 model for orchestration.
 
-The **agents** pane shows the whole tree: depth by indentation, `·` idle, `◐`
-running, `⏸` waiting on children, `⊘` a cancel in flight, `✓` done (with its final
+A run that reaches its turn limit (24 model turns) gets a **wrap-up turn**
+instead of an error: tools are withdrawn, the model summarizes what was done
+and what is left, and that summary is the run's result.
+
+## The agents pane
+
+The pane shows the whole tree: depth by indentation, `·` idle, `◐` running,
+`⏸` waiting on children, `⊘` a cancel in flight, `✓` done (with its final
 summary), `✗` failed. A running row ages with its phase (`◐ #1 edit_file
 src/lex.rs 12s`), an isolated row carries its branch and line delta
 (`mush/2 +8−0`), the pane title totals them (`agents · 2 running · Σ +324 −40`),
 and the selected row's full facts — including the merge commands — sit in the
-footer under the list. Enter on a
-row focuses that agent — the chat below switches to its transcript and typing
-nudges it.
-`Esc` returns to the root, `c` cancels the selected agent, `Ctrl-C` cancels
-everything that is running (an idle agent is left alone — it has nothing to
-cancel). A cancel reaches the model call itself: the request is read in short
-slices, so Ctrl-C stops a model that has not answered instead of waiting for its
-reply.
+footer under the list.
+
+`Enter` on a row focuses that agent — the chat switches to its transcript and
+typing nudges it. `Esc` returns to the root, `c` cancels the selected agent,
+`Ctrl-C` cancels everything that is running (an idle agent is left alone — it
+has nothing to cancel). A cancel reaches the model call itself: the request is
+read in short slices, so Ctrl-C stops a model that has not answered instead of
+waiting for its reply.
+
+## Isolated agents
 
 `isolated: true` gives a child its own git worktree
 (`.mush/wt/<id>` on branch `mush/<id>`), so parallel agents edit real files
-without colliding. A run's work is **committed** to that branch when the run ends
-(`mush #3: <brief>`), so the branch really carries it. **mush never auto-merges** —
-the tree shows the branch and these print the exact commands:
+without colliding. A run's work is **committed** to that branch when the run
+ends (`mush #3: <brief>`), so the branch really carries it. **mush never
+auto-merges** — the tree shows the branch and these print the exact commands:
 
 ```
 /diff <id>      git diff HEAD...mush/3
@@ -135,25 +144,22 @@ trimming only cuts in when the model itself cannot produce a summary.
 
 | Key | Action |
 |---|---|
-| `Tab` / `Shift-Tab` | cycle panes (agents, editor, chat) |
+| `Tab` / `Shift-Tab` | cycle panes (agents, chat) |
 | `Enter` | send message (chat) · focus agent (agents) |
-| `i` / `Esc` | enter / leave insert mode (editor) |
-| `hjkl` · `0` `$` · `g` `G` · `Ctrl-D` `Ctrl-U` | move (editor, normal mode) |
-| `i` `a` `I` `A` `o` `O` · `x` | insert and delete (editor, normal mode) |
+| `←` `→` `Home` `End` · `Backspace` `Delete` | edit the message box |
+| `↑` `↓` `PgUp` `PgDn` | scroll the transcript |
 | `j` `k` · `Enter` · `c` · `Esc` | select, focus, cancel, back to root (agents) |
 | `Ctrl-P` | model picker |
-| `Ctrl-S` / `Ctrl-R` | save / reload the open file |
 | `Ctrl-N` | new chat (stops every agent, restarts the root) |
 | `Ctrl-C` | cancel running agents — an idle root is left alone, and a cancel reaches a model that is still thinking |
-| `Ctrl-Q` | quit (twice if there are unsaved changes) |
+| `Ctrl-Q` | quit |
 
 Chat commands: `/provider`, `/model`, `/context`, `/url`, `/key`, `/models`,
-`/open` (no path opens a picker), `/worktrees`, `/diff`, `/merge`, `/discard`,
-`/new`, `/help`, `/quit`.
+`/worktrees`, `/diff`, `/merge`, `/discard`, `/new`, `/help`, `/quit`.
 
 ## The screen
 
-The line above the keys is a model of the workspace, not a log. Its **first
+The line above the facts is a model of the workspace, not a log. Its **first
 line** is what just happened: the tree's activity (`◐ #1 edit_file src/lex.rs
 12s`), else the last command's result for a few seconds, else a hint. Its
 **second line** (on terminals at least 26 rows tall) is the stable facts, cut
@@ -165,8 +171,8 @@ from the right when the terminal is narrow:
 
 `±3` counts paths with uncommitted changes, `+12−3` the line delta against
 `HEAD`. Terminals narrower than 80 columns (or shorter than 20 rows) get a
-**compact** layout: the agent strip on top, chat below, and no empty editor.
-Below 40×10 mush says so instead of painting shreds.
+**compact** layout: the agent strip on top, chat below. Below 40×10 mush says
+so instead of painting shreds.
 
 ## Context window
 
@@ -175,8 +181,10 @@ first of these that knows:
 
 1. **You**: `--context N`, `MUSH_CONTEXT=N`, or `/context N`. A number you state
    is remembered in `.mush/session.json` and never overruled.
-2. **The endpoint**, when it advertises one: llama.cpp's `meta.n_ctx`, vLLM's
-   `max_model_len`, OpenRouter's `context_length`.
+2. **The endpoint**, when it advertises one and mush fetched its model list:
+   llama.cpp's `meta.n_ctx`, vLLM's `max_model_len`, OpenRouter's
+   `context_length`. Discovery only runs when no model was named, or on
+   `/model`, `/models`, and `/url`.
 3. **The model's documented window** — `deepseek-flash` and `deepseek-v4-pro`
    are 500k, so a hosted API (which answers with ids and nothing else) is not
    silently treated as an 8k local model.
@@ -184,20 +192,21 @@ first of these that knows:
 
 The tool caps (a read, command output, a listing) scale with the window, so one
 `read_file` can never fill an 8k transcript. If a server rejects a request over
-its context length, mush reads the number out of the complaint and retries once.
+its context length, mush reads the number out of the complaint, tells the UI,
+and retries once.
 
 ## What it writes
 
 - `./.mush/` — workspace-local state, git-ignored by itself:
   `session.json` (the root conversation, provider, endpoint, model).
-- `~/.config/mush/config.json` — machine-global defaults **including the API
-  key**. The key never touches the workspace.
+- The platform config directory (e.g. `~/.config/mush/config.json`) —
+  machine-global defaults **including the API key**. The key never touches the
+  workspace.
 
 ## Design
 
-See [docs/mush.md](docs/mush.md) for the full design: the single-owner event
-loop, why agents edit live buffers instead of stale files, the safety rules,
-and the roadmap.
+See [docs/mush.md](docs/mush.md) for the design: the single-owner event loop,
+the agent actor tree, the safety rules, and the roadmap.
 
 ## Layout
 
@@ -215,7 +224,8 @@ docs/mush.md        the design doc
 ```sh
 cargo test                    # offline unit tests
 cargo test -- --ignored       # live endpoint tests, plus isolated_subagent,
-                              # deep_chain, and compaction (deterministic, via
+                              # deep_chain, compaction, steering and the
+                              # turn-limit wrap-up (deterministic, via
                               # scripts/mock_llm.py)
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke           # needs a model
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --resize  # needs none

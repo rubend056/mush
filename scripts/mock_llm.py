@@ -27,6 +27,10 @@ root's first user message:
    and answers "first reply". Request "STEERME" answers "steered".
    (Exercises a nudge that arrives while a reply is being generated.)
 
+5. TURNS (user message contains "TURNS"): every turn calls run_command until
+   the request carries the wrap-up instruction ("turn limit"), which is
+   answered with a summary. (Exercises the final turn of a run.)
+
 Subagents are told apart by "mush subagent" in the system prompt, and child
 vs grandchild by "at depth 1" vs "at depth 2". The parent's task travels as
 subagent's first user message, so task keywords ("iso.txt") are found in the
@@ -83,6 +87,13 @@ class Handler(BaseHTTPRequestHandler):
             reply = {"role": "assistant", "content": "first reply"}
         elif "STEERME" in joined:
             reply = {"role": "assistant", "content": "steered"}
+        elif "TURNS" in joined and "turn limit" in joined:
+            # The wrap-up turn: tools are withdrawn and a summary is asked for.
+            reply = {"role": "assistant",
+                     "content": "wrapped up: the work done so far is in the workspace"}
+        elif "TURNS" in joined:
+            # Keep taking turns until the run hits its limit.
+            reply = self.tool_call("run_command", {"command": "true"})
         else:
             is_subagent = "mush subagent" in system
             depth2 = "at depth 2" in system

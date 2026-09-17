@@ -1,9 +1,11 @@
 //! Workspace filesystem access: safe paths, listings, reads, atomic writes.
 
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+
+use tempfile::NamedTempFile;
+use walkdir::WalkDir;
 
 /// Directories that are never worth showing or walking into.
 const SKIP_DIRS: &[&str] = &[
@@ -22,7 +24,12 @@ const SKIP_DIRS: &[&str] = &[
     ".cache",
 ];
 
-static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+/// Whether a walk should skip this entry: hidden names always, build/VCS
+/// directories by name (their contents are never part of the workspace).
+fn skipped(entry: &walkdir::DirEntry) -> bool {
+    let name = entry.file_name().to_string_lossy();
+    name.starts_with('.') || (entry.file_type().is_dir() && SKIP_DIRS.contains(&name.as_ref()))
+}
 
 /// A single workspace root. All agent file access goes through here, which is
 /// what keeps a runaway model inside the directory the human opened.
@@ -82,38 +89,25 @@ impl Workspace {
     }
 
     /// List workspace-relative file paths, sorted. Hidden files and build/VCS
-    /// directories are skipped so the file pane stays useful.
+    /// directories are skipped so a listing stays useful, and symlinks are not
+    /// followed (a link out of the workspace is not workspace content).
     pub fn list_files(&self, limit: usize) -> Vec<String> {
         let mut out = Vec::new();
-        let mut stack = vec![self.root.clone()];
-        while let Some(dir) = stack.pop() {
+        let walk = WalkDir::new(&self.root)
+            .min_depth(1)
+            .follow_links(false)
+            .into_iter()
+            .filter_entry(|entry| !skipped(entry));
+        for entry in walk {
+            // A per-entry error (a racing delete, a permission wall) skips
+            // that entry, not the rest of the walk.
+            let Ok(entry) = entry else { continue };
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            out.push(self.rel(entry.path()));
             if out.len() >= limit {
                 break;
-            }
-            let entries = match fs::read_dir(&dir) {
-                Ok(entries) => entries,
-                Err(_) => continue,
-            };
-            for entry in entries.filter_map(Result::ok) {
-                let name = entry.file_name().to_string_lossy().to_string();
-                if name.starts_with('.') {
-                    continue;
-                }
-                let file_type = match entry.file_type() {
-                    Ok(t) => t,
-                    Err(_) => continue,
-                };
-                if file_type.is_dir() {
-                    if SKIP_DIRS.contains(&name.as_str()) {
-                        continue;
-                    }
-                    stack.push(entry.path());
-                } else if file_type.is_file() {
-                    out.push(self.rel(&entry.path()));
-                    if out.len() >= limit {
-                        break;
-                    }
-                }
             }
         }
         out.sort();
@@ -165,17 +159,10 @@ pub fn truncate_for_model(mut text: String, cap: usize) -> String {
 /// a half-written file and a crash cannot corrupt the original.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().to_string())
-        .unwrap_or_else(|| "file".to_string());
-    let unique = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
-    let tmp = dir.join(format!(".{name}.mush-tmp-{}-{unique}", std::process::id()));
-    let result = fs::write(&tmp, bytes).and_then(|()| fs::rename(&tmp, path));
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    result
+    let mut tmp = NamedTempFile::new_in(dir)?;
+    tmp.write_all(bytes)?;
+    tmp.persist(path).map_err(|error| error.error)?;
+    Ok(())
 }
 
 #[cfg(test)]

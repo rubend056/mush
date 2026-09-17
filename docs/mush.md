@@ -1,28 +1,29 @@
-# mush — design doc (v0.1)
+# mush — design doc (v0.2)
 
-> A small, fast, agent-agnostic terminal editor. Open a folder, talk to an
-> agent, and watch it edit the files you have open — without either of you
-> clobbering the other.
+> A small, fast terminal surface for coding agents. Open a folder, give the
+> root agent a task, and watch the tree of agents work — with the repository's
+> branch, dirty count, and line delta always in view.
 
-Status: **MVP implemented and working end to end** (M0–M2.5 of §9). This document
+Status: **implemented and working end to end** (M0–M2.7 of §9). This document
 describes what is actually built, then what comes next. Decisions are marked
 `[DECIDED]` or `[OPEN]`.
 
-This revision folds in two audits: the agent contract (§3, §5.5) and the screen,
-photographed at six terminal sizes (§4.5). Their functional findings are §2's
-known gaps; the work they imply is M2.6–M2.7 in §9.
+This revision folds in two audits — the agent contract (§3, §5.5) and the
+screen, photographed at six terminal sizes (§4.5) — and the v0.2 decision to
+drop the built-in editor: mush manages agents and shows git state; the agents
+edit the files.
 
 ---
 
 ## 0. TL;DR
 
-- `mush` is a modal TUI editor in Rust. One binary. **No async runtime.**
+- `mush` is a TUI in Rust. One binary. **No async runtime.**
 - Workspace-first: `mush [DIR]`, or just `mush` in the folder you are in.
 - An **agent is built in**: it talks to any OpenAI-compatible endpoint
   (default `http://rubendpc:8078`) and edits the workspace through five file
   tools; it can delegate work through four more.
-- Agents *drive* the editor: file tools execute on the UI thread, so an agent
-  edits the **live buffer**, not a stale copy on disk. The human sees edits land.
+- mush holds **no file state**: agents read and write files directly, and the
+  UI shows their tree, their transcripts, and the git facts.
 - The agent's **system prompt is ~10 lines** and the tool set is nine functions.
   Simple prompt is a consequence of a small, honest interface.
 - Everything mush writes lives in `<DIR>/.mush/`, which **git-ignores itself**.
@@ -35,14 +36,17 @@ known gaps; the work they imply is M2.6–M2.7 in §9.
 
 ### Is
 
-- A **text editor first**: open, navigate, edit, save. Keys stay out of the way.
-- A **live collaboration surface** between one human and the built-in agent.
+- A **control surface for the built-in agent**: ask, watch, steer, cancel.
+- A **glance at the repository**: branch, dirty count, and per-branch line
+  delta, updated while agents work.
 - **Endpoint-neutral**: anything speaking the OpenAI chat-completions API with
   function calling works (llama.cpp, Ollama, vLLM, LM Studio, hosted APIs).
-- **Small on purpose.** Roughly 5,000 lines including tests, across two crates.
+- **Small on purpose.** Roughly 9,000 lines including tests, across two crates.
 
 ### Is not
 
+- A text editor. The agents own file editing; mush never opens a file, so
+  there is no second copy of anything to reconcile.
 - A full IDE. No debugger, no terminal multiplexer, no project wizard.
 - A CRDT / collaborative-OT server. One human, the filesystem is truth.
 - Provider-specific, plugin-based, or extensible via a scripting language.
@@ -59,52 +63,35 @@ not required for mush to be useful today.
 
 ---
 
-## 2. The central trick: agents edit live buffers
+## 2. The UI owns no file state
 
-The naive design has the agent read and write files on disk while the human has
-the same file open in memory. Whoever saves last wins, and work is lost.
+An editor-shaped design has a hard problem: the agent reads and writes files on
+disk while the human has the same file open in memory. Whoever saves last wins.
 
-mush avoids this the simple way: **only the UI thread touches editor state.**
+mush avoids it by not being an editor. Agents do their own file I/O on their own
+threads (`read_file`, `write_file`, `edit_file`), and the UI holds only what the
+human needs to steer them: the agent tree, the focused transcript, the message
+box, and the git snapshot. There is no live buffer, so there is no stale copy,
+no lock, and no save race — a consequence of a smaller product.
 
-- The agent runs on a background thread and asks the UI thread to run file tools
-  (`Msg::Tool`), blocking on a reply channel.
-- `read_file` therefore returns the *live buffer* when the file is open, so the
-  agent sees unsaved human edits.
-- `write_file` / `edit_file` apply to the live buffer and save it, so the human
-  sees the agent's edit immediately.
-- `run_command` runs on the agent thread (a slow build must not freeze the UI),
-  and afterwards the agent asks the UI to re-read clean buffers (`Resync`).
+What the UI does own is one channel. Every input — a keystroke, an agent
+event — becomes a `Msg`, and one thread applies it to `App`. Agents never paint
+and never share state with the painter.
 
-This is why there are no locks around editor data. There is only one owner, and
-ownership is expressed as a message.
+### Safety rules that stay
 
-### Safety rules that follow from it
-
-- **Atomic saves.** Every write is temp-file + `rename`; readers never see a
-  half-written file, and a crash cannot corrupt the original.
+- **Atomic saves.** Every agent write is temp-file + `rename`; readers never see
+  a half-written file, and a crash cannot corrupt the original.
 - **Workspace jail.** Every agent path is resolved against the root and rejected
   if it escapes (`..`, absolute paths). The agent cannot touch `/etc`.
 - **Edits are exact.** `edit_file` refuses if `old_string` is missing or appears
   more than once, so an edit can never hit the wrong occurrence.
 - **Truncated reads are capped, edits are not.** Reads to the model are capped
   for context; edit operations always work on the complete file.
-- **Bounded loops.** At most 24 model turns per request; a shell command runs in
-  its own process group with a 120 s timeout, a hard 8 MB output limit, and
-  cancellation that reaches it; delegation is bounded in depth and fan-out
-  (§5.5). A runaway agent stops. (M2.8 turns that 120 s kill into a 60 s detach —
-  §5.6.)
-
-### Known gaps
-
-**1. Unsaved buffers vs `run_command` (M4).** If `run_command` rewrites a file the
-human has unsaved changes in, those changes are preserved (the buffer is left
-alone) but the file on disk has moved on. A filesystem watcher plus a diff3 merge
-is the planned fix (§9).
-
-**2. The subagent pane is display-only.** A child's chat shows its replies and tool
-results, but not the parent's brief, the human's nudges to it, or the `#N done`
-lines it receives from its own children. The model sees all of them; the pane does
-not, so the human's picture of a child is thinner than the child's own context.
+- **Bounded loops.** At most 24 model turns per run — the last one a wrap-up
+  turn that withdraws tools and asks for a summary — a shell command in its own
+  process group with a 120 s timeout and a hard 8 MB output limit, delegation
+  bounded in depth and fan-out (§5.5). A runaway agent stops.
 
 ---
 
@@ -134,14 +121,16 @@ Delegation:
 
 A subagent gets its own system prompt: who it is (depth), the workspace it works
 in (the shared one, or its isolated worktree), and the same rules — the brief
-travels as the first user message, mirroring the root's system+user shape.
+travels as the first user message, mirroring the root's system+user shape. The
+UI shows that same brief as the child's first message, so the human's picture of
+a child starts where the child's does.
 
 ### Tools
 
 | Tool | Arguments | Notes |
 |---|---|---|
 | `list_files` | `path?` | recursive, skips `.git`, `.mush`, `target`, `node_modules`, … |
-| `read_file` | `path` | live buffer if open; capped at 16 KB per result |
+| `read_file` | `path` | capped per result (the cap scales with the context window) |
 | `write_file` | `path`, `content` | atomic; creates parent directories |
 | `edit_file` | `path`, `old_string`, `new_string` | exact and unique match required |
 | `run_command` | `command` | `sh -c` in the root, own process group; 120 s timeout, 8 MB output limit, cancellable |
@@ -185,22 +174,22 @@ what lets a long task survive a small context window.
 
 ---
 
-## 4. The editor
+## 4. The message box
 
-`[DECIDED]` Normal + Insert modal editing. No Vim operators, no selections yet;
-the smallest thing that is genuinely usable.
+`[DECIDED]` No editor. The one text field is the message box, and it behaves
+like every other terminal input: a cursor, arrows, `Home`/`End`,
+`Backspace`/`Delete`. Edits land on **grapheme cluster** boundaries
+(`unicode-segmentation`), so a combining mark or a ZWJ emoji is one keystroke,
+and the view is measured in display columns (`unicode-width`, through
+`unicode-truncate`), so a CJK glyph takes two. Past the pane width the box
+scrolls horizontally instead of clipping its tail: `…` marks whichever edge is
+elided, and the cursor is always on screen.
 
 | Context | Keys |
 |---|---|
-| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit · `Ctrl-S` save · `Ctrl-R` reload · `Ctrl-N` new chat · `Ctrl-C` cancel running agents (reaches a model that is still thinking) |
+| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit · `Ctrl-N` new chat · `Ctrl-C` cancel running agents (reaches a model that is still thinking) · `Ctrl-P` model picker |
 | agents | `j`/`k`, arrows, `g`/`G`, `Enter` focus a row, `c` cancel that agent, `Esc` back to the root |
-| editor (normal) | `i` `a` `I` `A` `o` `O` insert · `hjkl`/arrows · `0` `$` `g` `G` · `Ctrl-D`/`Ctrl-U` · `x` delete |
-| editor (insert) | typing, `Enter`, `Backspace`, `Delete`, arrows, `Esc` to normal |
-| chat | typing, `Enter` send, `Backspace`, `↑`/`↓`/`PgUp`/`PgDn` scroll, `Esc` clear · `/new` `/help` `/quit` · `/model` and `/provider` open a picker |
-
-A `Buffer` is `Vec<String>` lines plus a `trailing_newline` flag, so files
-round-trip byte-for-byte. Cursor columns are counted in **characters**, so
-multi-byte text edits correctly.
+| chat | typing, `Enter` send, `←`/`→`/`Home`/`End`, `Backspace`/`Delete`, `↑`/`↓`/`PgUp`/`PgDn` scroll, `Esc` clear · `/new` `/help` `/quit` · `/model` and `/provider` open a picker |
 
 ---
 
@@ -218,8 +207,9 @@ typing anything, at whatever size the terminal is.
 An audit of real screens (200×50, 120×32, 80×24, 60×17, 40×10, 30×8) found ten
 defects. They share one shape: the data exists, the pixels do not.
 
-1. **A dead instruction — fixed in this revision.** The empty editor said "Tab to
-   files"; there is no files pane. Copy that cannot come true is worse than none.
+1. **A dead instruction — fixed in this revision.** The old empty editor said
+   "Tab to files"; there is no files pane. Copy that cannot come true is worse
+   than none. (The editor itself is gone as of v0.2.)
 2. **Row fields are ranked backwards.** `brief(18) + activity(14) + branch`, then
    truncated to the pane, so identity, activity, and branch never coexist — and the
    branch, which the merge story depends on, is at the tail.
@@ -275,8 +265,8 @@ are computed in `App`.
   never a mystery again, and the repository survives the narrowest of them.
 - **R3 — Size tiers with a floor.** `[DONE]` `w<40 || h<10` → a single centred
   `mush needs at least 40×10`; `w<80 || h<20` → compact: the agent strip on top,
-  chat below, and an empty editor hidden; `h≥26` → the two-line bar; the
-  transcript is capped at 110 columns however wide the terminal is.
+  chat below; `h≥26` → the two-line bar; the transcript is capped at 110 columns
+  however wide the terminal is.
 - **R4 — Truthful glyphs.** `[DONE]` `·` idle/never ran, `◐` running, `⏸` waiting
   on children, `⊘` a cancel in flight, `✓` finished, `✗` failed; tool calls are
   `⚙ name summarized-args` (never raw JSON), and notices are neutral `·` unless
@@ -344,11 +334,10 @@ Agents are one thread each, owning one transcript; parents and children talk
 directly through mailboxes (`spawn_agent`, `wait_agents`, `agent_status`,
 `agent_control`), while the UI observes via id-tagged events. Depth and live
 count are hard budgets; the delegation tools are simply omitted from a leaf's
-schema. Agents in the main workspace keep the live-buffer rule (file tools
-round-trip through the UI thread); `isolated` agents edit their own git
-worktree directly on disk. Human-in-the-loop is the merge story: a run's work is
-committed to its branch when the run ends, mush prints the git commands, and it
-never auto-merges.
+schema. Every agent does its own file I/O on its own thread, an `isolated` one
+inside its own git worktree. Human-in-the-loop is the merge story: a run's work
+is committed to its branch when the run ends, mush prints the git commands, and
+it never auto-merges.
 
 An orchestrator that ends its turn while children still run is not finished, it
 is napping: the completion is folded into its transcript as a user message and
@@ -435,15 +424,15 @@ Single-owner state. No locks. No async runtime.
 ```
                        ┌──────────────── UI thread ────────────────┐
   crossterm events ───▶│  Msg::Key ─┐                              │
-  tool replies     ───▶│  Msg::Tool ─┼─▶ App::update(&mut self, Msg) │   6. crates
-  agent events     ───▶│  Msg::Agent ┘            │                │
+  agent events     ───▶│  Msg::Agent ┴─▶ App::update(&mut self, Msg)│
+                       │                          │                │
                        │                          ▼                │
                        │            terminal.draw(|f| ui::draw(f, app))
                        └───────────────────────────────────────────┘
-                                   ▲       │
-                                   │       ▼  Msg::Tool (file ops)
-                       agent thread: model HTTP loop
-                       └ also runs `run_command` directly
+                                   ▲
+                                   │  AgentEvent (id-tagged)
+                       agent threads: model HTTP loop
+                       └ file tools and `run_command` run on the agent's own thread
 ```
 
 - One `crossbeam` channel carries every input into the UI thread.
@@ -478,9 +467,10 @@ mush/
       workspace.rs   path jail, listings, capped reads, atomic writes
     mush/        # the binary: TUI + agent
       main.rs        CLI, terminal guard/panic hook, event loop
-      app.rs         state, update, key handling, tool execution, buffers
+      app.rs         state, update, key handling, agents, git snapshot, message box
       agent.rs       agent actors, model loop, tool dispatch, shell execution
-      http.rs        ~300-line blocking HTTP/1.1 client
+      input.rs       the message box's grapheme cursor and horizontal window
+      http.rs        a few hundred lines of blocking HTTP/1.1 client
       ui.rs          layout, panes, transcript rendering, word wrap
   docs/mush.md
   scripts/          pty smoke test + scripted mock model server
@@ -501,14 +491,21 @@ wrapping) is where the tests live.
 | `crossterm` (via ratatui) | keyboard events, raw mode, alternate screen |
 | `serde`, `serde_json` | messages, session file, tool arguments |
 | `crossbeam-channel` | one channel, `.select()`-ready |
-| `unicode-width` | correct wrapping and cursor columns for wide glyphs |
+| `unicode-width` | correct wrapping and columns for wide glyphs |
+| `unicode-segmentation` | grapheme-correct cursor edits (already compiled via ratatui) |
+| `unicode-truncate` | display-width truncation and slicing (already compiled via ratatui) |
+| `tempfile` | secure scratch files for command output, atomic replace |
+| `walkdir` | workspace listings with a per-entry API and an explicit symlink policy |
+| `dirs` | platform-correct config directory |
 | `rustls`, `webpki-roots` | TLS for hosted https endpoints (DeepSeek); the client stays hand-rolled |
 
-Not used, on purpose: `tokio`, `reqwest`/`ureq`, `clap`, `ropey`, `notify`,
-`anyhow`, `blake3`, `diffy`. HTTP is hand-rolled because the target is a
-plain-HTTP server (or a rustls-wrapped socket), and ~150 lines beats a
-dependency tree. CLI parsing is ~40 lines. Each omitted crate is one less thing
-to version, audit, and wait for.
+Not used, on purpose: `tokio`, `reqwest`, `clap`, `ropey`, `notify`, `anyhow`,
+`blake3`, `diffy`. HTTP is hand-rolled because the target is a plain-HTTP server
+(or a rustls-wrapped socket), and ~400 lines beats a dependency tree. `ureq` is
+the tempting swap, but its receive timeout is a total budget rather than a
+per-read one, and the cancel flag is polled *between* socket reads — that is the
+feature Ctrl-C depends on. CLI parsing is ~40 lines. Each omitted crate is one
+less thing to version, audit, and wait for.
 
 ---
 
@@ -516,24 +513,28 @@ to version, audit, and wait for.
 
 | Metric | Target | Reality |
 |---|---|---|
-| Cold start | < 20 ms | ~2 ms without model discovery; ratatui enter/leave and one redraw |
-| Model discovery | < 50 ms | one `GET /v1/models` (~20 ms cold, ~4 ms warm); skipped with `--model` |
-| Keypress → screen | < 5 ms | `update` touches only the buffer; draw only when dirty |
+| Cold start | < 20 ms | ~2 ms; model discovery is only fetched when no model is named |
+| Model discovery | < 50 ms | one `GET /v1/models` (~20 ms cold, ~4 ms warm), or on `/model`, `/models`, `/url` |
+| Keypress → screen | < 5 ms | `update` touches only UI state; draw only when dirty |
 | Idle CPU | ~0% | blocked on a 30 ms poll, no spinner unless an agent is running |
-| Memory, no open files | < 15 MB | a `Vec<String>` per open file and a message list |
+| Memory | < 15 MB | the agent tree, the transcripts, and one message box |
 
 An unreachable endpoint cannot hang startup: connections are bounded by a 5 s
 `connect_timeout`, and the model list by a 10 s read timeout — after which the
-editor opens and reports no model. A chat completion, by contrast, may take as
+window opens and reports no model. A chat completion, by contrast, may take as
 long as the model needs: one 10-minute deadline bounds the whole request, while
 the socket itself is read in 200 ms slices so the reader can notice a
-cancellation. Ctrl-C therefore stops a model that has not answered instead of
-waiting for its reply, and a wedged endpoint still cannot pin a thread forever.
+cancellation — and the deadline and cancel flag are checked after every
+successful read too, not only on a timeout, so a server dribbling one byte per
+slice cannot outlive them. Ctrl-C therefore stops a model that has not answered
+instead of waiting for its reply, and a wedged endpoint still cannot pin a
+thread forever. One hole is documented rather than papered over: name resolution
+(`to_socket_addrs`) has no timeout, because std cannot give it one.
 
-Rules: no full-buffer scan per frame, no redraw without a state change, no
-allocation in the input path beyond the edit itself, and no subprocess inside
-`draw` — the git snapshot of M2.7 is cached in `App` and refreshed by events.
-Release profile uses `lto = "thin"`, `codegen-units = 1`, `strip = true`.
+Rules: no full-buffer scan per frame, no redraw without a state change, and no
+subprocess inside `draw` — the git snapshot is cached in `App` and refreshed by
+events and by a two-second tick while anything is running. Release profile uses
+`lto = "thin"`, `codegen-units = 1`, `strip = true`.
 
 ---
 
@@ -543,10 +544,11 @@ Release profile uses `lto = "thin"`, `codegen-units = 1`, `strip = true`.
 
 - **M0 — Core.** workspace path jail, atomic writes, session persistence, message
   types, prompt/tool schemas, config resolution.
-- **M1 — Editor.** open/edit/save, modal keys, panes, transcript, wrapping.
-- **M2 — Agent.** OpenAI function-calling loop, live-buffer tool execution,
-  streaming-free status spinner, cancellation, history trimming, `Resync`,
-  context compaction.
+- **M1 — Editor.** `[REMOVED v0.2]` open/edit/save, modal keys, panes. mush is not
+  an editor; the message box of §4 is what remains of it.
+- **M2 — Agent.** OpenAI function-calling loop, file tools on the agent thread,
+  streaming-free status spinner, cancellation, history trimming, context
+  compaction.
 - **M2.5 — Subagents.** actor-per-agent with mailboxes, delegation tools, the
   agent tree, isolated git worktrees, wake-on-completion, bounded depth and
   fan-out.
@@ -560,10 +562,15 @@ Release profile uses `lto = "thin"`, `codegen-units = 1`, `strip = true`.
 - **M2.7 — Glance layer.** `[DONE]` Ranked agent rows with a selected-row footer;
   the workspace bar (activity › status › hint, then path · branch ±dirty · stat ·
   model · context); size tiers with a 40×10 floor and a width cap; truthful glyphs;
-  tool calls as `name(summarized args)`; neutral notices; `/open` as a picker;
+  tool calls as `name(summarized args)`; neutral notices;
   `mush-core/src/git.rs` and one cached snapshot (§4.5). The context window is
   discovered (endpoint → model table → provider default), shown, settable with
   `/context`, and the tool caps scale with it.
+- **M2.75 — Seams.** [docs/refactor.md](refactor.md): six extractions so every
+  fact has one owner and four test seams (`ModelClient`, `Machine`, `Clock`,
+  `Events`) so the gate needs no socket, subprocess, or sleep. It lands before
+  M2.8 because jobs and attach are the first things that would otherwise touch
+  the same tangle.
 - **M2.8 — Concurrent work (jobs + one lock).** Detach long or explicitly
   detached commands into a job registry with ids, status, control, and the same
   completion-wake lifecycle as subagents; `all` waits for agents and commands; a
@@ -576,14 +583,14 @@ Release profile uses `lto = "thin"`, `codegen-units = 1`, `strip = true`.
   CLI, so an agent you run yourself can drive mush. Newline-delimited JSON;
   requests carry an `id`; `edit` carries a base revision and returns `conflict`
   rather than guessing.
-- **M4 — FS watching + merge.** Watch the workspace and three-way merge external
-  changes into dirty buffers (`base`/`ours`/`theirs`), with conflict markers and
-  `.mush/backups/` before anything destructive. This closes the M2 gap.
+- **M4 — FS watching.** `[OBSOLETE v0.2]` There are no buffers to merge into;
+  the periodic git snapshot already tells the human what moved.
 - **M5 — Spawn mode.** `mush` launches a configured agent in a pty pane with
   `MUSH_SOCKET`/`MUSH_ROOT` injected, so "works with any agent" covers binaries
   that know nothing about mush.
-- **M6 — Polish.** Search, syntax highlighting (incremental, dirty-lines only),
-  undo/redo, word motions, config file, optional MCP bridge as a separate binary.
+- **M6 — Polish.** Transcript search, a config file, optional MCP bridge as a
+  separate binary, and per-agent token accounting (invisible, and the one with a
+  bill).
 
 Each milestone ends with a demoable, tested artifact. No milestone depends on a
 later one.
@@ -592,33 +599,36 @@ later one.
 
 ## 10. Testing
 
-- **Unit tests.** Buffer semantics (split/join, multi-byte columns, exact
-  round-trip), path jail and escaping, capped reads, atomic writes, session and
-  user-config round-trips, `.mush` self-ignore, history trimming and its
-  termination guard, compaction, tool-execution semantics (list filtering,
-  unique-match edits), tool-pair repair, argument validation, shell-command
-  timeout, cancellation, output cap and runaway-writer limit, URL/status-line
-  parsing, the model-list timeout, cancelling a chat request mid-wait and the
-  request deadline (plus the slow-but-alive body the slices must not mistake for
-  one), the git snapshot (branch, dirty count, per-branch diffstat), the
-  context-window precedence and the caps that follow it, row field priority, a
-  draw sweep over thirteen terminal sizes, config precedence, schema/prompt
-  invariants,
-  word wrapping, column slicing, the actor mailbox (parked nudges, Stop vs
-  Shutdown, completion delivery), and the `/new`, Ctrl-C, stale-event, and
-  steering-echo state transitions.
+- **Unit tests.** Message-box semantics (grapheme edits, the cursor window, wide
+glyphs), path jail and escaping, capped reads, atomic writes, session and
+user-config round-trips, `.mush` self-ignore, history trimming and its
+termination guard, compaction, tool-execution semantics (list filtering,
+unique-match edits), tool-pair repair, argument validation, shell-command
+timeout, cancellation, output cap and runaway-writer limit, URL/status-line
+parsing (IPv6 literals included), the model-list timeout, cancelling a chat
+request mid-wait and the request deadline (plus the slow-but-alive body the
+slices must not mistake for one, and a dribbling body the deadline must still
+stop), an oversized or malformed response body, the git snapshot (branch, dirty
+count, per-branch diffstat, ref names that look like flags), the context-window
+precedence and the caps that follow it, row field priority and column-aware
+truncation, the `~` elision boundary, a draw sweep over thirteen terminal sizes,
+config precedence, schema/prompt invariants, word wrapping, the actor mailbox
+(parked nudges, Stop vs Shutdown, completion delivery), and the `/new`, Ctrl-C,
+stale-event, steering-echo, stale-status, id-floor, and phase-restore state
+transitions.
 - **End-to-end (pty).** `scripts/smoke.py` drives the real binary over a
   pseudo-terminal with the pty as its controlling terminal (so window size and
   SIGWINCH behave as they do in a terminal). Scenarios: agent (needs a model),
-  editor (needs a model), resize (needs nothing), cancel (needs nothing — a
-  socket that accepts the chat request and never answers must be abandoned by a
-  single Ctrl-C, which is only observable from outside the process).
+  resize (needs nothing), cancel (needs nothing — a socket that accepts the chat
+  request and never answers must be abandoned by a single Ctrl-C, which is only
+  observable from outside the process).
 - **Deterministic orchestration.** `cargo test -- --ignored` starts
   `scripts/mock_llm.py` and runs a root → child → grandchild chain, an isolated
   child whose run must commit its worktree (the test then merges it, removes the
-  worktree, and deletes the branch — the documented commands, executed), and a
-  context overflow that must compact. No network, but it needs `python3` and
-  `git`.
+  worktree, and deletes the branch — the documented commands, executed), a
+  context overflow that must compact, a nudge that lands mid-reply, and a run
+  that hits its turn limit and must end with a wrap-up summary. No network, but
+  it needs `python3` and `git`.
 - **Live.** Two `#[ignore]`d tests talk to the configured endpoint (one of them
   proves the TLS path), so the default suite stays green offline.
 - **The checks.** `cargo fmt --all --check`, `cargo clippy --all-targets --
@@ -628,7 +638,7 @@ later one.
   prints the painted screen as text at 200×50 down to 30×8, which is how the ten
   defects of §4.5 were found and how the next layer gets reviewed. Pass `--ask`
   with a reachable endpoint to see the agent's own screens (thinking, cancel,
-  done); without it the editor's screens need no model at all.
+  done); without it the empty screens need no model at all.
 - **Not yet.** Property tests for merge/undo (they arrive with M4), and a fuzz
   target for the path jail.
 
@@ -645,18 +655,17 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
 
 ## 11. Open questions
 
-1. `[OPEN]` Editor depth: add undo/redo before or after search? Undo is the more
-   painful omission for real use.
-2. `[OPEN]` Highlighting: none, a tiny regex highlighter, or tree-sitter? Leaning
-   "incremental regex at M6", because tree-sitter multiplies the dependency
-   budget for the least certain payoff.
+1. `[OPEN]` Transcript search: `/find` over the focused transcript, or is the
+   scrollback enough?
+2. `[OPEN]` Token accounting per agent: a rough meter per row would make a
+   `MAX_AGENTS` fan-out legible, but the character heuristic is wrong by design.
 3. `[OPEN]` Config file format: `mush.toml` in `.mush/` vs environment only.
 4. `[OPEN]` Should `run_command` be denied by default and enabled per session?
 5. `[OPEN]` Do we ship the MCP bridge ourselves, or leave it to the community?
 6. `[DECIDED]` The M2.7 tiers cut at 80×20: narrower or shorter stacks the agent strip
-   above the chat and hides an empty editor, and 40×10 is the floor, below which
-   mush says so instead of painting shreds. Very wide terminals cap the tree at 34
-   columns and the transcript at 110.
+   above the chat, and 40×10 is the floor, below which mush says so instead of
+   painting shreds. Very wide terminals cap the tree at 34 columns and the
+   transcript at 110.
 7. `[DECIDED]` Notices stay inline in the transcript, neutral `·` for information
    and `!` in red only when something actually failed; the bar's second line
    carries the transient command results.
@@ -677,14 +686,19 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
 
 - **Filesystem + shell is the universal agent interface.** A socket is an
   upgrade, never a requirement.
-- **Agents edit live buffers.** File tools round-trip through the UI thread; this
-  replaces locks, merges, and conflict handling in the common case.
-- **One owner of state.** `Msg` → `update` → `draw`. No shared mutable editor.
+- **The UI owns no file state.** Agents do their own file I/O on their own
+  threads; there is no live buffer, so there is no save race to design around.
+- **mush is not an editor** `[v0.2]`. It manages agents and shows git state at a
+  glance. The message box is the only editable text.
+- **One owner of state.** `Msg` → `update` → `draw`. No shared mutable state
+  between the painter and the work.
+- **A wrap-up turn, not a bare error, at the turn limit** `[v0.2]`. A long task
+  ends with a summary of what was done and what is left; the bound stays.
 - **No async runtime.** Threads and channels; `run_command` off the UI thread.
 - **No OT/CRDT.** Plain files, atomic writes, exact-match edits.
 - **The prompt is data, not logic.** It lives in one small function beside the
   tool schemas, so the contract can be read in one screen.
-- **Seven direct crates, listed in §7.** Anything else must earn its place.
+- **The direct crates in §7 are the budget.** Anything else must earn its place.
 - **`.mush/` ignores itself.** Zero setup, zero footprint in the host repo.
 - **An isolated agent's work is committed when its run ends.** A branch that stays
   at its base commit makes every merge command a lie, however good the diff looks.

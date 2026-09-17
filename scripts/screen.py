@@ -31,7 +31,10 @@ import sys
 import termios
 import time
 
-CSI = re.compile(r"\x1b\[([0-9;?]*)([@-~])", re.S)
+CSI = re.compile(r"\x1b\[([\x20-\x3f]*)([@-~])", re.S)
+# An escape sequence that has not completed after this many characters is
+# treated as garbage and dropped, so one odd byte cannot stall rendering.
+MAX_PENDING = 64
 
 
 class Screen:
@@ -63,6 +66,10 @@ class Screen:
                 if rest.startswith("\x1b["):
                     match = CSI.match(rest)
                     if not match:
+                        if len(rest) > MAX_PENDING:
+                            # Unparsable: drop the escape and render the rest.
+                            index += 1
+                            continue
                         self.pending = rest
                         return
                     self.control(match.group(1), match.group(2))
@@ -99,8 +106,9 @@ class Screen:
         self.pending = ""
 
     def control(self, params: str, final: str) -> None:
-        numbers = [int(p) for p in params.replace("?", "").split(";") if p.isdigit()]
-        first = numbers[0] if numbers else 1
+        numbers = [int(p) for p in re.findall(r"\d+", params)]
+        # J and K default to 0 (cursor to end); the rest default to 1.
+        first = numbers[0] if numbers else (0 if final in "JK" else 1)
         second = numbers[1] if len(numbers) > 1 else 1
         if final in "Hf":
             self.y, self.x = max(0, first - 1), max(0, second - 1)
@@ -123,8 +131,12 @@ class Screen:
         elif final == "K":
             row = self.grid[self.y] if 0 <= self.y < self.rows else None
             if row:
-                start = 0 if first == 2 else (self.x if first == 0 else 0)
-                end = self.cols if first == 2 else (self.cols if first == 0 else self.x + 1)
+                if first == 2:
+                    start, end = 0, self.cols
+                elif first == 1:
+                    start, end = 0, min(self.cols, self.x + 1)
+                else:
+                    start, end = min(self.x, self.cols), self.cols
                 for x in range(start, end):
                     row[x] = " "
         elif final == "X":
@@ -229,12 +241,18 @@ def main() -> int:
     }
     env.pop("MUSH_API_KEY", None)
 
+    try:
+        keys = codecs.decode(args.keys, "unicode_escape") if args.keys else ""
+    except ValueError as exc:
+        print(f"bad --keys value {args.keys!r}: {exc}", file=sys.stderr)
+        return 2
+
     cols, rows = sizes[0]
     tui = Tui(binary, args.workdir, cols, rows, env)
     try:
         tui.pump(args.settle)
-        if args.keys:
-            tui.send(args.keys)
+        if keys:
+            tui.send(keys)
         if args.ask:
             tui.send(args.ask + "\r", settle=args.settle)
         for index, (cols, rows) in enumerate(sizes):

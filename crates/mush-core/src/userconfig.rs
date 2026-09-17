@@ -6,8 +6,9 @@
 //! choices. Resolution order on startup is
 //! `CLI flags > environment > saved session > this file > built-in defaults`.
 //!
-//! Path: `$MUSH_CONFIG`, else `$XDG_CONFIG_HOME/mush/config.json`,
-//! else `~/.config/mush/config.json`.
+//! Path: `$MUSH_CONFIG`, else the platform config directory
+//! (`$XDG_CONFIG_HOME/mush/config.json`, usually `~/.config/mush/config.json`
+//! on Unix, Application Support on macOS, `%APPDATA%` on Windows).
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -32,22 +33,17 @@ pub struct UserConfig {
 }
 
 /// Where the user config lives. `MUSH_CONFIG` overrides the path for tests and
-/// unusual setups.
+/// unusual setups; otherwise the platform's config directory is used
+/// (`$XDG_CONFIG_HOME/mush/config.json` on Unix, the Application Support
+/// directory on macOS, `%APPDATA%` on Windows).
 pub fn config_path() -> PathBuf {
     if let Some(path) = std::env::var_os("MUSH_CONFIG") {
         if !path.is_empty() {
             return PathBuf::from(path);
         }
     }
-    if let Some(xdg) = std::env::var_os("XDG_CONFIG_HOME") {
-        if !xdg.is_empty() {
-            return PathBuf::from(xdg).join("mush/config.json");
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        if !home.is_empty() {
-            return PathBuf::from(home).join(".config/mush/config.json");
-        }
+    if let Some(dir) = dirs::config_dir() {
+        return dir.join("mush/config.json");
     }
     PathBuf::from(".mush-user-config.json")
 }

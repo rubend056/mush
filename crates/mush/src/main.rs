@@ -1,11 +1,13 @@
-//! mush — a small, fast, agent-agnostic terminal editor.
+//! mush — a small, fast terminal surface for coding agents.
 //!
-//! Usage: `mush [DIRECTORY]` and you are editing. An agent connected to the
-//! configured OpenAI-compatible endpoint reads and writes the same workspace.
+//! Usage: `mush [DIRECTORY]` opens a workspace. An agent connected to the
+//! configured OpenAI-compatible endpoint reads and writes it; mush shows the
+//! tree of agents and the repository's state at a glance.
 
 mod agent;
 mod app;
 mod http;
+mod input;
 mod ui;
 
 use std::error::Error;
@@ -65,6 +67,12 @@ fn parse_args() -> Result<Args, String> {
     let mut only_flags = false;
 
     while let Some(arg) = args.next() {
+        // After `--` every argument is a path, however much it looks like a
+        // flag: a directory named `--url` has to be openable (finding A13).
+        if only_flags {
+            set_dir(&mut dir, &arg)?;
+            continue;
+        }
         match arg.as_str() {
             "-h" | "--help" => {
                 print_help();
@@ -87,10 +95,10 @@ fn parse_args() -> Result<Args, String> {
                     .ok_or_else(|| format!("--context needs a token count, got `{value}`"))?;
                 context = Some(tokens);
             }
-            other if other.starts_with("--") && !only_flags => {
+            other if other.starts_with("--") => {
                 return Err(format!("unknown option `{other}` (try --help)"));
             }
-            other => dir = Some(PathBuf::from(other)),
+            other => set_dir(&mut dir, other)?,
         }
     }
 
@@ -103,10 +111,23 @@ fn parse_args() -> Result<Args, String> {
     })
 }
 
+fn set_dir(dir: &mut Option<PathBuf>, value: &str) -> Result<(), String> {
+    if dir.is_some() {
+        // Silently opening one of two directories is worse than saying so
+        // (finding A14).
+        return Err(format!(
+            "only one directory may be given (got `{}` as well)",
+            PathBuf::from(value).display()
+        ));
+    }
+    *dir = Some(PathBuf::from(value));
+    Ok(())
+}
+
 fn print_help() {
     println!(
         "mush {}\n\
-         A small, fast, agent-agnostic terminal editor.\n\n\
+         A small, fast terminal surface for coding agents.\n\n\
          USAGE:\n    mush [DIRECTORY] [--url URL] [--model NAME] [--provider NAME] [--context TOKENS]\n\n\
          OPTIONS:\n\
          \x20   --url URL          OpenAI-compatible endpoint (default: $MUSH_URL or the provider default)\n\
@@ -115,14 +136,13 @@ fn print_help() {
          \x20   --context TOKENS   Context window when nothing else knows it (default: $MUSH_CONTEXT,\n\
          \x20                      else what the endpoint advertises, else the model's known window)\n\n\
          KEYS:\n\
-         \x20   Tab / Shift-Tab   cycle panes (agents, editor, chat)\n\
+         \x20   Tab / Shift-Tab   cycle panes (agents, chat)\n\
          \x20   Enter             send message (chat) · focus agent (agents)\n\
-         \x20   i / Esc           enter insert / leave insert (editor)\n\
+         \x20   j / k · Enter     select and focus an agent\n\
          \x20   c / Esc           cancel agent / back to the root (agents)\n\
          \x20   Ctrl-P            model picker\n\
-         \x20   Ctrl-S            save        Ctrl-R  reload file\n\
          \x20   Ctrl-N            new chat    Ctrl-C  cancel running agents\n\
-         \x20   Ctrl-Q            quit (twice if there are unsaved changes)\n\n\
+         \x20   Ctrl-Q            quit\n\n\
          COMMANDS (type in the chat):\n\
          \x20   /provider [deepseek|custom]  switch provider\n\
          \x20   /model                       pick a model\n\
@@ -130,12 +150,11 @@ fn print_help() {
          \x20   /url http://host:port        set the endpoint\n\
          \x20   /key <secret>                set the API key (saved to the home config)\n\
          \x20   /models                      refresh the model list\n\
-         \x20   /open [path]                 open a file (no path: pick one)\n\
          \x20   /worktrees                   re-scan for leftover isolated worktrees\n\
          \x20   /diff|/merge|/discard <id>   git commands for an isolated agent\n\
          \x20   /new  /help  /quit\n\
          Endpoint, API key, and model defaults live in\n\
-         $MUSH_CONFIG or ~/.config/mush/config.json. The conversation is stored\n\
+         $MUSH_CONFIG or the platform config directory. The conversation is stored\n\
          in <DIRECTORY>/.mush/session.json.",
         env!("CARGO_PKG_VERSION")
     );
@@ -145,17 +164,19 @@ fn run() -> Result<(), Box<dyn Error>> {
     let args = parse_args()?;
     let overrides = args.overrides();
 
-    // `mush src/main.rs` opens that file; `mush dir/` is a workspace.
-    let mut dir = args.dir;
-    let mut open_file: Option<String> = None;
+    let dir = args.dir;
     if dir.is_file() {
-        open_file = dir
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned());
-        dir = dir
-            .parent()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."));
+        // mush works on a directory: the agent's file tools, the git facts,
+        // and the agent tree are all workspace-shaped. Opening a file would
+        // promise an editing surface that no longer exists.
+        return Err(format!(
+            "mush works on a directory, not a file: {} — run mush in {} instead",
+            dir.display(),
+            dir.parent()
+                .map(|parent| parent.display().to_string())
+                .unwrap_or_else(|| ".".to_string())
+        )
+        .into());
     }
 
     let workspace = Workspace::new(&dir)?;
@@ -166,12 +187,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     let stored = Session::load(workspace.root());
     let mut config = config::resolve(&overrides, &UserConfig::load(), stored.as_ref())?;
 
-    // One `/v1/models` request serves both the picker and, when nothing else
-    // named a model, the initial choice. A failed lookup yields the provider's
-    // known models (empty for custom endpoints). An endpoint that advertises a
-    // context window overrides the guess here, before the first request.
-    let models = http::list_models(&config);
-    if config.model.is_empty() {
+    // One `/v1/models` request serves the picker, and picks the initial model
+    // only when nothing else named one. A known model skips the fetch — a slow
+    // or silent endpoint must not delay the first paint (finding A9); `/model`
+    // and `/url` refetch on demand. The endpoint's advertised window can only
+    // be adopted from a fetch that happened.
+    let models = if config.model.is_empty() {
+        let models = http::list_models(&config);
         match models.first() {
             Some(model) => config.model = model.id.clone(),
             None => eprintln!(
@@ -179,7 +201,10 @@ fn run() -> Result<(), Box<dyn Error>> {
                 config.models_url()
             ),
         }
-    }
+        models
+    } else {
+        Vec::new()
+    };
     if let Some(advertised) = models
         .iter()
         .find(|model| model.id == config.model)
@@ -190,15 +215,7 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let (tx, rx) = unbounded::<Msg>();
     let root = agent::spawn(config.clone(), tx.clone(), workspace.root().to_path_buf());
-    let mut app = App::new(
-        workspace,
-        config,
-        stored,
-        root,
-        tx.clone(),
-        models,
-        open_file,
-    );
+    let mut app = App::new(workspace, config, stored, root, tx.clone(), models);
 
     install_panic_hook();
     let mut guard = TerminalGuard::enter()?;
@@ -294,7 +311,7 @@ mod tests {
     }
 
     /// The full startup path with an unreachable endpoint must still produce a
-    /// usable config: that is the "editor opens, no model" case.
+    /// usable config: that is the "window opens, no model" case.
     #[test]
     fn resolution_survives_an_empty_world() {
         let config = config::resolve(&Overrides::default(), &UserConfig::default(), None).unwrap();

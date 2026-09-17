@@ -1,37 +1,27 @@
 //! Application state and the update function.
 //!
-//! mush has exactly one owner of editor state: the UI thread. Every input —
-//! a keystroke, an agent event, a tool request — becomes a `Msg` and flows
-//! through `App::update`. That single entry point is why the editor can hand
-//! live buffers to an agent without races or locks.
+//! The UI thread owns no file state: agents read and write the workspace
+//! themselves, and this module is the human's view of them — the agent tree,
+//! the focused transcript, the git facts, and the message box. Every input — a
+//! keystroke, an agent event — becomes a `Msg` and flows through `App::update`.
 
 use std::collections::HashMap;
 use std::process::Command;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use serde_json::Value;
 
 use mush_core::message::Message;
-use mush_core::workspace::truncate_for_model;
 use mush_core::{
-    git, prompt, session, tools, userconfig, Config, Provider, Session, UserConfig, Workspace,
-    LIST_LIMIT,
+    git, prompt, session, userconfig, Config, Provider, Session, UserConfig, Workspace,
 };
 
 use crate::agent::{self, spawn, AgentEvent, AgentMsg, RootHandle};
 use crate::http;
-
-/// Tools that the model may call but that must execute on the UI thread,
-/// because only the UI thread knows about unsaved buffer content.
-pub struct ToolCallRequest {
-    pub name: String,
-    pub args: Value,
-    pub reply: Sender<Result<String, String>>,
-}
+use crate::input::Input;
 
 pub enum Msg {
     Key(KeyEvent),
@@ -43,32 +33,18 @@ pub enum Msg {
         id: u64,
         event: AgentEvent,
     },
-    /// A file tool to run on this thread, on behalf of an agent acting in the
-    /// main workspace. Carries the conversation for the same reason.
-    Tool {
-        conversation: u64,
-        request: ToolCallRequest,
-    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Focus {
     Agents,
-    Editor,
     Chat,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum Mode {
-    Normal,
-    Insert,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum PickerKind {
     Model,
     Provider,
-    File,
 }
 
 /// A small modal list (models or providers) that grabs the keyboard until
@@ -84,7 +60,6 @@ impl Picker {
         match self.kind {
             PickerKind::Model => " models · Enter picks ".to_string(),
             PickerKind::Provider => " provider · Enter picks ".to_string(),
-            PickerKind::File => " open file · Enter opens ".to_string(),
         }
     }
 }
@@ -166,8 +141,11 @@ pub struct Status {
 }
 
 /// A line for the transcript that is not a message: a note from mush itself.
+/// It is tagged with the agent it concerns, so a root-level failure is not
+/// rendered into every child's transcript (finding B19).
 #[derive(Clone, Debug)]
 pub struct Notice {
+    pub agent: u64,
     pub kind: NoticeKind,
     pub text: String,
 }
@@ -194,238 +172,15 @@ pub struct AgentNode {
     pub summary: Option<String>,
 }
 
-/// A single open file. Lines are stored without their terminators; whether the
-/// file ends in a newline is tracked separately so saves round-trip exactly.
-pub struct Buffer {
-    pub rel: String,
-    pub lines: Vec<String>,
-    pub trailing_newline: bool,
-    pub dirty: bool,
-    pub cursor: (usize, usize),
-    pub scroll: usize,
-    pub h_scroll: usize,
-}
-
-impl Buffer {
-    pub fn from_text(rel: String, text: &str) -> Self {
-        let trailing_newline = text.ends_with('\n');
-        let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
-        if trailing_newline {
-            lines.pop();
-        }
-        if lines.is_empty() {
-            lines.push(String::new());
-        }
-        Self {
-            rel,
-            lines,
-            trailing_newline,
-            dirty: false,
-            cursor: (0, 0),
-            scroll: 0,
-            h_scroll: 0,
-        }
-    }
-
-    pub fn set_text(&mut self, text: &str) {
-        let trailing_newline = text.ends_with('\n');
-        let mut lines: Vec<String> = text.split('\n').map(str::to_string).collect();
-        if trailing_newline {
-            lines.pop();
-        }
-        if lines.is_empty() {
-            lines.push(String::new());
-        }
-        self.lines = lines;
-        self.trailing_newline = trailing_newline;
-        self.clamp();
-    }
-
-    pub fn text(&self) -> String {
-        let mut text = self.lines.join("\n");
-        if self.trailing_newline {
-            text.push('\n');
-        }
-        text
-    }
-
-    pub fn line_count(&self) -> usize {
-        self.lines.len()
-    }
-
-    pub fn line(&self, index: usize) -> &str {
-        self.lines.get(index).map(String::as_str).unwrap_or("")
-    }
-
-    pub fn clamp(&mut self) {
-        let rows = self.lines.len().max(1);
-        if self.cursor.0 >= rows {
-            self.cursor.0 = rows - 1;
-        }
-        let width = self.line(self.cursor.0).chars().count();
-        if self.cursor.1 > width {
-            self.cursor.1 = width;
-        }
-    }
-
-    fn dirty(&mut self) {
-        self.dirty = true;
-    }
-
-    pub fn insert_text(&mut self, text: &str) {
-        if text.is_empty() {
-            return;
-        }
-        let (row, col) = self.cursor;
-        let byte = byte_index(self.line(row), col);
-        if !text.contains('\n') {
-            self.lines[row].insert_str(byte, text);
-            self.cursor.1 += text.chars().count();
-        } else {
-            let parts: Vec<&str> = text.split('\n').collect();
-            let head = self.lines[row][..byte].to_string();
-            let tail = self.lines[row][byte..].to_string();
-            let mut replacement = Vec::with_capacity(parts.len());
-            replacement.push(format!("{head}{}", parts[0]));
-            for part in &parts[1..parts.len() - 1] {
-                replacement.push((*part).to_string());
-            }
-            let last = parts[parts.len() - 1];
-            replacement.push(format!("{last}{tail}"));
-            let new_cursor = (row + parts.len() - 1, last.chars().count());
-            self.lines.splice(row..=row, replacement);
-            self.cursor = new_cursor;
-        }
-        self.dirty();
-    }
-
-    pub fn backspace(&mut self) {
-        let (row, col) = self.cursor;
-        if col > 0 {
-            let line = &mut self.lines[row];
-            let end = byte_index(line, col);
-            let start = byte_index(line, col - 1);
-            line.replace_range(start..end, "");
-            self.cursor.1 -= 1;
-        } else if row > 0 {
-            let current = self.lines.remove(row);
-            let previous_width = self.lines[row - 1].chars().count();
-            self.lines[row - 1].push_str(&current);
-            self.cursor = (row - 1, previous_width);
-        } else {
-            return;
-        }
-        self.dirty();
-    }
-
-    pub fn delete_forward(&mut self) {
-        let (row, col) = self.cursor;
-        let width = self.line(row).chars().count();
-        if col < width {
-            let line = &mut self.lines[row];
-            let start = byte_index(line, col);
-            let end = byte_index(line, col + 1);
-            line.replace_range(start..end, "");
-        } else if row + 1 < self.lines.len() {
-            let next = self.lines.remove(row + 1);
-            self.lines[row].push_str(&next);
-        } else {
-            return;
-        }
-        self.dirty();
-    }
-
-    pub fn move_left(&mut self) {
-        if self.cursor.1 > 0 {
-            self.cursor.1 -= 1;
-        } else if self.cursor.0 > 0 {
-            self.cursor.0 -= 1;
-            self.cursor.1 = self.line(self.cursor.0).chars().count();
-        }
-    }
-
-    pub fn move_right(&mut self) {
-        let width = self.line(self.cursor.0).chars().count();
-        if self.cursor.1 < width {
-            self.cursor.1 += 1;
-        } else if self.cursor.0 + 1 < self.lines.len() {
-            self.cursor.0 += 1;
-            self.cursor.1 = 0;
-        }
-    }
-
-    pub fn move_up(&mut self) {
-        if self.cursor.0 > 0 {
-            self.cursor.0 -= 1;
-            self.clamp();
-        }
-    }
-
-    pub fn move_down(&mut self) {
-        if self.cursor.0 + 1 < self.lines.len() {
-            self.cursor.0 += 1;
-            self.clamp();
-        }
-    }
-
-    pub fn move_home(&mut self) {
-        self.cursor.1 = 0;
-    }
-
-    pub fn move_end(&mut self) {
-        self.cursor.1 = self.line(self.cursor.0).chars().count();
-    }
-
-    pub fn move_top(&mut self) {
-        self.cursor = (0, 0);
-    }
-
-    pub fn move_bottom(&mut self) {
-        self.cursor = (self.lines.len().saturating_sub(1), 0);
-    }
-
-    pub fn scroll_view(&mut self, view_height: usize, view_width: usize) {
-        let height = view_height.max(1);
-        if self.cursor.0 < self.scroll {
-            self.scroll = self.cursor.0;
-        } else if self.cursor.0 >= self.scroll + height {
-            self.scroll = self.cursor.0 + 1 - height;
-        }
-        let column = display_column(self.line(self.cursor.0), self.cursor.1);
-        let width = view_width.max(1);
-        if column < self.h_scroll {
-            self.h_scroll = column;
-        } else if column >= self.h_scroll + width {
-            self.h_scroll = column + 1 - width;
-        }
-    }
-}
-
-fn byte_index(line: &str, char_col: usize) -> usize {
-    line.char_indices()
-        .nth(char_col)
-        .map(|(index, _)| index)
-        .unwrap_or(line.len())
-}
-
-/// Column including tab expansion, used for cursor placement.
-pub fn display_column(line: &str, char_col: usize) -> usize {
-    line.chars()
-        .take(char_col)
-        .map(|c| if c == '\t' { 4 } else { 1 })
-        .sum()
-}
-
 pub struct App {
     pub ws: Workspace,
     pub cfg: Config,
-    pub buffers: Vec<Buffer>,
-    pub current: Option<usize>,
     pub focus: Focus,
-    pub mode: Mode,
     pub chat: Vec<Message>,
     pub notices: Vec<Notice>,
-    pub input: String,
+    /// The message box: text plus a grapheme cursor, so editing is not
+    /// append-and-backspace.
+    pub input: Input,
     pub chat_scroll: usize,
     pub models: Vec<http::Model>,
     pub picker: Option<Picker>,
@@ -451,6 +206,10 @@ pub struct App {
     pub agent_cancel: HashMap<u64, Arc<AtomicBool>>,
     /// Shared with the agent actors so runtime config changes apply everywhere.
     pub cfg_shared: Arc<Mutex<Config>>,
+    /// The tree's id counter. Leftover worktrees are registered under their own
+    /// ids, so the next spawn must start above them or two nodes share an id
+    /// and every id-keyed lookup hits the wrong one (finding B1).
+    agent_ids: Arc<AtomicU64>,
     /// The UI event channel, needed to respawn the root actor on /new.
     ui_tx: Sender<Msg>,
     /// Which conversation the live actor tree belongs to; events tagged with
@@ -464,7 +223,6 @@ pub struct App {
     pub busy: bool,
     pub should_quit: bool,
     pub dirty_screen: bool,
-    pub quit_armed: bool,
     pub spin: u64,
     system: Message,
 }
@@ -477,20 +235,16 @@ impl App {
         root: RootHandle,
         ui_tx: Sender<Msg>,
         models: Vec<http::Model>,
-        open_file: Option<String>,
     ) -> Self {
         let system = Message::system(prompt::system_prompt(&ws.root_str()));
         let chat = stored.map(|s| s.messages).unwrap_or_default();
         let mut app = Self {
             ws,
             cfg,
-            buffers: Vec::new(),
-            current: None,
             focus: Focus::Chat,
-            mode: Mode::Normal,
             chat,
             notices: Vec::new(),
-            input: String::new(),
+            input: Input::default(),
             chat_scroll: 0,
             models,
             picker: None,
@@ -513,6 +267,7 @@ impl App {
             agent_tx: HashMap::from([(0, root.tx)]),
             agent_cancel: HashMap::new(),
             cfg_shared: root.cfg,
+            agent_ids: root.ids.clone(),
             ui_tx,
             conversation: root.conversation,
             git_at: None,
@@ -520,16 +275,12 @@ impl App {
             busy: false,
             should_quit: false,
             dirty_screen: true,
-            quit_armed: false,
             spin: 0,
             system,
         };
         app.discover_worktrees();
         app.count_context();
         app.refresh_git();
-        if let Some(rel) = open_file {
-            app.open_file(&rel);
-        }
         app
     }
 
@@ -617,6 +368,10 @@ impl App {
                 continue;
             }
             let full = format!("mush/{id}");
+            // Keep the tree's counter above every registered id, or the next
+            // `spawn_agent` hands a live child an id a leftover already holds
+            // (finding B1).
+            self.agent_ids.fetch_max(id + 1, Ordering::SeqCst);
             self.agents.push(AgentNode {
                 id,
                 parent: None,
@@ -628,6 +383,17 @@ impl App {
                 summary: Some("found on startup".to_string()),
             });
         }
+        self.repair_focus();
+    }
+
+    /// Reaping a leftover node leaves `focused` (and the cursor) pointing at a
+    /// ghost: the pane would stay titled `agent #4` while typing reports that
+    /// the agent is gone (finding B11).
+    fn repair_focus(&mut self) {
+        if !self.agents.iter().any(|node| node.id == self.focused) {
+            self.focused = 0;
+        }
+        self.agent_cursor = self.agent_cursor.min(self.agents.len().saturating_sub(1));
     }
 
     // ---------------------------------------------------------------- updates
@@ -650,10 +416,6 @@ impl App {
                     let _ = cmd.send(AgentMsg::Shutdown);
                 }
             }
-            Msg::Tool {
-                conversation,
-                request,
-            } => self.on_tool(conversation, request),
         }
         self.dirty_screen = true;
     }
@@ -681,6 +443,35 @@ impl App {
                 self.dirty_screen = true;
             }
         }
+        self.age_stale_cancels();
+    }
+
+    /// A cancel is acknowledged quickly — the actor yields, or the run ends. A
+    /// `⊘` older than this means the acknowledgement will never arrive (the
+    /// actor's mailbox is dead), and a row that spins forever is worse than an
+    /// idle one (finding B6).
+    fn age_stale_cancels(&mut self) {
+        const STALE_CANCEL: Duration = Duration::from_secs(10);
+        let stale: Vec<u64> = self
+            .agents
+            .iter()
+            .filter(|node| {
+                matches!(node.phase, Phase::Cancelling) && node.since.elapsed() > STALE_CANCEL
+            })
+            .map(|node| node.id)
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        for id in stale {
+            if let Some(node) = self.agent_node_mut(id) {
+                node.phase = Phase::Idle;
+                node.since = Instant::now();
+            }
+            self.agent_cancel.remove(&id);
+        }
+        self.recompute_busy();
+        self.dirty_screen = true;
     }
 
     fn on_agent(&mut self, id: u64, event: AgentEvent) {
@@ -694,7 +485,18 @@ impl App {
                 cmd,
             } => {
                 self.agent_tx.insert(child, cmd);
-                self.agent_msgs.entry(child).or_default();
+                // The child's first user message is its brief — the model sees
+                // it, so the transcript should too; otherwise a focused child
+                // looks as if it started from nothing (finding B13).
+                let opening = if brief.trim().is_empty() {
+                    "Begin the task now.".to_string()
+                } else {
+                    brief.clone()
+                };
+                self.agent_msgs
+                    .entry(child)
+                    .or_default()
+                    .push(Message::user(opening));
                 self.agents.push(AgentNode {
                     id: child,
                     parent: Some(parent),
@@ -710,10 +512,12 @@ impl App {
             AgentEvent::Running { cancel } => {
                 // A run started, possibly one the UI did not ask for (an idle
                 // agent woken by a child's result). Mark it so `busy`, the
-                // spinner, and Ctrl-C agree with the actor.
+                // spinner, and Ctrl-C agree with the actor. The last run's
+                // summary belongs to that run, not this one (finding B14).
                 if let Some(node) = self.agent_node_mut(id) {
                     node.phase = Phase::Thinking;
                     node.since = Instant::now();
+                    node.summary = None;
                 }
                 // Keep the run's flag: a Stop must be able to reach a model
                 // call that is still waiting, not just the actor's mailbox.
@@ -721,9 +525,20 @@ impl App {
                 self.recompute_busy();
             }
             AgentEvent::Status(status) => {
-                if let Some(node) = self.agent_node_mut(id) {
-                    node.phase = Phase::Activity(status);
-                    node.since = Instant::now();
+                // A status that arrives after the run's own end (a late or
+                // duplicated commit line) must not put a finished agent back to
+                // work (finding B5).
+                let at_rest = self
+                    .agents
+                    .iter()
+                    .find(|node| node.id == id)
+                    .map(|node| !node.phase.is_busy())
+                    .unwrap_or(true);
+                if !at_rest {
+                    if let Some(node) = self.agent_node_mut(id) {
+                        node.phase = Phase::Activity(status);
+                        node.since = Instant::now();
+                    }
                 }
                 // A status can arrive after the run's work is done (a commit
                 // message, say) and before `Done`: keep `busy` in step with the
@@ -759,7 +574,7 @@ impl App {
                         self.say("cancelled");
                     }
                 } else {
-                    self.note_error(error);
+                    self.note_error_for(id, error);
                 }
                 self.chat_scroll = 0;
                 self.recompute_busy();
@@ -769,15 +584,24 @@ impl App {
                 if let Some(node) = self.agent_node_mut(id) {
                     node.phase = Phase::Done;
                     node.since = Instant::now();
-                    if node.summary.is_none() {
-                        node.summary = summary;
-                    }
+                    // Every Done replaces the row's summary; keeping the first
+                    // one described a run that ended long ago (finding B14).
+                    node.summary = summary;
                 }
                 self.agent_cancel.remove(&id);
                 self.refresh_git();
                 self.recompute_busy();
             }
-            AgentEvent::Resync => self.resync_from_disk(),
+            AgentEvent::Context { tokens } => {
+                // The actor learned the endpoint's real window from a server
+                // complaint; the UI owns the copy the bar, `/context`, and the
+                // tool caps read, so it has to adopt the same number or the
+                // next `/model` clobbers it (finding B7).
+                if !self.cfg.context_explicit && tokens != self.cfg.context_tokens {
+                    self.cfg.context_tokens = tokens;
+                    self.apply_config();
+                }
+            }
             AgentEvent::Compact { summary } => {
                 // The actor's transcript is now [system, user(summary)];
                 // mirror it so nudges, saves, and the visible chat stay in
@@ -813,15 +637,26 @@ impl App {
     }
 
     /// A line for the transcript that is not a message: a hint, or a failure.
+    /// It concerns the root conversation unless tagged otherwise.
     pub fn note(&mut self, text: impl Into<String>) {
+        self.note_for(0, text);
+    }
+
+    pub fn note_for(&mut self, agent: u64, text: impl Into<String>) {
         self.notices.push(Notice {
+            agent,
             kind: NoticeKind::Info,
             text: text.into(),
         });
     }
 
     pub fn note_error(&mut self, text: impl Into<String>) {
+        self.note_error_for(0, text);
+    }
+
+    pub fn note_error_for(&mut self, agent: u64, text: impl Into<String>) {
         self.notices.push(Notice {
+            agent,
             kind: NoticeKind::Error,
             text: text.into(),
         });
@@ -915,177 +750,13 @@ impl App {
         self.agents.iter_mut().find(|node| node.id == id)
     }
 
-    /// A shell command may have changed files behind our back. Reload any
-    /// buffer without local edits so the agent and the human stay consistent.
-    fn resync_from_disk(&mut self) {
-        for buffer in &mut self.buffers {
-            if buffer.dirty {
-                continue;
-            }
-            if let Ok(text) = self.ws.read_file(&buffer.rel, usize::MAX) {
-                if buffer.text() != text {
-                    buffer.set_text(&text);
-                }
-            }
-        }
-    }
-
-    /// A file tool for an agent in the main workspace: it runs on this thread
-    /// because only the UI knows about live buffers. Only for the conversation
-    /// that is still live, though — a tree `/new` abandoned must not touch the
-    /// workspace, and its agent should be told so rather than blocking until
-    /// the tool timeout.
-    fn on_tool(&mut self, conversation: u64, request: ToolCallRequest) {
-        if conversation != self.conversation {
-            let _ = request
-                .reply
-                .send(Err("this conversation has ended".to_string()));
-            return;
-        }
-        let result = self.exec_tool(&request.name, &request.args);
-        let _ = request.reply.send(result);
-    }
-
-    // ------------------------------------------------------------ agent tools
-
-    fn exec_tool(&mut self, name: &str, args: &Value) -> Result<String, String> {
-        match name {
-            "list_files" => tools::list_result(&self.ws, args, self.cfg.list_limit()),
-            "read_file" => {
-                let rel = tools::arg_string(args, "path")?;
-                self.read_live(&rel)
-            }
-            "write_file" => {
-                let rel = tools::arg_string(args, "path")?;
-                let content = tools::arg_string(args, "content")?;
-                self.write_live(&rel, &content)
-            }
-            "edit_file" => {
-                let rel = tools::arg_string(args, "path")?;
-                let old = tools::arg_string(args, "old_string")?;
-                let new = tools::arg_string(args, "new_string")?;
-                let current = self.read_for_edit(&rel)?;
-                let updated = tools::edit_text(&current, &old, &new, &rel)?;
-                self.write_live(&rel, &updated)?;
-                Ok(format!("edited {rel}"))
-            }
-            other => Err(format!("unknown tool `{other}`")),
-        }
-    }
-
-    /// Read through the live buffer when the file is open, so an agent always
-    /// sees what the human sees. Large files are capped for the model's benefit.
-    fn read_live(&self, rel: &str) -> Result<String, String> {
-        Ok(truncate_for_model(
-            self.read_for_edit(rel)?,
-            self.cfg.read_cap(),
-        ))
-    }
-
-    /// The complete current text of a file: buffer first, disk second. Used by
-    /// edit operations, which must never operate on a truncated view.
-    fn read_for_edit(&self, rel: &str) -> Result<String, String> {
-        match self.buffer_index(rel) {
-            Some(index) => Ok(self.buffers[index].text()),
-            None => self.ws.read_file(rel, usize::MAX),
-        }
-    }
-
-    fn write_live(&mut self, rel: &str, content: &str) -> Result<String, String> {
-        let mut note = "";
-        if let Some(index) = self.buffer_index(rel) {
-            if self.buffers[index].dirty {
-                note = " (unsaved editor changes were replaced)";
-            }
-            self.ws.write_file(rel, content)?;
-            let buffer = &mut self.buffers[index];
-            buffer.set_text(content);
-            buffer.dirty = false;
-        } else {
-            self.ws.write_file(rel, content)?;
-        }
-        self.refresh_git();
-        Ok(format!("wrote {rel}{note}"))
-    }
-
-    // -------------------------------------------------------------- workspace
-
-    fn buffer_index(&self, rel: &str) -> Option<usize> {
-        let normalized = rel.trim_start_matches("./");
-        self.buffers
-            .iter()
-            .position(|buffer| buffer.rel == normalized)
-    }
-
-    pub fn open_file(&mut self, rel: &str) {
-        if let Some(index) = self.buffer_index(rel) {
-            self.current = Some(index);
-            self.focus = Focus::Editor;
-            self.mode = Mode::Normal;
-            return;
-        }
-        match self.ws.read_file(rel, usize::MAX) {
-            Ok(text) => {
-                self.buffers.push(Buffer::from_text(rel.to_string(), &text));
-                self.current = Some(self.buffers.len() - 1);
-                self.focus = Focus::Editor;
-                self.mode = Mode::Normal;
-                self.say(format!("opened {rel}"));
-            }
-            Err(error) => self.fail(error),
-        }
-    }
-
-    pub fn save_current(&mut self) {
-        let Some(index) = self.current else {
-            self.say("no file open");
-            return;
-        };
-        let rel = self.buffers[index].rel.clone();
-        let text = self.buffers[index].text();
-        match self.ws.write_file(&rel, &text) {
-            Ok(()) => {
-                self.buffers[index].dirty = false;
-                self.refresh_git();
-                self.say(format!("saved {rel}"));
-            }
-            Err(error) => self.fail(error),
-        }
-    }
-
-    pub fn reload_current(&mut self) {
-        let Some(index) = self.current else {
-            return;
-        };
-        let rel = self.buffers[index].rel.clone();
-        match self.ws.read_file(&rel, usize::MAX) {
-            Ok(text) => {
-                self.buffers[index].set_text(&text);
-                self.buffers[index].dirty = false;
-                self.say(format!("reloaded {rel}"));
-            }
-            Err(error) => self.fail(error),
-        }
-    }
-
-    pub fn current_rel(&self) -> Option<&str> {
-        self.current.map(|index| self.buffers[index].rel.as_str())
-    }
-
-    fn with_buffer(&mut self, action: impl FnOnce(&mut Buffer)) {
-        if let Some(index) = self.current {
-            action(&mut self.buffers[index]);
-        }
-    }
-
     // ------------------------------------------------------------- chat / LLM
 
     fn send_message(&mut self) {
-        let text = self.input.trim().to_string();
+        let text = self.input.take().trim().to_string();
         if text.is_empty() {
             return;
         }
-        self.input.clear();
         if text.starts_with('/') {
             self.run_command(&text);
             return;
@@ -1095,6 +766,9 @@ impl App {
             // The human's words belong in the transcript they can see, whether
             // the root is starting a run or already in one.
             self.chat.push(Message::user(text.clone()));
+            // The meter counts the root's conversation, the human's own words
+            // included (finding B8).
+            self.count_context();
             self.chat_scroll = 0;
             self.save_session();
             // The root's own phase, not the tree's: a napping orchestrator is
@@ -1140,6 +814,9 @@ impl App {
             }
         } else {
             // Nudge a specific agent; running ones fold it in, idle ones rerun.
+            // If the mailbox is gone the node's phase is put back exactly as it
+            // was, instead of leaving a lie on the row (finding B10).
+            let previous = self.agent_node_mut(target).map(|node| node.phase.clone());
             if let Some(msgs) = self.agent_msgs.get_mut(&target) {
                 msgs.push(Message::user(text.clone()));
             }
@@ -1150,8 +827,8 @@ impl App {
             match self.agent_tx.get(&target) {
                 Some(tx) if tx.send(AgentMsg::Nudge(text)).is_ok() => {}
                 _ => {
-                    if let Some(node) = self.agent_node_mut(target) {
-                        node.phase = Phase::Idle;
+                    if let (Some(node), Some(previous)) = (self.agent_node_mut(target), previous) {
+                        node.phase = previous;
                     }
                     self.fail(format!("agent #{target} is gone"));
                 }
@@ -1170,18 +847,11 @@ impl App {
             "/quit" | "/q" => self.should_quit = true,
             "/help" | "/?" => {
                 self.note(
-                    "mush: Tab cycles agents/editor/chat · Enter sends to the focused agent · \
-                     Ctrl-P pick a model · Ctrl-S save · Ctrl-R reload · Ctrl-N new chat · \
+                    "mush: Tab cycles agents/chat · Enter sends to the focused agent · \
+                     Ctrl-P pick a model · Ctrl-N new chat · \
                      Ctrl-C cancel all. Commands: /provider /model /context /url /key /models \
-                     /open /worktrees /diff /merge /discard /new /quit",
+                     /worktrees /diff /merge /discard /new /quit",
                 );
-            }
-            "/open" => {
-                if rest.is_empty() {
-                    self.open_file_picker();
-                    return;
-                }
-                self.open_file(rest);
             }
             "/context" => {
                 if rest.is_empty() {
@@ -1240,8 +910,15 @@ impl App {
                     return;
                 }
                 self.cfg.set_base_url(rest);
+                // A new endpoint may host a different model with a different
+                // window; re-derive it unless the human stated one (finding A5).
+                self.cfg.rederive_context();
                 self.refresh_models();
-                self.say(format!("endpoint: {}", self.cfg.base_url));
+                self.say(format!(
+                    "endpoint: {} · {}",
+                    self.cfg.base_url,
+                    self.context_label()
+                ));
                 self.apply_config();
                 self.persist_user_config();
             }
@@ -1353,25 +1030,6 @@ impl App {
         });
     }
 
-    /// Open the workspace's files, so `/open` without a path (or a new user
-    /// wondering how to open one) has somewhere to look.
-    fn open_file_picker(&mut self) {
-        let items = self.ws.list_files(LIST_LIMIT.min(500));
-        if items.is_empty() {
-            self.fail("no files here — is this the right directory?");
-            return;
-        }
-        let cursor = self
-            .current_rel()
-            .and_then(|rel| items.iter().position(|item| item == rel))
-            .unwrap_or(0);
-        self.picker = Some(Picker {
-            kind: PickerKind::File,
-            items,
-            cursor,
-        });
-    }
-
     fn open_provider_picker(&mut self) {
         let items: Vec<String> = Provider::ALL.iter().map(|p| p.name().to_string()).collect();
         let cursor = items
@@ -1399,15 +1057,23 @@ impl App {
             self.cfg.base_url = provider.default_base_url().to_string();
         }
         let known = self.cfg.default_models();
-        if !known.contains(&self.cfg.model) {
+        let mut model = self.cfg.model.clone();
+        if !known.contains(&model) {
             if let Some(first) = known.first() {
-                self.cfg.model = first.clone();
+                model = first.clone();
             }
         }
+        // The new provider means a new window; re-derive it unless the human
+        // stated one (finding A5).
+        self.cfg.set_model(&model);
         self.refresh_models();
         self.apply_config();
         self.persist_user_config();
-        self.say(format!("provider: {}", provider.name()));
+        self.say(format!(
+            "provider: {} · {}",
+            provider.name(),
+            self.context_label()
+        ));
     }
 
     fn key_picker(&mut self, key: KeyEvent) {
@@ -1445,8 +1111,10 @@ impl App {
             PickerKind::Model => {
                 // The picker labels models with their window; the id is the
                 // part before the separator.
-                let id = item.split(" · ").next().unwrap_or(item).to_string();
-                self.cfg.model = id;
+                let id = item.split(" · ").next().unwrap_or(item);
+                // A new model means a new documented window, unless the human
+                // stated one (finding A5).
+                self.cfg.set_model(id);
                 self.adopt_advertised_context();
                 self.apply_config();
                 self.persist_user_config();
@@ -1457,7 +1125,6 @@ impl App {
                 ));
             }
             PickerKind::Provider => self.apply_provider(item),
-            PickerKind::File => self.open_file(item),
         }
     }
 
@@ -1500,11 +1167,12 @@ impl App {
             self.ui_tx.clone(),
             self.ws.root().to_path_buf(),
         );
-        // The respawned root owns its own config cell and conversation tag;
-        // adopt both, or a later /model would never reach the agent and its
-        // events would look stale.
+        // The respawned root owns its own config cell, conversation tag, and id
+        // counter; adopt all three, or a later /model would never reach the
+        // agent, its events would look stale, and a spawn could reuse an id.
         self.cfg_shared = root.cfg.clone();
         self.conversation = root.conversation;
+        self.agent_ids = root.ids.clone();
         self.agent_tx = HashMap::from([(0, root.tx)]);
         self.agent_cancel.clear();
         self.agent_msgs.clear();
@@ -1575,17 +1243,10 @@ impl App {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
-        let is_quit_key = ctrl && key.code == KeyCode::Char('q');
-        if !is_quit_key {
-            self.quit_armed = false;
-        }
-
         if ctrl {
             match key.code {
                 KeyCode::Char('q') => return self.request_quit(),
                 KeyCode::Char('c') => return self.interrupt(),
-                KeyCode::Char('s') => return self.save_current(),
-                KeyCode::Char('r') => return self.reload_current(),
                 KeyCode::Char('n') => return self.new_chat(),
                 KeyCode::Char('p') => return self.open_model_picker(),
                 _ => {}
@@ -1605,18 +1266,11 @@ impl App {
 
         match self.focus {
             Focus::Agents => self.key_agents(key),
-            Focus::Editor => self.key_editor(key, ctrl, alt),
             Focus::Chat => self.key_chat(key, ctrl, alt),
         }
     }
 
     fn request_quit(&mut self) {
-        let dirty = self.buffers.iter().any(|buffer| buffer.dirty);
-        if dirty && !self.quit_armed {
-            self.quit_armed = true;
-            self.fail("unsaved changes — Ctrl-Q again to discard, Ctrl-S to save");
-            return;
-        }
         self.should_quit = true;
     }
 
@@ -1645,14 +1299,19 @@ impl App {
             .collect();
         let mut stopped = 0usize;
         for id in targets {
-            if !self.stop_agent(id) {
-                continue;
-            }
+            // A dead mailbox is a gone actor: mark the row so it stops showing
+            // work that can never finish (finding B6).
+            let alive = self.stop_agent(id);
             stopped += 1;
-            // Say so immediately: the actor may be mid-request, and a row that
-            // keeps spinning looks like the Stop was never heard.
             if let Some(node) = self.agent_node_mut(id) {
-                node.phase = Phase::Cancelling;
+                if alive {
+                    // Say so immediately: the actor may be mid-request, and a
+                    // row that keeps spinning looks like the Stop was never
+                    // heard.
+                    node.phase = Phase::Cancelling;
+                } else {
+                    node.phase = Phase::Idle;
+                }
                 node.since = Instant::now();
             }
         }
@@ -1663,17 +1322,13 @@ impl App {
     }
 
     fn cycle_focus(&mut self, direction: i64) {
-        let order = [Focus::Agents, Focus::Editor, Focus::Chat];
+        let order = [Focus::Agents, Focus::Chat];
         let index = match self.focus {
             Focus::Agents => 0,
-            Focus::Editor => 1,
-            Focus::Chat => 2,
+            Focus::Chat => 1,
         };
         let next = (index as i64 + direction).rem_euclid(order.len() as i64) as usize;
         self.focus = order[next];
-        if self.focus == Focus::Editor {
-            self.mode = Mode::Normal;
-        }
     }
 
     fn key_agents(&mut self, key: KeyEvent) {
@@ -1722,97 +1377,23 @@ impl App {
         }
     }
 
-    fn key_editor(&mut self, key: KeyEvent, ctrl: bool, alt: bool) {
-        if self.mode == Mode::Insert {
-            match key.code {
-                KeyCode::Esc => self.mode = Mode::Normal,
-                KeyCode::Enter => self.with_buffer(|buffer| buffer.insert_text("\n")),
-                KeyCode::Tab => self.with_buffer(|buffer| buffer.insert_text("    ")),
-                KeyCode::Backspace => self.with_buffer(|buffer| buffer.backspace()),
-                KeyCode::Delete => self.with_buffer(|buffer| buffer.delete_forward()),
-                KeyCode::Left => self.with_buffer(|buffer| buffer.move_left()),
-                KeyCode::Right => self.with_buffer(|buffer| buffer.move_right()),
-                KeyCode::Up => self.with_buffer(|buffer| buffer.move_up()),
-                KeyCode::Down => self.with_buffer(|buffer| buffer.move_down()),
-                KeyCode::Home => self.with_buffer(|buffer| buffer.move_home()),
-                KeyCode::End => self.with_buffer(|buffer| buffer.move_end()),
-                KeyCode::Char(c) if !ctrl && !alt => {
-                    self.with_buffer(|buffer| buffer.insert_text(&c.to_string()))
-                }
-                _ => {}
-            }
-            return;
-        }
-
-        match key.code {
-            KeyCode::Esc => {}
-            KeyCode::Char('d') if ctrl => self.with_buffer(|buffer| {
-                for _ in 0..10 {
-                    buffer.move_down();
-                }
-            }),
-            KeyCode::Char('u') if ctrl => self.with_buffer(|buffer| {
-                for _ in 0..10 {
-                    buffer.move_up();
-                }
-            }),
-            KeyCode::Char('i') if !ctrl && !alt => self.mode = Mode::Insert,
-            KeyCode::Char('a') if !ctrl && !alt => {
-                self.with_buffer(|buffer| buffer.move_right());
-                self.mode = Mode::Insert;
-            }
-            KeyCode::Char('I') => {
-                self.with_buffer(|buffer| buffer.move_home());
-                self.mode = Mode::Insert;
-            }
-            KeyCode::Char('A') => {
-                self.with_buffer(|buffer| buffer.move_end());
-                self.mode = Mode::Insert;
-            }
-            KeyCode::Char('o') => {
-                self.with_buffer(|buffer| {
-                    buffer.move_end();
-                    buffer.insert_text("\n");
-                });
-                self.mode = Mode::Insert;
-            }
-            KeyCode::Char('O') => {
-                self.with_buffer(|buffer| {
-                    buffer.move_home();
-                    buffer.insert_text("\n");
-                    buffer.move_up();
-                });
-                self.mode = Mode::Insert;
-            }
-            KeyCode::Char('x') | KeyCode::Delete => {
-                self.with_buffer(|buffer| buffer.delete_forward())
-            }
-            KeyCode::Char('h') | KeyCode::Left => self.with_buffer(|buffer| buffer.move_left()),
-            KeyCode::Char('j') | KeyCode::Down => self.with_buffer(|buffer| buffer.move_down()),
-            KeyCode::Char('k') | KeyCode::Up => self.with_buffer(|buffer| buffer.move_up()),
-            KeyCode::Char('l') | KeyCode::Right => self.with_buffer(|buffer| buffer.move_right()),
-            KeyCode::Char('0') | KeyCode::Home => self.with_buffer(|buffer| buffer.move_home()),
-            KeyCode::Char('$') | KeyCode::End => self.with_buffer(|buffer| buffer.move_end()),
-            KeyCode::Char('g') => self.with_buffer(|buffer| buffer.move_top()),
-            KeyCode::Char('G') => self.with_buffer(|buffer| buffer.move_bottom()),
-            _ => {}
-        }
-    }
-
+    /// The message box: a plain text field with a real cursor, so a long
+    /// prompt can be edited instead of backspaced away.
     fn key_chat(&mut self, key: KeyEvent, ctrl: bool, alt: bool) {
         match key.code {
             KeyCode::Enter => self.send_message(),
-            KeyCode::Backspace => {
-                self.input.pop();
-            }
-            KeyCode::Char(c) if !ctrl && !alt => self.input.push(c),
+            KeyCode::Backspace => self.input.backspace(),
+            KeyCode::Delete => self.input.delete_forward(),
+            KeyCode::Left => self.input.move_left(),
+            KeyCode::Right => self.input.move_right(),
+            KeyCode::Home => self.input.move_home(),
+            KeyCode::End => self.input.move_end(),
+            KeyCode::Char(c) if !ctrl && !alt => self.input.insert(&c.to_string()),
             KeyCode::Up => self.scroll_chat(1),
             KeyCode::Down => self.scroll_chat(-1),
             KeyCode::PageUp => self.scroll_chat(10),
             KeyCode::PageDown => self.scroll_chat(-10),
             KeyCode::Esc => self.input.clear(),
-            KeyCode::Home => {}
-            KeyCode::End => {}
             _ => {}
         }
     }
@@ -1820,21 +1401,21 @@ impl App {
 
 /// Show only the edges of a secret for confirmation without leaking it.
 fn mask_key(key: &str) -> String {
-    let key = key.trim();
-    if key.len() <= 8 {
+    // Four *characters*, not four bytes: `/key aéééé` must not panic on a
+    // multi-byte boundary (finding B2).
+    let chars: Vec<char> = key.trim().chars().collect();
+    if chars.len() <= 8 {
         return "••••".to_string();
     }
-    format!("{}…{}", &key[..4], &key[key.len() - 4..])
+    let first: String = chars[..4].iter().collect();
+    let last: String = chars[chars.len() - 4..].iter().collect();
+    format!("{first}…{last}")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossbeam_channel::Receiver;
-
-    fn buffer(text: &str) -> Buffer {
-        Buffer::from_text("test".to_string(), text)
-    }
 
     /// The transient line the bar would show, or the empty string.
     fn text_of(app: &App) -> &str {
@@ -1848,8 +1429,6 @@ mod tests {
         }
     }
 
-    /// A real `App` on a scratch directory, with a real (idle) root actor. The
-    /// returned receiver keeps the UI channel alive for the life of the test.
     /// A real `App` on a scratch directory, with a real (idle) root actor. The
     /// returned receiver keeps the UI channel alive for the life of the test.
     fn test_app(label: &str) -> (App, Receiver<Msg>) {
@@ -1870,7 +1449,6 @@ mod tests {
                 id: "test-model".to_string(),
                 context: None,
             }],
-            None,
         );
         (app, rx)
     }
@@ -1882,6 +1460,7 @@ mod tests {
         let (mut app, _rx) = test_app("new");
         app.chat.push(Message::user("an old task"));
         app.notices.push(Notice {
+            agent: 0,
             kind: NoticeKind::Info,
             text: "old noise".to_string(),
         });
@@ -1900,7 +1479,7 @@ mod tests {
 
         // Its mailbox is alive, so the next message starts a run instead of
         // reporting that the root is gone.
-        app.input = "hello".to_string();
+        app.input.insert("hello");
         app.send_message();
         assert!(app.busy);
         assert_eq!(app.agents[0].phase, Phase::Thinking);
@@ -1946,7 +1525,7 @@ mod tests {
         let (mut app, _rx) = test_app("steer");
         app.busy = true;
         app.agents[0].phase = Phase::Thinking;
-        app.input = "also rename the module".to_string();
+        app.input.insert("also rename the module");
 
         app.send_message();
 
@@ -1955,27 +1534,45 @@ mod tests {
         assert_eq!(text_of(&app), "noted — folded in as the agent continues");
     }
 
-    /// The file tools of an abandoned tree must not touch the workspace: its
-    /// `write_file` would otherwise land in the live buffers of the new chat.
+    /// The meter counts the human's own words as soon as they are sent, not
+    /// only once a reply arrives (finding B8).
     #[test]
-    fn file_tools_from_an_abandoned_conversation_are_refused() {
-        let (mut app, _rx) = test_app("stale-tools");
-        let abandoned = app.conversation;
-        app.run_command("/new");
-        let (reply, replies) = crossbeam_channel::bounded(1);
+    fn the_context_meter_counts_the_human_message() {
+        let (mut app, _rx) = test_app("meter");
+        let before = app.context_used_tokens();
+        app.input
+            .insert("a question long enough to weigh something");
+        app.send_message();
+        assert!(
+            app.context_used_tokens() > before,
+            "the meter ignores the human's message"
+        );
+    }
 
-        app.update(Msg::Tool {
-            conversation: abandoned,
-            request: ToolCallRequest {
-                name: "write_file".to_string(),
-                args: serde_json::json!({"path": "evil.txt", "content": "boom"}),
-                reply,
-            },
+    /// A failed nudge puts the node's phase back exactly as it was (finding
+    /// B10); a dead mailbox must not rewrite a `✓` into `· idle`.
+    #[test]
+    fn a_failed_nudge_restores_the_phase() {
+        let (mut app, _rx) = test_app("nudge-restore");
+        app.focus = Focus::Agents;
+        app.agent_tx.remove(&1);
+        app.agents.push(AgentNode {
+            id: 1,
+            parent: Some(0),
+            depth: 1,
+            brief: "lexer".to_string(),
+            phase: Phase::Done,
+            since: Instant::now(),
+            branch: None,
+            summary: Some("did the work".to_string()),
         });
+        app.focused = 1;
+        app.input.insert("one more thing");
 
-        let result = replies.recv().unwrap();
-        assert!(result.is_err(), "the stale tool is refused, not run");
-        assert!(!app.ws.exists("evil.txt"), "the workspace is untouched");
+        app.send_message();
+
+        assert_eq!(app.agents[1].phase, Phase::Done, "the ✓ is not rewritten");
+        assert_eq!(text_of(&app), "agent #1 is gone");
     }
 
     /// A tree `/new` abandoned can still spawn children, and their `Spawned`
@@ -2019,7 +1616,7 @@ mod tests {
             "nothing running · Ctrl-Q quits · Ctrl-N starts a new chat"
         );
 
-        app.input = "hello".to_string();
+        app.input.insert("hello");
         app.send_message();
         assert_eq!(
             app.agents[0].phase,
@@ -2191,8 +1788,8 @@ mod tests {
         use ratatui::Terminal;
 
         let (mut app, _rx) = test_app("layout-sizes");
-        // A tree with depth, a branch, and every phase, plus an open file, so
-        // no branch of the renderer goes unexercised.
+        // A tree with depth, a branch, and every phase, so no branch of the
+        // renderer goes unexercised.
         let conversation = app.conversation;
         for (id, parent, depth) in [(1u64, 0u64, 1usize), (2, 1, 2)] {
             app.update(Msg::Agent {
@@ -2211,7 +1808,6 @@ mod tests {
         app.agents[1].phase = Phase::Activity("edit_file src/lexer.rs 12s".to_string());
         app.agents[2].phase = Phase::Failed("no route to host".to_string());
         app.refresh_git();
-        app.open_file("notes.txt");
 
         for (width, height) in [
             (200u16, 50u16),
@@ -2232,9 +1828,9 @@ mod tests {
             terminal
                 .draw(|frame| crate::ui::draw(frame, &mut app))
                 .unwrap_or_else(|error| panic!("draw failed at {width}x{height}: {error}"));
-            // Both focus states, since the compact tier hides the editor when
-            // it is empty and empty-but-focused is the awkward case.
-            app.focus = Focus::Editor;
+            // Both focus states, since a border is painted differently when it
+            // is focused and a focused-but-tiny pane is the awkward case.
+            app.focus = Focus::Agents;
             terminal
                 .draw(|frame| crate::ui::draw(frame, &mut app))
                 .unwrap_or_else(|error| panic!("draw failed at {width}x{height}: {error}"));
@@ -2242,48 +1838,154 @@ mod tests {
         }
     }
 
+    /// Showing the edges of an API key must count characters: slicing four
+    /// bytes of a multi-byte key panicked (finding B2).
     #[test]
-    fn text_roundtrips_with_and_without_trailing_newline() {
-        assert_eq!(buffer("a\nb\n").text(), "a\nb\n");
-        assert_eq!(buffer("a\nb").text(), "a\nb");
-        assert_eq!(buffer("").text(), "");
-        assert_eq!(buffer("\n").text(), "\n");
+    fn masking_a_key_never_splits_a_character() {
+        assert_eq!(mask_key("short"), "••••");
+        assert_eq!(mask_key("aéééééééé"), "aééé…éééé");
+        assert_eq!(mask_key(&"é".repeat(9)), "éééé…éééé");
     }
 
+    /// A status that arrives after the run ended must not put a finished agent
+    /// back to work (finding B5).
     #[test]
-    fn insert_newline_splits_the_line() {
-        let mut b = buffer("hello world\n");
-        b.cursor = (0, 5);
-        b.insert_text("\n");
-        assert_eq!(b.text(), "hello\n world\n");
-        assert_eq!(b.cursor, (1, 0));
+    fn a_late_status_does_not_restart_a_finished_agent() {
+        let (mut app, _rx) = test_app("late-status");
+        let conversation = app.conversation;
+        app.update(Msg::Agent {
+            conversation,
+            id: 0,
+            event: AgentEvent::Done,
+        });
+        assert_eq!(app.agents[0].phase, Phase::Done);
+        app.update(Msg::Agent {
+            conversation,
+            id: 0,
+            event: AgentEvent::Status("committed abc123 on mush/1".to_string()),
+        });
+        assert_eq!(app.agents[0].phase, Phase::Done, "the ✓ must survive");
+        assert!(!app.busy);
     }
 
+    /// A `⊘` whose acknowledgement can never arrive goes quiet instead of
+    /// spinning forever (finding B6).
     #[test]
-    fn backspace_joins_lines() {
-        let mut b = buffer("ab\ncd\n");
-        b.cursor = (1, 0);
-        b.backspace();
-        assert_eq!(b.text(), "abcd\n");
-        assert_eq!(b.cursor, (0, 2));
+    fn a_stale_cancel_falls_back_to_idle() {
+        let (mut app, _rx) = test_app("stale-cancel");
+        app.agents[0].phase = Phase::Cancelling;
+        app.agents[0].since = Instant::now() - Duration::from_secs(11);
+        app.busy = true;
+        app.tick();
+        assert_eq!(app.agents[0].phase, Phase::Idle);
+        assert!(!app.busy, "the bar must stop claiming work");
     }
 
+    /// The child's brief is the first thing its transcript shows, exactly as
+    /// the model received it (finding B13).
     #[test]
-    fn multibyte_columns_are_char_based() {
-        let mut b = buffer("héllo\n");
-        b.cursor = (0, 1);
-        b.insert_text("X");
-        assert_eq!(b.text(), "hXéllo\n");
-        b.cursor = (0, 3);
-        b.backspace();
-        assert_eq!(b.text(), "hXllo\n");
+    fn a_childs_brief_is_the_start_of_its_transcript() {
+        let (mut app, _rx) = test_app("brief");
+        let conversation = app.conversation;
+        app.update(Msg::Agent {
+            conversation,
+            id: 0,
+            event: AgentEvent::Spawned {
+                child: 1,
+                parent: 0,
+                brief: "count the lexer tokens".to_string(),
+                depth: 1,
+                branch: None,
+                cmd: crossbeam_channel::unbounded().0,
+            },
+        });
+        let messages = &app.agent_msgs[&1];
+        assert_eq!(messages.len(), 1, "the brief opens the transcript");
+        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].text(), "count the lexer tokens");
     }
 
+    /// Every Done replaces the row's summary, and a new run clears it: the row
+    /// describes the current run, not the first one forever (finding B14).
     #[test]
-    fn delete_forward_joins_lines_at_eol() {
-        let mut b = buffer("ab\ncd\n");
-        b.cursor = (0, 2);
-        b.delete_forward();
-        assert_eq!(b.text(), "abcd\n");
+    fn a_rows_summary_follows_the_latest_run() {
+        let (mut app, _rx) = test_app("summary");
+        let conversation = app.conversation;
+        app.chat.push(Message::assistant("first result"));
+        app.update(Msg::Agent {
+            conversation,
+            id: 0,
+            event: AgentEvent::Done,
+        });
+        assert_eq!(app.agents[0].summary.as_deref(), Some("first result"));
+        app.update(Msg::Agent {
+            conversation,
+            id: 0,
+            event: AgentEvent::Running {
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        });
+        assert_eq!(app.agents[0].summary, None, "a new run clears the old one");
+        app.chat.push(Message::assistant("second result"));
+        app.update(Msg::Agent {
+            conversation,
+            id: 0,
+            event: AgentEvent::Done,
+        });
+        assert_eq!(app.agents[0].summary.as_deref(), Some("second result"));
+    }
+
+    /// Leftover worktrees keep their ids, and the tree's counter is raised
+    /// above them, so the next spawned child cannot collide (finding B1); a
+    /// reaped leftover releases the focus (finding B11).
+    #[test]
+    fn leftover_worktrees_raise_the_id_floor_and_release_the_focus() {
+        use std::fs;
+        use std::process::Command;
+
+        let root = std::env::temp_dir().join(format!("mush-app-wt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        git(&["worktree", "add", "-q", "-b", "mush/7", ".mush/wt/7"]);
+
+        let ws = Workspace::new(&root).unwrap();
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let mut app = App::new(ws, cfg, None, handle, tx, Vec::new());
+
+        assert!(
+            app.agents.iter().any(|node| node.id == 7),
+            "the leftover is registered"
+        );
+        assert!(
+            app.agent_ids.load(Ordering::SeqCst) >= 8,
+            "the next spawn must not reuse #7"
+        );
+
+        app.focused = 7;
+        git(&["worktree", "remove", "--force", ".mush/wt/7"]);
+        app.discover_worktrees();
+        assert!(
+            !app.agents.iter().any(|node| node.id == 7),
+            "the reaped leftover is gone"
+        );
+        assert_eq!(app.focused, 0, "focus cannot point at a ghost");
+        let _ = fs::remove_dir_all(&root);
     }
 }

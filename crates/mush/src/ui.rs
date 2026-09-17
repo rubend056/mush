@@ -6,16 +6,16 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
+use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use mush_core::message::Message;
 
-use crate::app::{
-    display_column, short_age, AgentNode, App, Focus, Mode, NoticeKind, Phase, PickerKind,
-    StatusKind,
-};
+use crate::app::{short_age, AgentNode, App, Focus, NoticeKind, Phase, PickerKind, StatusKind};
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// The idle bar hint, when there is nothing to report.
+const HINT: &str = "Tab cycles panes · /help lists commands · Ctrl-P picks a model";
 /// Beyond this the transcript is unreadable, however wide the terminal is.
 const MAX_TRANSCRIPT: u16 = 110;
 /// Below this mush has no room to be honest: say so instead of painting shreds.
@@ -34,42 +34,25 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     }
 
     // Size tiers (docs/mush.md §4.5 R3). Narrow or short terminals stack the
-    // agent strip above the chat, because two columns starve both panes; an
-    // empty editor is hidden there rather than eating the rows chat needs.
+    // agent strip above the chat, because two columns starve both panes.
     let compact = area.width < 80 || area.height < 20;
-    let editor_open = app.current.is_some();
     let bar_rows = if area.height >= 26 { 2 } else { 1 };
 
     if compact {
         let agent_rows = (app.agents.len() as u16 + 2).clamp(3, 6);
-        let show_editor = editor_open || app.focus == Focus::Editor;
-        // The chat pane draws its own message box, so there is no separate
-        // constraint for it here.
-        let mut constraints = vec![Constraint::Length(agent_rows)];
-        if show_editor {
-            constraints.push(Constraint::Length(4));
-        }
-        constraints.push(Constraint::Min(6)); // chat + message box
-        constraints.push(Constraint::Length(bar_rows));
-        let rows = Layout::vertical(constraints).split(area);
-        let mut index = 0;
-        draw_agents(frame, app, rows[index]);
-        index += 1;
-        if show_editor {
-            draw_editor(frame, app, rows[index]);
-            index += 1;
-        }
-        draw_chat(frame, app, rows[index]);
-        draw_status(frame, app, rows[rows.len() - 1]);
-    } else {
         let rows = Layout::vertical([
-            Constraint::Min(6),
-            Constraint::Percentage(45),
+            Constraint::Length(agent_rows),
+            Constraint::Min(6), // chat transcript + message box
             Constraint::Length(bar_rows),
         ])
         .split(area);
+        draw_agents(frame, app, rows[0]);
+        draw_chat(frame, app, rows[1]);
+        draw_status(frame, app, rows[2]);
+    } else {
+        let rows = Layout::vertical([Constraint::Min(6), Constraint::Length(bar_rows)]).split(area);
         // On a very wide terminal the tree stops growing: past a point it is
-        // empty space, and the editor is what the width belongs to.
+        // empty space, and the chat is what the width belongs to.
         let agents_pane = if area.width >= 160 {
             Constraint::Length(34)
         } else {
@@ -77,9 +60,8 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         };
         let columns = Layout::horizontal([agents_pane, Constraint::Min(20)]).split(rows[0]);
         draw_agents(frame, app, columns[0]);
-        draw_editor(frame, app, columns[1]);
-        draw_chat(frame, app, rows[1]);
-        draw_status(frame, app, rows[2]);
+        draw_chat(frame, app, columns[1]);
+        draw_status(frame, app, rows[1]);
     }
     draw_picker(frame, app);
 }
@@ -237,8 +219,7 @@ fn fit_row(head: &str, brief: &str, branch_stat: &str, tail: &[String], width: u
     let mut remaining = budget;
     if after_branch >= 7 && !brief.is_empty() {
         let text = truncate(brief, after_branch - 1);
-        // `truncate` counts characters, not columns: a wide glyph can make the
-        // text one column wider than asked for, so never subtract past zero.
+        // `truncate` budgets display columns now, so this width is the truth.
         remaining = remaining.saturating_sub(UnicodeWidthStr::width(text.as_str()) + 1);
         line.push(' ');
         line.push_str(&text);
@@ -330,92 +311,6 @@ fn phase_detail(node: &AgentNode) -> String {
     }
 }
 
-fn draw_editor(frame: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Focus::Editor;
-    let title = match app.current_rel() {
-        Some(rel) => {
-            let dirty = app
-                .current
-                .map(|index| app.buffers[index].dirty)
-                .unwrap_or(false);
-            if dirty {
-                format!(" {rel} • ")
-            } else {
-                format!(" {rel} ")
-            }
-        }
-        None => " editor ".to_string(),
-    };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(border(focused))
-        .title(title);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    if inner.height == 0 || inner.width == 0 {
-        return;
-    }
-    let Some(index) = app.current else {
-        frame.render_widget(
-            Paragraph::new(
-                "No file open — /open <path> (no path: pick one), or start mush with a file.",
-            )
-            .style(dim()),
-            inner,
-        );
-        return;
-    };
-
-    let buffer = &mut app.buffers[index];
-    let view_height = inner.height as usize;
-    let gutter = buffer.line_count().to_string().len().max(3);
-    let text_width = (inner.width as usize).saturating_sub(gutter + 3);
-    buffer.scroll_view(view_height, text_width);
-
-    let start = buffer.scroll;
-    let end = (start + view_height).min(buffer.line_count());
-    let mut lines = Vec::with_capacity(end.saturating_sub(start));
-    for row in start..end {
-        let number = format!("{:>width$}", row + 1, width = gutter);
-        let current = row == buffer.cursor.0 && focused;
-        let line_style = if current {
-            Style::default().bg(Color::Indexed(236))
-        } else {
-            Style::default()
-        };
-        let expanded: String = buffer
-            .line(row)
-            .chars()
-            .map(|c| {
-                if c == '\t' {
-                    "    ".to_string()
-                } else {
-                    c.to_string()
-                }
-            })
-            .collect();
-        let content = slice_columns(&expanded, buffer.h_scroll, text_width);
-        lines.push(Line::from(vec![
-            Span::styled(number, dim()),
-            Span::styled(" │ ", dim()),
-            Span::styled(content, line_style),
-        ]));
-    }
-    frame.render_widget(Paragraph::new(Text::from(lines)), inner);
-
-    if focused && app.mode == Mode::Insert {
-        let row = buffer.cursor.0.saturating_sub(buffer.scroll) as u16;
-        let column = display_column(buffer.line(buffer.cursor.0), buffer.cursor.1)
-            .saturating_sub(buffer.h_scroll) as u16;
-        let x = inner.x + gutter as u16 + 3 + column;
-        let y = inner.y + row;
-        if y < inner.y + inner.height && x < inner.x + inner.width {
-            frame.set_cursor_position(Position::new(x, y));
-        }
-    }
-}
-
 fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Chat;
     let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(3)]).split(area);
@@ -438,7 +333,8 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         let width = (inner.width as usize).min(MAX_TRANSCRIPT as usize);
         let height = inner.height as usize;
         let messages = focused_messages(app);
-        let lines = transcript_lines(app, messages, width);
+        let mut lines = transcript_lines(app, messages, width);
+        trim_trailing_blanks(&mut lines);
         let max_scroll = lines.len().saturating_sub(height);
         let scroll = max_scroll.saturating_sub(app.chat_scroll.min(max_scroll));
         let visible: Vec<Line> = lines.into_iter().skip(scroll).take(height).collect();
@@ -458,18 +354,29 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         } else {
             format!("#{} › ", app.focused)
         };
+        let prompt_width = UnicodeWidthStr::width(prompt.as_str());
+        let field = (input_inner.width as usize).saturating_sub(prompt_width);
+        // The box scrolls with the cursor instead of clipping its tail: what
+        // the human is editing is always the part on screen.
+        let (text, column) = app.input.window(field);
         let line = Line::from(vec![
-            Span::styled(prompt.clone(), Style::default().fg(Color::Cyan)),
-            Span::raw(app.input.clone()),
+            Span::styled(prompt, Style::default().fg(Color::Cyan)),
+            Span::raw(text),
         ]);
         frame.render_widget(Paragraph::new(line), input_inner);
         if focused {
-            let offset = (UnicodeWidthStr::width(prompt.as_str())
-                + UnicodeWidthStr::width(app.input.as_str())) as u16;
-            let max_x = input_inner.x + input_inner.width.saturating_sub(1);
-            let x = (input_inner.x + offset).min(max_x);
-            frame.set_cursor_position(Position::new(x, input_inner.y));
+            let offset = (prompt_width + column).min(input_inner.width.saturating_sub(1) as usize);
+            frame.set_cursor_position(Position::new(input_inner.x + offset as u16, input_inner.y));
         }
+    }
+}
+
+/// Every message ends with a blank separator line. At one row of transcript that
+/// blank would be the only visible line — the reply would be invisible — so the
+/// separator is trimmed before windowing (finding B4).
+fn trim_trailing_blanks(lines: &mut Vec<Line<'static>>) {
+    while lines.last().map(|line| line.width()) == Some(0) {
+        lines.pop();
     }
 }
 
@@ -526,7 +433,6 @@ fn draw_picker(frame: &mut Frame, app: &App) {
                 .map(|item| item.split(" · ").next().unwrap_or(item) == app.cfg.model)
                 .unwrap_or(false),
             PickerKind::Provider => item == app.cfg.provider.name(),
-            PickerKind::File => app.current_rel() == Some(item.as_str()),
         };
         let label = if current {
             format!("• {item}")
@@ -557,27 +463,12 @@ fn draw_picker(frame: &mut Frame, app: &App) {
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let focus = match app.focus {
         Focus::Agents => "agents",
-        Focus::Editor => match app.mode {
-            Mode::Normal => "editor · normal",
-            Mode::Insert => "editor · insert",
-        },
         Focus::Chat => "chat",
     };
-    // Priority: what the tree is doing (derived) › what just happened (fades) ›
-    // the static hint. Work in progress is never stored, so it cannot linger.
-    let (message, style) = match (app.activity_line(), app.status_line()) {
-        (Some(activity), _) => (activity, Style::default().fg(Color::Cyan)),
-        (None, Some((text, StatusKind::Error))) => {
-            (text.to_string(), Style::default().fg(Color::Red))
-        }
-        (None, Some((text, StatusKind::Info))) => {
-            (text.to_string(), Style::default().fg(Color::Gray))
-        }
-        (None, None) => (
-            "Tab cycles panes · /help lists commands · Ctrl-P picks a model".to_string(),
-            dim(),
-        ),
-    };
+    // Priority: a failure first (the Ctrl-Q warning included, so it is never
+    // hidden behind work in progress), then what the tree is doing (derived),
+    // then what just happened (fades), then the static hint.
+    let (message, style) = bar_line(app.status_line(), app.activity_line());
     let line = Line::from(vec![
         Span::styled(
             format!(" {focus} "),
@@ -602,14 +493,37 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+/// What the bar's first line says, and how it looks. Pure so the priority is
+/// testable without a frame: an error must never lose to work in progress
+/// (finding B12 — the Ctrl-Q warning included).
+fn bar_line(status: Option<(&str, StatusKind)>, activity: Option<String>) -> (String, Style) {
+    match status {
+        Some((text, StatusKind::Error)) => (text.to_string(), Style::default().fg(Color::Red)),
+        _ => match activity {
+            Some(activity) => (activity, Style::default().fg(Color::Cyan)),
+            None => match status {
+                Some((text, _)) => (text.to_string(), Style::default().fg(Color::Gray)),
+                None => (HINT.to_string(), dim()),
+            },
+        },
+    }
+}
+
 /// `⌂ ~/p/demo │ master ±3 +12 −3 │ deepseek-flash · ctx ~500k │ /help` — the
 /// stable facts, in the order that matters, cut from the right when the
 /// terminal is narrow.
 fn facts_line(app: &App, width: usize) -> String {
     let root = app.ws.root_str();
     let home = std::env::var("HOME").unwrap_or_default();
-    let shown = if !home.is_empty() && root.starts_with(&home) {
-        format!("~{}", &root[home.len()..])
+    // `~` only stands for the home *directory*: `/home/ru` must not elide
+    // `/home/ruben/x` into `~ben/x` (finding B18).
+    let shown = if !home.is_empty() && root == home {
+        "~".to_string()
+    } else if let Some(rest) = root
+        .strip_prefix(&home)
+        .filter(|rest| rest.starts_with('/'))
+    {
+        format!("~{rest}")
     } else {
         root
     };
@@ -642,8 +556,15 @@ fn facts_line(app: &App, width: usize) -> String {
 
 fn transcript_lines(app: &App, messages: &[Message], width: usize) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
+    // Notices are tagged with the agent they concern, so a root-level failure
+    // is not painted into a focused child's transcript (finding B19).
+    let notices: Vec<&crate::app::Notice> = app
+        .notices
+        .iter()
+        .filter(|notice| notice.agent == app.focused)
+        .collect();
     if app.focused == 0 {
-        if messages.is_empty() && app.notices.is_empty() {
+        if messages.is_empty() && notices.is_empty() {
             out.push(Line::from(Span::styled(
                 "Ask for a change — the agent reads and edits this workspace directly.",
                 dim(),
@@ -651,7 +572,7 @@ fn transcript_lines(app: &App, messages: &[Message], width: usize) -> Vec<Line<'
             out.push(Line::from(""));
             out.push(Line::from(Span::styled(app.cfg.label(), dim())));
             out.push(Line::from(Span::styled(
-                "Tab cycles panes · Enter sends · /open <file> edits · /help lists commands",
+                "Tab cycles panes · Enter sends · /help lists commands",
                 dim(),
             )));
             return out;
@@ -670,7 +591,7 @@ fn transcript_lines(app: &App, messages: &[Message], width: usize) -> Vec<Line<'
     for message in messages {
         render_message(&mut out, message, width);
     }
-    for notice in &app.notices {
+    for notice in notices {
         let (prefix, style) = match notice.kind {
             NoticeKind::Info => ("·", dim()),
             NoticeKind::Error => ("!", Style::default().fg(Color::Red)),
@@ -756,27 +677,6 @@ fn render_message(out: &mut Vec<Line<'static>>, message: &Message, width: usize)
     }
 }
 
-/// Char-aware slice by display column, used for horizontal scrolling.
-fn slice_columns(line: &str, skip: usize, width: usize) -> String {
-    let mut out = String::new();
-    let mut column = 0usize;
-    for ch in line.chars() {
-        let char_width = UnicodeWidthChar::width(ch).unwrap_or(1).max(1);
-        if column + char_width <= skip {
-            column += char_width;
-            continue;
-        }
-        if column >= skip && column + char_width <= skip + width {
-            out.push(ch);
-        }
-        column += char_width;
-        if column >= skip + width {
-            break;
-        }
-    }
-    out
-}
-
 /// Word-aware wrapping that preserves explicit newlines and never splits a
 /// grapheme's display width arithmetic.
 pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -820,23 +720,48 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
     out
 }
 
-/// Shorten to at most `max` characters *including* the ellipsis, so callers can
-/// budget columns with it (the old contract silently returned `max + 1`).
+/// Shorten to at most `max` display columns *including* the ellipsis, so a
+/// caller budgeting columns gets text that really fits (finding B9: counting
+/// characters made a CJK row twice as wide as its budget).
 fn truncate(text: &str, max: usize) -> String {
-    if text.chars().count() <= max {
-        return text.to_string();
-    }
     if max == 0 {
         return String::new();
     }
-    let mut out: String = text.chars().take(max - 1).collect();
-    out.push('…');
-    out
+    let (out, _) = text.unicode_truncate(max);
+    if out.len() == text.len() {
+        return text.to_string();
+    }
+    let (body, _) = text.unicode_truncate(max - 1);
+    format!("{body}…")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_error_outranks_activity() {
+        let (text, _) = bar_line(
+            Some(("cannot reach http://127.0.0.1:1", StatusKind::Error)),
+            Some("#0 thinking 3s".to_string()),
+        );
+        assert_eq!(
+            text, "cannot reach http://127.0.0.1:1",
+            "an error is visible"
+        );
+
+        let (text, _) = bar_line(
+            Some(("opened notes.txt", StatusKind::Info)),
+            Some("#0 thinking 3s".to_string()),
+        );
+        assert_eq!(text, "#0 thinking 3s", "activity beats a fading info line");
+
+        let (text, _) = bar_line(Some(("opened notes.txt", StatusKind::Info)), None);
+        assert_eq!(text, "opened notes.txt");
+
+        let (text, _) = bar_line(None, None);
+        assert!(text.contains("/help"), "{text}");
+    }
 
     /// A row's glyph is the whole status vocabulary in one character; it must
     /// never claim a run that did not happen (`·`, not `✓`).
@@ -933,9 +858,20 @@ mod tests {
         assert_eq!(lines.join(""), "abcdefghijklmnop");
     }
 
+    /// A truncation budget is in columns, so a wide glyph must not overshoot it
+    /// (finding B9).
     #[test]
-    fn slices_by_display_column() {
-        assert_eq!(slice_columns("hello world", 6, 5), "world");
-        assert_eq!(slice_columns("hello", 3, 10), "lo");
+    fn truncation_counts_columns_not_characters() {
+        let wide = "日本語日本語";
+        let cut = truncate(wide, 5);
+        assert!(
+            UnicodeWidthStr::width(cut.as_str()) <= 5,
+            "{cut} is {} columns",
+            UnicodeWidthStr::width(cut.as_str())
+        );
+        assert!(cut.ends_with('…'), "{cut}");
+        assert_eq!(truncate("short", 10), "short");
+        assert_eq!(truncate("anything", 0), "");
+        assert!(UnicodeWidthStr::width(truncate(wide, 1).as_str()) <= 1);
     }
 }

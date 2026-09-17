@@ -6,12 +6,12 @@
 //! an orchestrator can spawn N children, wait for whichever finishes first,
 //! nudge or stop individual agents, and descendants can spawn their own.
 //!
-//! File access still honors the single-owner rule: agents working in the main
-//! workspace round-trip file tools through the UI thread (live buffers), while
-//! isolated agents edit their own git worktree directly on disk.
+//! File access is direct disk I/O on the agent's own thread: the UI holds no
+//! copy of any file, so there is nothing to round-trip and nothing to keep in
+//! sync. An isolated agent works in its own git worktree.
 
 use std::collections::{HashMap, HashSet};
-use std::fs::{self, File};
+use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
@@ -21,19 +21,20 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
+use tempfile::NamedTempFile;
 
 use mush_core::config::parse_context_hint;
 use mush_core::message::{ChatRequest, ChatResponse};
 use mush_core::workspace::truncate_for_model;
 use mush_core::{prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_SECS};
 
-use crate::app::{Msg, ToolCallRequest};
+use crate::app::Msg;
 use crate::http;
 
-/// Safety valve: how many model turns one run may take.
+/// Safety valve: how many model turns one run may take. The final turn is a
+/// wrap-up turn — tools are withdrawn and the model is asked to summarize — so
+/// hitting the limit produces a result, not an error (finding N1).
 const MAX_TURNS: usize = 24;
-/// A tool that never comes back must not wedge the agent forever.
-const TOOL_TIMEOUT: Duration = Duration::from_secs(300);
 /// How deep subagent chains may go (0 = root agent only).
 pub const MAX_DEPTH: usize = 3;
 /// Hard ceiling on simultaneously running agents across the whole tree.
@@ -82,9 +83,14 @@ pub enum AgentEvent {
     },
     Status(String),
     Message(Message),
-    Resync,
     Done,
     Error(String),
+    /// The window the endpoint itself named when it rejected a request; the UI
+    /// adopts it so the bar, `/context`, and the tool caps agree with the agent
+    /// (finding B7).
+    Context {
+        tokens: usize,
+    },
     /// The transcript was folded into a summary (context compaction); the
     /// conversation is now `[system, user(summary)]`.
     Compact {
@@ -164,6 +170,9 @@ pub struct RootHandle {
     pub cfg: Arc<Mutex<Config>>,
     /// Identifies this conversation in events; see `AgentCtx::conversation`.
     pub conversation: u64,
+    /// The tree's id counter, so the UI can raise its floor to the highest id
+    /// a leftover worktree already occupies (finding B1).
+    pub ids: Arc<AtomicU64>,
 }
 
 /// Start the root actor.
@@ -172,13 +181,15 @@ pub fn spawn(cfg: Config, tx: Sender<Msg>, root: PathBuf) -> RootHandle {
     static CONVERSATIONS: AtomicU64 = AtomicU64::new(1);
     let conversation = CONVERSATIONS.fetch_add(1, Ordering::SeqCst);
     let shared = Arc::new(Mutex::new(cfg));
+    // Root agent is id 0; children start at 1. The UI holds a clone so it can
+    // raise the floor above leftover worktree ids.
+    let ids = Arc::new(AtomicU64::new(1));
     let ctx = Arc::new(AgentCtx {
         cfg: shared.clone(),
         tx,
         conversation,
         root,
-        // Root agent is id 0; children start at 1.
-        ids: Arc::new(AtomicU64::new(1)),
+        ids: ids.clone(),
         live: Arc::new(AtomicU64::new(0)),
     });
     let ws = Workspace::new(&ctx.root).expect("workspace root must exist");
@@ -203,6 +214,7 @@ pub fn spawn(cfg: Config, tx: Sender<Msg>, root: PathBuf) -> RootHandle {
         tx: cmd_tx,
         cfg: shared,
         conversation,
+        ids: ids.clone(),
     }
 }
 
@@ -407,7 +419,7 @@ fn run_loop(
     messages: &mut Vec<Message>,
     cancel: &AtomicBool,
 ) -> Result<Option<String>, String> {
-    let tools = if actor.depth >= MAX_DEPTH {
+    let schemas = if actor.depth >= MAX_DEPTH {
         prompt::leaf_tool_schemas()
     } else {
         prompt::tool_schemas()
@@ -416,7 +428,11 @@ fn run_loop(
     // window, anything else is the run's error.
     let mut learned_context = false;
 
-    for _ in 0..MAX_TURNS {
+    for turn in 0..MAX_TURNS {
+        // The last turn is a wrap-up: no tools, and a request for a summary.
+        // A long task then ends with a report of what was done and what is
+        // left, instead of a bare `stopped after 24 turns` (finding N1).
+        let wrap_up = turn + 1 == MAX_TURNS;
         drain_mailbox(&actor.rx, cancel, messages, state);
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.to_string());
@@ -441,12 +457,28 @@ fn run_loop(
         // Keep the whole request inside the endpoint's context window.
         trim_history(messages, budget);
 
+        // The wrap-up turn asks for a summary, appended only to the request so
+        // the stored transcript does not carry a turn-limit notice. A stop that
+        // arrived in the meantime is honoured below, before the request goes
+        // out.
+        let asked;
+        let request_messages: &[Message] = if wrap_up {
+            asked = {
+                let mut with_instruction = messages.clone();
+                with_instruction.push(Message::user(WRAP_UP_INSTRUCTION));
+                with_instruction
+            };
+            &asked
+        } else {
+            messages
+        };
+
         let mut request = ChatRequest {
             model: &cfg.model,
-            messages,
-            tools: &tools,
+            messages: request_messages,
+            tools: if wrap_up { &[] } else { &schemas },
             // `auto` keeps models that ignore tools working: they simply answer.
-            tool_choice: "auto",
+            tool_choice: if wrap_up { "none" } else { "auto" },
             stream: false,
             temperature: 0.2,
             max_tokens: 2048,
@@ -486,14 +518,21 @@ fn run_loop(
             // A hosted API advertises nothing, so its own complaint is the only
             // current source for the window. Learn it, tell the human, retry
             // once — and never again in this run, or a server that complains
-            // about everything becomes a loop.
-            if !learned_context {
+            // about everything becomes a loop. A number that would collapse the
+            // window by more than 8x is refused: a rate-limit body must not
+            // teach mush that the endpoint has ten tokens (finding A3).
+            if !learned_context && !cfg.context_explicit {
                 if let Some(tokens) = parse_context_hint(&detail) {
-                    if tokens < cfg.context_tokens {
+                    let plausible = tokens < cfg.context_tokens
+                        && tokens.saturating_mul(8) >= cfg.context_tokens;
+                    if plausible {
                         cfg.context_tokens = tokens;
                         if let Ok(mut shared) = actor.ctx.cfg.lock() {
                             shared.context_tokens = tokens;
                         }
+                        // The UI owns the copy every surface reads, so it gets
+                        // the number too (finding B7).
+                        actor.ctx.emit(actor.id, AgentEvent::Context { tokens });
                         actor.ctx.emit(
                             actor.id,
                             AgentEvent::Status(format!(
@@ -533,6 +572,25 @@ fn run_loop(
 
         messages.push(assistant.clone());
         actor.ctx.emit(actor.id, AgentEvent::Message(assistant));
+
+        if wrap_up {
+            // Whatever the model wrote is the run's result. If it tried to keep
+            // calling tools, answer the calls so the transcript stays valid,
+            // but run none of them: the run is out of turns.
+            for call in &tool_calls {
+                let message = Message::tool(
+                    call.id.clone(),
+                    format!("error: the run hit its {MAX_TURNS}-turn limit; tools are no longer available"),
+                );
+                messages.push(message.clone());
+                actor.ctx.emit(actor.id, AgentEvent::Message(message));
+            }
+            return if content.is_empty() {
+                Err(format!("stopped after {MAX_TURNS} turns without finishing"))
+            } else {
+                Ok(Some(content))
+            };
+        }
 
         if tool_calls.is_empty() {
             if content.is_empty() {
@@ -606,15 +664,6 @@ fn run_loop(
 
             let result = exec_tool(actor, state, &name, &args, cancel);
 
-            // Shell commands and edits in the main workspace can move files
-            // behind the editor's back; ask the UI to resync clean buffers.
-            if name == "run_command"
-                || (actor.ws.root() == actor.ctx.root
-                    && matches!(name.as_str(), "write_file" | "edit_file"))
-            {
-                actor.ctx.emit(actor.id, AgentEvent::Resync);
-            }
-
             let output = match result {
                 Ok(output) => output,
                 Err(error) => format!("error: {error}"),
@@ -633,6 +682,12 @@ fn run_loop(
 
     Err(format!("stopped after {MAX_TURNS} turns without finishing"))
 }
+
+/// The instruction appended to the request on the run's final turn.
+const WRAP_UP_INSTRUCTION: &str = "\
+You have reached this run's turn limit. Stop using tools now — they are no \
+longer available. Reply with a concise summary of what has been done, what \
+still remains, and anything the next run needs to know.";
 
 /// The instruction appended when the transcript nears the context window.
 const COMPACT_INSTRUCTION: &str = "\
@@ -813,7 +868,6 @@ fn exec_tool(
         "wait_agents" => wait_tool(actor, state, cancel, args),
         "agent_status" => status_tool(state),
         "agent_control" => control_tool(state, args),
-        _ if actor.ws.root() == actor.ctx.root => forward_to_ui(&actor.ctx, name, args),
         _ => {
             let cfg = actor
                 .ctx
@@ -1136,30 +1190,9 @@ fn create_worktree(
     }
 }
 
-/// File tools for the main workspace must run on the UI thread: only it knows
-/// about live buffers.
-fn forward_to_ui(ctx: &AgentCtx, name: &str, args: &Value) -> Result<String, String> {
-    let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-    let request = ToolCallRequest {
-        name: name.to_string(),
-        args: args.clone(),
-        reply: reply_tx,
-    };
-    let sent = ctx.tx.send(Msg::Tool {
-        conversation: ctx.conversation,
-        request,
-    });
-    if sent.is_err() {
-        return Err("mush is shutting down".to_string());
-    }
-    match reply_rx.recv_timeout(TOOL_TIMEOUT) {
-        Ok(result) => result,
-        Err(_) => Err(format!("{name} did not complete in time")),
-    }
-}
-
-/// Same five tools, executed directly against a workspace the UI never sees
-/// (an isolated agent's worktree): plain disk I/O, no live buffers.
+/// The five file tools, executed against a workspace on disk. Only the agent's
+/// own thread touches the files: the human's screen never holds a copy, so
+/// there is nothing to keep in sync.
 fn direct_tool(ws: &Workspace, name: &str, args: &Value, cfg: &Config) -> Result<String, String> {
     match name {
         "list_files" => tools::list_result(ws, args, cfg.list_limit()),
@@ -1346,62 +1379,47 @@ fn kill_command(child: &mut Child) {
 }
 
 /// A command's output file, removed when it is dropped.
+///
+/// `NamedTempFile` picks the name and creates it exclusively, so a guessable
+/// name in a shared temp directory can never redirect or read what a command
+/// prints — the property the hand-rolled counter and `0600` tried to buy. It is
+/// named (rather than an O_TMPFILE handle) because the child needs its own file
+/// description: `reopen` gives one for reading without moving the writer's
+/// offset.
 struct Scratch {
-    path: PathBuf,
+    file: NamedTempFile,
 }
 
 impl Scratch {
     fn new(kind: &str) -> Result<Self, String> {
-        static COUNTER: AtomicU64 = AtomicU64::new(0);
-        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
-        // The timestamp keeps a reused pid from colliding with a file left
-        // behind by a crashed run (which would make `create_new` fail and the
-        // command never run).
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|since| since.as_nanos())
-            .unwrap_or(0);
-        let path = std::env::temp_dir().join(format!(
-            "mush-cmd-{}-{stamp}-{unique}-{kind}",
-            std::process::id()
-        ));
-        Ok(Self { path })
+        NamedTempFile::with_prefix(format!("mush-cmd-{kind}-"))
+            .map(|file| Self { file })
+            .map_err(|error| format!("cannot create a scratch file: {error}"))
     }
 
-    /// A write handle for the child to inherit. `create_new` plus `0600`
-    /// keeps a guessable name in a shared temp directory from being a way to
-    /// redirect or read what a command prints.
+    /// An independent write handle for the child to inherit.
     fn writer(&self) -> Result<File, String> {
-        let mut options = fs::OpenOptions::new();
-        options.write(true).create_new(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600);
-        }
-        options
-            .open(&self.path)
-            .map_err(|error| format!("cannot create {}: {error}", self.path.display()))
+        self.file
+            .reopen()
+            .map_err(|error| format!("cannot open the scratch file: {error}"))
     }
 
     /// What was written, capped for the model. Reads one byte past the cap so
     /// a truncated result is marked as such.
     fn read(&self, cap: usize) -> String {
         let mut bytes = Vec::new();
-        if let Ok(file) = File::open(&self.path) {
+        if let Ok(file) = self.file.reopen() {
             let _ = file.take(cap as u64 + 1).read_to_end(&mut bytes);
         }
         truncate_for_model(String::from_utf8_lossy(&bytes).into_owned(), cap)
     }
 
     fn size(&self) -> u64 {
-        fs::metadata(&self.path).map(|meta| meta.len()).unwrap_or(0)
-    }
-}
-
-impl Drop for Scratch {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        self.file
+            .as_file()
+            .metadata()
+            .map(|meta| meta.len())
+            .unwrap_or(0)
     }
 }
 
@@ -1554,6 +1572,7 @@ mod tests {
     use super::*;
     use mush_core::{FunctionCall, ToolCall};
     use serde_json::json;
+    use std::fs;
 
     #[test]
     fn summarize_prefers_paths_then_commands_then_briefs() {
@@ -2260,24 +2279,31 @@ mod tests {
         let root = init_git_repo("compact");
 
         let mut cfg = Config::new(format!("http://127.0.0.1:{PORT}"), "mock", None);
-        // Tiny window: history_budget() = 3 * (ctx - 3348) bytes = 1956.
+        // Tight window: the reserve scales with it, so the budget is 3 * (ctx
+        // - ctx/2) = 6000 bytes.
         cfg.context_tokens = 4_000;
         let budget = cfg.history_budget();
 
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
         let root_tx = spawn(cfg, tx, root.clone()).tx;
 
-        // ~1.6 KB of history: above 3/4 of the budget but still fitting, so
-        // compaction must trigger instead of trimming.
+        // History above 3/4 of the budget but still fitting: compaction must
+        // trigger instead of trimming. Built until it crosses the line, so the
+        // test does not encode the budget formula.
         let mut messages = vec![
             Message::system("you are mush"),
             Message::user("create a file via subagents".to_string()),
         ];
-        for i in 0..5 {
-            messages.push(Message::assistant(format!("reply {i} {}", "x".repeat(280))));
-            messages.push(Message::user(format!("again {i}")));
+        let mut total: usize = messages.iter().map(Message::weight).sum();
+        let mut index = 0;
+        while total <= budget * 3 / 4 {
+            let assistant = Message::assistant(format!("reply {index} {}", "x".repeat(280)));
+            let user = Message::user(format!("again {index}"));
+            total += assistant.weight() + user.weight();
+            messages.push(assistant);
+            messages.push(user);
+            index += 1;
         }
-        let total: usize = messages.iter().map(Message::weight).sum();
         assert!(
             total > budget * 3 / 4 && total <= budget,
             "test transcript must sit in the compaction window (total {total}, budget {budget})"
@@ -2377,6 +2403,57 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         assert!(first, "the first reply should arrive while the nudge waits");
         assert!(steered, "the nudge must be answered, not swallowed");
+    }
+
+    /// Hitting the turn limit must end with a summary, not a bare `stopped
+    /// after 24 turns without finishing`: the safety valve stays, the failure
+    /// goes (finding N1).
+    #[test]
+    #[ignore = "needs python3; spawns a local mock model server"]
+    fn the_turn_limit_ends_with_a_summary() {
+        const PORT: u16 = 18_735;
+        let mock = start_mock(PORT);
+        let root = std::env::temp_dir().join(format!("mush-turns-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+
+        let cfg = Config::new(format!("http://127.0.0.1:{PORT}"), "mock", None);
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let root_tx = spawn(cfg, tx, root.clone()).tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user("TURNS"),
+            ]))
+            .unwrap();
+
+        let mut done = false;
+        let mut error = None;
+        let mut wrapped_up = false;
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !done && error.is_none() && Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Msg::Agent { event, .. }) => match event {
+                    AgentEvent::Done => done = true,
+                    AgentEvent::Error(why) => error = Some(why),
+                    AgentEvent::Message(message) if message.role == "assistant" => {
+                        wrapped_up |= message.text().contains("wrapped up");
+                    }
+                    _ => {}
+                },
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                Ok(Msg::Key(_)) => {}
+            }
+        }
+        stop_mock(mock);
+        let _ = fs::remove_dir_all(&root);
+        assert_eq!(
+            error, None,
+            "the turn limit must not be reported as an error"
+        );
+        assert!(done, "the run must finish normally");
+        assert!(wrapped_up, "the wrap-up turn's summary must be the result");
     }
 
     /// Start the scripted mock model server and wait until it answers.

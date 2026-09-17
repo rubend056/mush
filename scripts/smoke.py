@@ -4,10 +4,10 @@
 These drive the *real* binary through a pseudo-terminal: they send keystrokes,
 wait for the configured model to call tools, and assert on files on disk. That
 makes them the only test that covers the whole path — keys, agent loop, tool
-round-trip through the UI thread, atomic writes, and session persistence.
+execution, atomic writes, and session persistence.
 
 Usage:
-    python3 scripts/smoke.py [BINARY] [WORKDIR] [--agent|--editor|--resize|--cancel]
+    python3 scripts/smoke.py [BINARY] [WORKDIR] [--agent|--resize|--cancel]
 
 The resize and cancel scenarios need no model endpoint; the others do.
 
@@ -127,9 +127,8 @@ class Tui:
         return text
 
     def close(self) -> int:
-        self.send("\x11", 0.4)  # Ctrl-Q
-        self.send("\x11", 0.4)  # again, in case a buffer is dirty
-        self.pump(1.5)
+        self.send("\x11", 0.5)  # Ctrl-Q quits; there is nothing to save
+        self.pump(1.0)
         try:
             self.proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
@@ -206,44 +205,6 @@ def scenario_resize(binary: str, root: pathlib.Path) -> bool:
     return all(results)
 
 
-def scenario_editor(binary: str, root: pathlib.Path) -> bool:
-    """The human edits and saves; then the agent edits the same live buffer."""
-    print(f"\n== editor == {root}")
-    (root).mkdir(parents=True, exist_ok=True)
-    (root / "notes.txt").write_text("hello\n")
-
-    tui = Tui(binary, root)
-    tui.pump(2.0)
-
-    # Open notes.txt via the /open command (the file explorer is gone), type a
-    # line above, save.
-    tui.send("/open notes.txt\r", 0.8)
-    tui.pump(0.5)
-    tui.send("i")                  # insert mode
-    tui.send("new line")
-    tui.send("\r")                 # newline
-    tui.send("\x1b", 0.5)          # normal mode
-    tui.send("\x13", 0.8)          # Ctrl-S save
-
-    after_human = (root / "notes.txt").read_text()
-
-    # Editor -> Chat, ask the agent to edit the open buffer.
-    tui.send("\t", 0.4)
-    tui.send("in notes.txt replace the word hello with world and change nothing else\r")
-    final = tui.wait_for(root / "notes.txt", lambda t: "world" in t)
-    exit_code = tui.close()
-
-    results = [
-        check("human edit saved", after_human == "new line\nhello\n", repr(after_human)),
-        check("agent edited the live buffer", "world" in final, repr(final)),
-        check("agent preserved the human's edit", "new line" in final, repr(final)),
-        check("clean exit", exit_code == 0, f"exit {exit_code}"),
-    ]
-    if not all(results):
-        print(tui.tail())
-    return all(results)
-
-
 def scenario_cancel(binary: str, root: pathlib.Path) -> bool:
     """Ctrl-C must stop a model call that has not answered yet.
 
@@ -264,6 +225,16 @@ def scenario_cancel(binary: str, root: pathlib.Path) -> bool:
 
     second_request = threading.Event()
     state = {"chats": 0}
+
+    env = {
+        "MUSH_URL": f"http://127.0.0.1:{port}",
+        "MUSH_PROVIDER": "custom",
+        "MUSH_MODEL": "probe",
+    }
+    # Fork the TUI *before* any thread exists: forking a process that already
+    # has threads is a known CPython deadlock hazard, and this was the one
+    # scenario that did it.
+    tui = Tui(binary, root, rows=24, cols=100, env_extra=env)
 
     def reply(connection, payload: bytes):
         connection.sendall(
@@ -300,12 +271,6 @@ def scenario_cancel(binary: str, root: pathlib.Path) -> bool:
             threading.Thread(target=handle, args=(connection,), daemon=True).start()
 
     threading.Thread(target=endpoint, daemon=True).start()
-    env = {
-        "MUSH_URL": f"http://127.0.0.1:{port}",
-        "MUSH_PROVIDER": "custom",
-        "MUSH_MODEL": "probe",
-    }
-    tui = Tui(binary, root, rows=24, cols=100, env_extra=env)
     tui.pump(1.5)
 
     tui.send("a question that will not be answered\r", settle=0.6)
@@ -333,7 +298,6 @@ def main() -> int:
     parser.add_argument("binary", nargs="?", default="target/debug/mush")
     parser.add_argument("workdir", nargs="?", default="/tmp/mush-smoke")
     parser.add_argument("--agent", action="store_true", help="run only the agent scenario")
-    parser.add_argument("--editor", action="store_true", help="run only the editor scenario")
     parser.add_argument("--resize", action="store_true", help="run only the resize scenario")
     parser.add_argument("--cancel", action="store_true", help="run only the cancel scenario")
     args = parser.parse_args()
@@ -343,13 +307,11 @@ def main() -> int:
         print(f"binary not found: {binary}", file=sys.stderr)
         return 2
 
-    both = not (args.agent or args.editor or args.resize or args.cancel)
+    both = not (args.agent or args.resize or args.cancel)
     base = pathlib.Path(args.workdir)
     passed = True
     if both or args.agent:
         passed &= scenario_agent(binary, base / "agent")
-    if both or args.editor:
-        passed &= scenario_editor(binary, base / "editor")
     if both or args.resize:
         passed &= scenario_resize(binary, base / "resize")
     if both or args.cancel:
