@@ -9,15 +9,12 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use mush_core::git;
-use mush_core::message::Message;
-use mush_core::text::{fit_row, truncate, wrap_text, wrap_text_capped};
+use mush_core::text::{fit_row, truncate};
 
 use crate::app::{
-    short_age, AgentId, AgentNode, App, Focus, Landed, NoticeKind, Phase, PickerKind, Rank,
-    StatusKind,
+    short_age, AgentId, AgentNode, App, Focus, Landed, Pane, Phase, PickerKind, Rank, StatusKind,
 };
 
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// The idle bar hint, when there is nothing to report.
 const HINT: &str = "Tab cycles panes · /help lists commands · Ctrl-P picks a model";
 /// Beyond this the transcript is unreadable, however wide the terminal is.
@@ -70,10 +67,9 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     draw_picker(frame, app);
 }
 
-fn dim() -> Style {
+pub(crate) fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
 }
-
 fn border(focused: bool) -> Style {
     if focused {
         Style::default().fg(Color::Cyan)
@@ -330,23 +326,23 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         // and leave the rest as margin.
         let width = (inner.width as usize).min(MAX_TRANSCRIPT as usize);
         let height = inner.height as usize;
-        let messages = focused_messages(app);
-        // Render only the lines the window can show, counting from the bottom —
-        // which is where the transcript is anchored. Building the whole
-        // scrollback to display forty lines cost 55 ms a frame on a long
-        // session, and `tick` repaints every frame while an agent works.
-        let want = height + app.chat.scrollback();
-        let mut lines = transcript_tail(app, messages, width, want);
-        trim_trailing_blanks(&mut lines);
-        let start = if lines.len() >= want {
-            // There is more above, so what we rendered already *is* the window.
-            0
-        } else {
-            // The whole transcript fits: the original top-index arithmetic.
-            let max_scroll = lines.len().saturating_sub(height);
-            max_scroll.saturating_sub(app.chat.scrollback().min(max_scroll))
+        let label = app.cfg.label();
+        let pane = Pane {
+            agent: app.tree.focused,
+            // A run in flight is what the pane's own activity line is derived
+            // from, and the spinner is the frame `App::tick` advanced.
+            busy: app
+                .tree
+                .node(app.tree.focused)
+                .map(|node| node.phase.is_busy())
+                .unwrap_or(false),
+            spin: app.spin,
+            label: &label,
         };
-        let visible: Vec<Line> = lines.into_iter().skip(start).take(height).collect();
+        // Only the rows the window can show are built — the whole scrollback to
+        // display forty lines cost 55 ms a frame on a long session, and `tick`
+        // repaints every frame while an agent works.
+        let visible = app.chat.visible_lines(&pane, width, height);
         frame.render_widget(Paragraph::new(Text::from(visible)), inner);
     }
 
@@ -390,21 +386,6 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
             frame.set_cursor_position(Position::new(x, y));
         }
     }
-}
-
-/// Every message ends with a blank separator line. At one row of transcript that
-/// blank would be the only visible line — the reply would be invisible — so the
-/// separator is trimmed before windowing (finding B4).
-fn trim_trailing_blanks(lines: &mut Vec<Line<'static>>) {
-    while lines.last().map(|line| line.width()) == Some(0) {
-        lines.pop();
-    }
-}
-
-/// The transcript the chat pane shows: the root's conversation by default,
-/// otherwise the focused agent's.
-fn focused_messages(app: &App) -> &[Message] {
-    app.chat.transcript(app.tree.focused)
 }
 
 /// A centered modal list for `/model` and `/provider`. The current selection
@@ -572,169 +553,6 @@ fn facts_line(app: &App, width: usize) -> String {
         cells.pop();
     }
     cells.join(" │ ")
-}
-
-/// The last `want` transcript lines, rendered from the bottom up.
-///
-/// The window is anchored at the bottom, so rendering forwards from the first
-/// message meant building the entire scrollback — every tool result re-wrapped —
-/// to paint about forty lines. This walks backwards and stops once it has
-/// enough, which is O(visible) for a normal session.
-fn transcript_tail(
-    app: &App,
-    messages: &[Message],
-    width: usize,
-    want: usize,
-) -> Vec<Line<'static>> {
-    // Notices are scoped to the agent they concern, so a root-level failure is
-    // not painted into a focused child's transcript (finding B19).
-    let has_notices = app.chat.notices_for(app.tree.focused).next().is_some();
-    if app.tree.focused == AgentId::ROOT {
-        if messages.is_empty() && !has_notices {
-            return vec![
-                Line::from(Span::styled(
-                    "Ask for a change — the agent reads and edits this workspace directly.",
-                    dim(),
-                )),
-                Line::from(""),
-                Line::from(Span::styled(app.cfg.label(), dim())),
-                Line::from(Span::styled(
-                    "Tab cycles panes · Enter sends · /help lists commands",
-                    dim(),
-                )),
-            ];
-        }
-    } else if messages.is_empty() {
-        return vec![Line::from(Span::styled(
-            format!(
-                "Agent #{} has no messages yet — typing here sends it a nudge.",
-                app.tree.focused
-            ),
-            dim(),
-        ))];
-    }
-
-    // Collected back to front, then reversed: each chunk is one message's or
-    // one notice's lines in their own order.
-    let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
-    let mut count = 0usize;
-
-    // What is painted last is collected first: the pane's own lines, bottom of
-    // the pane first, in the order the one precedence table puts them — a
-    // failure below the activity line it used to lose to (finding B12).
-    let focused_busy = app
-        .tree
-        .node(app.tree.focused)
-        .map(|node| node.phase.is_busy())
-        .unwrap_or(false);
-    for footnote in app.chat.footnotes(app.tree.focused, focused_busy) {
-        if count >= want {
-            break;
-        }
-        let notice = match footnote {
-            crate::app::Footnote::Notice(notice) => notice,
-            crate::app::Footnote::Activity => {
-                chunks.push(vec![
-                    Line::from(""),
-                    Line::from(Span::styled(
-                        format!("{} working…", SPINNER[(app.spin as usize) % SPINNER.len()]),
-                        Style::default().fg(Color::Cyan),
-                    )),
-                ]);
-                count += 2;
-                continue;
-            }
-        };
-        let (prefix, style) = match notice.kind {
-            NoticeKind::Info => ("·", dim()),
-            NoticeKind::Error => ("!", Style::default().fg(Color::Red)),
-        };
-        let mut chunk = Vec::new();
-        for line in wrap_text(&notice.text, width.saturating_sub(2)) {
-            chunk.push(Line::from(Span::styled(format!("{prefix} {line}"), style)));
-        }
-        count += chunk.len();
-        chunks.push(chunk);
-    }
-
-    for message in messages.iter().rev() {
-        if count >= want {
-            break;
-        }
-        let mut chunk = Vec::new();
-        render_message(&mut chunk, message, width);
-        count += chunk.len();
-        chunks.push(chunk);
-    }
-
-    let mut out = Vec::with_capacity(count);
-    for chunk in chunks.into_iter().rev() {
-        out.extend(chunk);
-    }
-    out
-}
-
-fn render_message(out: &mut Vec<Line<'static>>, message: &Message, width: usize) {
-    match message.role.as_str() {
-        "user" => {
-            for (index, line) in wrap_text(message.text(), width).into_iter().enumerate() {
-                if index == 0 {
-                    out.push(Line::from(vec![
-                        Span::styled("you › ", Style::default().fg(Color::Cyan)),
-                        Span::raw(line),
-                    ]));
-                } else {
-                    out.push(Line::from(vec![Span::raw("      "), Span::raw(line)]));
-                }
-            }
-            out.push(Line::from(""));
-        }
-        "assistant" => {
-            let text = message.text();
-            if !text.trim().is_empty() {
-                for (index, line) in wrap_text(text, width).into_iter().enumerate() {
-                    if index == 0 {
-                        out.push(Line::from(vec![
-                            Span::styled("mush › ", Style::default().fg(Color::Green)),
-                            Span::raw(line),
-                        ]));
-                    } else {
-                        out.push(Line::from(vec![Span::raw("       "), Span::raw(line)]));
-                    }
-                }
-            }
-            for call in message.tool_calls() {
-                // `agent::summarize_args` is the same reading the tree shows:
-                // `edit_file src/lex.rs`, not forty lines of JSON.
-                let label = format!(
-                    "  ⚙ {} {}",
-                    call.function.name,
-                    truncate(&crate::agent::summarize_args(&call.function.arguments), 60)
-                );
-                out.push(Line::from(Span::styled(
-                    label,
-                    Style::default().fg(Color::Yellow),
-                )));
-            }
-            out.push(Line::from(""));
-        }
-        "tool" => {
-            // Only the first eight lines are ever shown, so only those are
-            // wrapped; the ninth is what tells us to print the `…`. Wrapping
-            // the whole result was most of a frame's cost on a long session.
-            const SHOWN: usize = 8;
-            let wrapped = wrap_text_capped(message.text(), width.saturating_sub(2), SHOWN + 1);
-            let clipped = wrapped.len() > SHOWN;
-            for line in wrapped.iter().take(SHOWN) {
-                out.push(Line::from(Span::styled(format!("  {line}"), dim())));
-            }
-            if clipped {
-                out.push(Line::from(Span::styled("  …", dim())));
-            }
-            out.push(Line::from(""));
-        }
-        _ => {}
-    }
 }
 
 #[cfg(test)]

@@ -13,7 +13,7 @@
 mod chat;
 mod tree;
 
-pub use chat::{Chat, Footnote, NoticeKind, Rank};
+pub use chat::{Chat, Pane, Rank};
 pub use tree::{AgentId, AgentNode, AgentTree, ConversationId, Existing, Landed, Phase, Spawn};
 
 use std::collections::HashMap;

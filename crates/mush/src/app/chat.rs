@@ -8,15 +8,30 @@
 //! it) and because every way a line reaches the screen is a method on this
 //! type: `app::mod` routes events and keys into it and never writes a
 //! transcript itself, so "what the human is looking at" has exactly one writer.
+//!
+//! The transcript body is built here too (`visible_lines`), because which rows
+//! a pane shows is a fact about the conversation and its scrollback, and not
+//! about the terminal it is painted on: width and height are arguments, and the
+//! blank separator that closes a message is trimmed before the window is cut.
+//! `ui.rs` keeps the frame around it — the border, the title, the prompt and
+//! the cursor — and paints what this returns.
 
 use std::collections::HashMap;
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+use ratatui::style::{Color, Style};
+use ratatui::text::{Line, Span};
 
 use mush_core::message::Message;
+use mush_core::text::{truncate, wrap_text, wrap_text_capped};
 
+use crate::agent::summarize_args;
 use crate::app::tree::AgentId;
 use crate::input::Input;
+use crate::ui::dim;
+
+/// A spinner's frames, so a run in flight looks alive in the pane.
+const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
 /// A line for the transcript that is not a message: a note from mush itself.
 /// It is tagged with the agent it concerns, so a root-level failure is not
@@ -90,6 +105,17 @@ pub enum Footnote<'a> {
     Activity,
     /// A line mush wrote about this agent.
     Notice(&'a Notice),
+}
+
+/// What a pane knows that the conversation does not: which agent it is showing,
+/// whether that agent's run is in flight, where the animation is, and the
+/// endpoint/model line the empty state names.
+#[derive(Clone, Copy)]
+pub struct Pane<'a> {
+    pub agent: AgentId,
+    pub busy: bool,
+    pub spin: u64,
+    pub label: &'a str,
 }
 
 /// One conversation: what has been said, what mush added to it, and what the
@@ -282,9 +308,98 @@ impl Chat {
         self.scroll = next.max(0) as usize;
     }
 
-    /// Rows of scrollback the pane is showing.
-    pub fn scrollback(&self) -> usize {
-        self.scroll
+    /// The rows a pane `height` rows tall and `width` columns wide is showing:
+    /// the tail of the agent's transcript, bottom-anchored, with the blank
+    /// separator that closes a message trimmed before the window is cut.
+    ///
+    /// The trim is what keeps a one-row pane from showing that blank instead of
+    /// the message it separates (finding B4); only the tail is built, so a long
+    /// session costs the visible rows and not the scrollback.
+    pub fn visible_lines(
+        &self,
+        pane: &Pane<'_>,
+        width: usize,
+        height: usize,
+    ) -> Vec<Line<'static>> {
+        let messages = self.transcript(pane.agent);
+
+        // A pane with nothing in it says what it is waiting for rather than
+        // being blank.
+        if messages.is_empty() && self.notices_for(pane.agent).next().is_none() {
+            return if pane.agent == AgentId::ROOT {
+                vec![
+                    Line::from(Span::styled(
+                        "Ask for a change — the agent reads and edits this workspace directly.",
+                        dim(),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(pane.label.to_string(), dim())),
+                    Line::from(Span::styled(
+                        "Tab cycles panes · Enter sends · /help lists commands",
+                        dim(),
+                    )),
+                ]
+            } else {
+                vec![Line::from(Span::styled(
+                    format!(
+                        "Agent #{} has no messages yet — typing here sends it a nudge.",
+                        pane.agent
+                    ),
+                    dim(),
+                ))]
+            };
+        }
+
+        // Built back to front and then reversed: each chunk is one message's or
+        // one footnote's rows in their own order, and the pane is anchored at
+        // the bottom, so the newest line is the one that must be there.
+        let want = height + self.scroll;
+        let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
+        let mut count = 0usize;
+
+        for footnote in self.footnotes(pane.agent, pane.busy) {
+            if count >= want {
+                break;
+            }
+            let chunk = match footnote {
+                Footnote::Activity => vec![
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        format!("{} working…", SPINNER[(pane.spin as usize) % SPINNER.len()]),
+                        Style::default().fg(Color::Cyan),
+                    )),
+                ],
+                Footnote::Notice(notice) => footnote_lines(notice, width),
+            };
+            count += chunk.len();
+            chunks.push(chunk);
+        }
+
+        for message in messages.iter().rev() {
+            if count >= want {
+                break;
+            }
+            let mut chunk = Vec::new();
+            render_message(&mut chunk, message, width);
+            count += chunk.len();
+            chunks.push(chunk);
+        }
+
+        let mut lines = Vec::with_capacity(count);
+        for chunk in chunks.into_iter().rev() {
+            lines.extend(chunk);
+        }
+        trim_trailing_blanks(&mut lines);
+
+        let start = if lines.len() >= want {
+            // There is more above, so what was built already *is* the window.
+            0
+        } else {
+            // The whole transcript fits: the original top-index arithmetic.
+            let max_scroll = lines.len().saturating_sub(height);
+            max_scroll.saturating_sub(self.scroll.min(max_scroll))
+        };
+        lines.into_iter().skip(start).take(height).collect()
     }
 
     /// The message box, for painting it.
@@ -335,12 +450,175 @@ impl Chat {
     }
 }
 
+/// The rows of one notice, wrapped at the pane's width and marked by kind: only
+/// a failure shouts.
+fn footnote_lines(notice: &Notice, width: usize) -> Vec<Line<'static>> {
+    let (prefix, style) = match notice.kind {
+        NoticeKind::Info => ("·", dim()),
+        NoticeKind::Error => ("!", Style::default().fg(Color::Red)),
+    };
+    wrap_text(&notice.text, width.saturating_sub(2))
+        .into_iter()
+        .map(|line| Line::from(Span::styled(format!("{prefix} {line}"), style)))
+        .collect()
+}
+
+/// Every message ends with a blank separator line. At one row of transcript that
+/// blank would be the only visible line — the reply would be invisible — so the
+/// separator is trimmed before windowing (finding B4).
+fn trim_trailing_blanks(lines: &mut Vec<Line<'static>>) {
+    while lines.last().map(|line| line.width()) == Some(0) {
+        lines.pop();
+    }
+}
+
+/// One message's rows: who said it, wrapped at the pane's width.
+fn render_message(out: &mut Vec<Line<'static>>, message: &Message, width: usize) {
+    match message.role.as_str() {
+        "user" => {
+            for (index, line) in wrap_text(message.text(), width).into_iter().enumerate() {
+                if index == 0 {
+                    out.push(Line::from(vec![
+                        Span::styled("you › ", Style::default().fg(Color::Cyan)),
+                        Span::raw(line),
+                    ]));
+                } else {
+                    out.push(Line::from(vec![Span::raw("      "), Span::raw(line)]));
+                }
+            }
+            out.push(Line::from(""));
+        }
+        "assistant" => {
+            let text = message.text();
+            if !text.trim().is_empty() {
+                for (index, line) in wrap_text(text, width).into_iter().enumerate() {
+                    if index == 0 {
+                        out.push(Line::from(vec![
+                            Span::styled("mush › ", Style::default().fg(Color::Green)),
+                            Span::raw(line),
+                        ]));
+                    } else {
+                        out.push(Line::from(vec![Span::raw("       "), Span::raw(line)]));
+                    }
+                }
+            }
+            for call in message.tool_calls() {
+                // `agent::summarize_args` is the same reading the tree shows:
+                // `edit_file src/lex.rs`, not forty lines of JSON.
+                let label = format!(
+                    "  ⚙ {} {}",
+                    call.function.name,
+                    truncate(&summarize_args(&call.function.arguments), 60)
+                );
+                out.push(Line::from(Span::styled(
+                    label,
+                    Style::default().fg(Color::Yellow),
+                )));
+            }
+            out.push(Line::from(""));
+        }
+        "tool" => {
+            // Only the first eight lines are ever shown, so only those are
+            // wrapped; the ninth is what tells us to print the `…`. Wrapping
+            // the whole result was most of a frame's cost on a long session.
+            const SHOWN: usize = 8;
+            let wrapped = wrap_text_capped(message.text(), width.saturating_sub(2), SHOWN + 1);
+            let clipped = wrapped.len() > SHOWN;
+            for line in wrapped.iter().take(SHOWN) {
+                out.push(Line::from(Span::styled(format!("  {line}"), dim())));
+            }
+            if clipped {
+                out.push(Line::from(Span::styled("  …", dim())));
+            }
+            out.push(Line::from(""));
+        }
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn pane(agent: AgentId) -> Pane<'static> {
+        Pane {
+            agent,
+            busy: false,
+            spin: 0,
+            label: "test-model · ctx ~500k",
+        }
+    }
+
+    /// The text of the rows a pane would paint.
+    fn shown(lines: &[Line<'_>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// A 40×10 terminal leaves the transcript pane one row tall, and every
+    /// message ends with a blank separator: that blank was the only row shown,
+    /// so the reply was invisible (finding B4). The trim happens before the
+    /// window is cut, for the same reason at every height.
+    #[test]
+    fn a_one_row_pane_shows_a_message_and_not_the_blank_after_it() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::user("make the lexer faster"));
+        chat.push_message(AgentId::ROOT, Message::assistant("done — 3× on the bench"));
+        let pane = pane(AgentId::ROOT);
+
+        let rows = shown(&chat.visible_lines(&pane, 38, 1));
+        assert_eq!(rows, vec!["mush › done — 3× on the bench"]);
+        assert!(
+            rows.iter().all(|row| !row.trim().is_empty()),
+            "the pane's one row must not be a separator"
+        );
+
+        // One row taller, and the message the reply belongs to is in view: the
+        // transcript is anchored at the bottom.
+        let rows = shown(&chat.visible_lines(&pane, 38, 3));
+        assert_eq!(
+            rows,
+            vec![
+                "you › make the lexer faster",
+                "",
+                "mush › done — 3× on the bench"
+            ]
+        );
+    }
+
+    /// The window follows the scrollback, and the bottom is where a new line
+    /// puts it back.
+    #[test]
+    fn the_window_follows_the_scrollback() {
+        let mut chat = Chat::bare();
+        for i in 0..5 {
+            chat.push_message(AgentId::ROOT, Message::user(format!("line {i}")));
+        }
+        let pane = pane(AgentId::ROOT);
+        let bottom = shown(&chat.visible_lines(&pane, 20, 2));
+        assert_eq!(bottom, vec!["you › line 4"], "anchored at the newest");
+
+        // Up and down are the pane's own keys.
+        assert!(chat.key(key(KeyCode::Up)));
+        let up = shown(&chat.visible_lines(&pane, 20, 2));
+        assert_ne!(up, bottom, "scrolling shows what was above the fold");
+        assert!(up.iter().any(|row| row.contains("line 3")), "{up:?}");
+
+        assert!(chat.key(key(KeyCode::Down)));
+        assert_eq!(shown(&chat.visible_lines(&pane, 20, 2)), bottom);
+        chat.scroll_to_bottom();
+        assert_eq!(shown(&chat.visible_lines(&pane, 20, 2)), bottom);
     }
 
     /// A transcript belongs to one agent: what a child was told is in the
