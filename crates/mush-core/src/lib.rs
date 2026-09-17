@@ -11,6 +11,7 @@ pub mod message;
 pub mod prompt;
 pub mod session;
 pub mod tools;
+pub mod transcript;
 pub mod userconfig;
 pub mod workspace;
 
