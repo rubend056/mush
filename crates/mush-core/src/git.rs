@@ -217,8 +217,17 @@ pub fn parse_worktrees(text: &str) -> Vec<Worktree> {
 /// not, and there is nothing to branch an isolated agent from — a caller asks
 /// this *before* trying, so it can report that instead of relaying whatever
 /// `worktree add` says about an unborn HEAD.
-pub fn has_commits(dir: &Path) -> bool {
-    git(dir, &["rev-parse", "--verify", "-q", "HEAD"]).is_some()
+///
+/// `Some(false)` is git answering "no", `None` is git not answering at all (no
+/// binary). The two want different words in front of a human, so they are not
+/// collapsed into one `bool`.
+pub fn has_commits(dir: &Path) -> Option<bool> {
+    match run(dir, &["rev-parse", "--verify", "-q", "HEAD"]) {
+        Ok(_) => Some(true),
+        // `run` says exactly this when the process could not be started.
+        Err(error) if error == "git binary unavailable" => None,
+        Err(_) => Some(false),
+    }
 }
 
 /// Create the worktree at [`worktree_path`] on a new [`branch_name`], based on
@@ -234,8 +243,14 @@ pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf,
     if !dir.join(".git").exists() {
         return Err("not a git repository".to_string());
     }
-    if base.is_none() && !has_commits(dir) {
-        return Err("the repo has no commits yet — commit first or drop isolated".to_string());
+    match (base, has_commits(dir)) {
+        (None, Some(false)) => {
+            return Err("the repo has no commits yet — commit first or drop isolated".to_string())
+        }
+        // A missing git is not a missing commit, and saying so would send a
+        // human looking for a `git commit` they cannot run either.
+        (None, None) => return Err("git binary unavailable".to_string()),
+        _ => {}
     }
     let path = worktree_path(dir, id);
     let branch = branch_name(id);
@@ -513,7 +528,7 @@ mod tests {
     #[test]
     fn a_worktree_is_added_and_committed_once() {
         let dir = init_repo("worktree-verbs");
-        assert!(has_commits(&dir));
+        assert_eq!(has_commits(&dir), Some(true));
         let (path, branch) = worktree_add(&dir, 5, None).unwrap();
         assert_eq!(path, worktree_path(&dir, 5));
         assert_eq!(branch, branch_name(5));
@@ -542,6 +557,29 @@ mod tests {
             "not a git repository"
         );
         let _ = fs::remove_dir_all(&plain);
+
+        // A repository with no commit yet is the other refusal: there is
+        // nothing to branch from, and the reason says so.
+        let unborn = std::env::temp_dir().join(format!("mush-git-unborn-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&unborn);
+        fs::create_dir_all(&unborn).unwrap();
+        let init = |args: &[&str]| {
+            Command::new("git")
+                .arg("-C")
+                .arg(&unborn)
+                .args(args)
+                .output()
+                .unwrap();
+        };
+        init(&["init", "-q"]);
+        assert_eq!(has_commits(&unborn), Some(false));
+        assert_eq!(
+            worktree_add(&unborn, 7, None).unwrap_err(),
+            "the repo has no commits yet — commit first or drop isolated"
+        );
+        // With a base branch named, the refusal is git's own.
+        assert!(worktree_add(&unborn, 7, Some("HEAD")).is_err());
+        let _ = fs::remove_dir_all(&unborn);
         let _ = fs::remove_dir_all(&dir);
     }
 
