@@ -969,7 +969,13 @@ fn absorb(
                 })
                 .copied()
                 .collect();
-            state.delivered = announced.into_iter().collect();
+            // Adoption may only *add* marks, never remove one. Every line this
+            // actor folds is now emitted as a `Message` event, so the copy the
+            // UI hands back carries it — but that copy can be older than the
+            // emit (the human typed in between). Un-marking a delivery the
+            // model has already read would inject the same result a second
+            // time; the two copies converge at the next adoption instead.
+            state.delivered.extend(announced);
             // The same question for jobs, answered on the line itself: it
             // carries the job's id, its exit status, its command and its tail,
             // so a transcript that holds it is a transcript that has read it.
@@ -983,7 +989,7 @@ fn absorb(
                 })
                 .map(|(id, _)| *id)
                 .collect();
-            state.delivered_jobs = announced_jobs.into_iter().collect();
+            state.delivered_jobs.extend(announced_jobs);
             Fold::Run
         }
         AgentMsg::Nudge(text) => {
@@ -1005,7 +1011,7 @@ fn absorb(
             // read it in this very run.
             let news = outcome.is_news();
             let line = note_completion(state, id, outcome);
-            transcript.push(Message::user(line));
+            push_line(actor, transcript, line);
             state.delivered.insert(id);
             // A stopped child is the human's doing, not news that warrants
             // waking a napping parent into a fresh (paid) run: the line is in
@@ -1020,7 +1026,7 @@ fn absorb(
             // `ChildDone` for a job: the same wake, the same once-only
             // delivery, the same "the human's stop is not a result".
             let line = note_job(state, id, line, news);
-            transcript.push(Message::user(line));
+            push_line(actor, transcript, line);
             state.delivered_jobs.insert(id);
             if news {
                 Fold::Run
@@ -1087,14 +1093,7 @@ fn run_loop(
                 )),
             );
         }
-        drain_mailbox(
-            &actor.ctx.registry,
-            actor.id,
-            &actor.rx,
-            cancel,
-            messages,
-            state,
-        );
+        drain_mailbox(actor, cancel, messages, state);
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.to_string());
         }
@@ -1389,14 +1388,7 @@ fn run_loop(
             // Parked nudges belong after the reply; the human wrote them while
             // it was in flight, so the model has not answered them yet.
             let before = messages.len();
-            drain_mailbox(
-                &actor.ctx.registry,
-                actor.id,
-                &actor.rx,
-                cancel,
-                messages,
-                state,
-            );
+            drain_mailbox(actor, cancel, messages, state);
             if cancel.load(Ordering::SeqCst) {
                 return Err(CANCELLED.to_string());
             }
@@ -1405,7 +1397,7 @@ fn run_loop(
             // being waited on: deliver their lines and keep going instead of
             // ending. (Completions that arrive after this run returns wake the
             // idle actor instead — see actor_main.)
-            if fold_completions(state, messages) {
+            if fold_completions(actor, state, messages) {
                 continue;
             }
             // Answer the steering instead of ending the run without it: the
@@ -1464,14 +1456,7 @@ fn run_loop(
         }
         // Fold mailbox commands in at the message boundary, and honour a
         // cancellation now that every call has a result.
-        drain_mailbox(
-            &actor.ctx.registry,
-            actor.id,
-            &actor.rx,
-            cancel,
-            messages,
-            state,
-        );
+        drain_mailbox(actor, cancel, messages, state);
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.to_string());
         }
@@ -1480,7 +1465,7 @@ fn run_loop(
         // rather than whenever it next stops calling them (§5.5). The call
         // comes *after* the batch's tool results, which is what keeps the
         // transcript a shape a strict server accepts.
-        fold_completions(state, messages);
+        fold_completions(actor, state, messages);
     }
 
     Err(format!(
@@ -1562,14 +1547,7 @@ fn compact_history(
         .emit(actor_id, AgentEvent::Status(why.to_string()));
 
     // Fold pending nudges/completions in first; a Stop cancels the run.
-    drain_mailbox(
-        &actor.ctx.registry,
-        actor.id,
-        &actor.rx,
-        cancel,
-        messages,
-        state,
-    );
+    drain_mailbox(actor, cancel, messages, state);
     if cancel.load(Ordering::SeqCst) {
         return Err(CANCELLED.to_string());
     }
@@ -1725,16 +1703,16 @@ fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
 /// messages, stops set the cancel flag, child completions update the registry.
 /// Everything parked by `drain_signals` goes in first, in order.
 fn drain_mailbox(
-    registry: &jobs::Registry,
-    owner: u64,
-    rx: &Receiver<AgentMsg>,
+    actor: &Actor,
     cancel: &AtomicBool,
     messages: &mut Vec<Message>,
     state: &mut ActorState,
 ) {
     let parked = std::mem::take(&mut state.deferred);
-    for command in parked.into_iter().chain(rx.try_iter()) {
+    for command in parked.into_iter().chain(actor.rx.try_iter()) {
         match command {
+            // The human's own words: the UI echoed them before sending, so the
+            // actor folds them in without telling the UI to add them again.
             AgentMsg::Nudge(text) => messages.push(Message::user(text)),
             // A message-boundary job like a nudge: the transcript is folded
             // into a summary at the next turn, never between an assistant's
@@ -1742,13 +1720,13 @@ fn drain_mailbox(
             AgentMsg::Compact => state.compact_requested = true,
             AgentMsg::Stop => {
                 cancel.store(true, Ordering::SeqCst);
-                registry.kill_owned(owner);
+                actor.ctx.registry.kill_owned(actor.id);
             }
             AgentMsg::Shutdown => {
                 // Cancel now, and remember: the run ends, and so does the actor.
                 cancel.store(true, Ordering::SeqCst);
                 state.shutdown = true;
-                registry.kill_owned(owner);
+                actor.ctx.registry.kill_owned(actor.id);
             }
             AgentMsg::ChildDone { id, outcome } => {
                 note_completion(state, id, outcome);
@@ -1758,7 +1736,7 @@ fn drain_mailbox(
             // the line is marked delivered so it is never injected twice.
             AgentMsg::CommandDone { id, line, news } => {
                 let line = note_job(state, id, line, news);
-                messages.push(Message::user(line));
+                push_line(actor, messages, line);
                 state.delivered_jobs.insert(id);
             }
             // The UI sends a whole transcript when it believes we are idle.
@@ -1804,6 +1782,20 @@ fn note_job(state: &mut ActorState, id: u64, line: String, news: bool) -> String
     line
 }
 
+/// Fold one line into this actor's transcript *and* tell the UI to put it in
+/// its own copy — one fact, two readers.
+///
+/// A line that reaches `messages` alone is a line the human cannot see
+/// (`docs/findings.md` B20) and, because the UI's copy is what an idle `Run`
+/// hands back, a delivery that adoption then re-arms and the model reads
+/// twice. Every fold of a completion or a steering line goes through here, so
+/// the two copies cannot drift apart in either direction.
+fn push_line(actor: &Actor, messages: &mut Vec<Message>, text: String) {
+    let message = Message::user(text);
+    messages.push(message.clone());
+    actor.ctx.emit(actor.id, AgentEvent::Message(message));
+}
+
 /// Fold into the transcript every completion the run has heard about but the
 /// model has not read — a child's summary, or a job's report — and say whether
 /// any of them is *news* (a result, which the model still has to answer).
@@ -1819,7 +1811,7 @@ fn note_job(state: &mut ActorState, id: u64, line: String, news: bool) -> String
 /// tool calls and their results. A *nudge* is not: the human's words between an
 /// assistant's calls and their results are the shape strict servers reject, so
 /// nudges keep parking for the tool-free boundary (`drain_mailbox`).
-fn fold_completions(state: &mut ActorState, messages: &mut Vec<Message>) -> bool {
+fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Message>) -> bool {
     // Jobs first: they are the newest actors, and a job's line is only news if
     // the job ended on its own — one mush killed is the human's or the model's
     // own doing, and its line waits for the next run instead of paying for one.
@@ -1831,7 +1823,7 @@ fn fold_completions(state: &mut ActorState, messages: &mut Vec<Message>) -> bool
         .collect();
     let mut news = false;
     for (job, line, job_news) in jobs {
-        messages.push(Message::user(note_job(state, job, line, job_news)));
+        push_line(actor, messages, note_job(state, job, line, job_news));
         state.delivered_jobs.insert(job);
         news |= job_news;
     }
@@ -1847,7 +1839,7 @@ fn fold_completions(state: &mut ActorState, messages: &mut Vec<Message>) -> bool
         .collect();
     for (child, outcome) in children {
         let line = note_completion(state, child, outcome);
-        messages.push(Message::user(line));
+        push_line(actor, messages, line);
         state.delivered.insert(child);
         news = true;
     }
@@ -2721,16 +2713,8 @@ mod tests {
 
         // The next message boundary has nothing left to inject, or the model
         // would answer the same sentence twice.
-        let (_tx, rx) = crossbeam_channel::unbounded();
         let mut messages = Vec::new();
-        drain_mailbox(
-            &actor.ctx.registry,
-            actor.id,
-            &rx,
-            &AtomicBool::new(false),
-            &mut messages,
-            &mut state,
-        );
+        drain_mailbox(&actor, &AtomicBool::new(false), &mut messages, &mut state);
         assert!(messages.is_empty(), "no duplicate user message");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
@@ -2898,6 +2882,46 @@ mod tests {
         );
     }
 
+    /// The other half of the same rule, and the half a hidden fold used to
+    /// break: adoption must not *re-arm* a delivery that already happened.
+    ///
+    /// The two threads are independent, so the copy the UI hands back can be
+    /// older than the event that carried the folded line: the human wrote after
+    /// the fold but the App sent its transcript before it drained that event.
+    /// Un-marking the delivery there folds the same result into the model's
+    /// transcript a second time — the model answers news it has answered.
+    ///
+    /// The transcript stays exactly as adopted (it is what the App has), so
+    /// nothing is invented here; the two copies converge at the next adoption.
+    #[test]
+    fn adoption_does_not_re_arm_a_delivery_that_already_happened() {
+        let (actor, _mailbox) = test_actor("stale-copy");
+        let mut state = ActorState::default();
+        state
+            .completed
+            .insert(1, Outcome::Finished("did the thing".into()));
+        let mut messages = vec![Message::system("you are mush")];
+        assert!(fold_completions(&actor, &mut state, &mut messages));
+
+        // The App's copy as it was before it drained the fold's own event.
+        let stale = vec![Message::system("you are mush")];
+        let mut adopted = stale.clone();
+        assert!(matches!(
+            absorb(&actor, &mut state, &mut adopted, AgentMsg::Run(stale)),
+            Fold::Run
+        ));
+        assert!(
+            state.delivered.contains(&1),
+            "the model has read it, whatever the copy says"
+        );
+        assert!(
+            !fold_completions(&actor, &mut state, &mut adopted),
+            "and it is not read twice"
+        );
+        assert_eq!(adopted.len(), 1, "nothing is invented into the transcript");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// A child that was stopped and then resumed finishes later; the stale
     /// `stopped` must not outlive the result, or the parent waits on a stop
     /// forever.
@@ -2963,6 +2987,131 @@ mod tests {
         assert!(
             state.delivered.contains(&1),
             "the model reads it in the transcript, so it is already delivered"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// Exactly once, and visible, across an idle `Run`: the human writes, the
+    /// UI hands its own transcript back, and the actor adopts it.
+    ///
+    /// Both halves are asserted against the UI's copy built from the events, as
+    /// the App builds it — because before this the folded line was pushed into
+    /// the actor's `messages` alone (`docs/findings.md` B20): the human never
+    /// saw what the model was told, and the copy the UI handed back could not
+    /// contain the line, so `absorb` un-marked the delivery and the model read
+    /// the same result twice.
+    #[test]
+    fn a_child_completion_is_delivered_once_across_an_idle_run() {
+        let (actor, events, _mailbox) = recording_actor("once-child");
+        let mut state = ActorState::default();
+        state
+            .completed
+            .insert(1, Outcome::Finished("wrote the parser".into()));
+        let mut messages = vec![Message::system("you are mush")];
+
+        assert!(fold_completions(&actor, &mut state, &mut messages));
+
+        let line = "#1 done: wrote the parser";
+        assert_eq!(messages.last().unwrap().text(), line);
+        let ui = ui_copy(&events);
+        assert!(
+            ui.iter().any(|message| message.text() == line),
+            "the human's copy holds what the model was told: {ui:?}"
+        );
+
+        let mut adopted = ui.clone();
+        assert!(matches!(
+            absorb(&actor, &mut state, &mut adopted, AgentMsg::Run(ui)),
+            Fold::Run
+        ));
+        assert!(
+            !fold_completions(&actor, &mut state, &mut adopted),
+            "a delivery that already happened is not re-armed by adoption"
+        );
+        assert_eq!(
+            adopted
+                .iter()
+                .filter(|message| message.text() == line)
+                .count(),
+            1,
+            "one completion, one line"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The same road for a job (§5.6: a job's completion is `ChildDone`'s twin),
+    /// folded by `absorb` when its owner was idle.
+    #[test]
+    fn a_job_report_is_delivered_once_across_an_idle_run() {
+        let (actor, events, _mailbox) = recording_actor("once-job");
+        let mut state = ActorState::default();
+        state.running_jobs.insert(1);
+        let mut messages = vec![Message::system("you are mush")];
+        let line = "#c1 done: exit 0 · 3m12s · cargo test — test result: ok";
+
+        let folded = absorb(
+            &actor,
+            &mut state,
+            &mut messages,
+            AgentMsg::CommandDone {
+                id: 1,
+                line: line.into(),
+                news: true,
+            },
+        );
+        assert!(matches!(folded, Fold::Run), "a result is work to answer");
+        assert_eq!(messages.last().unwrap().text(), line);
+
+        let ui = ui_copy(&events);
+        assert!(
+            ui.iter().any(|message| message.text() == line),
+            "the job's line reaches the human too: {ui:?}"
+        );
+
+        let mut adopted = ui.clone();
+        assert!(matches!(
+            absorb(&actor, &mut state, &mut adopted, AgentMsg::Run(ui)),
+            Fold::Run
+        ));
+        assert!(!fold_completions(&actor, &mut state, &mut adopted));
+        assert_eq!(
+            adopted
+                .iter()
+                .filter(|message| message.text() == line)
+                .count(),
+            1,
+            "one job completion, one line"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A job that ends while its owner is mid-run is folded in at the message
+    /// boundary by `drain_mailbox`, not by `absorb`. That path has to tell the
+    /// UI too, or the human's copy is missing exactly the lines the model read
+    /// while it worked.
+    #[test]
+    fn a_job_report_folded_mid_run_reaches_the_ui() {
+        let (actor, events, mailbox) = recording_actor("mid-run-job");
+        let mut state = ActorState::default();
+        state.running_jobs.insert(1);
+        let mut messages = vec![Message::system("you are mush")];
+        let line = "#c1 stopped after 1s · npm run dev";
+        mailbox
+            .send(AgentMsg::CommandDone {
+                id: 1,
+                line: line.into(),
+                news: false,
+            })
+            .unwrap();
+
+        drain_mailbox(&actor, &AtomicBool::new(false), &mut messages, &mut state);
+
+        assert_eq!(messages.last().unwrap().text(), line);
+        assert!(state.delivered_jobs.contains(&1));
+        let ui = ui_copy(&events);
+        assert!(
+            ui.iter().any(|message| message.text() == line),
+            "a fold mid-run is visible too: {ui:?}"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
@@ -3279,6 +3428,36 @@ mod tests {
         let (actor, _events, mailbox) =
             build_actor(label, Arc::new(HttpModel::new(cfg.clone())), cfg);
         (actor, mailbox)
+    }
+
+    /// The same actor, keeping the sink it emits into: how a delivery test sees
+    /// both halves of one fact — the line the model reads and the line the UI
+    /// was told.
+    fn recording_actor(label: &str) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
+        let cfg = test_cfg();
+        build_actor_about(
+            label,
+            Arc::new(HttpModel::new(cfg.clone())),
+            cfg,
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        )
+    }
+
+    /// The App's half of the delivery contract, in miniature: the UI's copy of
+    /// agent 7's transcript is the system message plus every `Message` event
+    /// that agent emitted, in order. A test that wants to know what the human
+    /// reads has to build it the same way, because that is the only road a line
+    /// takes into it.
+    fn ui_copy(events: &Recorder) -> Vec<Message> {
+        let mut messages = vec![Message::system("you are mush")];
+        messages.extend(events.events_for(AgentId(7)).into_iter().filter_map(
+            |event| match event {
+                AgentEvent::Message(message) => Some(message),
+                _ => None,
+            },
+        ));
+        messages
     }
 
     /// The same actor, with its model calls served by a script instead of a
@@ -4255,14 +4434,7 @@ mod tests {
 
         // The next message boundary folds it in, in order.
         let mut messages = vec![Message::assistant("working")];
-        drain_mailbox(
-            &actor.ctx.registry,
-            actor.id,
-            &actor.rx,
-            &cancel,
-            &mut messages,
-            &mut state,
-        );
+        drain_mailbox(&actor, &cancel, &mut messages, &mut state);
         assert!(state.deferred.is_empty());
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1].text(), "steer left");
@@ -4280,26 +4452,12 @@ mod tests {
 
         mailbox.send(AgentMsg::Stop).unwrap();
         let cancel = AtomicBool::new(false);
-        drain_mailbox(
-            &actor.ctx.registry,
-            actor.id,
-            &actor.rx,
-            &cancel,
-            &mut messages,
-            &mut state,
-        );
+        drain_mailbox(&actor, &cancel, &mut messages, &mut state);
         assert!(cancel.load(Ordering::SeqCst), "a Stop cancels the run");
         assert!(!state.shutdown, "a Stop must not end the actor");
 
         mailbox.send(AgentMsg::Shutdown).unwrap();
-        drain_mailbox(
-            &actor.ctx.registry,
-            actor.id,
-            &actor.rx,
-            &cancel,
-            &mut messages,
-            &mut state,
-        );
+        drain_mailbox(&actor, &cancel, &mut messages, &mut state);
         assert!(
             state.shutdown,
             "a Shutdown ends the actor once the run stops"
@@ -4743,6 +4901,7 @@ mod tests {
     /// waiting for `drain_mailbox` on a tool-free turn.
     #[test]
     fn fold_completions_folds_results_and_leaves_nudges_parked() {
+        let (actor, events, _mailbox) = recording_actor("fold-boundary");
         let mut state = ActorState::default();
         state.deferred.push(AgentMsg::Nudge("steer".into()));
         state
@@ -4754,7 +4913,7 @@ mod tests {
         ];
 
         assert!(
-            fold_completions(&mut state, &mut messages),
+            fold_completions(&actor, &mut state, &mut messages),
             "a child's result is worth a turn"
         );
         assert_eq!(messages.last().unwrap().text(), "#1 done: did the thing");
@@ -4779,7 +4938,7 @@ mod tests {
             },
         );
         assert!(
-            fold_completions(&mut state, &mut messages),
+            fold_completions(&actor, &mut state, &mut messages),
             "a job's result is work to answer"
         );
         let folded: Vec<&str> = messages.iter().map(Message::text).collect();
@@ -4796,13 +4955,26 @@ mod tests {
         // Delivered once: the next boundary has nothing new to say, and the
         // human's parked words are still parked.
         let before = messages.len();
-        assert!(!fold_completions(&mut state, &mut messages));
+        assert!(!fold_completions(&actor, &mut state, &mut messages));
         assert_eq!(messages.len(), before, "a completion is never repeated");
         assert_eq!(
             state.deferred.len(),
             1,
             "a nudge is not this function's to fold"
         );
+        // And every one of those lines reached the copy the human reads.
+        let ui = ui_copy(&events);
+        for line in [
+            "#1 done: did the thing",
+            "#c2 done: exit 0 · 12s · npm test — ok",
+            "#c3 stopped after 1s · npm run dev",
+        ] {
+            assert!(
+                ui.iter().any(|message| message.text() == line),
+                "`{line}` is missing from the UI's copy: {ui:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// A parent that keeps calling tools must still hear its children.
@@ -4894,17 +5066,25 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A completion that the model has not read yet must be delivered when the
-    /// UI's transcript replaces the actor's, or the result is lost for good.
+    /// A completion the model has *not* read survives an adoption: the UI's
+    /// transcript replaces the actor's, and the result is still the next thing
+    /// folded in — or it would be lost for good.
+    ///
+    /// The mirror of this is
+    /// `a_child_completion_is_delivered_once_across_an_idle_run`: adoption
+    /// re-arms nothing that has already been read. Together they say what the
+    /// books have to mean — the delivery fact belongs to the actor, and the
+    /// transcript is a copy of it, not a second place to keep it.
     #[test]
-    fn replacing_the_transcript_puts_completions_back_on_the_delivery_list() {
+    fn replacing_the_transcript_keeps_an_unread_completion_deliverable() {
         let (actor, _mailbox) = test_actor("deliver");
         let mut state = ActorState::default();
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
+        // A completion that arrived between boundaries and has not been folded
+        // into the model's transcript yet.
         state
             .completed
             .insert(1, Outcome::Finished("did the thing".into()));
-        state.delivered.insert(1);
 
         let fresh = vec![Message::system("you are mush"), Message::user("carry on")];
         assert!(matches!(
@@ -4913,8 +5093,13 @@ mod tests {
         ));
         assert!(
             !state.delivered.contains(&1),
-            "the new transcript has no #1 done line, so it is undelivered again"
+            "the model has not read it yet"
         );
+        assert!(
+            fold_completions(&actor, &mut state, &mut messages),
+            "so the next boundary folds it in"
+        );
+        assert_eq!(messages.last().unwrap().text(), "#1 done: did the thing");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -5016,20 +5201,22 @@ mod tests {
     /// reach the model twice, however many boundaries the run passes.
     #[test]
     fn a_completion_is_delivered_once() {
+        let (actor, _mailbox) = test_actor("delivered-once");
         let mut state = ActorState::default();
         let mut messages = vec![Message::system("you are mush")];
         state
             .completed
             .insert(1, Outcome::Finished("wrote the parser".into()));
 
-        assert!(fold_completions(&mut state, &mut messages));
+        assert!(fold_completions(&actor, &mut state, &mut messages));
         assert_eq!(messages.len(), 2, "one line for the one completion");
         assert_eq!(messages[1].text(), "#1 done: wrote the parser");
         assert!(
-            !fold_completions(&mut state, &mut messages),
+            !fold_completions(&actor, &mut state, &mut messages),
             "the model has read it, so there is nothing left to fold"
         );
         assert_eq!(messages.len(), 2, "and nothing is pushed a second time");
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// The learned-context retry, in process: the endpoint refuses the request
