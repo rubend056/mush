@@ -747,6 +747,7 @@ mod tests {
             updated: 0,
             messages: Vec::new(),
             agents: Vec::new(),
+            notices: Vec::new(),
         }
     }
 

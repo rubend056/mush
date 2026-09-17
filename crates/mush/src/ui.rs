@@ -309,17 +309,13 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
     let rows =
         Layout::vertical([Constraint::Min(3), Constraint::Length(input_lines + 2)]).split(area);
 
-    let title = if app.tree.focused == AgentId::ROOT {
-        " mush ".to_string()
-    } else {
-        format!(" agent #{} ", app.tree.focused)
-    };
+    // The pane's own title, not one built here: a pane with no room for the
+    // foot's count line says what it is hiding in the title instead, and that
+    // is arithmetic about the conversation, not about the frame.
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(border(focused))
-        .title(title);
+        .border_style(border(focused));
     let inner = block.inner(rows[0]);
-    frame.render_widget(block, rows[0]);
 
     if inner.height > 0 && inner.width > 0 {
         // A 200-column transcript is not read, it is skimmed. Cap the measure
@@ -342,8 +338,11 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         // Only the rows the window can show are built — the whole scrollback to
         // display forty lines cost 55 ms a frame on a long session, and `tick`
         // repaints every frame while an agent works.
-        let visible = app.chat.visible_lines(&pane, width, height);
-        frame.render_widget(Paragraph::new(Text::from(visible)), inner);
+        let painted = app.chat.painted(&pane, width, height);
+        frame.render_widget(block.title(painted.title), rows[0]);
+        frame.render_widget(Paragraph::new(Text::from(painted.lines)), inner);
+    } else {
+        frame.render_widget(block, rows[0]);
     }
 
     let input_block = Block::default()
@@ -426,6 +425,8 @@ fn draw_picker(frame: &mut Frame, app: &App) {
                 .map(|item| item.split(" · ").next().unwrap_or(item) == app.cfg.model)
                 .unwrap_or(false),
             PickerKind::Provider => item == app.cfg.provider.name(),
+            // Nothing in this list is a choice, so nothing is marked as one.
+            PickerKind::Notes => false,
         };
         let label = if current {
             format!("• {item}")
@@ -448,7 +449,7 @@ fn draw_picker(frame: &mut Frame, app: &App) {
         1,
     );
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(" Enter pick · Esc cancel ", dim()))),
+        Paragraph::new(Line::from(Span::styled(picker.hint(), dim()))),
         hint,
     );
 }

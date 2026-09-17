@@ -63,10 +63,14 @@ pub enum Focus {
 pub enum PickerKind {
     Model,
     Provider,
+    /// The lines mush wrote about the focused agent, for `/notes`. Nothing here
+    /// is a choice, so `Enter` and `Esc` do the same thing.
+    Notes,
 }
 
-/// A small modal list (models or providers) that grabs the keyboard until
-/// Enter or Esc. Drawn as a centered popup by `ui::draw_picker`.
+/// A small modal list that grabs the keyboard until Enter or Esc: the models,
+/// the providers, and the notes mush wrote about the focused agent. Drawn as a
+/// centered popup by `ui::draw_picker`.
 pub struct Picker {
     pub kind: PickerKind,
     pub items: Vec<String>,
@@ -78,6 +82,17 @@ impl Picker {
         match self.kind {
             PickerKind::Model => " models · Enter picks ".to_string(),
             PickerKind::Provider => " provider · Enter picks ".to_string(),
+            PickerKind::Notes => " notes · newest last ".to_string(),
+        }
+    }
+
+    /// What the popup's own last row says the keys do. It belongs to the picker
+    /// rather than to the painter because it is the same fact as the title: what
+    /// this list is for.
+    pub fn hint(&self) -> &'static str {
+        match self.kind {
+            PickerKind::Model | PickerKind::Provider => " Enter pick · Esc cancel ",
+            PickerKind::Notes => " j/k scrolls · Esc closes ",
         }
     }
 }
@@ -209,9 +224,9 @@ impl App {
         session_save: Arc<dyn SessionSave>,
     ) -> Self {
         let system = Message::system(prompt::system_prompt(&ws.root_str()));
-        let (messages, stored_agents) = match stored {
-            Some(session) => (session.messages, session.agents),
-            None => (Vec::new(), Vec::new()),
+        let (messages, stored_agents, stored_notices) = match stored {
+            Some(session) => (session.messages, session.agents, session.notices),
+            None => (Vec::new(), Vec::new(), Vec::new()),
         };
         let cfg_shared = root.cfg.clone();
         let mut app = Self {
@@ -234,6 +249,9 @@ impl App {
             dirty_screen: true,
             spin: 0,
         };
+        // The failures come back before the agents do, because the agent that
+        // went back to idle takes its line with it (see `restore_agents`).
+        app.chat.restore_notices(stored_notices);
         app.restore_agents(stored_agents);
         app.discover_worktrees();
         app.refresh_git();
@@ -281,6 +299,13 @@ impl App {
                 // A run that was still in flight at shutdown is not a result.
                 session::StoredStatus::Idle => (Phase::Idle, agent.summary.clone()),
             };
+            // The row is derived and cannot lie, so the line that disagrees with
+            // it is the one that goes: an agent come back idle or done keeps no
+            // failure notice, and a `✓` row with a `!` line under it is exactly
+            // the pair this rule exists to prevent.
+            if !matches!(phase, Phase::Failed(_)) {
+                self.chat.clear_notes_for(AgentId(agent.id));
+            }
             let landed = agent.landed.map(|landed| match landed {
                 session::StoredLanded::Merged => Landed::Merged,
                 session::StoredLanded::Discarded => Landed::Discarded,
@@ -575,6 +600,15 @@ impl App {
                 // spinner, and Ctrl-C agree with the actor. The last run's
                 // summary belongs to that run, not this one (finding B14).
                 self.tree.begin(id, Some(cancel));
+                // A new run supersedes everything mush said about the last one:
+                // the hints answered a command in a moment that is over, and the
+                // failure belonged to the run this one is replacing. The row is
+                // derived from the phase and cannot go stale, so the line is the
+                // one that ages out — which is also what keeps a pane from
+                // holding a `!` line next to a run in flight that is fixing it.
+                if self.chat.clear_notes_for(id) {
+                    self.mark_session_dirty();
+                }
             }
             AgentEvent::Status(status) => {
                 // A status that arrives after the run's own end (a late or
@@ -618,6 +652,9 @@ impl App {
                 self.tree.fail(id, error.clone());
                 self.mark_session_dirty();
                 self.refresh_git();
+                // The durable half of the same fact: the row's `✗` is derived and
+                // dies with the next run, while this line is tagged, stamped and
+                // written to the session, so a restart still says what broke.
                 self.chat.note_error_for(id, error);
                 self.chat.scroll_to_bottom();
             }
@@ -857,12 +894,14 @@ impl App {
                      Ctrl-P pick a model · Ctrl-N new chat · \
                      Ctrl-C stops the focused agent · Ctrl-X stops them all. \
                      Commands: /provider /model /context /url /key /models \
-                     /worktrees /diff /merge /discard /forget /compact /new /quit \
+                     /worktrees /diff /merge /discard /forget /compact /notes /new /quit \
                      (/merge and /discard run git for you and reclaim the worktree; \
                      /forget drops the agent from this session and leaves the branch; \
-                     /compact folds the focused agent's conversation into a summary)",
+                     /compact folds the focused agent's conversation into a summary; \
+                     /notes reads the lines this pane had no room for)",
                 );
             }
+            "/notes" => self.open_notes_picker(),
             "/context" => {
                 if rest.is_empty() {
                     self.say(format!(
@@ -1050,6 +1089,30 @@ impl App {
         });
     }
 
+    /// `/notes`: the lines mush wrote about the focused agent, in full.
+    ///
+    /// The foot shows at most two of them, so this is the other half of that
+    /// cap: a list where a long line is wrapped rather than clipped, which is
+    /// what `/help` and a multi-line failure need. Newest last, the same order
+    /// the pane reads in, with the cursor on it — the newest is what the human
+    /// came back for.
+    fn open_notes_picker(&mut self) {
+        let agent = self.tree.focused;
+        let items = self
+            .chat
+            .notes_report(agent, session::now_secs(), chat::NOTES_WIDTH);
+        if items.is_empty() {
+            self.say(format!("nothing written about #{agent} yet"));
+            return;
+        }
+        let cursor = items.len() - 1;
+        self.picker = Some(Picker {
+            kind: PickerKind::Notes,
+            items,
+            cursor,
+        });
+    }
+
     fn open_provider_picker(&mut self) {
         let items: Vec<String> = Provider::ALL.iter().map(|p| p.name().to_string()).collect();
         let cursor = items
@@ -1146,6 +1209,9 @@ impl App {
                 ));
             }
             PickerKind::Provider => self.apply_provider(item),
+            // Nothing to apply: the list is a reading, and `key_picker` closes it
+            // on Enter exactly as it does on Esc.
+            PickerKind::Notes => {}
         }
     }
 
@@ -1450,6 +1516,9 @@ impl App {
             updated: session::now_secs(),
             messages: self.chat.transcript(AgentId::ROOT).to_vec(),
             agents,
+            // A failure is the one line worth coming back to; a command's answer
+            // is not (see `Chat::stored_notices`).
+            notices: self.chat.stored_notices(),
         }
     }
 
@@ -1649,6 +1718,8 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use crossbeam_channel::Receiver;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
 
     use crate::session_save;
     use crate::session_save::SessionSave;
@@ -1744,6 +1815,44 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// A real `App` that adopted what is on disk in `root`, the way a restart
+    /// does.
+    fn reopened(root: &std::path::Path) -> App {
+        let ws = Workspace::new(root).unwrap();
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let handle = spawn(cfg.clone(), tx.clone(), root.to_path_buf());
+        App::new(
+            ws,
+            cfg,
+            Session::load(root),
+            handle,
+            tx,
+            Vec::new(),
+            session_save::fake::Recorder::new(),
+        )
+    }
+
+    /// The painted screen, row by row, at a real terminal size. The layout
+    /// tiers, the panes and the foot are only true together, which is why the
+    /// audit that found these defects read rows instead of reasoning about
+    /// them. A pane's border is stripped: what a test reads is the row's text.
+    fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+                    .trim_matches('│')
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
     }
 
     /// One streamed message from the root, the way its actor sends them.
@@ -1998,6 +2107,7 @@ mod tests {
                 summary: Some("finished it".into()),
                 messages: vec![Message::user("port the parser"), Message::assistant("done")],
             }],
+            notices: Vec::new(),
         };
 
         let app = App::new(
@@ -2065,6 +2175,7 @@ mod tests {
                 summary: None,
                 messages,
             }],
+            notices: Vec::new(),
         }
     }
 
@@ -2541,6 +2652,208 @@ mod tests {
             per_frame < Duration::from_millis(16),
             "a frame must fit a 60 fps budget, took {per_frame:?}"
         );
+    }
+
+    /// The two lifetimes, read off the file. A run's failure belongs to the run
+    /// and to the workspace it broke, so it is on disk and comes back at the
+    /// next start; a line that answered a command answered a moment that is
+    /// over by then, and restoring it out of context would say "git diff
+    /// HEAD...mush/2" over a tree nobody was looking at.
+    #[test]
+    fn a_failure_is_stored_and_a_command_answer_is_not() {
+        let root = dir("notes-file");
+        let (mut app, _writer) = app_writing(&root);
+        app.chat.note("git diff HEAD...mush/2");
+        let conversation = app.tree.conversation();
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Error("no route to host".into()),
+        });
+        app.flush_session();
+        drop(app);
+
+        let stored = Session::load(&root).expect("the command flushed it");
+        assert_eq!(stored.notices.len(), 1, "only the failure is stored");
+        assert_eq!(stored.notices[0].agent, 0);
+        assert_eq!(stored.notices[0].text, "no route to host");
+        assert!(
+            stored.notices[0].at > 0,
+            "a stored line says when it happened, not only what happened"
+        );
+
+        let app = reopened(&root);
+        let notes: Vec<&str> = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .map(|notice| notice.text.as_str())
+            .collect();
+        assert_eq!(
+            notes,
+            vec!["no route to host"],
+            "the restart kept the failure and dropped the diff line"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A fresh run of an agent supersedes its stale failure: the row is derived
+    /// from the phase and cannot lie, so the line that disagrees with it is the
+    /// one that goes.
+    #[test]
+    fn a_completed_run_supersedes_an_older_failure() {
+        let (mut app, _rx) = test_app("supersede");
+        let conversation = app.tree.conversation();
+        let send = |app: &mut App, id: AgentId, event: AgentEvent| {
+            app.update(Msg::Agent {
+                conversation,
+                id,
+                event,
+            })
+        };
+        let notes = |app: &App| -> Vec<String> {
+            app.chat
+                .notices_for(AgentId::ROOT)
+                .map(|notice| notice.text.clone())
+                .collect()
+        };
+
+        send(
+            &mut app,
+            AgentId::ROOT,
+            AgentEvent::Error("no route to host".into()),
+        );
+        assert_eq!(notes(&app), vec!["no route to host"]);
+
+        // Failing twice in one run is still one failure: two lines would
+        // disagree about which of them is current.
+        send(
+            &mut app,
+            AgentId::ROOT,
+            AgentEvent::Error("still no route".into()),
+        );
+        assert_eq!(notes(&app), vec!["still no route"]);
+
+        // A child's run is not the root's business: the line is tagged with the
+        // agent it concerns (finding B19).
+        send(
+            &mut app,
+            AgentId(1),
+            AgentEvent::Running {
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        assert_eq!(
+            notes(&app),
+            vec!["still no route"],
+            "an agent that ran clears its own line and nobody else's"
+        );
+
+        // The run that supersedes it: the failure belonged to the attempt this
+        // one replaced, and once it has started and finished there is nothing
+        // left claiming the agent is broken.
+        send(
+            &mut app,
+            AgentId::ROOT,
+            AgentEvent::Running {
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
+        send(&mut app, AgentId::ROOT, AgentEvent::Done);
+        assert!(
+            notes(&app).is_empty(),
+            "a completed run leaves no failure line behind: {:?}",
+            notes(&app)
+        );
+    }
+
+    /// The foot at the two sizes the audit names. 40×10 leaves the transcript
+    /// pane one row, so the pane keeps that row and says the count in its
+    /// title; 60×17 has room for two note rows and the count above them. Either
+    /// way the number is the number of lines not painted, which is what makes
+    /// it a decision and not a discovery.
+    #[test]
+    fn the_foot_caps_at_two_rows_and_counts_the_rest() {
+        let (mut app, _rx) = test_app("foot-sizes");
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("port the parser"));
+        for index in 0..6 {
+            app.chat.note_for(AgentId::ROOT, format!("note {index}"));
+        }
+
+        // 40×10: the pane is one row tall inside its border. The transcript
+        // keeps it — the foot takes none, and the title says what is missing.
+        let small = screen(&mut app, 40, 10);
+        assert_eq!(small.len(), 10);
+        assert!(
+            small[4].contains("you › port the parser"),
+            "the one transcript row is the conversation, not a foot: {:?}",
+            &small[3..6]
+        );
+        assert!(
+            small[3].contains("+6 more lines"),
+            "six note lines are hidden and the pane says so: {:?}",
+            small[3]
+        );
+        assert!(
+            !small.iter().any(|row| row.contains("/notes")),
+            "a pane with no room for the count line does not pretend otherwise: {small:?}"
+        );
+
+        // 60×17: two rows of notes, then one that says four lines are not
+        // there. Six lines were written, two are painted, four are counted.
+        let roomy = screen(&mut app, 60, 17);
+        assert!(
+            roomy[4].contains("you › port the parser"),
+            "{:?}",
+            &roomy[3..9]
+        );
+        assert_eq!(roomy[5], "  +4 more lines · /notes", "{:?}", &roomy[3..9]);
+        assert_eq!(roomy[6], "· note 4", "{:?}", &roomy[3..9]);
+        assert_eq!(roomy[7], "· note 5", "{:?}", &roomy[3..9]);
+        assert!(
+            !roomy.iter().any(|row| row.contains("note 3")),
+            "the cap is two rows, and the count is the rest: {:?}",
+            &roomy[3..9]
+        );
+    }
+
+    /// `/notes` is the other half of the cap: the lines the foot ceded are read
+    /// in full, oldest first, with the cursor on the newest.
+    #[test]
+    fn the_notes_command_lists_what_the_foot_could_not_show() {
+        let (mut app, _rx) = test_app("notes-command");
+        assert!(
+            app.chat
+                .notes_report(AgentId::ROOT, session::now_secs(), chat::NOTES_WIDTH)
+                .is_empty(),
+            "nothing has been written about a fresh conversation"
+        );
+        app.run_command("/notes");
+        assert!(
+            app.picker.is_none(),
+            "and the command says so instead of opening an empty list"
+        );
+        assert_eq!(text_of(&app), "nothing written about #0 yet");
+
+        for index in 0..5 {
+            app.chat.note_for(AgentId::ROOT, format!("note {index}"));
+        }
+        app.run_command("/notes");
+        let picker = app.picker.as_ref().expect("the lines mush wrote");
+        assert!(
+            matches!(picker.kind, PickerKind::Notes),
+            "the popup is a reading, not a choice"
+        );
+        assert_eq!(
+            picker.items.len(),
+            5,
+            "every note, not only the held-back ones"
+        );
+        assert_eq!(
+            picker.items[0], "0s · note 0",
+            "oldest first, like the pane"
+        );
+        assert_eq!(picker.cursor, 4, "the cursor opens on the newest");
     }
 
     fn test_app(label: &str) -> (App, Receiver<Msg>) {
