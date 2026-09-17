@@ -134,11 +134,8 @@ pub struct App {
     pub picker: Option<Picker>,
     /// The main worktree's branch, dirty count, and uncommitted line delta.
     pub git: Option<git::RepoStatus>,
-    /// Bytes of the root conversation, so the context meter costs nothing to
-    /// draw. Updated whenever the transcript changes.
-    pub context_used: usize,
     /// The agents, their phases, the focus and the per-agent mailboxes,
-    /// transcripts, cancel flags and git stats.
+    /// cancel flags and git stats.
     pub tree: AgentTree,
     /// Shared with the agent actors so runtime config changes apply everywhere.
     pub cfg_shared: Arc<Mutex<Config>>,
@@ -180,7 +177,6 @@ impl App {
             models,
             picker: None,
             git: None,
-            context_used: 0,
             tree: AgentTree::rooted(root),
             cfg_shared,
             ui_tx,
@@ -193,7 +189,6 @@ impl App {
         };
         app.restore_agents(stored_agents);
         app.discover_worktrees();
-        app.count_context();
         app.refresh_git();
         app
     }
@@ -317,21 +312,10 @@ impl App {
         self.dirty_screen = true;
     }
 
-    /// How many tokens the root conversation is holding, roughly (the same
-    /// three-bytes-per-token heuristic the trimmer uses).
-    fn count_context(&mut self) {
-        self.context_used = self
-            .chat
-            .transcript(AgentId::ROOT)
-            .iter()
-            .map(Message::weight)
-            .sum::<usize>()
-            + self.chat.system().weight();
-    }
-
-    /// The window in tokens, for the meter.
+    /// The window in tokens, for the meter. The number is the conversation's,
+    /// not a copy of it: nothing can go stale between a push and a draw.
     pub fn context_used_tokens(&self) -> usize {
-        self.context_used / 3
+        self.chat.used_tokens()
     }
 
     /// Register git worktrees left over from earlier sessions (`mush/<id>`
@@ -520,7 +504,6 @@ impl App {
             AgentEvent::Message(message) => {
                 self.chat.push_message(id, message);
                 if id == AgentId::ROOT {
-                    self.count_context();
                     self.save_session();
                 }
                 self.chat.scroll_to_bottom();
@@ -568,7 +551,6 @@ impl App {
                 let carried = Message::user(prompt::compaction_message(&summary));
                 self.chat.replace_transcript(id, vec![carried]);
                 if id == AgentId::ROOT {
-                    self.count_context();
                     self.save_session();
                     self.chat
                         .note("context compacted — continuing from a summary");
@@ -693,7 +675,6 @@ impl App {
             // the root is starting a run or already in one.
             self.chat
                 .push_message(AgentId::ROOT, Message::user(text.clone()));
-            self.count_context();
             self.chat.scroll_to_bottom();
             self.save_session();
             // The root's own phase, not the tree's: a napping orchestrator is
@@ -1208,7 +1189,6 @@ impl App {
         self.chat.clear();
         self.spin = 0;
         self.discover_worktrees();
-        self.count_context();
         self.refresh_git();
         self.save_session();
         self.say("new chat — agents stopped, root restarted");

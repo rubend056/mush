@@ -76,6 +76,9 @@ impl Chat {
         Self::new(Message::system("you are mush"), Vec::new())
     }
 
+    /// The system prompt this conversation opens with. Every run is sent it
+    /// through [`Self::conversation`]; this is for weighing it on its own.
+    #[cfg(test)]
     pub fn system(&self) -> &Message {
         &self.system
     }
@@ -126,6 +129,18 @@ impl Chat {
     /// transcript without a node is text nobody can see or steer.
     pub fn forget(&mut self, agent: AgentId) {
         self.agents.remove(&agent);
+    }
+
+    /// How many tokens the root conversation is holding, roughly — the same
+    /// three-bytes-per-token heuristic the trimmer uses.
+    ///
+    /// Derived on read, from the system prompt and the transcript, and never
+    /// counted beside them: there is no push site left to forget, and the
+    /// human's own words weigh as soon as they are in the transcript they are
+    /// in (finding B8).
+    pub fn used_tokens(&self) -> usize {
+        let bytes = self.system.weight() + self.root.iter().map(Message::weight).sum::<usize>();
+        bytes / 3
     }
 
     /// `/new`: the conversation is gone, the box and the scrollback with it.
@@ -279,6 +294,46 @@ mod tests {
             "a plain Enter must reach the agents"
         );
         assert!(!chat.key(key(KeyCode::Tab)), "and so must the pane keys");
+    }
+
+    /// The context meter is derived from the conversation, not counted beside
+    /// it: the human's own words weigh as soon as they are in the transcript,
+    /// and a transcript replaced wholesale moves the meter with it — there is
+    /// nothing to forget (finding B8).
+    #[test]
+    fn the_context_meter_is_derived_from_the_conversation() {
+        let mut chat = Chat::bare();
+        let idle = chat.used_tokens();
+        assert_eq!(
+            idle,
+            chat.system().weight() / 3,
+            "the system prompt alone, for a conversation with nothing said"
+        );
+
+        let asked = Message::user("a question long enough to weigh something");
+        chat.push_message(AgentId::ROOT, asked.clone());
+        assert!(
+            chat.used_tokens() > idle,
+            "the meter must count the human's own message"
+        );
+
+        // Compaction replaces the transcript with a summary; the meter follows
+        // the transcript, because it is the transcript.
+        let summary = Message::user("a summary");
+        chat.replace_transcript(AgentId::ROOT, vec![summary.clone()]);
+        assert_eq!(
+            chat.used_tokens(),
+            (chat.system().weight() + summary.weight()) / 3,
+            "the meter reads what is there now"
+        );
+
+        // A subagent's transcript is not the root's conversation, so it does
+        // not weigh on it.
+        chat.push_message(AgentId(1), Message::assistant("x".repeat(1000)));
+        assert_eq!(
+            chat.used_tokens(),
+            (chat.system().weight() + summary.weight()) / 3
+        );
     }
 
     /// The box that the chat routes keys to keeps its cursor in grapheme
