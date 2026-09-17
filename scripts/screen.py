@@ -36,6 +36,41 @@ CSI = re.compile(r"\x1b\[([\x20-\x3f]*)([@-~])", re.S)
 # treated as garbage and dropped, so one odd byte cannot stall rendering.
 MAX_PENDING = 64
 
+# The escapes `--keys` understands. `unicode_escape` used to decode this
+# argument, which is the wrong tool twice over: it turns a literal `é` into the
+# two latin-1 characters `Ã©`, and it leaves `\e` (the usual way to write ESC on
+# a command line) as a literal backslash.
+KEY_ESCAPES = {
+    "n": "\n",
+    "r": "\r",
+    "t": "\t",
+    "a": "\a",
+    "b": "\b",
+    "f": "\f",
+    "v": "\v",
+    "e": "\x1b",
+    "0": "\0",
+    "\\": "\\",
+    "'": "'",
+    '"': '"',
+}
+KEY_ESCAPE = re.compile(r"\\(x[0-9a-fA-F]{2}|u[0-9a-fA-F]{4}|.)", re.S)
+
+
+def decode_keys(text: str) -> str:
+    """Decode the escapes in `--keys`, and nothing else.
+
+    A literal non-ASCII character is left alone: the bytes sent to the pty are
+    UTF-8, and the terminal is promised those bytes."""
+
+    def one(match: "re.Match") -> str:
+        body = match.group(1)
+        if body[0] in "xu" and len(body) > 1:
+            return chr(int(body[1:], 16))
+        return KEY_ESCAPES.get(body, body)
+
+    return KEY_ESCAPE.sub(one, text)
+
 
 class Screen:
     """Just enough terminal to render ratatui: a grid, a cursor, and the
@@ -43,8 +78,8 @@ class Screen:
     what is on the screen, not what it looks like)."""
 
     def __init__(self, cols: int, rows: int):
-        self.resize(cols, rows)
         self.x = self.y = 0
+        self.resize(cols, rows)
         self.pending = ""
         self.decoder = codecs.getincrementaldecoder("utf-8")("replace")
 
@@ -55,6 +90,17 @@ class Screen:
         if old:
             for y, row in enumerate(old[:rows]):
                 self.grid[y][: len(row[:cols])] = row[:cols]
+        self.clamp()
+
+    def clamp(self) -> None:
+        """Keep the cursor on the grid.
+
+        A terminal can be resized smaller under a cursor that was already low,
+        and a program can name a row past the bottom (\x1b[999;1H). Both used to
+        leave x/y out of range and the next erase or write raised IndexError
+        instead of painting."""
+        self.x = min(max(self.x, 0), max(self.cols - 1, 0))
+        self.y = min(max(self.y, 0), max(self.rows - 1, 0))
 
     def feed(self, chunk: bytes) -> None:
         text = self.pending + self.decoder.decode(chunk)
@@ -140,8 +186,9 @@ class Screen:
                 for x in range(start, end):
                     row[x] = " "
         elif final == "X":
-            for x in range(self.x, min(self.cols, self.x + first)):
-                self.grid[self.y][x] = " "
+            if 0 <= self.y < self.rows:
+                for x in range(self.x, min(self.cols, self.x + first)):
+                    self.grid[self.y][x] = " "
 
     def text(self) -> str:
         return "\n".join("".join(row).rstrip() for row in self.grid)
@@ -222,7 +269,15 @@ def main() -> int:
     parser.add_argument("--settle", type=float, default=1.5, help="seconds per screen")
     parser.add_argument("--url", default="", help="endpoint (default: a closed port)")
     parser.add_argument("--model", default="probe")
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="check the screen decoder against escapes a TUI really emits",
+    )
     args = parser.parse_args()
+
+    if args.self_test:
+        return self_test()
 
     binary = str(pathlib.Path(args.binary).resolve())
     if not pathlib.Path(binary).exists():
@@ -242,7 +297,7 @@ def main() -> int:
     env.pop("MUSH_API_KEY", None)
 
     try:
-        keys = codecs.decode(args.keys, "unicode_escape") if args.keys else ""
+        keys = decode_keys(args.keys) if args.keys else ""
     except ValueError as exc:
         print(f"bad --keys value {args.keys!r}: {exc}", file=sys.stderr)
         return 2
@@ -263,6 +318,55 @@ def main() -> int:
     finally:
         tui.close()
     return 0
+
+
+def self_test() -> int:
+    """The decoder's own regressions: no binary, no pty, no model.
+
+    What this catches is not what ratatui normally emits but what it can be made
+    to emit by a smaller terminal or an odd keystroke, which is exactly how the
+    decoder was wrong before: an `X` (erase characters) after a cursor that had
+    been pushed off the grid raised instead of painting.
+    """
+    failures = 0
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        nonlocal failures
+        failures += 0 if ok else 1
+        print(f"{'PASS' if ok else 'FAIL'}  {name}{(' — ' + detail) if detail else ''}")
+
+    def painted(seq: bytes, cols: int = 20, rows: int = 5) -> "Screen":
+        screen = Screen(cols, rows)
+        screen.feed(seq)
+        return screen
+
+    screen = painted(b"\x1b[2J\x1b[1;1Ha\x1b[1;3Hc")
+    check("cursor addressing paints where it says", screen.text().splitlines()[0] == "a c")
+
+    screen = painted(b"\x1b[999;1H\x1b[X")
+    check("a row past the bottom is clamped, not a crash", screen.text() != "")
+
+    screen = Screen(20, 20)
+    screen.feed(b"\x1b[15;5H")
+    screen.resize(20, 5)
+    screen.feed(b"\x1b[X")
+    check("a shrink under a low cursor does not crash", screen.text() != "")
+
+    screen = painted(b"\x1b[2;3H\x1b[Kfilled")
+    lines = screen.text().splitlines()
+    check("erase-to-end keeps the columns before it", lines[1] == "  filled")
+
+    screen = painted(b"one\x1b]0;title\x07two")
+    check("OSC is swallowed to its terminator", screen.text().splitlines()[0] == "onetwo")
+
+    check("a literal non-ascii key survives", decode_keys("é") == "é")
+    check("an escape decodes", decode_keys("\\e[B") == "\x1b[B")
+    check("a hex escape decodes", decode_keys("\\x1bq") == "\x1bq")
+    check("tab and enter decode", decode_keys("\\t") == "\t" and decode_keys("\\r") == "\r")
+    check("an unknown escape is its own letter", decode_keys("\\q") == "q")
+
+    print("all decoder checks passed" if not failures else f"{failures} check(s) failed")
+    return 0 if not failures else 1
 
 
 if __name__ == "__main__":

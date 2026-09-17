@@ -350,8 +350,8 @@ the queue of record; this column says where the *fix belongs*.
 | B12 | an `Error` status loses to the activity line | ✅ | one precedence table (3.2) |
 | B13 | a child's brief is never shown | ✅ | `Spawned` pushes the opening message |
 | B14 | the row's summary is from the first run, forever | ✅ | `AgentTree::{begin, finish}` |
-| B15 | `screen.py` mis-reads CSI / `--keys` escapes | 🔄 | `scripts/screen.py` |
-| B16 | `smoke.py --cancel` forks after starting a thread | 🔄 | `scripts/smoke.py` |
+| B15 | `screen.py` mis-reads CSI / `--keys` escapes | ✅ | `scripts/screen.py` — cursor clamped to the grid (a row past the bottom, or a shrink under a low cursor, raised `IndexError` on the next `X`), and `--keys` decodes the escapes it means instead of `unicode_escape`, which turned `é` into `Ã©` and left `\e` literal. `--self-test` pins both. |
+| B16 | `smoke.py --cancel` forks after starting a thread | ✅ | `scripts/smoke.py` — the pty is forked before the endpoint's thread exists; verified by running the scenario. |
 | B17 | the layout sweep never exercises an open file | 🔄 | `Screen` sweep (Stage 3) |
 | B18 | `~` elision matches a prefix, not a directory | ✅ | `ui::facts_line` |
 | B19 | global notices render into every transcript | ⬜ | agent-scoped notices (3.2) |
