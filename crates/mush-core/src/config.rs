@@ -271,11 +271,12 @@ fn normalize_url(url: &str) -> String {
 /// The schemas are context paid on *every* request, so this is a real cost and
 /// the descriptions are kept to the rules a model must read to obey them (the
 /// one-non-isolated-sibling limit, that stopping a child is not finishing it,
-/// and that a command already runs in the workspace root). They grew from
-/// ~3.1 KB when those rules were made explicit, to ~3.6 KB when the `cd` rule
-/// joined them; the `schemas_fit_the_budget_reserve` test is what makes that a
-/// decision rather than a silent drift.
-pub const SCHEMA_TOKENS: usize = 1_220;
+/// that a command already runs in the workspace root, and — with jobs — what
+/// `detach` and `exclusive` promise). They grew from ~3.1 KB when those rules
+/// were made explicit, to ~3.6 KB when the `cd` rule joined them, and to ~5 KB
+/// when the machine's three tools did; the `schemas_fit_the_budget_reserve` test
+/// is what makes that a decision rather than a silent drift.
+pub const SCHEMA_TOKENS: usize = 1_700;
 
 impl Config {
     /// Built-in defaults with the `MUSH_*` environment applied.
@@ -1246,14 +1247,15 @@ mod tests {
 
     #[test]
     fn history_budget_fits_the_context_window() {
-        // 8192 tokens: the full reserve (1220 schemas + 2048 reply + 200
-        // margin) leaves 14_172 bytes of history. The schema reserve has grown
-        // twice, each time with the test and the comment moved together: 1100
-        // when the delegation contract became explicit, 1220 when the `cd` rule
-        // joined it. See SCHEMA_TOKENS.
+        // 8192 tokens: the full reserve (1700 schemas + 2048 reply + 200
+        // margin) leaves 12_732 bytes of history. The schema reserve has grown
+        // three times, each time with the test and the comment moved together:
+        // 1100 when the delegation contract became explicit, 1220 when the `cd`
+        // rule joined it, and 1700 when the machine's three tools did. See
+        // SCHEMA_TOKENS.
         let small = Config::new("http://x:1", "m", None);
         assert_eq!(small.context_tokens, DEFAULT_CONTEXT_TOKENS);
-        assert_eq!(small.history_budget(), 14_172);
+        assert_eq!(small.history_budget(), 12_732);
 
         // A big window leaves a much larger budget.
         let big = Config {

@@ -155,6 +155,25 @@ pub fn truncate_for_model(mut text: String, cap: usize) -> String {
     text
 }
 
+/// Cap text handed to a model from the *end*, marking the cut at the front.
+///
+/// A side effect of an unfinished command is a tail: the tests it printed last,
+/// the error it died on, the panic at the bottom of the log. `truncate_for_model`
+/// keeps the head instead, which is right for a file the model is about to edit
+/// and wrong for a log it is about to read. Keeping the tail is also what makes a
+/// crash legible at all — the interesting bytes are the ones written just before
+/// it stopped.
+pub fn tail_for_model(text: &str, cap: usize) -> String {
+    if text.len() <= cap {
+        return text.to_string();
+    }
+    let mut cut = text.len() - cap;
+    while cut < text.len() && !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    format!("[mush: output truncated]\n\n{}", &text[cut..])
+}
+
 /// Write via a same-directory temp file plus `rename`, so readers never observe
 /// a half-written file and a crash cannot corrupt the original.
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
@@ -211,6 +230,21 @@ mod tests {
             truncate_for_model("abcdef".to_string(), 3),
             "abc\n\n[mush: output truncated]"
         );
+    }
+
+    /// A tail keeps the last bytes and says so at the front — the opposite end
+    /// from `truncate_for_model`, because what a log died of is at the bottom.
+    #[test]
+    fn a_tail_keeps_the_end_and_marks_the_cut_at_the_front() {
+        assert_eq!(tail_for_model("short", 100), "short");
+        assert_eq!(
+            tail_for_model("abcdef", 3),
+            "[mush: output truncated]\n\ndef"
+        );
+        // The cut lands on a char boundary, never inside a character.
+        let tail = tail_for_model("éééééé", 5);
+        assert!(tail.ends_with("é"), "{tail}");
+        assert!(tail.starts_with("[mush: output truncated]"), "{tail}");
     }
 
     #[test]

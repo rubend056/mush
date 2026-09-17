@@ -10,6 +10,7 @@ mod clock;
 mod events;
 mod http;
 mod input;
+mod jobs;
 mod machine;
 mod model;
 mod session_save;

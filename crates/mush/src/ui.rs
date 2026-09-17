@@ -204,6 +204,18 @@ fn agent_line(app: &App, node: &AgentNode, width: usize) -> String {
             where_and_how.push_str(&stat.compact());
         }
     }
+    // The jobs on this machine, on the row of whoever started them. It rides
+    // with the branch and the stat — facts that exist nowhere else on the
+    // screen — because the human should not have to ask a model what is
+    // running; the count is derived from the registry every frame, never
+    // stored, and the selected row's footer names each job.
+    let jobs = app.live_jobs(node.id).len();
+    if jobs > 0 {
+        if !where_and_how.is_empty() {
+            where_and_how.push(' ');
+        }
+        where_and_how.push_str(&format!("⚙{jobs}"));
+    }
     fit_row(&head, &node.brief, &where_and_how, &tail, width)
 }
 
@@ -236,7 +248,20 @@ fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>>
                 dim(),
             )));
         }
-        let _ = app;
+    }
+    // The selected row's jobs, in full: which command, how long, and whether it
+    // is the one holding the machine. Read from the same registry the row's
+    // count comes from, so the two can never disagree.
+    let jobs = app.job_lines(node.id);
+    if !jobs.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(
+                " {} jobs · {}",
+                jobs.len(),
+                truncate(&jobs.join(" · "), width.saturating_sub(14))
+            ),
+            dim(),
+        )));
     }
     lines
 }

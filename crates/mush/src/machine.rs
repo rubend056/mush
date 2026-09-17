@@ -16,13 +16,13 @@
 //! asserted in process: no `sh`, no `sleep`, no `yes`.
 
 use std::fs::File;
-use std::io::Read;
+use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
 
 use tempfile::NamedTempFile;
 
-use mush_core::workspace::truncate_for_model;
+use mush_core::workspace::{tail_for_model, truncate_for_model};
 
 /// What to run, and where.
 ///
@@ -48,6 +48,13 @@ pub trait Job: Send {
     /// The first `cap` bytes of each stream, marked when truncated, exactly as
     /// the model would read them.
     fn output(&self, cap: usize) -> (String, String);
+
+    /// The *last* `cap` bytes of each stream, marked when truncated. This is
+    /// the window a detached job keeps: a job ends, and what it ended with is
+    /// the part worth reading (see `crate::jobs`). A running job is read from
+    /// here too, so what `command_status` shows and what the completion reports
+    /// are the same bytes.
+    fn tail(&self, cap: usize) -> (String, String);
 
     /// Stop it and everything it started. Idempotent.
     fn kill(&mut self);
@@ -112,6 +119,10 @@ impl Job for Running {
         (self.out.read(cap), self.err.read(cap))
     }
 
+    fn tail(&self, cap: usize) -> (String, String) {
+        (self.out.read_tail(cap), self.err.read_tail(cap))
+    }
+
     fn kill(&mut self) {
         let group = self.child.id();
         let _ = self.child.kill();
@@ -162,6 +173,23 @@ impl Scratch {
         truncate_for_model(String::from_utf8_lossy(&bytes).into_owned(), cap)
     }
 
+    /// The end of what was written. Seeking from the end (rather than reading
+    /// the whole file and slicing it) is what keeps this bounded for a command
+    /// that has printed megabytes: the job only ever holds a window.
+    fn read_tail(&self, cap: usize) -> String {
+        let size = self.size();
+        let mut bytes = Vec::new();
+        if let Ok(file) = self.file.reopen() {
+            let skip = size.saturating_sub(cap as u64);
+            let mut reader = &file;
+            if skip > 0 && reader.seek(SeekFrom::Start(skip)).is_err() {
+                return String::new();
+            }
+            let _ = reader.read_to_end(&mut bytes);
+        }
+        tail_for_model(&String::from_utf8_lossy(&bytes), cap)
+    }
+
     fn size(&self) -> u64 {
         self.file
             .as_file()
@@ -177,7 +205,7 @@ pub(crate) mod fake {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
-    use mush_core::workspace::truncate_for_model;
+    use mush_core::workspace::{tail_for_model, truncate_for_model};
 
     use super::{Job, Machine, ShellCommand};
 
@@ -317,6 +345,13 @@ pub(crate) mod fake {
             (
                 truncate_for_model(self.script.stdout.clone(), cap),
                 truncate_for_model(self.script.stderr.clone(), cap),
+            )
+        }
+
+        fn tail(&self, cap: usize) -> (String, String) {
+            (
+                tail_for_model(&self.script.stdout, cap),
+                tail_for_model(&self.script.stderr, cap),
             )
         }
 

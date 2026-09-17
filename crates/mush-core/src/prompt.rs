@@ -37,10 +37,21 @@ pub fn system_prompt(root: &str) -> String {
          - Delegate independent, large, or context-heavy subtasks; do single edits and lookups yourself. \
          Prefer a few big delegations over many small ones.\n\
          - wait_agents blocks until a child finishes and returns its summary; agent_status lists your \
-         children; agent_control stops or messages one.\n\
+         children; agent_control stops or messages one. wait_agents with all=true waits for every \
+         child instead of the first.\n\
          - Ending your turn while children still run is fine: they keep working and you are woken with \
          their \"#N done: summary\" results as each finishes. Use wait_agents when you need a result \
-         before you continue."
+         before you continue.\n\
+         \n\
+         The machine is shared (CPU, ports, /tmp — a worktree isolates files, nothing else):\n\
+         - A long command detaches instead of dying: run_command answers \"[still running — detached as \
+         #c2]\" and you are told when it finishes. Pass detach=true for a server; any command that \
+         outlives 60s detaches by itself. command_status lists your jobs, wait_commands waits for one, \
+         command_control with action \\\"stop\\\" ends one.\n\
+         - Pass exclusive=true for anything timing- or port-sensitive (a benchmark, a profiler, a \
+         fixed port): it owns the machine while it runs, and a sibling's command is refused with \
+         \"#3 holds the machine; retry when it finishes\" — so wait, don't interleave. The lock is \
+         between agents; it cannot see the human's own build or an unrelated process."
     )
 }
 
@@ -76,6 +87,9 @@ pub fn subagent_prompt(root: &str, depth: usize, isolated: bool) -> String {
          - Do the work instead of describing it. Keep replies short.\n\
          - Run until you are done: a run ends when you stop calling tools, not at a turn count, so do the \
          whole task.\n\
+         - The machine is shared with your siblings (CPU, ports, /tmp): a long command detaches into a \
+         job you are told about (command_status, wait_commands, command_control), and run_command with \
+         exclusive=true owns the machine for timing- or port-sensitive work.\n\
          - Finish with a concise summary of what you changed."
     )
 }
@@ -160,11 +174,13 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::RunCommand,
-            "Run a shell command in the workspace root — no `cd` needed.",
+            "Run a shell command in the workspace root — no `cd` needed. A long one becomes a job you are told about.",
             json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "Shell command (run with sh -c)." }
+                    "command": { "type": "string", "description": "Shell command (run with sh -c)." },
+                    "detach": { "type": "boolean", "description": "Return at once; it keeps running as a job (a server, a watch) and you are told when it finishes. A command that outlives 60s detaches by itself." },
+                    "exclusive": { "type": "boolean", "description": "Own the machine while it runs: benchmarks, profiling, a fixed port. Siblings are refused, not interleaved." }
                 },
                 "required": ["command"]
             }),
@@ -188,7 +204,8 @@ pub fn tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "ids": { "type": "array", "items": { "type": "integer" }, "description": "Child ids to wait for; empty means all." },
-                    "timeout": { "type": "integer", "description": "Seconds to wait; 0 waits forever. Default 600." }
+                    "timeout": { "type": "integer", "description": "Seconds to wait; 0 waits forever. Default 600." },
+                    "all": { "type": "boolean", "description": "Every result, not the first." }
                 }
             }),
         ),
@@ -208,6 +225,35 @@ pub fn tool_schemas() -> Vec<Value> {
                     "text": { "type": "string", "description": "Text, when action is message." }
                 },
                 "required": ["id", "action"]
+            }),
+        ),
+        tool(
+            ToolName::CommandStatus,
+            "List your jobs: what is running, how long, and the end of what it wrote.",
+            json!({ "type": "object", "properties": {} }),
+        ),
+        tool(
+            ToolName::CommandControl,
+            "Stop one of your jobs.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "The number in `#c2`." },
+                    "action": { "type": "string", "enum": ["stop"] }
+                },
+                "required": ["id", "action"]
+            }),
+        ),
+        tool(
+            ToolName::WaitCommands,
+            "Block until a job finishes, or the timeout expires; returns its exit status and the end of its output.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "ids": { "type": "array", "items": { "type": "integer" }, "description": "Job ids; empty means all of yours." },
+                    "timeout": { "type": "integer", "description": "Seconds; 0 waits forever. Default 600." },
+                    "all": { "type": "boolean", "description": "Every result, not the first." }
+                }
             }),
         ),
     ]
@@ -230,7 +276,7 @@ pub fn leaf_tool_schemas() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::TOOL_NAMES;
+    use crate::tools::{ORCHESTRATION_TOOLS, TOOL_NAMES};
 
     /// The schemas and the executors are two lists that must agree; this is
     /// the test that keeps them in step (and in order).
@@ -243,26 +289,41 @@ mod tests {
             .collect();
         assert_eq!(names, TOOL_NAMES.to_vec());
 
-        // A leaf keeps exactly the workspace tools.
+        // A leaf keeps the workspace tools — the job tools among them, since a
+        // leaf may run a build in the background while it edits — and none of
+        // the delegation tools.
         let leaf = leaf_tool_schemas();
         let leaf_names: Vec<String> = leaf
             .iter()
             .map(|schema| schema["function"]["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(leaf_names, TOOL_NAMES[..5].to_vec());
+        let workspace: Vec<&str> = TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|name| !ORCHESTRATION_TOOLS.contains(name))
+            .collect();
+        assert_eq!(leaf_names, workspace);
     }
 
+    /// Depth is bounded by what a leaf can see: the delegation tools are gone,
+    /// but the job tools stay — a leaf that runs a build in the background has
+    /// to be able to watch and stop it.
     #[test]
-    fn leaf_schemas_omit_orchestration() {
+    fn leaf_schemas_omit_orchestration_but_keep_the_job_tools() {
         let leaf = leaf_tool_schemas();
         let names: Vec<&str> = leaf
             .iter()
             .map(|schema| schema["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 5);
+        assert_eq!(names.len(), 8);
         assert!(names.contains(&"edit_file"));
+        assert!(names.contains(&"command_status"));
+        assert!(names.contains(&"command_control"));
+        assert!(names.contains(&"wait_commands"));
         assert!(!names.contains(&"spawn_agent"));
         assert!(!names.contains(&"wait_agents"));
+        assert!(!names.contains(&"agent_status"));
+        assert!(!names.contains(&"agent_control"));
     }
 
     /// The root's schemas must fit the tokens `Config::history_budget`
@@ -330,6 +391,26 @@ mod tests {
             .expect("run_command has a schema");
         let description = command["function"]["description"].as_str().unwrap();
         assert!(description.contains("no `cd` needed"), "{description}");
+    }
+
+    /// The prompt says what the tools promise: that a long command detaches
+    /// rather than being killed, and that `exclusive` buys the whole machine.
+    /// A model that does not know this writes `timeout`-shaped commentary in
+    /// every summary instead of using the tools.
+    #[test]
+    fn the_prompts_say_the_machine_is_shared() {
+        let root = system_prompt("/tmp/ws");
+        assert!(root.contains("The machine is shared"), "{root}");
+        assert!(root.contains("exclusive=true"), "{root}");
+        assert!(
+            root.contains("holds the machine"),
+            "the refusal a sibling reads is quoted, so the model recognises it: {root}"
+        );
+        assert!(root.contains("worktree isolates files"), "{root}");
+        // A subagent gets the same facts in one bullet.
+        let child = subagent_prompt("/tmp/ws", 1, true);
+        assert!(child.contains("machine is shared"), "{child}");
+        assert!(child.contains("exclusive=true"), "{child}");
     }
 
     #[test]
