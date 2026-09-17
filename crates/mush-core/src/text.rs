@@ -72,7 +72,13 @@ pub fn truncate(text: &str, max: usize) -> String {
 /// the screen — then the brief, then the activity, which the bar already repeats
 /// for the focused agent. Fields are dropped from the right when the pane is
 /// narrow, and the cursor row's full facts are one row below in the footer.
-pub fn fit_row(head: &str, brief: &str, branch_stat: &str, tail: &[String], width: usize) -> String {
+pub fn fit_row(
+    head: &str,
+    brief: &str,
+    branch_stat: &str,
+    tail: &[String],
+    width: usize,
+) -> String {
     let head_width = UnicodeWidthStr::width(head);
     if width <= head_width + 2 {
         return head.to_string();
