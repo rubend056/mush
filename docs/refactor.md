@@ -1,15 +1,18 @@
 # mush — refactor plan: seams and owners
 
-> Status: **Stage 0 complete.** All four moves are on master: `transcript.rs`,
-> `text.rs`, `ToolName` and the git verbs. The delegation-honesty family below
-> (N1, N3–N6) is closed. Stages 1–3 are untouched. The plan still says "not yet
-> started" further down where it describes the *findings pass* sequencing — that
-> part is history.
+> Status: **Stages 0, 1.1, 1.2 and 2 complete; Stage 1.3 in flight.** On master:
+> Stage 0 (all four moves), `AgentTree` (`app/tree.rs`), `Chat` (`app/chat.rs`),
+> the `ModelClient` seam, the other three seams (`Machine`, `Clock`, `Events`),
+> and the `#[ignore]`d actor tests rewritten in process. What is left of Stage 1
+> is `ConfigCell` (§3.3) and its row B7; Stage 3 (`Screen` + `Intent`) is
+> untouched. The delegation-honesty family (N1, N3–N6) is closed.
 >
 > Written 2026-09-17 against `d4f80ae` plus the
 > in-flight findings pass (`input.rs`, `config.rs`, `git.rs`, `http.rs`,
 > `workspace.rs`, `userconfig.rs`, `ui.rs`, `app.rs` all dirty). References are by
-> symbol, not line, because that tree was moving while this was written.
+> symbol, not line, because that tree was moving while this was written. The
+> "Landed" notes under §§3–5 record where the tree ended up differing from the
+> sketches, so a reader can trust the code over the plan.
 >
 > This document is the *structural* companion to `docs/findings.md`: findings
 > lists what is broken, this lists where the breakage lives and what shape makes
@@ -275,11 +278,12 @@ when* the new modules' tests are the old tests and the gate is green with no
 assertion edits — both held (the two later commits added tests; no existing
 assertion was edited).
 
-**Stage 1 — one owner per fact.** `AgentTree`, then `Chat`, then `ConfigCell`,
-each landing with the transition rules as unit tests, including a regression per
-finding in its row of §6. *Done when* nothing outside `tree.rs` writes
+**Stage 1 — one owner per fact.** 1.1 ✅ `AgentTree`, 1.2 ✅ `Chat`, 1.3 ⬜
+`ConfigCell`. *Done when* nothing outside `tree.rs` writes
 `node.phase`, `node.summary`, `focused` or `agent_cursor`, `busy` is a method,
-and the context meter is a method.
+and the context meter is a method — all three hold; §3.3's cell is what is left,
+and its finding is B7 (A5 turned out to be closed already: `rederive_context`
+runs on every runtime switch).
 
 **Stage 2 — the seams.** ✅ Rewrite the `#[ignore]`d actor tests in-process and
 delete `scripts/mock_llm.py` from the test path (keep it for the pty smoke
@@ -376,14 +380,14 @@ the queue of record; this column says where the *fix belongs*.
 | A2 | `tokens * 3` overflow | ✅ | `config::clamp_context` |
 | A3 | `parse_context_hint` misfires / misses | ✅ | `config` (markers + range) |
 | A4 | caps as floors; reserve > window | ✅ | `config::{read_cap, cmd_cap, list_limit, history_budget}` |
-| A5 | window derived once; runtime switches never re-derive | 🔄 | `ConfigCell` (3.3) |
+| A5 | window derived once; runtime switches never re-derive | ✅ | `git::rederive_context` on every runtime switch (`/url`, `/provider`, `set_model`, `set_base_url`), pinned in `config.rs` |
 | A6 | CLI provider never selects its endpoint | ✅ | `config::resolve_with` test |
 | A7 | no cap on response body | ✅ | `http` `MAX_BODY_BYTES` |
 | A8 | localized git output parses as ±0 | ✅ | `git()` sets `LC_ALL=C` |
 | A9 | model discovery runs even when a model is known | ⬜ | `main.rs` — skip when known, or fetch after first paint |
 | A10 | branch name read as an argv option | ✅ | `git` ref→sha guard |
 | A11 | `adopt_context` accepts 1 | ✅ | `config::adopt_context` clamp |
-| A12 | `Stat` is `u32`, git counts are 64-bit | 🔄 | `git::Stat` widen |
+| A12 | `Stat` is `u32`, git counts are 64-bit | ✅ | `git::Stat` is `u64` (`a_huge_diff_keeps_its_count`) |
 | A13 | `--` does not stop flag parsing | ✅ | `main::parse_args` |
 | A14 | a second positional silently replaces the first | ⬜ | `main::parse_args` — error |
 | A15 | unparsable `Content-Length` treated as absent | ✅ | `http` `InvalidData` |
@@ -391,17 +395,17 @@ the queue of record; this column says where the *fix belongs*.
 | A17 | `openai` alias sends the key to the LAN default | ✅ | `Provider::parse` (aliases removed) |
 | A18 | git test hardcodes `master` | ✅ | `git` test `init_repo` |
 | A19 | DNS resolution unbounded | ⬜ | `Clock` seam + `http::connect` |
-| B1 | leftover worktree id collides with a fresh child | ⬜ | `AgentTree::reserve_ids` (3.1) |
+| B1 | leftover worktree id collides with a fresh child | ✅ | `AgentTree::reserve_ids` — raised from the leftover scan (`discover_worktrees`), pinned in `tree.rs` |
 | B2 | `mask_key` slices on a byte boundary | ✅ | core `text::mask_secret` (3.6) |
 | B3 | zero-row pane still focusable | 🔄 | `Screen`/layout tiers (Stage 3) |
 | B4 | at 40×10 the only transcript row is a blank | ✅ | `Chat::visible_lines` (3.2) |
-| B5 | `Status` after `Done` restarts a finished agent | ⬜ | `AgentTree::activity` (3.1) |
+| B5 | `Status` after `Done` restarts a finished agent | ✅ | `AgentTree::activity` ignores it after `Done`/`Failed`, and `busy` is derived from the phases (`tree.rs`) |
 | B6 | failed/idle `Stop` leaves `Cancelling` + `busy` stuck | ✅ | `AgentTree::cancel_requested` (only a run in flight is marked) + the actor's end-of-run event as the ack |
 | B7 | learned window never reaches the UI, then is clobbered | 🔄 | `ConfigCell` (3.3) |
-| B8 | context meter ignores the human's own message | ⬜ | `Chat::used_tokens` derived (3.2) |
+| B8 | context meter ignores the human's own message | ✅ | `Chat::used_tokens_for` derives it on read, per conversation |
 | B9 | `fit_row` budgets columns, `truncate` counts chars | ✅ | core `text` (3.6) |
 | B10 | a failed nudge rewrites the node's phase | ✅ | `AgentTree::nudge_failed` |
-| B11 | reaping a leftover leaves `focused` on a ghost | ⬜ | `AgentTree::reap` (3.1) |
+| B11 | reaping a leftover leaves `focused` on a ghost | ✅ | `AgentTree::reap` + `repair_focus`; `discover_worktrees` reaps through it |
 | B12 | an `Error` status loses to the activity line | ✅ | one precedence table (3.2) |
 | B13 | a child's brief is never shown | ✅ | `Spawned` pushes the opening message |
 | B14 | the row's summary is from the first run, forever | ✅ | `AgentTree::{begin, finish}` |
@@ -409,9 +413,9 @@ the queue of record; this column says where the *fix belongs*.
 | B16 | `smoke.py --cancel` forks after starting a thread | ✅ | `scripts/smoke.py` — the pty is forked before the endpoint's thread exists; verified by running the scenario. |
 | B17 | the layout sweep never exercises an open file | 🔄 | `Screen` sweep (Stage 3) |
 | B18 | `~` elision matches a prefix, not a directory | ✅ | `ui::facts_line` |
-| B19 | global notices render into every transcript | ⬜ | agent-scoped notices (3.2) |
+| B19 | global notices render into every transcript | ✅ | `Notice.agent` + `Chat::notices_for` — no unscoped read exists |
 | N1 | `MAX_TURNS` turns "long" into "failed" | ✅ | `agent/run.rs`: `RUNAWAY_TURNS` + `LOOP_ROUNDS` (a run ends when it stops calling tools; only a *loop* ends it early) |
-| N2 | message box is append-only and clips at the right edge | 🔄 | `app/input.rs` (already extracted) |
+| N2 | message box is append-only and clips at the right edge | ✅ | `Input` (grapheme cursor + window), `Chat::key` owns the editing keys |
 | N3 | a stopped child is reported to its parent as `#N done: cancelled` | ✅ | `agent::Outcome` (one enum, not a `summary == CANCELLED` string sentinel) |
 | N4 | Ctrl-C stopped *every* busy agent, and blanked a stopped one to `Idle` | ✅ | `App::interrupt` (focused) + `Ctrl-X` (`interrupt_all`); `Phase::Stopped` |
 | N5 | the one-non-isolated-sibling rule fails only *after* the brief is written | ✅ | `spawn_tool` message + the rule stated in `prompt` schemas and the system prompt |
