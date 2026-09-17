@@ -53,9 +53,6 @@ const FOOT_ROWS: usize = 3;
 /// Of those rows, how many the notes themselves may have before the rest are
 /// arithmetical. Two, because the third is what says they are an excerpt.
 const FOOT_NOTE_ROWS: usize = 2;
-/// The width `/notes` wraps a note at: the popup is at most 80 columns wide,
-/// minus its border, the list's cursor and the age that leads each line.
-pub const NOTES_WIDTH: usize = 74;
 
 /// A line for the transcript that is not a message: a note from mush itself.
 /// It is tagged with the agent it concerns, so a root-level failure is not
@@ -299,6 +296,10 @@ impl Chat {
         self.push_notice(agent, NoticeKind::Info, text);
     }
 
+    /// A failure in the root conversation. Test-only now: every production
+    /// failure is tagged with the agent it concerns, so the root's goes through
+    /// [`Self::note_error_for`].
+    #[cfg(test)]
     pub fn note_error(&mut self, text: impl Into<String>) {
         self.note_error_for(AgentId::ROOT, text);
     }
@@ -388,7 +389,15 @@ impl Chat {
             };
             let age = short_age(Duration::from_secs(now.saturating_sub(notice.at)));
             let lead = format!("{age} {marker} ");
-            for (index, line) in wrap_text(&notice.text, width).into_iter().enumerate() {
+            // The lead is part of the first row, so the text is wrapped *inside*
+            // what the lead leaves — a continuation row carries the same indent.
+            // Wrapping at `width` and then prepending the lead made the very
+            // first row `lead.len()` columns too wide, which is exactly the row
+            // that was clipped even on an 80-column popup.
+            for (index, line) in wrap_text(&notice.text, width.saturating_sub(lead.len()))
+                .into_iter()
+                .enumerate()
+            {
                 if index == 0 {
                     rows.push(format!("{lead}{line}"));
                 } else {
@@ -448,9 +457,11 @@ impl Chat {
         };
         // A pane with no row to spare for the foot's own count line is the case
         // the title exists for: wherever the human looks, the pane says how
-        // many lines it is hiding.
+        // many lines it is hiding — and names the way to read them, because the
+        // count row that carries `· /notes` is exactly the row this pane has no
+        // room for.
         if foot.hidden > 0 && !foot.counted {
-            title.push_str(&format!("· {} ", more_label(foot.hidden)));
+            title.push_str(&format!("· {} · /notes ", more_label(foot.hidden)));
         }
         Painted { lines, title }
     }
@@ -463,28 +474,29 @@ impl Chat {
         // A pane with nothing in it says what it is waiting for rather than
         // being blank.
         if messages.is_empty() && self.notices_for(pane.agent).next().is_none() {
-            return if pane.agent == AgentId::ROOT {
+            let hint: Vec<String> = if pane.agent == AgentId::ROOT {
                 vec![
-                    Line::from(Span::styled(
-                        "Ask for a change — the agent reads and edits this workspace directly.",
-                        dim(),
-                    )),
-                    Line::from(""),
-                    Line::from(Span::styled(pane.label.to_string(), dim())),
-                    Line::from(Span::styled(
-                        "Tab cycles panes · Enter sends · /help lists commands",
-                        dim(),
-                    )),
+                    "Ask for a change — the agent reads and edits this workspace directly."
+                        .to_string(),
+                    String::new(),
+                    pane.label.to_string(),
+                    "Tab cycles panes · Enter sends · /help lists commands".to_string(),
                 ]
             } else {
-                vec![Line::from(Span::styled(
-                    format!(
-                        "Agent #{} has no messages yet — typing here sends it a nudge.",
-                        pane.agent
-                    ),
-                    dim(),
-                ))]
+                vec![format!(
+                    "Agent #{} has no messages yet — typing here sends it a nudge.",
+                    pane.agent
+                )]
             };
+            // Wrapped to the pane and windowed to its height, like every other
+            // row: returned raw, the hint was cut mid-word on a narrow pane
+            // ("the agent reads and") and the lines under it never appeared.
+            return hint
+                .iter()
+                .flat_map(|line| wrap_text(line, width))
+                .take(height)
+                .map(|line| Line::from(Span::styled(line, dim())))
+                .collect();
         }
 
         // Built back to front and then reversed: each chunk is one message's
@@ -540,9 +552,11 @@ impl Chat {
         let said = notices.len() - usize::from(alert.is_some());
 
         // Blocks in paint order, each with the order it is worth keeping in:
-        // lower is less hideable.
+        // lower is less hideable, and whether the block is a note (something
+        // `/notes` could read back) or the derived activity line.
         let mut blocks: Vec<Vec<Line<'static>>> = Vec::new();
         let mut worth: Vec<usize> = Vec::new();
+        let mut is_note: Vec<bool> = Vec::new();
         let mut said_at = 0usize;
         for (at, notice) in notices.iter().enumerate() {
             if Some(at) == alert {
@@ -553,6 +567,7 @@ impl Chat {
             worth.push(2 + (said - 1 - said_at));
             said_at += 1;
             blocks.push(footnote_lines(notice, width));
+            is_note.push(true);
         }
         if pane.busy {
             worth.push(1);
@@ -560,10 +575,15 @@ impl Chat {
                 format!("{} working…", SPINNER[(pane.spin as usize) % SPINNER.len()]),
                 Style::default().fg(Color::Cyan),
             ))]);
+            // Derived from a phase, so not a note: hiding it promises nothing
+            // `/notes` can answer, and counting it made a busy agent with no
+            // notices at all claim lines that do not exist.
+            is_note.push(false);
         }
         if let Some(at) = alert {
             worth.push(0);
             blocks.push(footnote_lines(notices[at], width));
+            is_note.push(true);
         }
 
         let rows: Vec<usize> = blocks.iter().map(Vec::len).collect();
@@ -589,7 +609,13 @@ impl Chat {
             budget -= kept;
         }
         let shown: usize = keep.iter().sum();
-        let hidden = total - shown;
+        // The count is the notes that are not painted, not every foot row: the
+        // activity line is derived and always rebuildable, so a count that
+        // included it would name lines `/notes` cannot show.
+        let hidden: usize = (0..blocks.len())
+            .filter(|index| is_note[*index])
+            .map(|index| rows[index] - keep[index])
+            .sum();
         // The count row needs a row the pane has; without both, the title says
         // it instead.
         let counted = hidden > 0 && shown < room;
@@ -1114,7 +1140,7 @@ mod tests {
         // saying it.
         let painted = chat.painted(&pane, 40, 1);
         assert_eq!(shown(&painted.lines), vec!["mush › the newest reply"]);
-        assert_eq!(painted.title, " mush · +5 more lines ");
+        assert_eq!(painted.title, " mush · +5 more lines · /notes ");
 
         // Two rows: the conversation and one line of mush's own — five note
         // lines were written and the other four are counted in the title,
@@ -1125,7 +1151,7 @@ mod tests {
             shown(&painted.lines),
             vec!["mush › the newest reply", "· note 4"]
         );
-        assert_eq!(painted.title, " mush · +4 more lines ");
+        assert_eq!(painted.title, " mush · +4 more lines · /notes ");
 
         // Three rows: the count has a row of its own now, so both it and the
         // newest line are painted.
@@ -1154,7 +1180,39 @@ mod tests {
             vec!["· note 4"],
             "the newest line, not the count of the lines above it"
         );
-        assert_eq!(painted.title, " mush · +4 more lines ");
+        assert_eq!(painted.title, " mush · +4 more lines · /notes ");
+    }
+
+    /// The derived activity line is not a note: `/notes` cannot show it, so it
+    /// must not be counted as one. A run in flight with nothing written about
+    /// it used to title the pane `+1 more lines` and then answer "nothing
+    /// written about #0 yet" — the screen promising a reading it could not
+    /// give.
+    #[test]
+    fn the_activity_row_never_inflates_the_count() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::assistant("the newest reply"));
+        let busy = Pane {
+            busy: true,
+            ..pane(AgentId::ROOT)
+        };
+
+        // One row of pane, and no notes: the transcript keeps the row, the
+        // hidden spinner is not a line something wrote, and the title claims
+        // nothing.
+        let painted = chat.painted(&busy, 40, 1);
+        assert_eq!(shown(&painted.lines), vec!["mush › the newest reply"]);
+        assert_eq!(painted.title, " mush ", "{:?}", painted.title);
+        assert!(
+            chat.notes_report(AgentId::ROOT, 0, 34).is_empty(),
+            "and there is in fact nothing to read"
+        );
+
+        // With one note the count is that note and only that note, whether the
+        // spinner is shown beside it or not.
+        chat.note_for(AgentId::ROOT, "reading the lexer");
+        let painted = chat.painted(&busy, 40, 1);
+        assert_eq!(painted.title, " mush · +1 more lines · /notes ");
     }
 
     /// `/notes` is the other half of the cap and it wraps: a note longer than a
@@ -1177,13 +1235,52 @@ mod tests {
             rows[1]
         );
         assert!(
-            rows.iter().any(|row| row.ends_with("! no route to host")),
+            rows.iter().any(|row| row.starts_with("0s ! no route to")),
             "the failure is in the same list, marked: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.trim_start().starts_with("host")),
+            "and wrapped whole instead of being clipped: {rows:?}"
         );
         assert!(
             chat.notes_report(AgentId(2), at, 20).is_empty(),
             "and it is one agent's list, not every agent's (finding B19)"
         );
+    }
+
+    /// The report is wrapped for the width the list is actually painted at, so
+    /// a row — the age and marker that lead it included — never overruns the
+    /// list and is clipped. The old test wrapped at a fixed 74 and never at the
+    /// painted width, which is exactly why the first row clipped on the widest
+    /// popup (74 + the lead) and every row clipped below 80 columns.
+    #[test]
+    fn the_notes_report_fits_the_width_it_is_given() {
+        use unicode_width::UnicodeWidthStr;
+
+        let mut chat = Chat::bare();
+        chat.note_for(
+            AgentId(1),
+            "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo \
+             lima mike november oscar papa quebec romeo sierra tango",
+        );
+        let at = chat.notices_for(AgentId(1)).next().expect("the note").at;
+
+        // 34 and 74 are the popup's own content widths at the two ends of
+        // `ui::picker_text_width` (a 40-column terminal and an 80-column one),
+        // which is what makes this the real painted width and not a stand-in.
+        for width in [34usize, 46, 74] {
+            let rows = chat.notes_report(AgentId(1), at, width);
+            assert!(
+                rows.iter().any(|row| row.contains("tango")),
+                "the tail of the note survives at {width}: {rows:?}"
+            );
+            for row in &rows {
+                assert!(
+                    UnicodeWidthStr::width(row.as_str()) <= width,
+                    "a row is wider than the list at {width}: {row:?}"
+                );
+            }
+        }
     }
 
     /// Clearing is per agent, because a line about one conversation is not a

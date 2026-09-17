@@ -25,6 +25,27 @@ const MAX_TRANSCRIPT: u16 = 110;
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 10;
 
+/// The popup the pickers paint in: a share of the terminal, floored so a model
+/// list is readable and capped so it does not sprawl on a wide one. One formula,
+/// because `draw_picker` sizes the popup with it and `picker_text_width` says
+/// how much of it a `/notes` row may use.
+const PICKER_MIN_WIDTH: u16 = 40;
+const PICKER_MAX_WIDTH: u16 = 80;
+
+fn picker_width(terminal_width: u16) -> u16 {
+    (terminal_width * 60 / 100).clamp(PICKER_MIN_WIDTH, PICKER_MAX_WIDTH)
+}
+
+/// The columns the picker's list gives one item's text. The term carries the
+/// popup's two border columns, the two the `› ` symbol reserves, and the two the
+/// `  ` indent every row wears. `App` wraps a `/notes` report to this, so the
+/// lines it hands the list already fit the width they are painted at — wrapping
+/// to any other width (the old fixed 74) is how the documented escape hatch
+/// clipped.
+pub(crate) fn picker_text_width(terminal_width: u16) -> usize {
+    picker_width(terminal_width).saturating_sub(6) as usize
+}
+
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
     if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
@@ -421,7 +442,7 @@ fn draw_picker(frame: &mut Frame, app: &App) {
         return;
     };
     let area = frame.area();
-    let width = (area.width * 60 / 100).clamp(40, 80);
+    let width = picker_width(area.width);
     let height = ((picker.items.len() as u16 + 3).min(24)).min(area.height.saturating_sub(2));
     let x = area.x + area.width.saturating_sub(width) / 2;
     let y = area.y + area.height.saturating_sub(height) / 2;
@@ -609,6 +630,27 @@ mod tests {
 
         let (text, _) = bar_line(None, None);
         assert!(text.contains("/help"), "{text}");
+    }
+
+    /// The `/notes` report is wrapped for the popup's own content width, and
+    /// that width is this one function: the popup the terminal size paints,
+    /// minus the two border columns, the two the `› ` symbol reserves and the
+    /// two the `  ` indent carries. A `/notes` line wider than this is a line
+    /// the list has to clip.
+    #[test]
+    fn the_notes_width_follows_the_popup_it_is_painted_in() {
+        // The two ends the tests name: the floor and the ceiling.
+        assert_eq!(picker_text_width(40), 34);
+        assert_eq!(picker_text_width(200), 74);
+        assert!(picker_text_width(60) < picker_text_width(200));
+
+        // Never wider than the popup it is painted in, at any size.
+        for terminal in 40..=240u16 {
+            assert!(
+                picker_text_width(terminal) <= picker_width(terminal) as usize,
+                "a report wider than its popup at {terminal}"
+            );
+        }
     }
 
     /// A row's glyph is the whole status vocabulary in one character; it must
