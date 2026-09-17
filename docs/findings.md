@@ -34,6 +34,45 @@ their own answer instead of reading that one.
 |---|---|---|---|
 | B20 | **A child's completion reaches the model but not the screen, and can be folded twice.** `fold_completions` (fixed below) pushes the `#N done: …` line into the actor's `messages` only; no `AgentEvent::Message` is emitted, so the UI's copy of the parent's transcript never shows it. The next idle `Run` then hands the UI transcript back, `absorb` finds no such line in it and re-arms delivery for the same child — so one completion can be folded into the model's transcript a second time. | ⬜ | `agent.rs`: the fold must either emit the line to the UI or record that the child has been announced in a way an adopted transcript cannot re-arm |
 
+## 2.5 Observed live: steering a subagent is invisible, and may not arrive
+
+Throughout the session above, the root agent steered its four children with
+`agent_control {id, action: "message"}` — the "do not spawn any further
+subagents" rule, the result of a child whose parent had never learned it
+finished, and where to find a finished sibling's commit. The tool answered
+`messaged agent #N` every time, and then:
+
+- **No child's transcript contains a single one of them.** Every agent in
+  `.mush/session.json` — the four implementers, their children, the read-only
+  auditor — holds exactly one user message: its brief. Counts at the time of
+  writing: #1 359 messages/1 user, #2 375/1, #3 277/1, #4 425/1, and so on for
+  all ten agents.
+- **An idle child was not woken by its own.** #4 had finished its run when the
+  message reached it; a nudge to an idle actor is supposed to start a run, and
+  #4 stayed at rest.
+
+Two readings, and the difference matters:
+
+1. The nudge *was* delivered — folded into the actor's `messages` at its next
+   message boundary — and simply never emitted as `AgentEvent::Message`, so the
+   UI's copy (which is what `session.json` holds, and what the human reads) has
+   no record of it. That is finding B20's shape exactly: the model sees the
+   line, the human does not. It also means the human's picture of a subagent's
+   conversation is silently missing every word they said to it.
+2. The message never left the UI at all, in which case a steering command
+   reports success and does nothing.
+
+Either way this is the same class as §1 and §2: the screen keeps a conclusion
+("messaged agent #4") where it should keep a fact the human can check. It also
+costs the orchestrator its only lever — with no delivery and no visibility,
+"steer the running agent" is not a capability, and the honest workaround is to
+spawn a fresh agent with the correction folded into its brief (which is what
+this session had to do).
+
+| ID | What | Status | Home |
+|---|---|---|---|
+| B22 | **A steering message to a subagent is invisible in that agent's transcript, and an idle target was not woken by it.** `agent_control message` answers success; no child's transcript shows the line. | ⬜ | `agent.rs` (`absorb`/`drain_mailbox` must emit the folded nudge to the UI the way the human's own typed message is echoed) and `app` (`agent_control`'s reply should say *delivered*, not *messaged*, when it cannot know) |
+
 ## 3. The contract bug that started this file
 
 | ID | What | Status | Home |
