@@ -64,6 +64,8 @@ struct Args {
     context: Option<usize>,
     temperature: Option<f32>,
     max_completion_tokens: Option<bool>,
+    reasoning_effort: Option<config::ReasoningEffort>,
+    thinking: Option<config::ThinkingMode>,
     /// `-y` / `--yes`: recorded in [`AUTO_APPROVE`] and nowhere else.
     yes: bool,
     /// `--print-config`: print the resolved config and exit, instead of opening
@@ -83,6 +85,8 @@ impl Args {
             context: self.context,
             temperature: self.temperature,
             max_completion_tokens: self.max_completion_tokens,
+            reasoning_effort: self.reasoning_effort,
+            thinking: self.thinking,
         }
     }
 }
@@ -101,6 +105,8 @@ fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
     let mut context = None;
     let mut temperature = None;
     let mut max_completion_tokens = None;
+    let mut reasoning_effort = None;
+    let mut thinking = None;
     let mut yes = false;
     let mut print_config = false;
     let mut only_flags = false;
@@ -149,6 +155,25 @@ fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
                     .ok_or_else(|| format!("--temperature needs a number, got `{value}`"))?;
                 temperature = Some(stated);
             }
+            "--reasoning-effort" => {
+                let value = args.next().ok_or("--reasoning-effort needs a value")?;
+                // Rejected by name rather than ignored, like every other value
+                // mush cannot use: an unknown effort must never reach an
+                // endpoint, and dropping it would send the provider's default
+                // instead of the effort the human asked for.
+                let stated = config::ReasoningEffort::parse(&value).map_err(|_| {
+                    format!("--reasoning-effort needs low, medium, high or none, got `{value}`")
+                })?;
+                reasoning_effort = Some(stated);
+            }
+            "--thinking" => {
+                let value = args.next().ok_or("--thinking needs a value")?;
+                // The same rule: `--thinking of` is a typo, not an instruction
+                // to leave the thinking mode on.
+                let stated = config::ThinkingMode::parse(&value)
+                    .map_err(|_| format!("--thinking needs on or off, got `{value}`"))?;
+                thinking = Some(stated);
+            }
             other if other.starts_with("--") => {
                 return Err(format!("unknown option `{other}` (try --help)"));
             }
@@ -164,6 +189,8 @@ fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
         context,
         temperature,
         max_completion_tokens,
+        reasoning_effort,
+        thinking,
         yes,
         print_config,
     })
@@ -187,7 +214,8 @@ fn print_help() {
         "mush {}\n\
          A small, fast terminal surface for coding agents.\n\n\
          USAGE:\n    mush [DIRECTORY] [--url URL] [--model NAME] [--provider NAME] [--context TOKENS]\n\
-         \x20        [--temperature F] [--max-completion-tokens] [-y] [--print-config]\n\n\
+         \x20        [--temperature F] [--reasoning-effort LEVEL] [--thinking MODE]\n\
+         \x20        [--max-completion-tokens] [-y] [--print-config]\n\n\
          OPTIONS:\n\
          \x20   --url URL          OpenAI-compatible endpoint (default: $MUSH_URL or the provider default)\n\
          \x20   --model NAME       Model id (default: $MUSH_MODEL, else auto-detected)\n\
@@ -195,14 +223,20 @@ fn print_help() {
          \x20   --context TOKENS   Context window when nothing else knows it (default: $MUSH_CONTEXT,\n\
          \x20                      else what the endpoint advertises, else the model's known window)\n\
          \x20   --temperature F    Sampling temperature, 0.0-2.0 (default: 1.0, the model's own choice)\n\
+         \x20   --reasoning-effort LEVEL\n\
+         \x20                      Reasoning effort sent as `reasoning_effort`: low, medium or high,\n\
+         \x20                      or none to send no such field (default: DeepSeek's `high`,\n\
+         \x20                      no field anywhere else; $MUSH_REASONING_EFFORT)\n\
+         \x20   --thinking MODE    on asks for the provider's thinking mode, off sends no `thinking`\n\
+         \x20                      field at all (default: on for DeepSeek, off elsewhere; $MUSH_THINKING)\n\
          \x20   --max-completion-tokens\n\
          \x20                      Send the reply cap as `max_completion_tokens` instead of\n\
          \x20                      `max_tokens`, as OpenAI's reasoning models require\n\
          \x20   -y, --yes          Pre-approve this session's work. Recorded only: mush asks\n\
          \x20                      nothing yet, so this changes no behaviour today\n\
          \x20   --print-config     Print the resolved config (endpoint, provider, model, window\n\
-         \x20                      and whether it was stated, temperature, reply-cap name,\n\
-         \x20                      key masked) and exit 0\n\n\
+         \x20                      and whether it was stated, temperature, reasoning effort and\n\
+         \x20                      thinking mode, reply-cap name, key masked) and exit 0\n\n\
          KEYS:\n\
          \x20   Tab / Shift-Tab   cycle panes (agents, chat)\n\
          \x20   Enter             send message (chat) · focus agent (agents)\n\
@@ -268,6 +302,28 @@ fn describe(config: &Config, approved: bool) -> Vec<(String, String)> {
     } else {
         "max_tokens"
     };
+    // Both of these are stated values with a provider default, so the line says
+    // which one a request will carry *and* where it came from: a `high` nobody
+    // stated is DeepSeek's, not the human's.
+    let source = if config.reasoning_effort_stated() {
+        "stated"
+    } else {
+        "the provider's default"
+    };
+    let effort = format!("{} ({source})", config.reasoning_effort().unwrap_or("none"));
+    let source = if config.thinking_stated() {
+        "stated"
+    } else {
+        "the provider's default"
+    };
+    let thinking = format!(
+        "{} ({source})",
+        if config.thinking_enabled() {
+            "on"
+        } else {
+            "off"
+        }
+    );
     let approve = if approved {
         "yes (-y recorded; nothing asks yet)"
     } else {
@@ -285,6 +341,8 @@ fn describe(config: &Config, approved: bool) -> Vec<(String, String)> {
             "temperature".to_string(),
             format!("{:?}", config.temperature()),
         ),
+        ("reasoning".to_string(), effort),
+        ("thinking".to_string(), thinking),
         ("reply cap".to_string(), cap.to_string()),
         ("api key".to_string(), key),
         ("auto-approve".to_string(), approve.to_string()),
@@ -507,6 +565,8 @@ mod tests {
             context: Some(64_000),
             temperature: Some(0.2),
             max_completion_tokens: Some(true),
+            reasoning_effort: Some(config::ReasoningEffort::Medium),
+            thinking: Some(config::ThinkingMode::Off),
             yes: true,
             print_config: false,
         };
@@ -517,6 +577,11 @@ mod tests {
         assert_eq!(overrides.context, Some(64_000));
         assert_eq!(overrides.temperature, Some(0.2));
         assert_eq!(overrides.max_completion_tokens, Some(true));
+        assert_eq!(
+            overrides.reasoning_effort,
+            Some(config::ReasoningEffort::Medium)
+        );
+        assert_eq!(overrides.thinking, Some(config::ThinkingMode::Off));
         // The key never comes from argv, and `-y` is not a config value: it is
         // recorded for the features that will ask, and nothing else.
         assert_eq!(overrides.api_key, None);
@@ -530,6 +595,10 @@ mod tests {
             "-y",
             "--temperature",
             "0.25",
+            "--reasoning-effort",
+            "none",
+            "--thinking",
+            "off",
             "--max-completion-tokens",
             "--print-config",
             "work",
@@ -538,6 +607,10 @@ mod tests {
         assert_eq!(args.dir, PathBuf::from("work"));
         assert_eq!(args.temperature, Some(0.25));
         assert_eq!(args.max_completion_tokens, Some(true));
+        // `none` is a statement, and it survives parsing as one: the config
+        // layer has to be able to tell it from silence.
+        assert_eq!(args.reasoning_effort, Some(config::ReasoningEffort::Off));
+        assert_eq!(args.thinking, Some(config::ThinkingMode::Off));
         assert!(args.yes, "`-y` is remembered, not acted on");
         assert!(args.print_config);
 
@@ -546,6 +619,8 @@ mod tests {
         assert!(args.yes);
         assert_eq!(args.temperature, None);
         assert_eq!(args.max_completion_tokens, None);
+        assert_eq!(args.reasoning_effort, None, "unstated is not `none`");
+        assert_eq!(args.thinking, None);
         assert!(!args.print_config);
         assert_eq!(args.dir, PathBuf::from("."));
     }
@@ -563,9 +638,14 @@ mod tests {
         for (argv, flag) in [
             (["--temperature", "warm"], "--temperature"),
             (["--context", "8k"], "--context"),
+            (["--reasoning-effort", "very"], "--reasoning-effort"),
+            (["--thinking", "of"], "--thinking"),
         ] {
             let error = error_of(&argv);
             assert!(error.contains(flag), "{error}");
+            // The value that was wrong is named too, so a typo is fixable
+            // without guessing which argument mush meant.
+            assert!(error.contains(argv[1]), "{error}");
         }
         // A float that is not a number is not a temperature either: `NaN`
         // compares false against every bound, so it must not reach a request.
@@ -603,6 +683,8 @@ mod tests {
         cfg.set_context(64_000);
         cfg.temperature = 0.0;
         cfg.max_completion_tokens = true;
+        cfg.reasoning_effort = Some(config::ReasoningEffort::Medium);
+        cfg.thinking = Some(config::ThinkingMode::Off);
 
         let lines = describe(&cfg, true);
         let field = |name: &str| {
@@ -617,6 +699,8 @@ mod tests {
         assert_eq!(field("model"), "deepseek-v4-pro");
         assert_eq!(field("window"), "64000 tokens (stated)");
         assert_eq!(field("temperature"), "0.0", "0 is a value, not an absence");
+        assert_eq!(field("reasoning"), "medium (stated)");
+        assert_eq!(field("thinking"), "off (stated)");
         assert_eq!(field("reply cap"), "max_completion_tokens");
         assert_eq!(field("api key"), "sk-1…7890 (masked)");
         assert_eq!(field("auto-approve"), "yes (-y recorded; nothing asks yet)");
@@ -638,9 +722,28 @@ mod tests {
             "8192 tokens (assumed from the model or the provider)"
         );
         assert_eq!(field("temperature"), "1.0");
+        // Nothing stated: the two knobs report the provider default they will
+        // send, and name it as such rather than claiming the human asked.
+        assert_eq!(field("reasoning"), "none (the provider's default)");
+        assert_eq!(field("thinking"), "off (the provider's default)");
         assert_eq!(field("reply cap"), "max_tokens");
         assert_eq!(field("api key"), "(none)");
         assert_eq!(field("auto-approve"), "no");
+
+        // DeepSeek with nothing stated is the preset request: the effort and
+        // the thinking mode are sent, and the line says whose they are.
+        let mut preset = Config::new("https://api.deepseek.com", "deepseek-flash", None);
+        preset.provider = config::Provider::DeepSeek;
+        let preset = describe(&preset, false);
+        let field = |name: &str| {
+            preset
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, value)| value.clone())
+                .unwrap()
+        };
+        assert_eq!(field("reasoning"), "high (the provider's default)");
+        assert_eq!(field("thinking"), "on (the provider's default)");
     }
 
     /// The full startup path with an unreachable endpoint must still produce a

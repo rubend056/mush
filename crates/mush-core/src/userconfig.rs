@@ -42,6 +42,8 @@ const COMMENT: &[&str] = &[
     "context: a context window in tokens; stating it here beats what the endpoint advertises, as --context does.",
     "temperature: 0.0-2.0, sent with every request; 1.0 is the model's own choice, and the default.",
     "max_completion_tokens: true sends the reply cap as max_completion_tokens; OpenAI's reasoning models reject max_tokens.",
+    "reasoning_effort: \"low\", \"medium\" or \"high\", or \"none\" to send no reasoning_effort at all. A value here reaches any endpoint; DeepSeek's default is \"high\".",
+    "thinking: true asks for the provider's thinking mode (DeepSeek sends {\"type\":\"enabled\"}); false sends no thinking field at all, the model's own default.",
     "Keys mush does not know are ignored, and kept when mush rewrites this file. `mush --print-config` shows what these resolved to.",
 ];
 
@@ -82,6 +84,19 @@ pub struct UserConfig {
     /// which OpenAI's reasoning models require.
     #[serde(default)]
     pub max_completion_tokens: Option<bool>,
+    /// Reasoning effort sent as `reasoning_effort`: "low", "medium" or "high",
+    /// or "none" for no `reasoning_effort` field at all. Stated here it is
+    /// honoured wherever the endpoint is pointed; unstated, DeepSeek's own
+    /// default ("high") applies. A value mush does not know is reported at
+    /// startup rather than sent.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    /// Ask for the provider's thinking mode. `true` sends DeepSeek's
+    /// `{"type":"enabled"}`; `false` sends no `thinking` field at all and
+    /// leaves the model's own default. Unstated, DeepSeek's thinking mode is
+    /// asked for and every other endpoint gets no field.
+    #[serde(default)]
+    pub thinking: Option<bool>,
 }
 
 /// Where the user config lives. `MUSH_CONFIG` overrides the path for tests and
@@ -216,6 +231,8 @@ mod tests {
             "context",
             "temperature",
             "max_completion_tokens",
+            "reasoning_effort",
+            "thinking",
         ] {
             assert!(header.contains(field), "`{field}` is documented: {header}");
         }
@@ -255,6 +272,10 @@ mod tests {
         assert_eq!(user.context, None);
         assert_eq!(user.temperature, None);
         assert_eq!(user.max_completion_tokens, None);
+        // The thinking knobs are unstated too, which is what leaves the
+        // provider's own defaults in charge.
+        assert_eq!(user.reasoning_effort, None);
+        assert_eq!(user.thinking, None);
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
@@ -276,6 +297,8 @@ mod tests {
   "context": 64000,
   "temperature": 0.3,
   "max_completion_tokens": true,
+  "reasoning_effort": "low",
+  "thinking": false,
   "future_knob": {"a": 1}
 }"#,
         )
@@ -289,6 +312,8 @@ mod tests {
         assert_eq!(user.context, Some(64_000));
         assert_eq!(user.temperature, Some(0.3));
         assert_eq!(user.max_completion_tokens, Some(true));
+        assert_eq!(user.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(user.thinking, Some(false));
 
         // The TUI's save states the connection and nothing else; the knobs and
         // the unknown key are left exactly as the human wrote them.
@@ -305,6 +330,8 @@ mod tests {
         assert_eq!(reloaded.context, Some(64_000));
         assert_eq!(reloaded.temperature, Some(0.3));
         assert_eq!(reloaded.max_completion_tokens, Some(true));
+        assert_eq!(reloaded.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(reloaded.thinking, Some(false));
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("future_knob"), "{written}");
         assert!(header_of(&path).contains("CLI flags > MUSH_* environment"));

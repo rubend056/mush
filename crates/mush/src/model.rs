@@ -152,6 +152,12 @@ pub(crate) mod fake {
         pub model: String,
         pub messages: Vec<Message>,
         pub tools: usize,
+        /// What the request asked about the provider's thinking mode, as the
+        /// endpoint would read it: a test asserts the config's knobs reach
+        /// this, and that nothing stated sends no field at all.
+        pub thinking: Option<Value>,
+        /// The same for `reasoning_effort`.
+        pub reasoning_effort: Option<String>,
     }
 
     impl Asked {
@@ -389,6 +395,8 @@ pub(crate) mod fake {
                 model: request.model.to_string(),
                 messages: request.messages.to_vec(),
                 tools: request.tools.len(),
+                thinking: request.thinking.clone(),
+                reasoning_effort: request.reasoning_effort.clone(),
             };
             // The first reply still scripted whose matcher accepts this
             // request, and it is spent: that reply was written for this call.
