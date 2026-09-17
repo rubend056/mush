@@ -293,6 +293,9 @@ struct ActorState {
     deferred: Vec<AgentMsg>,
     /// A `Shutdown` arrived: stop the run and end this actor.
     shutdown: bool,
+    /// A `Stop` arrived with the work this actor is about to start; the run it
+    /// points at is born cancelled (finding B6).
+    stop_requested: bool,
 }
 
 /// One agent: its identity, its workspace, and the mailboxes it is wired to.
@@ -535,7 +538,7 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
             return;
         }
         ready = false;
-        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel = run_cancel(&mut state);
         // Say so up front: the UI did not necessarily ask for this run (a nap
         // ends with a wake-up), and the tree must show it running. The flag
         // travels with the event so the human can stop a run that is blocked
@@ -626,12 +629,33 @@ fn wait_for_work(
     loop {
         match actor.rx.try_recv() {
             Err(_) => return true,
-            Ok(command) => match absorb(state, transcript, command) {
-                Fold::End => return false,
-                Fold::Run | Fold::Idle => {}
-            },
+            Ok(command) => {
+                // A Stop that arrives *behind* the work it was aimed at. The
+                // blocking loop above folds a Stop away because nothing has
+                // been asked of an idle actor; here the run is about to start,
+                // so a Stop that came after the Run is aimed at it. Swallowing
+                // it is the one way a Ctrl-C does nothing at all: the run pays
+                // for its model calls and the human waits for the row to stop
+                // saying `⊘` on its own (finding B6).
+                let aimed_at_this_run = matches!(command, AgentMsg::Stop);
+                match absorb(state, transcript, command) {
+                    Fold::End => return false,
+                    _ if aimed_at_this_run => state.stop_requested = true,
+                    Fold::Run | Fold::Idle => {}
+                }
+            }
         }
     }
+}
+
+/// The cancellation flag a run starts with.
+///
+/// A Stop that arrived with the work — after the `Run`, before this run's first
+/// message boundary — is already aimed at it, so the flag is born set. Anything
+/// else starts a run the human has not asked to stop, even if an earlier Stop
+/// was folded away while the actor was idle: that one cancelled nothing.
+fn run_cancel(state: &mut ActorState) -> Arc<AtomicBool> {
+    Arc::new(AtomicBool::new(std::mem::take(&mut state.stop_requested)))
 }
 
 /// What a command means for an actor that is not running.
@@ -2565,6 +2589,51 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// A Stop that arrives *behind* the work it was aimed at must not be
+    /// swallowed. The blocking wait folds a Stop away while the actor is idle —
+    /// there is no work to cancel — but once a `Run` has been read, a Stop that
+    /// follows it was aimed at the run about to start, and nothing later in the
+    /// run will ever see it: the flag is created at the start, so the human's
+    /// Ctrl-C did nothing at all and the row sat at `⊘` until the run ended on
+    /// its own (finding B6).
+    #[test]
+    fn a_stop_behind_the_run_it_was_aimed_at_is_not_swallowed() {
+        let (actor, mailbox) = test_actor("stop-behind-run");
+        let mut state = ActorState::default();
+        let mut transcript = vec![Message::system("you are mush")];
+
+        mailbox
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("do the work"),
+            ]))
+            .unwrap();
+        mailbox.send(AgentMsg::Stop).unwrap();
+
+        assert!(
+            wait_for_work(&actor, &mut state, &mut transcript, false),
+            "there is a run to start"
+        );
+        assert_eq!(transcript.len(), 2, "and its task is folded in");
+        assert!(
+            run_cancel(&mut state).load(Ordering::SeqCst),
+            "the run is born cancelled, so the Stop lands where it was aimed"
+        );
+
+        // A Stop with no work in front of it stays a no-op: an agent the human
+        // stopped while it was idle must still run when they later ask it to.
+        let mut state = ActorState::default();
+        assert!(matches!(
+            absorb(&mut state, &mut transcript, AgentMsg::Stop),
+            Fold::Idle
+        ));
+        assert!(
+            !run_cancel(&mut state).load(Ordering::SeqCst),
+            "a Stop folded away while idle cancels nothing"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// A completion that the model has not read yet must be delivered when the
     /// UI's transcript replaces the actor's, or the result is lost for good.
     #[test]
@@ -2603,7 +2672,7 @@ mod tests {
                 )])
                 .says("wrote note.txt"),
         );
-        let (actor, _ui, _mailbox) = scripted_actor("scripted-run", &model);
+        let (actor, _events, _mailbox) = scripted_actor("scripted-run", &model);
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
         let mut messages = vec![
@@ -2650,7 +2719,7 @@ mod tests {
                 )
                 .says("done"),
         );
-        let (actor, ui, _mailbox) = scripted_actor("learned-context", &model);
+        let (actor, events, _mailbox) = scripted_actor("learned-context", &model);
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
@@ -2664,7 +2733,7 @@ mod tests {
             4_096,
             "the learned window reaches the shared config"
         );
-        assert_eq!(contexts(&ui), vec![4_096], "and the UI is told");
+        assert_eq!(contexts(&events), vec![4_096], "and the UI is told");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -2674,7 +2743,7 @@ mod tests {
     #[test]
     fn a_scripted_cancellation_stops_the_run_without_a_turn() {
         let model = Arc::new(Scripted::new().cancels());
-        let (actor, _ui, _mailbox) = scripted_actor("cancelled", &model);
+        let (actor, _events, _mailbox) = scripted_actor("cancelled", &model);
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
