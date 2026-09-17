@@ -32,20 +32,38 @@ const COMMENT_KEY: &str = "_comment";
 
 /// What every file mush writes says about itself: the precedence, then the
 /// fields, then the command that shows what they resolved to.
-const COMMENT: &[&str] = &[
-    "mush home config — hand-editable, and every field is optional.",
-    "Resolution: CLI flags > MUSH_* environment > this workspace's session > this file > built-in defaults.",
-    "api_key: the provider's secret; also read from MUSH_API_KEY. Never written into a workspace.",
-    "provider: \"deepseek\" or \"custom\"; \"custom\" defaults to the local endpoint http://rubendpc:8078.",
-    "base_url: an OpenAI-compatible endpoint, without a trailing slash.",
-    "model: the model id to start with, when nothing above names one.",
-    "context: a context window in tokens; stating it here beats what the endpoint advertises, as --context does.",
-    "temperature: 0.0-2.0, sent with every request; 1.0 is the model's own choice, and the default.",
-    "max_completion_tokens: true sends the reply cap as max_completion_tokens; OpenAI's reasoning models reject max_tokens.",
-    "reasoning_effort: \"low\", \"medium\" or \"high\", or \"none\" to send no reasoning_effort at all. A value here reaches any endpoint; DeepSeek's default is \"high\".",
-    "thinking: true asks for the provider's thinking mode (DeepSeek sends {\"type\":\"enabled\"}); false sends no thinking field at all, the model's own default.",
-    "Keys mush does not know are ignored, and kept when mush rewrites this file. `mush --print-config` shows what these resolved to.",
-];
+///
+/// The provider names and the endpoint `custom` falls back to are spelled from
+/// [`crate::provider::PROVIDERS`], so this header cannot offer a choice the
+/// `/provider` picker would not.
+fn comment() -> Vec<String> {
+    use crate::provider::{names_hint, Provider, DEFAULT_PROVIDER};
+    vec![
+        "mush home config — hand-editable, and every field is optional.".to_string(),
+        "Resolution: CLI flags > MUSH_* environment > this workspace's session > this file > built-in defaults.".to_string(),
+        "api_key: the provider's secret; also read from MUSH_API_KEY. Never written into a workspace.".to_string(),
+        format!(
+            "provider: {}; `{}` defaults to the local endpoint {}.",
+            names_hint(),
+            DEFAULT_PROVIDER.name(),
+            Provider::Custom.default_base_url()
+        ),
+        "base_url: an OpenAI-compatible endpoint, without a trailing slash.".to_string(),
+        "model: the model id to start with, when nothing above names one.".to_string(),
+        "context: a context window in tokens; stating it here beats what the endpoint advertises, as --context does.".to_string(),
+        "temperature: 0.0-2.0, sent with every request; 1.0 is the model's own choice, and the default.".to_string(),
+        "max_completion_tokens: true sends the reply cap as max_completion_tokens; OpenAI's reasoning models reject max_tokens.".to_string(),
+        format!(
+            "reasoning_effort: \"low\", \"medium\" or \"high\", or \"none\" to send no reasoning_effort at all. A value here reaches any endpoint; the provider's own default is {}.",
+            crate::provider::effort_default_hint()
+        ),
+        format!(
+            "thinking: true asks for the provider's thinking mode (the request carries {{\"type\":\"enabled\"}}); false sends no thinking field at all and leaves the model's own default. The provider's own default is {}.",
+            crate::provider::thinking_default_hint()
+        ),
+        "Keys mush does not know are ignored, and kept when mush rewrites this file. `mush --print-config` shows what these resolved to.".to_string(),
+    ]
+}
 
 /// The machine-global defaults the precedence chain consults below the session.
 ///
@@ -63,7 +81,8 @@ pub struct UserConfig {
     /// never written to the workspace.
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Provider name as given by `Provider::name` (e.g. "deepseek").
+    /// Provider name as given by [`Provider::name`], i.e. a name
+    /// `--provider` accepts (see `provider::PROVIDERS`).
     #[serde(default)]
     pub provider: String,
     #[serde(default)]
@@ -86,15 +105,15 @@ pub struct UserConfig {
     pub max_completion_tokens: Option<bool>,
     /// Reasoning effort sent as `reasoning_effort`: "low", "medium" or "high",
     /// or "none" for no `reasoning_effort` field at all. Stated here it is
-    /// honoured wherever the endpoint is pointed; unstated, DeepSeek's own
-    /// default ("high") applies. A value mush does not know is reported at
-    /// startup rather than sent.
+    /// honoured wherever the endpoint is pointed; unstated, the provider's own
+    /// documented default applies (`provider::PROVIDERS`). A value mush does
+    /// not know is reported at startup rather than sent.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
-    /// Ask for the provider's thinking mode. `true` sends DeepSeek's
-    /// `{"type":"enabled"}`; `false` sends no `thinking` field at all and
-    /// leaves the model's own default. Unstated, DeepSeek's thinking mode is
-    /// asked for and every other endpoint gets no field.
+    /// Ask for the provider's thinking mode. `true` sends the `thinking` field
+    /// a provider documents (`{"type":"enabled"}`); `false` sends no
+    /// `thinking` field at all and leaves the model's own default. Unstated,
+    /// the provider's own default applies (see `provider::PROVIDERS`).
     #[serde(default)]
     pub thinking: Option<bool>,
 }
@@ -164,7 +183,7 @@ impl UserConfig {
         // The header is mush's and is always rewritten: the file explains
         // itself, whatever the human does to it.
         if let Some(fields) = merged.as_object_mut() {
-            fields.insert(COMMENT_KEY.to_string(), json!(COMMENT));
+            fields.insert(COMMENT_KEY.to_string(), json!(comment()));
         }
         let json = serde_json::to_vec_pretty(&merged).unwrap_or_else(|_| b"{}".to_vec());
         atomic_write(path, &json)
@@ -235,6 +254,15 @@ mod tests {
             "thinking",
         ] {
             assert!(header.contains(field), "`{field}` is documented: {header}");
+        }
+        // The provider line is spelled from the table, so it offers every name
+        // a `/provider` could select — never a stale one.
+        for spec in crate::provider::PROVIDERS {
+            assert!(
+                header.contains(spec.name),
+                "`{}` is offered in the file's own header: {header}",
+                spec.name
+            );
         }
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }

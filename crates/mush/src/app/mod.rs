@@ -1066,14 +1066,15 @@ impl App {
     fn apply_provider(&mut self, name: &str) {
         let Some(provider) = Provider::parse(name) else {
             self.fail(format!(
-                "unknown provider `{name}` — try deepseek or custom"
+                "unknown provider `{name}` — try {}",
+                mush_core::provider::names_hint()
             ));
             return;
         };
         self.cfg.provider = provider;
-        // Switching to DeepSeek points at its hosted API; coming back to
-        // custom keeps whatever endpoint is set.
-        if provider == Provider::DeepSeek {
+        // A provider that owns an endpoint points at it; one that stands for
+        // "wherever the human pointed mush" keeps the endpoint already set.
+        if provider.spec().switches_endpoint {
             self.cfg.base_url = provider.default_base_url().to_string();
         }
         let known = self.cfg.default_models();

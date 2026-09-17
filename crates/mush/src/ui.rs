@@ -510,7 +510,7 @@ fn bar_line(status: Option<(&str, StatusKind)>, activity: Option<String>) -> (St
     }
 }
 
-/// `⌂ ~/p/demo │ master ±3 +12 −3 │ deepseek-flash · ctx ~500k │ /help` — the
+/// `⌂ ~/p/demo │ master ±3 +12 −3 │ qwen2.5-coder · ctx ~500k │ /help` — the
 /// stable facts, in the order that matters, cut from the right when the
 /// terminal is narrow.
 fn facts_line(app: &App, width: usize) -> String {

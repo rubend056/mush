@@ -8,9 +8,15 @@
 //! [`resolve`] is the single place where the startup precedence is written
 //! down; `main.rs` only parses argv and hands the values over.
 
+use crate::provider;
 use crate::session::Session;
 use crate::userconfig::UserConfig;
 use crate::{CMD_CAP, LIST_LIMIT, READ_CAP};
+
+/// Re-exported so a caller reads the whole provider vocabulary from one crate
+/// path. Every vendor fact behind it lives in [`crate::provider`], the only
+/// module that names one.
+pub use crate::provider::{known_context, ModelSpec, Provider, ProviderSpec, PROVIDERS};
 
 /// Context window assumed when nothing better is known: `MUSH_CONTEXT`, an
 /// endpoint's own metadata, or the provider's per-model table all beat it.
@@ -29,66 +35,6 @@ const MIN_CONTEXT_TOKENS: usize = 1_024;
 /// Keep a window inside the range mush can work with, whatever its source.
 fn clamp_context(tokens: usize) -> usize {
     tokens.clamp(MIN_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS)
-}
-
-/// A model's known context window, from the provider's documentation. Used when
-/// the endpoint does not advertise one (`api.deepseek.com` answers with ids
-/// only). Keep these honest: the value is shown wherever the model is chosen.
-const KNOWN_CONTEXT: &[(&str, usize)] =
-    &[("deepseek-flash", 500_000), ("deepseek-v4-pro", 500_000)];
-
-/// The window a model id is documented to have, if we know it.
-pub fn known_context(model: &str) -> Option<usize> {
-    let model = model.rsplit('/').next().unwrap_or(model);
-    KNOWN_CONTEXT
-        .iter()
-        .find(|(known, _)| *known == model)
-        .map(|(_, tokens)| *tokens)
-}
-
-/// Where mush talks to a model. Deliberately OpenAI-compatible so it works with
-/// llama.cpp, Ollama, vLLM, LM Studio, DeepSeek, and hosted APIs alike.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Provider {
-    /// DeepSeek's hosted API at `https://api.deepseek.com`.
-    DeepSeek,
-    /// Any OpenAI-compatible endpoint (local servers, proxies, other hosts).
-    Custom,
-}
-
-impl Provider {
-    pub const ALL: [Provider; 2] = [Provider::DeepSeek, Provider::Custom];
-
-    pub fn name(&self) -> &'static str {
-        match self {
-            Provider::DeepSeek => "deepseek",
-            Provider::Custom => "custom",
-        }
-    }
-
-    pub fn parse(name: &str) -> Option<Self> {
-        match name.trim().to_ascii_lowercase().as_str() {
-            "deepseek" => Some(Provider::DeepSeek),
-            // Deliberately no `openai`/`openai-compatible` aliases: they would
-            // land on `Custom`, whose default endpoint is a LAN host, and the
-            // request (and the API key) would go there.
-            "custom" => Some(Provider::Custom),
-            _ => None,
-        }
-    }
-
-    /// Endpoint used when no URL is given.
-    pub fn default_base_url(&self) -> &'static str {
-        match self {
-            Provider::DeepSeek => "https://api.deepseek.com",
-            Provider::Custom => "http://rubendpc:8078",
-        }
-    }
-
-    /// Whether the provider requires an API key for normal use.
-    pub fn needs_api_key(&self) -> bool {
-        matches!(self, Provider::DeepSeek)
-    }
 }
 
 /// The reasoning effort a request asks for. `Off` is a statement rather than a
@@ -133,11 +79,12 @@ impl ReasoningEffort {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ThinkingMode {
     /// Send no `thinking` field at all: the model's own default stands. The
-    /// honest "off" — DeepSeek documents `{"type":"enabled"}` and mush knows
-    /// no documented `{"type":"disabled"}` — so stating off never invents a
-    /// shape an endpoint may reject.
+    /// honest "off" — a provider that documents the field documents only how
+    /// to enable it, so stating off never invents a shape an endpoint may
+    /// reject.
     Off,
-    /// Ask for the thinking mode: DeepSeek's `{"type":"enabled"}`.
+    /// Ask for the thinking mode: `{"type":"enabled"}`, the one shape a
+    /// provider that documents this field documents.
     On,
 }
 
@@ -176,14 +123,17 @@ pub struct Config {
     /// documents it, so this is opt-in rather than guessed.
     pub max_completion_tokens: bool,
     /// The reasoning effort every request asks for. `None` is "not stated":
-    /// the provider's own default applies (DeepSeek asks for `high`).
+    /// the provider's own documented default applies, from its row in
+    /// [`crate::provider::PROVIDERS`].
     /// `Some(ReasoningEffort::Off)` is a statement too — no `reasoning_effort`
     /// field is sent at all — and a statement is honoured wherever the human
     /// pointed mush, which is the whole point of stating one.
     pub reasoning_effort: Option<ReasoningEffort>,
-    /// The provider's thinking mode. `None` is "not stated": DeepSeek's mode is
-    /// asked for, and any other endpoint gets no `thinking` field. Stated, the
-    /// human's choice is sent wherever they pointed mush.
+    /// The provider's thinking mode. `None` is "not stated": the provider's own
+    /// documented default applies, from its row in
+    /// [`crate::provider::PROVIDERS`], and an endpoint whose provider documents
+    /// none gets no `thinking` field at all. Stated, the human's choice is sent
+    /// wherever they pointed mush.
     pub thinking: Option<ThinkingMode>,
 }
 
@@ -286,7 +236,10 @@ pub fn parse_context_env(value: &str) -> Result<usize, String> {
 /// there (finding A17).
 pub fn parse_provider_env(value: &str) -> Result<Provider, String> {
     Provider::parse(value).ok_or_else(|| {
-        format!("MUSH_PROVIDER: unknown provider `{value}` (try deepseek or custom)")
+        format!(
+            "MUSH_PROVIDER: unknown provider `{value}` (try {})",
+            provider::names_hint()
+        )
     })
 }
 
@@ -332,7 +285,7 @@ impl Config {
             .provider
             .as_deref()
             .and_then(Provider::parse)
-            .unwrap_or(Provider::Custom);
+            .unwrap_or(provider::DEFAULT_PROVIDER);
         let base_url = env
             .url
             .as_deref()
@@ -361,7 +314,7 @@ impl Config {
         api_key: Option<String>,
     ) -> Self {
         Self {
-            provider: Provider::Custom,
+            provider: provider::DEFAULT_PROVIDER,
             base_url: normalize_url(&base_url.into()),
             model: model.into(),
             api_key,
@@ -448,19 +401,18 @@ impl Config {
     /// The provider's known models, used when the endpoint cannot list them
     /// (offline, missing key, or a server without `/v1/models`).
     pub fn default_models(&self) -> Vec<String> {
-        match self.provider {
-            Provider::DeepSeek => vec!["deepseek-flash".to_string(), "deepseek-v4-pro".to_string()],
-            Provider::Custom => Vec::new(),
-        }
+        self.provider
+            .spec()
+            .models
+            .iter()
+            .map(|model| model.id.to_string())
+            .collect()
     }
 
     /// The window to assume for the current model when the endpoint advertises
     /// nothing: the documented one, else the provider's general default.
     pub fn fallback_context(&self) -> usize {
-        known_context(&self.model).unwrap_or(match self.provider {
-            Provider::DeepSeek => 128_000,
-            Provider::Custom => DEFAULT_CONTEXT_TOKENS,
-        })
+        known_context(&self.model).unwrap_or(self.provider.spec().fallback_context_tokens)
     }
 
     /// Adopt a window learned from the endpoint or the model table, unless the
@@ -503,7 +455,7 @@ impl Config {
     pub fn thinking_enabled(&self) -> bool {
         match self.thinking {
             Some(mode) => mode == ThinkingMode::On,
-            None => self.provider == Provider::DeepSeek,
+            None => self.provider.spec().thinking_by_default,
         }
     }
 
@@ -517,15 +469,12 @@ impl Config {
 
     /// What a request sends as `reasoning_effort`, `None` for no such field at
     /// all. A stated value reaches any endpoint; unstated, the provider's own
-    /// default applies — DeepSeek asks for `high`, and no other endpoint is
-    /// given a field its provider never documented.
+    /// documented default applies, and an endpoint whose provider documents
+    /// none is never given a field it never asked for.
     pub fn reasoning_effort(&self) -> Option<&'static str> {
         match self.reasoning_effort {
             Some(effort) => effort.as_str(),
-            None => match self.provider {
-                Provider::DeepSeek => Some("high"),
-                Provider::Custom => None,
-            },
+            None => self.provider.spec().reasoning_effort_by_default,
         }
     }
 
@@ -542,7 +491,10 @@ impl Config {
         self.base_url = normalize_url(url);
     }
 
-    /// A short label for the status bar, e.g. `deepseek-flash @ deepseek.com`.
+    /// A short label for the status bar: the model, then the endpoint — the
+    /// provider's own name where the provider owns the endpoint (see
+    /// [`crate::provider::ProviderSpec::display_endpoint`]), the configured URL
+    /// otherwise.
     pub fn label(&self) -> String {
         let model = if self.model.is_empty() {
             "no model".to_string()
@@ -553,9 +505,9 @@ impl Config {
                 .unwrap_or(&self.model)
                 .to_string()
         };
-        let endpoint = match self.provider {
-            Provider::DeepSeek => "deepseek.com".to_string(),
-            Provider::Custom => self.base_url.clone(),
+        let endpoint = match self.provider.spec().display_endpoint {
+            Some(endpoint) => endpoint.to_string(),
+            None => self.base_url.clone(),
         };
         format!("{model} @ {endpoint}")
     }
@@ -592,11 +544,15 @@ pub fn resolve_with(
         config.set_base_url(url);
     }
     if let Some(provider) = cli.provider.as_deref() {
-        config.provider = Provider::parse(provider)
-            .ok_or_else(|| format!("unknown provider `{provider}` (try deepseek or custom)"))?;
+        config.provider = Provider::parse(provider).ok_or_else(|| {
+            format!(
+                "unknown provider `{provider}` (try {})",
+                provider::names_hint()
+            )
+        })?;
         // Naming a provider on the command line selects its own endpoint — the
-        // flag must reach `api.deepseek.com`, not whatever the environment's
-        // provider defaulted to — unless a URL was named too.
+        // flag must reach the host the provider names, not whatever the
+        // environment's provider defaulted to — unless a URL was named too.
         if cli.url.is_none() && env.url.is_none() {
             config.base_url = config.provider.default_base_url().to_string();
         }
@@ -715,7 +671,7 @@ pub fn resolve_with(
     }
 
     // 4. An endpoint named on the command line or in the environment is a
-    //    *custom* endpoint: a stored provider must not leak its DeepSeek-only
+    //    *custom* endpoint: a stored provider must not leak its hosted-provider
     //    knobs (`reasoning_effort`, `thinking`) to a URL it does not own. A
     //    provider named alongside the URL keeps its knobs.
     if (cli.url.is_some() || env.url.is_some()) && !provider_given {

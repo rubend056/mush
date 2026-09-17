@@ -332,6 +332,15 @@ the window, so one `read_file` can never fill an 8k transcript. A server that
 complains about the context length teaches mush the number it names, and the run
 retries once.
 
+Everything mush knows about a named vendor — the name a human types, its
+default endpoint, the models it documents, their windows, whether the thinking
+field is sent and with what effort, and what the status bar calls its host — is
+one row of `provider::PROVIDERS` in `mush-core/src/provider.rs`. No other file
+names a vendor: the help text, the `/provider` picker, the error messages and
+the home config's own header are all spelled from that table, and a unit test
+fails on a vendor literal found anywhere else in the two crates' production
+code. Adding a provider is a row there, not a hunt.
+
 ### Known rough edge: notices and errors have no lifetime `[OPEN]`
 
 Everything else on the screen is derived from a fact and ages with it. The lines

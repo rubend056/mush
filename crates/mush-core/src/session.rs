@@ -103,7 +103,8 @@ pub struct AgentSession {
 pub struct Session {
     pub root: String,
     pub model: String,
-    /// Provider name as given by `Provider::name` (e.g. "deepseek").
+    /// Provider name as given by [`Provider::name`], i.e. a name
+    /// `--provider` accepts (see `provider::PROVIDERS`).
     #[serde(default)]
     pub provider: String,
     /// Base URL of the endpoint in use; empty when never customized.

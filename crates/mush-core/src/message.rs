@@ -129,8 +129,8 @@ pub struct Message {
         skip_serializing_if = "Option::is_none"
     )]
     pub content: Option<String>,
-    /// A thinking model's reasoning for this turn (DeepSeek's
-    /// `reasoning_content`). It is read from the reply and written straight
+    /// A thinking model's reasoning for this turn (`reasoning_content`). It is
+    /// read from the reply and written straight
     /// back out with the turn: in thinking mode the endpoint refuses a request
     /// that replays an assistant turn without it, tool-call turns first among
     /// them. `None` for every model that keeps its thinking to itself, and
@@ -229,10 +229,12 @@ pub struct ChatRequest<'a> {
     /// The same cap under the newer name, for endpoints that require it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_completion_tokens: Option<u32>,
-    /// Provider-specific: enable the model's thinking mode (DeepSeek).
+    /// Provider-specific: enable the model's thinking mode, for the providers
+    /// whose row in `provider::PROVIDERS` asks for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thinking: Option<serde_json::Value>,
-    /// Provider-specific: reasoning effort lever (DeepSeek).
+    /// Provider-specific: the reasoning effort lever, sent only where a
+    /// provider documents it (see `provider::PROVIDERS`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<String>,
 }

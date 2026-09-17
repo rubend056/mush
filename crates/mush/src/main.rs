@@ -221,16 +221,16 @@ fn print_help() {
          OPTIONS:\n\
          \x20   --url URL          OpenAI-compatible endpoint (default: $MUSH_URL or the provider default)\n\
          \x20   --model NAME       Model id (default: $MUSH_MODEL, else auto-detected)\n\
-         \x20   --provider NAME    deepseek or custom (default: $MUSH_PROVIDER or custom)\n\
+         \x20   --provider NAME    {} (default: $MUSH_PROVIDER or {})\n\
          \x20   --context TOKENS   Context window when nothing else knows it (default: $MUSH_CONTEXT,\n\
          \x20                      else what the endpoint advertises, else the model's known window)\n\
          \x20   --temperature F    Sampling temperature, 0.0-2.0 (default: 1.0, the model's own choice)\n\
          \x20   --reasoning-effort LEVEL\n\
          \x20                      Reasoning effort sent as `reasoning_effort`: low, medium or high,\n\
-         \x20                      or none to send no such field (default: DeepSeek's `high`,\n\
-         \x20                      no field anywhere else; $MUSH_REASONING_EFFORT)\n\
+         \x20                      or none to send no such field (default: {};\n\
+         \x20                      $MUSH_REASONING_EFFORT)\n\
          \x20   --thinking MODE    on asks for the provider's thinking mode, off sends no `thinking`\n\
-         \x20                      field at all (default: on for DeepSeek, off elsewhere; $MUSH_THINKING)\n\
+         \x20                      field at all (default: {}; $MUSH_THINKING)\n\
          \x20   --max-completion-tokens\n\
          \x20                      Send the reply cap as `max_completion_tokens` instead of\n\
          \x20                      `max_tokens`, as OpenAI's reasoning models require\n\
@@ -251,7 +251,7 @@ fn print_help() {
          \x20   wheel             scroll the transcript\n\
          \x20   Ctrl-Q            quit\n\n\
          COMMANDS (type in the chat):\n\
-         \x20   /provider [deepseek|custom]  switch provider\n\
+         \x20   /provider [{}]  switch provider\n\
          \x20   /model                       pick a model\n\
          \x20   /context [TOKENS]            show or set the context window\n\
          \x20   /url http://host:port        set the endpoint\n\
@@ -267,7 +267,12 @@ fn print_help() {
          every field is optional, and the one mush writes documents itself.\n\
          --print-config shows what those layers resolved to. The conversation is\n\
          stored in <DIRECTORY>/.mush/session.json.",
-        env!("CARGO_PKG_VERSION")
+        env!("CARGO_PKG_VERSION"),
+        mush_core::provider::names_hint(),
+        mush_core::provider::DEFAULT_PROVIDER.name(),
+        mush_core::provider::effort_default_hint(),
+        mush_core::provider::thinking_default_hint(),
+        mush_core::provider::names_piped(),
     );
 }
 
@@ -305,8 +310,8 @@ fn describe(config: &Config, approved: bool) -> Vec<(String, String)> {
         "max_tokens"
     };
     // Both of these are stated values with a provider default, so the line says
-    // which one a request will carry *and* where it came from: a `high` nobody
-    // stated is DeepSeek's, not the human's.
+    // which one a request will carry *and* where it came from: a value nobody
+    // stated is the provider's, not the human's.
     let source = if config.reasoning_effort_stated() {
         "stated"
     } else {
