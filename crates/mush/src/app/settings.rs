@@ -6,14 +6,17 @@
 //! each site that learned something. A number one side learned and the other
 //! did not is a screen that promises room the next request does not have.
 //!
-//! The invariant: the two copies change together or not at all, and a window
-//! mush did not get from the human is written in exactly two places, both
-//! running the same policy in [`believable`] — [`ConfigCell::learn_context`],
-//! which is the UI adopting a number an actor announced, and
-//! [`ConfigHandle::learn_context`], which is an actor adopting what the endpoint
-//! said and which `AgentCtx` always announces as an event in the same call.
-//! Nothing else can write one, so "the UI shows a window the actor does not
-//! have" is not a state this module can reach.
+//! The invariant: every write to one of the copies goes through one of this
+//! module's functions, never by hand at the site that happened to learn
+//! something; and a window mush did not get from the human is written in
+//! exactly two places, both running the same policy in [`believable`] —
+//! [`ConfigCell::learn_context`], which is the UI adopting a number an actor
+//! announced, and [`ConfigHandle::learn_context`], which is an actor adopting
+//! what the endpoint said and which `AgentCtx` always announces as an event in
+//! the same call. Nothing else can write one, so "the UI shows a window the
+//! actor does not have" is not a state this module can reach. (The one way the
+//! copies can still differ is a thread that panicked while holding the cell;
+//! see `ConfigHandle::adopt`.)
 //!
 //! Two faces, one cell: the UI thread holds a [`ConfigCell`] — a plain copy to
 //! read on every frame, and the shared cell to write through — and an actor is
