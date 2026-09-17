@@ -3845,20 +3845,50 @@ mod tests {
         let (actor, _mailbox) = scripted_tools_actor("wait-jobs", machine, clock);
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
-        let mut call =
-            |tool: ToolName, args: Value| exec_tool(&actor, &mut state, tool, &args, &cancel);
 
         for command in ["make build", "make test"] {
-            let started = call(
+            let started = exec_tool(
+                &actor,
+                &mut state,
                 ToolName::RunCommand,
-                json!({ "command": command, "detach": true }),
+                &json!({ "command": command, "detach": true }),
+                &cancel,
             )
             .unwrap();
             assert!(started.contains("detached as #c"), "{started}");
         }
 
+        // Each job's own watcher thread delivers its report to this actor's
+        // mailbox. Block on those two arrivals *before* the wait begins, rather
+        // than let the wait's fake clock race the watcher being scheduled: on
+        // this clock a `timeout: 5` elapses in microseconds, so a report whose
+        // thread had not yet been given the CPU made the wait answer "wait
+        // timed out — #c1 still running" — a fact about the scheduler, not
+        // about `wait_commands`. The recorded event is what the wait reads
+        // anyway (`drain_signals` records a `CommandDone` through this same
+        // `note_job`), so this changes only *when* the report is known.
+        for _ in 0..2 {
+            match actor.rx.recv_timeout(Duration::from_secs(10)) {
+                Ok(AgentMsg::CommandDone { id, line, news }) => {
+                    note_job(&mut state, id, line, news);
+                }
+                Ok(_) => panic!("a job's report must reach the owner's mailbox"),
+                Err(error) => panic!(
+                    "a job that has already ended must report — waited for its `CommandDone`: \
+                     {error}"
+                ),
+            }
+        }
+
         // One report, by id: the wait answers with the job's own line.
-        let one = call(ToolName::WaitCommands, json!({ "ids": [1], "timeout": 5 })).unwrap();
+        let one = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::WaitCommands,
+            &json!({ "ids": [1], "timeout": 5 }),
+            &cancel,
+        )
+        .unwrap();
         assert!(one.contains("exit 0"), "{one}");
         assert!(one.contains("make build"), "{one}");
         assert!(
@@ -3868,7 +3898,14 @@ mod tests {
 
         // No ids: every job this agent started, and no `all` means the first
         // report that is ready rather than every one.
-        let mine = call(ToolName::WaitCommands, json!({ "timeout": 5 })).unwrap();
+        let mine = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::WaitCommands,
+            &json!({ "timeout": 5 }),
+            &cancel,
+        )
+        .unwrap();
         assert!(mine.contains("exit 0"), "{mine}");
         assert!(!mine.contains('\n'), "one result, not a list: {mine}");
 
