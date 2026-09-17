@@ -2226,6 +2226,56 @@ mod tests {
 
     /// A standalone actor over a scratch workspace, for exercising the mailbox
     /// plumbing with no model, no UI, and no threads.
+    /// Several edits to the *same* file in one batch must all land: every file
+    /// tool re-reads from disk, so the second edit sees the first one's result
+    /// instead of clobbering it with a stale copy.
+    #[test]
+    fn several_edits_to_one_file_in_a_batch_all_land() {
+        let (actor, _mailbox) = test_actor("multi-edit");
+        let cfg = Config::new("http://127.0.0.1:1", "test", None);
+        fs::write(actor.ws.root().join("f.rs"), "let a = 1;\nlet b = 2;\n").unwrap();
+
+        // Exactly what a batch of three `edit_file` calls does, in order.
+        for (old, new) in [
+            ("let a = 1;", "let a = 10;"),
+            ("let b = 2;", "let b = 20;"),
+            ("let b = 20;", "let b = 21;"),
+        ] {
+            direct_tool(
+                &actor.ws,
+                "edit_file",
+                &json!({ "path": "f.rs", "old_string": old, "new_string": new }),
+                &cfg,
+            )
+            .unwrap();
+        }
+
+        assert_eq!(
+            fs::read_to_string(actor.ws.root().join("f.rs")).unwrap(),
+            "let a = 10;\nlet b = 21;\n"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// An ambiguous `old_string` is refused rather than guessed at, which is
+    /// what makes a repeated pattern (a rename) need context each time.
+    #[test]
+    fn an_ambiguous_edit_is_refused_not_guessed() {
+        let (actor, _mailbox) = test_actor("ambiguous");
+        let cfg = Config::new("http://127.0.0.1:1", "test", None);
+        fs::write(actor.ws.root().join("f.rs"), "x = 1;\nx = 2;\n").unwrap();
+
+        let error = direct_tool(
+            &actor.ws,
+            "edit_file",
+            &json!({ "path": "f.rs", "old_string": "x = ", "new_string": "y = " }),
+            &cfg,
+        )
+        .unwrap_err();
+        assert!(error.contains("2 times"), "{error}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     fn test_actor(label: &str) -> (Actor, Sender<AgentMsg>) {
         let root = std::env::temp_dir().join(format!("mush-actor-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
