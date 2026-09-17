@@ -299,6 +299,10 @@ impl Chat {
         self.push_notice(agent, NoticeKind::Info, text);
     }
 
+    /// A failure in the root conversation. Test-only now: every production
+    /// failure is tagged with the agent it concerns, so the root's goes through
+    /// [`Self::note_error_for`].
+    #[cfg(test)]
     pub fn note_error(&mut self, text: impl Into<String>) {
         self.note_error_for(AgentId::ROOT, text);
     }

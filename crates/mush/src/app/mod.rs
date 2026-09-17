@@ -919,11 +919,15 @@ impl App {
             // was spelled beside the rule that rejected it, and the bar is
             // where every other complaint of this kind goes.
             Err(CommandError::Usage(line)) => self.say(line),
-            // A slash nobody implements: a transcript error, where a human
-            // looking at what they typed will see it.
-            Err(CommandError::Unknown(name)) => {
-                self.chat.note_error(format!("unknown command: {name}"))
-            }
+            // A slash nobody implements answered a command the human just
+            // typed, in a moment that ends the instant they type again — an
+            // informational line in the focused pane, not a failure. As an
+            // error it was ranked an alert (never the line the cap yielded),
+            // painted red, and written to the session, so a typo outlived the
+            // run it answered and came back at the next start.
+            Err(CommandError::Unknown(name)) => self
+                .chat
+                .note_for(self.tree.focused, format!("unknown command: {name}")),
         }
     }
 
@@ -2883,6 +2887,51 @@ mod tests {
             notes,
             vec!["no route to host"],
             "the restart kept the failure and dropped the diff line"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A typo'd command answers the moment the human typed it, so it is nothing
+    /// more than a note for that moment: not an alert that outlives the moment,
+    /// and not a line the session file writes down and a relaunch reads back. A
+    /// *run's* failure is the opposite and stays stored — see
+    /// [`a_failure_is_stored_and_a_command_answer_is_not`].
+    #[test]
+    fn a_typoed_command_is_a_moment_not_a_stored_failure() {
+        let root = dir("typo");
+        let (mut app, _writer) = app_writing(&root);
+        app.chat.insert("/hlep");
+        app.send_message();
+
+        let notice = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .next()
+            .expect("the typo is answered");
+        assert_eq!(notice.text, "unknown command: /hlep");
+        assert_eq!(
+            notice.rank(),
+            Rank::Said,
+            "an informational line, not an alert the cap may never yield"
+        );
+        assert!(
+            app.chat.stored_notices().is_empty(),
+            "nothing about a typo is written to the session"
+        );
+
+        app.flush_session();
+        let stored = Session::load(&root).expect("the flush wrote the file");
+        assert!(
+            stored.notices.is_empty(),
+            "so the file records no such line: {:?}",
+            stored.notices
+        );
+        drop(app);
+
+        let app = reopened(&root);
+        assert!(
+            app.chat.notices_for(AgentId::ROOT).next().is_none(),
+            "and a relaunch does not bring the typo back"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
