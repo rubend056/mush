@@ -49,6 +49,58 @@ fn part_text(part: Value) -> String {
         .to_string()
 }
 
+/// Every call in one batch needs an id a strict server will accept, and no two
+/// calls may share one: a server pairs a result with its call *by id*, so a
+/// missing id (mush used to re-send `tool_call_id: ""`) or a duplicate makes
+/// the whole pairing invalid and the next request is rejected.
+///
+/// A missing or repeated id becomes `call_N` — the first `N` at or after the
+/// call's position that neither this batch nor an earlier call is already
+/// using. Deterministic, and decided only by the batch itself: the same reply
+/// always yields the same ids, and a batch that already has unique ids is left
+/// exactly as it was.
+fn assign_tool_call_ids(calls: &mut [ToolCall]) {
+    // Ids this batch already uses, so a synthesized one cannot collide with an
+    // id that appears *later* in the same batch.
+    let mut used: Vec<String> = calls
+        .iter()
+        .map(|call| call.id.trim().to_string())
+        .filter(|id| !id.is_empty())
+        .collect();
+    let mut answered: Vec<String> = Vec::with_capacity(calls.len());
+    for (index, call) in calls.iter_mut().enumerate() {
+        let id = call.id.trim().to_string();
+        let id = if !id.is_empty() && !answered.contains(&id) {
+            id
+        } else {
+            let mut n = index;
+            loop {
+                let candidate = format!("call_{n}");
+                if !used.contains(&candidate) && !answered.contains(&candidate) {
+                    used.push(candidate.clone());
+                    break candidate;
+                }
+                n += 1;
+            }
+        };
+        answered.push(id.clone());
+        call.id = id;
+    }
+}
+
+/// The `tool_calls` wire field, normalized on the way in: a reply is not
+/// malformed because a model left an id out or repeated one.
+fn tool_calls_from_wire<'de, D>(deserializer: D) -> Result<Option<Vec<ToolCall>>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let mut calls = Option::<Vec<ToolCall>>::deserialize(deserializer)?;
+    if let Some(calls) = calls.as_mut() {
+        assign_tool_call_ids(calls);
+    }
+    Ok(calls)
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct FunctionCall {
     pub name: String,
@@ -77,7 +129,11 @@ pub struct Message {
         skip_serializing_if = "Option::is_none"
     )]
     pub content: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "tool_calls_from_wire",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub tool_calls: Option<Vec<ToolCall>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -123,6 +179,15 @@ impl Message {
 
     pub fn tool_calls(&self) -> &[ToolCall] {
         self.tool_calls.as_deref().unwrap_or(&[])
+    }
+
+    /// See [`assign_tool_call_ids`]: every call gets an id a strict server
+    /// accepts, and its result can then answer an id that exists. Idempotent,
+    /// so a message that already has unique ids comes out unchanged.
+    pub fn ensure_tool_call_ids(&mut self) {
+        if let Some(calls) = self.tool_calls.as_mut() {
+            assign_tool_call_ids(calls);
+        }
     }
 
     /// Rough size in bytes, used for history budgeting.
@@ -248,6 +313,61 @@ mod tests {
             serde_json::to_string(&Message::assistant("hi")).unwrap(),
             r#"{"role":"assistant","content":"hi"}"#
         );
+    }
+
+    /// A call with no id, or two calls sharing one, must not round-trip as
+    /// `tool_call_id: ""` / a duplicate: a server pairs a result with its call
+    /// by id, and rejects the pairing otherwise.
+    #[test]
+    fn tool_calls_with_no_id_or_a_duplicate_get_unique_ones() {
+        let parsed: Message = serde_json::from_str(
+            r#"{"role":"assistant","tool_calls":[
+                 {"type":"function","function":{"name":"read_file","arguments":"{}"}},
+                 {"id":"dup","type":"function","function":{"name":"ls","arguments":"{}"}},
+                 {"id":"dup","type":"function","function":{"name":"ls","arguments":"{}"}},
+                 {"id":"   ","type":"function","function":{"name":"ls","arguments":"{}"}}
+               ]}"#,
+        )
+        .unwrap();
+        let ids: Vec<&str> = parsed.tool_calls().iter().map(|c| c.id.as_str()).collect();
+        assert!(
+            ids.iter().all(|id| !id.trim().is_empty()),
+            "no call is answered with an empty id: {ids:?}"
+        );
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), ids.len(), "ids are unique: {ids:?}");
+        // Deterministic, and the first user of an id keeps it.
+        assert_eq!(ids, ["call_0", "dup", "call_2", "call_3"]);
+
+        // A synthesized id never collides with one already in the batch.
+        let clash: Message = serde_json::from_str(
+            r#"{"role":"assistant","tool_calls":[
+                 {"type":"function","function":{"name":"ls","arguments":"{}"}},
+                 {"id":"call_0","type":"function","function":{"name":"ls","arguments":"{}"}}
+               ]}"#,
+        )
+        .unwrap();
+        let ids: Vec<&str> = clash.tool_calls().iter().map(|c| c.id.as_str()).collect();
+        assert_eq!(ids, ["call_1", "call_0"], "the existing id is never taken");
+    }
+
+    /// Normalizing is idempotent: a batch that already has unique ids — every
+    /// call mush got from a well-behaved endpoint — is left exactly as it was.
+    #[test]
+    fn unique_tool_call_ids_are_left_alone() {
+        let mut message: Message = serde_json::from_str(
+            r#"{"role":"assistant","tool_calls":[
+                 {"id":"call_a","type":"function","function":{"name":"ls","arguments":"{}"}},
+                 {"id":"call_1","type":"function","function":{"name":"ls","arguments":"{}"}}
+               ]}"#,
+        )
+        .unwrap();
+        let before = serde_json::to_string(&message).unwrap();
+        message.ensure_tool_call_ids();
+        message.ensure_tool_call_ids();
+        assert_eq!(serde_json::to_string(&message).unwrap(), before);
     }
 
     #[test]

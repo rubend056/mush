@@ -2826,6 +2826,66 @@ mod tests {
         let _ = mailbox;
     }
 
+    /// Some compatible servers (and models) answer with a tool call that has no
+    /// id, or repeat one across a batch. Strict servers pair a result with its
+    /// call *by id*, so the run must answer each call — with its own id, never
+    /// `""` and never a duplicate.
+    #[test]
+    fn a_reply_whose_calls_have_no_ids_still_gets_answered() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .calls(vec![
+                    tool_call("", "read_file", json!({ "path": "missing.rs" })),
+                    tool_call("dup", "read_file", json!({ "path": "missing.rs" })),
+                    tool_call("dup", "list_files", json!({})),
+                ])
+                .says("done"),
+        );
+        let (actor, _events, mailbox) = scripted_actor("id-less-calls", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("look around"),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("done"));
+
+        // The second request carries the assistant's calls and their results:
+        // the pairing a server validates is exactly this.
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 2, "the batch, then the answer");
+        let ids: Vec<String> = asked[1]
+            .messages
+            .iter()
+            .flat_map(|message| message.tool_calls().iter().map(|call| call.id.clone()))
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|id| !id.trim().is_empty()), "{ids:?}");
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            3,
+            "each call is answerable on its own: {ids:?}"
+        );
+
+        let answered: Vec<String> = asked[1]
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .map(|message| message.tool_call_id.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            answered, ids,
+            "every result answers the id that asked for it"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
     /// A model that keeps answering too big has to end the run: the bounded
     /// retry is a kindness, not an infinite loop.
     #[test]
