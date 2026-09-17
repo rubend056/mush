@@ -70,19 +70,69 @@ pub fn list_result(ws: &Workspace, args: &Value, limit: usize) -> Result<String,
     }
 }
 
+/// One replacement in a batch. `replace_all` is what a rename needs: the same
+/// pattern several times in a file is otherwise refused as ambiguous.
+#[derive(Clone, Debug)]
+pub struct Edit {
+    pub old: String,
+    pub new: String,
+    pub replace_all: bool,
+}
+
 /// The text `edit_file` produces: `current` with exactly one occurrence of
 /// `old` replaced by `new`. Refusing to guess is the point — a missing or
 /// ambiguous match is an error the model can correct, and a wrong edit is
 /// impossible.
 pub fn edit_text(current: &str, old: &str, new: &str, rel: &str) -> Result<String, String> {
+    apply_one(current, old, new, false, rel, None)
+}
+
+/// Several edits applied in order, in memory, as one change.
+///
+/// All or nothing: the value is built up and returned whole, so an edit that
+/// does not match leaves the input untouched and a caller that writes only on
+/// `Ok` cannot leave a file half-changed. Applying them here rather than as
+/// separate tool calls also makes the batch one round trip instead of one per
+/// edit, and guarantees the edits see each other's results in the order given.
+pub fn edit_text_many(current: &str, edits: &[Edit], rel: &str) -> Result<String, String> {
+    let mut text = current.to_string();
+    for (index, edit) in edits.iter().enumerate() {
+        text = apply_one(
+            &text,
+            &edit.old,
+            &edit.new,
+            edit.replace_all,
+            rel,
+            Some(index + 1),
+        )?;
+    }
+    Ok(text)
+}
+
+fn apply_one(
+    current: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+    rel: &str,
+    which: Option<usize>,
+) -> Result<String, String> {
+    // Naming *which* edit failed matters in a batch: the model has to know what
+    // to fix, and "old_string not found" alone is ambiguous.
+    let at = match which {
+        Some(index) => format!("edit {index}: "),
+        None => String::new(),
+    };
     if old.is_empty() {
-        return Err("old_string must not be empty".to_string());
+        return Err(format!("{at}old_string must not be empty"));
     }
     match current.matches(old).count() {
-        0 => Err(format!("old_string not found in {rel}")),
+        0 => Err(format!("{at}old_string not found in {rel}")),
         1 => Ok(current.replacen(old, new, 1)),
+        _ if replace_all => Ok(current.replace(old, new)),
         count => Err(format!(
-            "old_string appears {count} times in {rel}; include more context to make it unique"
+            "{at}old_string appears {count} times in {rel}; include more context to make it \
+             unique, or set replace_all to change every occurrence"
         )),
     }
 }
@@ -130,6 +180,64 @@ mod tests {
         let none = list_result(&ws, &json!({"path": "missing"}), 100).unwrap();
         assert!(none.starts_with("no files under"), "{none}");
         let _ = fs::remove_dir_all(ws.root());
+    }
+
+    fn edit(old: &str, new: &str) -> Edit {
+        Edit {
+            old: old.to_string(),
+            new: new.to_string(),
+            replace_all: false,
+        }
+    }
+
+    /// A batch lands whole or not at all: an edit that cannot apply leaves the
+    /// input untouched, so a caller that writes only on `Ok` cannot leave a file
+    /// half-changed.
+    #[test]
+    fn a_batch_is_all_or_nothing() {
+        let file = "let a = 1;\nlet b = 2;\n";
+        let applied = edit_text_many(
+            file,
+            &[edit("a = 1", "a = 10"), edit("b = 2", "b = 20")],
+            "f.rs",
+        )
+        .unwrap();
+        assert_eq!(applied, "let a = 10;\nlet b = 20;\n");
+
+        // The second edit cannot match, so the whole batch fails and the first
+        // edit is *not* returned as a partial result.
+        let error = edit_text_many(
+            file,
+            &[edit("a = 1", "a = 10"), edit("nothing here", "x")],
+            "f.rs",
+        )
+        .unwrap_err();
+        assert!(
+            error.contains("edit 2"),
+            "the failing edit is named: {error}"
+        );
+        assert!(error.contains("not found"), "{error}");
+        // The input itself is untouched, which is what makes the batch atomic.
+        assert_eq!(file, "let a = 1;\nlet b = 2;\n");
+    }
+
+    /// A rename is the case a single-pair edit cannot express: the same text
+    /// several times.
+    #[test]
+    fn replace_all_changes_every_occurrence() {
+        let file = "old_name();\nold_name(arg);\n";
+        let plain = edit_text(file, "old_name", "new_name", "f.rs").unwrap_err();
+        assert!(plain.contains("2 times"), "{plain}");
+
+        let all = Edit {
+            old: "old_name".to_string(),
+            new: "new_name".to_string(),
+            replace_all: true,
+        };
+        assert_eq!(
+            edit_text_many(file, &[all], "f.rs").unwrap(),
+            "new_name();\nnew_name(arg);\n"
+        );
     }
 
     #[test]

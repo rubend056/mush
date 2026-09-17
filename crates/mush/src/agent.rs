@@ -1566,10 +1566,31 @@ fn direct_tool(ws: &Workspace, name: &str, args: &Value, cfg: &Config) -> Result
         }
         "edit_file" => {
             let rel = tools::arg_string(args, "path")?;
-            let old = tools::arg_string(args, "old_string")?;
-            let new = tools::arg_string(args, "new_string")?;
             let current = ws.read_file(&rel, usize::MAX)?;
-            let updated = tools::edit_text(&current, &old, &new, &rel)?;
+            // A list of edits is applied to one read and written once: all of
+            // them land or none do, so a batch cannot leave the file
+            // half-changed, and the edits see each other's results in order.
+            let updated = match args.get("edits").and_then(Value::as_array) {
+                Some(list) if !list.is_empty() => {
+                    let mut edits = Vec::with_capacity(list.len());
+                    for entry in list {
+                        edits.push(tools::Edit {
+                            old: tools::arg_string(entry, "old_string")?,
+                            new: tools::arg_string(entry, "new_string")?,
+                            replace_all: entry
+                                .get("replace_all")
+                                .and_then(Value::as_bool)
+                                .unwrap_or(false),
+                        });
+                    }
+                    tools::edit_text_many(&current, &edits, &rel)?
+                }
+                _ => {
+                    let old = tools::arg_string(args, "old_string")?;
+                    let new = tools::arg_string(args, "new_string")?;
+                    tools::edit_text(&current, &old, &new, &rel)?
+                }
+            };
             ws.write_file(&rel, &updated)?;
             Ok(format!("edited {rel}"))
         }
@@ -1797,12 +1818,27 @@ fn summarize(args: &Value) -> String {
         return path.to_string();
     }
     if let Some(command) = args.get("command").and_then(Value::as_str) {
-        return truncate(command, 60);
+        // The *first line*, with whitespace collapsed. Truncating the raw string
+        // at 60 characters kept its newlines, so a heredoc turned a one-line
+        // label into several — `⚙ run_command cd …` followed by `import io`,
+        // `p = 'crates/…`, and so on. A label is one line by definition.
+        return truncate(&first_line(command), 50);
     }
     if let Some(brief) = args.get("brief").and_then(Value::as_str) {
-        return truncate(brief, 40);
+        return truncate(&first_line(brief), 40);
     }
     String::new()
+}
+
+/// Everything up to the first newline, with runs of whitespace collapsed to one
+/// space, so a summary is always a single readable line.
+fn first_line(text: &str) -> String {
+    text.lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 fn truncate(text: &str, max: usize) -> String {
@@ -1831,6 +1867,18 @@ mod tests {
             "fix the parser"
         );
         assert_eq!(summarize(&json!({})), "");
+    }
+
+    /// A tool label is one line by definition. Truncating a command's raw text
+    /// kept its newlines, so a heredoc turned one row into several.
+    #[test]
+    fn a_command_summary_collapses_to_one_line() {
+        let label = summarize(&json!({
+            "command": "cd /w && python3 - <<'PY'\nimport io\nprint('x')\nPY"
+        }));
+        assert!(!label.contains('\n'), "{label:?} must be one line");
+        assert!(label.starts_with("cd /w && python3"), "{label}");
+        assert_eq!(first_line("  a\n\n  b  c \n"), "a");
     }
 
     /// A nudge parked during a run that was cancelled is already in the UI's

@@ -18,8 +18,7 @@ use std::time::Duration;
 use crossbeam_channel::{unbounded, Receiver};
 use ratatui::backend::CrosstermBackend;
 use ratatui::crossterm::event::{
-    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
-    Event, KeyEventKind,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event, KeyEventKind,
 };
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
@@ -262,10 +261,6 @@ fn event_loop(
                 }
                 // The whole paste, in one event.
                 Event::Paste(text) => app.update(Msg::Paste(text)),
-                // A wheel notch is a scroll, not a keypress: one event moves
-                // several lines at once, which is what makes the wheel feel
-                // like a wheel instead of a very slow arrow key.
-                Event::Mouse(mouse) => app.update(Msg::Mouse(mouse)),
                 // The terminal changed size: schedule a redraw. ratatui's
                 // `terminal.draw` re-queries the size first, so the next
                 // frame already paints at the new dimensions.
@@ -311,17 +306,12 @@ fn enter_terminal_modes() -> io::Result<()> {
     // keystrokes — one event, one repaint, and a redraw per character — into a
     // single `Event::Paste` carrying the whole paste.
     //
-    // Mouse capture is the same fix for the wheel: it arrives as `Event::Mouse`
-    // instead of as arrow keys, so mush scrolls by a notch rather than by one
-    // keystroke per wheel event, and a wheel event cannot be queued behind
-    // pending input. The cost is the terminal's own drag-to-select, which comes
-    // back with Shift held.
-    execute!(
-        stdout,
-        EnterAlternateScreen,
-        EnableBracketedPaste,
-        EnableMouseCapture
-    )
+    // Mouse capture is deliberately NOT taken. It would let mush scroll by wheel
+    // notch instead of by arrow key, but it also takes away the terminal's own
+    // drag-to-select, and reading text out of the transcript is worth more than
+    // a wheel notch. The lag that made the wheel feel broken was the per-keystroke
+    // repaint, which the event loop no longer does.
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
 }
 
 /// Undo every mode [`enter_terminal_modes`] turned on.

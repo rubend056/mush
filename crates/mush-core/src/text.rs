@@ -10,9 +10,26 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 /// Word-aware wrapping that preserves explicit newlines and never splits a
 /// grapheme's display width arithmetic.
 pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    wrap_capped(text, width, None)
+}
+
+/// [`wrap_text`], but it stops after `max_lines` lines.
+///
+/// For a caller that discards the rest — a tool result shows its first eight
+/// lines — wrapping the whole thing is work thrown away, and at one frame per
+/// keystroke it was megabytes per second: 300 multi-kilobyte results wrapped in
+/// full cost 55 ms a frame, 18 fps, to paint about forty lines.
+pub fn wrap_text_capped(text: &str, width: usize, max_lines: usize) -> Vec<String> {
+    wrap_capped(text, width, Some(max_lines))
+}
+
+fn wrap_capped(text: &str, width: usize, max_lines: Option<usize>) -> Vec<String> {
     let width = width.max(1);
-    let mut out = Vec::new();
+    let mut out: Vec<String> = Vec::new();
     for raw in text.split('\n') {
+        if max_lines.is_some_and(|max| out.len() >= max) {
+            break;
+        }
         let mut current = String::new();
         let mut current_width = 0usize;
         let mut last_space: Option<usize> = None;
@@ -34,6 +51,11 @@ pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
                     current = rest.trim_start().to_string();
                 } else {
                     out.push(std::mem::take(&mut current));
+                }
+                // Stop mid-line too, so one enormous wrapped line cannot cost
+                // more than the lines the caller will keep.
+                if max_lines.is_some_and(|max| out.len() >= max) {
+                    return out;
                 }
                 current_width = UnicodeWidthStr::width(current.as_str());
                 last_space = None;

@@ -87,17 +87,17 @@ pub fn tool_schemas() -> Vec<Value> {
     vec![
         tool(
             "list_files",
-            "List files in the workspace, optionally under a subdirectory.",
+            "List files, optionally under a subdirectory.",
             json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string", "description": "Workspace-relative directory. Defaults to the root." }
+                    "path": { "type": "string", "description": "Workspace-relative directory, default the root." }
                 }
             }),
         ),
         tool(
             "read_file",
-            "Read a text file. The result may be truncated for very large files.",
+            "Read a text file (may be truncated).",
             json!({
                 "type": "object",
                 "properties": { "path": { "type": "string", "description": "Workspace-relative file path." } },
@@ -106,32 +106,45 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             "write_file",
-            "Create or fully replace a file with the given content.",
+            "Create or replace a file.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "content": { "type": "string", "description": "The complete new file content." }
+                    "content": { "type": "string", "description": "The complete new content." }
                 },
                 "required": ["path", "content"]
             }),
         ),
         tool(
             "edit_file",
-            "Replace one exact occurrence of old_string with new_string in a file.",
+            "Replace text: one old_string/new_string, or `edits` for several replacements at once. A batch lands all-or-nothing in one call, so prefer it for multi-part changes. Ambiguous matches are refused unless replace_all is set.",
             json!({
                 "type": "object",
                 "properties": {
                     "path": { "type": "string" },
-                    "old_string": { "type": "string", "description": "Exact text to find. Must occur exactly once." },
-                    "new_string": { "type": "string", "description": "Replacement text." }
+                    "old_string": { "type": "string", "description": "Exact text, must occur exactly once. Omit when using `edits`." },
+                    "new_string": { "type": "string", "description": "Replacement. Omit when using `edits`." },
+                    "edits": {
+                        "type": "array",
+                        "description": "Replacements, applied in order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "old_string": { "type": "string", "description": "Exact text." },
+                                "new_string": { "type": "string", "description": "Replacement." },
+                                "replace_all": { "type": "boolean", "description": "Change every occurrence (a rename). Default false refuses an ambiguous match." }
+                            },
+                            "required": ["old_string", "new_string"]
+                        }
+                    }
                 },
-                "required": ["path", "old_string", "new_string"]
+                "required": ["path"]
             }),
         ),
         tool(
             "run_command",
-            "Run a shell command in the workspace root and return its output.",
+            "Run a shell command in the workspace root.",
             json!({
                 "type": "object",
                 "properties": {
@@ -142,41 +155,41 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             "spawn_agent",
-            "Delegate a self-contained task to a subagent. It has no memory of this conversation, so the brief must carry all context, the exact deliverable, and the expected output. Only one non-isolated subagent may run at a time. Returns its id.",
+            "Delegate a self-contained task to a subagent with no memory here: the brief must carry all context, the deliverable, and the expected output. Only one non-isolated subagent runs at a time. Returns its id.",
             json!({
                 "type": "object",
                 "properties": {
                     "brief": { "type": "string", "description": "Self-contained task for the subagent." },
-                    "isolated": { "type": "boolean", "description": "Run in its own git worktree (.mush/wt/<id>, branch mush/<id>). Required to run siblings in parallel: a non-isolated subagent shares this workspace and only one may run at a time. Default false." }
+                    "isolated": { "type": "boolean", "description": "Own git worktree. Required to run siblings in parallel: only one non-isolated subagent runs at a time. Default false." }
                 },
                 "required": ["brief"]
             }),
         ),
         tool(
             "wait_agents",
-            "Block until any of your child agents finishes (or the timeout expires) and return its id and final summary.",
+            "Block until a child finishes, or the timeout expires; returns its id and summary.",
             json!({
                 "type": "object",
                 "properties": {
-                    "ids": { "type": "array", "items": { "type": "integer" }, "description": "Child agent ids to wait for; empty means all children." },
+                    "ids": { "type": "array", "items": { "type": "integer" }, "description": "Child ids to wait for; empty means all." },
                     "timeout": { "type": "integer", "description": "Seconds to wait; 0 waits forever. Default 600." }
                 }
             }),
         ),
         tool(
             "agent_status",
-            "Describe your children: running, finished with a summary, failed, or stopped (no result; idle until you message it again).",
+            "Describe your children: running, finished, failed, or stopped (idle until messaged).",
             json!({ "type": "object", "properties": {} }),
         ),
         tool(
             "agent_control",
-            "Stop a child, or message it (a nudge appears in its conversation as a user message). Stopping is not finishing: the child keeps its context and its work in progress, and a later message resumes it.",
+            "Stop a child or message it. Stopping is not finishing: it keeps its context and work, and a later message resumes it.",
             json!({
                 "type": "object",
                 "properties": {
                     "id": { "type": "integer" },
                     "action": { "type": "string", "enum": ["stop", "message"] },
-                    "text": { "type": "string", "description": "Message content when action is message." }
+                    "text": { "type": "string", "description": "Text, when action is message." }
                 },
                 "required": ["id", "action"]
             }),

@@ -9,7 +9,7 @@ use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
 use mush_core::message::Message;
-use mush_core::text::{fit_row, truncate, wrap_text};
+use mush_core::text::{fit_row, truncate, wrap_text, wrap_text_capped};
 
 use crate::app::{
     short_age, AgentNode, App, Focus, Landed, NoticeKind, Phase, PickerKind, StatusKind,
@@ -320,11 +320,22 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         let width = (inner.width as usize).min(MAX_TRANSCRIPT as usize);
         let height = inner.height as usize;
         let messages = focused_messages(app);
-        let mut lines = transcript_lines(app, messages, width);
+        // Render only the lines the window can show, counting from the bottom —
+        // which is where the transcript is anchored. Building the whole
+        // scrollback to display forty lines cost 55 ms a frame on a long
+        // session, and `tick` repaints every frame while an agent works.
+        let want = height + app.chat_scroll;
+        let mut lines = transcript_tail(app, messages, width, want);
         trim_trailing_blanks(&mut lines);
-        let max_scroll = lines.len().saturating_sub(height);
-        let scroll = max_scroll.saturating_sub(app.chat_scroll.min(max_scroll));
-        let visible: Vec<Line> = lines.into_iter().skip(scroll).take(height).collect();
+        let start = if lines.len() >= want {
+            // There is more above, so what we rendered already *is* the window.
+            0
+        } else {
+            // The whole transcript fits: the original top-index arithmetic.
+            let max_scroll = lines.len().saturating_sub(height);
+            max_scroll.saturating_sub(app.chat_scroll.min(max_scroll))
+        };
+        let visible: Vec<Line> = lines.into_iter().skip(start).take(height).collect();
         frame.render_widget(Paragraph::new(Text::from(visible)), inner);
     }
 
@@ -553,8 +564,18 @@ fn facts_line(app: &App, width: usize) -> String {
     cells.join(" │ ")
 }
 
-fn transcript_lines(app: &App, messages: &[Message], width: usize) -> Vec<Line<'static>> {
-    let mut out: Vec<Line<'static>> = Vec::new();
+/// The last `want` transcript lines, rendered from the bottom up.
+///
+/// The window is anchored at the bottom, so rendering forwards from the first
+/// message meant building the entire scrollback — every tool result re-wrapped —
+/// to paint about forty lines. This walks backwards and stops once it has
+/// enough, which is O(visible) for a normal session.
+fn transcript_tail(
+    app: &App,
+    messages: &[Message],
+    width: usize,
+    want: usize,
+) -> Vec<Line<'static>> {
     // Notices are tagged with the agent they concern, so a root-level failure
     // is not painted into a focused child's transcript (finding B19).
     let notices: Vec<&crate::app::Notice> = app
@@ -564,43 +585,35 @@ fn transcript_lines(app: &App, messages: &[Message], width: usize) -> Vec<Line<'
         .collect();
     if app.focused == 0 {
         if messages.is_empty() && notices.is_empty() {
-            out.push(Line::from(Span::styled(
-                "Ask for a change — the agent reads and edits this workspace directly.",
-                dim(),
-            )));
-            out.push(Line::from(""));
-            out.push(Line::from(Span::styled(app.cfg.label(), dim())));
-            out.push(Line::from(Span::styled(
-                "Tab cycles panes · Enter sends · /help lists commands",
-                dim(),
-            )));
-            return out;
+            return vec![
+                Line::from(Span::styled(
+                    "Ask for a change — the agent reads and edits this workspace directly.",
+                    dim(),
+                )),
+                Line::from(""),
+                Line::from(Span::styled(app.cfg.label(), dim())),
+                Line::from(Span::styled(
+                    "Tab cycles panes · Enter sends · /help lists commands",
+                    dim(),
+                )),
+            ];
         }
     } else if messages.is_empty() {
-        out.push(Line::from(Span::styled(
+        return vec![Line::from(Span::styled(
             format!(
                 "Agent #{} has no messages yet — typing here sends it a nudge.",
                 app.focused
             ),
             dim(),
-        )));
-        return out;
+        ))];
     }
 
-    for message in messages {
-        render_message(&mut out, message, width);
-    }
-    for notice in notices {
-        let (prefix, style) = match notice.kind {
-            NoticeKind::Info => ("·", dim()),
-            NoticeKind::Error => ("!", Style::default().fg(Color::Red)),
-        };
-        for line in wrap_text(&notice.text, width.saturating_sub(2)) {
-            out.push(Line::from(Span::styled(format!("{prefix} {line}"), style)));
-        }
-    }
-    // The spinner belongs to the transcript on screen: another agent working
-    // elsewhere is not this conversation's business.
+    // Collected back to front, then reversed: each chunk is one message's or
+    // one notice's lines in their own order.
+    let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
+    let mut count = 0usize;
+
+    // What is painted last is collected first.
     let focused_busy = app
         .agents
         .iter()
@@ -608,11 +621,45 @@ fn transcript_lines(app: &App, messages: &[Message], width: usize) -> Vec<Line<'
         .map(|node| node.phase.is_busy())
         .unwrap_or(false);
     if focused_busy {
-        out.push(Line::from(""));
-        out.push(Line::from(Span::styled(
-            format!("{} working…", SPINNER[(app.spin as usize) % SPINNER.len()]),
-            Style::default().fg(Color::Cyan),
-        )));
+        chunks.push(vec![
+            Line::from(""),
+            Line::from(Span::styled(
+                format!("{} working…", SPINNER[(app.spin as usize) % SPINNER.len()]),
+                Style::default().fg(Color::Cyan),
+            )),
+        ]);
+        count += 2;
+    }
+
+    for notice in notices.iter().rev() {
+        if count >= want {
+            break;
+        }
+        let (prefix, style) = match notice.kind {
+            NoticeKind::Info => ("·", dim()),
+            NoticeKind::Error => ("!", Style::default().fg(Color::Red)),
+        };
+        let mut chunk = Vec::new();
+        for line in wrap_text(&notice.text, width.saturating_sub(2)) {
+            chunk.push(Line::from(Span::styled(format!("{prefix} {line}"), style)));
+        }
+        count += chunk.len();
+        chunks.push(chunk);
+    }
+
+    for message in messages.iter().rev() {
+        if count >= want {
+            break;
+        }
+        let mut chunk = Vec::new();
+        render_message(&mut chunk, message, width);
+        count += chunk.len();
+        chunks.push(chunk);
+    }
+
+    let mut out = Vec::with_capacity(count);
+    for chunk in chunks.into_iter().rev() {
+        out.extend(chunk);
     }
     out
 }
@@ -662,9 +709,13 @@ fn render_message(out: &mut Vec<Line<'static>>, message: &Message, width: usize)
             out.push(Line::from(""));
         }
         "tool" => {
-            let wrapped = wrap_text(message.text(), width.saturating_sub(2));
-            let clipped = wrapped.len() > 8;
-            for line in wrapped.iter().take(8) {
+            // Only the first eight lines are ever shown, so only those are
+            // wrapped; the ninth is what tells us to print the `…`. Wrapping
+            // the whole result was most of a frame's cost on a long session.
+            const SHOWN: usize = 8;
+            let wrapped = wrap_text_capped(message.text(), width.saturating_sub(2), SHOWN + 1);
+            let clipped = wrapped.len() > SHOWN;
+            for line in wrapped.iter().take(SHOWN) {
                 out.push(Line::from(Span::styled(format!("  {line}"), dim())));
             }
             if clipped {

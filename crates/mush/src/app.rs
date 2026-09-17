@@ -12,9 +12,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
-use ratatui::crossterm::event::{
-    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEvent, MouseEventKind,
-};
+use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use mush_core::message::Message;
 use mush_core::{
@@ -31,8 +29,11 @@ pub enum Msg {
     /// Pasted text, delivered whole by the terminal's bracketed paste. Inserted
     /// in one update: a paste must not cost one message per character.
     Paste(String),
-    /// A mouse event: today only the wheel, which scrolls the transcript.
-    Mouse(MouseEvent),
+    /// A repository read that finished on its own thread.
+    Git {
+        stats: HashMap<u64, git::Stat>,
+        status: Option<git::RepoStatus>,
+    },
     /// An event from an agent actor. `conversation` identifies the tree that
     /// sent it, so an actor left over from `/new` cannot write into the new
     /// chat: events are tagged and the UI drops the stale ones.
@@ -250,6 +251,9 @@ pub struct App {
     conversation: u64,
     /// When the git snapshot was last taken, so a long run refreshes it.
     git_at: Option<Instant>,
+    /// A `git` read is already running on its own thread; asking again would
+    /// only queue another one behind it.
+    git_in_flight: bool,
     /// A transient line for the bar: what just happened, or what went wrong.
     /// Work in progress does not live here — it is derived from the phases.
     pub status: Option<Status>,
@@ -310,6 +314,7 @@ impl App {
             ui_tx,
             conversation: root.conversation,
             git_at: None,
+            git_in_flight: false,
             status: None,
             busy: false,
             should_quit: false,
@@ -392,27 +397,53 @@ impl App {
     /// dirty count and uncommitted delta, plus each isolated branch's own work.
     /// Called on events, never from `draw` — a `git` process per frame would be
     /// absurd (docs/mush.md §8).
+    /// Ask for a fresh read of the repository. The work happens on its own
+    /// thread and comes back as `Msg::Git`: `git` is subprocesses, and
+    /// subprocesses on the UI thread are dropped frames. This used to fork up to
+    /// three per isolated agent, synchronously, every two seconds of a run —
+    /// which is felt while an agent works, exactly when the screen is busiest.
     pub fn refresh_git(&mut self) {
-        let root = self.ws.root();
-        let mut stats = HashMap::new();
-        for node in &self.agents {
-            let Some(branch) = node.branch.clone() else {
-                continue;
-            };
-            // A nested agent forked from its parent's branch, so that is what
-            // its work is measured against; a top-level one forked from HEAD.
-            let base = node
-                .parent
-                .and_then(|parent| self.agents.iter().find(|n| n.id == parent))
-                .and_then(|parent| parent.branch.clone())
-                .unwrap_or_else(|| "HEAD".to_string());
-            if let Some(stat) = git::branch_stat(root, &base, &branch) {
-                stats.insert(node.id, stat);
-            }
+        if self.git_in_flight {
+            return;
         }
+        self.git_in_flight = true;
+        let root = self.ws.root().to_path_buf();
+        // Resolved here: the tree is UI state, and the worker must not touch it.
+        // A nested agent forked from its parent's branch, so that is what its
+        // work is measured against; a top-level one forked from HEAD.
+        let branches: Vec<(u64, String, String)> = self
+            .agents
+            .iter()
+            .filter_map(|node| {
+                let branch = node.branch.clone()?;
+                let base = node
+                    .parent
+                    .and_then(|parent| self.agents.iter().find(|n| n.id == parent))
+                    .and_then(|parent| parent.branch.clone())
+                    .unwrap_or_else(|| "HEAD".to_string());
+                Some((node.id, base, branch))
+            })
+            .collect();
+        let tx = self.ui_tx.clone();
+        std::thread::spawn(move || {
+            let mut stats = HashMap::new();
+            for (id, base, branch) in branches {
+                if let Some(stat) = git::branch_stat(&root, &base, &branch) {
+                    stats.insert(id, stat);
+                }
+            }
+            let status = git::status(&root);
+            let _ = tx.send(Msg::Git { stats, status });
+        });
+    }
+
+    /// Adopt a repository read that finished on its own thread.
+    fn adopt_git(&mut self, stats: HashMap<u64, git::Stat>, status: Option<git::RepoStatus>) {
         self.agent_stats = stats;
-        self.git = git::status(root);
+        self.git = status;
         self.git_at = Some(Instant::now());
+        self.git_in_flight = false;
+        self.dirty_screen = true;
     }
 
     /// How many tokens the root conversation is holding, roughly (the same
@@ -527,16 +558,7 @@ impl App {
 
     pub fn update(&mut self, msg: Msg) {
         match msg {
-            Msg::Mouse(mouse) => {
-                // One notch is several lines: a wheel event carries no repeat, unlike a
-                // held arrow key, so the amount has to come from mush.
-                const NOTCH: i64 = 3;
-                match mouse.kind {
-                    MouseEventKind::ScrollUp => self.scroll_chat(NOTCH),
-                    MouseEventKind::ScrollDown => self.scroll_chat(-NOTCH),
-                    _ => {}
-                }
-            }
+            Msg::Git { stats, status } => self.adopt_git(stats, status),
             Msg::Paste(text) => {
                 // A paste is something the human wants to say, so it lands in
                 // the message box whichever pane has focus. An open picker is
@@ -2095,6 +2117,38 @@ mod tests {
         }
         assert_eq!(app.input.text(), "\n\n");
         assert!(app.chat.is_empty(), "a modified Enter must not send");
+    }
+
+    /// How long one frame costs on a session the size of a real one. A frame
+    /// that does not fit in a 60 fps budget is felt as lag, so this is a
+    /// regression guard as much as a measurement.
+    #[test]
+    fn a_frame_fits_in_a_60fps_budget_on_a_long_transcript() {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        let (mut app, _rx) = test_app("perf");
+        // Roughly what a long session looks like: hundreds of messages, with
+        // multi-kilobyte tool results in among them.
+        for i in 0..300 {
+            app.chat.push(Message::user(format!("message {i}")));
+            app.chat
+                .push(Message::assistant("a reply a few words long"));
+            app.chat
+                .push(Message::tool(format!("c{i}"), "x".repeat(2000)));
+        }
+        let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        const FRAMES: u32 = 30;
+        let start = Instant::now();
+        for _ in 0..FRAMES {
+            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        }
+        let per_frame = start.elapsed() / FRAMES;
+        eprintln!("measured: {per_frame:?} per frame");
+        assert!(
+            per_frame < Duration::from_millis(16),
+            "a frame must fit a 60 fps budget, took {per_frame:?}"
+        );
     }
 
     fn test_app(label: &str) -> (App, Receiver<Msg>) {
