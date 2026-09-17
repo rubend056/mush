@@ -42,6 +42,14 @@ pub enum Msg {
     /// Pasted text, delivered whole by the terminal's bracketed paste. Inserted
     /// in one update: a paste must not cost one message per character.
     Paste(String),
+    /// A model list that finished fetching on its own thread. `endpoint` is the
+    /// endpoint it was fetched from: a fetch outlives the human who typed
+    /// `/url`, and a list from the endpoint they left must not land
+    /// (finding A9).
+    Models {
+        endpoint: String,
+        models: Vec<http::Model>,
+    },
     /// A repository read that finished on its own thread.
     Git {
         stats: HashMap<AgentId, git::Stat>,
@@ -214,7 +222,6 @@ impl App {
         stored: Option<Session>,
         root: RootHandle,
         ui_tx: Sender<Msg>,
-        models: Vec<http::Model>,
         session_save: Arc<dyn SessionSave>,
     ) -> Self {
         let system = Message::system(prompt::system_prompt(&ws.root_str()));
@@ -227,7 +234,11 @@ impl App {
             cell,
             focus: Focus::Chat,
             chat: Chat::new(system, messages),
-            models,
+            // Empty until a fetch says otherwise: the model list is discovered
+            // on its own thread so nothing about an endpoint delays the first
+            // frame (finding A9), and `/model` refetches if this is still
+            // empty when the human asks.
+            models: Vec::new(),
             picker: None,
             git: None,
             tree: AgentTree::rooted(root),
@@ -474,6 +485,7 @@ impl App {
 
     pub fn update(&mut self, msg: Msg) {
         match msg {
+            Msg::Models { endpoint, models } => self.adopt_models(endpoint, models),
             Msg::Git { stats, status } => self.adopt_git(stats, status),
             Msg::Paste(text) => {
                 // A paste is something the human wants to say, so it lands in
@@ -786,6 +798,17 @@ impl App {
             self.run_command(&text);
             return;
         }
+        // A request without a model is a guaranteed refusal from the endpoint,
+        // and since discovery runs after the first frame this state is
+        // reachable for as long as one fetch takes (finding A9). Saying so is
+        // better than the endpoint's own complaint about an empty model id —
+        // and the words go back in the box, because a message that cannot be
+        // sent is not something the human should have to retype.
+        if self.cfg().model.is_empty() {
+            self.chat.insert(&text);
+            self.fail("no model yet — /model picks one, /url points mush at an endpoint");
+            return;
+        }
         let target = self.tree.focused;
         if target == AgentId::ROOT {
             // The human's words belong in the transcript they can see, whether
@@ -998,6 +1021,40 @@ impl App {
     /// context window is adopted here, so it lands before the next request.
     pub fn refresh_models(&mut self) {
         self.models = http::list_models(self.cfg());
+        self.adopt_advertised_context();
+    }
+
+    /// Adopt a model list that finished fetching on its own thread.
+    ///
+    /// The first entry is only a guess, and only when nothing has named a
+    /// model: that is the one case that sent the fetch in the first place
+    /// (finding A9). A model the human picked, or one the startup precedence
+    /// stated, is not overwritten by whatever the endpoint lists first — and a
+    /// list from an endpoint the human has since left is dropped, because the
+    /// picker is about the endpoint in use.
+    fn adopt_models(&mut self, endpoint: String, models: Vec<http::Model>) {
+        if endpoint != self.cfg().base_url {
+            return;
+        }
+        self.models = models;
+        if self.cfg().model.is_empty() {
+            match self.models.first().map(|model| model.id.clone()) {
+                Some(id) => {
+                    self.cell.edit(|cfg| cfg.set_model(&id));
+                    self.say(format!(
+                        "model: {} · {}",
+                        self.cfg().label(),
+                        self.context_label()
+                    ));
+                }
+                None => self.fail(format!(
+                    "no model given and none discovered at {} — pick one with /model",
+                    self.cfg().models_url()
+                )),
+            }
+        }
+        // The endpoint's advertised window can only be adopted from a fetch
+        // that happened, and this one just did.
         self.adopt_advertised_context();
     }
 
@@ -1718,7 +1775,6 @@ mod tests {
             None,
             handle,
             tx,
-            Vec::new(),
             session_save::fake::Recorder::new(),
         )
     }
@@ -1733,7 +1789,7 @@ mod tests {
         let cell = ConfigCell::own(cfg);
         let handle = spawn(cell.handle(), tx.clone(), root.to_path_buf());
         let writer = Arc::new(session_save::Writer::new(root.to_path_buf()));
-        let app = App::new(ws, cell, None, handle, tx, Vec::new(), writer.clone());
+        let app = App::new(ws, cell, None, handle, tx, writer.clone());
         (app, writer)
     }
 
@@ -1747,7 +1803,7 @@ mod tests {
         let cell = ConfigCell::own(cfg);
         let handle = spawn(cell.handle(), tx.clone(), root.clone());
         let recorder = session_save::fake::Recorder::new();
-        let app = App::new(ws, cell, None, handle, tx, Vec::new(), recorder.clone());
+        let app = App::new(ws, cell, None, handle, tx, recorder.clone());
         (app, recorder)
     }
 
@@ -2020,7 +2076,6 @@ mod tests {
             Some(stored),
             handle,
             tx,
-            Vec::new(),
             session_save::fake::Recorder::new(),
         );
 
@@ -2130,7 +2185,6 @@ mod tests {
             Some(stored),
             handle,
             tx,
-            Vec::new(),
             session_save::fake::Recorder::new(),
         );
 
@@ -2186,7 +2240,6 @@ mod tests {
             Some(stored),
             handle,
             tx,
-            Vec::new(),
             session_save::fake::Recorder::new(),
         );
 
@@ -2230,7 +2283,6 @@ mod tests {
             Some(stored),
             handle,
             tx,
-            Vec::new(),
             session_save::fake::Recorder::new(),
         );
 
@@ -2503,7 +2555,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
         let cell = ConfigCell::own(cfg);
         let handle = spawn(cell.handle(), tx.clone(), root.clone());
-        let mut app = App::new(ws, cell, None, handle, tx, Vec::new(), recorder);
+        let mut app = App::new(ws, cell, None, handle, tx, recorder);
         streamed(&mut app, "lost");
 
         // The debounce hands it over; the scripted write fails; the next tick is
@@ -2576,10 +2628,6 @@ mod tests {
             None,
             handle,
             tx,
-            vec![http::Model {
-                id: "test-model".to_string(),
-                context: None,
-            }],
             session_save::fake::Recorder::new(),
         );
         (app, rx)
@@ -2878,6 +2926,102 @@ mod tests {
             app.cfg().context_tokens,
             32_768,
             "what the human said stays"
+        );
+    }
+
+    /// The model list is discovered on its own thread, so it arrives after the
+    /// first frame (finding A9). Its first entry is the guess only when nothing
+    /// else named a model, its advertised window comes with it, and a model the
+    /// human picked is never overwritten by whatever the endpoint lists first.
+    #[test]
+    fn a_late_model_list_names_a_model_only_when_nothing_did() {
+        let (mut app, _rx) = test_app("late-models");
+        let endpoint = app.cfg().base_url.clone();
+        // What "no model given and none known yet" looks like after the
+        // precedence chain: mush started without one.
+        app.cell.edit(|cfg| cfg.model.clear());
+
+        app.update(Msg::Models {
+            endpoint: endpoint.clone(),
+            models: vec![http::Model {
+                id: "found".to_string(),
+                context: Some(4_096),
+            }],
+        });
+
+        assert_eq!(app.cfg().model, "found", "the endpoint's first model");
+        assert_eq!(
+            app.cfg().context_tokens,
+            4_096,
+            "and the window it advertised for it"
+        );
+        assert_eq!(
+            app.cell.handle().config().unwrap().model,
+            "found",
+            "the actors ask for the model the UI shows"
+        );
+        assert!(
+            text_of(&app).contains("found"),
+            "a model that appeared on its own is said out loud: {}",
+            text_of(&app)
+        );
+
+        app.cell.edit(|cfg| cfg.set_model("mine"));
+        app.update(Msg::Models {
+            endpoint,
+            models: vec![http::Model {
+                id: "other".to_string(),
+                context: None,
+            }],
+        });
+        assert_eq!(app.cfg().model, "mine", "a stated model wins over the list");
+    }
+
+    /// A list fetched from the endpoint the human has since left must not land:
+    /// the picker, and the model it would name, are about the endpoint in use.
+    #[test]
+    fn a_model_list_from_an_endpoint_mush_left_is_dropped() {
+        let (mut app, _rx) = test_app("stale-models");
+        app.cell.edit(|cfg| cfg.model.clear());
+
+        app.update(Msg::Models {
+            endpoint: "http://127.0.0.1:2".to_string(),
+            models: vec![http::Model {
+                id: "from-elsewhere".to_string(),
+                context: None,
+            }],
+        });
+
+        assert!(app.models.is_empty(), "nothing was adopted");
+        assert!(app.cfg().model.is_empty(), "and no model was named");
+    }
+
+    /// A request with no model is a guaranteed refusal, and discovery now runs
+    /// after the first frame, so this state is reachable for as long as a fetch
+    /// takes: the human is told, rather than reading the endpoint's complaint
+    /// about an empty model id (finding A9).
+    #[test]
+    fn a_message_with_no_model_says_so_instead_of_asking() {
+        let (mut app, _rx) = test_app("no-model");
+        app.cell.edit(|cfg| cfg.model.clear());
+
+        app.chat.insert("hello");
+        app.send_message();
+
+        assert!(!app.busy(), "no run was started");
+        assert!(
+            app.chat.transcript(AgentId::ROOT).is_empty(),
+            "and nothing was put in the transcript an endpoint would be sent"
+        );
+        assert!(
+            text_of(&app).contains("no model"),
+            "the bar says why: {}",
+            text_of(&app)
+        );
+        assert_eq!(
+            app.chat.input().text(),
+            "hello",
+            "and the words are still in the box to retry"
         );
     }
 
@@ -3390,7 +3534,6 @@ mod tests {
             None,
             handle,
             tx,
-            Vec::new(),
             session_save::fake::Recorder::new(),
         );
 
