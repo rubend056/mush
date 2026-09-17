@@ -12,6 +12,9 @@ serde_json.workspace = true
 tempfile.workspace = true
 walkdir.workspace = true
 dirs.workspace = true
+# Display-column arithmetic (`text.rs`): the same width the renderer paints.
+unicode-width = "0.2"
+unicode-truncate = "1.1"
 
 [lints]
 workspace = true

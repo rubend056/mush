@@ -6,10 +6,10 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
-use unicode_truncate::UnicodeTruncateStr;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use mush_core::message::Message;
+use mush_core::text::{fit_row, truncate, wrap_text};
 
 use crate::app::{short_age, AgentNode, App, Focus, NoticeKind, Phase, PickerKind, StatusKind};
 
@@ -196,49 +196,6 @@ fn agent_line(app: &App, node: &AgentNode, width: usize) -> String {
         }
     }
     fit_row(&head, &node.brief, &where_and_how, &tail, width)
-}
-
-/// Lay out one row in the width it has.
-///
-/// The row answers "what is happening": the state (glyph, id) is never
-/// sacrificed, then the branch and line delta — facts that exist nowhere else on
-/// the screen — then the brief, then the activity, which the bar already repeats
-/// for the focused agent. Fields are dropped from the right when the pane is
-/// narrow, and the cursor row's full facts are one row below in the footer.
-fn fit_row(head: &str, brief: &str, branch_stat: &str, tail: &[String], width: usize) -> String {
-    let head_width = UnicodeWidthStr::width(head);
-    if width <= head_width + 2 {
-        return head.to_string();
-    }
-    let budget = width - head_width - 1;
-    let branch_width = UnicodeWidthStr::width(branch_stat);
-    let show_branch = branch_width > 0 && branch_width + 2 <= budget.saturating_sub(4);
-    let after_branch = budget.saturating_sub(if show_branch { branch_width + 2 } else { 0 });
-
-    let mut line = head.to_string();
-    let mut remaining = budget;
-    if after_branch >= 7 && !brief.is_empty() {
-        let text = truncate(brief, after_branch - 1);
-        // `truncate` budgets display columns now, so this width is the truth.
-        remaining = remaining.saturating_sub(UnicodeWidthStr::width(text.as_str()) + 1);
-        line.push(' ');
-        line.push_str(&text);
-    }
-    if show_branch {
-        line.push_str("  ");
-        line.push_str(branch_stat);
-        remaining = remaining.saturating_sub(branch_width + 2);
-    }
-    for cell in tail {
-        let cell_width = UnicodeWidthStr::width(cell.as_str());
-        if remaining < cell_width + 2 {
-            break;
-        }
-        line.push_str("  ");
-        line.push_str(cell);
-        remaining -= cell_width + 2;
-    }
-    line.trim_end().to_string()
 }
 
 /// The footer under the tree: the cursor row's full facts, so a narrow pane
@@ -675,64 +632,6 @@ fn render_message(out: &mut Vec<Line<'static>>, message: &Message, width: usize)
         }
         _ => {}
     }
-}
-
-/// Word-aware wrapping that preserves explicit newlines and never splits a
-/// grapheme's display width arithmetic.
-pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut out = Vec::new();
-    for raw in text.split('\n') {
-        let mut current = String::new();
-        let mut current_width = 0usize;
-        let mut last_space: Option<usize> = None;
-
-        for ch in raw.chars() {
-            let (rendered, char_width) = if ch == '\t' {
-                ("    ".to_string(), 4)
-            } else {
-                (
-                    ch.to_string(),
-                    UnicodeWidthChar::width(ch).unwrap_or(1).max(1),
-                )
-            };
-
-            if current_width + char_width > width && !current.is_empty() {
-                if let Some(space) = last_space {
-                    let rest = current.split_off(space);
-                    out.push(std::mem::take(&mut current));
-                    current = rest.trim_start().to_string();
-                } else {
-                    out.push(std::mem::take(&mut current));
-                }
-                current_width = UnicodeWidthStr::width(current.as_str());
-                last_space = None;
-            }
-
-            current.push_str(&rendered);
-            current_width += char_width;
-            if ch == ' ' {
-                last_space = Some(current.len() - 1);
-            }
-        }
-        out.push(current);
-    }
-    out
-}
-
-/// Shorten to at most `max` display columns *including* the ellipsis, so a
-/// caller budgeting columns gets text that really fits (finding B9: counting
-/// characters made a CJK row twice as wide as its budget).
-fn truncate(text: &str, max: usize) -> String {
-    if max == 0 {
-        return String::new();
-    }
-    let (out, _) = text.unicode_truncate(max);
-    if out.len() == text.len() {
-        return text.to_string();
-    }
-    let (body, _) = text.unicode_truncate(max - 1);
-    format!("{body}…")
 }
 
 #[cfg(test)]
