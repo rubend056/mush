@@ -8,6 +8,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragra
 use ratatui::Frame;
 use unicode_width::UnicodeWidthStr;
 
+use mush_core::git;
 use mush_core::message::Message;
 use mush_core::text::{fit_row, truncate, wrap_text, wrap_text_capped};
 
@@ -245,7 +246,9 @@ fn agent_detail(node: &AgentNode) -> Vec<String> {
             // This is the one place on screen that says an isolated agent
             // exists at all, and the commands that land it.
             Some(branch) => vec![
-                format!(".mush/wt/{}", node.id),
+                // The worktree path comes from core like every other one: the
+                // row must name the directory `/discard` would remove.
+                format!("{}/{}", git::WORKTREE_DIR, node.id),
                 format!("git diff HEAD...{branch}"),
                 format!("/merge {}", node.id),
             ],

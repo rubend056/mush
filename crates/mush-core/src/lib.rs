@@ -17,7 +17,7 @@ pub mod userconfig;
 pub mod workspace;
 
 pub use config::{Config, Overrides, Provider};
-pub use git::{RepoStatus, Stat};
+pub use git::{RepoStatus, Stat, Worktree};
 pub use message::{FunctionCall, Message, ToolCall};
 pub use session::Session;
 pub use userconfig::UserConfig;

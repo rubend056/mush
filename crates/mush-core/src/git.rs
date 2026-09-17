@@ -5,7 +5,7 @@
 //! Everything here is best-effort: a workspace that is not a repository, or a
 //! `git` binary that is missing, answers `None` rather than failing a caller.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The line delta of some change set. git's counts are 64-bit, so a diff of
@@ -139,6 +139,156 @@ pub fn branch_stat(dir: &Path, base: &str, branch: &str) -> Option<Stat> {
     let base = commit(dir, base)?;
     let branch = commit(dir, branch)?;
     diff_stat(dir, &["diff", "--shortstat", &format!("{base}...{branch}")])
+}
+
+/// Where an isolated agent's worktree lives, under the repository root. This
+/// constant is the *only* spelling of that directory: the path a worktree is
+/// created at, the path a row prints, and the path `/discard` removes used to be
+/// three separate `format!`s, and a divergence between them is a worktree nobody
+/// can reclaim (docs/refactor.md §3.6).
+pub const WORKTREE_DIR: &str = ".mush/wt";
+
+/// The worktree of agent `id`: `<root>/.mush/wt/<id>`.
+pub fn worktree_path(root: &Path, id: u64) -> PathBuf {
+    root.join(format!("{WORKTREE_DIR}/{id}"))
+}
+
+/// The branch an isolated agent's worktree is checked out on: `mush/<id>`.
+/// Mush creates it and mush reclaims it, so its name is not the human's to
+/// choose — [`worktree_id`] reads the id back out of it.
+pub fn branch_name(id: u64) -> String {
+    format!("mush/{id}")
+}
+
+/// The agent id in a `mush/<id>` branch name, `None` for any other name. A
+/// branch the human made by hand must not be adopted as mush's leftover, so
+/// everything that is not exactly this shape stays unnamed.
+pub fn worktree_id(branch: &str) -> Option<u64> {
+    branch.strip_prefix("mush/")?.parse().ok()
+}
+
+/// One entry of `git worktree list --porcelain`: where the checkout is, the
+/// branch that is out (absent when HEAD is detached), and — for mush's own
+/// `mush/<id>` worktrees — the agent id, so a worktree left behind by an
+/// earlier session is registered under the id its branch claims.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Worktree {
+    pub path: PathBuf,
+    pub branch: Option<String>,
+    pub id: Option<u64>,
+}
+
+/// Every worktree of the repository at `dir`, in git's order (the main checkout
+/// first). `None` when git is missing, fails, or `dir` is not a repository: a
+/// caller that cannot ask git has no worktrees to reclaim, and must leave the
+/// ones it already knows about alone rather than drop them.
+pub fn worktrees(dir: &Path) -> Option<Vec<Worktree>> {
+    let text = git(dir, &["worktree", "list", "--porcelain"])?;
+    Some(parse_worktrees(&text))
+}
+
+/// Parse `git worktree list --porcelain`: blank-line-separated blocks, each
+/// starting with `worktree <path>` and carrying `branch refs/heads/<name>` when
+/// a branch is out. A detached or bare worktree simply has no branch line, and
+/// that is not an error — it is a worktree with nothing for mush to name. Pure,
+/// so the shapes git can emit are testable without a repository.
+pub fn parse_worktrees(text: &str) -> Vec<Worktree> {
+    text.split("\n\n")
+        .filter_map(|block| {
+            let mut path = None;
+            let mut branch = None;
+            for line in block.lines() {
+                if let Some(rest) = line.strip_prefix("worktree ") {
+                    path = Some(PathBuf::from(rest));
+                } else if let Some(rest) = line.strip_prefix("branch refs/heads/") {
+                    branch = Some(rest.to_string());
+                }
+            }
+            // A block without a path is not a worktree: a stray blank line at
+            // the end of the listing must not become an entry pointing nowhere.
+            let path = path?;
+            let id = branch.as_deref().and_then(worktree_id);
+            Some(Worktree { path, branch, id })
+        })
+        .collect()
+}
+
+/// Whether the repository at `dir` has a commit at all. A fresh `git init` does
+/// not, and there is nothing to branch an isolated agent from — a caller asks
+/// this *before* trying, so it can report that instead of relaying whatever
+/// `worktree add` says about an unborn HEAD.
+pub fn has_commits(dir: &Path) -> bool {
+    git(dir, &["rev-parse", "--verify", "-q", "HEAD"]).is_some()
+}
+
+/// Create the worktree at [`worktree_path`] on a new [`branch_name`], based on
+/// `base` — the parent agent's branch, or `HEAD` when the caller has none.
+/// Returns the path and the branch, both from the formatters above, so no caller
+/// ever spells `.mush/wt/<id>` or `mush/<id>` itself.
+///
+/// The three ways this can refuse each carry a reason a human has to read: no
+/// repository, no commit to start from, and git's own message when the add
+/// itself fails (an id whose branch or directory is still taken). Callers treat
+/// every one of them as "isolate in place" rather than as a failed delegation.
+pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf, String), String> {
+    if !dir.join(".git").exists() {
+        return Err("not a git repository".to_string());
+    }
+    if base.is_none() && !has_commits(dir) {
+        return Err("the repo has no commits yet — commit first or drop isolated".to_string());
+    }
+    let path = worktree_path(dir, id);
+    let branch = branch_name(id);
+    run(
+        dir,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            path.to_str().unwrap_or(""),
+            base.unwrap_or("HEAD"),
+        ],
+    )
+    .map(|_| (path, branch))
+    .map_err(|error| {
+        // `run` names the verb it failed at, and a silent failure reads
+        // "git worktree failed"; the human needs the subcommand that failed.
+        if error == "git worktree failed" {
+            "git worktree add failed".to_string()
+        } else {
+            error
+        }
+    })
+}
+
+/// Commit everything in the worktree `dir` under `subject`, and answer the short
+/// revision — or `None` when the run changed nothing, so a clean worktree costs
+/// no empty commit.
+///
+/// The identity and the message are supplied here (`-c user.name=…`,
+/// `--no-verify`) so a commit never depends on the human's git configuration and
+/// never runs their hooks. The index belongs to this worktree, so committing
+/// here cannot contend with the human's own git commands in the main checkout.
+pub fn commit_all(dir: &Path, subject: &str) -> Result<Option<String>, String> {
+    if run(dir, &["status", "--porcelain"])?.is_empty() {
+        return Ok(None);
+    }
+    run(dir, &["add", "-A"])?;
+    run(
+        dir,
+        &[
+            "-c",
+            "user.name=mush",
+            "-c",
+            "user.email=mush@local",
+            "commit",
+            "--no-verify",
+            "-qm",
+            subject,
+        ],
+    )?;
+    Ok(Some(run(dir, &["rev-parse", "--short", "HEAD"])?))
 }
 
 /// A revision resolved to its commit id, or `None` when it does not exist.
@@ -315,6 +465,83 @@ mod tests {
             error.contains("no-such-branch") || error.contains("not something we can merge"),
             "{error}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The porcelain listing has shapes a repository can really be in, and the
+    /// parser has to survive all of them: a detached checkout (no branch line),
+    /// a block split by blank lines, and a branch that is not mush's.
+    #[test]
+    fn porcelain_worktrees_parse_in_every_shape() {
+        let text = "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\n\
+                    worktree /repo/.mush/wt/3\nHEAD def\nbranch refs/heads/mush/3\n\n\
+                    worktree /repo/detached\nHEAD 0123\ndetached\n\n\
+                    worktree /repo/mine\nHEAD 4567\nbranch refs/heads/feature/x\n\n";
+        let list = parse_worktrees(text);
+        assert_eq!(list.len(), 4, "{list:?}");
+        assert_eq!(list[0].path, PathBuf::from("/repo"));
+        assert_eq!(list[0].branch.as_deref(), Some("main"));
+        assert_eq!(list[0].id, None, "main is not an agent's branch");
+        assert_eq!(list[1].path, PathBuf::from("/repo/.mush/wt/3"));
+        assert_eq!(list[1].branch.as_deref(), Some("mush/3"));
+        assert_eq!(list[1].id, Some(3));
+        assert_eq!(list[2].branch, None, "a detached worktree has no branch");
+        assert_eq!(list[2].id, None);
+        assert_eq!(list[3].id, None, "someone else's branch stays unnamed");
+        // A trailing blank line, and a listing that is only whitespace.
+        assert_eq!(parse_worktrees("\n\n").len(), 0);
+        assert_eq!(parse_worktrees("").len(), 0);
+    }
+
+    /// The path and the branch are one formatting rule, and the id round-trips
+    /// through the branch name: that is what lets a leftover be registered.
+    #[test]
+    fn the_path_and_branch_are_one_rule() {
+        let root = Path::new("/repo");
+        assert_eq!(worktree_path(root, 12), PathBuf::from("/repo/.mush/wt/12"));
+        assert_eq!(branch_name(12), "mush/12");
+        assert_eq!(worktree_id(&branch_name(12)), Some(12));
+        assert_eq!(worktree_id("mush/"), None);
+        assert_eq!(worktree_id("mush/x"), None);
+        assert_eq!(worktree_id("main"), None);
+        assert_eq!(worktree_id("refs/heads/mush/1"), None);
+    }
+
+    /// The two mutating worktree verbs against a real repository: a worktree is
+    /// created where the formatter says, and its work commits once — the second
+    /// call finds nothing and must not make an empty commit.
+    #[test]
+    fn a_worktree_is_added_and_committed_once() {
+        let dir = init_repo("worktree-verbs");
+        assert!(has_commits(&dir));
+        let (path, branch) = worktree_add(&dir, 5, None).unwrap();
+        assert_eq!(path, worktree_path(&dir, 5));
+        assert_eq!(branch, branch_name(5));
+        assert!(path.join(".git").exists(), "the worktree is a checkout");
+
+        fs::write(path.join("work.txt"), "the work\n").unwrap();
+        let revision = commit_all(&path, "mush #5: do the thing").unwrap();
+        assert!(revision.is_some(), "the worktree had work to commit");
+        assert_eq!(
+            subject_of(&path, "HEAD").as_deref(),
+            Some("mush #5: do the thing")
+        );
+        assert_eq!(
+            commit_all(&path, "mush #5: do the thing").unwrap(),
+            None,
+            "a clean worktree must not be committed again"
+        );
+
+        // A directory that is not a repository refuses before touching git's
+        // worktree state, and says so.
+        let plain = std::env::temp_dir().join(format!("mush-git-plain-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&plain);
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(
+            worktree_add(&plain, 6, None).unwrap_err(),
+            "not a git repository"
+        );
+        let _ = fs::remove_dir_all(&plain);
         let _ = fs::remove_dir_all(&dir);
     }
 

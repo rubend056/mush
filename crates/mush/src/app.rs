@@ -6,7 +6,6 @@
 //! keystroke, an agent event — becomes a `Msg` and flows through `App::update`.
 
 use std::collections::HashMap;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -462,47 +461,31 @@ impl App {
     /// branches) as finished tree nodes, so `/diff`, `/merge`, `/discard` keep
     /// working after a restart.
     pub fn discover_worktrees(&mut self) {
-        let output = Command::new("git")
-            .arg("-C")
-            .arg(self.ws.root())
-            .args(["worktree", "list", "--porcelain"])
-            .output();
-        let Ok(output) = output else { return };
-        if !output.status.success() {
-            return;
-        }
-        let text = String::from_utf8_lossy(&output.stdout);
         let root = self.ws.root().to_path_buf();
+        // `None` means git could not answer (no binary, not a repository). The
+        // tree then keeps the leftovers it already knows about: dropping them
+        // on a failed read would look like the work had been reclaimed.
+        let Some(worktrees) = git::worktrees(&root) else {
+            return;
+        };
         // Drop stale leftovers whose worktree no longer exists.
         self.agents.retain(|node| {
             if !node.leftover {
                 return true;
             }
-            let Some(branch) = node.branch.as_deref() else {
+            let Some(id) = node.branch.as_deref().and_then(git::worktree_id) else {
                 return false;
             };
-            let Some(id) = branch
-                .strip_prefix("mush/")
-                .and_then(|s| s.parse::<u64>().ok())
-            else {
-                return false;
-            };
-            root.join(format!(".mush/wt/{id}")).exists()
+            git::worktree_path(&root, id).exists()
         });
-        for block in text.split("\n\n") {
-            let Some(branch) = block
-                .lines()
-                .find_map(|line| line.strip_prefix("branch refs/heads/mush/"))
-            else {
-                continue;
-            };
-            let Some(id) = branch.parse::<u64>().ok() else {
+        for worktree in worktrees {
+            let Some(id) = worktree.id else {
                 continue;
             };
             if self.agents.iter().any(|node| node.id == id) {
                 continue;
             }
-            let full = format!("mush/{id}");
+            let full = git::branch_name(id);
             // Keep the tree's counter above every registered id, or the next
             // `spawn_agent` hands a live child an id a leftover already holds
             // (finding B1).
@@ -1365,7 +1348,15 @@ impl App {
             return;
         }
         let root = self.ws.root().to_path_buf();
-        let worktree = format!(".mush/wt/{id}");
+        // The path git removes and the path the note names are one string: the
+        // core formatter, made relative to the root `-C` already resolves it
+        // against, so a discard cannot remove one worktree and report another.
+        let worktree = git::worktree_path(&root, id);
+        let worktree = worktree
+            .strip_prefix(&root)
+            .unwrap_or(&worktree)
+            .to_string_lossy()
+            .to_string();
         match command {
             "/merge" => match git::run(&root, &["merge", branch.as_str()]) {
                 Err(error) => self.fail(format!("merge {branch} failed: {error}")),
@@ -1857,7 +1848,7 @@ mod tests {
     /// An isolated agent's worktree with one commit on it, committed exactly the
     /// way the actor commits (so the subject is real, not test-shaped).
     fn isolated_work(root: &std::path::Path, id: u64, brief: &str) {
-        let worktree = root.join(format!(".mush/wt/{id}"));
+        let worktree = git::worktree_path(root, id);
         std::fs::create_dir_all(root.join(".mush")).unwrap();
         git(
             root,
@@ -1867,7 +1858,7 @@ mod tests {
                 "-q",
                 worktree.to_str().unwrap(),
                 "-b",
-                &format!("mush/{id}"),
+                &git::branch_name(id),
             ],
         );
         std::fs::write(worktree.join("work.txt"), "the work\n").unwrap();

@@ -24,6 +24,7 @@ use serde_json::{json, Value};
 use tempfile::NamedTempFile;
 
 use mush_core::config::parse_context_hint;
+use mush_core::git;
 use mush_core::message::{ChatRequest, ChatResponse};
 use mush_core::tools::ToolName;
 use mush_core::transcript::{
@@ -407,7 +408,7 @@ pub fn revive(
     // now is.
     let isolated = branch
         .as_deref()
-        .map(|_| root.join(format!(".mush/wt/{id}")))
+        .map(|_| git::worktree_path(&root, id))
         .filter(|path| path.exists());
     let ws_root = isolated.clone().unwrap_or_else(|| root.clone());
     let ws = Workspace::new(&ws_root).expect("workspace root must exist");
@@ -1253,7 +1254,11 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
 
     let id = ctx.ids.fetch_add(1, Ordering::SeqCst);
     let (child_ws, branch, note) = if isolated {
-        match create_worktree(&ctx.root, id, actor.branch.as_deref()) {
+        // A private worktree on `mush/<id>`, based on the parent's branch (or
+        // HEAD). The reason it cannot be made is reported either way, so
+        // isolation degrades to the shared workspace instead of failing the
+        // delegation.
+        match git::worktree_add(&ctx.root, id, actor.branch.as_deref()) {
             Ok((path, branch)) => match Workspace::new(&path) {
                 Ok(child_ws) => (child_ws, Some(branch), String::new()),
                 // Isolation is best-effort: degrade to the shared workspace
@@ -1452,108 +1457,16 @@ fn control_tool(state: &mut ActorState, args: &Value) -> Result<String, String> 
 /// short revision when something was committed, `None` when the run changed
 /// nothing.
 ///
-/// The identity and the message are supplied here (`-c user.name=…`,
-/// `--no-verify`) so a commit never depends on the human's git configuration and
-/// never runs their hooks. The index belongs to this worktree, so committing
-/// here cannot contend with the human's own git commands in the main checkout.
+/// The subject is built here, next to the id, brief and outcome it is made of;
+/// the commit itself is one of the core git verbs, so an isolated agent commits
+/// by the same rules as everything else that touches a repository.
 fn commit_worktree(
     root: &Path,
     id: u64,
     brief: &str,
     outcome: &Outcome,
 ) -> Result<Option<String>, String> {
-    let status = git_output(root, &["status", "--porcelain"])?;
-    if status.is_empty() {
-        return Ok(None);
-    }
-    git_output(root, &["add", "-A"])?;
-    let subject = commit_subject(id, brief, outcome);
-    git_output(
-        root,
-        &[
-            "-c",
-            "user.name=mush",
-            "-c",
-            "user.email=mush@local",
-            "commit",
-            "--no-verify",
-            "-qm",
-            &subject,
-        ],
-    )?;
-    Ok(Some(git_output(root, &["rev-parse", "--short", "HEAD"])?))
-}
-
-/// Run a git command in `dir` and return its trimmed stdout. Git never inherits
-/// our stdout — the TUI owns the terminal.
-fn git_output(dir: &Path, args: &[&str]) -> Result<String, String> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .map_err(|_| "git binary unavailable".to_string())?;
-    if !output.status.success() {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(if detail.is_empty() {
-            format!("git {} failed", args.first().unwrap_or(&""))
-        } else {
-            detail
-        });
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-}
-
-/// A private git worktree for an isolated child: `.mush/wt/<id>` on branch
-/// `mush/<id>`, based on the parent's branch (or HEAD). Returns the reason
-/// when isolation is impossible so callers can degrade transparently.
-fn create_worktree(
-    main_root: &Path,
-    id: u64,
-    base_branch: Option<&str>,
-) -> Result<(PathBuf, String), String> {
-    if !main_root.join(".git").exists() {
-        return Err("not a git repository".to_string());
-    }
-    if base_branch.is_none() {
-        // `output()`, not `status()`: the TUI owns the terminal, so git must
-        // never inherit our stdout.
-        let head = Command::new("git")
-            .arg("-C")
-            .arg(main_root)
-            .args(["rev-parse", "--verify", "-q", "HEAD"])
-            .output()
-            .map_err(|_| "git binary unavailable".to_string())?;
-        if !head.status.success() {
-            return Err("the repo has no commits yet — commit first or drop isolated".to_string());
-        }
-    }
-    let worktree = main_root.join(format!(".mush/wt/{id}"));
-    let branch = format!("mush/{id}");
-    let base = base_branch.unwrap_or("HEAD");
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(main_root)
-        .args([
-            "worktree",
-            "add",
-            "-b",
-            &branch,
-            worktree.to_str().unwrap_or(""),
-            base,
-        ])
-        .output()
-        .map_err(|_| "git binary unavailable".to_string())?;
-    if output.status.success() {
-        Ok((worktree, branch))
-    } else {
-        let detail = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        Err(if detail.is_empty() {
-            "git worktree add failed".to_string()
-        } else {
-            detail
-        })
-    }
+    git::commit_all(root, &commit_subject(id, brief, outcome))
 }
 
 /// The five file tools, executed against a workspace on disk. Only the agent's
@@ -2498,13 +2411,13 @@ mod tests {
         // The run's end commits the worktree, so the branch mush advertises for
         // the child (and tells the human to diff and merge) carries the file.
         let branch_files =
-            git_output(&root, &["diff", "--name-only", "HEAD...mush/1"]).unwrap_or_default();
+            git::run(&root, &["diff", "--name-only", "HEAD...mush/1"]).unwrap_or_default();
         // …and nothing is left behind as an uncommitted change.
-        let worktree_status = git_output(&root.join(".mush/wt/1"), &["status", "--porcelain"])
+        let worktree_status = git::run(&root.join(".mush/wt/1"), &["status", "--porcelain"])
             .unwrap_or_else(|error| error);
         // The three commands mush prints must now do what they say: merge the
         // work back, then let go of the worktree and the branch.
-        let merged = git_output(
+        let merged = git::run(
             &root,
             &[
                 "-c",
@@ -2517,8 +2430,8 @@ mod tests {
             ],
         );
         let merged_into_workspace = root.join("iso.txt").exists();
-        let removed = git_output(&root, &["worktree", "remove", ".mush/wt/1"]);
-        let deleted = git_output(&root, &["branch", "-D", "mush/1"]);
+        let removed = git::run(&root, &["worktree", "remove", ".mush/wt/1"]);
+        let deleted = git::run(&root, &["branch", "-D", "mush/1"]);
         stop_mock(mock);
         let _ = fs::remove_dir_all(&root);
         assert_eq!(found.as_deref(), Some("isolated work"));
@@ -2590,11 +2503,11 @@ mod tests {
         // the child only delegated — still sits at the branch point. And the
         // child's worktree must NOT contain the grandchild's file.
         let grandchild_files =
-            git_output(&root, &["diff", "--name-only", "HEAD...mush/2"]).unwrap_or_default();
+            git::run(&root, &["diff", "--name-only", "HEAD...mush/2"]).unwrap_or_default();
         let child_head = git_rev_parse(&root, "mush/1");
         let base_head = git_rev_parse(&root, "HEAD");
         let branched_from_child =
-            git_output(&root, &["merge-base", "--is-ancestor", "mush/1", "mush/2"]).is_ok();
+            git::run(&root, &["merge-base", "--is-ancestor", "mush/1", "mush/2"]).is_ok();
         let child_has_file = root.join(".mush/wt/1/deep.txt").exists();
 
         stop_mock(mock);
