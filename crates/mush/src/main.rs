@@ -17,6 +17,7 @@ mod ui;
 use std::error::Error;
 use std::io::{self, Stdout};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Receiver};
@@ -30,9 +31,23 @@ use ratatui::crossterm::terminal::{
 };
 use ratatui::Terminal;
 
-use mush_core::{config, session, Overrides, Session, UserConfig, Workspace};
+use mush_core::text::mask_key;
+use mush_core::{config, session, Config, Overrides, Session, UserConfig, Workspace};
 
 use app::{App, Msg};
+
+/// `-y` / `--yes`: this session's human pre-approved work that a feature would
+/// otherwise stop and ask about. Nothing asks yet — the design doc's
+/// single-owner rule keeps a human on the other end of every write — so the
+/// flag is only *recorded*: it prints nothing, sets no config, and changes no
+/// behaviour. The approval prompts that will ask read it from here.
+static AUTO_APPROVE: AtomicBool = AtomicBool::new(false);
+
+/// Whether `-y` / `--yes` was given. [`print_config`] reports it, and so will
+/// the features that ask.
+pub(crate) fn auto_approve() -> bool {
+    AUTO_APPROVE.load(Ordering::Relaxed)
+}
 
 fn main() {
     if let Err(error) = run() {
@@ -47,6 +62,13 @@ struct Args {
     model: Option<String>,
     provider: Option<String>,
     context: Option<usize>,
+    temperature: Option<f32>,
+    max_completion_tokens: Option<bool>,
+    /// `-y` / `--yes`: recorded in [`AUTO_APPROVE`] and nowhere else.
+    yes: bool,
+    /// `--print-config`: print the resolved config and exit, instead of opening
+    /// the terminal.
+    print_config: bool,
 }
 
 impl Args {
@@ -59,17 +81,28 @@ impl Args {
             provider: self.provider.clone(),
             api_key: None,
             context: self.context,
+            temperature: self.temperature,
+            max_completion_tokens: self.max_completion_tokens,
         }
     }
 }
 
 fn parse_args() -> Result<Args, String> {
+    parse_from(std::env::args().skip(1))
+}
+
+/// [`parse_args`] over an explicit argument list, so the flags are testable
+/// without a process environment.
+fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
     let mut dir: Option<PathBuf> = None;
     let mut url = None;
     let mut model = None;
     let mut provider = None;
     let mut context = None;
-    let mut args = std::env::args().skip(1);
+    let mut temperature = None;
+    let mut max_completion_tokens = None;
+    let mut yes = false;
+    let mut print_config = false;
     let mut only_flags = false;
 
     while let Some(arg) = args.next() {
@@ -89,6 +122,9 @@ fn parse_args() -> Result<Args, String> {
                 std::process::exit(0);
             }
             "--" => only_flags = true,
+            "-y" | "--yes" => yes = true,
+            "--print-config" => print_config = true,
+            "--max-completion-tokens" => max_completion_tokens = Some(true),
             "--url" => url = Some(args.next().ok_or("--url needs a value")?),
             "--model" => model = Some(args.next().ok_or("--model needs a value")?),
             "--provider" => provider = Some(args.next().ok_or("--provider needs a value")?),
@@ -100,6 +136,18 @@ fn parse_args() -> Result<Args, String> {
                     .filter(|n| *n > 0)
                     .ok_or_else(|| format!("--context needs a token count, got `{value}`"))?;
                 context = Some(tokens);
+            }
+            "--temperature" => {
+                let value = args.next().ok_or("--temperature needs a value")?;
+                // A value mush cannot use is reported by name rather than
+                // dropped on the floor (finding A16's class). `NaN` and the
+                // infinities parse as floats but are not temperatures.
+                let stated = value
+                    .parse::<f32>()
+                    .ok()
+                    .filter(|f| f.is_finite())
+                    .ok_or_else(|| format!("--temperature needs a number, got `{value}`"))?;
+                temperature = Some(stated);
             }
             other if other.starts_with("--") => {
                 return Err(format!("unknown option `{other}` (try --help)"));
@@ -114,6 +162,10 @@ fn parse_args() -> Result<Args, String> {
         model,
         provider,
         context,
+        temperature,
+        max_completion_tokens,
+        yes,
+        print_config,
     })
 }
 
@@ -134,13 +186,23 @@ fn print_help() {
     println!(
         "mush {}\n\
          A small, fast terminal surface for coding agents.\n\n\
-         USAGE:\n    mush [DIRECTORY] [--url URL] [--model NAME] [--provider NAME] [--context TOKENS]\n\n\
+         USAGE:\n    mush [DIRECTORY] [--url URL] [--model NAME] [--provider NAME] [--context TOKENS]\n\
+         \x20        [--temperature F] [--max-completion-tokens] [-y] [--print-config]\n\n\
          OPTIONS:\n\
          \x20   --url URL          OpenAI-compatible endpoint (default: $MUSH_URL or the provider default)\n\
          \x20   --model NAME       Model id (default: $MUSH_MODEL, else auto-detected)\n\
          \x20   --provider NAME    deepseek or custom (default: $MUSH_PROVIDER or custom)\n\
          \x20   --context TOKENS   Context window when nothing else knows it (default: $MUSH_CONTEXT,\n\
-         \x20                      else what the endpoint advertises, else the model's known window)\n\n\
+         \x20                      else what the endpoint advertises, else the model's known window)\n\
+         \x20   --temperature F    Sampling temperature, 0.0-2.0 (default: 1.0, the model's own choice)\n\
+         \x20   --max-completion-tokens\n\
+         \x20                      Send the reply cap as `max_completion_tokens` instead of\n\
+         \x20                      `max_tokens`, as OpenAI's reasoning models require\n\
+         \x20   -y, --yes          Pre-approve this session's work. Recorded only: mush asks\n\
+         \x20                      nothing yet, so this changes no behaviour today\n\
+         \x20   --print-config     Print the resolved config (endpoint, provider, model, window\n\
+         \x20                      and whether it was stated, temperature, reply-cap name,\n\
+         \x20                      key masked) and exit 0\n\n\
          KEYS:\n\
          \x20   Tab / Shift-Tab   cycle panes (agents, chat)\n\
          \x20   Enter             send message (chat) · focus agent (agents)\n\
@@ -164,15 +226,77 @@ fn print_help() {
          \x20   /merge|/discard <id>         merge or throw away its work, and reclaim it\n\
          \x20   /forget <id>                 drop the agent from this session (its branch stays)\n\
          \x20   /new  /help  /quit\n\
-         Endpoint, API key, and model defaults live in\n\
-         $MUSH_CONFIG or the platform config directory. The conversation is stored\n\
-         in <DIRECTORY>/.mush/session.json.",
+         Endpoint, API key, model, and the request knobs live in\n\
+         $MUSH_CONFIG or the platform config directory. That file is hand-editable,\n\
+         every field is optional, and the one mush writes documents itself.\n\
+         --print-config shows what those layers resolved to. The conversation is\n\
+         stored in <DIRECTORY>/.mush/session.json.",
         env!("CARGO_PKG_VERSION")
     );
 }
 
+/// `--print-config`: the resolved config and nothing else — no workspace, no
+/// `.mush/`, no request to an endpoint. This is what makes a hand-edited home
+/// file debuggable, and the only way to see the precedence chain rather than
+/// guess at it.
+fn print_config(config: &Config) {
+    for (field, value) in describe(config, auto_approve()) {
+        println!("{field:<13}{value}");
+    }
+}
+
+/// One `field  value` line per fact, in the order a human reads them. The
+/// values are what a request will carry, not what some file wished for; the
+/// window is the one fact whose *source* matters, so it is named.
+fn describe(config: &Config, approved: bool) -> Vec<(String, String)> {
+    let key = match config.api_key.as_deref().filter(|key| !key.is_empty()) {
+        Some(key) => format!("{} (masked)", mask_key(key)),
+        None => "(none)".to_string(),
+    };
+    let model = if config.model.is_empty() {
+        "(none yet)".to_string()
+    } else {
+        config.model.clone()
+    };
+    let window = if config.context_explicit {
+        "stated"
+    } else {
+        "assumed from the model or the provider"
+    };
+    let cap = if config.uses_max_completion_tokens() {
+        "max_completion_tokens"
+    } else {
+        "max_tokens"
+    };
+    let approve = if approved {
+        "yes (-y recorded; nothing asks yet)"
+    } else {
+        "no"
+    };
+    vec![
+        ("endpoint".to_string(), config.base_url.clone()),
+        ("provider".to_string(), config.provider.name().to_string()),
+        ("model".to_string(), model),
+        (
+            "window".to_string(),
+            format!("{} tokens ({window})", config.context_tokens),
+        ),
+        (
+            "temperature".to_string(),
+            format!("{:?}", config.temperature()),
+        ),
+        ("reply cap".to_string(), cap.to_string()),
+        ("api key".to_string(), key),
+        ("auto-approve".to_string(), approve.to_string()),
+    ]
+}
+
 fn run() -> Result<(), Box<dyn Error>> {
     let args = parse_args()?;
+    // `-y` is a fact about this session, not a config value: it is recorded here
+    // and read by the features that will ask (and by `--print-config`). Nothing
+    // else changes because of it.
+    AUTO_APPROVE.store(args.yes, Ordering::Relaxed);
     let overrides = args.overrides();
 
     let dir = args.dir;
@@ -188,6 +312,16 @@ fn run() -> Result<(), Box<dyn Error>> {
                 .unwrap_or_else(|| ".".to_string())
         )
         .into());
+    }
+
+    if args.print_config {
+        // The resolved config, then out: no terminal is entered, no `.mush/` is
+        // created, and no request is made. The workspace's stored session is
+        // still read, because it is a layer of the precedence being shown.
+        let stored = Session::load(&dir);
+        let config = config::resolve(&overrides, &UserConfig::load(), stored.as_ref())?;
+        print_config(&config);
+        return Ok(());
     }
 
     let workspace = Workspace::new(&dir)?;
@@ -371,14 +505,142 @@ mod tests {
             model: None,
             provider: Some("deepseek".into()),
             context: Some(64_000),
+            temperature: Some(0.2),
+            max_completion_tokens: Some(true),
+            yes: true,
+            print_config: false,
         };
         let overrides = args.overrides();
         assert_eq!(overrides.url.as_deref(), Some("http://host:1"));
         assert_eq!(overrides.provider.as_deref(), Some("deepseek"));
         assert_eq!(overrides.model, None);
         assert_eq!(overrides.context, Some(64_000));
-        // The key never comes from argv.
+        assert_eq!(overrides.temperature, Some(0.2));
+        assert_eq!(overrides.max_completion_tokens, Some(true));
+        // The key never comes from argv, and `-y` is not a config value: it is
+        // recorded for the features that will ask, and nothing else.
         assert_eq!(overrides.api_key, None);
+    }
+
+    /// The flags a human types reach the config layer, the session flag is
+    /// recorded, and a directory still arrives as the positional argument.
+    #[test]
+    fn the_flags_a_human_types_are_parsed() {
+        let argv = [
+            "-y",
+            "--temperature",
+            "0.25",
+            "--max-completion-tokens",
+            "--print-config",
+            "work",
+        ];
+        let args = parse_from(argv.into_iter().map(str::to_string)).unwrap();
+        assert_eq!(args.dir, PathBuf::from("work"));
+        assert_eq!(args.temperature, Some(0.25));
+        assert_eq!(args.max_completion_tokens, Some(true));
+        assert!(args.yes, "`-y` is remembered, not acted on");
+        assert!(args.print_config);
+
+        // Long form, and nothing else stated: every flag stays unset.
+        let args = parse_from(["--yes".to_string()].into_iter()).unwrap();
+        assert!(args.yes);
+        assert_eq!(args.temperature, None);
+        assert_eq!(args.max_completion_tokens, None);
+        assert!(!args.print_config);
+        assert_eq!(args.dir, PathBuf::from("."));
+    }
+
+    /// A value mush cannot use is reported by name, never ignored (the A13/A16
+    /// class): every flag that takes one says which flag was wrong.
+    #[test]
+    fn a_bad_flag_value_names_its_flag() {
+        fn error_of(argv: &[&str]) -> String {
+            match parse_from(argv.iter().map(|arg| arg.to_string())) {
+                Err(error) => error,
+                Ok(_) => panic!("{argv:?} was accepted"),
+            }
+        }
+        for (argv, flag) in [
+            (["--temperature", "warm"], "--temperature"),
+            (["--context", "8k"], "--context"),
+        ] {
+            let error = error_of(&argv);
+            assert!(error.contains(flag), "{error}");
+        }
+        // A float that is not a number is not a temperature either: `NaN`
+        // compares false against every bound, so it must not reach a request.
+        for value in ["nan", "inf", "-inf"] {
+            let error = error_of(&["--temperature", value]);
+            assert!(error.contains(value), "{error}");
+        }
+    }
+
+    /// A second positional is an error rather than a silent replacement
+    /// (finding A14), and `--` still ends the flags (finding A13).
+    #[test]
+    fn a_second_directory_is_an_error() {
+        let error = match parse_from(["one", "two"].iter().map(|arg| arg.to_string())) {
+            Err(error) => error,
+            Ok(_) => panic!("two directories were accepted"),
+        };
+        assert!(error.contains("two"), "{error}");
+
+        let args = parse_from(["--", "--yes"].iter().map(|arg| arg.to_string())).unwrap();
+        assert_eq!(args.dir, PathBuf::from("--yes"));
+        assert!(!args.yes, "after `--` even `--yes` is a path");
+    }
+
+    /// `--print-config` reports what a request will carry — the endpoint, the
+    /// window and *where it came from*, the reply cap's name, and a masked key
+    /// — rather than what any one file wished for.
+    #[test]
+    fn describe_reports_the_request_not_the_wishes() {
+        let mut cfg = Config::new(
+            "http://host:1",
+            "deepseek-v4-pro",
+            Some("sk-1234567890".into()),
+        );
+        cfg.set_context(64_000);
+        cfg.temperature = 0.0;
+        cfg.max_completion_tokens = true;
+
+        let lines = describe(&cfg, true);
+        let field = |name: &str| {
+            lines
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| panic!("no `{name}` line in {lines:?}"))
+        };
+        assert_eq!(field("endpoint"), "http://host:1");
+        assert_eq!(field("provider"), "custom");
+        assert_eq!(field("model"), "deepseek-v4-pro");
+        assert_eq!(field("window"), "64000 tokens (stated)");
+        assert_eq!(field("temperature"), "0.0", "0 is a value, not an absence");
+        assert_eq!(field("reply cap"), "max_completion_tokens");
+        assert_eq!(field("api key"), "sk-1…7890 (masked)");
+        assert_eq!(field("auto-approve"), "yes (-y recorded; nothing asks yet)");
+
+        // An unresolved window says so, and a default request samples at 1.0
+        // under the name every endpoint documents.
+        let plain = Config::new("http://host:1", "", None);
+        let plain = describe(&plain, false);
+        let field = |name: &str| {
+            plain
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, value)| value.clone())
+                .unwrap()
+        };
+        assert_eq!(field("model"), "(none yet)");
+        assert_eq!(
+            field("window"),
+            "8192 tokens (assumed from the model or the provider)"
+        );
+        assert_eq!(field("temperature"), "1.0");
+        assert_eq!(field("reply cap"), "max_tokens");
+        assert_eq!(field("api key"), "(none)");
+        assert_eq!(field("auto-approve"), "no");
     }
 
     /// The full startup path with an unreachable endpoint must still produce a

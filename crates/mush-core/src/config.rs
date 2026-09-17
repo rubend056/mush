@@ -122,20 +122,33 @@ pub const DEFAULT_TEMPERATURE: f32 = 1.0;
 /// A set of user-supplied values: the command line, or the `MUSH_*`
 /// environment. `None` means "not given", which is what lets a lower-priority
 /// layer win.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// No `Eq`: a temperature is a float, and `1.0 == 1.0` is not the question any
+/// caller asks.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Overrides {
     pub url: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
     pub api_key: Option<String>,
     pub context: Option<usize>,
+    /// Sampling temperature (`--temperature`). A float stated by a human, so it
+    /// is stored as one rather than as the text they typed; no endpoint ever
+    /// sees it outside the range `Config::temperature` clamps to.
+    pub temperature: Option<f32>,
+    /// Whether the reply cap travels as `max_completion_tokens`
+    /// (`--max-completion-tokens`). `None` is "not stated", which is what keeps
+    /// a deliberate `false` distinguishable from silence.
+    pub max_completion_tokens: Option<bool>,
 }
 
 impl Overrides {
     /// The environment layer: `MUSH_URL`, `MUSH_MODEL`, `MUSH_PROVIDER`,
-    /// `MUSH_API_KEY`, `MUSH_CONTEXT`. Empty variables count as unset. A
-    /// malformed `MUSH_CONTEXT` is ignored here; [`Self::from_env_checked`] is
-    /// the form startup uses, so it is reported instead.
+    /// `MUSH_API_KEY`, `MUSH_CONTEXT`. Empty variables count as unset. The
+    /// temperature and the reply cap's name have no environment spelling: they
+    /// are stated on a command line or in the home config. A malformed
+    /// `MUSH_CONTEXT` is ignored here; [`Self::from_env_checked`] is the form
+    /// startup uses, so it is reported instead.
     pub fn from_env() -> Self {
         Self {
             url: env_nonempty("MUSH_URL"),
@@ -143,6 +156,9 @@ impl Overrides {
             provider: env_nonempty("MUSH_PROVIDER"),
             api_key: env_nonempty("MUSH_API_KEY"),
             context: env_nonempty("MUSH_CONTEXT").and_then(|value| parse_context_env(&value).ok()),
+            // No environment spelling for these two: see the doc comment.
+            temperature: None,
+            max_completion_tokens: None,
         }
     }
 
@@ -451,12 +467,20 @@ pub fn resolve_with(
     if let Some(context) = cli.context.filter(|n| *n > 0) {
         config.set_context(context);
     }
+    if let Some(temperature) = cli.temperature.or(env.temperature) {
+        config.temperature = temperature;
+    }
+    if let Some(max_completion_tokens) = cli.max_completion_tokens.or(env.max_completion_tokens) {
+        config.max_completion_tokens = max_completion_tokens;
+    }
 
     // A URL, provider, or model the user stated explicitly, here or in the
     // environment, is never overridden by a stored one.
     let url_given = cli.url.is_some() || env.url.is_some();
     let provider_given = cli.provider.is_some() || env.provider.is_some();
     let model_given = cli.model.is_some() || env.model.is_some();
+    let temperature_given = cli.temperature.is_some() || env.temperature.is_some();
+    let cap_given = cli.max_completion_tokens.is_some() || env.max_completion_tokens.is_some();
 
     // 2. Home config: machine-global defaults, and where the API key lives.
     if config.api_key.is_none() {
@@ -477,6 +501,16 @@ pub fn resolve_with(
     }
     if !model_given && config.model.is_empty() && !home.model.is_empty() {
         config.model = home.model.clone();
+    }
+    if !temperature_given {
+        if let Some(temperature) = home.temperature {
+            config.temperature = temperature;
+        }
+    }
+    if !cap_given {
+        if let Some(max_completion_tokens) = home.max_completion_tokens {
+            config.max_completion_tokens = max_completion_tokens;
+        }
     }
 
     // 3. The workspace's saved session: the last runtime choice beats the
@@ -499,6 +533,16 @@ pub fn resolve_with(
             if let Some(tokens) = session.context.filter(|n| *n > 0) {
                 config.set_context(tokens);
             }
+        }
+    }
+
+    // The home config's window. A window there is a statement too, so it beats
+    // what an endpoint advertises; but a window this workspace remembers is the
+    // more specific statement, which is why this waits for the session above.
+    // The layers still read CLI > env > session > home.
+    if !config.context_explicit {
+        if let Some(tokens) = home.context.filter(|n| *n > 0) {
+            config.set_context(tokens);
         }
     }
 
@@ -565,6 +609,7 @@ mod tests {
             provider: provider.into(),
             base_url: base_url.into(),
             model: model.into(),
+            ..UserConfig::default()
         }
     }
 
@@ -589,6 +634,7 @@ mod tests {
             provider: Some("deepseek".into()),
             api_key: None,
             context: None,
+            ..Overrides::default()
         };
         let env = Overrides {
             url: Some("http://env:2".into()),
@@ -596,6 +642,7 @@ mod tests {
             provider: Some("custom".into()),
             api_key: Some("sk-env".into()),
             context: None,
+            ..Overrides::default()
         };
         let session = stored("custom", "http://session:3", "session-model");
         let config = resolve_with(
@@ -686,6 +733,80 @@ mod tests {
         assert_eq!(config.base_url, "http://base:0");
     }
 
+    /// The home config fills what every layer above it leaves unstated: the
+    /// request knobs nothing else can state, and a window that a human means
+    /// (so it beats discovery — but not a window this workspace remembers).
+    #[test]
+    fn the_home_config_fills_what_the_layers_above_leave_unstated() {
+        let home = UserConfig {
+            context: Some(32_000),
+            temperature: Some(0.2),
+            max_completion_tokens: Some(true),
+            ..UserConfig::default()
+        };
+        let mut config = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.temperature(), 0.2);
+        assert!(config.uses_max_completion_tokens());
+        assert_eq!(config.context_tokens, 32_000);
+        assert!(config.context_explicit, "a stated window is not a guess");
+        assert!(
+            !config.adopt_context(4_096),
+            "so an endpoint cannot overrule it"
+        );
+
+        // A flag above the file wins, and an unstated field is the built-in
+        // default rather than an empty file's.
+        let config = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides {
+                context: Some(8_000),
+                temperature: Some(0.9),
+                max_completion_tokens: Some(false),
+                ..Overrides::default()
+            },
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.temperature(), 0.9);
+        assert!(!config.uses_max_completion_tokens());
+        assert_eq!(config.context_tokens, 8_000);
+
+        let empty = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &UserConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(empty.temperature(), DEFAULT_TEMPERATURE);
+        assert!(!empty.uses_max_completion_tokens());
+
+        // A window this workspace remembers is more specific than the
+        // machine-global one, so the session still wins.
+        let mut session = stored("custom", "http://session:3", "session-model");
+        session.context = Some(16_000);
+        let config = resolve_with(
+            Config::new("http://base:0", "", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            Some(&session),
+        )
+        .unwrap();
+        assert_eq!(config.context_tokens, 16_000);
+        assert_eq!(config.temperature(), 0.2, "the other knobs still come home");
+    }
+
     #[test]
     fn urls_are_normalized() {
         let config = Config::new("http://host:1///", "m", None);
@@ -697,6 +818,55 @@ mod tests {
             config.chat_url(),
             "https://api.deepseek.com/v1/chat/completions"
         );
+    }
+
+    /// The temperature and the reply cap's name are stated, not guessed: the
+    /// command line is the top layer, the environment the next one down, and a
+    /// statement below them is filled in only when nothing above said anything.
+    #[test]
+    fn the_command_line_states_the_temperature_and_the_cap_name() {
+        let config = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides {
+                temperature: Some(0.2),
+                max_completion_tokens: Some(true),
+                ..Overrides::default()
+            },
+            &Overrides::default(),
+            &UserConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.temperature(), 0.2);
+        assert!(config.uses_max_completion_tokens());
+
+        // The environment is below the flag: it fills what the flag left alone.
+        let from_env = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides {
+                temperature: Some(0.5),
+                max_completion_tokens: Some(true),
+                ..Overrides::default()
+            },
+            &UserConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(from_env.temperature(), 0.5);
+        assert!(from_env.uses_max_completion_tokens());
+
+        // Nobody stated anything: the documented defaults stay.
+        let untouched = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &UserConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(untouched.temperature(), DEFAULT_TEMPERATURE);
+        assert!(!untouched.uses_max_completion_tokens());
     }
 
     #[test]

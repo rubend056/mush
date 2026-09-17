@@ -307,13 +307,14 @@ while anything is running. A nested agent is measured against its *parent's*
 branch, which is what makes the Σ in the title exact.
 
 The context window is resolved the same way: `MUSH_CONTEXT` / `--context` /
-`/context` (and a stored explicit choice) › what the endpoint advertises
-(`meta.n_ctx`, `max_model_len`, `context_length`) › the model's documented window
-(`deepseek-flash` and `deepseek-v4-pro`: 500k) › the provider default. Derived
-windows are never persisted — they are re-read, so a stale guess cannot outlive
-its cause — and the caps a tool result may use follow the window, so one
-`read_file` can never fill an 8k transcript. A server that complains about the
-context length teaches mush the number it names, and the run retries once.
+the home config's `context` / `/context` (and a stored explicit choice) › what
+the endpoint advertises (`meta.n_ctx`, `max_model_len`, `context_length`) › the
+model's documented window (`deepseek-flash` and `deepseek-v4-pro`: 500k) › the
+provider default. Derived windows are never persisted — they are re-read, so a
+stale guess cannot outlive its cause — and the caps a tool result may use follow
+the window, so one `read_file` can never fill an 8k transcript. A server that
+complains about the context length teaches mush the number it names, and the run
+retries once.
 
 ---
 
@@ -330,6 +331,27 @@ context length teaches mush the number it names, and the run retries once.
 The API key is never stored here — it lives in the machine-global home config
 (`$MUSH_CONFIG`, else `~/.config/mush/config.json`), set with `/key` or
 `MUSH_API_KEY`.
+
+That file is meant to be hand-edited, and it documents itself. Every field is
+optional — `api_key`, `provider`, `base_url`, `model`, `context` (a stated
+window), `temperature`, and `max_completion_tokens` (the reply cap's name) —
+and the file mush writes opens with a `_comment` header naming the precedence
+and each field, as plain JSON rather than a JSONC dialect. Unknown keys are
+ignored *and kept* when mush rewrites the file, and so is any field a particular
+writer leaves unstated: `/key` saves the connection without erasing what a human
+typed by hand. There is no `param_style`, because the only parameter-name switch
+mush has is the reply cap, and no `history_budget_multiplier`, because the
+window is the knob that budget derives from.
+
+`mush --print-config` prints what those layers resolved to — endpoint, provider,
+model, window and whether a human stated it, temperature, the reply cap's name,
+and the key masked — and exits 0 without opening the terminal or creating
+`.mush/`. It is the honest view of the precedence, and what makes a hand-edited
+file debuggable. The other flags a human would type are `--temperature F`,
+`--max-completion-tokens`, and `-y`/`--yes`, which *records* that this session's
+human pre-approved the work: mush has no approval prompt yet (the single-owner
+rule above), so the flag is a record for the features that will ask, and today
+it changes nothing.
 
 Resolution order on startup: CLI flags > env > saved session > home config >
 built-in defaults.
@@ -519,7 +541,7 @@ Not used, on purpose: `tokio`, `reqwest`, `clap`, `ropey`, `notify`, `anyhow`,
 (or a rustls-wrapped socket), and ~400 lines beats a dependency tree. `ureq` is
 the tempting swap, but its receive timeout is a total budget rather than a
 per-read one, and the cancel flag is polled *between* socket reads — that is the
-feature Ctrl-C depends on. CLI parsing is ~40 lines. Each omitted crate is one
+feature Ctrl-C depends on. CLI parsing is ~75 lines. Each omitted crate is one
 less thing to version, audit, and wait for.
 
 ---
