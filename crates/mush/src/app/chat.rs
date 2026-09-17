@@ -896,6 +896,34 @@ impl Chat {
 /// below this the mark goes and the words stay.
 const MIN_BODY: usize = 4;
 
+/// The most of a tool call's arguments a label ever shows. A tool call is a
+/// heading for its result, not a transcript of the call: `edit_file src/lex.rs`,
+/// not forty lines of JSON (`docs/mush.md` §4.5 R4).
+const LABEL_ARGS: usize = 60;
+
+/// One tool call's row: `  ⚙ name summarized-args`, budgeted to the pane.
+///
+/// The arguments are what a path or a command is read from, so the columns they
+/// are given are the pane's less the `  ⚙ name ` head's — the number `truncate`
+/// was handed used to be a flat 60 that ignored the head, so on a narrow pane a
+/// path was cut mid-word with the `…` that says so falling outside the border.
+/// The name is never the part that goes: a row too narrow for both keeps the
+/// name.
+fn tool_label(call: &mush_core::ToolCall, width: usize) -> String {
+    // `agent::summarize_args` is the same reading the tree shows.
+    let head = format!("  ⚙ {} ", call.function.name);
+    let budget = LABEL_ARGS.min(width.saturating_sub(head.width()));
+    if budget < MIN_BODY {
+        return head.trim_end().to_string();
+    }
+    format!(
+        "{head}{}",
+        truncate(&summarize_args(&call.function.arguments), budget)
+    )
+    .trim_end()
+    .to_string()
+}
+
 /// The rows of one marked line: the mark on the first row, its own width of
 /// blank under it, and the words wrapped *inside* the columns the mark leaves.
 ///
@@ -1042,15 +1070,8 @@ fn render_message(
                 );
             }
             for call in message.tool_calls() {
-                // `agent::summarize_args` is the same reading the tree shows:
-                // `edit_file src/lex.rs`, not forty lines of JSON.
-                let label = format!(
-                    "  ⚙ {} {}",
-                    call.function.name,
-                    truncate(&summarize_args(&call.function.arguments), 60)
-                );
                 out.push(Line::from(Span::styled(
-                    label,
+                    tool_label(call, width),
                     Style::default().fg(Color::Yellow),
                 )));
             }
@@ -1332,6 +1353,75 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A truncated label says it was truncated. The arguments are budgeted the
+    /// columns the `  ⚙ name ` head leaves, so the `…` lands *inside* the pane;
+    /// the flat 60 it used to be ignored the head, so on a narrow pane a path
+    /// was cut mid-word and the mark that says something was dropped fell past
+    /// the border.
+    #[test]
+    fn a_tool_call_label_truncates_inside_the_pane() {
+        let path = "crates/mush/src/app/chat.rs/deeply/nested/module/some/more/directories/and/more/file.rs";
+        for width in [24usize, 40, 60, 80, 120] {
+            let mut chat = Chat::bare();
+            let call = mush_core::ToolCall {
+                id: "call_1".into(),
+                kind: "function".into(),
+                function: mush_core::FunctionCall {
+                    name: "read_file".into(),
+                    arguments: format!(r#"{{"path":"{path}"}}"#),
+                },
+            };
+            chat.push_message(
+                AgentId::ROOT,
+                Message {
+                    role: "assistant".into(),
+                    tool_calls: Some(vec![call]),
+                    ..Default::default()
+                },
+            );
+
+            let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), width, 4));
+            let label = rows
+                .iter()
+                .find(|row| row.contains("⚙"))
+                .unwrap_or_else(|| panic!("no label at {width}: {rows:?}"));
+            assert!(
+                UnicodeWidthStr::width(label.as_str()) <= width,
+                "a {width}-column pane painted {}: {label:?}",
+                UnicodeWidthStr::width(label.as_str())
+            );
+            assert!(label.contains("read_file"), "the name stays: {label:?}");
+            assert!(
+                label.ends_with('…'),
+                "a cut path says so: {label:?} at {width}"
+            );
+        }
+
+        // A path that fits is painted whole, with no mark to explain.
+        let mut chat = Chat::bare();
+        let call = mush_core::ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: mush_core::FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"path":"src/a.rs"}"#.into(),
+            },
+        };
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                role: "assistant".into(),
+                tool_calls: Some(vec![call]),
+                ..Default::default()
+            },
+        );
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 40, 4));
+        assert!(
+            rows.iter().any(|row| row == "  ⚙ read_file src/a.rs"),
+            "{rows:?}"
+        );
     }
 
     /// A pane narrower than the voice: the label is what the row cannot afford.
