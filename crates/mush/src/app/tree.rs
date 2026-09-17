@@ -557,6 +557,13 @@ impl AgentTree {
             node.phase = Phase::Thinking;
             node.since = Instant::now();
             node.summary = None;
+            // A landed agent that runs again is not a landed agent: its
+            // worktree is gone (which is why `land` cleared the branch), so the
+            // new run happens in the main checkout, and a footer still saying
+            // `merged into HEAD` would be describing the run before this one
+            // while the row shows work in flight (finding P7). What the merge
+            // did is in the transcript, where history lives.
+            node.landed = None;
         }
     }
 
@@ -617,9 +624,17 @@ impl AgentTree {
     }
 
     /// Record that `/merge` or `/discard` reclaimed this agent's worktree.
+    ///
+    /// The branch goes with it. A landed agent has no worktree, no branch and
+    /// nothing to diff — the row that kept naming `mush/2` after
+    /// `merged mush/2 into HEAD · mush/2 deleted` was pointing at two things
+    /// that no longer existed, and `/diff` would have offered a command that
+    /// cannot run (finding P7). Where the work *went* is what is left, and that
+    /// is what `landed` records.
     pub fn land(&mut self, id: AgentId, landed: Landed) {
         if let Some(node) = self.node_mut(id) {
             node.landed = Some(landed);
+            node.branch = None;
         }
     }
 

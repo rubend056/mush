@@ -1373,19 +1373,12 @@ impl App {
             }
             Some(node) => (node.branch.clone(), node.phase.is_busy(), node.landed),
         };
-        let Some(branch) = branch else {
-            self.fail(format!("agent #{id} has no worktree branch (not isolated)"));
-            return;
-        };
-        // The read is the one verb that changes nothing, so it goes first: it
-        // is the answer to "what would merging this do", and neither of the
-        // refusals below applies to looking.
-        if verb == Verb::Diff {
-            let text = format!("git diff HEAD...{branch}");
-            self.say(text.clone());
-            self.chat.note(text);
-            return;
-        }
+        // A landed agent has nothing left to look at: `land` took its branch
+        // with the worktree, so what happened must be asked *before* the branch
+        // it no longer has is read — a `let Some(branch)` guard first would
+        // answer a landed agent with "has no worktree branch (not isolated)",
+        // which is false. Where the work went is the answer, not a `git diff`
+        // against a branch that is gone.
         if let Some(landed) = landed {
             self.say(format!(
                 "agent #{id} was already {}",
@@ -1394,6 +1387,18 @@ impl App {
                     Landed::Discarded => "discarded",
                 }
             ));
+            return;
+        }
+        let Some(branch) = branch else {
+            self.fail(format!("agent #{id} has no worktree branch (not isolated)"));
+            return;
+        };
+        // The read is the one verb that changes nothing, so it goes first: it
+        // is the answer to "what would merging this do".
+        if verb == Verb::Diff {
+            let text = format!("git diff HEAD...{branch}");
+            self.say(text.clone());
+            self.chat.note(text);
             return;
         }
         if busy {
@@ -2185,8 +2190,26 @@ mod tests {
             .find(|node| node.id == AgentId(1))
             .unwrap();
         assert_eq!(node.landed, Some(Landed::Merged));
-        // A second /merge must not re-run git or claim a second merge.
+        assert!(
+            node.branch.is_none(),
+            "the branch git deleted must leave the row with it"
+        );
+        // A second /merge must not re-run git or claim a second merge. It says
+        // what happened — `land` cleared the branch, so a landed agent must be
+        // asked first, or this reports a missing branch that was never missing.
         run(&mut app, "/merge 1");
+        assert!(
+            text_of(&app).contains("was already merged"),
+            "a second /merge reports the merge, not a branch: {}",
+            text_of(&app)
+        );
+        // `/diff` too: it used to name a branch git had already deleted.
+        run(&mut app, "/diff 1");
+        assert!(
+            text_of(&app).contains("was already merged") && !text_of(&app).contains("git diff"),
+            "/diff must not offer a branch that is gone: {}",
+            text_of(&app)
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
