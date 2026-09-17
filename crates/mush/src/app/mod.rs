@@ -243,6 +243,11 @@ pub struct App {
     pub status: Option<Status>,
     pub should_quit: bool,
     pub dirty_screen: bool,
+    /// The terminal's width, as of the last size `main` reported. `/notes`
+    /// wraps its lines to the popup this size paints them in, so the report has
+    /// to know it — `ui.rs` is not asked to wrap, and the screen keeps one
+    /// owner of the popup's geometry.
+    term_width: u16,
     pub spin: u64,
 }
 
@@ -250,6 +255,13 @@ impl App {
     /// The configuration every screen reads: the UI's copy of the cell.
     pub fn cfg(&self) -> &Config {
         self.cell.ui()
+    }
+
+    /// Record the terminal width `main` read, so a `/notes` report can be
+    /// wrapped to the popup that size paints. One setter, called at startup and
+    /// from the resize event — the only two places the terminal's size changes.
+    pub fn set_term_width(&mut self, width: u16) {
+        self.term_width = width;
     }
 
     pub fn new(
@@ -286,6 +298,7 @@ impl App {
             status: None,
             should_quit: false,
             dirty_screen: true,
+            term_width: 80,
             spin: 0,
         };
         // The failures come back before the agents do, because the agent that
@@ -1205,9 +1218,12 @@ impl App {
     /// came back for.
     fn open_notes_picker(&mut self) {
         let agent = self.tree.focused;
-        let items = self
-            .chat
-            .notes_report(agent, session::now_secs(), chat::NOTES_WIDTH);
+        // Wrapped for the popup this terminal actually paints: the width comes
+        // from the same formula `ui::draw_picker` sizes with, so the lines fit
+        // the list instead of being clipped by it (`picker_text_width` says
+        // what).
+        let width = crate::ui::picker_text_width(self.term_width);
+        let items = self.chat.notes_report(agent, session::now_secs(), width);
         if items.is_empty() {
             self.say(format!("nothing written about #{agent} yet"));
             return;
@@ -1975,6 +1991,9 @@ mod tests {
     /// audit that found these defects read rows instead of reasoning about
     /// them. A pane's border is stripped: what a test reads is the row's text.
     fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        // Exactly what `main` does at startup and on resize: the width the
+        // next frame (and any `/notes` opened between frames) sees.
+        app.set_term_width(width);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer();
@@ -3030,13 +3049,14 @@ mod tests {
             &small[3..6]
         );
         assert!(
-            small[3].contains("+6 more lines"),
-            "six note lines are hidden and the pane says so: {:?}",
+            small[3].contains("+6 more lines") && small[3].contains("/notes"),
+            "six note lines are hidden, the pane says so and names the way to read \
+             them even though it has no count row to spend: {:?}",
             small[3]
         );
         assert!(
-            !small.iter().any(|row| row.contains("/notes")),
-            "a pane with no room for the count line does not pretend otherwise: {small:?}"
+            !small.iter().any(|row| row.contains("  +6 more lines")),
+            "but the count row itself needs a row the pane does not have: {small:?}"
         );
 
         // 60×17: two rows of notes, then one that says four lines are not
@@ -3064,7 +3084,7 @@ mod tests {
         let (mut app, _rx) = test_app("notes-command");
         assert!(
             app.chat
-                .notes_report(AgentId::ROOT, session::now_secs(), chat::NOTES_WIDTH)
+                .notes_report(AgentId::ROOT, session::now_secs(), 74)
                 .is_empty(),
             "nothing has been written about a fresh conversation"
         );
@@ -3094,6 +3114,55 @@ mod tests {
             "oldest first, like the pane"
         );
         assert_eq!(picker.cursor, 4, "the cursor opens on the newest");
+    }
+
+    /// `/notes` is the escape hatch for the lines the foot ceded, so it has to
+    /// be readable at every size the popup is painted at. The report used to be
+    /// wrapped at a fixed 74 — the popup's content width only at the widest size
+    /// — so every row was clipped below 80 columns, and the first row clipped
+    /// even on a 200-column terminal. The width has to come from the popup the
+    /// frame actually paints, which is what `picker_text_width` says.
+    #[test]
+    fn the_notes_popup_wraps_to_the_width_it_is_painted_at() {
+        let (mut app, _rx) = test_app("notes-wrap");
+        app.chat.note(
+            "alpha bravo charlie delta echo foxtrot golf hotel india juliet kilo \
+             lima mike november oscar papa quebec romeo sierra tango",
+        );
+
+        // 60 columns: the popup is 40 wide and its list 34. A paint records the
+        // width the way `main` does, then the command wraps its report to it.
+        let _ = screen(&mut app, 60, 17);
+        run(&mut app, "/notes");
+        let narrow = screen(&mut app, 60, 17).join("\n");
+        assert!(
+            narrow.contains("tango"),
+            "the whole note is read at 60 columns, not clipped: {narrow}"
+        );
+
+        // 200 columns: the widest popup, 74 content columns. The first row used
+        // to overrun it by the age and marker that lead it.
+        let _ = screen(&mut app, 200, 50);
+        run(&mut app, "/notes");
+        let wide = screen(&mut app, 200, 50).join("\n");
+        assert!(wide.contains("tango"), "and at 200 columns: {wide}");
+    }
+
+    /// The empty state is a row like any other: wrapped to the pane and windowed
+    /// to its height. Returned raw it was cut mid-word on a narrow pane, so the
+    /// end of the instruction never appeared at all.
+    #[test]
+    fn the_empty_state_is_readable_on_a_narrow_pane() {
+        let (mut app, _rx) = test_app("empty-state");
+        let rows = screen(&mut app, 60, 17).join("\n");
+        assert!(
+            rows.contains("directly."),
+            "the instruction wraps whole instead of clipping mid-word: {rows}"
+        );
+        assert!(
+            rows.contains("Tab cycles panes · Enter sends"),
+            "and the hints under it still get their rows: {rows}"
+        );
     }
 
     fn test_app(label: &str) -> (App, Receiver<Msg>) {
