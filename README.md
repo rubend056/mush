@@ -59,8 +59,9 @@ Everything can be changed at runtime from the chat — no restart:
 
 Resolution order on startup: **CLI flags > env vars (`MUSH_*`) > saved session
 > home config > built-in defaults**. `MUSH_CONTEXT` sets the endpoint's
-context window in tokens (default 8192); history is trimmed to fit it, so
-requests never overflow small local models. The home config file lives at
+context window in tokens (the built-in default is 120000 for DeepSeek and 8192
+for a custom endpoint); history is trimmed to fit it, so requests never
+overflow small local models. The home config file lives at
 `$MUSH_CONFIG`, else the platform config directory (`~/.config/mush/config.json`
 on Linux) — it is *machine-global*:
 
@@ -196,7 +197,7 @@ first of these that knows:
 3. **The model's documented window** — `deepseek-flash` and `deepseek-v4-pro`
    are 500k, so a hosted API (which answers with ids and nothing else) is not
    silently treated as an 8k local model.
-4. **The provider default**: 128k for DeepSeek, 8192 for a custom endpoint.
+4. **The provider default**: 120k for DeepSeek, 8192 for a custom endpoint.
 
 The tool caps (a read, command output, a listing) scale with the window, so one
 `read_file` can never fill an 8k transcript. If a server rejects a request over

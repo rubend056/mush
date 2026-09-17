@@ -164,6 +164,10 @@ pub(crate) mod fake {
         pub thinking: Option<Value>,
         /// The same for `reasoning_effort`.
         pub reasoning_effort: Option<String>,
+        /// The reply cap the request carried, under whichever of the two names
+        /// the config sends it. It is the number the endpoint cuts a reply off
+        /// at, so a test can assert what a window really buys.
+        pub reply_cap: u32,
     }
 
     impl Asked {
@@ -405,6 +409,9 @@ pub(crate) mod fake {
                 tool_choice: request.tool_choice.to_string(),
                 thinking: request.thinking.clone(),
                 reasoning_effort: request.reasoning_effort.clone(),
+                reply_cap: request
+                    .max_tokens
+                    .max(request.max_completion_tokens.unwrap_or(0)),
             };
             // The first reply still scripted whose matcher accepts this
             // request, and it is spent: that reply was written for this call.

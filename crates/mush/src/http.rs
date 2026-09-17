@@ -1503,6 +1503,58 @@ mod tests {
         assert!(response.body.contains("data"));
     }
 
+    /// The reply cap mush ships is one the configured endpoint actually takes.
+    /// A cap past a vendor's documented `max_tokens` range is a 400 — worse
+    /// than the short reply it would have stopped — so the number is checked
+    /// against the endpoint itself rather than trusted. The request is built
+    /// the way a run builds one, cap and all, and the endpoint's status is the
+    /// verdict. Run with `--ignored`, pointing the usual `MUSH_*` at a live
+    /// endpoint: a connection error is a fact about the network, not about the
+    /// cap.
+    #[test]
+    #[ignore]
+    fn live_endpoint_accepts_the_shipped_reply_cap() {
+        // The same resolution startup runs (minus a home file), so the window —
+        // and the cap that is a quarter of it — is the one a real run would
+        // send, not `Config::from_env`'s un-derivable default.
+        let mut cfg = mush_core::config::resolve(
+            &mush_core::Overrides::from_env(),
+            &mush_core::UserConfig::default(),
+            None,
+        )
+        .expect("the environment resolves to a config");
+        if cfg.model.is_empty() {
+            // Nothing named one: take what the endpoint lists first, so the
+            // request names a model the endpoint knows.
+            cfg.model = list_models(&cfg)
+                .first()
+                .map(|model| model.id.clone())
+                .unwrap_or_default();
+        }
+        let request = mush_core::message::ChatRequest {
+            model: &cfg.model,
+            messages: &[mush_core::Message::user("say hi in one word")],
+            tools: &[],
+            tool_choice: "none",
+            stream: false,
+            temperature: cfg.temperature(),
+            max_tokens: cfg.reply_cap(),
+            max_completion_tokens: None,
+            thinking: None,
+            reasoning_effort: None,
+        };
+        let body = serde_json::to_string(&request).unwrap();
+        let cancel = AtomicBool::new(false);
+        let response = post_json(&cfg.chat_url(), &body, cfg.api_key.as_deref(), &cancel).unwrap();
+        assert_eq!(
+            response.status,
+            200,
+            "the endpoint refused the {}-token cap: {}",
+            cfg.reply_cap(),
+            response.body
+        );
+    }
+
     /// Proves the TLS path works against a public https endpoint. No key is
     /// used, so DeepSeek must answer 401 — a plain-HTTP-only client would fail
     /// to connect at all. Run with `--ignored`.
