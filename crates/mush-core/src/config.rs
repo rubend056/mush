@@ -122,20 +122,33 @@ pub const DEFAULT_TEMPERATURE: f32 = 1.0;
 /// A set of user-supplied values: the command line, or the `MUSH_*`
 /// environment. `None` means "not given", which is what lets a lower-priority
 /// layer win.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+///
+/// No `Eq`: a temperature is a float, and `1.0 == 1.0` is not the question any
+/// caller asks.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Overrides {
     pub url: Option<String>,
     pub model: Option<String>,
     pub provider: Option<String>,
     pub api_key: Option<String>,
     pub context: Option<usize>,
+    /// Sampling temperature (`--temperature`). A float stated by a human, so it
+    /// is stored as one rather than as the text they typed; no endpoint ever
+    /// sees it outside the range `Config::temperature` clamps to.
+    pub temperature: Option<f32>,
+    /// Whether the reply cap travels as `max_completion_tokens`
+    /// (`--max-completion-tokens`). `None` is "not stated", which is what keeps
+    /// a deliberate `false` distinguishable from silence.
+    pub max_completion_tokens: Option<bool>,
 }
 
 impl Overrides {
     /// The environment layer: `MUSH_URL`, `MUSH_MODEL`, `MUSH_PROVIDER`,
-    /// `MUSH_API_KEY`, `MUSH_CONTEXT`. Empty variables count as unset. A
-    /// malformed `MUSH_CONTEXT` is ignored here; [`Self::from_env_checked`] is
-    /// the form startup uses, so it is reported instead.
+    /// `MUSH_API_KEY`, `MUSH_CONTEXT`. Empty variables count as unset. The
+    /// temperature and the reply cap's name have no environment spelling: they
+    /// are stated on a command line or in the home config. A malformed
+    /// `MUSH_CONTEXT` is ignored here; [`Self::from_env_checked`] is the form
+    /// startup uses, so it is reported instead.
     pub fn from_env() -> Self {
         Self {
             url: env_nonempty("MUSH_URL"),
@@ -143,6 +156,9 @@ impl Overrides {
             provider: env_nonempty("MUSH_PROVIDER"),
             api_key: env_nonempty("MUSH_API_KEY"),
             context: env_nonempty("MUSH_CONTEXT").and_then(|value| parse_context_env(&value).ok()),
+            // No environment spelling for these two: see the doc comment.
+            temperature: None,
+            max_completion_tokens: None,
         }
     }
 
@@ -451,6 +467,12 @@ pub fn resolve_with(
     if let Some(context) = cli.context.filter(|n| *n > 0) {
         config.set_context(context);
     }
+    if let Some(temperature) = cli.temperature.or(env.temperature) {
+        config.temperature = temperature;
+    }
+    if let Some(max_completion_tokens) = cli.max_completion_tokens.or(env.max_completion_tokens) {
+        config.max_completion_tokens = max_completion_tokens;
+    }
 
     // A URL, provider, or model the user stated explicitly, here or in the
     // environment, is never overridden by a stored one.
@@ -589,6 +611,7 @@ mod tests {
             provider: Some("deepseek".into()),
             api_key: None,
             context: None,
+            ..Overrides::default()
         };
         let env = Overrides {
             url: Some("http://env:2".into()),
@@ -596,6 +619,7 @@ mod tests {
             provider: Some("custom".into()),
             api_key: Some("sk-env".into()),
             context: None,
+            ..Overrides::default()
         };
         let session = stored("custom", "http://session:3", "session-model");
         let config = resolve_with(
@@ -697,6 +721,55 @@ mod tests {
             config.chat_url(),
             "https://api.deepseek.com/v1/chat/completions"
         );
+    }
+
+    /// The temperature and the reply cap's name are stated, not guessed: the
+    /// command line is the top layer, the environment the next one down, and a
+    /// statement below them is filled in only when nothing above said anything.
+    #[test]
+    fn the_command_line_states_the_temperature_and_the_cap_name() {
+        let config = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides {
+                temperature: Some(0.2),
+                max_completion_tokens: Some(true),
+                ..Overrides::default()
+            },
+            &Overrides::default(),
+            &UserConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.temperature(), 0.2);
+        assert!(config.uses_max_completion_tokens());
+
+        // The environment is below the flag: it fills what the flag left alone.
+        let from_env = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides {
+                temperature: Some(0.5),
+                max_completion_tokens: Some(true),
+                ..Overrides::default()
+            },
+            &UserConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(from_env.temperature(), 0.5);
+        assert!(from_env.uses_max_completion_tokens());
+
+        // Nobody stated anything: the documented defaults stay.
+        let untouched = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &UserConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(untouched.temperature(), DEFAULT_TEMPERATURE);
+        assert!(!untouched.uses_max_completion_tokens());
     }
 
     #[test]
