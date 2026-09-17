@@ -44,7 +44,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -369,6 +369,21 @@ impl Registry {
         })
     }
 
+    /// The registry's own bookkeeping.
+    ///
+    /// A panic elsewhere must not take the reader down with it: `live_for` runs
+    /// on every frame (`ui.rs`), so an `unwrap` here would turn one actor's
+    /// panic into a dead UI thread. A poisoned lock does not corrupt the
+    /// records — the panic was somewhere else — so the value is taken as it is.
+    /// The only alternatives are worse than the truth: a panic, or an empty
+    /// registry that says nothing is running. (The house shape for a lock whose
+    /// failure must not be fatal; see `app::settings`.)
+    fn inner(&self) -> MutexGuard<'_, Inner> {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// A registry with no clock of its own, no sink, and nobody to tell: for the
     /// tests that only need the type to exist (the tree's, the app's). Nothing
     /// should ever be launched in one — `launch` would work, and nothing would
@@ -427,7 +442,7 @@ impl Registry {
     /// Take the workspace-wide lock for `agent`.
     pub fn take_machine(&self, agent: u64, command: &str) -> Result<(), Held> {
         self.machine_free_for(agent)?;
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         inner.holder = Some((agent, command.to_string(), None));
         Ok(())
     }
@@ -444,7 +459,7 @@ impl Registry {
     /// detached exclusive job holds the lock for its whole life". The job's own
     /// end gives the machine back, in [`Registry::finish`].
     pub fn release_machine(&self, agent: u64) {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         if matches!(&inner.holder, Some((holder, _, None)) if *holder == agent) {
             inner.holder = None;
         }
@@ -454,7 +469,7 @@ impl Registry {
     /// holding it when the holder is a detached job rather than a live tool
     /// call.
     pub fn held(&self) -> Option<(u64, String, Option<u64>)> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner();
         inner.holder.clone()
     }
 
@@ -481,7 +496,7 @@ impl Registry {
             stop: Arc::new(AtomicBool::new(false)),
         };
         let admitted = {
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner();
             let refusal = if exclusive {
                 match &inner.holder {
                     Some((holder, held, _)) if *holder != owner => Some(Refused::Machine(Held {
@@ -547,7 +562,7 @@ impl Registry {
             // claimed — which `release_machine` will not do, because a job's
             // claim is a job's to give up.
             live.kill();
-            let mut inner = self.inner.lock().unwrap();
+            let mut inner = self.inner();
             inner.jobs.remove(&id);
             if matches!(&inner.holder, Some((holder, _, claimed)) if *holder == owner && *claimed == Some(id))
             {
@@ -656,7 +671,7 @@ impl Registry {
     /// own lock is held. The watch thread takes the handle lock before this one,
     /// and holding both in the other order would deadlock.
     fn jobs(&self) -> Vec<Record> {
-        let inner = self.inner.lock().unwrap();
+        let inner = self.inner();
         inner
             .jobs
             .values()
@@ -676,7 +691,7 @@ impl Registry {
     /// was the holder, and forget the oldest ended job if there are too many.
     /// Called from the job's own thread, which is also what tells the owner.
     fn finish(&self, id: u64, outcome: &JobOutcome, tail: String) -> Option<String> {
-        let mut inner = self.inner.lock().unwrap();
+        let mut inner = self.inner();
         let (started, command) = {
             let record = inner.jobs.get(&id)?;
             (record.started, record.command.clone())
@@ -719,11 +734,10 @@ impl Drop for Registry {
     /// outlives it. `App` calls `kill_all` explicitly on the way out; this
     /// catches the paths that do not (a panic inside an actor, a test).
     fn drop(&mut self) {
-        if let Ok(inner) = self.inner.lock() {
-            for record in inner.jobs.values() {
-                if let Some(live) = &record.live {
-                    live.kill();
-                }
+        let inner = self.inner();
+        for record in inner.jobs.values() {
+            if let Some(live) = &record.live {
+                live.kill();
             }
         }
     }
@@ -1056,6 +1070,49 @@ mod tests {
             other => panic!("expected a kill: {:?}", other.is_ok()),
         }
         assert_eq!(machine.kills(), 1, "the runaway writer was stopped");
+    }
+
+    /// The painter path must not panic. `live_for` is called every frame, and a
+    /// panic while the registry's lock was held — by a job's thread, by a
+    /// reader — used to make the next frame's `unwrap` take the UI thread down
+    /// with it.
+    ///
+    /// A poisoned lock does not corrupt the records, so the reader gets the
+    /// truth: what is running, and who holds the machine.
+    #[test]
+    fn a_poisoned_registry_still_answers_the_painter() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let (registry, _events, _clock) = registry();
+        let (id, _mailbox) = launch(&registry, &machine, 7);
+
+        // Another thread panicking with the bookkeeping locked is exactly how a
+        // lock gets poisoned.
+        let clone = registry.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = clone.inner.lock().unwrap();
+            panic!("a thread died with the registry locked");
+        })
+        .join();
+        assert!(registry.inner.is_poisoned(), "the lock is poisoned");
+
+        let live = registry.live_for(7);
+        assert_eq!(live.len(), 1, "the painter still knows what runs");
+        assert_eq!(live[0].command, "cargo build");
+        assert_eq!(registry.running(), 1);
+        assert!(registry.has_room());
+        assert_eq!(registry.held(), None);
+        let status = registry.status_for(7);
+        assert!(status.starts_with("#c1 running "), "{status}");
+        assert!(status.ends_with("cargo build"), "{status}");
+        // Every writer too: admission, the lock, and a stop are still answered
+        // rather than panicking on the way in.
+        assert_eq!(
+            registry.stop(7, id).unwrap(),
+            "stopping job #c1",
+            "a stop is still a stop"
+        );
+        assert!(registry.machine_free_for(9).is_ok());
+        registry.kill_all();
     }
 
     /// The budget is the machine's, not one agent's: `MAX_JOBS` live jobs are
