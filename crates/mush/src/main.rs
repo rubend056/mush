@@ -8,6 +8,7 @@ mod agent;
 mod app;
 mod http;
 mod input;
+mod model;
 mod ui;
 
 use std::error::Error;

@@ -12,7 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::{ErrorKind, Read};
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -35,7 +35,7 @@ use mush_core::workspace::truncate_for_model;
 use mush_core::{prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_SECS};
 
 use crate::app::Msg;
-use crate::http;
+use crate::model::{HttpModel, ModelClient, ModelError};
 
 /// Backstop against a model that never stops — *not* a budget for the work.
 ///
@@ -248,6 +248,10 @@ pub struct AgentCtx {
     /// Shared so a runtime `/provider` / `/url` / `/model` / `/key` applies to
     /// every agent immediately.
     pub cfg: Arc<Mutex<Config>>,
+    /// Where this agent's model calls go. Shared by the whole tree — a child
+    /// gets its parent's client — so one endpoint serves every agent, and one
+    /// scripted client can serve a whole tree in a test.
+    pub model: Arc<dyn ModelClient>,
     pub tx: Sender<Msg>,
     /// Which conversation this tree belongs to. The UI drops events stamped
     /// with another one: after `/new`, an abandoned actor can still be
@@ -333,8 +337,12 @@ pub fn spawn(cfg: Config, tx: Sender<Msg>, root: PathBuf) -> RootHandle {
     // raise the floor above leftover worktree ids.
     let ids = Arc::new(AtomicU64::new(1));
     let live = Arc::new(AtomicU64::new(0));
+    // The real endpoint, behind the seam: every agent in this tree calls it
+    // through `AgentCtx::model`, children included.
+    let model: Arc<dyn ModelClient> = Arc::new(HttpModel::new(shared.clone()));
     let ctx = Arc::new(AgentCtx {
         cfg: shared.clone(),
+        model,
         tx,
         conversation,
         root,
@@ -418,7 +426,8 @@ pub fn revive(
     // checkout.
     let branch = if isolated.is_some() { branch } else { None };
     let ctx = Arc::new(AgentCtx {
-        cfg,
+        cfg: cfg.clone(),
+        model: Arc::new(HttpModel::new(cfg)),
         tx,
         conversation,
         root,
@@ -754,72 +763,67 @@ fn run_loop(
             request.reasoning_effort = Some(effort.to_string());
         }
 
-        let body = match serde_json::to_string(&request) {
-            Ok(body) => body,
-            Err(error) => return Err(format!("could not encode request: {error}")),
-        };
-
-        let response = match http::post_json(&cfg.chat_url(), &body, cfg.api_key.as_deref(), cancel)
-        {
-            Ok(response) => response,
+        let reply = match actor.ctx.model.chat(&request, cancel) {
+            Ok(reply) => reply,
             // The reader stops the moment the human cancels; that is a
             // cancellation, not a failure to reach the endpoint.
-            Err(_) if cancel.load(Ordering::SeqCst) => return Err(CANCELLED.to_string()),
+            Err(ModelError::Cancelled) => return Err(CANCELLED.to_string()),
             // A refusal — a body past `MAX_BODY_BYTES`, a malformed status or
             // chunk line — is not a connection failure: the endpoint answered,
             // and saying so is the difference between "check the URL" and "the
             // reply was too big".
-            Err(error) if error.kind() == ErrorKind::InvalidData => {
+            Err(ModelError::Refused(error)) => {
                 return Err(format!("the endpoint's reply was refused: {error}"));
             }
-            Err(error) => {
+            Err(ModelError::Unreachable(error)) => {
                 return Err(format!("cannot reach {}: {error}", cfg.base_url));
             }
-        };
-
-        if response.status != 200 {
-            let parsed = serde_json::from_str::<ChatResponse>(&response.body).ok();
-            let detail = parsed
-                .and_then(|r| r.error.map(|e| e.message))
-                .unwrap_or_else(|| truncate(&response.body, 600));
-            // A hosted API advertises nothing, so its own complaint is the only
-            // current source for the window. Learn it, tell the human, retry
-            // once — and never again in this run, or a server that complains
-            // about everything becomes a loop. A number that would collapse the
-            // window by more than 8x is refused: a rate-limit body must not
-            // teach mush that the endpoint has ten tokens (finding A3).
-            if !learned_context && !cfg.context_explicit {
-                if let Some(tokens) = parse_context_hint(&detail) {
-                    let plausible = tokens < cfg.context_tokens
-                        && tokens.saturating_mul(8) >= cfg.context_tokens;
-                    if plausible {
-                        cfg.context_tokens = tokens;
-                        if let Ok(mut shared) = actor.ctx.cfg.lock() {
-                            shared.context_tokens = tokens;
+            Err(ModelError::Encode(error)) => {
+                return Err(format!("could not encode request: {error}"));
+            }
+            Err(ModelError::Malformed(error)) => {
+                return Err(format!("could not parse model response: {error}"));
+            }
+            Err(ModelError::Status { status, body }) => {
+                let parsed = serde_json::from_str::<ChatResponse>(&body).ok();
+                let detail = parsed
+                    .and_then(|r| r.error.map(|e| e.message))
+                    .unwrap_or_else(|| truncate(&body, 600));
+                // A hosted API advertises nothing, so its own complaint is the
+                // only current source for the window. Learn it, tell the human,
+                // retry once — and never again in this run, or a server that
+                // complains about everything becomes a loop. A number that
+                // would collapse the window by more than 8x is refused: a
+                // rate-limit body must not teach mush that the endpoint has ten
+                // tokens (finding A3).
+                if !learned_context && !cfg.context_explicit {
+                    if let Some(tokens) = parse_context_hint(&detail) {
+                        let plausible = tokens < cfg.context_tokens
+                            && tokens.saturating_mul(8) >= cfg.context_tokens;
+                        if plausible {
+                            cfg.context_tokens = tokens;
+                            if let Ok(mut shared) = actor.ctx.cfg.lock() {
+                                shared.context_tokens = tokens;
+                            }
+                            // The UI owns the copy every surface reads, so it
+                            // gets the number too (finding B7).
+                            actor.ctx.emit(actor.id, AgentEvent::Context { tokens });
+                            actor.ctx.emit(
+                                actor.id,
+                                AgentEvent::Status(format!(
+                                    "context window is {tokens} tokens — retrying"
+                                )),
+                            );
+                            learned_context = true;
+                            continue;
                         }
-                        // The UI owns the copy every surface reads, so it gets
-                        // the number too (finding B7).
-                        actor.ctx.emit(actor.id, AgentEvent::Context { tokens });
-                        actor.ctx.emit(
-                            actor.id,
-                            AgentEvent::Status(format!(
-                                "context window is {tokens} tokens — retrying"
-                            )),
-                        );
-                        learned_context = true;
-                        continue;
                     }
                 }
+                return Err(format!("model returned HTTP {status}: {detail}"));
             }
-            return Err(format!("model returned HTTP {}: {detail}", response.status));
-        }
-
-        let parsed = match serde_json::from_str::<ChatResponse>(&response.body) {
-            Ok(parsed) => parsed,
-            Err(error) => return Err(format!("could not parse model response: {error}")),
         };
 
-        let Some(choice) = parsed.choices.into_iter().next() else {
+        let Some(choice) = reply.choices.into_iter().next() else {
             return Err("model returned no choices".to_string());
         };
         // `length` means the endpoint cut the reply off at `max_tokens` — with
@@ -1084,25 +1088,21 @@ fn compact_history(
         },
         reasoning_effort: cfg.reasoning_effort().map(str::to_string),
     };
-    let body = match serde_json::to_string(&request) {
-        Ok(body) => body,
-        Err(error) => return Err(format!("could not encode request: {error}")),
-    };
-    let response = match http::post_json(&cfg.chat_url(), &body, cfg.api_key.as_deref(), cancel) {
-        Ok(response) => response,
+    let reply = match actor.ctx.model.chat(&request, cancel) {
+        Ok(reply) => reply,
         // A cancelled run is already ending; do not report a network failure.
-        Err(_) if cancel.load(Ordering::SeqCst) => return Err(CANCELLED.to_string()),
+        Err(ModelError::Cancelled) => return Err(CANCELLED.to_string()),
         // The run will fail on its real request anyway; surface it.
-        Err(error) => return Err(format!("cannot reach {}: {error}", cfg.base_url)),
+        Err(ModelError::Unreachable(error)) | Err(ModelError::Refused(error)) => {
+            return Err(format!("cannot reach {}: {error}", cfg.base_url));
+        }
+        Err(ModelError::Encode(error)) => return Err(format!("could not encode request: {error}")),
+        // The endpoint complained, or answered something we cannot read: the
+        // run will fail on its real request anyway, and a summary mush could
+        // not make is not that failure.
+        Err(ModelError::Status { .. }) | Err(ModelError::Malformed(_)) => return Ok(()),
     };
-    if response.status != 200 {
-        return Ok(());
-    }
-    let parsed = match serde_json::from_str::<ChatResponse>(&response.body) {
-        Ok(parsed) => parsed,
-        Err(_) => return Ok(()),
-    };
-    let summary = parsed
+    let summary = reply
         .choices
         .into_iter()
         .next()
@@ -2258,8 +2258,10 @@ mod tests {
         fs::create_dir_all(&root).unwrap();
         let (ui_tx, ui_rx) = crossbeam_channel::unbounded::<Msg>();
         std::mem::forget(ui_rx);
+        let cfg = Arc::new(Mutex::new(Config::new("http://127.0.0.1:1", "test", None)));
         let ctx = Arc::new(AgentCtx {
-            cfg: Arc::new(Mutex::new(Config::new("http://127.0.0.1:1", "test", None))),
+            cfg: cfg.clone(),
+            model: Arc::new(HttpModel::new(cfg)),
             tx: ui_tx.clone(),
             conversation: 1,
             root: root.clone(),
