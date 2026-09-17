@@ -19,33 +19,14 @@
 //! modes was dropped from the tree in Stage 0 — a `mode` argument here would be
 //! a value no state can produce.
 //!
-//! The whole table, which is also what `mush --help` prints in prose:
-//!
-//! | context | key | intent |
-//! |---|---|---|
-//! | anywhere, picker or not | `Ctrl-Q` | `Quit` |
-//! | anywhere, picker or not | `Ctrl-C` | `Interrupt` — the *focused* agent |
-//! | anywhere, picker or not | `Ctrl-X` | `InterruptAll` |
-//! | anywhere, picker or not | `Ctrl-N` | `NewChat` |
-//! | anywhere, picker or not | `Ctrl-P` | `OpenModelPicker` |
-//! | anywhere, picker or not | `Tab` / `Shift-Tab` | `CycleFocus(+1/-1)` |
-//! | picker open | `Esc` | `PickerClose` |
-//! | picker open | `Enter` | `PickerPick` |
-//! | picker open | `j` / `Down`, `k` / `Up` | `PickerMove(+1/-1)` |
-//! | picker open | `g` / `Home`, `G` / `End` | `PickerFirst` / `PickerLast` |
-//! | `Focus::Agents` | `j` / `Down`, `k` / `Up` | `TreeMove(+1/-1)` |
-//! | `Focus::Agents` | `g` / `Home`, `G` / `End` | `TreeFirst` / `TreeLast` |
-//! | `Focus::Agents` | `Enter` | `TreeFocus` |
-//! | `Focus::Agents` | `c` | `TreeCancel` |
-//! | `Focus::Agents` | `Esc` | `TreeBackToRoot` |
-//! | `Focus::Chat` | `Enter` | `Send` |
-//! | `Focus::Chat` | `Shift-Enter` / `Alt-Enter` | `Chat(Newline)` |
-//! | `Focus::Chat` | `Backspace`, `Delete` | `Chat(Backspace)`, `Chat(Delete)` |
-//! | `Focus::Chat` | `Left`, `Right`, `Home`, `End` | `Chat(Left…End)` |
-//! | `Focus::Chat` | any `Char` with neither `Ctrl` nor `Alt` | `Chat(Insert)` |
-//! | `Focus::Chat` | `Up` / `Down`, `PageUp` / `PageDown` | `Chat(Scroll(±1/±10))` |
-//! | `Focus::Chat` | `Esc` | `Chat(Clear)` |
-//! | everywhere | anything else, and any `Release` | `Ignore` |
+//! The whole table lives in [`KEYS`] — one row per binding — and both help
+//! surfaces render it through [`help_table`]: `mush --help`'s KEYS block and
+//! the in-app `/help` notice. A binding therefore cannot be documented in one
+//! and missing from the other, which is what the hand-written `--help` prose
+//! and the six-key `/help` line allowed (the key half of finding B2). This is
+//! the same one-source shape `commands::table` gives the slash commands. [`key`]
+//! stays the behaviour and the tests below pin it key by key; a test pins both
+//! help surfaces to [`KEYS`], so the documentation cannot drift from the rows.
 //!
 //! The tree's keys deliberately ignore modifiers, exactly as the old arms did:
 //! `Alt-C` stops a row and `Ctrl-J` moves the cursor, and both are pinned in a
@@ -54,6 +35,189 @@
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::Focus;
+
+/// The context a binding belongs to, so the help can group the rows the way a
+/// human reads them: what works anywhere, then the modal list, then each pane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Context {
+    /// Active with a picker up and while either pane is focused.
+    Anywhere,
+    /// Only while a picker holds the keyboard.
+    Picker,
+    Agents,
+    Chat,
+}
+
+impl Context {
+    /// The heading [`help_table`] prints above this context's rows.
+    const fn label(self) -> &'static str {
+        match self {
+            Context::Anywhere => "anywhere",
+            Context::Picker => "in a picker",
+            Context::Agents => "agents pane",
+            Context::Chat => "chat pane",
+        }
+    }
+}
+
+/// One row of the key table: the keys, and what they do.
+///
+/// [`KEYS`] is the single source both `mush --help` and the in-app `/help`
+/// render — the way `COMMANDS` serves both scripts — so a binding cannot be
+/// documented in one surface and missing from the other. Every binding the
+/// program has appears here exactly once.
+pub struct Binding {
+    pub context: Context,
+    /// The keys as a human reads them, e.g. `j / k, ↑ / ↓`.
+    pub keys: &'static str,
+    /// What they do, in one clause.
+    pub help: &'static str,
+}
+
+/// The whole key table, in the order the help prints it.
+pub const KEYS: &[Binding] = &[
+    Binding {
+        context: Context::Anywhere,
+        keys: "Ctrl-Q",
+        help: "quit",
+    },
+    Binding {
+        context: Context::Anywhere,
+        keys: "Ctrl-C",
+        help: "stop the focused agent",
+    },
+    Binding {
+        context: Context::Anywhere,
+        keys: "Ctrl-X",
+        help: "stop every running agent",
+    },
+    Binding {
+        context: Context::Anywhere,
+        keys: "Ctrl-N",
+        help: "start a new chat",
+    },
+    Binding {
+        context: Context::Anywhere,
+        keys: "Ctrl-P",
+        help: "model picker",
+    },
+    Binding {
+        context: Context::Anywhere,
+        keys: "Tab / Shift-Tab",
+        help: "cycle panes (agents, chat)",
+    },
+    Binding {
+        context: Context::Picker,
+        keys: "Enter",
+        help: "take the selected row",
+    },
+    Binding {
+        context: Context::Picker,
+        keys: "Esc",
+        help: "close the picker",
+    },
+    Binding {
+        context: Context::Picker,
+        keys: "j / k, ↑ / ↓",
+        help: "move down / up the list",
+    },
+    Binding {
+        context: Context::Picker,
+        keys: "g / G, Home / End",
+        help: "first / last row",
+    },
+    Binding {
+        context: Context::Agents,
+        keys: "Enter",
+        help: "focus the selected agent",
+    },
+    Binding {
+        context: Context::Agents,
+        keys: "j / k, ↑ / ↓",
+        help: "move down / up a row",
+    },
+    Binding {
+        context: Context::Agents,
+        keys: "g / G, Home / End",
+        help: "first / last row",
+    },
+    Binding {
+        context: Context::Agents,
+        keys: "c",
+        help: "cancel the selected agent",
+    },
+    Binding {
+        context: Context::Agents,
+        keys: "Esc",
+        help: "back to the root agent",
+    },
+    Binding {
+        context: Context::Chat,
+        keys: "Enter",
+        help: "send the message",
+    },
+    Binding {
+        context: Context::Chat,
+        keys: "Shift / Alt-Enter",
+        help: "new line in the message",
+    },
+    Binding {
+        context: Context::Chat,
+        keys: "letters and symbols",
+        help: "type into the message box",
+    },
+    Binding {
+        context: Context::Chat,
+        keys: "← / →, Home / End",
+        help: "move the box cursor",
+    },
+    Binding {
+        context: Context::Chat,
+        keys: "Backspace / Delete",
+        help: "delete in the box",
+    },
+    Binding {
+        context: Context::Chat,
+        keys: "wheel",
+        help: "scroll the transcript",
+    },
+    Binding {
+        context: Context::Chat,
+        keys: "Esc",
+        help: "clear the box",
+    },
+];
+
+/// The key table as text: a heading per context, then `keys` and `what it does`
+/// in one aligned column.
+///
+/// Both `mush --help`'s KEYS block and the in-app `/help` notice print exactly
+/// this string, so the two cannot disagree about a binding.
+pub fn help_table() -> String {
+    let width = KEYS
+        .iter()
+        .map(|binding| binding.keys.chars().count())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::new();
+    let mut shown: Option<Context> = None;
+    for binding in KEYS {
+        if shown != Some(binding.context) {
+            if shown.is_some() {
+                out.push('\n');
+            }
+            out.push_str(&format!("  {}:\n", binding.context.label()));
+            shown = Some(binding.context);
+        }
+        out.push_str(&format!(
+            "    {:<width$}  {}\n",
+            binding.keys,
+            binding.help,
+            width = width
+        ));
+    }
+    out.trim_end().to_string()
+}
 
 /// What the message box and the transcript's scrollback do with a key.
 ///

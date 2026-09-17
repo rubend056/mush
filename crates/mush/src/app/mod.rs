@@ -14,7 +14,7 @@
 
 mod chat;
 pub mod commands;
-mod keys;
+pub mod keys;
 mod settings;
 mod tree;
 
@@ -149,18 +149,20 @@ fn ended_on_an_answer(messages: &[Message]) -> bool {
     )
 }
 
-/// `/help`: what the keys do, then the command table.
+/// `/help`: the key table, then the command table.
 ///
-/// The table is the same one `mush --help` prints, so the two surfaces cannot
-/// advertise different commands — `/compact` used to be implemented, listed by
-/// `/help` and missing from `--help`, because each list was written by hand
-/// (the help/status drift half of finding B2). It is a notice rather than a
-/// status line: it is a thing to read, not a thing that just happened.
+/// Both tables are the same one source their CLI counterparts print —
+/// [`keys::help_table`] is `mush --help`'s KEYS block and [`commands::table`]
+/// is its COMMANDS block — so no surface can advertise a binding or a command
+/// the others do not. `/help` used to name six keys by hand and miss `j`/`k`,
+/// `Enter`, `c`, `Esc` and `Ctrl-Q`; rendering [`keys::KEYS`] here is what stops
+/// a human learning the keyboard from a subset of it (the key half of finding
+/// B2). It is a notice rather than a status line: it is a thing to read, not a
+/// thing that just happened.
 fn help_notice() -> String {
     format!(
-        "mush: Tab cycles agents/chat · Enter sends to the focused agent · \
-         Ctrl-P pick a model · Ctrl-N new chat · \
-         Ctrl-C stops the focused agent · Ctrl-X stops them all. Commands:\n{}",
+        "mush keys:\n{}\nCommands:\n{}",
+        keys::help_table(),
         commands::table(&mush_core::provider::names_piped())
     )
 }
