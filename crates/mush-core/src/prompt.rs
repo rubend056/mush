@@ -18,6 +18,9 @@ pub fn system_prompt(root: &str) -> String {
          Use the tools to inspect and change files. Rules:\n\
          - Read a file before you edit it.\n\
          - Prefer edit_file for small, surgical changes; use write_file only for new files or full rewrites.\n\
+         - Every tool already works inside the workspace: paths are workspace-relative (\"src/main.rs\", \
+         not an absolute path) and run_command already runs there with its cwd at the workspace root. \
+         Never prefix a command with `cd`.\n\
          - Do the work instead of describing it. Keep replies short.\n\
          - Never touch paths outside the workspace.\n\
          - When the task is done, stop calling tools and reply with a one-sentence summary.\n\
@@ -25,11 +28,12 @@ pub fn system_prompt(root: &str) -> String {
          Delegation:\n\
          - spawn_agent(brief, isolated?) starts a subagent that has NO memory of this conversation: \
          the brief must carry every fact, file, and the exact deliverable.\n\
-         - A subagent gets a bounded number of turns and the spawn result names it. Size the brief \
-         so the work fits in that budget: a brief too big for its budget ends mid-task, not early.\n\
-         - Only one non-isolated subagent may run at a time in a shared workspace. Decide up front: \
-         pass isolated=true for siblings that should run in parallel, or wait_agents for the running \
-         one first. (The check can only fail after the brief exists, so decide before writing it.)\n\
+         - An isolated subagent works in its own copy of the repository (its own git worktree and branch); \
+         a shared one works in this workspace, so only one of those may run at a time. Decide up front: \
+         pass isolated=true for siblings that should run in parallel, or wait_agents for the running one \
+         first. (The check can only fail after the brief exists, so decide before writing it.)\n\
+         - A subagent runs until it stops calling tools, so a brief is bounded by the work, not a turn \
+         count: split by what is independent, not by how long you think it takes.\n\
          - Delegate independent, large, or context-heavy subtasks; do single edits and lookups yourself. \
          Prefer a few big delegations over many small ones.\n\
          - wait_agents blocks until a child finishes and returns its summary; agent_status lists your \
@@ -43,11 +47,17 @@ pub fn system_prompt(root: &str) -> String {
 /// The system prompt for a delegated subagent: who it is, the workspace it
 /// works in, and the rules. The task itself is not embedded here — it arrives
 /// as the first user message, mirroring the root's system+user shape.
+/// `root` is what a human reading a log would recognise as this agent's
+/// workspace. It is deliberately *not* offered as something to type: an
+/// isolated agent's worktree is its cwd already, and an absolute path is
+/// refused by every file tool, so naming it in a command is a mistake the
+/// prompt should not invite.
 pub fn subagent_prompt(root: &str, depth: usize, isolated: bool) -> String {
     let workspace = if isolated {
         format!(
-            "Your workspace is an isolated git worktree at {root}; your changes stay on its branch \
-             until they are reviewed and merged."
+            "You have your own copy of the repository — a git worktree at {root}, on your own branch. It \
+             is your workspace root: edit in it, run your tests in it. Your changes stay on your branch \
+             until your parent reviews and merges them."
         )
     } else {
         format!("Your workspace is the shared workspace at {root}.")
@@ -59,8 +69,13 @@ pub fn subagent_prompt(root: &str, depth: usize, isolated: bool) -> String {
          Rules:\n\
          - Read a file before you edit it.\n\
          - Prefer edit_file for small, surgical changes; use write_file only for new files or full rewrites.\n\
+         - Every tool already works inside your workspace: paths are workspace-relative (\"src/main.rs\"), \
+         never absolute, and run_command already runs there with its cwd at the workspace root. \
+         Never prefix a command with `cd`.\n\
          - Never touch paths outside your workspace.\n\
          - Do the work instead of describing it. Keep replies short.\n\
+         - Run until you are done: a run ends when you stop calling tools, not at a turn count, so do the \
+         whole task.\n\
          - Finish with a concise summary of what you changed."
     )
 }
@@ -119,7 +134,7 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::EditFile,
-            "Replace text: one old_string/new_string, or `edits` for several replacements at once.A batch lands all-or-nothing in one call, so prefer it for multi-part changes. Ambiguous matches are refused unless replace_all is set.",
+            "Replace text: one old_string/new_string, or `edits` for several replacements at once. A batch lands all-or-nothing in one call, so prefer it for multi-part changes. Ambiguous matches are refused unless replace_all is set.",
             json!({
                 "type": "object",
                 "properties": {
@@ -145,7 +160,7 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::RunCommand,
-            "Run a shell command in the workspace root.",
+            "Run a shell command in the workspace root — no `cd` needed.",
             json!({
                 "type": "object",
                 "properties": {
@@ -184,7 +199,7 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::AgentControl,
-            "Stop a child or message it.Stopping is not finishing: it keeps its context and work, and a later message resumes it.",
+            "Stop a child or message it. Stopping is not finishing: it keeps its context and work, and a later message resumes it.",
             json!({
                 "type": "object",
                 "properties": {
@@ -278,8 +293,43 @@ mod tests {
     #[test]
     fn subagent_prompt_names_an_isolated_worktree() {
         let prompt = subagent_prompt("/tmp/wt/3", 1, true);
-        assert!(prompt.contains("isolated git worktree at /tmp/wt/3"));
+        assert!(
+            prompt.contains("your own copy of the repository"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("worktree at /tmp/wt/3"), "{prompt}");
         assert!(!prompt.contains("shared workspace"));
+    }
+
+    /// Every tool already runs in the workspace, so a command never needs a
+    /// `cd` — and an absolute path is refused by the file tools, so inviting one
+    /// is inviting a failure. Both prompts say so, and neither tells the model
+    /// to size a brief against a turn budget (a run ends when the model stops
+    /// calling tools).
+    #[test]
+    fn the_prompts_forbid_cd_and_promise_no_turn_budget() {
+        for prompt in [
+            system_prompt("/tmp/ws"),
+            subagent_prompt("/tmp/ws", 1, true),
+        ] {
+            let lower = prompt.to_lowercase();
+            assert!(
+                lower.contains("never prefix a command with `cd`"),
+                "{prompt}"
+            );
+            assert!(lower.contains("workspace-relative"), "{prompt}");
+            assert!(
+                !lower.contains("bounded number of turns") && !lower.contains("turn budget"),
+                "no turn budget exists to size a brief against: {prompt}"
+            );
+        }
+        // The tool description the model reads says the same thing.
+        let command = tool_schemas()
+            .into_iter()
+            .find(|schema| schema["function"]["name"] == "run_command")
+            .expect("run_command has a schema");
+        let description = command["function"]["description"].as_str().unwrap();
+        assert!(description.contains("no `cd` needed"), "{description}");
     }
 
     #[test]
