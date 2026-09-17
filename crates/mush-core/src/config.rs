@@ -546,6 +546,7 @@ mod tests {
             context: None,
             updated: 0,
             messages: Vec::new(),
+            agents: Vec::new(),
         }
     }
 

@@ -316,6 +316,9 @@ pub struct RootHandle {
     /// The tree's id counter, so the UI can raise its floor to the highest id
     /// a leftover worktree already occupies (finding B1).
     pub ids: Arc<AtomicU64>,
+    /// The tree-wide count of running agents, shared so a revived agent is
+    /// counted against `MAX_AGENTS` like any other.
+    pub live: Arc<AtomicU64>,
 }
 
 /// Start the root actor.
@@ -327,13 +330,14 @@ pub fn spawn(cfg: Config, tx: Sender<Msg>, root: PathBuf) -> RootHandle {
     // Root agent is id 0; children start at 1. The UI holds a clone so it can
     // raise the floor above leftover worktree ids.
     let ids = Arc::new(AtomicU64::new(1));
+    let live = Arc::new(AtomicU64::new(0));
     let ctx = Arc::new(AgentCtx {
         cfg: shared.clone(),
         tx,
         conversation,
         root,
         ids: ids.clone(),
-        live: Arc::new(AtomicU64::new(0)),
+        live: live.clone(),
     });
     let ws = Workspace::new(&ctx.root).expect("workspace root must exist");
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AgentMsg>();
@@ -358,7 +362,96 @@ pub fn spawn(cfg: Config, tx: Sender<Msg>, root: PathBuf) -> RootHandle {
         cfg: shared,
         conversation,
         ids: ids.clone(),
+        live,
     }
+}
+
+/// What a revived agent needs to be re-adopted.
+pub struct ReviveSpec {
+    pub id: u64,
+    /// The depth it had: it decides the system prompt, and whether this agent
+    /// may spawn children of its own.
+    pub depth: usize,
+    pub brief: String,
+    pub branch: Option<String>,
+    /// The messages it had, *without* the system prompt (which is regenerated:
+    /// it names a workspace that may have moved).
+    pub messages: Vec<Message>,
+}
+
+/// Bring back an agent whose actor is gone — one restored from a stored session,
+/// or a worktree found on disk — seeded with the transcript it had, and run it.
+///
+/// The human owns this agent, not the root: its completion goes to a dead
+/// channel, so reviving a child never wakes the root with news it did not ask
+/// for.
+pub fn revive(
+    cfg: Arc<Mutex<Config>>,
+    tx: Sender<Msg>,
+    conversation: u64,
+    ids: Arc<AtomicU64>,
+    live: Arc<AtomicU64>,
+    root: PathBuf,
+    spec: ReviveSpec,
+) -> Sender<AgentMsg> {
+    let ReviveSpec {
+        id,
+        depth,
+        brief,
+        branch,
+        messages,
+    } = spec;
+    // Its own worktree if it still exists, else the shared root — an agent whose
+    // branch was merged continues in the main checkout, which is where its work
+    // now is.
+    let isolated = branch
+        .as_deref()
+        .map(|_| root.join(format!(".mush/wt/{id}")))
+        .filter(|path| path.exists());
+    let ws_root = isolated.clone().unwrap_or_else(|| root.clone());
+    let ws = Workspace::new(&ws_root).expect("workspace root must exist");
+    let ws_root_str = ws.root_str();
+    // A branch with no worktree left must not be carried: the actor commits at
+    // the end of every run, and that commit would land in the human's own
+    // checkout.
+    let branch = if isolated.is_some() { branch } else { None };
+    let ctx = Arc::new(AgentCtx {
+        cfg,
+        tx,
+        conversation,
+        root,
+        ids,
+        live,
+    });
+    let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+    let (dead_tx, dead_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+    drop(dead_rx);
+    let actor = Actor {
+        ctx,
+        id,
+        depth,
+        ws,
+        branch,
+        brief: brief.clone(),
+        my_tx: cmd_tx.clone(),
+        parent_tx: dead_tx,
+        rx: cmd_rx,
+    };
+    // The system prompt is regenerated, and an agent with no transcript but a
+    // known brief is seeded with the task — so a worktree found on disk resumes
+    // knowing what it was for, even though it has no memory of the run.
+    let mut transcript = vec![Message::system(prompt::subagent_prompt(
+        &ws_root_str,
+        depth,
+        isolated.is_some(),
+    ))];
+    if messages.is_empty() && !brief.is_empty() {
+        transcript.push(Message::user(brief));
+    } else {
+        transcript.extend(messages);
+    }
+    start(actor, transcript, true);
+    cmd_tx
 }
 
 /// Run an actor on its own thread. A thread that cannot start is reported as

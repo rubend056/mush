@@ -43,6 +43,58 @@ pub fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// How a stored agent's last run ended.
+///
+/// The UI's `Phase` is the live version of this and cannot be stored: a phase
+/// carries an `Instant`, and an age frozen at shutdown would be a lie.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredStatus {
+    /// Never ran, or its run was interrupted and it is idle again.
+    #[default]
+    Idle,
+    Done,
+    Stopped,
+    Failed(String),
+}
+
+/// Where an agent's isolated work went, once the human landed it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StoredLanded {
+    Merged,
+    Discarded,
+}
+
+/// One subagent of a stored conversation.
+///
+/// Its transcript is here so a follow-up survives a restart. Without it a
+/// relaunch forgot every child's context, and "continue that agent" really meant
+/// writing the brief again from scratch.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct AgentSession {
+    pub id: u64,
+    #[serde(default)]
+    pub parent: Option<u64>,
+    #[serde(default)]
+    pub depth: usize,
+    #[serde(default)]
+    pub brief: String,
+    #[serde(default)]
+    pub branch: Option<String>,
+    #[serde(default)]
+    pub status: StoredStatus,
+    #[serde(default)]
+    pub landed: Option<StoredLanded>,
+    #[serde(default)]
+    pub leftover: bool,
+    /// The result the row showed, so a restored tree does not lose it.
+    #[serde(default)]
+    pub summary: Option<String>,
+    #[serde(default)]
+    pub messages: Vec<Message>,
+}
+
 /// A stored conversation. The system message is regenerated on load, so only
 /// the human/assistant/tool messages are persisted, along with the endpoint
 /// selection (provider and base URL) so it survives a restart. The API key is
@@ -64,6 +116,10 @@ pub struct Session {
     pub context: Option<usize>,
     pub updated: u64,
     pub messages: Vec<Message>,
+    /// The subagents this conversation had, so their context outlives the
+    /// process. Old sessions have none and still load.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub agents: Vec<AgentSession>,
 }
 
 impl Session {
@@ -116,6 +172,18 @@ mod tests {
             context: Some(123_456),
             updated: now_secs(),
             messages: vec![Message::user("hello"), Message::assistant("hi")],
+            agents: vec![AgentSession {
+                id: 3,
+                parent: Some(0),
+                depth: 1,
+                brief: "port the parser".into(),
+                branch: Some("mush/3".into()),
+                status: StoredStatus::Stopped,
+                landed: Some(StoredLanded::Merged),
+                leftover: true,
+                summary: Some("did the thing".into()),
+                messages: vec![Message::user("do it"), Message::assistant("done")],
+            }],
         };
         session.save(&root).unwrap();
 
@@ -123,6 +191,17 @@ mod tests {
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[0].text(), "hello");
         assert_eq!(loaded.context, Some(123_456));
+        // The child's context is the point: it must survive the round trip.
+        assert_eq!(loaded.agents.len(), 1);
+        let child = &loaded.agents[0];
+        assert_eq!(child.id, 3);
+        assert_eq!(child.brief, "port the parser");
+        assert_eq!(child.status, StoredStatus::Stopped);
+        assert_eq!(child.landed, Some(StoredLanded::Merged));
+        assert!(child.leftover);
+        assert_eq!(child.summary.as_deref(), Some("did the thing"));
+        assert_eq!(child.messages.len(), 2);
+        assert_eq!(child.messages[0].text(), "do it");
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -141,6 +220,7 @@ mod tests {
 
         let loaded = Session::load(&root).unwrap();
         assert_eq!(loaded.context, None);
+        assert!(loaded.agents.is_empty(), "no agents, not a parse failure");
         let _ = fs::remove_dir_all(&root);
     }
 }

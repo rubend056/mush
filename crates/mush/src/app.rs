@@ -235,6 +235,9 @@ pub struct App {
     agent_ids: Arc<AtomicU64>,
     /// The UI event channel, needed to respawn the root actor on /new.
     ui_tx: Sender<Msg>,
+    /// The tree-wide running count, shared with the actors so an agent revived
+    /// from a stored session is counted against the ceiling like any other.
+    agent_live: Arc<AtomicU64>,
     /// Which conversation the live actor tree belongs to; events tagged with
     /// any other are from an abandoned tree and are ignored.
     conversation: u64,
@@ -260,7 +263,10 @@ impl App {
         models: Vec<http::Model>,
     ) -> Self {
         let system = Message::system(prompt::system_prompt(&ws.root_str()));
-        let chat = stored.map(|s| s.messages).unwrap_or_default();
+        let (chat, stored_agents) = match stored {
+            Some(session) => (session.messages, session.agents),
+            None => (Vec::new(), Vec::new()),
+        };
         let mut app = Self {
             ws,
             cfg,
@@ -293,6 +299,7 @@ impl App {
             agent_cancel: HashMap::new(),
             cfg_shared: root.cfg,
             agent_ids: root.ids.clone(),
+            agent_live: root.live.clone(),
             ui_tx,
             conversation: root.conversation,
             git_at: None,
@@ -303,10 +310,75 @@ impl App {
             spin: 0,
             system,
         };
+        app.restore_agents(stored_agents);
         app.discover_worktrees();
         app.count_context();
         app.refresh_git();
         app
+    }
+
+    /// Adopt the subagents of the previous conversation: their nodes, their
+    /// transcripts, and — through `agent::revive` — a live actor each, so a
+    /// follow-up message continues the agent instead of starting over.
+    ///
+    /// A restored agent whose worktree is gone continues in the main checkout,
+    /// which is where its work ended up once it was merged.
+    fn restore_agents(&mut self, stored: Vec<session::AgentSession>) {
+        if stored.is_empty() {
+            return;
+        }
+        let cfg = self.cfg_shared.clone();
+        let ui_tx = self.ui_tx.clone();
+        let conversation = self.conversation;
+        let ids = self.agent_ids.clone();
+        let live = self.agent_live.clone();
+        let root = self.ws.root().to_path_buf();
+        for agent in stored {
+            // Keep the counter above every restored id, or the next spawn hands
+            // a live child an id a restored agent already holds (finding B1).
+            self.agent_ids.fetch_max(agent.id + 1, Ordering::SeqCst);
+            let phase = match &agent.status {
+                session::StoredStatus::Done => Phase::Done,
+                session::StoredStatus::Stopped => Phase::Stopped,
+                session::StoredStatus::Failed(error) => Phase::Failed(error.clone()),
+                // A run that was still in flight at shutdown is not a result.
+                session::StoredStatus::Idle => Phase::Idle,
+            };
+            let landed = agent.landed.map(|landed| match landed {
+                session::StoredLanded::Merged => Landed::Merged,
+                session::StoredLanded::Discarded => Landed::Discarded,
+            });
+            let tx = agent::revive(
+                cfg.clone(),
+                ui_tx.clone(),
+                conversation,
+                ids.clone(),
+                live.clone(),
+                root.clone(),
+                agent::ReviveSpec {
+                    id: agent.id,
+                    depth: agent.depth.max(1),
+                    brief: agent.brief.clone(),
+                    branch: agent.branch.clone(),
+                    messages: agent.messages.clone(),
+                },
+            );
+            self.agent_msgs.insert(agent.id, agent.messages);
+            self.agent_tx.insert(agent.id, tx);
+            self.agents.push(AgentNode {
+                id: agent.id,
+                parent: agent.parent,
+                depth: agent.depth.max(1),
+                brief: agent.brief,
+                phase,
+                since: Instant::now(),
+                branch: agent.branch,
+                summary: agent.summary,
+                leftover: agent.leftover,
+                landed,
+            });
+        }
+        self.repair_focus();
     }
 
     /// Re-read what the repository looks like: the main worktree's branch,
@@ -1398,6 +1470,48 @@ impl App {
     }
 
     fn save_session(&mut self) {
+        // Every subagent, not just the root: without this a relaunch forgot
+        // each child's context, and "continue that agent" meant writing the
+        // brief again from scratch.
+        let agents = self
+            .agents
+            .iter()
+            .filter(|node| node.id != 0)
+            .map(|node| session::AgentSession {
+                id: node.id,
+                parent: node.parent,
+                depth: node.depth,
+                brief: node.brief.clone(),
+                branch: node.branch.clone(),
+                status: match &node.phase {
+                    Phase::Done => session::StoredStatus::Done,
+                    Phase::Stopped => session::StoredStatus::Stopped,
+                    Phase::Failed(error) => session::StoredStatus::Failed(error.clone()),
+                    // Mid-run at shutdown is not a result; it comes back idle,
+                    // which is what it will actually be.
+                    _ => session::StoredStatus::Idle,
+                },
+                landed: node.landed.map(|landed| match landed {
+                    Landed::Merged => session::StoredLanded::Merged,
+                    Landed::Discarded => session::StoredLanded::Discarded,
+                }),
+                leftover: node.leftover,
+                summary: node.summary.clone(),
+                // The system prompt is regenerated on the way back in, since it
+                // names a workspace that may have moved.
+                messages: self
+                    .agent_msgs
+                    .get(&node.id)
+                    .map(|messages| {
+                        messages
+                            .iter()
+                            .filter(|message| message.role != "system")
+                            .cloned()
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+            .collect();
         let session = Session {
             root: self.ws.root_str(),
             model: self.cfg.model.clone(),
@@ -1408,6 +1522,7 @@ impl App {
             context: self.cfg.context_explicit.then_some(self.cfg.context_tokens),
             updated: session::now_secs(),
             messages: self.chat.clone(),
+            agents,
         };
         if let Err(error) = session.save(self.ws.root()) {
             self.fail(format!("could not save session: {error}"));
@@ -1860,6 +1975,67 @@ mod tests {
             app.agents.iter().any(|node| node.id == 9),
             "a running agent is not forgotten under itself"
         );
+    }
+
+    /// A stored conversation comes back with its subagents: a live mailbox each
+    /// (so a follow-up message is delivered, not lost) and the transcript it had
+    /// (which is the whole point of storing it).
+    #[test]
+    fn a_stored_conversation_restores_its_agents_with_a_live_mailbox() {
+        let root = repo("restore");
+        let ws = Workspace::new(&root).unwrap();
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let handle = spawn(cfg.clone(), tx.clone(), root.clone());
+        let stored = Session {
+            root: root.display().to_string(),
+            model: "test-model".into(),
+            provider: "custom".into(),
+            base_url: "http://127.0.0.1:1".into(),
+            context: None,
+            updated: 0,
+            messages: vec![Message::user("the root task")],
+            agents: vec![session::AgentSession {
+                id: 2,
+                parent: Some(0),
+                depth: 1,
+                brief: "port the parser".into(),
+                branch: None,
+                status: session::StoredStatus::Done,
+                landed: None,
+                leftover: false,
+                summary: Some("finished it".into()),
+                messages: vec![Message::user("port the parser"), Message::assistant("done")],
+            }],
+        };
+
+        let app = App::new(ws, cfg, Some(stored), handle, tx, Vec::new());
+
+        let node = app
+            .agents
+            .iter()
+            .find(|node| node.id == 2)
+            .expect("the stored agent comes back");
+        assert_eq!(node.brief, "port the parser");
+        assert_eq!(node.phase, Phase::Done);
+        assert_eq!(node.summary.as_deref(), Some("finished it"));
+        // The transcript is what makes a follow-up possible: without it the
+        // human is back to writing the brief from scratch.
+        assert_eq!(app.agent_msgs[&2].len(), 2);
+        assert_eq!(app.agent_msgs[&2][1].text(), "done");
+        // A live mailbox: a follow-up is delivered rather than dropped, which is
+        // what "revive" has to mean to be worth anything.
+        let tx_to_child = app
+            .agent_tx
+            .get(&2)
+            .expect("a restored agent gets a mailbox");
+        assert!(
+            tx_to_child
+                .send(AgentMsg::Nudge("one more thing".into()))
+                .is_ok(),
+            "the restored actor must still be listening"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn test_app(label: &str) -> (App, Receiver<Msg>) {
