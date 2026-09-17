@@ -137,7 +137,9 @@ pub(crate) mod fake {
 
     use crossbeam_channel::{Receiver, Sender};
 
-    use mush_core::message::{ChatRequest, ChatResponse, Choice, FunctionCall, Message, ToolCall};
+    use mush_core::message::{
+        ChatRequest, ChatResponse, Choice, FunctionCall, Message, ToolCall, Usage,
+    };
     use serde_json::Value;
 
     use super::{ModelClient, ModelError};
@@ -281,6 +283,14 @@ pub(crate) mod fake {
             self
         }
 
+        /// The next reply is this message, finished for this reason: how a
+        /// server that refuses (`finish_reason: content_filter`) or ends a
+        /// reply in a way mush does not know answers.
+        pub fn finishing(mut self, message: Message, finish_reason: &str) -> Self {
+            self.script(Ok(reply(message, finish_reason)));
+            self
+        }
+
         /// The next reply is cut off at the token cap: the endpoint stopped it
         /// mid-answer (`finish_reason: length`), which is what a model does when
         /// it tries to write a whole file in one call.
@@ -325,6 +335,24 @@ pub(crate) mod fake {
         /// real client does: a caller that trusts the flag sees the same thing.
         pub fn cancels(mut self) -> Self {
             self.script(Err(ModelError::Cancelled));
+            self
+        }
+
+        /// The reply just scripted carries the endpoint's own token counts, the
+        /// way a server that reports `usage` calls do — and a server that does
+        /// not is every other scripted reply.
+        pub fn with_usage(self, prompt: u64, completion: u64, total: u64) -> Self {
+            let mut rules = self.rules.lock().expect("no test panicked mid-script");
+            if let Some(rule) = rules.back_mut() {
+                if let Answer::Now(Ok(reply)) | Answer::Held(_, Ok(reply)) = &mut rule.answer {
+                    reply.usage = Some(Usage {
+                        prompt_tokens: prompt,
+                        completion_tokens: completion,
+                        total_tokens: total,
+                    });
+                }
+            }
+            drop(rules);
             self
         }
 
@@ -418,6 +446,7 @@ pub(crate) mod fake {
                 finish_reason: Some(finish_reason.to_string()),
             }],
             error: None,
+            usage: None,
         }
     }
 

@@ -66,6 +66,87 @@ fn reply_cap(cfg: &Config) -> u32 {
     let share = (cfg.context_tokens / 4) as u64;
     MAX_REPLY_TOKENS.min(share.max(1024) as u32)
 }
+/// The real token counts the endpoint reported for this run's calls, summed
+/// over the turns it reported them on. `None` until a reply carries `usage`: a
+/// server that reports none leaves mush's own bytes-per-token estimate as the
+/// only number there is, and that estimate is what the UI's meter shows.
+#[derive(Clone, Copy, Default)]
+struct RunUsage {
+    prompt: u64,
+    completion: u64,
+    total: u64,
+    /// Whether a reply that was counted left the total out. A sum with a hole
+    /// in it is not a total, so the two parts stand in for one.
+    total_missing: bool,
+}
+
+impl RunUsage {
+    fn add(&mut self, usage: &mush_core::Usage) {
+        self.prompt += usage.prompt_tokens;
+        self.completion += usage.completion_tokens;
+        if usage.total_tokens == 0 {
+            self.total_missing = true;
+        } else {
+            self.total += usage.total_tokens;
+        }
+    }
+
+    /// The line the run reports. A server that omits the total still gets one:
+    /// the two parts are what it counted, and adding them invents nothing.
+    fn line(&self) -> String {
+        let total = if self.total_missing {
+            self.prompt + self.completion
+        } else {
+            self.total
+        };
+        format!(
+            "the endpoint counted {} prompt + {} completion tokens this run ({total} total)",
+            self.prompt, self.completion
+        )
+    }
+}
+
+/// Report the endpoint's own numbers once, when the run ends. Cheap and rare
+/// (one line per run), and the only place a real count can come from: the
+/// UI's meter is bytes/3, which is all a server without `usage` offers.
+fn report_usage(actor: &Actor, usage: Option<RunUsage>) {
+    if let Some(usage) = usage {
+        actor.ctx.emit(actor.id, AgentEvent::Notice(usage.line()));
+    }
+}
+
+/// The reply's finish reason when it is none of the three mush understands:
+/// `stop`, a tool batch, and the token cap. `content_filter` is the endpoint
+/// refusing to hand over what the model wrote; any other value is a reply the
+/// endpoint chose not to finish normally. Neither is a result — and with no
+/// content a refused reply used to surface as an empty one, which reads as the
+/// model having nothing to say.
+///
+/// A missing reason — or an empty one, which some servers send instead of
+/// `stop` — says nothing, and is the only reason read as a normal end besides
+/// the three.
+fn refusal_reason(finish_reason: Option<&str>) -> Option<&str> {
+    match finish_reason {
+        None | Some("") | Some("stop") | Some("tool_calls") | Some("length") => None,
+        Some(other) => Some(other),
+    }
+}
+
+/// Why a refused reply is not a result, in the run's own words. `length` gets
+/// its own account (the cap can be asked down and retried); a refusal is the
+/// endpoint's verdict and no amount of retrying inside one run changes it.
+fn refusal_error(reason: &str) -> String {
+    match reason {
+        "content_filter" => "the model's reply was stopped by the endpoint's content filter \
+                             (finish_reason: content_filter) — the endpoint refused to answer"
+            .to_string(),
+        other => format!(
+            "the model's reply ended with an unsupported finish_reason: {other} \
+             — the endpoint did not finish the answer"
+        ),
+    }
+}
+
 /// Consecutive cut-off replies before the run gives up. A cut reply is usually
 /// a *too big* answer — a whole file in one `write_file`, or a long reasoning
 /// pass — not a broken model, so the run asks for smaller pieces and carries
@@ -838,6 +919,9 @@ fn run_loop(
     let mut repeats = 0usize;
     // Consecutive replies the endpoint cut off at the token cap.
     let mut cut_offs = 0usize;
+    // What the endpoint itself counted, when it says: the UI's meter is an
+    // estimate, and this is the one number that is not.
+    let mut usage: Option<RunUsage> = None;
 
     for turn in 0..RUNAWAY_TURNS {
         // The last turn is a wrap-up: no tools, and a request for a summary.
@@ -988,12 +1072,20 @@ fn run_loop(
         let Some(choice) = reply.choices.into_iter().next() else {
             return Err("model returned no choices".to_string());
         };
+        // Read before the reply's other parts are consumed below.
+        if let Some(reported) = reply.usage.as_ref() {
+            usage.get_or_insert_with(RunUsage::default).add(reported);
+        }
         // `length` means the endpoint cut the reply off at `max_tokens` — with
         // a thinking model the cap can be spent before any visible text. Such a
         // reply is not a result: the text is partial and a tool call may be
         // half-written JSON, so the run fails loudly below instead of ending as
         // if the work were done.
-        let truncated = choice.finish_reason.as_deref() == Some("length");
+        let finish = choice.finish_reason.as_deref().map(str::trim);
+        let truncated = finish == Some("length");
+        // Any other reason mush does not know — `content_filter` first among
+        // them — is not a normal end either, and must not be read as one.
+        let refused = refusal_reason(finish).map(str::to_string);
 
         let assistant = sanitize_tool_calls(choice.message);
         let tool_calls = assistant.tool_calls().to_vec();
@@ -1049,6 +1141,25 @@ fn run_loop(
             );
             messages.push(Message::user(TRUNCATION_INSTRUCTION));
             continue;
+        }
+
+        if let Some(reason) = refused {
+            // A refused reply may still carry tool calls (a filtering endpoint
+            // emits the call, then stops). Answer them, never run them: half a
+            // plan is not a plan, and a dangling call would poison every later
+            // request in the conversation.
+            for call in &tool_calls {
+                let message = Message::tool(
+                    call.id.clone(),
+                    format!(
+                        "error: the model's reply ended with finish_reason: {reason}; \
+                         this call was not run"
+                    ),
+                );
+                messages.push(message.clone());
+                actor.ctx.emit(actor.id, AgentEvent::Message(message));
+            }
+            return Err(refusal_error(&reason));
         }
 
         // The same batch of calls, twice in a row with nothing changed in
@@ -1107,6 +1218,7 @@ fn run_loop(
                     "stopped after {RUNAWAY_TURNS} turns without finishing (runaway guard)"
                 ))
             } else {
+                report_usage(actor, usage);
                 Ok(Some(content))
             };
         }
@@ -1149,6 +1261,7 @@ fn run_loop(
             if steered {
                 continue;
             }
+            report_usage(actor, usage);
             return Ok(if content.is_empty() {
                 None
             } else {
@@ -2965,6 +3078,254 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
         let _ = rx;
         let _ = mailbox;
+    }
+
+    /// Some compatible servers (and models) answer with a tool call that has no
+    /// id, or repeat one across a batch. Strict servers pair a result with its
+    /// call *by id*, so the run must answer each call — with its own id, never
+    /// `""` and never a duplicate.
+    #[test]
+    fn a_reply_whose_calls_have_no_ids_still_gets_answered() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .calls(vec![
+                    tool_call("", "read_file", json!({ "path": "missing.rs" })),
+                    tool_call("dup", "read_file", json!({ "path": "missing.rs" })),
+                    tool_call("dup", "list_files", json!({})),
+                ])
+                .says("done"),
+        );
+        let (actor, _events, mailbox) = scripted_actor("id-less-calls", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("look around"),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("done"));
+
+        // The second request carries the assistant's calls and their results:
+        // the pairing a server validates is exactly this.
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 2, "the batch, then the answer");
+        let ids: Vec<String> = asked[1]
+            .messages
+            .iter()
+            .flat_map(|message| message.tool_calls().iter().map(|call| call.id.clone()))
+            .collect();
+        assert_eq!(ids.len(), 3);
+        assert!(ids.iter().all(|id| !id.trim().is_empty()), "{ids:?}");
+        let mut unique = ids.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            3,
+            "each call is answerable on its own: {ids:?}"
+        );
+
+        let answered: Vec<String> = asked[1]
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .map(|message| message.tool_call_id.clone().unwrap_or_default())
+            .collect();
+        assert_eq!(
+            answered, ids,
+            "every result answers the id that asked for it"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// `length` is not the only reason a reply is not an answer.
+    /// `content_filter` is the endpoint saying it refused to hand over what the
+    /// model wrote, and an unknown reason is no more a normal end — neither may
+    /// be reported as if the model had simply had nothing to say.
+    #[test]
+    fn a_refused_reply_is_an_error_not_an_empty_answer() {
+        let scripted =
+            Arc::new(Scripted::new().finishing(Message::assistant(""), "content_filter"));
+        let (actor, events, mailbox) = scripted_actor("filtered", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("say something"),
+        ];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+        assert!(error.contains("content_filter"), "{error}");
+        assert!(error.contains("refused"), "{error}");
+        assert!(
+            !events.events_for(AgentId(7)).iter().any(
+                |event| matches!(event, AgentEvent::Notice(what) if what.contains("empty reply"))
+            ),
+            "a refusal is not an empty reply"
+        );
+        assert_eq!(scripted.asked().len(), 1, "a refusal is not retried");
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// A reason mush has never heard of is still the endpoint saying it did not
+    /// finish the answer; the run names it instead of ending as if it had.
+    #[test]
+    fn an_unknown_finish_reason_is_named_in_the_runs_error() {
+        let scripted =
+            Arc::new(Scripted::new().finishing(Message::assistant("half a th"), "safety"));
+        let (actor, _events, mailbox) = scripted_actor("unknown-reason", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::user("do the thing")];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+        assert!(error.contains("safety"), "{error}");
+        assert!(error.contains("finish_reason"), "{error}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// A refused reply can still carry the call it was about to make. It must
+    /// be answered (never run), or the transcript keeps a dangling call that
+    /// poisons every later request in the conversation.
+    #[test]
+    fn a_refused_reply_answers_the_calls_it_carried() {
+        let mut assistant = Message::assistant("");
+        assistant.tool_calls = Some(vec![tool_call(
+            "c0",
+            "write_file",
+            json!({ "path": "secret.txt", "content": "x" }),
+        )]);
+        let scripted = Arc::new(Scripted::new().finishing(assistant, "content_filter"));
+        let (actor, _events, mailbox) = scripted_actor("filtered-call", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::user("write the file")];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+        assert!(error.contains("content_filter"), "{error}");
+        assert!(
+            !actor.ws.root().join("secret.txt").exists(),
+            "a call from a refused reply must never run"
+        );
+        assert_eq!(messages[1].role, "assistant");
+        assert_eq!(messages[2].role, "tool");
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("c0"));
+        assert!(
+            messages[2].text().contains("was not run"),
+            "{}",
+            messages[2].text()
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// A server that reports `usage` is the only source of a *real* token
+    /// count: the UI's meter is bytes/3. The run reports what it was told,
+    /// once, when the run ends.
+    #[test]
+    fn the_run_reports_the_endpoints_own_token_counts() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .says("all done")
+                .with_usage(1_200, 34, 1_234),
+        );
+        let (actor, events, mailbox) = scripted_actor("usage", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::system("you are mush"), Message::user("say hi")];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("all done"));
+
+        let usage: Vec<String> = notices(&events);
+        assert_eq!(usage.len(), 1, "one line per run: {usage:?}");
+        assert_eq!(
+            usage[0],
+            "the endpoint counted 1200 prompt + 34 completion tokens this run (1234 total)"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// A run is more than one call, and the number reported is the run's: the
+    /// parts are added up, and a server that never sends `total_tokens` still
+    /// gets one that adds up.
+    #[test]
+    fn the_runs_usage_adds_up_over_its_calls() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .calls(vec![tool_call("c1", "list_files", json!({}))])
+                .with_usage(1_100, 11, 1_111)
+                .says("done")
+                // The same server, not reporting a total this time.
+                .with_usage(2_200, 22, 0),
+        );
+        let (actor, events, mailbox) = scripted_actor("usage-sum", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::user("look around")];
+
+        run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        let usage: Vec<String> = notices(&events);
+        assert_eq!(usage.len(), 1, "{usage:?}");
+        assert_eq!(
+            usage[0],
+            "the endpoint counted 3300 prompt + 33 completion tokens this run (3333 total)"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// A server that reports nothing leaves mush's own estimate as the only
+    /// number there is, and the run says nothing it was not told.
+    #[test]
+    fn a_server_without_usage_reports_no_numbers() {
+        let scripted = Arc::new(Scripted::new().says("all done"));
+        let (actor, events, mailbox) = scripted_actor("usage-none", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::user("say hi")];
+
+        run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert!(notices(&events).is_empty(), "{:?}", notices(&events));
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// The usage lines a run emitted, in order.
+    fn notices(events: &Recorder) -> Vec<String> {
+        events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(what) if what.contains("endpoint counted") => Some(what),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The three reasons mush does understand are the only ones read as ends:
+    /// everything else goes to `refusal_reason`.
+    #[test]
+    fn only_stop_a_tool_batch_and_the_cap_are_normal_ends() {
+        for reason in [
+            None,
+            Some(""),
+            Some("stop"),
+            Some("tool_calls"),
+            Some("length"),
+        ] {
+            assert_eq!(refusal_reason(reason), None, "{reason:?}");
+        }
+        for reason in ["content_filter", "safety", "eos"] {
+            assert_eq!(refusal_reason(Some(reason)), Some(reason), "{reason:?}");
+        }
+        assert!(refusal_error("content_filter").contains("content filter"));
+        assert!(refusal_error("safety").contains("safety"));
     }
 
     /// A model that keeps answering too big has to end the run: the bounded
