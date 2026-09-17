@@ -7,7 +7,7 @@
 
 use serde_json::{json, Value};
 
-use crate::tools::ORCHESTRATION_TOOLS;
+use crate::tools::ToolName;
 
 /// The whole root-agent system prompt. If this grows much, something else went
 /// wrong.
@@ -71,22 +71,23 @@ pub fn compaction_message(summary: &str) -> String {
     format!("Context compacted — continue the task from this summary:\n{summary}")
 }
 
-fn tool(name: &str, description: &str, parameters: Value) -> Value {
+fn tool(name: ToolName, description: &str, parameters: Value) -> Value {
     json!({
         "type": "function",
         "function": {
-            "name": name,
+            "name": name.as_str(),
             "description": description,
             "parameters": parameters,
         }
     })
 }
 
-/// JSON-Schema tool definitions in the OpenAI `tools` format.
+/// JSON-Schema tool definitions in the OpenAI `tools` format, keyed by the tool
+/// they describe: a schema without an executor cannot be written down.
 pub fn tool_schemas() -> Vec<Value> {
     vec![
         tool(
-            "list_files",
+            ToolName::ListFiles,
             "List files, optionally under a subdirectory.",
             json!({
                 "type": "object",
@@ -96,7 +97,7 @@ pub fn tool_schemas() -> Vec<Value> {
             }),
         ),
         tool(
-            "read_file",
+            ToolName::ReadFile,
             "Read a text file (may be truncated).",
             json!({
                 "type": "object",
@@ -105,7 +106,7 @@ pub fn tool_schemas() -> Vec<Value> {
             }),
         ),
         tool(
-            "write_file",
+            ToolName::WriteFile,
             "Create or replace a file.",
             json!({
                 "type": "object",
@@ -117,8 +118,8 @@ pub fn tool_schemas() -> Vec<Value> {
             }),
         ),
         tool(
-            "edit_file",
-            "Replace text: one old_string/new_string, or `edits` for several replacements at once. A batch lands all-or-nothing in one call, so prefer it for multi-part changes. Ambiguous matches are refused unless replace_all is set.",
+            ToolName::EditFile,
+            "Replace text: one old_string/new_string, or `edits` for several replacements at once.A batch lands all-or-nothing in one call, so prefer it for multi-part changes. Ambiguous matches are refused unless replace_all is set.",
             json!({
                 "type": "object",
                 "properties": {
@@ -143,7 +144,7 @@ pub fn tool_schemas() -> Vec<Value> {
             }),
         ),
         tool(
-            "run_command",
+            ToolName::RunCommand,
             "Run a shell command in the workspace root.",
             json!({
                 "type": "object",
@@ -154,7 +155,7 @@ pub fn tool_schemas() -> Vec<Value> {
             }),
         ),
         tool(
-            "spawn_agent",
+            ToolName::SpawnAgent,
             "Delegate a self-contained task to a subagent with no memory here: the brief must carry all context, the deliverable, and the expected output. Only one non-isolated subagent runs at a time. Returns its id.",
             json!({
                 "type": "object",
@@ -166,7 +167,7 @@ pub fn tool_schemas() -> Vec<Value> {
             }),
         ),
         tool(
-            "wait_agents",
+            ToolName::WaitAgents,
             "Block until a child finishes, or the timeout expires; returns its id and summary.",
             json!({
                 "type": "object",
@@ -177,13 +178,13 @@ pub fn tool_schemas() -> Vec<Value> {
             }),
         ),
         tool(
-            "agent_status",
+            ToolName::AgentStatus,
             "Describe your children: running, finished, failed, or stopped (idle until messaged).",
             json!({ "type": "object", "properties": {} }),
         ),
         tool(
-            "agent_control",
-            "Stop a child or message it. Stopping is not finishing: it keeps its context and work, and a later message resumes it.",
+            ToolName::AgentControl,
+            "Stop a child or message it.Stopping is not finishing: it keeps its context and work, and a later message resumes it.",
             json!({
                 "type": "object",
                 "properties": {
@@ -203,7 +204,10 @@ pub fn leaf_tool_schemas() -> Vec<Value> {
     tool_schemas()
         .into_iter()
         .filter(|schema| {
-            !ORCHESTRATION_TOOLS.contains(&schema["function"]["name"].as_str().unwrap_or(""))
+            let name = schema["function"]["name"].as_str().unwrap_or("");
+            // A schema whose name is not a tool is a bug this filter cannot
+            // hide: `schemas_match_the_tool_names` asserts the list matches.
+            !ToolName::parse(name).is_some_and(ToolName::is_orchestration)
         })
         .collect()
 }

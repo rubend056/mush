@@ -25,6 +25,7 @@ use tempfile::NamedTempFile;
 
 use mush_core::config::parse_context_hint;
 use mush_core::message::{ChatRequest, ChatResponse};
+use mush_core::tools::ToolName;
 use mush_core::transcript::{
     needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
     COMPACT_REPLY_TOKENS,
@@ -988,15 +989,21 @@ fn run_loop(
                 return Err(CANCELLED.to_string());
             }
 
-            let name = call.function.name.clone();
+            let named = call.function.name.clone();
             let args: Value = serde_json::from_str(&call.function.arguments).unwrap_or(Value::Null);
 
+            // An invented name is answered like any other failure, so the batch
+            // still gets a tool message for every call.
+            let tool = ToolName::parse(&named);
             actor.ctx.emit(
                 actor.id,
-                AgentEvent::Status(format!("{} {}", name, summarize(&args))),
+                AgentEvent::Status(format!("{} {}", named, summarize(&args))),
             );
 
-            let result = exec_tool(actor, state, &name, &args, cancel);
+            let result = match tool {
+                Some(tool) => exec_tool(actor, state, tool, &args, cancel),
+                None => Err(format!("unknown tool `{named}`")),
+            };
 
             let output = match result {
                 Ok(output) => output,
@@ -1190,24 +1197,25 @@ fn note_completion(state: &mut ActorState, id: u64, outcome: Outcome) -> String 
 fn exec_tool(
     actor: &Actor,
     state: &mut ActorState,
-    name: &str,
+    tool: ToolName,
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<String, String> {
-    match name {
-        "run_command" => run_command(actor, state, args, cancel),
-        "spawn_agent" => spawn_tool(actor, state, args),
-        "wait_agents" => wait_tool(actor, state, cancel, args),
-        "agent_status" => status_tool(state),
-        "agent_control" => control_tool(state, args),
-        _ => {
+    match tool {
+        ToolName::RunCommand => run_command(actor, state, args, cancel),
+        ToolName::SpawnAgent => spawn_tool(actor, state, args),
+        ToolName::WaitAgents => wait_tool(actor, state, cancel, args),
+        ToolName::AgentStatus => status_tool(state),
+        ToolName::AgentControl => control_tool(state, args),
+        // The file tools read and write the workspace directly.
+        ToolName::ListFiles | ToolName::ReadFile | ToolName::WriteFile | ToolName::EditFile => {
             let cfg = actor
                 .ctx
                 .cfg
                 .lock()
                 .map(|config| config.clone())
                 .unwrap_or_else(|_| Config::new("http://127.0.0.1:1", "", None));
-            direct_tool(&actor.ws, name, args, &cfg)
+            direct_tool(&actor.ws, tool, args, &cfg)
         }
     }
 }
@@ -1551,20 +1559,25 @@ fn create_worktree(
 /// The five file tools, executed against a workspace on disk. Only the agent's
 /// own thread touches the files: the human's screen never holds a copy, so
 /// there is nothing to keep in sync.
-fn direct_tool(ws: &Workspace, name: &str, args: &Value, cfg: &Config) -> Result<String, String> {
-    match name {
-        "list_files" => tools::list_result(ws, args, cfg.list_limit()),
-        "read_file" => {
+fn direct_tool(
+    ws: &Workspace,
+    tool: ToolName,
+    args: &Value,
+    cfg: &Config,
+) -> Result<String, String> {
+    match tool {
+        ToolName::ListFiles => tools::list_result(ws, args, cfg.list_limit()),
+        ToolName::ReadFile => {
             let rel = tools::arg_string(args, "path")?;
             ws.read_file(&rel, cfg.read_cap())
         }
-        "write_file" => {
+        ToolName::WriteFile => {
             let rel = tools::arg_string(args, "path")?;
             let content = tools::arg_string(args, "content")?;
             ws.write_file(&rel, &content)?;
             Ok(format!("wrote {rel}"))
         }
-        "edit_file" => {
+        ToolName::EditFile => {
             let rel = tools::arg_string(args, "path")?;
             let current = ws.read_file(&rel, usize::MAX)?;
             // A list of edits is applied to one read and written once: all of
@@ -1594,7 +1607,9 @@ fn direct_tool(ws: &Workspace, name: &str, args: &Value, cfg: &Config) -> Result
             ws.write_file(&rel, &updated)?;
             Ok(format!("edited {rel}"))
         }
-        other => Err(format!("unknown tool `{other}`")),
+        // Everything else is dispatched by `exec_tool`: reaching here would
+        // mean a tool with no implementation, which the match now forbids.
+        other => Err(format!("`{other}` is not a file tool")),
     }
 }
 
@@ -2291,7 +2306,7 @@ mod tests {
         ] {
             direct_tool(
                 &actor.ws,
-                "edit_file",
+                ToolName::EditFile,
                 &json!({ "path": "f.rs", "old_string": old, "new_string": new }),
                 &cfg,
             )
@@ -2315,7 +2330,7 @@ mod tests {
 
         let error = direct_tool(
             &actor.ws,
-            "edit_file",
+            ToolName::EditFile,
             &json!({ "path": "f.rs", "old_string": "x = ", "new_string": "y = " }),
             &cfg,
         )

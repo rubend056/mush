@@ -4,32 +4,103 @@
 //! drift apart. The bytes always come from disk: mush holds no open file, so
 //! there is no second copy for a tool result to disagree with.
 
+use std::fmt;
+
 use serde_json::Value;
 
 use crate::workspace::Workspace;
 
-/// Every tool the model may call, in schema order. `prompt::tool_schemas` is
-/// tested against this list, so a schema and its executor cannot drift.
-pub const TOOL_NAMES: [&str; 9] = [
-    "list_files",
-    "read_file",
-    "write_file",
-    "edit_file",
-    "run_command",
-    "spawn_agent",
-    "wait_agents",
-    "agent_status",
-    "agent_control",
-];
+/// Every tool the model may call.
+///
+/// The schemas, the dispatcher and the prompt all name tools through this enum,
+/// so adding a tool is a compile error in every place that has to know about it
+/// instead of a string that silently never matches.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolName {
+    ListFiles,
+    ReadFile,
+    WriteFile,
+    EditFile,
+    RunCommand,
+    SpawnAgent,
+    WaitAgents,
+    AgentStatus,
+    AgentControl,
+}
 
-/// The tools that exist for delegation only. A leaf agent (at `MAX_DEPTH`)
-/// does not receive them, which is what bounds the tree.
-pub const ORCHESTRATION_TOOLS: [&str; 4] = [
-    "spawn_agent",
-    "wait_agents",
-    "agent_status",
-    "agent_control",
-];
+impl ToolName {
+    /// Every tool, in schema order. `prompt::tool_schemas` is tested against
+    /// this list, so a schema and its executor cannot drift.
+    pub const ALL: [ToolName; 9] = [
+        ToolName::ListFiles,
+        ToolName::ReadFile,
+        ToolName::WriteFile,
+        ToolName::EditFile,
+        ToolName::RunCommand,
+        ToolName::SpawnAgent,
+        ToolName::WaitAgents,
+        ToolName::AgentStatus,
+        ToolName::AgentControl,
+    ];
+
+    /// The tools that exist for delegation only. A leaf agent (at `MAX_DEPTH`)
+    /// does not receive them, which is what bounds the tree.
+    pub const ORCHESTRATION: [ToolName; 4] = [
+        ToolName::SpawnAgent,
+        ToolName::WaitAgents,
+        ToolName::AgentStatus,
+        ToolName::AgentControl,
+    ];
+
+    /// The name the model calls this tool by.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ToolName::ListFiles => "list_files",
+            ToolName::ReadFile => "read_file",
+            ToolName::WriteFile => "write_file",
+            ToolName::EditFile => "edit_file",
+            ToolName::RunCommand => "run_command",
+            ToolName::SpawnAgent => "spawn_agent",
+            ToolName::WaitAgents => "wait_agents",
+            ToolName::AgentStatus => "agent_status",
+            ToolName::AgentControl => "agent_control",
+        }
+    }
+
+    /// The tool a name refers to, or `None` when the model invented one.
+    pub fn parse(name: &str) -> Option<ToolName> {
+        Self::ALL.into_iter().find(|tool| tool.as_str() == name)
+    }
+
+    /// Whether this tool exists only for delegation.
+    pub fn is_orchestration(self) -> bool {
+        Self::ORCHESTRATION.contains(&self)
+    }
+}
+
+impl fmt::Display for ToolName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// The names of a list of tools, in the order given.
+const fn names<const N: usize>(tools: [ToolName; N]) -> [&'static str; N] {
+    let mut out = [""; N];
+    let mut index = 0;
+    while index < N {
+        out[index] = tools[index].as_str();
+        index += 1;
+    }
+    out
+}
+
+/// Every tool name, in schema order. Derived from [`ToolName::ALL`], so the two
+/// cannot disagree.
+pub const TOOL_NAMES: [&str; 9] = names(ToolName::ALL);
+
+/// The names of the delegation-only tools.
+pub const ORCHESTRATION_TOOLS: [&str; 4] = names(ToolName::ORCHESTRATION);
 
 /// A required string argument.
 pub fn arg_string(args: &Value, key: &str) -> Result<String, String> {
@@ -238,6 +309,28 @@ mod tests {
             edit_text_many(file, &[all], "f.rs").unwrap(),
             "new_name();\nnew_name(arg);\n"
         );
+    }
+
+    /// One name per variant, and parsing it back gives the same tool: the
+    /// schema table and the dispatcher are two views of one list.
+    #[test]
+    fn every_tool_name_round_trips() {
+        for tool in ToolName::ALL {
+            assert_eq!(ToolName::parse(tool.as_str()), Some(tool));
+            assert_eq!(tool.to_string(), tool.as_str());
+        }
+        assert_eq!(ToolName::parse("list_files"), Some(ToolName::ListFiles));
+        assert_eq!(ToolName::parse("nonsense"), None);
+
+        // The names derive from the enum, in the same order.
+        let all: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
+        assert_eq!(all, TOOL_NAMES.to_vec());
+        let orchestration: Vec<&str> = ToolName::ORCHESTRATION.iter().map(|t| t.as_str()).collect();
+        assert_eq!(orchestration, ORCHESTRATION_TOOLS.to_vec());
+        assert!(ToolName::ALL
+            .iter()
+            .skip(5)
+            .all(|tool| tool.is_orchestration()));
     }
 
     #[test]
