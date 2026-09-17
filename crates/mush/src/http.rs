@@ -1,18 +1,21 @@
 //! A tiny blocking HTTP/1.1 client.
 //!
 //! mush only ever talks to OpenAI-compatible endpoints, so a whole HTTP stack
-//! would be overkill. This handles exactly what we need: one request per
-//! connection, with `Content-Length` or chunked responses, over plain HTTP or
-//! TLS (rustls). Keeping it in-tree means no framework and no runtime to debug.
+//! would be overkill. This handles exactly what we need: `Content-Length` or
+//! chunked responses, over plain HTTP or TLS (rustls), and one connection kept
+//! per endpoint and reused (`Connection: keep-alive`) instead of a fresh
+//! TCP+TLS handshake for every call. Keeping it in-tree means no framework and
+//! no runtime to debug.
 //!
 //! A chat request can be *watched*: the socket is read in short slices and the
 //! caller's cancellation flag is polled between them, so Ctrl-C interrupts a
 //! model that is still thinking instead of waiting for its reply.
 
+use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mush_core::Config;
@@ -48,19 +51,24 @@ pub struct Response {
 
 /// Anything the client can read from and write to: a plain TCP stream or a
 /// rustls TLS stream. `Box<dyn Read + Write>` is not a valid trait object, so
-/// one supertrait is needed.
-trait ReadWrite: Read + Write {}
-impl<T: Read + Write> ReadWrite for T {}
+/// one supertrait is needed. `Send` because a kept connection is parked in the
+/// pool a whole tree of actors shares.
+trait ReadWrite: Read + Write + Send {}
+impl<T: Read + Write + Send> ReadWrite for T {}
 
 pub fn get_json(url: &str, api_key: Option<&str>, read_timeout: Duration) -> io::Result<Response> {
     request(
-        "GET",
-        url,
-        None,
-        api_key,
-        read_timeout,
-        None,
+        &Ask {
+            method: "GET",
+            url,
+            body: None,
+            api_key,
+            read_timeout,
+            cancel: None,
+        },
         clock::system(),
+        &POOL,
+        &mut connect,
     )
 }
 
@@ -74,13 +82,17 @@ pub fn post_json(
     cancel: &AtomicBool,
 ) -> io::Result<Response> {
     request(
-        "POST",
-        url,
-        Some(body),
-        api_key,
-        CHAT_READ_TIMEOUT,
-        Some(cancel),
+        &Ask {
+            method: "POST",
+            url,
+            body: Some(body),
+            api_key,
+            read_timeout: CHAT_READ_TIMEOUT,
+            cancel: Some(cancel),
+        },
         clock::system(),
+        &POOL,
+        &mut connect,
     )
 }
 
@@ -141,51 +153,208 @@ fn model_of(value: &serde_json::Value) -> Option<Model> {
     })
 }
 
-fn request(
-    method: &str,
-    url: &str,
-    body: Option<&str>,
-    api_key: Option<&str>,
+/// One request: what to send, and everything the transport needs beside it.
+/// Gathered into a value because the transport takes more than a handful of
+/// arguments now that the pool and the opener sit beside the request itself.
+struct Ask<'a> {
+    method: &'a str,
+    url: &'a str,
+    body: Option<&'a str>,
+    api_key: Option<&'a str>,
     read_timeout: Duration,
-    cancel: Option<&AtomicBool>,
-    clock: &dyn Clock,
-) -> io::Result<Response> {
-    let watch = Watch::new(cancel, read_timeout, clock);
+    cancel: Option<&'a AtomicBool>,
+}
+
+/// The endpoint a connection belongs to. Reuse is per host, port and scheme,
+/// because that is what a connection *is*: anything coarser would hand a stream
+/// to a request that never spoke to it.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct Endpoint {
+    host: String,
+    port: u16,
+    tls: bool,
+}
+
+/// One connection to an endpoint, with the buffer reads go through. The pool
+/// keeps it between requests, so it is both what a request reads and what a
+/// kept connection is.
+type Socket = BufReader<Box<dyn ReadWrite>>;
+
+/// One connection per endpoint, kept for the next request to that endpoint.
+///
+/// Conservative on purpose: a connection is *taken* before it is used, so two
+/// requests can never hold the same one, and it is only *kept* after a reply
+/// that framed itself (a `Content-Length` or chunked body) and did not say
+/// `Connection: close`. Anything else — an error, a body that ended at the
+/// stream's end, a server that hangs up — leaves the pool empty, so no request
+/// can ever be handed a connection that failed. A kept connection the server
+/// has since closed is retried once on a fresh one, and never counted twice.
+#[derive(Default)]
+struct Pool {
+    /// Made on first keep rather than up front, so the pool can be a `static`
+    /// that costs nothing until a connection is worth keeping.
+    idle: Mutex<Option<HashMap<Endpoint, Socket>>>,
+}
+
+impl Pool {
+    const fn new() -> Self {
+        Self {
+            idle: Mutex::new(None),
+        }
+    }
+
+    /// Take the connection kept for this endpoint, if there is one. It is
+    /// removed: the caller owns it for the request, and putting it back is what
+    /// a successful, reusable reply does.
+    fn take(&self, endpoint: &Endpoint) -> Option<Socket> {
+        self.idle.lock().ok()?.as_mut()?.remove(endpoint)
+    }
+
+    /// Keep this connection for the next request to the same endpoint. One per
+    /// endpoint: a newer stream replaces an older one rather than joining it,
+    /// so a pool can never grow past the endpoints mush talks to.
+    fn keep(&self, endpoint: Endpoint, stream: Socket) {
+        if let Ok(mut idle) = self.idle.lock() {
+            idle.get_or_insert_with(HashMap::new)
+                .insert(endpoint, stream);
+        }
+    }
+
+    #[cfg(test)]
+    fn idle(&self) -> usize {
+        self.idle
+            .lock()
+            .ok()
+            .and_then(|idle| idle.as_ref().map(HashMap::len))
+            .unwrap_or(0)
+    }
+}
+
+/// The pool every real request goes through. One process is one mush, and one
+/// endpoint is one host, so this is the tree's connection.
+static POOL: Pool = Pool::new();
+
+/// What opens a connection. The real client connects a socket; a test hands
+/// back an in-memory stream, so reuse — and a kept connection that died — are
+/// provable with no socket and no server.
+type Open<'a> = &'a mut dyn FnMut(&str, u16, bool, Duration) -> io::Result<Box<dyn ReadWrite>>;
+
+fn request(ask: &Ask<'_>, clock: &dyn Clock, pool: &Pool, open: Open<'_>) -> io::Result<Response> {
+    let watch = Watch::new(ask.cancel, ask.read_timeout, clock);
     // A Stop that arrived before the request did: do not pay for a call the
     // human already cancelled.
     watch.check()?;
 
-    let (host, port, path, tls) = parse_url(url)?;
-    let mut stream = connect(&host, port, tls, read_timeout)?;
+    let (host, port, path, tls) = parse_url(ask.url)?;
+    let endpoint = Endpoint {
+        host: host.clone(),
+        port,
+        tls,
+    };
 
-    let mut head = format!(
-        "{method} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: close\r\nAccept: application/json\r\n"
-    );
-    if let Some(key) = api_key {
-        head.push_str(&format!("Authorization: Bearer {key}\r\n"));
+    // The connection the last request to this endpoint left behind, or a fresh
+    // one. `reused` is what tells a dead kept connection apart from an endpoint
+    // that will not talk to us.
+    let pooled = pool.take(&endpoint);
+    let reused = pooled.is_some();
+    let stream = match pooled {
+        Some(stream) => stream,
+        None => BufReader::new(open(&host, port, tls, ask.read_timeout)?),
+    };
+
+    match exchange(stream, ask, &host, port, &path, &watch) {
+        Ok((response, stream, reusable)) => {
+            if reusable {
+                pool.keep(endpoint, stream);
+            }
+            Ok(response)
+        }
+        Err((error, heard)) => {
+            // A kept connection the server had already closed. Nothing was
+            // heard from it — not one byte of an answer — so the request was
+            // never answered and sending it again cannot duplicate anything.
+            // One retry, only for a connection that was reused, and never for a
+            // cancellation or a deadline: those are decisions, not a dead
+            // socket, and must be reported as themselves.
+            let dead_kept = reused
+                && !heard
+                && !watch.cancelled()
+                && !matches!(
+                    error.kind(),
+                    io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+                );
+            if !dead_kept {
+                return Err(error);
+            }
+            watch.check()?;
+            let fresh = BufReader::new(open(&host, port, tls, ask.read_timeout)?);
+            match exchange(fresh, ask, &host, port, &path, &watch) {
+                Ok((response, stream, reusable)) => {
+                    if reusable {
+                        pool.keep(endpoint, stream);
+                    }
+                    Ok(response)
+                }
+                Err((error, _)) => Err(error),
+            }
+        }
     }
-    if let Some(body) = body {
-        head.push_str(&format!(
-            "Content-Type: application/json\r\nContent-Length: {}\r\n",
-            body.len()
-        ));
+}
+
+/// One request and its reply on one connection.
+///
+/// `Ok` hands the connection back so the caller can keep it, with whether the
+/// reply framed itself well enough to be worth keeping. `Err` says whether any
+/// byte of the answer had arrived: nothing heard means the connection was dead
+/// before the endpoint saw the request, which is the only failure a retry on a
+/// fresh connection cannot duplicate.
+fn exchange(
+    mut stream: Socket,
+    ask: &Ask<'_>,
+    host: &str,
+    port: u16,
+    path: &str,
+    watch: &Watch,
+) -> Result<(Response, Socket, bool), (io::Error, bool)> {
+    let mut heard = false;
+    if let Err(error) = write_request(&mut stream, ask, host, port, path) {
+        return Err((error, heard));
     }
-    head.push_str("\r\n");
 
-    stream.write_all(head.as_bytes())?;
-    if let Some(body) = body {
-        stream.write_all(body.as_bytes())?;
-    }
-    stream.flush()?;
-
-    let mut reader = BufReader::new(stream);
-
-    let status_line = read_line(&mut reader, &watch)?.unwrap_or_default();
-    let status = parse_status(&status_line)?;
+    let status_line = match read_line(&mut stream, watch) {
+        Ok(Some(line)) => line,
+        // Nothing at all came back: the peer closed the connection before it
+        // answered (a kept connection the server has since dropped), which is
+        // not the same thing as a malformed status line, and must not be
+        // reported as one.
+        Ok(None) => {
+            return Err((
+                io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "the connection ended before it answered",
+                ),
+                heard,
+            ))
+        }
+        Err(error) => return Err((error, heard)),
+    };
+    heard = true;
+    let status = match parse_status(&status_line) {
+        Ok(status) => status,
+        Err(error) => return Err((error, heard)),
+    };
 
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
-    while let Some(line) = read_line(&mut reader, &watch)? {
+    let mut close = false;
+    loop {
+        let line = match read_line(&mut stream, watch) {
+            Ok(Some(line)) => line,
+            // The headers ended at the stream's end: the framing they would
+            // have given is simply absent, exactly as it was before.
+            Ok(None) => break,
+            Err(error) => return Err((error, heard)),
+        };
         if line.is_empty() {
             break;
         }
@@ -193,26 +362,82 @@ fn request(
         if let Some(value) = lower.strip_prefix("content-length:") {
             // A length we cannot parse is a broken message, not an absent one:
             // guessing "read to EOF" would silently change the framing.
-            content_length = Some(value.trim().parse().map_err(|_| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("malformed Content-Length: {:?}", value.trim()),
-                )
-            })?);
+            match value.trim().parse() {
+                Ok(length) => content_length = Some(length),
+                Err(_) => {
+                    return Err((
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("malformed Content-Length: {:?}", value.trim()),
+                        ),
+                        heard,
+                    ))
+                }
+            }
         } else if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
             chunked = true;
+        } else if lower.starts_with("connection:") && lower.contains("close") {
+            close = true;
         }
     }
 
     let body = if chunked {
-        read_chunked(&mut reader, &watch)?
+        read_chunked(&mut stream, watch)
     } else if let Some(len) = content_length {
-        String::from_utf8_lossy(&read_exact(&mut reader, len, &watch)?).into_owned()
+        read_exact(&mut stream, len, watch)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
     } else {
-        String::from_utf8_lossy(&read_to_end(&mut reader, &watch)?).into_owned()
+        read_to_end(&mut stream, watch).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+    };
+    let body = match body {
+        Ok(body) => body,
+        Err(error) => return Err((error, heard)),
     };
 
-    Ok(Response { status, body })
+    // A connection is only worth keeping when the reply said where it ended: a
+    // body framed as "until the stream closes" *is* the closed stream. HTTP/1.1
+    // keeps the connection alive unless the reply says otherwise, so only an
+    // HTTP/1.1 reply that did not say `close` is kept.
+    let reusable =
+        !close && (chunked || content_length.is_some()) && status_line.starts_with("HTTP/1.1");
+    Ok((Response { status, body }, stream, reusable))
+}
+
+/// The request head and its body, written whole and flushed: the reply cannot
+/// start before the endpoint has all of it, so a write error means the
+/// connection was already dead.
+///
+/// The write goes through `get_mut`, because std's `BufReader` is read-only.
+/// That is safe here and deliberate: the buffer holds bytes the *server* sent,
+/// in order, and a new request does not make them any less the server's.
+fn write_request(
+    stream: &mut Socket,
+    ask: &Ask<'_>,
+    host: &str,
+    port: u16,
+    path: &str,
+) -> io::Result<()> {
+    let mut head = format!(
+        "{} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: keep-alive\r\nAccept: application/json\r\n",
+        ask.method
+    );
+    if let Some(key) = ask.api_key {
+        head.push_str(&format!("Authorization: Bearer {key}\r\n"));
+    }
+    if let Some(body) = ask.body {
+        head.push_str(&format!(
+            "Content-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        ));
+    }
+    head.push_str("\r\n");
+
+    let out = stream.get_mut();
+    out.write_all(head.as_bytes())?;
+    if let Some(body) = ask.body {
+        out.write_all(body.as_bytes())?;
+    }
+    out.flush()
 }
 
 /// A cancellation flag and a deadline, threaded through one request's reads.
@@ -528,6 +753,7 @@ fn read_chunked<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<String>
 mod tests {
     use super::*;
     use crate::clock::fake::Advanceable;
+    use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
 
     #[test]
@@ -671,6 +897,295 @@ mod tests {
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
         assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// A connection a test drives by hand: `answers` are the raw bytes of the
+    /// replies, served one per request, everything written is recorded, and an
+    /// emptied queue is the stream's end. No socket, no server, no thread.
+    struct Wire {
+        answers: std::collections::VecDeque<Vec<u8>>,
+        current: Vec<u8>,
+        written: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl Read for Wire {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            if self.current.is_empty() {
+                match self.answers.pop_front() {
+                    Some(answer) => self.current = answer,
+                    // Nothing scripted left: the peer closed the connection,
+                    // which is exactly how a server drops an idle one.
+                    None => return Ok(0),
+                }
+            }
+            let take = buf.len().min(self.current.len());
+            buf[..take].copy_from_slice(&self.current[..take]);
+            self.current.drain(..take);
+            Ok(take)
+        }
+    }
+
+    impl Write for Wire {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.written
+                .lock()
+                .expect("no test panicked mid-write")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A connection that serves these replies, and records what is written.
+    fn wire(written: &Arc<Mutex<Vec<u8>>>, answers: &[&str]) -> Wire {
+        Wire {
+            answers: answers.iter().map(|a| a.as_bytes().to_vec()).collect(),
+            current: Vec::new(),
+            written: written.clone(),
+        }
+    }
+
+    /// An HTTP/1.1 200 with a `Content-Length` body, and any extra header lines
+    /// the test wants — each written with its own CRLF, so `Connection: close\r\n`
+    /// says what it looks like on the wire.
+    fn ok_with(headers: &str, body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{headers}\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// The shape every endpoint uses, and one a connection can be kept for.
+    fn ok(body: &str) -> String {
+        ok_with("", body)
+    }
+
+    /// One request through a pool and an opener the test owns — no socket, and
+    /// the pool is this test's alone.
+    fn send(pool: &Pool, open: Open<'_>, url: &str, body: &str) -> io::Result<Response> {
+        let ask = Ask {
+            method: "POST",
+            url,
+            body: Some(body),
+            api_key: Some("secret"),
+            read_timeout: Duration::from_secs(5),
+            cancel: None,
+        };
+        request(&ask, clock::system(), pool, open)
+    }
+
+    /// Two calls to one endpoint must not cost two TCP+TLS handshakes: the kept
+    /// connection serves the second request, and both replies parse.
+    #[test]
+    fn a_kept_connection_serves_the_next_request_to_the_same_endpoint() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opens = opened.clone();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(wire(&written, &[&ok("{\"one\":1}"), &ok("{\"two\":2}")]));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+            opens.fetch_add(1, Ordering::SeqCst);
+            match queue.pop_front() {
+                Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+                None => Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "the test scripted no more connections",
+                )),
+            }
+        };
+        let pool = Pool::new();
+        let url = "http://models.test:8078/v1/chat/completions";
+
+        let first = send(&pool, &mut opener, url, "{\"ask\":1}").unwrap();
+        let second = send(&pool, &mut opener, url, "{\"ask\":2}").unwrap();
+        assert_eq!(first.body, "{\"one\":1}");
+        assert_eq!(second.body, "{\"two\":2}");
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            1,
+            "one connection, two calls"
+        );
+        assert_eq!(pool.idle(), 1, "the connection is kept for the next call");
+
+        // Both requests went down that one connection, and neither asked the
+        // server to hang up after answering.
+        let sent = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        assert_eq!(sent.matches("POST /v1/chat/completions").count(), 2);
+        assert_eq!(sent.matches("Connection: keep-alive").count(), 2);
+        assert!(!sent.contains("Connection: close"), "{sent}");
+        assert!(sent.contains("Authorization: Bearer secret"), "{sent}");
+        assert!(sent.contains("{\"ask\":2}"), "the second body was sent");
+    }
+
+    /// A server closes an idle connection eventually. The stale one is
+    /// discovered, dropped, and the request is answered on a fresh connection —
+    /// not reported as a parse failure, and not retried forever.
+    #[test]
+    fn a_kept_connection_the_server_closed_is_replaced_once() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opens = opened.clone();
+        let mut queue = std::collections::VecDeque::new();
+        // Serves one reply, then ends the stream (the server hung up).
+        queue.push_back(wire(&written, &[&ok("{\"one\":1}")]));
+        // The connection opened after that answers normally.
+        queue.push_back(wire(&written, &[&ok("{\"two\":2}")]));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+            opens.fetch_add(1, Ordering::SeqCst);
+            match queue.pop_front() {
+                Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+                None => Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "the test scripted no more connections",
+                )),
+            }
+        };
+        let pool = Pool::new();
+        let url = "http://models.test:8078/v1/chat/completions";
+
+        assert_eq!(
+            send(&pool, &mut opener, url, "{}").unwrap().body,
+            "{\"one\":1}"
+        );
+        let second = send(&pool, &mut opener, url, "{}").unwrap();
+        assert_eq!(
+            second.body, "{\"two\":2}",
+            "the stale connection was replaced"
+        );
+        assert_eq!(opened.load(Ordering::SeqCst), 2, "one retry, no more");
+        assert_eq!(pool.idle(), 1, "the fresh connection is kept");
+    }
+
+    /// A reply that ends the connection — `Connection: close`, or a body framed
+    /// as "until the stream ends" — is not kept: the next call pays for its own
+    /// connection rather than being handed a dead one.
+    #[test]
+    fn a_connection_the_reply_closed_is_not_kept() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opens = opened.clone();
+        let mut queue = std::collections::VecDeque::new();
+        let closing = ok_with("Connection: close\r\n", "{\"x\":1}");
+        queue.push_back(wire(&written, &[&closing]));
+        queue.push_back(wire(&written, &[&ok("{\"y\":2}")]));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+            opens.fetch_add(1, Ordering::SeqCst);
+            match queue.pop_front() {
+                Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+                None => Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "the test scripted no more connections",
+                )),
+            }
+        };
+        let pool = Pool::new();
+        let url = "http://models.test:8078/v1/chat/completions";
+
+        assert_eq!(
+            send(&pool, &mut opener, url, "{}").unwrap().body,
+            "{\"x\":1}"
+        );
+        assert_eq!(pool.idle(), 0, "a reply that closes is not kept");
+        assert_eq!(
+            send(&pool, &mut opener, url, "{}").unwrap().body,
+            "{\"y\":2}"
+        );
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            2,
+            "the next call opened its own"
+        );
+    }
+
+    /// A body framed as "until the stream ends" *is* the closed stream, so
+    /// that connection cannot be kept either — the next call opens its own.
+    #[test]
+    fn a_reply_framed_to_the_end_of_the_stream_is_not_kept() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opens = opened.clone();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(wire(
+            &written,
+            &["HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{\"eof\":1}"],
+        ));
+        queue.push_back(wire(&written, &[&ok("{\"y\":2}")]));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+            opens.fetch_add(1, Ordering::SeqCst);
+            match queue.pop_front() {
+                Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+                None => Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "the test scripted no more connections",
+                )),
+            }
+        };
+        let pool = Pool::new();
+        let url = "http://models.test:8078/v1/chat/completions";
+
+        assert_eq!(
+            send(&pool, &mut opener, url, "{}").unwrap().body,
+            "{\"eof\":1}"
+        );
+        assert_eq!(
+            pool.idle(),
+            0,
+            "a body read to the stream's end is not kept"
+        );
+        assert_eq!(
+            send(&pool, &mut opener, url, "{}").unwrap().body,
+            "{\"y\":2}"
+        );
+        assert_eq!(opened.load(Ordering::SeqCst), 2);
+    }
+
+    /// A connection that fails after the answer started is dropped, never put
+    /// back, and the half-read answer is reported — a retry there could repeat
+    /// work the endpoint has already done.
+    #[test]
+    fn a_connection_that_breaks_mid_answer_is_dropped_not_retried() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opens = opened.clone();
+        let mut queue = std::collections::VecDeque::new();
+        // Announced as 20 bytes; only 3 arrive, then the stream ends.
+        queue.push_back(wire(
+            &written,
+            &["HTTP/1.1 200 OK\r\nContent-Length: 20\r\n\r\n{\"a"],
+        ));
+        queue.push_back(wire(&written, &[&ok("{\"after\":1}")]));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+            opens.fetch_add(1, Ordering::SeqCst);
+            match queue.pop_front() {
+                Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+                None => Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "the test scripted no more connections",
+                )),
+            }
+        };
+        let pool = Pool::new();
+        let url = "http://models.test:8078/v1/chat/completions";
+
+        // The failure is the one it is: a short body, not a parse error.
+        let error = send(&pool, &mut opener, url, "{}").unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof, "{error}");
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            1,
+            "no retry of a heard request"
+        );
+        assert_eq!(pool.idle(), 0, "a failed connection is never kept");
+
+        // And the pool is still usable: the next call opens its own.
+        assert_eq!(
+            send(&pool, &mut opener, url, "{}").unwrap().body,
+            "{\"after\":1}"
+        );
+        assert_eq!(opened.load(Ordering::SeqCst), 2);
     }
 
     /// The 200 ms slice must not turn a slow-but-alive body into a failure:
