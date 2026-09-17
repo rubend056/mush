@@ -432,11 +432,20 @@ impl Registry {
         Ok(())
     }
 
-    /// Release the lock if `agent` holds it. A release from anyone else is a
-    /// no-op, so an agent cannot unlock a sibling by finishing its own work.
+    /// Release the lock if `agent` holds it *as a tool call*. A release from
+    /// anyone else is a no-op, so an agent cannot unlock a sibling by finishing
+    /// its own work.
+    ///
+    /// A holder that is a detached job is deliberately left alone. Every
+    /// foreground call ends by releasing, and a call that outlived
+    /// `CMD_DETACH_AFTER` has just handed its claim to the job it became (see
+    /// [`Registry::launch`]): clearing it would let a sibling start while the
+    /// benchmark the lock exists for still runs, contradicting §5.6 — "a
+    /// detached exclusive job holds the lock for its whole life". The job's own
+    /// end gives the machine back, in [`Registry::finish`].
     pub fn release_machine(&self, agent: u64) {
         let mut inner = self.inner.lock().unwrap();
-        if matches!(&inner.holder, Some((holder, _, _)) if *holder == agent) {
+        if matches!(&inner.holder, Some((holder, _, None)) if *holder == agent) {
             inner.holder = None;
         }
     }
@@ -512,11 +521,16 @@ impl Registry {
             .name(format!("mush-job-{id}"))
             .spawn(move || watch(registry, watching, id, owner, command, started, mailbox));
         if let Err(error) = spawned {
+            // The job never ran: kill it, forget it, and hand back the lock it
+            // claimed — which `release_machine` will not do, because a job's
+            // claim is a job's to give up.
             live.kill();
             let mut inner = self.inner.lock().unwrap();
             inner.jobs.remove(&id);
-            drop(inner);
-            self.release_machine(owner);
+            if matches!(&inner.holder, Some((holder, _, claimed)) if *holder == owner && *claimed == Some(id))
+            {
+                inner.holder = None;
+            }
             return Err(Refused::Thread(error.to_string()));
         }
         Ok(id)

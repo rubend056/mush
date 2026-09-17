@@ -2421,9 +2421,10 @@ fn run_command(
         actor,
         state,
     );
-    // The lock is released either way: a command that ended releases it here,
-    // and a command that detached handed it to its job, which releases it when
-    // *it* ends (`Registry::finish`).
+    // The tool call's own claim ends here — and *only* its own: a command that
+    // auto-detached has handed the lock to the job it became, which is what
+    // keeps it for the job's whole life (§5.6) and gives it up in
+    // `Registry::finish`.
     if exclusive {
         registry.release_machine(actor.id);
     }
@@ -4422,6 +4423,87 @@ mod tests {
             }
             other => panic!("the owner must be told: {:?}", other.is_ok()),
         }
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// §5.6: "A detached exclusive job holds the lock for its whole life". A
+    /// foreground `exclusive` command that outlives `CMD_DETACH_AFTER` becomes a
+    /// job, and the lock goes with it: the tool call is over, the benchmark is
+    /// not. The release that ends every foreground call must not clear the
+    /// claim its own new job has just taken — which is exactly what it did,
+    /// silently, while `detach: true` (which returns before that release) kept
+    /// it. The two paths have to agree.
+    #[test]
+    fn an_auto_detached_exclusive_command_keeps_the_machine() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("exclusive-detach", machine.clone(), clock);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "cargo bench", "exclusive": true }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(report.contains("detached as #c1"), "{report}");
+        assert_eq!(
+            actor.ctx.registry.held(),
+            Some((7, "cargo bench".to_string(), Some(1))),
+            "the job holds the machine, not just its first sixty seconds"
+        );
+
+        // A sibling is refused, and told who has it — the whole point of the
+        // lock is that everyone else knows what to wait for.
+        let held = actor.ctx.registry.machine_free_for(9).unwrap_err();
+        let refusal = Refused::Machine(held).message(9);
+        assert_eq!(refusal, "#7 holds the machine; retry when it finishes");
+
+        // And the job gives it up when it ends, not before.
+        assert_eq!(
+            actor.ctx.registry.stop(actor.id, 1).unwrap(),
+            "stopping job #c1"
+        );
+        match actor.rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(AgentMsg::CommandDone { id, .. }) => assert_eq!(id, 1),
+            _ => panic!("the job must report its own end"),
+        }
+        assert!(
+            actor.ctx.registry.machine_free_for(9).is_ok(),
+            "the machine is free once the job is over"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The other half of the same rule, so the two paths are pinned against
+    /// each other: a foreground `exclusive` command that *ended* releases the
+    /// machine — the release still means what it says.
+    #[test]
+    fn a_foreground_exclusive_command_releases_the_machine() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::exits(0).says("bench done")));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("exclusive-foreground", machine, clock);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "cargo bench", "exclusive": true }),
+            &cancel,
+        )
+        .unwrap();
+
+        assert!(report.contains("bench done"), "{report}");
+        assert_eq!(actor.ctx.registry.held(), None, "the call is over");
+        assert!(
+            actor.ctx.registry.machine_free_for(9).is_ok(),
+            "and a sibling may start"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
