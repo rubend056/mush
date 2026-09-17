@@ -2701,79 +2701,118 @@ mod tests {
     /// Root -> child -> grandchild, each isolated: the grandchild's file must
     /// land in `.mush/wt/2/` on a branch that carries it, branched off the
     /// child's worktree (`mush/2` based on `mush/1`), and the summaries bubble up
-    /// through wait_agents.
+    /// through wait_agents. Three actors ask one scripted model at once; each
+    /// reply says which of them it is for.
     #[test]
-    #[ignore = "needs python3 + git; spawns a local mock model server"]
     fn deep_chain_writes_nested_worktrees() {
-        use std::fs;
-
-        const PORT: u16 = 18_732;
-        let mock = start_mock(PORT);
         let root = init_git_repo("chain");
-
-        let cfg = Config::new(format!("http://127.0.0.1:{PORT}"), "mock", None);
+        let scripted = Arc::new(
+            Scripted::new()
+                // The grandchild is the leaf that writes.
+                .when(|asked: &Asked| asked.depth() == Some(2) && !asked.saw("wrote deep.txt"))
+                .calls(vec![tool_call(
+                    "c2",
+                    "write_file",
+                    json!({ "path": "deep.txt", "content": "deep work" }),
+                )])
+                .when(|asked: &Asked| asked.depth() == Some(2))
+                .says("created deep.txt")
+                // The child only delegates: spawn its own, wait, report.
+                .when(|asked: &Asked| asked.depth() == Some(1) && asked.saw("#2 done"))
+                .says("chain child done")
+                .when(|asked: &Asked| asked.depth() == Some(1) && asked.saw("spawned agent"))
+                .calls(vec![tool_call(
+                    "c1b",
+                    "wait_agents",
+                    json!({ "ids": [2], "timeout": 30 }),
+                )])
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .calls(vec![tool_call(
+                    "c1a",
+                    "spawn_agent",
+                    json!({
+                        "brief": "create a file called deep.txt containing exactly: deep work; \
+                                  you must delegate this to your own subagent",
+                        "isolated": true
+                    }),
+                )])
+                // The root: delegate, wait for the child, report.
+                .when(|asked: &Asked| asked.saw("#1 done"))
+                .says("chain root done")
+                .when(|asked: &Asked| asked.saw("spawned agent"))
+                .calls(vec![tool_call(
+                    "c0b",
+                    "wait_agents",
+                    json!({ "ids": [1], "timeout": 30 }),
+                )])
+                .calls(vec![tool_call(
+                    "c0a",
+                    "spawn_agent",
+                    json!({
+                        "brief": "delegate file creation to your own subagent: spawn one with \
+                                  brief 'create a file called deep.txt containing exactly: deep \
+                                  work' and isolated true, then wait for it, then report",
+                        "isolated": true
+                    }),
+                )]),
+        );
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let root_tx = spawn(cfg, tx, root.clone()).tx;
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            tx,
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user(
+                    "CHAIN: delegate the file creation through two levels of subagents".to_string(),
+                ),
+            ]))
+            .unwrap();
 
-        let messages = vec![
-            Message::system(prompt::system_prompt(root.to_str().unwrap())),
-            Message::user(
-                "CHAIN: delegate the file creation through two levels of subagents".to_string(),
-            ),
-        ];
-        root_tx.send(AgentMsg::Run(messages)).unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&rx, WAIT, |seen| seen.done >= 3),
+            "each level must run and finish once: {seen:?}"
+        );
+        assert_eq!(seen.done, 3, "each level runs exactly once: {seen:?}");
+        assert_eq!(seen.errors, Vec::<String>::new());
 
-        // The grandchild (agent #2) writes into its own worktree.
-        let target = root.join(".mush/wt/2/deep.txt");
-        let mut found = None;
-        for _ in 0..600 {
-            if target.exists() {
-                found = fs::read_to_string(&target).ok();
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-
-        // Every level ran exactly once and reported: root, child, grandchild.
-        let done_events = count_done_events(&rx, 3);
-
+        // The grandchild (agent #2) wrote into its own worktree.
+        assert_eq!(
+            fs::read_to_string(root.join(".mush/wt/2/deep.txt"))
+                .ok()
+                .as_deref(),
+            Some("deep work"),
+            "the grandchild must write its own worktree"
+        );
         // Nested worktree, now with real history: the grandchild's branch
         // carries its work and is based on the child's branch, which — because
         // the child only delegated — still sits at the branch point. And the
         // child's worktree must NOT contain the grandchild's file.
         let grandchild_files =
             git::run(&root, &["diff", "--name-only", "HEAD...mush/2"]).unwrap_or_default();
-        let child_head = git_rev_parse(&root, "mush/1");
-        let base_head = git_rev_parse(&root, "HEAD");
-        let branched_from_child =
-            git::run(&root, &["merge-base", "--is-ancestor", "mush/1", "mush/2"]).is_ok();
-        let child_has_file = root.join(".mush/wt/1/deep.txt").exists();
-
-        stop_mock(mock);
-        let _ = fs::remove_dir_all(&root);
-        assert_eq!(
-            found.as_deref(),
-            Some("deep work"),
-            "grandchild must write its own worktree"
-        );
-        assert_eq!(done_events, 3, "each level must run and finish once");
         assert!(
             grandchild_files.contains("deep.txt"),
             "mush/2 must carry the grandchild's work, got {grandchild_files:?}"
         );
         assert_eq!(
-            child_head.as_deref(),
-            base_head.as_deref(),
+            git_rev_parse(&root, "mush/1").as_deref(),
+            git_rev_parse(&root, "HEAD").as_deref(),
             "the child delegated, so its own branch stays at the branch point"
         );
         assert!(
-            branched_from_child,
+            git::run(&root, &["merge-base", "--is-ancestor", "mush/1", "mush/2"]).is_ok(),
             "mush/2 must be based on mush/1 (nested, not re-rooted)"
         );
         assert!(
-            !child_has_file,
+            !root.join(".mush/wt/1/deep.txt").exists(),
             "the child's worktree must stay clean of grandchild work"
         );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A transcript that fills the (tiny, configured) context window must be
@@ -3115,27 +3154,6 @@ mod tests {
                 _ => {}
             }
         }
-    }
-
-    /// Drain the event channel until `target` Done events have been seen.
-    fn count_done_events(rx: &Receiver<Msg>, target: usize) -> usize {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        let mut done_events = 0usize;
-        while done_events < target && Instant::now() < deadline {
-            while let Ok(msg) = rx.try_recv() {
-                if matches!(
-                    msg,
-                    Msg::Agent {
-                        event: AgentEvent::Done,
-                        ..
-                    }
-                ) {
-                    done_events += 1;
-                }
-            }
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        done_events
     }
 
     /// A scratch workspace, empty: for a scenario whose work is not files.
