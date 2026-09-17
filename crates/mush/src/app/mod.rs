@@ -931,7 +931,8 @@ impl App {
             base_url: self.cfg.base_url.clone(),
             model: self.cfg.model.clone(),
             // The fields this save does not state — the window, the temperature,
-            // the reply cap's name — keep whatever the file already holds.
+            // the reply cap's name, and the two thinking knobs — keep whatever
+            // the file already holds.
             ..UserConfig::default()
         };
         if let Err(error) = user.save() {
