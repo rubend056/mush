@@ -152,6 +152,15 @@ pub(crate) mod fake {
         pub model: String,
         pub messages: Vec<Message>,
         pub tools: usize,
+        /// The schemas themselves, not just how many there were. They are the
+        /// head of the rendered prompt, so whether two requests share a
+        /// cacheable prefix is a question about these bytes — a count of zero
+        /// and a count of eight are not the comparison a test needs.
+        pub tool_schemas: Vec<Value>,
+        /// How the request asked for tools to be used. Also part of "is this the
+        /// same request as the one before it": a fold that switches to `none`
+        /// is asking the model something else.
+        pub tool_choice: String,
         /// What the request asked about the provider's thinking mode, as the
         /// endpoint would read it: a test asserts the config's knobs reach
         /// this, and that nothing stated sends no field at all.
@@ -395,6 +404,8 @@ pub(crate) mod fake {
                 model: request.model.to_string(),
                 messages: request.messages.to_vec(),
                 tools: request.tools.len(),
+                tool_schemas: request.tools.to_vec(),
+                tool_choice: request.tool_choice.to_string(),
                 thinking: request.thinking.clone(),
                 reasoning_effort: request.reasoning_effort.clone(),
             };

@@ -16,12 +16,21 @@ use crate::message::Message;
 pub const COMPACT_REPLY_TOKENS: u32 = 10_240;
 
 /// The instruction appended when the transcript nears the context window.
+///
+/// The last sentence is where "do not call a tool" lives, and it lives *here* on
+/// purpose. The request this travels with is the run's own request plus this one
+/// user message and nothing else — same system prompt, same tools, same
+/// `tool_choice` — because the tools are the head of the prompt and the endpoint
+/// caches prefixes: a summarize call that drops them is a cache miss over an
+/// entire history, at the moment that history is at its largest. Asking for
+/// prose in the message costs nothing and is something the model can act on,
+/// where a `tool_choice` in the request body is not part of what it is asked.
 pub const COMPACT_INSTRUCTION: &str = "\
 The conversation is approaching the context limit. Summarize everything \
 important so far — the original task, the work done, files created or \
 changed, open issues, and the current state. This summary replaces the \
 conversation, so include every fact the task still depends on. Reply with \
-just the summary.";
+just the summary, as plain text, and end your turn: call no tool.";
 
 /// Approaching the context window: fold the conversation into a summary
 /// instead of dropping old turns, so long-running tasks keep their state. The

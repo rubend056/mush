@@ -906,6 +906,25 @@ fn absorb(state: &mut ActorState, transcript: &mut Vec<Message>, command: AgentM
     }
 }
 
+/// The tool schemas this agent's requests carry: the leaf set at the deepest
+/// level, the full set above it.
+///
+/// One function, because every request an agent makes has to carry the *same*
+/// schemas. The rendered prompt starts with the tool definitions, so a request
+/// that drops them — the summarize call, or a wrap-up turn — shares no prefix
+/// with the run it belongs to: the endpoint's prompt cache misses at the first
+/// token and the whole history is prefilled again, which is the one cost
+/// compaction exists to avoid, paid exactly when the history is largest. A
+/// request that must not call tools says so with `tool_choice: "none"`, a
+/// request parameter rather than prompt text.
+fn tool_schemas(actor: &Actor) -> Vec<Value> {
+    if actor.depth >= MAX_DEPTH {
+        prompt::leaf_tool_schemas()
+    } else {
+        prompt::tool_schemas()
+    }
+}
+
 /// One run: model turns → tool calls → results, until the model answers.
 fn run_loop(
     actor: &Actor,
@@ -913,11 +932,7 @@ fn run_loop(
     messages: &mut Vec<Message>,
     cancel: &AtomicBool,
 ) -> Result<Option<String>, String> {
-    let schemas = if actor.depth >= MAX_DEPTH {
-        prompt::leaf_tool_schemas()
-    } else {
-        prompt::tool_schemas()
-    };
+    let schemas = tool_schemas(actor);
     // One learning attempt per run: a context-limit complaint teaches the
     // window, anything else is the run's error.
     let mut learned_context = false;
@@ -991,7 +1006,11 @@ fn run_loop(
         let mut request = ChatRequest {
             model: &cfg.model,
             messages: request_messages,
-            tools: if wrap_up { &[] } else { &schemas },
+            // The schemas stay even on a wrap-up turn: the prompt starts with
+            // them, so withdrawing them re-prefills a history that is at its
+            // longest (see `tool_schemas`). `tool_choice` is what stops the
+            // calls, and a call the model makes anyway is answered, not run.
+            tools: &schemas,
             // `auto` keeps models that ignore tools working: they simply answer.
             tool_choice: if wrap_up { "none" } else { "auto" },
             stream: false,
@@ -1337,7 +1356,7 @@ fn run_loop(
 /// The instruction appended to the request on the run's final turn.
 const WRAP_UP_INSTRUCTION: &str = "\
 You have reached this run's runaway guard, which is meant to be far past any \
-real task. Stop using tools now — they are no longer available. Reply with a \
+real task. Stop using tools now — none of them will be run. Reply with a \
 concise summary of what has been done, what still remains, and anything the \
 next run needs to know.";
 
@@ -1415,14 +1434,27 @@ fn compact_history(
 
     let mut ask = messages.clone();
     ask.push(Message::user(COMPACT_INSTRUCTION));
-    // A plain, tool-free request: the summary, nothing else. It carries the
-    // same thinking knobs as the real requests — an endpoint that only answers
-    // with its thinking mode on must not be asked for a summary without it.
+    // A summarize request: the run's own request, byte for byte, plus that one
+    // user message. Same system prompt, same tools, same `tool_choice`, same
+    // thinking knobs. What shapes the prompt shapes the endpoint's cache, and
+    // the tools are the head of it — dropping them here saves no token, it
+    // throws the whole cached history away at the moment the history is at its
+    // largest, which is the one cost compaction exists to avoid. What stops the
+    // model from calling a tool is the instruction, *persisted in the user
+    // message* rather than encoded in a request field: a turn that says "reply
+    // with the summary and call no tool" is a turn the model can take, while a
+    // `tool_choice` the endpoint reads is not part of what the model is asked,
+    // and a model that answers with a call instead of a summary is a model mush
+    // cannot fold with either way.
+    //
+    // Sampling and length parameters are a separate matter: they are not prompt
+    // text, so the summary's own cap costs no cache miss.
+    let schemas = tool_schemas(actor);
     let request = ChatRequest {
         model: &cfg.model,
         messages: &ask,
-        tools: &[],
-        tool_choice: "none",
+        tools: &schemas,
+        tool_choice: "auto",
         stream: false,
         temperature: cfg.temperature(),
         max_tokens: COMPACT_REPLY_TOKENS,
@@ -4368,12 +4400,35 @@ mod tests {
             .count();
         assert_eq!(running, 1, "only the run that was asked for, before it");
 
-        // One ask for the run, one for the fold — the second carries no tools
-        // and the instruction, and no answer was requested after it.
+        // One ask for the run, one for the fold — the second carries the
+        // instruction, and no answer was requested after it.
         let asked = scripted.asked();
         assert_eq!(asked.len(), 2, "one summarize call, nothing else");
         assert!(asked[1].saw(COMPACT_INSTRUCTION), "the second ask folds");
-        assert_eq!(asked[1].tools, 0, "a plain, tool-free request");
+        // The tools travel with the summarize call, and so does the way they are
+        // offered. They are the head of the rendered prompt, so a request
+        // without them is no prefix of the conversation: the endpoint's cache
+        // would miss on every token, and the history it re-prefills is the
+        // largest one there has ever been — the cost compaction exists to avoid,
+        // paid at the worst moment. What stops a tool call is the instruction in
+        // the appended user message, not a request field.
+        assert_eq!(
+            asked[1].tool_schemas, asked[0].tool_schemas,
+            "the fold must share the run's prefix, tools included"
+        );
+        assert_eq!(
+            asked[1].tool_choice, asked[0].tool_choice,
+            "the fold asks the model the same thing, not a different kind of turn"
+        );
+        assert!(
+            !asked[1].tool_schemas.is_empty(),
+            "and they must be the real schemas, not two empty lists"
+        );
+        assert!(
+            asked[1].saw("call no tool"),
+            "the instruction is where the tools are refused: {}",
+            COMPACT_INSTRUCTION
+        );
 
         // The transcript really is `[system, user(summary)]`: the next request
         // is that plus the words the human typed after it.
@@ -4711,10 +4766,18 @@ mod tests {
             RUNAWAY_TURNS,
             "the run must use every turn before the guard"
         );
+        // The tools stay even here, and so does `tool_choice`: the schemas are
+        // the head of the prompt, so withdrawing them re-prefills the longest
+        // history the run has had. The instruction is what tells the model to
+        // stop calling them, and a call it makes anyway is answered, not run.
         assert_eq!(
-            asked[RUNAWAY_TURNS - 1].tools,
-            0,
-            "the wrap-up turn must be asked without tools"
+            asked[RUNAWAY_TURNS - 1].tool_schemas,
+            asked[0].tool_schemas,
+            "the wrap-up turn must share the run's prefix, tools included"
+        );
+        assert!(
+            !asked[RUNAWAY_TURNS - 1].tool_schemas.is_empty(),
+            "and they must be the real schemas, not two empty lists"
         );
         assert!(
             asked[RUNAWAY_TURNS - 1].saw("runaway guard"),

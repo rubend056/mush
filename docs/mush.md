@@ -187,6 +187,22 @@ request and can only re-summarize the summary. The refusal is said out loud
 because a human typed a command — silence there is indistinguishable from a
 fold that quietly failed. Anything longer is folded exactly as asked.
 
+The fold is one ordinary request: the conversation's own — same system prompt,
+same tools, same `tool_choice`, same thinking knobs — with
+`COMPACT_INSTRUCTION` appended as one more **user message**. Nothing about it is
+special-cased, and that is the point: the tool schemas are the head of the
+rendered prompt, and an endpoint caches *prefixes*, so a summarize call that
+dropped them (or switched `tool_choice` from `auto` to `none`) would share no
+prefix with the run it belongs to and re-prefill the entire history — at exactly
+the moment that history is at its largest, which is the cost the fold exists to
+avoid. What keeps the model from calling a tool is the instruction, persisted in
+the message where the model can act on it: *reply with the summary, as plain
+text, and end your turn: call no tool*. The one thing that is not the run's is
+the summary's own reply cap (`COMPACT_REPLY_TOKENS`), and that is safe — sampling
+and length parameters are not prompt text, so they cost no cache miss. A model
+that answers with a tool call instead of a summary is not a fold: mush says it
+could not compact and leaves the transcript alone.
+
 ---
 
 ## 4. The message box
