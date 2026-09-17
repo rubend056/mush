@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use mush_core::config::parse_context_hint;
 use mush_core::git;
 use mush_core::message::{ChatRequest, ChatResponse};
-use mush_core::text::truncate;
+use mush_core::text::{sanitize, truncate};
 use mush_core::tools::ToolName;
 use mush_core::transcript::{
     needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
@@ -2684,7 +2684,17 @@ pub fn summarize_args(raw: &str) -> String {
     summarize(&args)
 }
 
+/// [`read_args`], defanged. The arguments are the model's own text and a file
+/// name is a file name, and this label is painted raw — one span in the
+/// transcript (`docs/mush.md` §4.5 R4), one activity line in the tree — so a
+/// `path` of `…\u{1b}]0;PWNED` would otherwise repaint the terminal it is drawn
+/// on. The one reading both callers share is the one place to do it.
 fn summarize(args: &Value) -> String {
+    sanitize(&read_args(args))
+}
+
+/// What the arguments say, before the text is made safe to paint.
+fn read_args(args: &Value) -> String {
     if let Some(path) = args.get("path").and_then(Value::as_str) {
         return path.to_string();
     }
@@ -2697,6 +2707,48 @@ fn summarize(args: &Value) -> String {
     }
     if let Some(brief) = args.get("brief").and_then(Value::as_str) {
         return truncate(&first_line(brief), 40);
+    }
+    // The orchestration tools, which name none of the three above: the tools a
+    // human watching a tree most needs to read are exactly the ones that
+    // rendered as a bare `⚙ agent_control` — R4's "`⚙ name summarized-args`"
+    // vacuous for the calls that steer the run.
+    //
+    // `agent_control {id, action, text?}` and `command_control {id, action}`
+    // share a shape, so they share an arm: the id is the target and the action
+    // is what is being done to it.
+    if let Some(id) = args.get("id").and_then(Value::as_u64) {
+        let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+        let mut label = format!("#{id}");
+        if !action.is_empty() {
+            label.push(' ');
+            label.push_str(action);
+        }
+        if let Some(text) = args.get("text").and_then(Value::as_str) {
+            label.push_str(&format!(" \"{}\"", truncate(&first_line(text), 30)));
+        }
+        return label;
+    }
+    // `wait_agents {ids?, timeout?}` and `wait_commands {ids?, timeout?}`: which
+    // ids are being waited on, and how long. An empty list is not "nothing" —
+    // the schema reads it as *all* of them.
+    if let Some(ids) = args.get("ids").and_then(Value::as_array) {
+        let list: Vec<String> = ids
+            .iter()
+            .filter_map(Value::as_u64)
+            .map(|id| format!("#{id}"))
+            .collect();
+        let mut label = if list.is_empty() {
+            "all".to_string()
+        } else {
+            list.join(" ")
+        };
+        if let Some(timeout) = args.get("timeout").and_then(Value::as_u64) {
+            label.push_str(&format!(" {timeout}s"));
+        }
+        return label;
+    }
+    if let Some(timeout) = args.get("timeout").and_then(Value::as_u64) {
+        return format!("{timeout}s");
     }
     String::new()
 }
@@ -2737,6 +2789,51 @@ mod tests {
             summarize(&json!({"brief": "fix the parser"})),
             "fix the parser"
         );
+        assert_eq!(summarize(&json!({})), "");
+    }
+
+    /// The label is painted raw — one span in the transcript, one activity line
+    /// in the tree — and a file name is a file name: a model that puts an escape
+    /// sequence in an argument must not repaint the terminal it is drawn on.
+    #[test]
+    fn a_summary_carries_no_escape_from_an_argument() {
+        assert_eq!(
+            summarize_args(r#"{"path":"src/\u001b]0;PWNED\u0007main.rs"}"#),
+            "src/main.rs"
+        );
+        assert_eq!(
+            summarize_args(r#"{"command":"cat log\u001b[2J\u001b[H"}"#),
+            "cat log"
+        );
+        assert_eq!(
+            summarize_args(r#"{"brief":"do\u0007 this\rplease"}"#),
+            "do this please"
+        );
+    }
+
+    /// The orchestration tools carry no path, command or brief, so they rendered
+    /// as a bare `⚙ agent_control` — for exactly the calls an orchestrator uses
+    /// to steer a tree, which is where a human most needs to know *whom*.
+    #[test]
+    fn an_orchestration_call_summarizes_its_target() {
+        assert_eq!(
+            summarize(&json!({"id": 2, "action": "message", "text": "keep the steps small"})),
+            "#2 message \"keep the steps small\""
+        );
+        assert_eq!(
+            summarize(&json!({"id": 3, "action": "stop"})),
+            "#3 stop",
+            "command_control and agent_control share one shape"
+        );
+        assert_eq!(summarize(&json!({"ids": [1, 2]})), "#1 #2");
+        assert_eq!(
+            summarize(&json!({"ids": [], "timeout": 60})),
+            "all 60s",
+            "an empty id list is the schema's `all`, not nothing"
+        );
+        assert_eq!(summarize(&json!({"timeout": 30})), "30s");
+        // A tool with no arguments has nothing to summarize, and says so by
+        // summarizing nothing: `command_status`, `agent_status`.
         assert_eq!(summarize(&json!({})), "");
     }
 

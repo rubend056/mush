@@ -9,6 +9,13 @@
 //! type: `app::mod` routes events and keys into it and never writes a
 //! transcript itself, so "what the human is looking at" has exactly one writer.
 //!
+//! A line said is also *who* said it ([`Voice`]). A transcript holds four kinds
+//! of user line and only one of them is the human's: the brief a parent spawned
+//! an agent with, a parent's steering, mush's own report about a child or a job,
+//! and the words typed into this terminal. The box is the human's voice, so the
+//! line that answers a send is theirs and a line that arrives unasked is
+//! somebody else's — the fact that keeps `you › ` meaning the human.
+//!
 //! A notice is a line *about* a conversation, and it has a lifetime here rather
 //! than a life of its own. It carries when it happened and which agent it
 //! concerns; a command's answer is dropped when that agent runs again, a run's
@@ -31,6 +38,7 @@ use std::time::Duration;
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use unicode_width::UnicodeWidthStr;
 
 use mush_core::message::Message;
 use mush_core::session;
@@ -75,6 +83,62 @@ pub struct Notice {
 pub enum NoticeKind {
     Info,
     Error,
+    /// A run mush itself stopped — the loop guard ending a model that kept
+    /// repeating one call. Nothing the model did *failed*: R4 reserves `!` for
+    /// the things that did, and the stop is the honest mark — `⊘`, the same
+    /// reading `agent_status` gives a stopped child.
+    Stopped,
+}
+
+impl NoticeKind {
+    /// The mark a line of this kind leads with, and how it is painted: `·` for a
+    /// line mush wrote, `⊘` for a run it stopped, `!` in red for one it failed
+    /// to do.
+    fn mark(self) -> (&'static str, Style) {
+        match self {
+            NoticeKind::Info => ("· ", dim()),
+            NoticeKind::Stopped => ("⊘ ", Style::default().fg(Color::Yellow)),
+            NoticeKind::Error => ("! ", Style::default().fg(Color::Red)),
+        }
+    }
+}
+
+/// Who said one line of a transcript.
+///
+/// A conversation is not only the human's words: a child's pane opens with the
+/// brief its parent spawned it with, a folded completion (`#1 done: …`) is
+/// mush's own report of another agent, and `agent_control message` puts a
+/// parent's words in a child's transcript. All three used to render as
+/// `you › ` — the human's own voice, in their own mouth, for words they never
+/// said. Each of them is now a voice of its own, so `you › ` means the human
+/// again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Voice {
+    /// The human at this terminal: what they typed into the message box.
+    #[default]
+    Human,
+    /// The brief a parent spawned this agent with, which opens its transcript.
+    Brief,
+    /// A parent's words to this agent (`agent_control message`). `agent_control`
+    /// only reaches the sender's own children, so the speaker is its parent.
+    Parent,
+    /// A line mush itself wrote into the conversation: a child's or a job's
+    /// report, a fold's carried summary. Nobody said it, so it has no voice —
+    /// it is marked like the other lines mush writes.
+    Mush,
+}
+
+impl Voice {
+    /// The mark this voice leads with, and its colour. [`Voice::Mush`] has none:
+    /// its rows are marked by the caller, because it is not a voice.
+    fn mark(self) -> (&'static str, Color) {
+        match self {
+            Voice::Human => ("you › ", Color::Cyan),
+            Voice::Brief => ("brief › ", Color::Cyan),
+            Voice::Parent => ("parent › ", Color::Magenta),
+            Voice::Mush => ("· ", Color::Reset),
+        }
+    }
 }
 
 /// What wins when more than one line wants to be a pane's last (finding B12):
@@ -114,10 +178,12 @@ impl Rank {
 }
 
 impl Notice {
-    /// Where this line sits in the precedence table. Only failures are alerts.
+    /// Where this line sits in the precedence table. A failure and a run mush
+    /// stopped are both the thing the human has to read; only a line mush merely
+    /// wrote yields.
     pub fn rank(&self) -> Rank {
         match self.kind {
-            NoticeKind::Error => Rank::Alert,
+            NoticeKind::Error | NoticeKind::Stopped => Rank::Alert,
             NoticeKind::Info => Rank::Said,
         }
     }
@@ -195,6 +261,23 @@ pub struct Chat {
     /// (finding U3). A pane nobody has scrolled is absent, which is exactly
     /// `Reading::Following` — following costs no state at all.
     reading: HashMap<AgentId, Reading>,
+    /// The user lines that are *not* the human's, keyed by the index they sit at
+    /// in their conversation. Absent is the norm — most of a transcript is the
+    /// human's own words — so the default costs nothing and there is no second
+    /// copy of the transcript to keep in step with this one. `replace_transcript`
+    /// drops an agent's map with it: a restored transcript arrives without its
+    /// provenance, and the pane then reads what it can from the lines themselves
+    /// ([`unrecorded`]).
+    spoken: HashMap<AgentId, HashMap<usize, Voice>>,
+    /// The words the human just sent, waiting for their echo.
+    ///
+    /// The box is the human's voice and `take_input` is the send; `app::mod`
+    /// hands exactly those words back through [`Self::push_message`] on the same
+    /// turn, with no event able to arrive in between. So the first user line that
+    /// matches them is the human's, and a user line that does not is somebody
+    /// else's — the fact that tells a parent's steering apart from the human's
+    /// nudge, which is the only thing two such lines differ by.
+    pending: Option<String>,
 }
 
 impl Chat {
@@ -206,6 +289,8 @@ impl Chat {
             notices: Vec::new(),
             input: Input::default(),
             reading: HashMap::new(),
+            spoken: HashMap::new(),
+            pending: None,
         }
     }
 
@@ -246,7 +331,22 @@ impl Chat {
     }
 
     /// Append a line to an agent's transcript.
+    ///
+    /// This is the one place a line's *voice* is decided while it is known: a
+    /// user line that is the echo of the words the box just sent is the human's,
+    /// and every other user line was written by another agent or by mush (see
+    /// [`unrecorded`]).
     pub fn push_message(&mut self, agent: AgentId, message: Message) {
+        if message.role == "user" {
+            let index = self.transcript(agent).len();
+            let voice = match self.pending.take() {
+                Some(words) if words == message.text().trim() => Voice::Human,
+                _ => elsewhere(agent, index, message.text()),
+            };
+            if voice != Voice::Human {
+                self.spoken.entry(agent).or_default().insert(index, voice);
+            }
+        }
         if agent == AgentId::ROOT {
             self.root.push(message);
         } else {
@@ -256,12 +356,36 @@ impl Chat {
 
     /// Replace an agent's transcript: the root's is compacted to
     /// `[system, user(summary)]`, a restored one arrives whole.
+    ///
+    /// The voices this conversation knew go with it: the indices they were keyed
+    /// by describe the transcript that is gone, and a stale one would paint
+    /// somebody else's line in the wrong voice. What a restored transcript still
+    /// says for itself is read back at paint time.
     pub fn replace_transcript(&mut self, agent: AgentId, messages: Vec<Message>) {
+        self.spoken.remove(&agent);
+        self.pending = None;
         if agent == AgentId::ROOT {
             self.root = messages;
         } else {
             self.agents.insert(agent, messages);
         }
+    }
+
+    /// Who said the line at `index` of `agent`'s transcript, if a speaker is what
+    /// it has. A user line with nothing recorded about it is the human's: that is
+    /// what most of a transcript is, and the alternative — recusing the pane from
+    /// its own conversation after a restart — is the louder lie.
+    fn voice_at(&self, agent: AgentId, index: usize, message: &Message) -> Option<Voice> {
+        if message.role != "user" {
+            return None;
+        }
+        Some(
+            self.spoken
+                .get(&agent)
+                .and_then(|voices| voices.get(&index))
+                .copied()
+                .unwrap_or_else(|| unrecorded(agent, index, message.text())),
+        )
     }
 
     /// Drop an agent's transcript, and the lines mush wrote about it: a
@@ -272,6 +396,7 @@ impl Chat {
         self.agents.remove(&agent);
         self.notices.retain(|notice| notice.agent != agent);
         self.reading.remove(&agent);
+        self.spoken.remove(&agent);
     }
 
     /// How big one conversation is, in tokens, roughly — the same
@@ -301,6 +426,8 @@ impl Chat {
         self.agents.clear();
         self.notices.clear();
         self.reading.clear();
+        self.spoken.clear();
+        self.pending = None;
     }
 
     /// A line for the transcript that is not a message: a hint, or a failure.
@@ -331,10 +458,31 @@ impl Chat {
     /// own record of its last failure, so a new one replaces the old rather
     /// than piling up beside it — two failures for one agent would disagree
     /// about which is current, and the pane would print both.
+    ///
+    /// A run the loop guard stopped arrives here too, because that is the shape
+    /// an ended run has on the wire. It is not a failure — mush stopped it, and
+    /// nothing the model did broke — so it lands as a stop, and it takes the
+    /// notice the guard wrote about the same event with it: one event, one line,
+    /// and the line that survives is the one that says what happened to the run.
     pub fn note_error_for(&mut self, agent: AgentId, text: impl Into<String>) {
-        self.notices
-            .retain(|notice| !(notice.agent == agent && notice.kind == NoticeKind::Error));
-        self.push_notice(agent, NoticeKind::Error, text);
+        let text = text.into();
+        let stopped = text.starts_with(LOOP_STOP);
+        let kind = if stopped {
+            NoticeKind::Stopped
+        } else {
+            NoticeKind::Error
+        };
+        self.notices.retain(|notice| {
+            if notice.agent != agent {
+                return true;
+            }
+            // One failure per agent, and one stop: the newest.
+            if notice.kind != NoticeKind::Info {
+                return false;
+            }
+            !(stopped && notice.text.starts_with(LOOP_NOTICE))
+        });
+        self.push_notice(agent, kind, text);
     }
 
     /// Forget what mush said about one agent, and say whether it said anything.
@@ -408,6 +556,7 @@ impl Chat {
         for notice in self.notices_for(agent) {
             let marker = match notice.kind {
                 NoticeKind::Info => "·",
+                NoticeKind::Stopped => "⊘",
                 NoticeKind::Error => "!",
             };
             let age = short_age(Duration::from_secs(now.saturating_sub(notice.at)));
@@ -590,12 +739,13 @@ impl Chat {
         let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
         let mut count = 0usize;
 
-        for message in messages.iter().rev() {
+        for (index, message) in messages.iter().enumerate().rev() {
             if count >= want {
                 break;
             }
+            let voice = self.voice_at(pane.agent, index, message);
             let mut chunk = Vec::new();
-            render_message(&mut chunk, message, width);
+            render_message(&mut chunk, message, voice, width);
             count += chunk.len();
             chunks.push(chunk);
         }
@@ -731,9 +881,16 @@ impl Chat {
         self.input.insert(text);
     }
 
-    /// Take the box's text out, as a send does.
+    /// Take the box's text out, as a send does. The words are remembered until
+    /// their echo arrives, so the line that comes back is painted as the human's
+    /// ([`Self::push_message`]).
     pub fn take_input(&mut self) -> String {
-        self.input.take()
+        let text = self.input.take();
+        let words = text.trim();
+        if !words.is_empty() {
+            self.pending = Some(words.to_string());
+        }
+        text
     }
 
     /// Do one key the keymap handed to the chat: editing the message box, or
@@ -765,26 +922,85 @@ impl Chat {
     }
 }
 
+/// The fewest columns a line's own words get before the pane gives up on its
+/// mark. A mark wider than the pane is a row of label with no words after it, so
+/// below this the mark goes and the words stay.
+const MIN_BODY: usize = 4;
+
+/// The most of a tool call's arguments a label ever shows. A tool call is a
+/// heading for its result, not a transcript of the call: `edit_file src/lex.rs`,
+/// not forty lines of JSON (`docs/mush.md` §4.5 R4).
+const LABEL_ARGS: usize = 60;
+
+/// How a tool result that never happened is spelled. `agent.rs` prefixes every
+/// refused or failed call's result with exactly this (`format!("error: {error}")`),
+/// so a result either is one or merely starts like one.
+const FAILED: &str = "error:";
+
+/// One tool call's row: `  ⚙ name summarized-args`, budgeted to the pane.
+///
+/// The arguments are what a path or a command is read from, so the columns they
+/// are given are the pane's less the `  ⚙ name ` head's — the number `truncate`
+/// was handed used to be a flat 60 that ignored the head, so on a narrow pane a
+/// path was cut mid-word with the `…` that says so falling outside the border.
+/// The name is never the part that goes: a row too narrow for both keeps the
+/// name.
+fn tool_label(call: &mush_core::ToolCall, width: usize) -> String {
+    // `agent::summarize_args` is the same reading the tree shows.
+    let head = format!("  ⚙ {} ", call.function.name);
+    let budget = LABEL_ARGS.min(width.saturating_sub(head.width()));
+    if budget < MIN_BODY {
+        return head.trim_end().to_string();
+    }
+    format!(
+        "{head}{}",
+        truncate(&summarize_args(&call.function.arguments), budget)
+    )
+    .trim_end()
+    .to_string()
+}
+
+/// The rows of one marked line: the mark on the first row, its own width of
+/// blank under it, and the words wrapped *inside* the columns the mark leaves.
+///
+/// Wrapping at the pane's whole width and prepending the mark afterwards made
+/// every row `mark` columns too wide for the pane, and ratatui clipped the
+/// overflow from the right: an assistant's `w00 … w59` at 80 columns lost
+/// `w12 w13` off its first row, `w26 w27` off its second, and one more pair off
+/// every row after that — each wrapped line quietly lost its end, for as long as
+/// the message was. The tool-call rows and the message box already budgeted
+/// their own indent this way; the marks are where the arithmetic was missing.
+fn marked(out: &mut Vec<Line<'static>>, mark: &str, style: Style, text: &str, width: usize) {
+    let lead = mark.width();
+    // A pane too narrow for the mark and a few words: the mark is what the row
+    // cannot afford, because a mark the pane clips is a row that says who spoke
+    // and nothing about what was said.
+    let (mark, lead) = if width >= lead + MIN_BODY {
+        (mark, lead)
+    } else {
+        ("", 0)
+    };
+    for (index, line) in wrap_text(text, width.saturating_sub(lead))
+        .into_iter()
+        .enumerate()
+    {
+        let head = if index == 0 {
+            Span::styled(mark.to_string(), style)
+        } else {
+            Span::raw(" ".repeat(lead))
+        };
+        out.push(Line::from(vec![head, Span::raw(line)]));
+    }
+}
+
 /// The rows of one notice, wrapped at the pane's width and marked by kind: only
 /// a failure shouts. The mark leads the first row only — a wrapped line is one
 /// line, and a column of `!` reads as several failures.
 fn footnote_lines(notice: &Notice, width: usize) -> Vec<Line<'static>> {
-    let (prefix, style) = match notice.kind {
-        NoticeKind::Info => ("·", dim()),
-        NoticeKind::Error => ("!", Style::default().fg(Color::Red)),
-    };
-    wrap_text(&notice.text, width.saturating_sub(2))
-        .into_iter()
-        .enumerate()
-        .map(|(index, line)| {
-            let lead = if index == 0 {
-                format!("{prefix} ")
-            } else {
-                "  ".to_string()
-            };
-            Line::from(Span::styled(format!("{lead}{line}"), style))
-        })
-        .collect()
+    let (mark, style) = notice.kind.mark();
+    let mut rows = Vec::new();
+    marked(&mut rows, mark, style, &notice.text, width);
+    rows
 }
 
 /// How a pane says it is showing an excerpt. One wording, because the foot's own
@@ -802,18 +1018,85 @@ fn trim_trailing_blanks(lines: &mut Vec<Line<'static>>) {
     }
 }
 
+/// The head of the one user message a fold leaves behind
+/// (`prompt::compaction_message`): the model's own summary, carried as the next
+/// conversation's first message. It is mush's line, not the human's words.
+const FOLDED: &str = "Context compacted";
+
+/// The two lines one loop guard writes, in its own vocabulary: the notice it
+/// emits as it stops the run, and the failure the run then ends with
+/// (`agent.rs`'s guard, which the run has no other way to report). They are one
+/// event, so the pane paints one line for it — see [`Chat::note_error_for`].
+const LOOP_NOTICE: &str = "the run repeated the same tool call";
+const LOOP_STOP: &str = "the run was stopped as a loop";
+
+/// Who said a user line when nothing recorded it: a transcript restored from the
+/// session file, or the one a fold just replaced. Everything mush writes into a
+/// conversation has a shape — a child's `#1 done: …` / `#1 stopped: …` /
+/// `#1 failed: …`, a job's `#c2 done: …`, a fold's carried summary — and a child's
+/// transcript opens with the brief its parent spawned it with. What is left is
+/// the human's, because that is what most of a transcript is.
+///
+/// The one line this cannot place is a parent's steering after a restart: the
+/// words look exactly like the human's own nudge, and nothing in the file says
+/// which they were. It reads as the human's until the process is new again —
+/// the alternative would be painting the human's question as somebody else's.
+fn unrecorded(agent: AgentId, index: usize, text: &str) -> Voice {
+    if report(text) || text.starts_with(FOLDED) {
+        return Voice::Mush;
+    }
+    if agent != AgentId::ROOT && index == 0 {
+        return Voice::Brief;
+    }
+    Voice::Human
+}
+
+/// Who said a line that is known *not* to be the human's: [`unrecorded`] read at
+/// the one moment the answer is certain, so what it cannot place is another
+/// agent — a parent's steering, the only other speaker a transcript has.
+fn elsewhere(agent: AgentId, index: usize, text: &str) -> Voice {
+    match unrecorded(agent, index, text) {
+        Voice::Human => Voice::Parent,
+        voice => voice,
+    }
+}
+
+/// Whether a line is one of mush's reports — `#1 done: …`, `#c2 stopped: …` —
+/// written by the run loop and the job registry with exactly this vocabulary.
+fn report(text: &str) -> bool {
+    let Some(rest) = text.strip_prefix('#') else {
+        return false;
+    };
+    let rest = rest.strip_prefix('c').unwrap_or(rest);
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    digits > 0
+        && [" done:", " stopped:", " failed:"]
+            .iter()
+            .any(|tail| rest[digits..].starts_with(tail))
+}
+
 /// One message's rows: who said it, wrapped at the pane's width.
-fn render_message(out: &mut Vec<Line<'static>>, message: &Message, width: usize) {
+fn render_message(
+    out: &mut Vec<Line<'static>>,
+    message: &Message,
+    voice: Option<Voice>,
+    width: usize,
+) {
     match message.role.as_str() {
         "user" => {
-            for (index, line) in wrap_text(message.text(), width).into_iter().enumerate() {
-                if index == 0 {
-                    out.push(Line::from(vec![
-                        Span::styled("you › ", Style::default().fg(Color::Cyan)),
-                        Span::raw(line),
-                    ]));
-                } else {
-                    out.push(Line::from(vec![Span::raw("      "), Span::raw(line)]));
+            match voice.unwrap_or(Voice::Human) {
+                // Mush's own line in the conversation: nobody said it, so it is
+                // marked like the other lines mush writes into a pane.
+                Voice::Mush => marked(out, "· ", dim(), message.text(), width),
+                voice => {
+                    let (mark, colour) = voice.mark();
+                    marked(
+                        out,
+                        mark,
+                        Style::default().fg(colour),
+                        message.text(),
+                        width,
+                    );
                 }
             }
             out.push(Line::from(""));
@@ -821,27 +1104,17 @@ fn render_message(out: &mut Vec<Line<'static>>, message: &Message, width: usize)
         "assistant" => {
             let text = message.text();
             if !text.trim().is_empty() {
-                for (index, line) in wrap_text(text, width).into_iter().enumerate() {
-                    if index == 0 {
-                        out.push(Line::from(vec![
-                            Span::styled("mush › ", Style::default().fg(Color::Green)),
-                            Span::raw(line),
-                        ]));
-                    } else {
-                        out.push(Line::from(vec![Span::raw("       "), Span::raw(line)]));
-                    }
-                }
+                marked(
+                    out,
+                    "mush › ",
+                    Style::default().fg(Color::Green),
+                    text,
+                    width,
+                );
             }
             for call in message.tool_calls() {
-                // `agent::summarize_args` is the same reading the tree shows:
-                // `edit_file src/lex.rs`, not forty lines of JSON.
-                let label = format!(
-                    "  ⚙ {} {}",
-                    call.function.name,
-                    truncate(&summarize_args(&call.function.arguments), 60)
-                );
                 out.push(Line::from(Span::styled(
-                    label,
+                    tool_label(call, width),
                     Style::default().fg(Color::Yellow),
                 )));
             }
@@ -852,13 +1125,38 @@ fn render_message(out: &mut Vec<Line<'static>>, message: &Message, width: usize)
             // wrapped; the ninth is what tells us to print the `…`. Wrapping
             // the whole result was most of a frame's cost on a long session.
             const SHOWN: usize = 8;
-            let wrapped = wrap_text_capped(message.text(), width.saturating_sub(2), SHOWN + 1);
+            // A result that came back `error: …` — mush's own spelling for a
+            // call that was refused or that failed — is not a result, and it was
+            // painted exactly like one, with only the word at the front to tell
+            // them apart. The mark is the difference now, and it is red, because
+            // this is the one kind of line in the transcript that reports
+            // something did not happen.
+            let failed = message.text().trim_start().starts_with(FAILED);
+            let (mark, style) = if failed {
+                ("! ", Style::default().fg(Color::Red))
+            } else {
+                ("", dim())
+            };
+            // The lead is the block's indent plus the mark's own columns, and
+            // the text is wrapped inside what is left: a flagged result is not
+            // `mark` columns wider than a successful one.
+            const INDENT: usize = 2;
+            let lead = INDENT + mark.width();
+            let wrapped = wrap_text_capped(message.text(), width.saturating_sub(lead), SHOWN + 1);
             let clipped = wrapped.len() > SHOWN;
-            for line in wrapped.iter().take(SHOWN) {
-                out.push(Line::from(Span::styled(format!("  {line}"), dim())));
+            for (index, line) in wrapped.iter().take(SHOWN).enumerate() {
+                let head = if index == 0 {
+                    format!("{}{mark}", " ".repeat(INDENT))
+                } else {
+                    " ".repeat(lead)
+                };
+                out.push(Line::from(Span::styled(format!("{head}{line}"), style)));
             }
             if clipped {
-                out.push(Line::from(Span::styled("  …", dim())));
+                out.push(Line::from(Span::styled(
+                    format!("{}…", " ".repeat(lead)),
+                    style,
+                )));
             }
             out.push(Line::from(""));
         }
@@ -902,6 +1200,15 @@ mod tests {
         }
     }
 
+    /// The human speaks, through the box they type in: what `App::deliver` does,
+    /// in the order it does it. A test that pushes a user message *without* this
+    /// is testing somebody else's line — which is the whole point of the voice.
+    fn say(chat: &mut Chat, agent: AgentId, text: &str) {
+        chat.insert(text);
+        assert_eq!(chat.take_input().trim(), text);
+        chat.push_message(agent, Message::user(text));
+    }
+
     /// The text of the rows a pane would paint.
     fn shown(lines: &[Line<'_>]) -> Vec<String> {
         lines
@@ -928,7 +1235,7 @@ mod tests {
     #[test]
     fn a_one_row_pane_shows_a_message_and_not_the_blank_after_it() {
         let mut chat = Chat::bare();
-        chat.push_message(AgentId::ROOT, Message::user("make the lexer faster"));
+        say(&mut chat, AgentId::ROOT, "make the lexer faster");
         chat.push_message(AgentId::ROOT, Message::assistant("done — 3× on the bench"));
         let pane = pane(AgentId::ROOT);
 
@@ -958,7 +1265,7 @@ mod tests {
     fn the_window_follows_the_scrollback() {
         let mut chat = Chat::bare();
         for i in 0..5 {
-            chat.push_message(AgentId::ROOT, Message::user(format!("line {i}")));
+            say(&mut chat, AgentId::ROOT, &format!("line {i}"));
         }
         let pane = pane(AgentId::ROOT);
         let bottom = shown(&pane_rows(&chat, &pane, 20, 2));
@@ -973,7 +1280,7 @@ mod tests {
         assert!(press(&mut chat, key(KeyCode::Down)));
         assert_eq!(shown(&pane_rows(&chat, &pane, 20, 2)), bottom);
         // And a new line arrives at the bottom, where the pane already is.
-        chat.push_message(AgentId::ROOT, Message::user("line 5"));
+        say(&mut chat, AgentId::ROOT, "line 5");
         assert_eq!(shown(&pane_rows(&chat, &pane, 20, 2)), vec!["you › line 5"]);
     }
 
@@ -985,7 +1292,7 @@ mod tests {
     fn a_held_window_does_not_follow_the_lines_that_arrive() {
         let mut chat = Chat::bare();
         for index in 0..6 {
-            chat.push_message(AgentId::ROOT, Message::user(format!("line {index}")));
+            say(&mut chat, AgentId::ROOT, &format!("line {index}"));
         }
         let pane = pane(AgentId::ROOT);
         chat.scroll_by(AgentId::ROOT, 4);
@@ -995,7 +1302,7 @@ mod tests {
             "the pane is away from the newest line: {held:?}"
         );
 
-        chat.push_message(AgentId::ROOT, Message::user("arrived while held"));
+        say(&mut chat, AgentId::ROOT, "arrived");
         assert_eq!(
             shown(&pane_rows(&chat, &pane, 20, 2)),
             held,
@@ -1006,7 +1313,7 @@ mod tests {
         chat.scroll_by(AgentId::ROOT, -4);
         let bottom = shown(&pane_rows(&chat, &pane, 20, 2));
         assert!(
-            bottom.iter().any(|row| row.contains("arrived while held")),
+            bottom.iter().any(|row| row.contains("arrived")),
             "{bottom:?}"
         );
     }
@@ -1017,8 +1324,8 @@ mod tests {
     fn one_panes_position_is_not_anothers() {
         let mut chat = Chat::bare();
         for index in 0..6 {
-            chat.push_message(AgentId::ROOT, Message::user(format!("root {index}")));
-            chat.push_message(AgentId(1), Message::user(format!("child {index}")));
+            say(&mut chat, AgentId::ROOT, &format!("root {index}"));
+            say(&mut chat, AgentId(1), &format!("child {index}"));
         }
         let root = pane(AgentId::ROOT);
         let child = pane(AgentId(1));
@@ -1042,7 +1349,7 @@ mod tests {
     #[test]
     fn a_transcript_belongs_to_one_agent() {
         let mut chat = Chat::bare();
-        chat.push_message(AgentId::ROOT, Message::user("the human's question"));
+        say(&mut chat, AgentId::ROOT, "the human's question");
         chat.push_message(AgentId(1), Message::user("the child's brief"));
 
         assert_eq!(
@@ -1083,6 +1390,126 @@ mod tests {
         );
     }
 
+    /// Every row of a wrapped message fits the pane, and every word of it is
+    /// still there. The voice used to be prepended *after* the text was wrapped
+    /// at the pane's whole width, so every row was six (or seven) columns too
+    /// wide and ratatui clipped the overflow from the right edge: `w12 w13` gone
+    /// from the first row at 80 columns, `w26 w27` from the second, and one more
+    /// pair off every row for the life of the message.
+    #[test]
+    fn a_wrapped_message_keeps_its_tail_at_every_width() {
+        let words: Vec<String> = (0..60).map(|index| format!("w{index:02}")).collect();
+        let text = words.join(" ");
+        for width in [30usize, 40, 60, 80, 120] {
+            for message in [Message::user(&text), Message::assistant(&text)] {
+                let mut rows = Vec::new();
+                render_message(&mut rows, &message, Some(Voice::Human), width);
+                let painted = shown(&rows);
+                for row in &painted {
+                    assert!(
+                        UnicodeWidthStr::width(row.as_str()) <= width,
+                        "a {width}-column pane painted {}: {row:?}",
+                        UnicodeWidthStr::width(row.as_str())
+                    );
+                }
+                let flat = painted.join(" ");
+                for word in &words {
+                    assert!(
+                        flat.contains(word.as_str()),
+                        "{word} was clipped at {width}: {painted:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A truncated label says it was truncated. The arguments are budgeted the
+    /// columns the `  ⚙ name ` head leaves, so the `…` lands *inside* the pane;
+    /// the flat 60 it used to be ignored the head, so on a narrow pane a path
+    /// was cut mid-word and the mark that says something was dropped fell past
+    /// the border.
+    #[test]
+    fn a_tool_call_label_truncates_inside_the_pane() {
+        let path = "crates/mush/src/app/chat.rs/deeply/nested/module/some/more/directories/and/more/file.rs";
+        for width in [24usize, 40, 60, 80, 120] {
+            let mut chat = Chat::bare();
+            let call = mush_core::ToolCall {
+                id: "call_1".into(),
+                kind: "function".into(),
+                function: mush_core::FunctionCall {
+                    name: "read_file".into(),
+                    arguments: format!(r#"{{"path":"{path}"}}"#),
+                },
+            };
+            chat.push_message(
+                AgentId::ROOT,
+                Message {
+                    role: "assistant".into(),
+                    tool_calls: Some(vec![call]),
+                    ..Default::default()
+                },
+            );
+
+            let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), width, 4));
+            let label = rows
+                .iter()
+                .find(|row| row.contains("⚙"))
+                .unwrap_or_else(|| panic!("no label at {width}: {rows:?}"));
+            assert!(
+                UnicodeWidthStr::width(label.as_str()) <= width,
+                "a {width}-column pane painted {}: {label:?}",
+                UnicodeWidthStr::width(label.as_str())
+            );
+            assert!(label.contains("read_file"), "the name stays: {label:?}");
+            assert!(
+                label.ends_with('…'),
+                "a cut path says so: {label:?} at {width}"
+            );
+        }
+
+        // A path that fits is painted whole, with no mark to explain.
+        let mut chat = Chat::bare();
+        let call = mush_core::ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: mush_core::FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"path":"src/a.rs"}"#.into(),
+            },
+        };
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                role: "assistant".into(),
+                tool_calls: Some(vec![call]),
+                ..Default::default()
+            },
+        );
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 40, 4));
+        assert!(
+            rows.iter().any(|row| row == "  ⚙ read_file src/a.rs"),
+            "{rows:?}"
+        );
+    }
+
+    /// A pane narrower than the voice: the label is what the row cannot afford.
+    /// Painting `you › ` into a five-column pane is a row that says who spoke
+    /// and nothing else, and a message the human cannot read.
+    #[test]
+    fn a_pane_narrower_than_the_voice_still_shows_the_words() {
+        let mut rows = Vec::new();
+        render_message(
+            &mut rows,
+            &Message::user("aaaa bbbb"),
+            Some(Voice::Human),
+            5,
+        );
+        assert_eq!(
+            shown(&rows),
+            vec!["aaaa".to_string(), "bbbb".to_string(), String::new()]
+        );
+    }
+
     /// A message taller than the pane must show its *end*, not its start: the
     /// pane is anchored at the bottom (scroll 0), so the newest rows are the
     /// ones a human is looking for — and with scroll 0 there is no other way to
@@ -1090,7 +1517,7 @@ mod tests {
     #[test]
     fn a_message_taller_than_the_pane_shows_its_end() {
         let mut chat = Chat::bare();
-        chat.push_message(AgentId::ROOT, Message::user("aaaa bbbb cccc dddd"));
+        say(&mut chat, AgentId::ROOT, "aaaa bbbb cccc dddd");
         let pane = pane(AgentId::ROOT);
         let one = pane_rows(&chat, &pane, 5, 1);
         assert_eq!(one.len(), 1);
@@ -1117,7 +1544,7 @@ mod tests {
     fn scrolling_moves_the_window_not_its_size() {
         let mut chat = Chat::bare();
         for index in 0..6 {
-            chat.push_message(AgentId::ROOT, Message::user(format!("line {index}")));
+            say(&mut chat, AgentId::ROOT, &format!("line {index}"));
         }
         let pane = pane(AgentId::ROOT);
         let bottom = pane_rows(&chat, &pane, 40, 3);
@@ -1130,6 +1557,276 @@ mod tests {
         assert!(
             scrolled[0].to_string() != text[0],
             "scrolling showed older rows"
+        );
+    }
+
+    /// A model can write an escape into its reply and a tool result can carry
+    /// one out of a log file. Neither reaches the terminal that paints the pane:
+    /// the reply that erased the border, the OSC that set the window title and
+    /// the CSI that wiped the frame are all just text now — and text that lost
+    /// its commands, not text that kept them.
+    #[test]
+    fn a_pane_paints_no_escape_sequence_and_no_carriage_return() {
+        let mut chat = Chat::bare();
+        say(&mut chat, AgentId::ROOT, "look at this");
+        chat.push_message(
+            AgentId::ROOT,
+            Message::assistant("and then\rREPLACED \x1b]0;PWNED\x07"),
+        );
+        chat.push_message(
+            AgentId::ROOT,
+            Message::tool("call_1", "\x1b[2J\x1b[Hwiped\ttabbed\nsecond row"),
+        );
+        chat.note_for(AgentId::ROOT, "a note \x1b[31min red\x1b[0m");
+
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 8)).join("\n");
+        assert!(!rows.contains('\x1b'), "{rows:?}");
+        assert!(!rows.contains('\r'), "{rows:?}");
+        assert!(rows.contains("and then␍REPLACED"), "{rows:?}");
+        assert!(rows.contains("wiped    tabbed"), "{rows:?}");
+        assert!(rows.contains("second row"), "{rows:?}");
+        assert!(rows.contains("· a note in red"), "{rows:?}");
+    }
+
+    /// The tool-call label is the model's own arguments, and it is painted as one
+    /// span rather than wrapped, so it is defanged where it is read: both the
+    /// transcript and the tree's row paint `summarize_args`.
+    #[test]
+    fn a_tool_call_label_carries_no_escape_from_its_arguments() {
+        let mut chat = Chat::bare();
+        let call = mush_core::ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: mush_core::FunctionCall {
+                name: "read_file".into(),
+                arguments: r#"{"path":"src/\u001b]0;PWNED\u0007main.rs"}"#.into(),
+            },
+        };
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                role: "assistant".into(),
+                tool_calls: Some(vec![call]),
+                ..Default::default()
+            },
+        );
+
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 4)).join("\n");
+        assert!(!rows.contains('\x1b'), "{rows:?}");
+        assert!(rows.contains("⚙ read_file src/"), "{rows:?}");
+
+        // And a command whose argument carries an escape: the label keeps its
+        // words and loses the sequence.
+        let mut chat = Chat::bare();
+        let call = mush_core::ToolCall {
+            id: "call_2".into(),
+            kind: "function".into(),
+            function: mush_core::FunctionCall {
+                name: "run_command".into(),
+                arguments: r#"{"command":"cat log\u001b[2J\u001b[H"}"#.into(),
+            },
+        };
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                role: "assistant".into(),
+                tool_calls: Some(vec![call]),
+                ..Default::default()
+            },
+        );
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 4)).join("\n");
+        assert!(rows.contains("⚙ run_command cat log"), "{rows:?}");
+    }
+
+    /// A result that came back `error: …` is not a result. Painting it exactly
+    /// like one left the word at the front as the only difference, so a call
+    /// that was refused or failed — "this call was not run" — read as work that
+    /// happened.
+    #[test]
+    fn a_failed_tool_result_is_not_painted_as_a_success() {
+        let mut chat = Chat::bare();
+        chat.push_message(
+            AgentId::ROOT,
+            Message::tool(
+                "call_1",
+                "error: this call was not run — the run was stopped as a loop",
+            ),
+        );
+        chat.push_message(AgentId::ROOT, Message::tool("call_2", "wrote 3 lines"));
+
+        let rows = pane_rows(&chat, &pane(AgentId::ROOT), 60, 8);
+        let painted = shown(&rows);
+        assert!(
+            painted.iter().any(|row| row.starts_with("  ! error:")),
+            "{painted:?}"
+        );
+        assert!(
+            painted.iter().any(|row| row == "  wrote 3 lines"),
+            "{painted:?}"
+        );
+
+        let failed = rows
+            .iter()
+            .find(|line| line.to_string().contains("! error:"))
+            .expect("the failed result");
+        assert_eq!(
+            failed.spans.first().map(|span| span.style.fg),
+            Some(Some(Color::Red)),
+            "the failure is the red one: {failed:?}"
+        );
+        let ok = rows
+            .iter()
+            .find(|line| line.to_string().contains("wrote 3 lines"))
+            .expect("the result");
+        assert_ne!(
+            ok.spans.first().map(|span| span.style.fg),
+            Some(Some(Color::Red))
+        );
+    }
+
+    /// One loop guard writes two lines — the notice it emits as it stops the
+    /// run, and the failure the run then ends with — and the pane painted both,
+    /// one of them with a red `!`, though nothing the model did failed. One
+    /// event is one line, and it is marked as the stop R4 says it is.
+    #[test]
+    fn a_guard_stop_is_one_line_marked_as_a_stop() {
+        let notice = "the run repeated the same tool call 5 times without changing \
+                      anything — stopping it as a loop";
+        let stop = "the run was stopped as a loop: the same tool call repeated 5 times \
+                    with nothing changed in between";
+        let mut chat = Chat::bare();
+        // The order the two arrive in: the notice as the guard fires, the
+        // failure when the run ends a moment later.
+        chat.note_for(AgentId::ROOT, notice);
+        chat.note_error_for(AgentId::ROOT, stop);
+
+        let texts: Vec<&str> = chat
+            .notices_for(AgentId::ROOT)
+            .map(|notice| notice.text.as_str())
+            .collect();
+        assert_eq!(texts, vec![stop], "one event, one line");
+        let notice = chat.notices_for(AgentId::ROOT).next().unwrap();
+        assert_eq!(notice.kind, NoticeKind::Stopped);
+        assert_eq!(
+            notice.rank(),
+            Rank::Alert,
+            "a run that stopped is the thing the human has to read"
+        );
+
+        let rows = pane_rows(&chat, &pane(AgentId::ROOT), 70, 7);
+        let painted = shown(&rows).join("\n");
+        assert!(
+            painted.contains("⊘ the run was stopped as a loop"),
+            "{painted}"
+        );
+        let row = rows
+            .iter()
+            .find(|line| line.to_string().contains("⊘"))
+            .expect("the stop line");
+        assert_eq!(
+            row.spans.first().map(|span| span.style.fg),
+            Some(Some(Color::Yellow)),
+            "a stop is not a failure and is not painted like one: {row:?}"
+        );
+
+        // A real failure is still the red `!` it was, and it takes the agent's
+        // older outcome with it: an agent has one *last run*, so it has one line
+        // about how that run ended.
+        chat.note_error_for(AgentId::ROOT, "no route to host");
+        let texts: Vec<&str> = chat
+            .notices_for(AgentId::ROOT)
+            .map(|notice| notice.text.as_str())
+            .collect();
+        assert_eq!(texts, vec!["no route to host"]);
+    }
+
+    /// A line the human did not say is not painted in the human's voice. Three
+    /// kinds of them reach a child's pane: the brief its parent spawned it with,
+    /// a parent's steering (`agent_control message`, the words of which the
+    /// human has no other way to see), and mush's own report of a completion it
+    /// folded in. All three read `you › …` — the human's words in the human's
+    /// mouth — while the human's own nudge to the same agent must keep it.
+    #[test]
+    fn a_line_the_human_did_not_say_is_not_in_the_human_voice() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId(1), Message::user("create a file called iso.txt"));
+        chat.push_message(AgentId(1), Message::user("#1 done: created iso.txt"));
+        chat.push_message(AgentId(1), Message::user("keep the steps small"));
+        say(&mut chat, AgentId(1), "and add a test");
+
+        let rows = shown(&pane_rows(&chat, &pane(AgentId(1)), 60, 8));
+        let painted = rows.join("\n");
+        assert!(painted.contains("brief › create a file"), "{rows:?}");
+        assert!(painted.contains("· #1 done: created iso.txt"), "{rows:?}");
+        assert!(
+            painted.contains("parent › keep the steps small"),
+            "{rows:?}"
+        );
+        assert!(painted.contains("you › and add a test"), "{rows:?}");
+        assert_eq!(
+            rows.iter().filter(|row| row.contains("you ›")).count(),
+            1,
+            "only the human's own words carry the human's voice: {rows:?}"
+        );
+    }
+
+    /// The same in the root's pane: mush folds a child's result in as a *user*
+    /// message (that is the shape a model reads it in), so the root's transcript
+    /// paints `· #1 done: …` — mush's report — and not the human asking
+    /// themselves a question.
+    #[test]
+    fn a_folded_completion_is_mushs_line_in_the_roots_pane() {
+        let mut chat = Chat::bare();
+        say(&mut chat, AgentId::ROOT, "delegate the parser");
+        chat.push_message(AgentId::ROOT, Message::user("#1 done: wrote the parser"));
+
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 6));
+        assert!(
+            rows.iter().any(|row| row == "· #1 done: wrote the parser"),
+            "{rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row == "you › delegate the parser"),
+            "{rows:?}"
+        );
+    }
+
+    /// A transcript restored from the session file arrives without its voices,
+    /// so the pane reads what the lines themselves say: a fold's carried summary
+    /// is mush's line, a child's first line is the brief it was spawned with,
+    /// and everything else is the human — which is what most of a transcript is,
+    /// and the panel recusing itself from the human's own question would be the
+    /// louder lie.
+    #[test]
+    fn a_restored_transcript_reads_its_own_lines() {
+        let mut chat = Chat::bare();
+        chat.replace_transcript(
+            AgentId::ROOT,
+            vec![
+                Message::user("port the parser"),
+                Message::user("Context compacted — continue the task from this summary:\ndid it"),
+                Message::user("#c2 done: exit 0 · 3m12s · cargo test"),
+                Message::assistant("still here"),
+            ],
+        );
+        chat.replace_transcript(
+            AgentId(1),
+            vec![
+                Message::user("write the lexer tests"),
+                Message::user("and make them fast"),
+            ],
+        );
+
+        let root = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 70, 10)).join("\n");
+        assert!(root.contains("you › port the parser"), "{root}");
+        assert!(root.contains("· Context compacted"), "{root}");
+        assert!(root.contains("· #c2 done: exit 0"), "{root}");
+
+        let child = shown(&pane_rows(&chat, &pane(AgentId(1)), 70, 6)).join("\n");
+        assert!(child.contains("brief › write the lexer tests"), "{child}");
+        assert!(
+            child.contains("you › and make them fast"),
+            "a mid-transcript line nothing distinguishes reads as the human's: {child}"
         );
     }
 
