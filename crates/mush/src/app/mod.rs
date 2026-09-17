@@ -762,9 +762,10 @@ impl App {
                      Ctrl-P pick a model · Ctrl-N new chat · \
                      Ctrl-C stops the focused agent · Ctrl-X stops them all. \
                      Commands: /provider /model /context /url /key /models \
-                     /worktrees /diff /merge /discard /forget /new /quit \
+                     /worktrees /diff /merge /discard /forget /compact /new /quit \
                      (/merge and /discard run git for you and reclaim the worktree; \
-                     /forget drops the agent from this session and leaves the branch)",
+                     /forget drops the agent from this session and leaves the branch; \
+                     /compact folds the focused agent's conversation into a summary)",
                 );
             }
             "/context" => {
@@ -1167,7 +1168,9 @@ impl App {
     fn compact_focused(&mut self) {
         let target = self.tree.focused;
         match self.tree.agent_tx.get(&target) {
-            Some(tx) if tx.send(AgentMsg::Compact).is_ok() => {}
+            Some(tx) if tx.send(AgentMsg::Compact).is_ok() => {
+                self.say(format!("compacting #{target}…"));
+            }
             _ => self.fail(format!("agent #{target} is gone")),
         }
     }
@@ -2094,6 +2097,83 @@ mod tests {
             "the ✓ is not rewritten"
         );
         assert_eq!(text_of(&app), "agent #1 is gone");
+    }
+
+    /// `/compact` asks the *focused* agent to fold its conversation, and says
+    /// so on the bar. Nothing about the row's phase changes: the fold is the
+    /// actor's job, and its `Compact` event is what replaces the transcript.
+    #[test]
+    fn compact_asks_the_focused_agent() {
+        let (mut app, _rx) = test_app("compact-focus");
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "lexer".to_string(),
+            depth: 1,
+            branch: None,
+            cmd: crossbeam_channel::unbounded().0,
+        });
+        let (mailbox, asked) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.agent_tx.insert(AgentId(1), mailbox);
+        app.tree.focus(AgentId(1));
+        let before = app.tree.node(AgentId(1)).unwrap().phase.clone();
+
+        app.run_command("/compact");
+
+        assert!(
+            matches!(asked.try_recv(), Ok(AgentMsg::Compact)),
+            "the request goes to the agent whose pane is focused"
+        );
+        assert_eq!(text_of(&app), "compacting #1…");
+        assert_eq!(
+            app.tree.node(AgentId(1)).unwrap().phase,
+            before,
+            "a fold is not a run, so the row is not put to work"
+        );
+        // The root is a different agent: its mailbox is not what was written to.
+        assert!(asked.try_recv().is_err());
+    }
+
+    /// A `/compact` that cannot be delivered says so, the way a nudge does —
+    /// and leaves the row exactly as it was (finding B10).
+    #[test]
+    fn compact_on_a_dead_mailbox_does_not_lie_on_the_row() {
+        let (mut app, _rx) = test_app("compact-dead");
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "lexer".to_string(),
+            depth: 1,
+            branch: None,
+            cmd: crossbeam_channel::unbounded().0,
+        });
+        app.tree
+            .finish(AgentId(1), Some("did the work".to_string()));
+        app.tree.agent_tx.remove(&AgentId(1));
+        app.tree.focus(AgentId(1));
+
+        app.run_command("/compact");
+
+        assert_eq!(text_of(&app), "agent #1 is gone");
+        assert_eq!(
+            app.tree.node(AgentId(1)).unwrap().phase,
+            Phase::Done,
+            "no phase is claimed for work nobody is doing"
+        );
+    }
+
+    /// `/help` is the list a human reads to find out what exists.
+    #[test]
+    fn help_advertises_compact() {
+        let (mut app, _rx) = test_app("compact-help");
+        app.run_command("/help");
+        let help = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .map(|notice| notice.text.clone())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(help.contains("/compact"), "{help}");
     }
 
     /// A tree `/new` abandoned can still spawn children, and their `Spawned`
