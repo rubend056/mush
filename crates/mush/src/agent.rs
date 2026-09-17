@@ -389,8 +389,12 @@ impl AgentCtx {
 struct ActorState {
     children: HashMap<u64, Sender<AgentMsg>>,
     running: HashSet<u64>,
+    /// The latest outcome of each child, whether or not the model has read it.
+    /// A completion is recorded the moment it arrives — even mid-batch — and
+    /// folded into the transcript by [`fold_completions`].
     completed: HashMap<u64, Outcome>,
-    /// Completions already handed to the model (via wait_agents or delivery).
+    /// Completions already handed to the model (via `wait_agents` or a folded
+    /// line); a fresh completion clears the mark, so it is announced again.
     delivered: HashSet<u64>,
     /// Commands parked while a blocking tool call was in flight; folded in at
     /// the next message boundary (see `drain_signals`).
@@ -1272,18 +1276,7 @@ fn run_loop(
             // waited on: deliver their summaries and keep going instead of
             // ending. (Completions that arrive after this run returns wake the
             // idle actor instead — see actor_main.)
-            let pending: Vec<(u64, Outcome)> = state
-                .completed
-                .iter()
-                .filter(|(child, _)| !state.delivered.contains(child))
-                .map(|(child, outcome)| (*child, outcome.clone()))
-                .collect();
-            if !pending.is_empty() {
-                for (child, outcome) in &pending {
-                    let line = note_completion(state, *child, outcome.clone());
-                    messages.push(Message::user(line));
-                    state.delivered.insert(*child);
-                }
+            if fold_completions(state, messages) > 0 {
                 continue;
             }
             // Answer the steering instead of ending the run without it: the
@@ -1343,6 +1336,14 @@ fn run_loop(
         // Fold mailbox commands in at the message boundary, and honour a
         // cancellation now that every call has a result.
         drain_mailbox(&actor.rx, cancel, messages, state);
+        // And fold in the children that finished while the batch ran, before
+        // the next request goes out. This is the boundary a busy parent needs:
+        // a run can work through a long chain of tool-calling turns without
+        // ever reaching a tool-free one, and a result that waits for that turn
+        // is a result nobody hears (`docs/mush.md` §5.5). A user line is legal
+        // here — every call above has its answer — and `note_completion` keeps
+        // a child from being announced twice.
+        fold_completions(state, messages);
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.to_string());
         }
@@ -1546,12 +1547,15 @@ fn compact_now(actor: &Actor, state: &mut ActorState, transcript: &mut Vec<Messa
     }
 }
 
-/// Fold in only what may appear between tool calls: cancellation, shutdown, and
-/// child completions. Nudges and new transcripts are *parked* for the next
-/// message boundary — a user message between an assistant's tool calls and their
-/// results makes strict servers reject the whole conversation. They are parked
-/// in the actor's own state, never put back in the mailbox: that is the queue
-/// this function is draining, so re-sending would spin forever.
+/// Fold in only what may appear between tool calls: cancellation and shutdown.
+/// A child's completion is *recorded* here rather than folded — it must not be
+/// missed while a call is in flight, and the line it becomes is a user message
+/// that only belongs at a message boundary (`fold_completions`). Nudges and new
+/// transcripts are *parked* for that same boundary: a user message between an
+/// assistant's tool calls and their results makes strict servers reject the
+/// whole conversation. They are parked in the actor's own state, never put
+/// back in the mailbox: that is the queue this function is draining, so
+/// re-sending would spin forever.
 fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
     for command in actor.rx.try_iter() {
         match command {
@@ -1608,6 +1612,31 @@ fn drain_mailbox(
             }
         }
     }
+}
+
+/// Hand every child completion the model has not read yet to the transcript,
+/// and report how many lines were folded.
+///
+/// This belongs at a *message boundary*: a turn that ended without tool calls,
+/// or the gap after a batch's results and before the next request. It must not
+/// wait for the former alone — a parent can work through a long chain of
+/// tool-calling turns, and the point of waking it with a result is that it
+/// never had to ask (`docs/mush.md` §5.5). A user message is legal there:
+/// every call in the assistant's batch already has its answer, so the
+/// conversation is still one the endpoint will accept.
+fn fold_completions(state: &mut ActorState, messages: &mut Vec<Message>) -> usize {
+    let pending: Vec<(u64, Outcome)> = state
+        .completed
+        .iter()
+        .filter(|(child, _)| !state.delivered.contains(child))
+        .map(|(child, outcome)| (*child, outcome.clone()))
+        .collect();
+    for (child, outcome) in &pending {
+        let line = note_completion(state, *child, outcome.clone());
+        messages.push(Message::user(line));
+        state.delivered.insert(*child);
+    }
+    pending.len()
 }
 
 /// Record a child's completion and return the line the model reads. A fresh
@@ -3849,6 +3878,74 @@ mod tests {
         assert_eq!(carried.role, "tool");
         assert_eq!(carried.text(), "wrote note.txt");
         let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A parent that keeps calling tools still hears its child. The completion
+    /// is folded in at the batch's own boundary, so the very next request
+    /// carries it; waiting for a turn that made no calls at all is the failure
+    /// §5.5 promises cannot happen, and a parent in a chain of busy turns never
+    /// makes that turn.
+    #[test]
+    fn a_childs_result_reaches_a_parent_that_keeps_calling_tools() {
+        let model = Arc::new(
+            Scripted::new()
+                .calls(vec![tool_call("c0", "list_files", json!({}))])
+                .says("all done"),
+        );
+        let (actor, _events, mailbox) = scripted_actor("child-done-mid-batch", &model);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("orchestrate"),
+        ];
+
+        // The child finished while this run was in flight: its outcome is in
+        // the mailbox, not yet in the transcript.
+        mailbox
+            .send(AgentMsg::ChildDone {
+                id: 1,
+                outcome: Outcome::Finished("wrote the parser".into()),
+            })
+            .unwrap();
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+
+        assert_eq!(result.as_deref(), Some("all done"));
+        let asked = model.asked();
+        assert_eq!(asked.len(), 2, "two turns: the batch's, then the answer");
+        assert!(
+            asked[1].saw("#1 done: wrote the parser"),
+            "the result must travel with the request that follows the batch: {:?}",
+            asked[1].messages
+        );
+        assert_eq!(
+            asked[1].messages.last().unwrap().text(),
+            "#1 done: wrote the parser",
+            "and it is the newest thing the model reads"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// Folding is a hand-over, so it happens once: the same completion cannot
+    /// reach the model twice, however many boundaries the run passes.
+    #[test]
+    fn a_completion_is_delivered_once() {
+        let mut state = ActorState::default();
+        let mut messages = vec![Message::system("you are mush")];
+        state
+            .completed
+            .insert(1, Outcome::Finished("wrote the parser".into()));
+
+        assert_eq!(fold_completions(&mut state, &mut messages), 1);
+        assert_eq!(messages.len(), 2, "one line for the one completion");
+        assert_eq!(messages[1].text(), "#1 done: wrote the parser");
+        assert_eq!(
+            fold_completions(&mut state, &mut messages),
+            0,
+            "the model has read it, so there is nothing left to fold"
+        );
+        assert_eq!(messages.len(), 2, "and nothing is pushed a second time");
     }
 
     /// The learned-context retry, in process: the endpoint refuses the request
