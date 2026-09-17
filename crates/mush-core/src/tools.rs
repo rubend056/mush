@@ -53,14 +53,11 @@ impl ToolName {
     /// does not receive them, which is what bounds the tree. A *job's* tools are
     /// workspace tools: an agent with no children can still start one, so they
     /// are not in this list.
-    pub const ORCHESTRATION: [ToolName; 7] = [
+    pub const ORCHESTRATION: [ToolName; 4] = [
         ToolName::SpawnAgent,
         ToolName::WaitAgents,
         ToolName::AgentStatus,
         ToolName::AgentControl,
-        ToolName::CommandStatus,
-        ToolName::CommandControl,
-        ToolName::WaitCommands,
     ];
 
     /// The name the model calls this tool by.
@@ -114,7 +111,7 @@ const fn names<const N: usize>(tools: [ToolName; N]) -> [&'static str; N] {
 pub const TOOL_NAMES: [&str; 12] = names(ToolName::ALL);
 
 /// The names of the delegation-only tools.
-pub const ORCHESTRATION_TOOLS: [&str; 7] = names(ToolName::ORCHESTRATION);
+pub const ORCHESTRATION_TOOLS: [&str; 4] = names(ToolName::ORCHESTRATION);
 
 /// A required string argument.
 pub fn arg_string(args: &Value, key: &str) -> Result<String, String> {
@@ -341,16 +338,15 @@ mod tests {
         assert_eq!(all, TOOL_NAMES.to_vec());
         let orchestration: Vec<&str> = ToolName::ORCHESTRATION.iter().map(|t| t.as_str()).collect();
         assert_eq!(orchestration, ORCHESTRATION_TOOLS.to_vec());
-        assert!(ToolName::ALL
-            .iter()
-            .skip(5)
-            .all(|tool| tool.is_orchestration()));
-        // A job is a second-class actor, so its tools travel with the agent
-        // tools: a leaf at `MAX_DEPTH` does not get them, and a leaf's job still
-        // reports to it by waking it.
-        assert!(ToolName::CommandStatus.is_orchestration());
-        assert!(ToolName::CommandControl.is_orchestration());
-        assert!(ToolName::WaitCommands.is_orchestration());
+        // Only delegation bounds a tree. A job is workspace work: an agent with
+        // no children can still start one and manage it, so the job tools are
+        // *not* orchestration and a leaf receives them (the subagent prompt
+        // names them).
+        assert!(ToolName::SpawnAgent.is_orchestration());
+        assert!(ToolName::WaitAgents.is_orchestration());
+        assert!(!ToolName::CommandStatus.is_orchestration());
+        assert!(!ToolName::CommandControl.is_orchestration());
+        assert!(!ToolName::WaitCommands.is_orchestration());
     }
 
     #[test]

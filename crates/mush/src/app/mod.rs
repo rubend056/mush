@@ -2468,6 +2468,65 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// Quitting kills every job, wherever it is in the tree. The `Drop` is the
+    /// one way out of the event loop, and a build an agent started must not
+    /// outlive a clean quit — the human's next `cargo build` would otherwise
+    /// fight a ghost for the target directory.
+    #[test]
+    fn quitting_kills_the_jobs_the_agents_started() {
+        use crate::jobs::Launch;
+        use crate::machine::fake::{Script, Scripted as ScriptedMachine};
+        use crate::machine::{Machine, ShellCommand};
+
+        let (app, _rx) = test_app("jobs-die-on-quit");
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::hangs())
+                .runs(Script::hangs()),
+        );
+        let registry = app.tree.handles().jobs;
+        let mut job_rx = Vec::new();
+        // One job for the root, one for an agent that is not the root: the kill
+        // is the registry's, so it is not the root's jobs that die but every
+        // job in the tree.
+        for owner in [0u64, 3] {
+            let job = machine
+                .spawn(&ShellCommand {
+                    command: "cargo build",
+                    root: std::path::Path::new("/tmp"),
+                })
+                .unwrap();
+            let (tx, rx) = crossbeam_channel::unbounded();
+            registry
+                .launch(Launch {
+                    owner,
+                    command: "cargo build".to_string(),
+                    exclusive: false,
+                    job,
+                    mailbox: tx,
+                })
+                .unwrap();
+            job_rx.push(rx);
+        }
+        assert_eq!(registry.running(), 2, "both jobs are live before the quit");
+
+        drop(app);
+
+        // The kill is synchronous: the process groups are gone before `Drop`
+        // returns, not ten milliseconds later.
+        assert_eq!(machine.kills(), 2, "quitting killed every job");
+        for rx in &job_rx {
+            assert!(
+                matches!(
+                    rx.recv_timeout(Duration::from_secs(5)),
+                    Ok(AgentMsg::CommandDone { .. })
+                ),
+                "each job's own thread reported its stop"
+            );
+        }
+        assert_eq!(registry.running(), 0, "nothing is left running");
+    }
+
     /// `/new` clears the stored conversation too, not just the visible one: the
     /// old chat coming back at the next start is exactly what the flush stops.
     #[test]

@@ -4462,6 +4462,56 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// A leaf (depth `MAX_DEPTH`) has no delegation tools — that is what bounds
+    /// the tree — but its own jobs are its business: the subagent prompt names
+    /// `command_status`/`wait_commands`/`command_control`, so the schema has to
+    /// carry them, and the executors have to answer a leaf exactly as they
+    /// answer the root.
+    #[test]
+    fn a_leaf_agent_keeps_the_job_tools_and_can_manage_its_job() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let clock = Arc::new(Advanceable::new());
+        let (mut actor, _mailbox) = scripted_tools_actor("leaf-jobs", machine, clock);
+        actor.depth = MAX_DEPTH;
+
+        // The leaf set is the workspace tools and the job tools; the delegation
+        // tools are what the depth removes.
+        let schemas = tool_schemas(&actor);
+        let names: Vec<&str> = schemas
+            .iter()
+            .map(|schema| schema["function"]["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"command_status"), "{names:?}");
+        assert!(names.contains(&"command_control"), "{names:?}");
+        assert!(names.contains(&"wait_commands"), "{names:?}");
+        assert!(!names.contains(&"spawn_agent"), "{names:?}");
+        assert!(!names.contains(&"wait_agents"), "{names:?}");
+
+        // And they work: a leaf detaches a job, lists it and stops it.
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut call =
+            |tool: ToolName, args: Value| exec_tool(&actor, &mut state, tool, &args, &cancel);
+        let started = call(
+            ToolName::RunCommand,
+            json!({ "command": "npm run dev", "detach": true }),
+        )
+        .unwrap();
+        assert!(started.contains("detached as #c1"), "{started}");
+        let status = call(ToolName::CommandStatus, json!({})).unwrap();
+        assert!(status.contains("#c1 running "), "{status}");
+        assert!(status.contains("npm run dev"), "{status}");
+        assert_eq!(
+            call(
+                ToolName::CommandControl,
+                json!({ "id": 1, "action": "stop" })
+            )
+            .unwrap(),
+            "stopping job #c1"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// A job's completion is `ChildDone`'s twin: it wakes a napping owner when
     /// there is a result, and folds quietly into the transcript when mush killed
     /// the job.

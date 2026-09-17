@@ -276,7 +276,7 @@ pub fn leaf_tool_schemas() -> Vec<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::tools::TOOL_NAMES;
+    use crate::tools::{ORCHESTRATION_TOOLS, TOOL_NAMES};
 
     /// The schemas and the executors are two lists that must agree; this is
     /// the test that keeps them in step (and in order).
@@ -289,26 +289,41 @@ mod tests {
             .collect();
         assert_eq!(names, TOOL_NAMES.to_vec());
 
-        // A leaf keeps exactly the workspace tools.
+        // A leaf keeps the workspace tools — the job tools among them, since a
+        // leaf may run a build in the background while it edits — and none of
+        // the delegation tools.
         let leaf = leaf_tool_schemas();
         let leaf_names: Vec<String> = leaf
             .iter()
             .map(|schema| schema["function"]["name"].as_str().unwrap().to_string())
             .collect();
-        assert_eq!(leaf_names, TOOL_NAMES[..5].to_vec());
+        let workspace: Vec<&str> = TOOL_NAMES
+            .iter()
+            .copied()
+            .filter(|name| !ORCHESTRATION_TOOLS.contains(name))
+            .collect();
+        assert_eq!(leaf_names, workspace);
     }
 
+    /// Depth is bounded by what a leaf can see: the delegation tools are gone,
+    /// but the job tools stay — a leaf that runs a build in the background has
+    /// to be able to watch and stop it.
     #[test]
-    fn leaf_schemas_omit_orchestration() {
+    fn leaf_schemas_omit_orchestration_but_keep_the_job_tools() {
         let leaf = leaf_tool_schemas();
         let names: Vec<&str> = leaf
             .iter()
             .map(|schema| schema["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 5);
+        assert_eq!(names.len(), 8);
         assert!(names.contains(&"edit_file"));
+        assert!(names.contains(&"command_status"));
+        assert!(names.contains(&"command_control"));
+        assert!(names.contains(&"wait_commands"));
         assert!(!names.contains(&"spawn_agent"));
         assert!(!names.contains(&"wait_agents"));
+        assert!(!names.contains(&"agent_status"));
+        assert!(!names.contains(&"agent_control"));
     }
 
     /// The root's schemas must fit the tokens `Config::history_budget`
