@@ -329,17 +329,43 @@ pub struct RootHandle {
 
 /// Start the root actor.
 pub fn spawn(cfg: Config, tx: Sender<Msg>, root: PathBuf) -> RootHandle {
+    let shared = Arc::new(Mutex::new(cfg));
+    // The real endpoint, behind the seam: every agent in this tree calls it
+    // through `AgentCtx::model`, children included.
+    let model: Arc<dyn ModelClient> = Arc::new(HttpModel::new(shared.clone()));
+    root_actor(shared, model, tx, root)
+}
+
+/// The same tree, with its model calls served by the caller instead of the
+/// real endpoint.
+///
+/// Children inherit the client through the cloned context, so one scripted
+/// model serves a whole tree: a test can drive a parent, its children and its
+/// grandchildren through one script, with no socket, no server and no sleep.
+#[cfg(test)]
+pub(crate) fn spawn_scripted(
+    cfg: Config,
+    tx: Sender<Msg>,
+    root: PathBuf,
+    model: Arc<dyn ModelClient>,
+) -> RootHandle {
+    root_actor(Arc::new(Mutex::new(cfg)), model, tx, root)
+}
+
+/// Start the root actor of one conversation over a given model.
+fn root_actor(
+    shared: Arc<Mutex<Config>>,
+    model: Arc<dyn ModelClient>,
+    tx: Sender<Msg>,
+    root: PathBuf,
+) -> RootHandle {
     // One conversation per `/new`, so stale events can be told apart.
     static CONVERSATIONS: AtomicU64 = AtomicU64::new(1);
     let conversation = CONVERSATIONS.fetch_add(1, Ordering::SeqCst);
-    let shared = Arc::new(Mutex::new(cfg));
     // Root agent is id 0; children start at 1. The UI holds a clone so it can
     // raise the floor above leftover worktree ids.
     let ids = Arc::new(AtomicU64::new(1));
     let live = Arc::new(AtomicU64::new(0));
-    // The real endpoint, behind the seam: every agent in this tree calls it
-    // through `AgentCtx::model`, children included.
-    let model: Arc<dyn ModelClient> = Arc::new(HttpModel::new(shared.clone()));
     let ctx = Arc::new(AgentCtx {
         cfg: shared.clone(),
         model,
@@ -1782,7 +1808,7 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::fake::{tool_call, Scripted};
+    use crate::model::fake::{tool_call, Asked, Gate, Scripted};
     use mush_core::{FunctionCall, ToolCall};
     use serde_json::json;
     use std::fs;
@@ -2510,52 +2536,136 @@ mod tests {
         found
     }
 
-    /// The full orchestration path, headless: root spawns an isolated child,
-    /// the child writes into its own worktree, the parent waits and collects
-    /// the summary. The model is `scripts/mock_llm.py` — deterministic.
+    /// The seam the orchestration scenarios run on: a tree spawned over a
+    /// scripted client asks *it*. The endpoint in the config is a port nothing
+    /// listens on, so a run that finished cannot have used one — which is what
+    /// keeps these tests off the socket, off `python3` and off the clock.
     #[test]
-    #[ignore = "needs python3 + git; spawns a local mock model server"]
-    fn isolated_subagent_writes_its_worktree() {
-        use std::fs;
-
-        const PORT: u16 = 18_731;
-        let mock = start_mock(PORT);
-
-        // A real git repo so `create_worktree` has something to branch from.
-        let root = init_git_repo("iso");
-
-        let cfg = Config::new(format!("http://127.0.0.1:{PORT}"), "mock", None);
+    fn a_spawned_tree_asks_the_scripted_model() {
+        let root = scratch_dir("scripted-tree");
+        let scripted = Arc::new(Scripted::new().says("nothing to do"));
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let root_tx = spawn(cfg, tx, root.clone()).tx;
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            tx,
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("say something".to_string()),
+            ]))
+            .unwrap();
 
-        let messages = vec![
-            Message::system(prompt::system_prompt(root.to_str().unwrap())),
-            Message::user("delegate: create iso.txt via an isolated subagent".to_string()),
-        ];
-        root_tx.send(AgentMsg::Run(messages)).unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&rx, WAIT, |seen| seen.done > 0 || !seen.errors.is_empty()),
+            "the run must end: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+        assert_eq!(seen.replies, vec!["nothing to do"]);
+        assert_eq!(
+            scripted.asked().len(),
+            1,
+            "the tree's one turn must have gone to the scripted client"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
 
-        // The isolated child must write into `.mush/wt/1/`, not the main root.
-        let target = root.join(".mush/wt/1/iso.txt");
-        let mut found = None;
-        for _ in 0..300 {
-            if target.exists() {
-                found = fs::read_to_string(&target).ok();
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
+    /// The full orchestration path, headless: the root spawns an isolated
+    /// child, the child writes into its own worktree and its completion wakes
+    /// the parent. The model is scripted; the work — the git worktree, the
+    /// file, the commit, the merge — is real.
+    #[test]
+    fn isolated_subagent_writes_its_worktree() {
+        let root = init_git_repo("iso");
+        // The child's first reply is held until the root's turn has ended, so
+        // "the parent was woken by its child" is the only way this run can
+        // finish — not a race the test happens to win.
+        let gate = Arc::new(Gate::new());
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.depth() == Some(1) && !asked.saw("wrote iso.txt"))
+                .held(gate.clone())
+                .calls(vec![tool_call(
+                    "c1",
+                    "write_file",
+                    json!({ "path": "iso.txt", "content": "isolated work" }),
+                )])
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .says("created iso.txt in my worktree")
+                .when(|asked: &Asked| asked.saw("#1 done"))
+                .says("child finished")
+                .when(|asked: &Asked| asked.saw("spawned agent"))
+                .says("child left running — I will handle its result when it finishes")
+                // The root's first turn: delegate and let the child work.
+                .calls(vec![tool_call(
+                    "c0",
+                    "spawn_agent",
+                    json!({
+                        "brief": "create a file called iso.txt containing exactly: isolated work",
+                        "isolated": true
+                    }),
+                )]),
+        );
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            tx,
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user("delegate: create iso.txt via an isolated subagent".to_string()),
+            ]))
+            .unwrap();
 
-        // The mock ends the root's first turn while the child still runs, so
-        // the orchestrator must be woken by the child's completion: expect the
-        // root to run twice (3 Done events total: root, child, woken root).
-        let done_events = count_done_events(&rx, 3);
+        let mut seen = Watched::default();
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the child never asked for its first turn"
+        );
+        assert!(
+            seen.wait(&rx, WAIT, |seen| seen.done >= 1),
+            "the root's first turn must end while the child still runs: {seen:?}"
+        );
+        gate.release();
+        // The child finishes, and its completion wakes the root into a second
+        // run: 3 Done events, root and child and woken root.
+        assert!(
+            seen.wait(&rx, WAIT, |seen| seen.done >= 3),
+            "the child, then the woken root, must each finish: {seen:?}"
+        );
+        assert_eq!(seen.done, 3, "no other run may happen: {seen:?}");
+        assert_eq!(seen.errors, Vec::<String>::new());
+
+        // The isolated child worked in `.mush/wt/1`, not the main root.
+        assert_eq!(
+            fs::read_to_string(root.join(".mush/wt/1/iso.txt"))
+                .ok()
+                .as_deref(),
+            Some("isolated work")
+        );
         // The run's end commits the worktree, so the branch mush advertises for
         // the child (and tells the human to diff and merge) carries the file.
         let branch_files =
             git::run(&root, &["diff", "--name-only", "HEAD...mush/1"]).unwrap_or_default();
+        assert!(
+            branch_files.contains("iso.txt"),
+            "the branch must carry the child's work, got {branch_files:?}"
+        );
         // …and nothing is left behind as an uncommitted change.
         let worktree_status = git::run(&root.join(".mush/wt/1"), &["status", "--porcelain"])
             .unwrap_or_else(|error| error);
+        assert!(
+            worktree_status.is_empty(),
+            "the worktree must be left clean, got {worktree_status:?}"
+        );
         // The three commands mush prints must now do what they say: merge the
         // work back, then let go of the worktree and the branch.
         let merged = git::run(
@@ -2570,34 +2680,22 @@ mod tests {
                 "mush/1",
             ],
         );
-        let merged_into_workspace = root.join("iso.txt").exists();
-        let removed = git::run(&root, &["worktree", "remove", ".mush/wt/1"]);
-        let deleted = git::run(&root, &["branch", "-D", "mush/1"]);
-        stop_mock(mock);
-        let _ = fs::remove_dir_all(&root);
-        assert_eq!(found.as_deref(), Some("isolated work"));
-        assert_eq!(done_events, 3, "root must be woken when its child finishes");
-        assert!(
-            branch_files.contains("iso.txt"),
-            "the branch must carry the child's work, got {branch_files:?}"
-        );
-        assert!(
-            worktree_status.is_empty(),
-            "the worktree must be left clean, got {worktree_status:?}"
-        );
         assert!(merged.is_ok(), "/merge must merge: {merged:?}");
         assert!(
-            merged_into_workspace,
+            root.join("iso.txt").exists(),
             "after /merge the file must be in the human's workspace"
         );
+        let removed = git::run(&root, &["worktree", "remove", ".mush/wt/1"]);
         assert!(
             removed.is_ok(),
             "/discard must remove the worktree: {removed:?}"
         );
+        let deleted = git::run(&root, &["branch", "-D", "mush/1"]);
         assert!(
             deleted.is_ok(),
             "/discard must delete the branch: {deleted:?}"
         );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Root -> child -> grandchild, each isolated: the grandchild's file must
@@ -2920,12 +3018,9 @@ mod tests {
     /// A scratch git repo with one initial commit, ready for worktrees. The
     /// label keeps parallel tests from sharing a directory.
     fn init_git_repo(label: &str) -> PathBuf {
-        use std::fs;
         use std::process::Command;
 
-        let root = std::env::temp_dir().join(format!("mush-chain-{label}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = scratch_dir(&format!("git-{label}"));
         let git = |args: &[&str]| {
             let status = Command::new("git")
                 .arg("-C")
@@ -2959,6 +3054,69 @@ mod tests {
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
     }
 
+    /// How long a scenario waits for something the run is *supposed* to do.
+    /// Only ever spent waiting for an event, never asserting on it.
+    const WAIT: Duration = Duration::from_secs(5);
+
+    /// What the actors told the UI, as a test watches a run.
+    ///
+    /// One pass over the event channel answers all of it, so a deadline is
+    /// spent waiting for the run rather than sleeping past it.
+    #[derive(Default, Debug)]
+    struct Watched {
+        done: usize,
+        errors: Vec<String>,
+        notices: Vec<String>,
+        /// What the model said, in the empty-reply-free sense: an assistant
+        /// message that actually carried words.
+        replies: Vec<String>,
+        summaries: Vec<String>,
+    }
+
+    impl Watched {
+        /// Read events until `until` holds or `timeout` passes; the return says
+        /// whether it held, so a run that never finishes fails an assertion
+        /// instead of hanging the suite.
+        fn wait(
+            &mut self,
+            rx: &Receiver<Msg>,
+            timeout: Duration,
+            until: impl Fn(&Self) -> bool,
+        ) -> bool {
+            let deadline = Instant::now() + timeout;
+            while !until(self) {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                match rx.recv_timeout(left.min(Duration::from_millis(20))) {
+                    Ok(msg) => self.note(msg),
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return false,
+                }
+            }
+            true
+        }
+
+        fn note(&mut self, msg: Msg) {
+            let Msg::Agent { event, .. } = msg else {
+                return;
+            };
+            match event {
+                AgentEvent::Done => self.done += 1,
+                AgentEvent::Error(why) => self.errors.push(why),
+                AgentEvent::Notice(what) => self.notices.push(what),
+                AgentEvent::Compact { summary } => self.summaries.push(summary),
+                AgentEvent::Message(message)
+                    if message.role == "assistant" && !message.text().is_empty() =>
+                {
+                    self.replies.push(message.text().to_string());
+                }
+                _ => {}
+            }
+        }
+    }
+
     /// Drain the event channel until `target` Done events have been seen.
     fn count_done_events(rx: &Receiver<Msg>, target: usize) -> usize {
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -2978,5 +3136,13 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         done_events
+    }
+
+    /// A scratch workspace, empty: for a scenario whose work is not files.
+    fn scratch_dir(label: &str) -> PathBuf {
+        let root = std::env::temp_dir().join(format!("mush-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
     }
 }

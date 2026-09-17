@@ -10,7 +10,9 @@
 //! complete implementation, so `run_loop`, compaction, the learned-context
 //! retry and a cancellation mid-reply are all assertable in process — no
 //! socket, no thread, no sleep. And a whole tree shares one client, so a
-//! scripted model can serve a parent, its children and their children.
+//! scripted model can serve a parent, its children and their children: each
+//! reply may say which request it is the answer to, because a child's first
+//! request races its parent's next one.
 
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -130,7 +132,10 @@ impl ModelClient for HttpModel {
 pub(crate) mod fake {
     use std::collections::VecDeque;
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use crossbeam_channel::{Receiver, Sender};
 
     use mush_core::message::{ChatRequest, ChatResponse, Choice, FunctionCall, Message, ToolCall};
     use serde_json::Value;
@@ -147,16 +152,114 @@ pub(crate) mod fake {
         pub tools: usize,
     }
 
+    impl Asked {
+        /// Who the model was told it is working for: the depth of a subagent,
+        /// or `None` for a root. Read off the identity line of the system
+        /// prompt, which is the one thing that differs between the actors of a
+        /// tree when they ask at the same time.
+        pub fn depth(&self) -> Option<usize> {
+            let after = self.system().split_once("mush subagent at depth ")?.1;
+            let digits: String = after.chars().take_while(char::is_ascii_digit).collect();
+            digits.parse().ok()
+        }
+
+        /// Whether any message the model was given contains `needle` — what
+        /// the script needs to know to answer as if it had read the transcript.
+        pub fn saw(&self, needle: &str) -> bool {
+            self.messages
+                .iter()
+                .any(|message| message.text().contains(needle))
+        }
+
+        fn system(&self) -> &str {
+            self.messages.first().map(Message::text).unwrap_or_default()
+        }
+    }
+
+    /// A reply the test releases. A call that would answer with a held reply
+    /// announces itself and then waits, so a test can do something while the
+    /// reply is in flight — type a nudge, let a parent's turn end — with no
+    /// sleep and no socket.
+    pub struct Gate {
+        arrived: (Sender<()>, Receiver<()>),
+        released: (Sender<()>, Receiver<()>),
+    }
+
+    impl Gate {
+        pub fn new() -> Self {
+            Self {
+                arrived: crossbeam_channel::unbounded(),
+                released: crossbeam_channel::unbounded(),
+            }
+        }
+
+        /// Wait for a held call to be in flight. Bounded, so a call that never
+        /// arrives fails the test instead of hanging it.
+        pub fn wait_until_asked(&self, timeout: Duration) -> bool {
+            self.arrived.1.recv_timeout(timeout).is_ok()
+        }
+
+        /// Let the held reply through.
+        pub fn release(&self) {
+            let _ = self.released.0.send(());
+        }
+
+        fn hold(&self) {
+            let _ = self.arrived.0.send(());
+            // Bounded too: a test that never releases holds up one actor
+            // thread, not the suite.
+            let _ = self.released.1.recv_timeout(Duration::from_secs(10));
+        }
+    }
+
+    /// What answers a request: a reply, or a reply held open until the test
+    /// says so.
+    enum Answer {
+        Now(Result<ChatResponse, ModelError>),
+        Held(Arc<Gate>, Result<ChatResponse, ModelError>),
+    }
+
+    /// What a request has to look like for a scripted reply to be its answer.
+    type Matches = Box<dyn Fn(&Asked) -> bool + Send + Sync>;
+
+    /// One scripted answer, and what a request has to look like to get it.
+    struct Rule {
+        when: Option<Matches>,
+        answer: Answer,
+    }
+
     /// The model that answers whatever the test says, in order.
     #[derive(Default)]
     pub struct Scripted {
-        replies: Mutex<VecDeque<Result<ChatResponse, ModelError>>>,
+        rules: Mutex<VecDeque<Rule>>,
         asked: Mutex<Vec<Asked>>,
+        /// The matcher and the gate the *next* scripted reply is written with.
+        when: Option<Matches>,
+        hold: Option<Arc<Gate>>,
     }
 
     impl Scripted {
         pub fn new() -> Self {
             Self::default()
+        }
+
+        /// The next reply answers only a request this matcher accepts.
+        ///
+        /// A tree asks concurrently, so a script for more than one actor has to
+        /// say who each reply is for: matching is on the request — which system
+        /// prompt, what the transcript already holds — not on arrival order.
+        /// A reply with no matcher answers whatever is asked next, which is all
+        /// a single-actor script ever needs.
+        pub fn when(mut self, matches: impl Fn(&Asked) -> bool + Send + Sync + 'static) -> Self {
+            self.when = Some(Box::new(matches));
+            self
+        }
+
+        /// The next reply is held until the test releases `gate`: the call is
+        /// announced first, so the test never has to race it or sleep on it.
+        pub fn held(mut self, gate: Arc<Gate>) -> Self {
+            self.hold = Some(gate);
+            self
         }
 
         /// The next reply is this text, finished.
@@ -205,10 +308,17 @@ pub(crate) mod fake {
         }
 
         fn script(&mut self, reply: Result<ChatResponse, ModelError>) {
-            self.replies
+            let answer = match self.hold.take() {
+                Some(gate) => Answer::Held(gate, reply),
+                None => Answer::Now(reply),
+            };
+            self.rules
                 .lock()
                 .expect("no test panicked mid-script")
-                .push_back(reply);
+                .push_back(Rule {
+                    when: self.when.take(),
+                    answer,
+                });
         }
     }
 
@@ -218,33 +328,55 @@ pub(crate) mod fake {
             request: &ChatRequest<'_>,
             cancel: &AtomicBool,
         ) -> Result<ChatResponse, ModelError> {
+            let asked = Asked {
+                model: request.model.to_string(),
+                messages: request.messages.to_vec(),
+                tools: request.tools.len(),
+            };
+            // The first reply still scripted whose matcher accepts this
+            // request, and it is spent: that reply was written for this call.
+            let answer = {
+                let mut rules = self.rules.lock().expect("no test panicked mid-script");
+                let found = rules.iter().position(|rule| match &rule.when {
+                    Some(matches) => matches(&asked),
+                    None => true,
+                });
+                found.map(|index| {
+                    rules
+                        .remove(index)
+                        .expect("the reply just found is still there")
+                        .answer
+                })
+            };
+            // Recorded before the reply (held or not) comes back, so a test
+            // woken by a gate can read what that call was asked.
             self.asked
                 .lock()
                 .expect("no test panicked mid-script")
-                .push(Asked {
-                    model: request.model.to_string(),
-                    messages: request.messages.to_vec(),
-                    tools: request.tools.len(),
-                });
-            match self
-                .replies
-                .lock()
-                .expect("no test panicked mid-script")
-                .pop_front()
-            {
-                Some(Ok(reply)) => Ok(reply),
-                Some(Err(error)) => {
+                .push(asked);
+            let reply = match answer {
+                Some(Answer::Now(reply)) => reply,
+                Some(Answer::Held(gate, reply)) => {
+                    gate.hold();
+                    reply
+                }
+                // Never panic: a request nothing was scripted for is a test
+                // bug, and saying so in the run's own error beats hanging a
+                // thread that waits for a reply which is not coming.
+                None => {
+                    return Err(ModelError::Unreachable(
+                        "the scripted model had no reply left for this request".to_string(),
+                    ))
+                }
+            };
+            match reply {
+                Ok(reply) => Ok(reply),
+                Err(error) => {
                     if error == ModelError::Cancelled {
                         cancel.store(true, Ordering::SeqCst);
                     }
                     Err(error)
                 }
-                // Never panic: a script that ran out is a test bug, and saying
-                // so in the run's own error beats hanging a thread that waits
-                // for a reply which is not coming.
-                None => Err(ModelError::Unreachable(
-                    "the scripted model was asked more times than it was scripted".to_string(),
-                )),
             }
         }
     }
