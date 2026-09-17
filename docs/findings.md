@@ -30,6 +30,16 @@ a stored *conclusion* ("has children", "busy") rather than a derived fact
 was made a method; what is left is that the *row* and the *title* each derive
 their own answer instead of reading that one.
 
+## 1.5 Observed live, again by the human using it
+
+| ID | What | Status | Home |
+|---|---|---|---|
+| U5 | **The same fact is on screen three times.** The newest tool call / activity shows in the conversation pane (as the `⚙` line), again at the bottom of the agents pane, and again in the first line of the status bar — one fact, three homes, no reader. §4.5 R2 spent line one on "activity › status › hint"; the activity is already the row's and the transcript's, so line one is repeating what a human can already see, and the three surfaces need to be looked at together rather than one at a time. | ⬜ | `ui.rs` (activity strip, bar line one) + `App` (what the bar is allowed to say) |
+| U6 | **An agent is a bare number.** Rows read `#2`, and everything else is inferred from a message; nothing names the *task*. A short title per agent, derived from its brief (and a command label for a job), would let the human tell two children apart without opening them — the brief is already in the node and in the transcript's first line. | ⬜ | `AgentTree`/`ui.rs` row (derive a title from the brief at spawn; jobs from their command) |
+| U7 | **A waiting agent still says `⠏ working…`.** When an orchestrator has ended its turn and is waiting on children (or on a job), the activity row claims work is in flight. It should say so differently from a model call that is actually in flight — the hourglass the human asked for — which is the same derived-facts rule as U1/U2, one surface further down. | ⬜ | the activity/status line (`Chat`/`App` derived from `Phase` + live jobs) |
+| U8 | **A transient notice never leaves.** `· reply cut off at 20480 tokens — asking for smaller steps` and help output sit in the foot forever (until that agent runs again), so a line about *one moment* outlives it and pushes the conversation around. §4.6's per-kind lifetime answered this for failures and command answers; the "said" rank still has only one lifetime. Somebody must decide which notices are news and which are chatter — and repeated identical lines (`· model produced an empty reply` ×N) should collapse rather than repeat. | ⬜ | `Chat`'s notice ranks/lifetimes (`Rank::Said` needs a clock, or a dismiss) |
+| U9 | **The default DeepSeek window/reply cap is far too small.** A real run was cut off at 20480 tokens; for the configuration mush ships, the default should be ~120k tokens (window, and the reply cap where the vendor accepts it) rather than a value that truncates ordinary work. Precedence must not change: a human-stated window still wins, and an endpoint-reported one still overrides the default. | ⬜ | `mush-core/src/provider.rs`'s `PROVIDERS` table (the one place that names a vendor) + the config tests and header |
+
 ## 2. Observed live: a delivered completion is invisible, and can be delivered twice
 
 | ID | What | Status | Home |
