@@ -200,6 +200,30 @@ const INFO_TTL: Duration = Duration::from_secs(5);
 /// in `on_agent`).
 const SESSION_DEBOUNCE: Duration = Duration::from_secs(1);
 
+/// How wide a job's handle may be: the same bound as an agent's title, for the
+/// same reason — a handle, whose full text is the report in the transcript.
+const JOB_TITLE_COLUMNS: usize = 30;
+
+/// `short_age`'s companion for a job: the command's own work, on one line.
+///
+/// A `command` the model wrote can be thirty lines of heredoc with a
+/// `cd /w &&` in front of it, and the bar and the row's footer each have one
+/// row to name it in: what is left is the last clause of the first line
+/// (`cargo build` out of `cd /w && cargo build --release`), collapsed and
+/// bounded like an agent's title. One derivation, so the two surfaces cannot
+/// spell the same job differently.
+fn job_title(command: &str) -> String {
+    let first = command
+        .lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let clause = first.rsplit("&&").next().unwrap_or(&first).trim();
+    mush_core::text::truncate(clause, JOB_TITLE_COLUMNS)
+}
+
 #[derive(Clone, Debug)]
 pub struct Status {
     pub kind: StatusKind,
@@ -734,7 +758,11 @@ impl App {
                 // rows read every frame — is what says what is running now. No
                 // copy of the job is kept here: the row's `⚙N` count is derived
                 // from the registry on every frame, so it cannot go stale.
-                let note = format!("{} detached · {}", crate::jobs::label(job), command);
+                let note = format!(
+                    "{} detached · {}",
+                    crate::jobs::label(job),
+                    job_title(&command)
+                );
                 if id == self.tree.focused {
                     self.say(note);
                 } else {
@@ -811,7 +839,7 @@ impl App {
                 format!(
                     "{} {} {}{held}",
                     crate::jobs::label(job.id),
-                    job.command,
+                    job_title(&job.command),
                     short_age(job.age)
                 )
             })
@@ -3235,6 +3263,53 @@ mod tests {
                 "the bar is missing its only row at {width}x{height}: {rows:?}"
             );
         }
+    }
+
+    /// Two children whose briefs open identically are two agents on the screen,
+    /// named by what they were asked to make — without opening either (finding
+    /// U6).
+    #[test]
+    fn the_row_names_an_agent_by_its_derived_title() {
+        let (mut app, _rx) = test_app("agent-titles");
+        let conversation = app.tree.conversation();
+        for (id, path) in [(1u64, "deep.txt"), (2, "wide.txt")] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId::ROOT,
+                event: AgentEvent::Spawned {
+                    child: id,
+                    parent: 0,
+                    depth: 1,
+                    brief: format!("create a file called {path} containing exactly: work"),
+                    branch: None,
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+        }
+        let rows = screen(&mut app, 120, 32);
+        assert!(
+            rows.iter().any(|row| row.contains("#1 deep.txt")),
+            "the row names the agent by what it was asked to make: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("#2 wide.txt")),
+            "and its sibling by its own: {rows:?}"
+        );
+    }
+
+    /// A job's handle is its own command on one line: a `command` can be a
+    /// thirty-line heredoc with a `cd` in front of it, and the footer and the
+    /// bar each have one row to name it in.
+    #[test]
+    fn a_job_is_named_by_its_command_on_one_line() {
+        assert_eq!(job_title("cargo build --release"), "cargo build --release");
+        assert_eq!(job_title("cd /w && cargo test -q"), "cargo test -q");
+        assert_eq!(
+            job_title("python3 - <<'PY'\nimport io\nprint('x')\nPY"),
+            "python3 - <<'PY'"
+        );
+        assert!(job_title("").is_empty());
+        assert!(job_title(&"x".repeat(80)).chars().count() <= JOB_TITLE_COLUMNS);
     }
 
     /// A failure is the third way a run can end, and it reaches the bar the way

@@ -25,16 +25,16 @@ const MAX_TRANSCRIPT: u16 = 110;
 /// a share of the terminal.
 ///
 /// R1's row spends its fields left to right — `state · branch +delta · what it
-/// is doing · its title` — and that is about forty columns of real labels. Below
-/// thirty the chat is the better use of a narrow screen; past forty-six the tree
-/// has nothing else to put there (a tool label is the widest field it has) while
-/// a wider terminal is what the transcript's measure is for (it is capped at 110
-/// columns anyway). The share this replaced was 26%, which is 31 columns at 120:
-/// `▶◐ #0` left 22 for a 23-column `edit_file src/lib.rs 12s`, so a busy agent's
-/// tool call and its age were dropped there — every frame, on the size the
-/// audit photographs.
+/// is doing · its title` — and that is about forty-five columns of real labels.
+/// Below thirty the chat is the better use of a narrow screen; past fifty the
+/// tree has nothing else to put there (a tool label is the widest field it has)
+/// while a wider terminal is what the transcript's measure is for (it is capped
+/// at 110 columns anyway). The share this replaced was 26%, which is 31 columns
+/// at 120: `▶◐ #0` left 22 for a 23-column `edit_file src/lib.rs 12s`, so a busy
+/// agent's tool call and its age were dropped there — every frame, on the size
+/// the audit photographs.
 const AGENTS_MIN_COLUMNS: u16 = 30;
-const AGENTS_MAX_COLUMNS: u16 = 46;
+const AGENTS_MAX_COLUMNS: u16 = 50;
 /// The chat below this is a column of broken words, whatever the tree wants.
 const CHAT_MIN_COLUMNS: u16 = 40;
 /// Below this mush has no room to be honest: say so instead of painting shreds.
@@ -255,9 +255,13 @@ fn agents_title(app: &App, width: usize) -> String {
 
 /// One tree row, with the fields it can afford.
 ///
-/// The row answers "what is happening": activity, branch and line delta survive
-/// as long as there is any room, and the brief — which the footer and the
-/// transcript carry in full — is what yields first.
+/// The row answers "what is happening" with the fields that answer it: the
+/// state, the branch and delta, what the agent is doing — and, when there is
+/// room, which agent this is. The name it spends those columns on is the node's
+/// derived *title* (`lexer`, `deep.txt`) rather than its brief: the brief opens
+/// with the boilerplate a model was asked in (`create a file called …`), which
+/// is the same words for two different children, and its full text is one row
+/// below in the footer and again as the transcript's opening line.
 fn agent_line(app: &App, node: &AgentNode, width: usize) -> String {
     let indent = "  ".repeat(node.depth);
     let marker = if app.tree.focused == node.id {
@@ -307,7 +311,7 @@ fn agent_line(app: &App, node: &AgentNode, width: usize) -> String {
         }
         where_and_how.push_str(&format!("⚙{jobs}"));
     }
-    fit_row(&head, &node.brief, &where_and_how, &tail, width)
+    fit_row(&head, &node.title(), &where_and_how, &tail, width)
 }
 
 /// The footer under the tree: the cursor row's full facts, so a narrow pane

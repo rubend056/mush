@@ -111,8 +111,9 @@ pub fn fit_row(
     tail: &[String],
     width: usize,
 ) -> String {
-    /// The least a field is worth: under this it is a lie about what the text
-    /// says (`cre…`), so the row spends the columns on nothing instead.
+    /// The least a field is worth: under this a long brief is dropped rather
+    /// than cut (`cre…`), because the row would be spending its last columns on
+    /// a word that is not one.
     const MIN_FIELD: usize = 7;
 
     let head_width = UnicodeWidthStr::width(head);
@@ -137,10 +138,16 @@ pub fn fit_row(
     }
 
     let mut line = head.to_string();
-    if remaining >= MIN_FIELD && !brief.is_empty() {
-        let text = truncate(brief, remaining - 1);
-        line.push(' ');
-        line.push_str(&text);
+    if !brief.is_empty() {
+        // Whole, if it fits — a short title costs nothing — and otherwise only
+        // when the columns left are enough to say something: a brief cut to
+        // `cre…` is not a brief, and the row spends those columns on nothing
+        // instead.
+        let room = remaining.saturating_sub(1);
+        if UnicodeWidthStr::width(brief) <= room || room >= MIN_FIELD {
+            line.push(' ');
+            line.push_str(&truncate(brief, room));
+        }
     }
     if show_branch {
         line.push_str("  ");
@@ -197,15 +204,23 @@ mod tests {
             "▶◐ #2  mush/2 +8−0  write deep.txt 3s"
         );
 
-        // Narrower again: the activity no longer fits whole, so it is dropped
-        // and the brief spends what it can — a field goes whole.
+        // Narrower: the activity no longer fits whole, so it is dropped and the
+        // brief spends what it can — a field goes whole.
         let narrow = fit_row(head, "create a file", "mush/2 +8−0", &activity, 34);
         assert_eq!(narrow, "▶◐ #2 create a file  mush/2 +8−0", "{narrow}");
 
-        // Narrower: the brief is cut to a word, the branch still stays.
+        // Narrower: the branch is all that is left whole. Six columns of a
+        // long brief would be `creat…`, which is not a word.
         assert_eq!(
             fit_row(head, "create a file", "mush/2 +8−0", &activity, 26),
-            "▶◐ #2 creat…  mush/2 +8−0"
+            "▶◐ #2  mush/2 +8−0"
+        );
+
+        // A brief that fits whole is placed however little room is left for
+        // it: `lexer` is a handle, not a sentence.
+        assert_eq!(
+            fit_row(head, "lexer", "mush/2 +8−0", &activity, 26),
+            "▶◐ #2 lexer  mush/2 +8−0"
         );
 
         // Narrowest: the state alone, which is never dropped.

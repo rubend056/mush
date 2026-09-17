@@ -18,6 +18,7 @@ use crossbeam_channel::Sender;
 
 use mush_core::git;
 use mush_core::message::Message;
+use mush_core::text::truncate;
 use mush_core::tools::ToolName;
 
 use crate::agent::{AgentMsg, RootHandle, TreeHandles};
@@ -107,6 +108,100 @@ impl Phase {
     }
 }
 
+/// How wide an agent's title may be. A title is a handle, not a sentence:
+/// `#2 tests` tells two children apart at a glance, and the brief — one row
+/// below in the cursor row's footer, and again as the transcript's opening line
+/// — is where the sentence lives.
+const TITLE_COLUMNS: usize = 24;
+
+/// Words a brief opens with that say nothing about the task.
+///
+/// A brief is written *for a model* — "please create a file called deep.txt…"
+/// — so the words that identify the job are usually not the first ones. The
+/// list is small on purpose: a word that is missing costs a slightly worse
+/// title, and a word wrongly in it costs the title entirely.
+const FILLER: &[&str] = &[
+    "a",
+    "an",
+    "the",
+    "and",
+    "or",
+    "to",
+    "of",
+    "for",
+    "in",
+    "on",
+    "with",
+    "then",
+    "please",
+    "must",
+    "make",
+    "sure",
+    "i",
+    "we",
+    "want",
+    "need",
+    "you",
+    "your",
+    "own",
+    "it",
+    "its",
+    "this",
+    "that",
+    "their",
+    "them",
+    "our",
+    "us",
+    "create",
+    "add",
+    "write",
+    "build",
+    "fix",
+    "update",
+    "implement",
+    "refactor",
+    "remove",
+    "delete",
+    "run",
+    "handle",
+    "ensure",
+    "check",
+    "test",
+    "document",
+    "profile",
+    "guard",
+    "measure",
+    "sweep",
+    "delegate",
+    "report",
+    "use",
+    "call",
+    "called",
+];
+
+/// Whether a word names a file or a directory: a slash anywhere, or a dot with
+/// a word on each side (`deep.txt`). A trailing sentence full stop is not part
+/// of the name.
+fn is_path_like(word: &str) -> bool {
+    let word = bare_word(word).trim_end_matches('.');
+    if word.contains('/') {
+        return true;
+    }
+    word.split_once('.')
+        .is_some_and(|(stem, ext)| !stem.is_empty() && ext.chars().all(char::is_alphabetic))
+}
+
+/// A word without the punctuation the sentence hung on it — `(deep.txt),` and
+/// `deep.txt` are the same word, and a row should name the file either way.
+fn bare_word(word: &str) -> &str {
+    word.trim_matches(|c: char| !c.is_alphanumeric() && !"/._-".contains(c))
+}
+
+/// Whether a word says nothing about the task (see [`FILLER`]).
+fn is_filler(word: &str) -> bool {
+    FILLER.contains(&bare_word(word).to_ascii_lowercase().as_str())
+}
+
 /// What a run in flight is parked on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Waiting {
@@ -158,6 +253,47 @@ pub struct AgentNode {
     pub leftover: bool,
     /// Set once `/merge` or `/discard` reclaimed the worktree.
     pub landed: Option<Landed>,
+}
+
+impl AgentNode {
+    /// A short handle for this agent, derived from its brief on read.
+    ///
+    /// A row used to spend its identity columns on the brief's first clause,
+    /// which is usually boilerplate: `create a file called deep.txt …` and
+    /// `create a file called wide.txt …` read the same for fifteen columns, and
+    /// the human could not tell two children apart without opening them (finding
+    /// U6). Two rules, in the order the value is in:
+    ///
+    /// 1. a *path* in the brief is the artifact the agent was asked to make —
+    ///    `deep.txt`, `crates/mush/src/ui.rs` — and it tells two children apart
+    ///    at a glance. The same reason `agent::summarize` reads a tool call's
+    ///    `path` before anything else;
+    /// 2. otherwise the first word that is not filler: `build a lexer for the
+    ///    config format` is `lexer`, not `build a lexer for`.
+    ///
+    /// Derived, never stored: the brief is the fact and this is a view of it,
+    /// and a stored copy is one more thing that can disagree with the
+    /// transcript's opening line.
+    pub fn title(&self) -> String {
+        let words: Vec<&str> = self
+            .brief
+            .lines()
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect();
+        if let Some(path) = words.iter().find(|word| is_path_like(word)) {
+            return truncate(bare_word(path).trim_end_matches('.'), TITLE_COLUMNS);
+        }
+        let first = words
+            .iter()
+            .find(|word| !is_filler(word))
+            .or_else(|| words.first());
+        match first {
+            Some(word) => truncate(bare_word(word), TITLE_COLUMNS),
+            None => String::new(),
+        }
+    }
 }
 
 /// How many agents are in each of the states the pane title names.
@@ -883,6 +1019,60 @@ mod tests {
             Phase::Activity("wait_commands #c2 #c3".to_string()).waiting(),
             Some(Waiting::Jobs)
         );
+    }
+
+    /// A node carrying a brief, so the title derived from it can be read.
+    fn titled(brief: &str) -> String {
+        let mut tree = AgentTree::bare();
+        let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let opened = tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: brief.to_string(),
+            depth: 1,
+            branch: None,
+            cmd: tx,
+        });
+        tree.node(opened.id).expect("the node was inserted").title()
+    }
+
+    /// An agent is not a bare number: its title is the artifact its brief
+    /// names, or the first word that says anything about the task (finding
+    /// U6). The two briefs below are identical for their first twenty columns
+    /// and name two different files.
+    #[test]
+    fn a_title_is_derived_from_the_brief() {
+        assert_eq!(
+            titled("create a file called deep.txt containing exactly: deep work"),
+            "deep.txt"
+        );
+        assert_eq!(
+            titled("create a file called wide.txt containing exactly: wide work"),
+            "wide.txt"
+        );
+        assert_eq!(
+            titled("edit crates/mush/src/ui.rs so the rows fit"),
+            "crates/mush/src/ui.rs"
+        );
+
+        // No path: the first word that is not filler.
+        assert_eq!(titled("build a lexer for the config format"), "lexer");
+        assert_eq!(
+            titled("you must delegate the lexer work to a subagent"),
+            "lexer"
+        );
+        assert_eq!(titled("write the token table"), "token");
+
+        // Nothing but filler falls back to the first word; a brief with no
+        // words has no title rather than a wrong one.
+        assert_eq!(titled("the a of"), "the");
+        assert_eq!(titled(""), "");
+
+        // A handle, not a sentence: a title is bounded, and a path keeps its
+        // head, which is the part that names the directory.
+        let long = titled("edit src/very/deep/directory/structure/file.rs now");
+        assert!(long.chars().count() <= TITLE_COLUMNS, "{long}");
+        assert!(long.starts_with("src/very/"), "{long}");
     }
 
     /// `busy` is derived, never stored, so it cannot disagree with the rows it
