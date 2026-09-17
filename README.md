@@ -182,6 +182,21 @@ run's failure is kept in `.mush/session.json` and is still there next time mush
 opens the workspace — until that agent runs again, when the failure belonged to
 the run being replaced.
 
+## When the network hiccups
+
+A failure of the transport — a connection reset or refused, an unexpected end
+of stream, a connect or read timeout — is the wire, not the endpoint refusing
+the request, so mush asks again: **three attempts in total**, with a short
+backoff between them. Each retry is a line in the agent's own transcript
+(`· Connection reset by peer (os error 104) — retrying (2/3)`) instead of a
+spinner that looks stuck, and Ctrl-C abandons the request at once, backoff
+included. What the endpoint *answered* — a 4xx or 5xx status, a reply past the
+body cap, a body that did not parse — is returned as it is, first time: an
+answer is not a hiccup. Every attempt is bounded by the client's own budget
+(5 s to connect, 30 s to write, a 10-minute read deadline), so three attempts
+plus the backoff is the worst case: seconds for the hiccup this is for, about
+half an hour for an endpoint that stalls and loses every time.
+
 ## Context window
 
 Every request fits inside the endpoint's window, and the window comes from the

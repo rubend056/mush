@@ -35,7 +35,7 @@ use crate::clock;
 use crate::events::{Events, Ui};
 use crate::jobs::{self, Refused};
 use crate::machine::{Job, Machine, Shell, ShellCommand};
-use crate::model::{HttpModel, ModelClient, ModelError};
+use crate::model::{retrying, HttpModel, ModelClient, ModelError};
 
 /// Backstop against a model that never stops — *not* a budget for the work.
 ///
@@ -1180,7 +1180,22 @@ fn run_loop(
             request.reasoning_effort = Some(effort.to_string());
         }
 
-        let reply = match actor.ctx.model.chat(&request, cancel) {
+        // One turn's ask, with the bounded retry a transport hiccup gets: the
+        // pause waits on the run's clock, the cancel flag is read between
+        // attempts, and every retry is a line in this agent's transcript rather
+        // than a spinner that looks stuck (finding B23). Everything the
+        // endpoint *answered* — a status, a refusal, a body that did not parse
+        // — is returned unchanged, first time.
+        let reply = match retrying(
+            actor.ctx.clock.as_ref(),
+            cancel,
+            |line| {
+                actor
+                    .ctx
+                    .emit(actor.id, AgentEvent::Notice(line.to_string()))
+            },
+            || actor.ctx.model.chat(&request, cancel),
+        ) {
             Ok(reply) => reply,
             // The reader stops the moment the human cancels; that is a
             // cancellation, not a failure to reach the endpoint.
@@ -1192,7 +1207,10 @@ fn run_loop(
             Err(ModelError::Refused(error)) => {
                 return Err(format!("the endpoint's reply was refused: {error}"));
             }
-            Err(ModelError::Unreachable(error)) => {
+            // Unreachable and Transport reach the human the same way; the
+            // difference between them is that a Transport failure was already
+            // retried, and its message says so.
+            Err(ModelError::Unreachable(error)) | Err(ModelError::Transport(error)) => {
                 return Err(format!("cannot reach {}: {error}", cfg.base_url));
             }
             Err(ModelError::Encode(error)) => {
@@ -1601,12 +1619,25 @@ fn compact_history(
         },
         reasoning_effort: cfg.reasoning_effort().map(str::to_string),
     };
-    let reply = match actor.ctx.model.chat(&request, cancel) {
+    let reply = match retrying(
+        actor.ctx.clock.as_ref(),
+        cancel,
+        |line| {
+            actor
+                .ctx
+                .emit(actor.id, AgentEvent::Notice(line.to_string()))
+        },
+        || actor.ctx.model.chat(&request, cancel),
+    ) {
         Ok(reply) => reply,
         // A cancelled run is already ending; do not report a network failure.
         Err(ModelError::Cancelled) => return Err(CANCELLED.to_string()),
-        // The run will fail on its real request anyway; surface it.
-        Err(ModelError::Unreachable(error)) | Err(ModelError::Refused(error)) => {
+        // The run will fail on its real request anyway; surface it. A
+        // `Transport` failure got its retries here, the same as the run's own
+        // ask: compaction is a model call like any other.
+        Err(ModelError::Unreachable(error))
+        | Err(ModelError::Transport(error))
+        | Err(ModelError::Refused(error)) => {
             return Err(format!("cannot reach {}: {error}", cfg.base_url));
         }
         Err(ModelError::Encode(error)) => return Err(format!("could not encode request: {error}")),
@@ -2702,6 +2733,7 @@ mod tests {
     use crate::events::fake::Recorder;
     use crate::machine::fake::{Script, Scripted as ScriptedMachine};
     use crate::model::fake::{tool_call, Asked, Gate, Scripted};
+    use crate::model::RETRY_ATTEMPTS;
     use mush_core::config::{ReasoningEffort, ThinkingMode};
     // The fold's trigger is core's formula, not this file's: the test below
     // crosses it instead of restating it.
@@ -3634,6 +3666,23 @@ mod tests {
         model: &Arc<Scripted>,
     ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
         build_actor(label, model.clone(), test_cfg())
+    }
+
+    /// The same, on a clock that only moves when the test says so: how long a
+    /// retry's backoff took is then a number the test reads, not a wait it
+    /// pays for.
+    fn scripted_actor_on_clock(
+        label: &str,
+        model: &Arc<Scripted>,
+        clock: Arc<dyn clock::Clock>,
+    ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
+        build_actor_about(
+            label,
+            model.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            clock,
+        )
     }
 
     /// A scratch config cell. The endpoint is deliberately unreachable: every
@@ -5574,6 +5623,88 @@ mod tests {
             vec![(4_096, WindowSource::Complaint)],
             "and the UI is told, on the terms the run trusted it"
         );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A hiccup on the wire is not the end of the run (finding B23: three
+    /// agents in one session died mid-work on `Connection reset by peer`, and
+    /// one of them had committed nothing). The run asks again, the human is
+    /// told each time in the transcript rather than left with a stuck spinner,
+    /// and the pause costs the clock seam rather than this suite.
+    #[test]
+    fn a_transport_hiccup_is_retried_and_the_run_carries_on() {
+        let hiccup = "Connection reset by peer (os error 104)";
+        let model = Arc::new(
+            Scripted::new()
+                .fails_transport(hiccup)
+                .fails_transport(hiccup)
+                .says("done"),
+        );
+        let clock = Arc::new(Advanceable::new());
+        let (actor, events, _mailbox) =
+            scripted_actor_on_clock("transport-hiccup", &model, clock.clone());
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::system("you are mush"), Message::user("task")];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+
+        assert_eq!(result.as_deref(), Some("done"), "the run finished its work");
+        assert_eq!(
+            model.asked().len(),
+            RETRY_ATTEMPTS,
+            "and the request was really made three times"
+        );
+        let mut seen = Watched::default();
+        seen.drain(&events);
+        assert_eq!(
+            seen.notices,
+            vec![
+                format!("{hiccup} — retrying (2/3)"),
+                format!("{hiccup} — retrying (3/3)"),
+            ],
+            "the human is told, in the agent's own transcript"
+        );
+        assert_eq!(
+            clock.elapsed(),
+            Duration::from_millis(1_500),
+            "the backoff came through the clock seam: no test waited for it"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// Every attempt loses: the run fails the way it failed before this, with
+    /// the wire's own words in front and the attempts named after them — never
+    /// a bare "gave up" that hides what the endpoint's side actually said.
+    #[test]
+    fn a_run_that_never_reaches_the_model_names_the_attempts() {
+        let hiccup = "Connection reset by peer (os error 104)";
+        let model = Arc::new(
+            Scripted::new()
+                .fails_transport(hiccup)
+                .fails_transport(hiccup)
+                .fails_transport(hiccup),
+        );
+        let (actor, _events, _mailbox) =
+            scripted_actor_on_clock("transport-dead", &model, Arc::new(Advanceable::new()));
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::system("you are mush"), Message::user("task")];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+
+        assert!(
+            error.starts_with(&format!(
+                "cannot reach {}: {hiccup}",
+                actor.ctx.cfg.config().unwrap().base_url
+            )),
+            "the original error reaches the caller: {error}"
+        );
+        assert!(
+            error.contains("3 attempts"),
+            "with its attempts named: {error}"
+        );
+        assert_eq!(model.asked().len(), RETRY_ATTEMPTS);
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 

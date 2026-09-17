@@ -13,13 +13,21 @@
 //! scripted model can serve a parent, its children and their children: each
 //! reply may say which request it is the answer to, because a child's first
 //! request races its parent's next one.
+//!
+//! A model call is also where the retry lives: [`retrying`] repeats a request
+//! whose *transport* failed, and never one the endpoint answered. The loop is
+//! driven by the caller, because the caller is the layer that holds the clock
+//! the backoff waits on, the cancel flag the human's Stop sets, and the agent
+//! whose transcript the retry is announced in.
 
-use std::io::ErrorKind;
+use std::io::{self, ErrorKind};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 use mush_core::message::{ChatRequest, ChatResponse};
 
 use crate::app::ConfigHandle;
+use crate::clock::Clock;
 use crate::http;
 
 /// Why a chat call produced no reply.
@@ -36,8 +44,17 @@ pub enum ModelError {
     Cancelled,
     /// The request could not be encoded.
     Encode(String),
-    /// The endpoint could not be reached, or answered nothing at all.
+    /// The endpoint could not be reached, and asking again would ask the same
+    /// broken question: a URL mush cannot parse, a name that does not resolve,
+    /// a TLS handshake that failed, a config cell that would not be read.
     Unreachable(String),
+    /// The wire failed under a request the endpoint never answered: a
+    /// connection reset or refused, an unexpected end of stream, a connect or
+    /// read timeout. The one failure [`retrying`] may ask again, because the
+    /// endpoint had no opinion about this request — a status, a refusal and a
+    /// body that did not parse are all answers, and all of them end the call
+    /// (finding B23).
+    Transport(String),
     /// The endpoint answered, but its reply was refused before it could be
     /// read: a body past `http`'s cap, a malformed status line or chunk line.
     Refused(String),
@@ -100,6 +117,12 @@ impl ModelClient for HttpModel {
             Err(error) if error.kind() == ErrorKind::InvalidData => {
                 return Err(ModelError::Refused(error.to_string()));
             }
+            // Which of the two a failed call is decides whether asking again
+            // is honest, so the *kind* travels with the message instead of
+            // being flattened into a string no caller can classify.
+            Err(error) if transport(&error) => {
+                return Err(ModelError::Transport(error.to_string()))
+            }
             Err(error) => return Err(ModelError::Unreachable(error.to_string())),
         };
 
@@ -117,6 +140,132 @@ impl ModelClient for HttpModel {
         serde_json::from_str::<ChatResponse>(&response.body)
             .map_err(|error| ModelError::Malformed(error.to_string()))
     }
+}
+
+/// Whether `error` is the wire failing rather than the endpoint answering: a
+/// connection reset or refused, an end of stream where a reply should have
+/// been, a connect or a read that timed out.
+///
+/// What is *not* here is as deliberate: `InvalidData` is a refusal `http.rs`
+/// already classified, `Interrupted` is how the cancel flag is reported (and a
+/// cancellation is never retried), and `NotFound`/`InvalidInput`/`Other` are a
+/// name that does not resolve, a URL that cannot be parsed and a TLS handshake
+/// that failed — misconfiguration, where a retry only repeats the mistake.
+fn transport(error: &io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::ConnectionReset
+            | ErrorKind::ConnectionRefused
+            | ErrorKind::ConnectionAborted
+            | ErrorKind::BrokenPipe
+            | ErrorKind::NotConnected
+            | ErrorKind::UnexpectedEof
+            | ErrorKind::TimedOut
+            | ErrorKind::WouldBlock
+    )
+}
+
+/// How many times one model call is attempted: the first try and two retries.
+/// A fourth would be a loop wearing a policy's clothes.
+pub const RETRY_ATTEMPTS: usize = 3;
+/// What the first backoff waits, doubling for the retry after it. Short on
+/// purpose: the hiccup this exists for clears in a moment, and a human who is
+/// being told what is happening does not need mush to wait a minute to be sure.
+const RETRY_BACKOFF: Duration = Duration::from_millis(500);
+/// The longest a backoff sleeps before the cancel flag is read again. Short
+/// enough that Ctrl-C during a pause lands at once, and the same shape as the
+/// poll in `agent.rs`'s waits (docs/mush.md §5.5).
+const BACKOFF_SLICE: Duration = Duration::from_millis(50);
+
+/// One model call, with the bounded retry a transport hiccup deserves (finding
+/// B23: three agents in one session died mid-work on `Connection reset by
+/// peer`, which was the network and not the endpoint).
+///
+/// `attempt` is one whole try — for the real client, one `http::post_json`.
+/// This decides whether a failed try is worth another, waits the backoff on the
+/// run's own [`Clock`], and hands every retry to `announce`, so the human reads
+/// `Connection reset by peer (os error 104) — retrying (2/3)` in the transcript
+/// instead of watching a spinner that looks stuck.
+///
+/// Only a [`ModelError::Transport`] is repeated. A cancellation, a status the
+/// endpoint chose (4xx *and* 5xx: an answer is not a hiccup, and the 400 that
+/// teaches mush a smaller window already has exactly one retry of its own in
+/// the run loop), a refusal, and a body that arrived and did not parse are all
+/// returned at once, unchanged.
+///
+/// Asking again cannot duplicate work: a completion has no effect on the
+/// endpoint's state, so a retry after a reset cannot replay a write the way
+/// re-sending a `POST` that changed something would. What a retry on a body
+/// cut in half costs is tokens — and it saves the run.
+///
+/// Worst case: [`RETRY_ATTEMPTS`] attempts, each bounded by the transport below
+/// it (`http.rs`: 5 s to connect, 30 s to write, a 600 s read deadline — and
+/// `http.rs` may itself replace a kept connection that died unheard, once,
+/// inside one attempt), plus 1.5 s of backoff. So roughly half an hour for an
+/// endpoint that stalls three times and loses every time, and a few hundred
+/// milliseconds for the reset this is here for. The one unbounded step is the
+/// one already documented: resolving a host has no timeout (docs/mush.md §8),
+/// and that is not a retry's to fix.
+pub fn retrying<T>(
+    clock: &dyn Clock,
+    cancel: &AtomicBool,
+    announce: impl Fn(&str),
+    mut attempt: impl FnMut() -> Result<T, ModelError>,
+) -> Result<T, ModelError> {
+    let mut tries = 1;
+    loop {
+        // A Stop outranks everything: before the first attempt, and between
+        // every pair of them.
+        if cancel.load(Ordering::SeqCst) {
+            return Err(ModelError::Cancelled);
+        }
+        let error = match attempt() {
+            Ok(value) => return Ok(value),
+            Err(error) => error,
+        };
+        let ModelError::Transport(message) = error else {
+            // A cancellation, the endpoint's own verdict, a refusal, a body
+            // that did not parse: an answer, never asked for twice.
+            return Err(error);
+        };
+        if tries == RETRY_ATTEMPTS {
+            // The endpoint's own message, plus the fact that it is not the
+            // first time it was heard: a retry layer that replaced it with a
+            // bare "unreachable after retries" would hide the only detail the
+            // human can act on.
+            return Err(ModelError::Transport(format!(
+                "{message} — {RETRY_ATTEMPTS} attempts failed"
+            )));
+        }
+        announce(&format!(
+            "{message} — retrying ({}/{RETRY_ATTEMPTS})",
+            tries + 1
+        ));
+        wait(clock, cancel, tries)?;
+        tries += 1;
+    }
+}
+
+/// The pause before the retry after `tries` attempts, in slices the cancel flag
+/// is read between.
+///
+/// One long `sleep` would make Ctrl-C wait out the whole backoff, which is the
+/// one thing a cancellation may never do; and a `Cancelled` returned from here
+/// is the run stopping, not the wire failing.
+fn wait(clock: &dyn Clock, cancel: &AtomicBool, tries: usize) -> Result<(), ModelError> {
+    let mut left = RETRY_BACKOFF * 2u32.pow(tries as u32 - 1);
+    while !left.is_zero() {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(ModelError::Cancelled);
+        }
+        let slice = left.min(BACKOFF_SLICE);
+        clock.sleep(slice);
+        left -= slice;
+    }
+    if cancel.load(Ordering::SeqCst) {
+        return Err(ModelError::Cancelled);
+    }
+    Ok(())
 }
 
 /// A scripted model, for tests: a queue of replies, and a log of the requests
@@ -342,6 +491,22 @@ pub(crate) mod fake {
             self
         }
 
+        /// The next call fails with exactly this error: how a test drives a
+        /// failure class the retry policy has an opinion about — a transport
+        /// hiccup, a refusal, a body that did not parse — with no socket to
+        /// produce one.
+        pub fn fails(mut self, error: ModelError) -> Self {
+            self.script(Err(error));
+            self
+        }
+
+        /// The next call fails the way the wire does: the request never reached
+        /// an endpoint with an opinion about it (finding B23).
+        pub fn fails_transport(mut self, message: &str) -> Self {
+            self.script(Err(ModelError::Transport(message.to_string())));
+            self
+        }
+
         /// The next call is cancelled mid-reply. The flag the reader polls is
         /// set as well as the error being returned, because that is what the
         /// real client does: a caller that trusts the flag sees the same thing.
@@ -475,6 +640,277 @@ pub(crate) mod fake {
                 name: name.to_string(),
                 arguments: arguments.to_string(),
             },
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    use mush_core::message::{ChatRequest, ChatResponse, Message};
+
+    use super::fake::Scripted;
+    use super::{
+        retrying, transport, ModelClient, ModelError, BACKOFF_SLICE, RETRY_ATTEMPTS, RETRY_BACKOFF,
+    };
+    use crate::agent::AgentEvent;
+    use crate::app::AgentId;
+    use crate::clock::fake::Advanceable;
+    use crate::clock::Clock;
+    use crate::events::fake::Recorder;
+    use crate::events::Events;
+
+    /// One model call, made the way an agent makes it: the retry line goes to
+    /// the recording sink the way `AgentEvent::Notice` reaches the UI, and the
+    /// backoff waits on a clock that only moves when it is told to — so a test
+    /// asserts *that* the pause happened, rather than paying for it.
+    fn called(
+        model: &Arc<Scripted>,
+        clock: &dyn Clock,
+        cancel: &AtomicBool,
+        log: &Arc<Recorder>,
+    ) -> Result<ChatResponse, ModelError> {
+        let messages = vec![Message::user("task")];
+        let request = ChatRequest {
+            model: "test",
+            messages: &messages,
+            tools: &[],
+            tool_choice: "auto",
+            stream: false,
+            temperature: 0.0,
+            max_tokens: 0,
+            max_completion_tokens: None,
+            thinking: None,
+            reasoning_effort: None,
+        };
+        retrying(
+            clock,
+            cancel,
+            |line| log.emit(AgentId(7), AgentEvent::Notice(line.to_string())),
+            || model.chat(&request, cancel),
+        )
+    }
+
+    /// The retry lines the human was shown, in order.
+    fn retry_lines(log: &Recorder) -> Vec<String> {
+        log.events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(line) => Some(line),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The classification itself, on the `io::Error`s `http.rs` really returns:
+    /// what the wire does is retried, and what the transport *refused* — a body
+    /// past the cap, a cancellation, a name that does not resolve — is not,
+    /// however alike the two look once they are strings.
+    #[test]
+    fn only_a_failure_of_the_wire_is_a_transport_failure() {
+        let hiccups = [
+            io::ErrorKind::ConnectionReset,
+            io::ErrorKind::ConnectionRefused,
+            io::ErrorKind::UnexpectedEof,
+            io::ErrorKind::TimedOut,
+            io::ErrorKind::BrokenPipe,
+        ];
+        for kind in hiccups {
+            assert!(
+                transport(&io::Error::new(kind, "the wire")),
+                "{kind:?} is the wire failing, not an answer"
+            );
+        }
+        let answers = [
+            // What `http.rs` refuses: a body past its cap, a malformed status.
+            io::ErrorKind::InvalidData,
+            // How a cancellation is reported; a cancellation is never retried.
+            io::ErrorKind::Interrupted,
+            // A name that does not resolve, and a URL mush cannot parse:
+            // asking again asks the same broken question.
+            io::ErrorKind::NotFound,
+            io::ErrorKind::InvalidInput,
+        ];
+        for kind in answers {
+            assert!(
+                !transport(&io::Error::new(kind, "an answer")),
+                "{kind:?} is not a hiccup"
+            );
+        }
+    }
+
+    /// Two hiccups and then an answer: the call succeeds, the endpoint really
+    /// was asked three times, every retry was announced, and the pause came
+    /// through the clock seam instead of costing the suite the wait it proves
+    /// (finding B23).
+    #[test]
+    fn a_transport_hiccup_is_retried_until_the_model_answers() {
+        let hiccup = "Connection reset by peer (os error 104)";
+        let model = Arc::new(
+            Scripted::new()
+                .fails_transport(hiccup)
+                .fails_transport(hiccup)
+                .says("done"),
+        );
+        let clock = Advanceable::new();
+        let log = Recorder::new();
+
+        let reply = called(&model, &clock, &AtomicBool::new(false), &log).unwrap();
+
+        assert_eq!(reply.choices[0].message.text(), "done");
+        assert_eq!(
+            model.asked().len(),
+            RETRY_ATTEMPTS,
+            "the request was really made three times"
+        );
+        assert_eq!(
+            retry_lines(&log),
+            vec![
+                format!("{hiccup} — retrying (2/3)"),
+                format!("{hiccup} — retrying (3/3)"),
+            ],
+            "and each retry was visible, in order"
+        );
+        assert_eq!(
+            clock.elapsed(),
+            RETRY_BACKOFF + RETRY_BACKOFF * 2,
+            "the backoff waits on the clock it was handed"
+        );
+    }
+
+    /// Every attempt fails: the caller gets the endpoint's own words, and the
+    /// attempts are named — not a bare fourth message that hides what the wire
+    /// actually said.
+    #[test]
+    fn transport_failures_on_every_attempt_name_the_attempts() {
+        let hiccup = "Connection reset by peer (os error 104)";
+        let model = Arc::new(
+            Scripted::new()
+                .fails_transport(hiccup)
+                .fails_transport(hiccup)
+                .fails_transport(hiccup),
+        );
+        let clock = Advanceable::new();
+        let log = Recorder::new();
+
+        let error = called(&model, &clock, &AtomicBool::new(false), &log).unwrap_err();
+
+        assert_eq!(
+            model.asked().len(),
+            RETRY_ATTEMPTS,
+            "three attempts, no more"
+        );
+        match error {
+            ModelError::Transport(reason) => {
+                assert!(
+                    reason.starts_with(hiccup),
+                    "the original error reaches the caller: {reason}"
+                );
+                assert!(
+                    reason.contains("3 attempts"),
+                    "and the attempts are named: {reason}"
+                );
+            }
+            other => panic!("a transport failure, not {other:?}"),
+        }
+        assert_eq!(
+            retry_lines(&log).len(),
+            RETRY_ATTEMPTS - 1,
+            "both retries were announced before giving up"
+        );
+    }
+
+    /// A clock whose `sleep` is the human pressing Ctrl-C: the flag is set at
+    /// the instant the pause begins, so the retry must not be made at all.
+    struct CancelledDuringBackoff {
+        flag: Arc<AtomicBool>,
+        clock: Advanceable,
+    }
+
+    impl Clock for CancelledDuringBackoff {
+        fn now(&self) -> Instant {
+            self.clock.now()
+        }
+
+        fn sleep(&self, d: Duration) {
+            self.flag.store(true, Ordering::SeqCst);
+            self.clock.sleep(d);
+        }
+    }
+
+    /// Ctrl-C during the backoff abandons the request at once: no second
+    /// attempt is made, and the answer is a cancellation — not a retry, and not
+    /// a transport failure, which would end a run as one (docs/mush.md §5.5).
+    #[test]
+    fn a_cancellation_during_the_backoff_abandons_the_retry() {
+        let model = Arc::new(
+            Scripted::new()
+                .fails_transport("Connection reset by peer (os error 104)")
+                .says("too late"),
+        );
+        let flag = Arc::new(AtomicBool::new(false));
+        let clock = CancelledDuringBackoff {
+            flag: flag.clone(),
+            clock: Advanceable::new(),
+        };
+        let log = Recorder::new();
+
+        let error = called(&model, &clock, &flag, &log).unwrap_err();
+
+        assert_eq!(error, ModelError::Cancelled);
+        assert!(flag.load(Ordering::SeqCst));
+        assert_eq!(
+            model.asked().len(),
+            1,
+            "the retry the human cancelled was never made"
+        );
+        assert_eq!(retry_lines(&log).len(), 1, "they were told it was coming");
+        assert_eq!(
+            clock.clock.elapsed(),
+            BACKOFF_SLICE,
+            "and it stopped at the first slice of the backoff, not at its end"
+        );
+    }
+
+    /// What the endpoint chose is an answer, and so is a body that arrived and
+    /// did not parse: one attempt, and the same error a human sees today. The
+    /// 400 is among them because the one retry a complaint gets — the window it
+    /// teaches the run — is the run loop's, decided once, and never a
+    /// transport policy that cannot read the body. A 503 is here too: an
+    /// endpoint that says it is overloaded has spoken, and its words are worth
+    /// more to the human than another silent ask.
+    #[test]
+    fn an_answer_from_the_endpoint_is_never_retried() {
+        let answers = [
+            ModelError::Status {
+                status: 400,
+                body: r#"{"error":{"message":"bad request"}}"#.to_string(),
+            },
+            ModelError::Status {
+                status: 503,
+                body: "the endpoint is overloaded".to_string(),
+            },
+            ModelError::Refused("the response body is larger than 83886080 bytes".to_string()),
+            ModelError::Malformed("expected value at line 1 column 1".to_string()),
+        ];
+        for expected in answers {
+            let model = Arc::new(Scripted::new().fails(expected.clone()).says("never asked"));
+            let clock = Advanceable::new();
+            let log = Recorder::new();
+
+            let error = called(&model, &clock, &AtomicBool::new(false), &log).unwrap_err();
+
+            assert_eq!(error, expected, "the endpoint's answer reaches the caller");
+            assert_eq!(model.asked().len(), 1, "{expected:?} is not a hiccup");
+            assert!(
+                retry_lines(&log).is_empty(),
+                "nothing was announced as a retry"
+            );
+            assert_eq!(clock.elapsed(), Duration::ZERO, "and nothing was waited");
         }
     }
 }
