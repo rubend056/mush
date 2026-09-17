@@ -155,7 +155,7 @@ trimming only cuts in when the model itself cannot produce a summary.
 | `Ctrl-Q` | quit |
 
 Chat commands: `/provider`, `/model`, `/context`, `/url`, `/key`, `/models`,
-`/worktrees`, `/diff`, `/merge`, `/discard`, `/new`, `/help`, `/quit`.
+`/worktrees`, `/diff`, `/merge`, `/discard`, `/notes`, `/new`, `/help`, `/quit`.
 
 ## The screen
 
@@ -173,6 +173,13 @@ from the right when the terminal is narrow:
 `HEAD`. Terminals narrower than 80 columns (or shorter than 20 rows) get a
 **compact** layout: the agent strip on top, chat below. Below 40×10 mush says
 so instead of painting shreds.
+
+Under the conversation is mush's own **foot**: `·` for what happened, `!` for a
+failure. It never takes more than two rows; when there is more, the row that says
+`+N more lines · /notes` is the count, and `/notes` reads the whole list. A fatal
+run's failure is kept in `.mush/session.json` and is still there next time mush
+opens the workspace — until that agent runs again, when the failure belonged to
+the run being replaced.
 
 ## Context window
 

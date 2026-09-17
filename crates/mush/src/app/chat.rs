@@ -83,10 +83,11 @@ pub enum NoticeKind {
 /// What wins when more than one line wants to be a pane's last (finding B12):
 /// a failure first, then derived activity, then what mush merely said.
 ///
-/// This is the one precedence table. The bar (`ui::bar_line`) and a transcript
-/// pane both rank their lines through it, so the two cannot disagree about
-/// which of two things the human needs to see first — which is how an `Error`
-/// status came to lose to a `thinking…` line.
+/// This is the one precedence table. The bar (`ui::bar_line`) picks the line it
+/// shows through it, and the foot ranks through it to decide what survives its
+/// cap — so neither can disagree with the other about which of two things the
+/// human needs to see first, which is how an `Error` status came to lose to a
+/// `thinking…` line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Rank {
     /// A line mush wrote: a hint, `opened notes.txt`, a merge that landed.
@@ -568,11 +569,16 @@ impl Chat {
         let rows: Vec<usize> = blocks.iter().map(Vec::len).collect();
         let total: usize = rows.iter().sum();
         // More lines than a foot may show: one row of what is left is spent on
-        // saying so. The transcript keeps the row that arithmetic costs it.
+        // saying so. The transcript keeps the row that arithmetic costs it, and
+        // a pane with a single row to spare gets the line itself — the count is
+        // worth less to a human than the note it counts, and the title can say
+        // it instead.
         let mut budget = if total <= FOOT_NOTE_ROWS {
             total.min(room)
+        } else if room >= 2 {
+            FOOT_NOTE_ROWS.min(room - 1)
         } else {
-            FOOT_NOTE_ROWS.min(room.saturating_sub(1))
+            room
         };
         let mut order: Vec<usize> = (0..blocks.len()).collect();
         order.sort_by_key(|index| worth[*index]);
@@ -1087,24 +1093,52 @@ mod tests {
         }
         let pane = pane(AgentId::ROOT);
 
-        // One row of pane: the transcript keeps it, and the title carries the
-        // count because the foot has no row to spend on saying it.
+        // One row of pane: the transcript keeps it — the foot takes none — and
+        // the title carries the count, because the foot has no row to spend on
+        // saying it.
         let painted = chat.painted(&pane, 40, 1);
         assert_eq!(shown(&painted.lines), vec!["mush › the newest reply"]);
         assert_eq!(painted.title, " mush · +5 more lines ");
 
-        // Two rows: one is the count, one is the conversation — five note lines
-        // were written and none of them is painted, which is what the count is
-        // for.
+        // Two rows: the conversation and one line of mush's own — five note
+        // lines were written and the other four are counted in the title,
+        // because a foot one row tall is worth more as a line than as a sum of
+        // the lines it is not showing.
         let painted = chat.painted(&pane, 40, 2);
         assert_eq!(
             shown(&painted.lines),
-            vec!["mush › the newest reply", "  +5 more lines · /notes"]
+            vec!["mush › the newest reply", "· note 4"]
         );
+        assert_eq!(painted.title, " mush · +4 more lines ");
+
+        // Three rows: the count has a row of its own now, so both it and the
+        // newest line are painted.
+        let painted = chat.painted(&pane, 40, 3);
         assert_eq!(
-            painted.title, " mush ",
-            "the foot said it, so the title need not say it twice"
+            shown(&painted.lines),
+            vec![
+                "mush › the newest reply",
+                "  +4 more lines · /notes",
+                "· note 4"
+            ]
         );
+        assert_eq!(painted.title, " mush ");
+
+        // Nothing said yet is the other case: there is no transcript row to
+        // protect, and the single row a 40×10 pane has goes to mush's own line
+        // rather than to a blank or to arithmetic about it. A fresh pane with a
+        // note in it used to paint exactly that blank.
+        let mut fresh = Chat::bare();
+        for index in 0..5 {
+            fresh.note_for(AgentId::ROOT, format!("note {index}"));
+        }
+        let painted = fresh.painted(&pane, 40, 1);
+        assert_eq!(
+            shown(&painted.lines),
+            vec!["· note 4"],
+            "the newest line, not the count of the lines above it"
+        );
+        assert_eq!(painted.title, " mush · +4 more lines ");
     }
 
     /// `/notes` is the other half of the cap and it wraps: a note longer than a
