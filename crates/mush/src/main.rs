@@ -36,7 +36,7 @@ use ratatui::Terminal;
 use mush_core::text::mask_key;
 use mush_core::{config, session, Config, Overrides, Session, UserConfig, Workspace};
 
-use app::{App, Msg};
+use app::{App, ConfigCell, Msg};
 
 /// `-y` / `--yes`: this session's human pre-approved work that a feature would
 /// otherwise stop and ask about. Nothing asks yet — the design doc's
@@ -424,12 +424,16 @@ fn run() -> Result<(), Box<dyn Error>> {
     }
 
     let (tx, rx) = unbounded::<Msg>();
-    let root = agent::spawn(config.clone(), tx.clone(), workspace.root().to_path_buf());
+    // One cell for the whole tree: the UI reads it, the root actor — and every
+    // agent under it — reads the same one, so a runtime `/model` cannot reach
+    // the screen without reaching the actors (finding B7).
+    let cell = ConfigCell::own(config);
+    let root = agent::spawn(cell.handle(), tx.clone(), workspace.root().to_path_buf());
     // The session goes out through its own thread: the UI thread hands a
     // snapshot over and keeps painting (see `session_save`). `App`'s drop is the
     // exit flush.
     let save = Arc::new(session_save::Writer::new(workspace.root().to_path_buf()));
-    let mut app = App::new(workspace, config, stored, root, tx.clone(), models, save);
+    let mut app = App::new(workspace, cell, stored, root, tx.clone(), models, save);
 
     install_panic_hook();
     let mut guard = TerminalGuard::enter()?;

@@ -326,7 +326,7 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
         // and leave the rest as margin.
         let width = (inner.width as usize).min(MAX_TRANSCRIPT as usize);
         let height = inner.height as usize;
-        let label = app.cfg.label();
+        let label = app.cfg().label();
         let pane = Pane {
             agent: app.tree.focused,
             // A run in flight is what the pane's own activity line is derived
@@ -423,9 +423,9 @@ fn draw_picker(frame: &mut Frame, app: &App) {
             PickerKind::Model => picker
                 .items
                 .get(picker.cursor)
-                .map(|item| item.split(" · ").next().unwrap_or(item) == app.cfg.model)
+                .map(|item| item.split(" · ").next().unwrap_or(item) == app.cfg().model)
                 .unwrap_or(false),
-            PickerKind::Provider => item == app.cfg.provider.name(),
+            PickerKind::Provider => item == app.cfg().provider.name(),
         };
         let label = if current {
             format!("• {item}")
@@ -544,7 +544,7 @@ fn facts_line(app: &App, width: usize) -> String {
         }
         cells.push(cell);
     }
-    cells.push(format!("{} · {}", app.cfg.label(), app.context_meter()));
+    cells.push(format!("{} · {}", app.cfg().label(), app.context_meter()));
     while cells.len() > 1 {
         let joined: String = cells.join(" │ ");
         if UnicodeWidthStr::width(joined.as_str()) <= width {

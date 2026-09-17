@@ -16,11 +16,10 @@
 
 use std::io::ErrorKind;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 
 use mush_core::message::{ChatRequest, ChatResponse};
-use mush_core::Config;
 
+use crate::app::ConfigHandle;
 use crate::http;
 
 /// Why a chat call produced no reply.
@@ -68,11 +67,11 @@ pub trait ModelClient: Send + Sync {
 /// The real endpoint: the config cell the actors already share, and the
 /// transport below it.
 pub struct HttpModel {
-    cfg: Arc<Mutex<Config>>,
+    cfg: ConfigHandle,
 }
 
 impl HttpModel {
-    pub fn new(cfg: Arc<Mutex<Config>>) -> Self {
+    pub fn new(cfg: ConfigHandle) -> Self {
         Self { cfg }
     }
 }
@@ -83,10 +82,8 @@ impl ModelClient for HttpModel {
         request: &ChatRequest<'_>,
         cancel: &AtomicBool,
     ) -> Result<ChatResponse, ModelError> {
-        let cfg =
-            self.cfg.lock().map(|cfg| cfg.clone()).map_err(|_| {
-                ModelError::Unreachable("shared configuration poisoned".to_string())
-            })?;
+        // One snapshot per request, not a lock held across the call.
+        let cfg = self.cfg.config().map_err(ModelError::Unreachable)?;
 
         let body = serde_json::to_string(request)
             .map_err(|error| ModelError::Encode(error.to_string()))?;
