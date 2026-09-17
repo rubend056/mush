@@ -479,6 +479,8 @@ pub fn resolve_with(
     let url_given = cli.url.is_some() || env.url.is_some();
     let provider_given = cli.provider.is_some() || env.provider.is_some();
     let model_given = cli.model.is_some() || env.model.is_some();
+    let temperature_given = cli.temperature.is_some() || env.temperature.is_some();
+    let cap_given = cli.max_completion_tokens.is_some() || env.max_completion_tokens.is_some();
 
     // 2. Home config: machine-global defaults, and where the API key lives.
     if config.api_key.is_none() {
@@ -499,6 +501,16 @@ pub fn resolve_with(
     }
     if !model_given && config.model.is_empty() && !home.model.is_empty() {
         config.model = home.model.clone();
+    }
+    if !temperature_given {
+        if let Some(temperature) = home.temperature {
+            config.temperature = temperature;
+        }
+    }
+    if !cap_given {
+        if let Some(max_completion_tokens) = home.max_completion_tokens {
+            config.max_completion_tokens = max_completion_tokens;
+        }
     }
 
     // 3. The workspace's saved session: the last runtime choice beats the
@@ -521,6 +533,16 @@ pub fn resolve_with(
             if let Some(tokens) = session.context.filter(|n| *n > 0) {
                 config.set_context(tokens);
             }
+        }
+    }
+
+    // The home config's window. A window there is a statement too, so it beats
+    // what an endpoint advertises; but a window this workspace remembers is the
+    // more specific statement, which is why this waits for the session above.
+    // The layers still read CLI > env > session > home.
+    if !config.context_explicit {
+        if let Some(tokens) = home.context.filter(|n| *n > 0) {
+            config.set_context(tokens);
         }
     }
 
@@ -587,6 +609,7 @@ mod tests {
             provider: provider.into(),
             base_url: base_url.into(),
             model: model.into(),
+            ..UserConfig::default()
         }
     }
 
@@ -708,6 +731,80 @@ mod tests {
         .unwrap();
         assert_eq!(config.provider, Provider::Custom);
         assert_eq!(config.base_url, "http://base:0");
+    }
+
+    /// The home config fills what every layer above it leaves unstated: the
+    /// request knobs nothing else can state, and a window that a human means
+    /// (so it beats discovery — but not a window this workspace remembers).
+    #[test]
+    fn the_home_config_fills_what_the_layers_above_leave_unstated() {
+        let home = UserConfig {
+            context: Some(32_000),
+            temperature: Some(0.2),
+            max_completion_tokens: Some(true),
+            ..UserConfig::default()
+        };
+        let mut config = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.temperature(), 0.2);
+        assert!(config.uses_max_completion_tokens());
+        assert_eq!(config.context_tokens, 32_000);
+        assert!(config.context_explicit, "a stated window is not a guess");
+        assert!(
+            !config.adopt_context(4_096),
+            "so an endpoint cannot overrule it"
+        );
+
+        // A flag above the file wins, and an unstated field is the built-in
+        // default rather than an empty file's.
+        let config = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides {
+                context: Some(8_000),
+                temperature: Some(0.9),
+                max_completion_tokens: Some(false),
+                ..Overrides::default()
+            },
+            &Overrides::default(),
+            &home,
+            None,
+        )
+        .unwrap();
+        assert_eq!(config.temperature(), 0.9);
+        assert!(!config.uses_max_completion_tokens());
+        assert_eq!(config.context_tokens, 8_000);
+
+        let empty = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &UserConfig::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(empty.temperature(), DEFAULT_TEMPERATURE);
+        assert!(!empty.uses_max_completion_tokens());
+
+        // A window this workspace remembers is more specific than the
+        // machine-global one, so the session still wins.
+        let mut session = stored("custom", "http://session:3", "session-model");
+        session.context = Some(16_000);
+        let config = resolve_with(
+            Config::new("http://base:0", "", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            Some(&session),
+        )
+        .unwrap();
+        assert_eq!(config.context_tokens, 16_000);
+        assert_eq!(config.temperature(), 0.2, "the other knobs still come home");
     }
 
     #[test]
