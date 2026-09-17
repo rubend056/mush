@@ -46,7 +46,8 @@ pub struct ProviderSpec {
     /// means "ask the endpoint and nothing else".
     pub models: &'static [ModelSpec],
     /// The window to assume when neither the endpoint nor [`ProviderSpec::models`]
-    /// knows one.
+    /// knows one. A default, never a statement: a `MUSH_CONTEXT`, a stored
+    /// choice, or the endpoint's own advertised window all beat it.
     pub fallback_context_tokens: usize,
     /// Whether a request asks for the provider's thinking mode when the human
     /// states none.
@@ -86,7 +87,12 @@ pub const PROVIDERS: &[ProviderSpec] = &[
                 context_tokens: 500_000,
             },
         ],
-        fallback_context_tokens: 128_000,
+        // 120000 is the number the human stated for this provider, and it is
+        // what the default is for: the modules below name a model's own
+        // documented window when one is named, and this is the window a
+        // session that has named none is budgeted against. Anything a human
+        // states, and anything the endpoint advertises, still overrules it.
+        fallback_context_tokens: 120_000,
         thinking_by_default: true,
         reasoning_effort_by_default: Some("high"),
         switches_endpoint: true,
@@ -206,6 +212,18 @@ pub fn thinking_default_hint() -> String {
     }
 }
 
+/// How the home config's own header spells the built-in window per provider,
+/// e.g. `120000 for deepseek, 8192 for custom`. Spelled from the table like the
+/// other hints, so the number a human reads in a hand-editable file cannot
+/// drift from the one a request would be sized against.
+pub fn context_default_hint() -> String {
+    PROVIDERS
+        .iter()
+        .map(|spec| format!("{} for {}", spec.fallback_context_tokens, spec.name))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// How the help text spells the reasoning-effort default, e.g.
 /// `high for deepseek, no field elsewhere`. Spelled from the table for the same
 /// reason [`thinking_default_hint`] is.
@@ -287,11 +305,26 @@ mod tests {
     fn the_hints_are_spelled_from_the_table() {
         assert_eq!(names_hint(), "deepseek or custom");
         assert_eq!(names_piped(), "deepseek|custom");
+        assert_eq!(
+            context_default_hint(),
+            "120000 for deepseek, 8192 for custom"
+        );
         assert_eq!(thinking_default_hint(), "on for deepseek, off elsewhere");
         assert_eq!(
             effort_default_hint(),
             "`high` for deepseek, no field elsewhere"
         );
+    }
+
+    /// The window a provider falls back to when nobody stated one: for DeepSeek
+    /// the number the human stated (120k), not a small guess that truncates
+    /// ordinary work; for an endpoint mush knows nothing about, the small
+    /// window a local server really has. Neither is a statement, so neither is
+    /// ever stored as if a human had made it.
+    #[test]
+    fn the_fallback_windows_are_the_shipped_numbers() {
+        assert_eq!(Provider::DeepSeek.spec().fallback_context_tokens, 120_000);
+        assert_eq!(Provider::Custom.spec().fallback_context_tokens, 8_192);
     }
 
     #[test]

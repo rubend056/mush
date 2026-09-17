@@ -53,20 +53,6 @@ const RUNAWAY_TURNS: usize = 200;
 /// same arguments and nothing changed in between is that signal; a long task
 /// that keeps changing something never trips it, however long it runs.
 const LOOP_ROUNDS: usize = 5;
-/// Ceiling on one model reply, in tokens. It has to cover a thinking model's
-/// reasoning too: when the cap is spent before the visible answer, the reply
-/// arrives cut off (`finish_reason: length`).
-const MAX_REPLY_TOKENS: u32 = 20_480;
-
-/// What one reply may use, given the endpoint's window. Asking for more than a
-/// fraction of the window is how a reply arrives cut off: the endpoint cannot
-/// deliver it, or spends the cap on reasoning and never reaches the answer.
-/// A quarter of the window is the same share `Config::history_budget` reserves
-/// for the reply, so the two cannot disagree about what "one reply" means.
-fn reply_cap(cfg: &Config) -> u32 {
-    let share = (cfg.context_tokens / 4) as u64;
-    MAX_REPLY_TOKENS.min(share.max(1024) as u32)
-}
 /// The real token counts the endpoint reported for this run's calls, summed
 /// over the turns it reported them on. `None` until a reply carries `usage`: a
 /// server that reports none leaves mush's own bytes-per-token estimate as the
@@ -1156,7 +1142,7 @@ fn run_loop(
             tool_choice: if wrap_up { "none" } else { "auto" },
             stream: false,
             temperature: cfg.temperature(),
-            max_tokens: reply_cap(&cfg),
+            max_tokens: cfg.reply_cap(),
             max_completion_tokens: None,
             thinking: None,
             reasoning_effort: None,
@@ -1284,7 +1270,7 @@ fn run_loop(
                     call.id.clone(),
                     format!(
                         "error: the model's reply was cut off at {} tokens; this call was not run",
-                        reply_cap(&cfg)
+                        cfg.reply_cap()
                     ),
                 );
                 messages.push(message.clone());
@@ -1299,14 +1285,14 @@ fn run_loop(
                 return Err(format!(
                     "the model's reply was cut off at the {}-token limit \
                      (finish_reason: length) {cut_offs} times in a row — nothing after it ran",
-                    reply_cap(&cfg)
+                    cfg.reply_cap()
                 ));
             }
             actor.ctx.emit(
                 actor.id,
                 AgentEvent::Notice(format!(
                     "reply cut off at {} tokens — asking for smaller steps",
-                    reply_cap(&cfg)
+                    cfg.reply_cap()
                 )),
             );
             messages.push(Message::user(TRUNCATION_INSTRUCTION));
@@ -4587,25 +4573,30 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
-    /// One reply may never be asked for more than a share of the window: an
-    /// endpoint cannot deliver what it does not have, and a thinking model
-    /// spends the cap before it reaches the answer.
+    /// The cap a request carries is the config's, window and all: a run
+    /// budgeted against a 120k window asks for a quarter of it rather than the
+    /// 20_480 that cut a real run off mid-task, and the number travels under
+    /// the name the config chose. `Asked` records what the endpoint was really
+    /// sent, so this is the number a reply would be cut off at.
     #[test]
-    fn a_reply_never_asks_for_more_than_the_window_has() {
-        let window = |tokens: usize| {
-            let mut cfg = Config::new("http://127.0.0.1:1", "m", None);
-            cfg.set_context(tokens);
-            cfg
-        };
-        assert_eq!(reply_cap(&window(8_192)), 2_048, "a quarter of 8k, not 20k");
+    fn a_request_carries_the_cap_its_window_derives() {
+        let scripted = Arc::new(Scripted::new().says("done"));
+        let mut cfg = Config::new("http://127.0.0.1:1", "test", None);
+        cfg.provider = mush_core::config::Provider::DeepSeek;
+        cfg.set_context(120_000);
+        let (actor, _events, _mailbox) =
+            build_actor("reply-cap", scripted.clone(), ConfigHandle::own(cfg));
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::user("hi")];
+
+        run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        let asked = scripted.asked();
         assert_eq!(
-            reply_cap(&window(128_000)),
-            MAX_REPLY_TOKENS,
-            "a big window keeps the cap"
+            asked[0].reply_cap, 30_000,
+            "a quarter of the 120k window, not a fixed 20_480"
         );
-        // Never zero, however tiny the window: a request for no reply is not a
-        // request.
-        assert_eq!(reply_cap(&window(512)), 1_024);
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// A command parked while a run was in flight must not wait for the

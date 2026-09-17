@@ -50,9 +50,12 @@ fn comment() -> Vec<String> {
         ),
         "base_url: an OpenAI-compatible endpoint, without a trailing slash.".to_string(),
         "model: the model id to start with, when nothing above names one.".to_string(),
-        "context: a context window in tokens; stating it here beats what the endpoint advertises, as --context does.".to_string(),
+        format!(
+            "context: a context window in tokens; the built-in default is {}. Stating it here beats what the endpoint advertises, as --context does.",
+            crate::provider::context_default_hint()
+        ),
         "temperature: 0.0-2.0, sent with every request; 1.0 is the model's own choice, and the default.".to_string(),
-        "max_completion_tokens: true sends the reply cap as max_completion_tokens; OpenAI's reasoning models reject max_tokens.".to_string(),
+        "max_completion_tokens: true sends the reply cap — a quarter of the window, at most — as max_completion_tokens; OpenAI's reasoning models reject max_tokens.".to_string(),
         format!(
             "reasoning_effort: \"low\", \"medium\" or \"high\", or \"none\" to send no reasoning_effort at all. A value here reaches any endpoint; the provider's own default is {}.",
             crate::provider::effort_default_hint()
@@ -261,6 +264,14 @@ mod tests {
             assert!(
                 header.contains(spec.name),
                 "`{}` is offered in the file's own header: {header}",
+                spec.name
+            );
+            // The window a provider defaults to is in the file too: a human
+            // hand-editing `context` reads the number a request would use
+            // where nothing else stated one.
+            assert!(
+                header.contains(&spec.fallback_context_tokens.to_string()),
+                "`{}`'s default window is in the header: {header}",
                 spec.name
             );
         }

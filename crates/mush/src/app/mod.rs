@@ -2649,6 +2649,32 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The shipped default window is not the human's: a session budgeted on it
+    /// must store `context: null`, or the next launch would read a default
+    /// nobody stated back as a statement — and no endpoint could ever teach
+    /// mush a smaller window for that workspace again. Only an explicit window
+    /// is worth remembering.
+    #[test]
+    fn a_default_window_is_never_stored_as_if_it_were_stated() {
+        let root = dir("default-context");
+        let (mut app, _writer) = app_writing(&root);
+        app.cell.edit(|cfg| {
+            cfg.provider = Provider::DeepSeek;
+            cfg.rederive_context();
+        });
+        assert_eq!(app.cfg().context_tokens, 120_000, "the shipped default");
+        assert!(!app.cfg().context_explicit);
+
+        app.chat.insert("hello");
+        app.send_message();
+
+        let stored = Session::load(&root).expect("the send flushed it");
+        assert_eq!(stored.context, None, "a guess is not a statement");
+        assert_eq!(stored.model, app.cfg().model);
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// `/forget` is a deletion, and a deletion that only lived in memory would
     /// come back at the next start — the agent would be listed as if the human
     /// had never dropped it.

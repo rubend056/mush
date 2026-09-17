@@ -239,13 +239,14 @@ fn print_help() {
          \x20   --thinking MODE    on asks for the provider's thinking mode, off sends no `thinking`\n\
          \x20                      field at all (default: {}; $MUSH_THINKING)\n\
          \x20   --max-completion-tokens\n\
-         \x20                      Send the reply cap as `max_completion_tokens` instead of\n\
-         \x20                      `max_tokens`, as OpenAI's reasoning models require\n\
+         \x20                      Send the reply cap (a quarter of the window) as\n\
+         \x20                      `max_completion_tokens` instead of `max_tokens`, as\n\
+         \x20                      OpenAI's reasoning models require\n\
          \x20   -y, --yes          Pre-approve this session's work. Recorded only: mush asks\n\
          \x20                      nothing yet, so this changes no behaviour today\n\
          \x20   --print-config     Print the resolved config (endpoint, provider, model, window\n\
          \x20                      and whether it was stated, temperature, reasoning effort and\n\
-         \x20                      thinking mode, reply-cap name, key masked) and exit 0\n\n\
+         \x20                      thinking mode, reply-cap size and name, key masked) and exit 0\n\n\
          KEYS:\n\
          \x20   Tab / Shift-Tab   cycle panes (agents, chat)\n\
          \x20   Enter             send message (chat) · focus agent (agents)\n\
@@ -305,6 +306,10 @@ fn describe(config: &Config, approved: bool) -> Vec<(String, String)> {
     } else {
         "max_tokens"
     };
+    // The name alone would not say what a reply is cut off at, which is the one
+    // number a truncated run makes a human want to see. The size is derived
+    // from the window, under the same name the request will carry it.
+    let reply_cap = format!("{} tokens as {cap}", config.reply_cap());
     // Both of these are stated values with a provider default, so the line says
     // which one a request will carry *and* where it came from: a value nobody
     // stated is the provider's, not the human's.
@@ -346,7 +351,7 @@ fn describe(config: &Config, approved: bool) -> Vec<(String, String)> {
         ),
         ("reasoning".to_string(), effort),
         ("thinking".to_string(), thinking),
-        ("reply cap".to_string(), cap.to_string()),
+        ("reply cap".to_string(), reply_cap),
         ("api key".to_string(), key),
         ("auto-approve".to_string(), approve.to_string()),
     ]
@@ -694,8 +699,12 @@ mod tests {
     }
 
     /// `--print-config` reports what a request will carry — the endpoint, the
-    /// window and *where it came from*, the reply cap's name, and a masked key
-    /// — rather than what any one file wished for.
+    /// window and *where it came from*, the reply cap's size and its name, and a
+    /// masked key — rather than what any one file wished for.
+    ///
+    /// The cap's size belongs there: a run that ends with `reply cut off at N
+    /// tokens` makes that N the one number a human wants to see before the run,
+    /// not after it.
     #[test]
     fn describe_reports_the_request_not_the_wishes() {
         let mut cfg = Config::new(
@@ -724,7 +733,11 @@ mod tests {
         assert_eq!(field("temperature"), "0.0", "0 is a value, not an absence");
         assert_eq!(field("reasoning"), "medium (stated)");
         assert_eq!(field("thinking"), "off (stated)");
-        assert_eq!(field("reply cap"), "max_completion_tokens");
+        assert_eq!(
+            field("reply cap"),
+            "16000 tokens as max_completion_tokens",
+            "a quarter of the stated 64k window"
+        );
         assert_eq!(field("api key"), "sk-1…7890 (masked)");
         assert_eq!(field("auto-approve"), "yes (-y recorded; nothing asks yet)");
 
@@ -749,7 +762,11 @@ mod tests {
         // send, and name it as such rather than claiming the human asked.
         assert_eq!(field("reasoning"), "none (the provider's default)");
         assert_eq!(field("thinking"), "off (the provider's default)");
-        assert_eq!(field("reply cap"), "max_tokens");
+        assert_eq!(
+            field("reply cap"),
+            "2048 tokens as max_tokens",
+            "an 8192-token window affords 2048"
+        );
         assert_eq!(field("api key"), "(none)");
         assert_eq!(field("auto-approve"), "no");
 
@@ -767,6 +784,33 @@ mod tests {
         };
         assert_eq!(field("reasoning"), "high (the provider's default)");
         assert_eq!(field("thinking"), "on (the provider's default)");
+    }
+
+    /// The session the shipped DeepSeek defaults describe, as `--print-config`
+    /// spells it: the window the human asked for, and a reply cap a quarter of
+    /// it under the name every endpoint documents — not the 20_480 a real run
+    /// was cut off at. The cap's *size* is on the line precisely so this can be
+    /// read before a run instead of after one.
+    #[test]
+    fn the_shipped_deepseek_session_reports_the_cap_it_sends() {
+        let mut config = Config::new("https://api.deepseek.com", "", None);
+        config.provider = config::Provider::DeepSeek;
+        config.rederive_context();
+        assert!(!config.context_explicit, "a default, not a statement");
+
+        let lines = describe(&config, false);
+        let field = |name: &str| {
+            lines
+                .iter()
+                .find(|(field, _)| field == name)
+                .map(|(_, value)| value.clone())
+                .unwrap_or_else(|| panic!("no `{name}` line in {lines:?}"))
+        };
+        assert_eq!(
+            field("window"),
+            "120000 tokens (assumed from the model or the provider)"
+        );
+        assert_eq!(field("reply cap"), "30000 tokens as max_tokens");
     }
 
     /// The full startup path with an unreachable endpoint must still produce a

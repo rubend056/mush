@@ -32,6 +32,32 @@ pub const MAX_CONTEXT_TOKENS: usize = 10_000_000;
 /// would exceed it however much history was trimmed.
 const MIN_CONTEXT_TOKENS: usize = 1_024;
 
+/// The most one reply may be asked for, in tokens. The cap has to cover a
+/// thinking model's reasoning too: when it is spent before the visible answer,
+/// the reply arrives cut off (`finish_reason: length`). At mush's old ceiling
+/// of 20_480 a real run ended with `reply cut off at 20480 tokens` for ordinary
+/// work, so the ceiling is now the number the human stated. It is a number mush
+/// has been told is safe rather than a guess: the endpoint itself answered a
+/// larger request with `Invalid max_tokens value, the valid range of
+/// max_tokens is [1, 393216]`, and 120_000 sits well inside that. Asking past a
+/// vendor's limit is a 400 — worse than a short reply — so the ceiling stays
+/// below what an endpoint documents it accepts, and `Config::reply_cap` is the
+/// only reader.
+pub const MAX_REPLY_TOKENS: u32 = 120_000;
+
+/// The ceiling has to stay under what an endpoint accepts: a request past a
+/// vendor's documented `max_tokens` range is a 400, which is worse than the
+/// short reply this number exists to stop. The number below is the one the
+/// endpoint itself named in that complaint; it is checked here, at compile
+/// time, so a later edit cannot raise the ceiling past it by accident.
+const _: () = assert!(MAX_REPLY_TOKENS < 393_216);
+
+/// The share of the window one reply may use, as a divisor: `window / this`.
+/// `Config::reply_cap` asks for this share and `Config::request_reserve` keeps
+/// room for it, so the cap a request carries and the budget that has to hold it
+/// cannot disagree about what one reply costs.
+const REPLY_SHARE_DIVISOR: usize = 4;
+
 /// Keep a window inside the range mush can work with, whatever its source.
 fn clamp_context(tokens: usize) -> usize {
     tokens.clamp(MIN_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS)
@@ -377,18 +403,42 @@ impl Config {
             .min(self.history_budget())
     }
 
-    /// How much conversation history (in bytes) fits alongside the tool
-    /// schemas and the reply inside `context_tokens`. Rough heuristic: ~3
-    /// bytes per token, `SCHEMA_TOKENS` of schemas, 2048 tokens of reply. The
-    /// reserve is itself capped at half the window: a small window shrinks it
-    /// (half the window is always history) instead of leaving no budget at all.
+    /// How many bytes of conversation history fit alongside the tool schemas
+    /// and the reply inside `context_tokens`, at the ~3 bytes per token the
+    /// heuristic uses. The reserve is itself capped at half the window: a small
+    /// window shrinks it (half the window is always history) instead of leaving
+    /// no budget at all.
+    ///
+    /// So `history + schemas + reply + margin == window`, and a request that
+    /// spends its whole reply cap still fits the window it is sent to. That is
+    /// what keeps a long conversation from being cut off as a context-length
+    /// complaint: the trimmer and the cap are two halves of one budget.
     pub fn history_budget(&self) -> usize {
-        const REPLY_TOKENS: usize = 2048;
-        const MARGIN_TOKENS: usize = 200;
-        let reserve = (SCHEMA_TOKENS + REPLY_TOKENS + MARGIN_TOKENS).min(self.context_tokens / 2);
         self.context_tokens
-            .saturating_sub(reserve)
+            .saturating_sub(self.request_reserve())
             .saturating_mul(3)
+    }
+
+    /// The tokens every request pays besides history: the tool schemas, the
+    /// reply (the same share of the window [`Config::reply_cap`] may ask for)
+    /// and a margin. It can never be more than half the window, so a window too
+    /// small for its own schemas still has a budget rather than none (the shape
+    /// of finding A4).
+    fn request_reserve(&self) -> usize {
+        const MARGIN_TOKENS: usize = 200;
+        (SCHEMA_TOKENS + self.context_tokens / REPLY_SHARE_DIVISOR + MARGIN_TOKENS)
+            .min(self.context_tokens / 2)
+    }
+
+    /// The tokens one reply may be asked for: a quarter of the window, floored
+    /// at 1_024 so a request always asks for *some* reply, and capped by
+    /// [`MAX_REPLY_TOKENS`]. Asking for more than the window can hold is how a
+    /// reply arrives cut off, and asking past what the endpoint accepts is a
+    /// rejected request, so both ends of this number are stated rather than
+    /// discovered.
+    pub fn reply_cap(&self) -> u32 {
+        let share = (self.context_tokens / REPLY_SHARE_DIVISOR).max(1_024);
+        MAX_REPLY_TOKENS.min(share as u32)
     }
 
     pub fn chat_url(&self) -> String {
@@ -1247,24 +1297,25 @@ mod tests {
 
     #[test]
     fn history_budget_fits_the_context_window() {
-        // 8192 tokens: the full reserve (1700 schemas + 2048 reply + 200
-        // margin) leaves 12_732 bytes of history. The schema reserve has grown
-        // three times, each time with the test and the comment moved together:
-        // 1100 when the delegation contract became explicit, 1220 when the `cd`
-        // rule joined it, and 1700 when the machine's three tools did. See
-        // SCHEMA_TOKENS.
+        // 8192 tokens: the full reserve (1700 schemas + 2048 reply — a quarter
+        // of the window — + 200 margin) leaves 12_732 bytes of history. The
+        // schema reserve has grown three times, each time with the test and the
+        // comment moved together: 1100 when the delegation contract became
+        // explicit, 1220 when the `cd` rule joined it, and 1700 when the
+        // machine's three tools did. See SCHEMA_TOKENS.
         let small = Config::new("http://x:1", "m", None);
         assert_eq!(small.context_tokens, DEFAULT_CONTEXT_TOKENS);
         assert_eq!(small.history_budget(), 12_732);
 
-        // A big window leaves a much larger budget.
+        // A big window leaves a much larger budget, and the reply's share of it
+        // grows with the window: 128k reserves 32k for one reply.
         let big = Config {
             context_tokens: 128_000,
             temperature: DEFAULT_TEMPERATURE,
             max_completion_tokens: false,
             ..small.clone()
         };
-        assert!(big.history_budget() > 300_000);
+        assert_eq!(big.history_budget(), 282_300);
 
         // A tiny window shrinks the reserve to half the window instead of
         // ignoring it: history still gets 1536 bytes, and no cap — which has
@@ -1277,6 +1328,114 @@ mod tests {
         assert!(tiny.read_cap() <= tiny.history_budget());
         assert!(tiny.cmd_cap() <= tiny.history_budget());
         assert!(tiny.list_limit() <= tiny.history_budget());
+    }
+
+    /// The reserve keeps the request inside the window: history, schemas, the
+    /// reply's share and the margin add up to exactly `context_tokens` at every
+    /// size, so a run that spends its whole reply cap is not the run that
+    /// overflows the window. It can never swallow the window either, whatever
+    /// the schemas grow to (finding A4's shape).
+    #[test]
+    fn the_reserve_keeps_a_full_reply_inside_the_window() {
+        for window in [8_192, 120_000, 128_000, 500_000, MAX_CONTEXT_TOKENS] {
+            let mut cfg = Config::new("http://x:1", "m", None);
+            cfg.set_context(window);
+            assert_eq!(
+                cfg.history_budget() / 3 + cfg.request_reserve(),
+                cfg.context_tokens,
+                "history + reserve is not the window at {window}"
+            );
+            assert!(
+                cfg.request_reserve() <= cfg.context_tokens / 2,
+                "the reserve swallowed the window at {window}"
+            );
+        }
+
+        // The floor a window can be clamped to is still bigger than the reserve
+        // asked of it: the ledger stays readable at the smallest size mush
+        // stores.
+        let mut tiny = Config::new("http://x:1", "m", None);
+        tiny.set_context(1);
+        assert_eq!(tiny.context_tokens, MIN_CONTEXT_TOKENS);
+        assert!(tiny.request_reserve() < tiny.context_tokens);
+    }
+
+    /// One reply may never be asked for more than a share of the window: an
+    /// endpoint cannot deliver what it does not have, and a thinking model
+    /// spends the cap before it reaches the answer. The ceiling is the number
+    /// the human stated, and it stays under the range the endpoint itself
+    /// documents it accepts — a cap past that is a rejected request, which is
+    /// worse than a short reply.
+    #[test]
+    fn a_reply_never_asks_for_more_than_the_window_has() {
+        let window = |tokens: usize| {
+            let mut cfg = Config::new("http://127.0.0.1:1", "m", None);
+            cfg.set_context(tokens);
+            cfg
+        };
+        assert_eq!(window(8_192).reply_cap(), 2_048, "a quarter of 8k");
+        assert_eq!(window(120_000).reply_cap(), 30_000, "a quarter of 120k");
+        assert_eq!(
+            window(500_000).reply_cap(),
+            MAX_REPLY_TOKENS,
+            "a big window keeps the ceiling"
+        );
+        assert_eq!(MAX_REPLY_TOKENS, 120_000, "the human's number");
+        // Never zero, however tiny the window: a request for no reply is not a
+        // request.
+        assert_eq!(window(512).reply_cap(), 1_024);
+    }
+
+    /// The window precedence the new default must not disturb: a window a human
+    /// stated beats the built-in one, a window learned from the endpoint beats
+    /// both, and a window nobody stated is never remembered as if somebody had.
+    /// `context_explicit` is what the session stores by, so it is what this
+    /// pins.
+    #[test]
+    fn the_window_precedence_outlives_the_new_default() {
+        let cli = Overrides {
+            provider: Some("deepseek".into()),
+            ..Overrides::default()
+        };
+        let resolve = |cli: &Overrides, home: &UserConfig| {
+            resolve_with(
+                Config::new("http://base:0", "", None),
+                cli,
+                &Overrides::default(),
+                home,
+                None,
+            )
+            .unwrap()
+        };
+
+        // Nothing stated: the provider's own default, and a guess, not a
+        // statement — which is what keeps it out of the session and the file.
+        let mut config = resolve(&cli, &UserConfig::default());
+        assert_eq!(config.context_tokens, 120_000, "the shipped default");
+        assert!(!config.context_explicit);
+
+        // The endpoint's own number overrides the default.
+        assert!(config.adopt_context(500_000), "learned, and adopted");
+        assert_eq!(config.context_tokens, 500_000);
+        assert!(!config.context_explicit, "still a guess, still not stored");
+
+        // ...and a window the human states overrides that, for good.
+        config.set_context(64_000);
+        assert!(config.context_explicit);
+        assert!(!config.adopt_context(500_000), "the human's number stays");
+        assert_eq!(config.context_tokens, 64_000);
+
+        // The home config's window is a statement too — the layer under the
+        // session, and over the built-in default.
+        let config = resolve(
+            &cli,
+            &UserConfig {
+                context: Some(200_000),
+                ..UserConfig::default()
+            },
+        );
+        assert_eq!(config.context_tokens, 200_000);
+        assert!(config.context_explicit);
     }
 
     /// The window comes from the model when nobody said otherwise, and the
@@ -1387,10 +1546,13 @@ mod tests {
         cfg.set_context(usize::MAX);
         assert!(cfg.context_explicit);
         assert_eq!(cfg.context_tokens, MAX_CONTEXT_TOKENS);
+        // The ledger still adds up at the ceiling: the reserve is what the
+        // window does not get to spend on history.
         assert_eq!(
-            cfg.history_budget(),
-            (MAX_CONTEXT_TOKENS - SCHEMA_TOKENS - 2048 - 200) * 3
+            cfg.history_budget() / 3 + cfg.request_reserve(),
+            MAX_CONTEXT_TOKENS
         );
+        assert!(cfg.history_budget() > 20_000_000);
 
         cfg.set_context(1);
         assert_eq!(cfg.context_tokens, 1_024);
@@ -1440,7 +1602,7 @@ mod tests {
         assert!(cfg.adopt_context(4_096));
         cfg.provider = Provider::DeepSeek;
         cfg.rederive_context();
-        assert_eq!(cfg.context_tokens, 128_000, "the new provider's default");
+        assert_eq!(cfg.context_tokens, 120_000, "the new provider's default");
     }
 
     /// A provider named on the command line reaches its own endpoint; a URL
