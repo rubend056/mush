@@ -463,6 +463,11 @@ impl Registry {
     /// This is the one door into the registry, so admission — the lock and the
     /// budget — is decided here under one lock: two agents cannot both be told
     /// there is room, and a job that cannot be watched is never registered.
+    ///
+    /// The job arrives already running, so a refusal has to kill it: dropping
+    /// the handle would leave the process group alive, unregistered and out of
+    /// `kill_all`'s reach. The kill happens after the registry lock is dropped,
+    /// never under it (see the module docs on lock order).
     pub fn launch(self: &Arc<Self>, launch: Launch) -> Result<u64, Refused> {
         let Launch {
             owner,
@@ -475,44 +480,61 @@ impl Registry {
             job: Arc::new(Mutex::new(job)),
             stop: Arc::new(AtomicBool::new(false)),
         };
-        let id = {
+        let admitted = {
             let mut inner = self.inner.lock().unwrap();
-            if exclusive {
-                if let Some((holder, held, _)) = &inner.holder {
-                    if *holder != owner {
-                        return Err(Refused::Machine(Held {
-                            agent: *holder,
-                            command: held.clone(),
-                        }));
+            let refusal = if exclusive {
+                match &inner.holder {
+                    Some((holder, held, _)) if *holder != owner => Some(Refused::Machine(Held {
+                        agent: *holder,
+                        command: held.clone(),
+                    })),
+                    _ => None,
+                }
+            } else {
+                None
+            }
+            .or_else(|| {
+                (inner
+                    .jobs
+                    .values()
+                    .filter(|record| record.running())
+                    .count()
+                    >= MAX_JOBS)
+                    .then_some(Refused::Budget)
+            });
+            match refusal {
+                Some(refusal) => Err(refusal),
+                None => {
+                    let id = self.ids.fetch_add(1, Ordering::SeqCst);
+                    if exclusive {
+                        inner.holder = Some((owner, command.clone(), Some(id)));
                     }
+                    inner.jobs.insert(
+                        id,
+                        Record {
+                            id,
+                            owner,
+                            command: command.clone(),
+                            started: self.clock.now(),
+                            live: Some(live.clone()),
+                            line: None,
+                            tail: String::new(),
+                        },
+                    );
+                    Ok(id)
                 }
             }
-            if inner
-                .jobs
-                .values()
-                .filter(|record| record.running())
-                .count()
-                >= MAX_JOBS
-            {
-                return Err(Refused::Budget);
+        };
+        let id = match admitted {
+            Ok(id) => id,
+            // Refuse before you own it, or kill what you refuse: this command
+            // was started before admission was asked for (the budget can be
+            // checked up to `CMD_DETACH_AFTER` after the process exists, in the
+            // auto-detach path), so it is ours to end.
+            Err(refusal) => {
+                live.kill();
+                return Err(refusal);
             }
-            let id = self.ids.fetch_add(1, Ordering::SeqCst);
-            if exclusive {
-                inner.holder = Some((owner, command.clone(), Some(id)));
-            }
-            inner.jobs.insert(
-                id,
-                Record {
-                    id,
-                    owner,
-                    command: command.clone(),
-                    started: self.clock.now(),
-                    live: Some(live.clone()),
-                    line: None,
-                    tail: String::new(),
-                },
-            );
-            id
         };
         let registry = Arc::clone(self);
         let watching = live.clone();
@@ -1073,11 +1095,57 @@ mod tests {
             mailbox: tx,
         });
         assert_eq!(refused, Err(Refused::Budget));
+        assert_eq!(
+            machine.kills(),
+            1,
+            "the command handed to the refused launch is stopped, not orphaned"
+        );
+        assert_eq!(registry.running(), MAX_JOBS, "and it took no slot");
         assert!(
             Refused::Budget.message(8).contains("command_control"),
             "the refusal tells the model how to make room"
         );
         registry.kill_all();
+    }
+
+    /// The same rule for the lock: a launch refused because a sibling holds the
+    /// machine must not leave the process it was handed running either.
+    /// `launch` owns the job before it decides — the lock and the budget are
+    /// checked under one lock, so two agents cannot both be told there is room —
+    /// and a refusal that merely dropped it left the command in its own process
+    /// group, registered nowhere and out of `kill_all`'s reach.
+    #[test]
+    fn a_launch_refused_by_the_lock_is_killed_too() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let (registry, _events, _clock) = registry();
+        registry.take_machine(7, "cargo bench").unwrap();
+
+        let job = machine
+            .spawn(&ShellCommand {
+                command: "cargo build",
+                root: Path::new("/tmp"),
+            })
+            .unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        assert_eq!(
+            registry.launch(Launch {
+                owner: 9,
+                command: "cargo build".to_string(),
+                exclusive: true,
+                job,
+                mailbox: tx,
+            }),
+            Err(Refused::Machine(Held {
+                agent: 7,
+                command: "cargo bench".to_string(),
+            })),
+        );
+        assert_eq!(
+            machine.kills(),
+            1,
+            "the refused command's process group is killed"
+        );
+        assert_eq!(registry.running(), 0, "and it is not a job");
     }
 
     /// The lock lives here, so who holds the machine and what a refused sibling
