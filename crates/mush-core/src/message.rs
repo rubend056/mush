@@ -129,6 +129,14 @@ pub struct Message {
         skip_serializing_if = "Option::is_none"
     )]
     pub content: Option<String>,
+    /// A thinking model's reasoning for this turn (DeepSeek's
+    /// `reasoning_content`). It is read from the reply and written straight
+    /// back out with the turn: in thinking mode the endpoint refuses a request
+    /// that replays an assistant turn without it, tool-call turns first among
+    /// them. `None` for every model that keeps its thinking to itself, and
+    /// skipped on the wire then, so no other endpoint ever sees the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
     #[serde(
         default,
         deserialize_with = "tool_calls_from_wire",
@@ -190,9 +198,14 @@ impl Message {
         }
     }
 
-    /// Rough size in bytes, used for history budgeting.
+    /// Rough size in bytes, used for history budgeting. The reasoning is
+    /// counted: it goes back out with the turn, so it is part of what the
+    /// request costs.
     pub fn weight(&self) -> usize {
         let mut n = self.role.len() + self.text().len();
+        if let Some(reasoning) = &self.reasoning_content {
+            n += reasoning.len();
+        }
         for call in self.tool_calls() {
             n += call.function.name.len() + call.function.arguments.len() + 16;
         }
@@ -328,6 +341,52 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&parsed).unwrap(),
             r#"{"role":"assistant","content":"hi there"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Message::assistant("hi")).unwrap(),
+            r#"{"role":"assistant","content":"hi"}"#
+        );
+    }
+
+    /// A thinking model's reasoning belongs to the turn that produced it, and
+    /// has to travel back with it: DeepSeek's thinking mode refuses the next
+    /// request when a replayed assistant turn arrives without its
+    /// `reasoning_content`, so dropping the field costs the whole conversation.
+    #[test]
+    fn a_replys_reasoning_is_carried_back_with_its_turn() {
+        let reply: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"finish_reason":"tool_calls","message":{"role":"assistant","content":"","reasoning_content":"read the file first","tool_calls":[{"id":"c1","type":"function","function":{"name":"read_file","arguments":"{}"}}]}}]}"#,
+        )
+        .unwrap();
+        let message = &reply.choices[0].message;
+        assert_eq!(
+            message.reasoning_content.as_deref(),
+            Some("read the file first")
+        );
+
+        // The history mush sends back is this same message, serialized: the
+        // reasoning must be on the wire with the calls it decided.
+        let wire = serde_json::to_string(message).unwrap();
+        assert!(
+            wire.contains(r#""reasoning_content":"read the file first""#),
+            "{wire}"
+        );
+
+        // It is weighed as part of what the request will cost, or the budget
+        // would count a thinking transcript as smaller than it is.
+        assert!(message.weight() > Message::assistant("").weight());
+    }
+
+    /// A model that does not think must not grow the field by being read: what
+    /// goes out is what came in, and nothing else (see `provider_params_are_opt_in`).
+    #[test]
+    fn a_reply_without_reasoning_does_not_grow_the_field() {
+        let from_wire: Message =
+            serde_json::from_str(r#"{"role":"assistant","content":"hi"}"#).unwrap();
+        assert!(from_wire.reasoning_content.is_none());
+        assert_eq!(
+            serde_json::to_string(&from_wire).unwrap(),
+            r#"{"role":"assistant","content":"hi"}"#
         );
         assert_eq!(
             serde_json::to_string(&Message::assistant("hi")).unwrap(),

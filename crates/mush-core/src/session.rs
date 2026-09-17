@@ -171,7 +171,13 @@ mod tests {
             base_url: "http://localhost:9".into(),
             context: Some(123_456),
             updated: now_secs(),
-            messages: vec![Message::user("hello"), Message::assistant("hi")],
+            messages: vec![
+                Message::user("hello"),
+                Message {
+                    reasoning_content: Some("weighing the greeting".into()),
+                    ..Message::assistant("hi")
+                },
+            ],
             agents: vec![AgentSession {
                 id: 3,
                 parent: Some(0),
@@ -190,6 +196,12 @@ mod tests {
         let loaded = Session::load(&root).unwrap();
         assert_eq!(loaded.messages.len(), 2);
         assert_eq!(loaded.messages[0].text(), "hello");
+        // A thinking turn's reasoning has to survive the save: a resumed agent
+        // replays this history, and the endpoint refuses the turn without it.
+        assert_eq!(
+            loaded.messages[1].reasoning_content.as_deref(),
+            Some("weighing the greeting")
+        );
         assert_eq!(loaded.context, Some(123_456));
         // The child's context is the point: it must survive the round trip.
         assert_eq!(loaded.agents.len(), 1);

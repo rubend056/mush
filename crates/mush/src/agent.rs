@@ -3140,6 +3140,82 @@ mod tests {
         let _ = mailbox;
     }
 
+    /// A thinking model's reasoning is part of the turn it decided, and the
+    /// endpoint refuses a request that replays an assistant turn without it
+    /// (DeepSeek: "the `reasoning_content` in the thinking mode must be passed
+    /// back to the API"). The request that carries the tool result is the one
+    /// that breaks first, so that is the one this pins.
+    #[test]
+    fn a_thinking_replys_reasoning_is_sent_back_with_its_turn() {
+        let reasoning = "the gate file is not mine to open; write the note first";
+        let scripted = Arc::new(
+            Scripted::new()
+                .finishing(
+                    Message {
+                        role: "assistant".into(),
+                        reasoning_content: Some(reasoning.into()),
+                        tool_calls: Some(vec![tool_call(
+                            "c0",
+                            "write_file",
+                            json!({ "path": "note.txt", "content": "hi" }),
+                        )]),
+                        ..Default::default()
+                    },
+                    "tool_calls",
+                )
+                .says("done"),
+        );
+        let (actor, _events, mailbox) = scripted_actor("reasoning", &scripted);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("write the note"),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("done"));
+
+        // The transcript kept the reasoning on its own turn...
+        assert_eq!(
+            messages[2].reasoning_content.as_deref(),
+            Some(reasoning),
+            "the reply's reasoning stays on the assistant turn"
+        );
+        // ...the request that carries the tool result replayed it...
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 2, "the call, then the answer");
+        let replayed = asked[1]
+            .messages
+            .iter()
+            .find(|message| message.role == "assistant")
+            .expect("the tool result's request replays the assistant turn");
+        assert_eq!(
+            replayed.reasoning_content.as_deref(),
+            Some(reasoning),
+            "a thinking endpoint refuses this request without it"
+        );
+        // ...and nothing invented reasoning for the request that had no reply
+        // yet, nor for the tool result that never had any.
+        assert!(
+            asked[0]
+                .messages
+                .iter()
+                .all(|message| message.reasoning_content.is_none()),
+            "the first request has no reply to carry reasoning from"
+        );
+        assert!(
+            asked[1]
+                .messages
+                .iter()
+                .filter(|message| message.role == "tool")
+                .all(|message| message.reasoning_content.is_none()),
+            "a tool result carries no reasoning"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
     /// `length` is not the only reason a reply is not an answer.
     /// `content_filter` is the endpoint saying it refused to hand over what the
     /// model wrote, and an unknown reason is no more a normal end — neither may
