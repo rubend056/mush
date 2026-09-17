@@ -105,11 +105,14 @@ impl Picker {
 
     /// What the popup's own last row says the keys do. It belongs to the picker
     /// rather than to the painter because it is the same fact as the title: what
-    /// this list is for.
+    /// this list is for. A long list is paged the same way the transcript is,
+    /// so `PgUp`/`PgDn` are named beside `j`/`k`.
     pub fn hint(&self) -> &'static str {
         match self.kind {
-            PickerKind::Model | PickerKind::Provider => " Enter pick · Esc cancel ",
-            PickerKind::Notes => " j/k scrolls · Esc closes ",
+            PickerKind::Model | PickerKind::Provider => {
+                " j/k or PgUp/PgDn · Enter pick · Esc cancel "
+            }
+            PickerKind::Notes => " j/k or PgUp/PgDn scrolls · Esc closes ",
         }
     }
 }

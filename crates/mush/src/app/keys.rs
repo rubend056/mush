@@ -36,6 +36,10 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::Focus;
 
+/// How many rows a page key moves, in the chat's scrollback and in a picker's
+/// list. One number, so "a page" is the same distance wherever a human pages.
+const PAGE: i64 = 10;
+
 /// The context a binding belongs to, so the help can group the rows the way a
 /// human reads them: what works anywhere, then the modal list, then each pane.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,6 +129,11 @@ pub const KEYS: &[Binding] = &[
         context: Context::Picker,
         keys: "g / G, Home / End",
         help: "first / last row",
+    },
+    Binding {
+        context: Context::Picker,
+        keys: "PgUp / PgDn",
+        help: "page the list",
     },
     Binding {
         context: Context::Agents,
@@ -351,6 +360,12 @@ fn picker(key: KeyEvent) -> Intent {
         KeyCode::Char('k') | KeyCode::Up => Intent::PickerMove(-1),
         KeyCode::Char('g') | KeyCode::Home => Intent::PickerFirst,
         KeyCode::Char('G') | KeyCode::End => Intent::PickerLast,
+        // A fifty-line list is paged, not walked: `PgUp`/`PgDn` move a whole
+        // screen the way they do in the transcript, so a human does not press
+        // `j` fifty times to reach the model at the bottom (finding U10's
+        // neighbour: a deep list is walked the same way a deep tree is).
+        KeyCode::PageUp => Intent::PickerMove(-PAGE),
+        KeyCode::PageDown => Intent::PickerMove(PAGE),
         _ => Intent::Ignore,
     }
 }
@@ -398,8 +413,8 @@ fn chat(key: KeyEvent) -> Intent {
         KeyCode::Char(c) if !ctrl && !alt => Intent::Chat(ChatKey::Insert(c)),
         KeyCode::Up => Intent::Chat(ChatKey::Scroll(1)),
         KeyCode::Down => Intent::Chat(ChatKey::Scroll(-1)),
-        KeyCode::PageUp => Intent::Chat(ChatKey::Scroll(10)),
-        KeyCode::PageDown => Intent::Chat(ChatKey::Scroll(-10)),
+        KeyCode::PageUp => Intent::Chat(ChatKey::Scroll(PAGE)),
+        KeyCode::PageDown => Intent::Chat(ChatKey::Scroll(-PAGE)),
         KeyCode::Esc => Intent::Chat(ChatKey::Clear),
         _ => Intent::Ignore,
     }
@@ -547,6 +562,8 @@ mod tests {
             (none(KeyCode::Home), Intent::PickerFirst),
             (none(KeyCode::Char('G')), Intent::PickerLast),
             (none(KeyCode::End), Intent::PickerLast),
+            (none(KeyCode::PageUp), Intent::PickerMove(-PAGE)),
+            (none(KeyCode::PageDown), Intent::PickerMove(PAGE)),
         ];
         for (key, want) in cases {
             assert_eq!(at(Focus::Chat, true, key), want, "{key:?}");
