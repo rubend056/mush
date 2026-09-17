@@ -1792,7 +1792,9 @@ fn truncate(text: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::fake::Advanceable;
     use crate::events::fake::Recorder;
+    use crate::machine::fake::{Script, Scripted as ScriptedMachine};
     use crate::model::fake::{tool_call, Asked, Gate, Scripted};
     use mush_core::{FunctionCall, ToolCall};
     use serde_json::json;
@@ -2060,6 +2062,13 @@ mod tests {
 
     /// A background job inherits the command's output file, so leaving one
     /// behind must not hold the tool (and the agent) hostage.
+    ///
+    /// This one stays a real `sh`. It is the *reason* the output goes to files
+    /// rather than pipes — a pipe is only complete once every holder exits — and
+    /// a scripted machine cannot demonstrate that, because a scripted job holds
+    /// nothing. It is bounded: the command returns at once, and the `sleep 30`
+    /// it leaves behind dies with the process group when the scratch files are
+    /// read.
     #[test]
     fn a_background_job_does_not_hold_the_tool_hostage() {
         let (actor, _mailbox) = test_actor("background");
@@ -2086,36 +2095,95 @@ mod tests {
     }
 
     /// The timeout is a real bound, and the report says what happened.
+    ///
+    /// Both halves are scripted: the command never exits, and the clock moves
+    /// only when the wait asks it to. The assertions are about the clock — the
+    /// deadline is what stopped the command, and the command was killed rather
+    /// than left behind — so proving a five-second timeout no longer costs five
+    /// seconds and a real `sleep`.
     #[test]
     fn a_command_that_runs_forever_is_killed_on_time() {
-        let (actor, _mailbox) = test_actor("timeout");
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("timeout", machine.clone(), clock.clone());
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
+        let timeout = Duration::from_secs(5);
         let started = Instant::now();
         let report = run_shell(
             "sleep 30",
             &std::env::temp_dir(),
-            Duration::from_millis(200),
+            timeout,
             &cancel,
             &actor,
             &mut state,
         )
         .unwrap();
-        assert!(report.contains("timed out"), "{report}");
+
+        assert!(report.contains("[timed out after 5s]"), "{report}");
         assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "took {:?}",
+            clock.elapsed() >= timeout,
+            "the deadline is what stopped it, not the end of the command: {:?}",
+            clock.elapsed()
+        );
+        assert_eq!(
+            machine.kills(),
+            1,
+            "and the command was killed, not left running"
+        );
+        assert_eq!(machine.spawned(), vec!["sleep 30".to_string()]);
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the deadline was reached without waiting for it: {:?}",
             started.elapsed()
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// A command that ends on its own is reported, not killed: what it said on
+    /// both streams, and the code it exited with. The ordinary path, driven by
+    /// a script instead of by `sh`.
+    #[test]
+    fn a_command_that_ends_reports_its_output_and_its_exit_code() {
+        let machine = Arc::new(
+            ScriptedMachine::new().runs(Script::exits(3).says("on stdout").complains("on stderr")),
+        );
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("exits", machine.clone(), clock.clone());
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+
+        let report = run_shell(
+            "false",
+            &std::env::temp_dir(),
+            Duration::from_secs(5),
+            &cancel,
+            &actor,
+            &mut state,
+        )
+        .unwrap();
+
+        assert_eq!(
+            report, "on stdout\n--- stderr ---\non stderr\n[exit 3]",
+            "both streams, then how it ended"
+        );
+        assert_eq!(machine.kills(), 0, "nothing to kill: it had finished");
+        assert_eq!(
+            clock.elapsed(),
+            Duration::ZERO,
+            "and nothing was waited for"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// Ctrl-C reaches a command that is still running; the tool returns at once
-    /// and says why. A plain flag is enough: `run_shell` polls the mailbox
-    /// itself, so a real Stop lands the same way.
+    /// and says why. The command hangs, the flag is already set, and the report
+    /// is the only thing the model ever sees of it.
     #[test]
     fn a_running_command_can_be_cancelled() {
-        let (actor, _mailbox) = test_actor("cancel");
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("cancel", machine.clone(), clock.clone());
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(true);
         let started = Instant::now();
@@ -2128,12 +2196,15 @@ mod tests {
             &mut state,
         )
         .unwrap();
+
         assert!(report.contains("[cancelled]"), "{report}");
-        assert!(
-            started.elapsed() < Duration::from_secs(5),
-            "took {:?}",
-            started.elapsed()
+        assert_eq!(machine.kills(), 1, "the command is stopped, not orphaned");
+        assert_eq!(
+            clock.elapsed(),
+            Duration::ZERO,
+            "a cancel is not a timeout: no time had to pass"
         );
+        assert!(started.elapsed() < Duration::from_secs(1));
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -2141,10 +2212,13 @@ mod tests {
     /// left for the end of the batch.
     #[test]
     fn a_stop_in_the_mailbox_interrupts_a_running_command() {
-        let (actor, mailbox) = test_actor("stop-command");
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, mailbox) = scripted_tools_actor("stop-command", machine.clone(), clock.clone());
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
         mailbox.send(AgentMsg::Stop).unwrap();
+
         let report = run_shell(
             "echo starting; sleep 30",
             &std::env::temp_dir(),
@@ -2154,15 +2228,29 @@ mod tests {
             &mut state,
         )
         .unwrap();
+
         assert!(report.contains("[cancelled]"), "{report}");
+        assert!(cancel.load(Ordering::SeqCst), "the Stop set the flag");
+        assert_eq!(machine.kills(), 1);
+        assert_eq!(
+            clock.elapsed(),
+            Duration::ZERO,
+            "the command never reached its own timeout"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// A command that writes without end is stopped at the disk limit rather
     /// than filling the filesystem — the model only ever sees the first chunk.
+    /// The writer is scripted: one megabyte a poll, forever, which reaches the
+    /// eight-megabyte limit in nine polls with no `yes`, no disk and no race.
     #[test]
     fn a_runaway_writer_is_stopped_at_the_output_limit() {
-        let (actor, _mailbox) = test_actor("runaway");
+        let machine = Arc::new(
+            ScriptedMachine::new().runs(Script::hangs().says("mush\n").writes_without_end(1 << 20)),
+        );
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("runaway", machine.clone(), clock.clone());
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
         let started = Instant::now();
@@ -2175,18 +2263,25 @@ mod tests {
             &mut state,
         )
         .unwrap();
+
         assert!(report.contains("output passed"), "{report}");
+        assert_eq!(machine.kills(), 1, "the runaway writer was killed");
         assert!(report.len() < CMD_CAP * 2, "report grew: {}", report.len());
         assert!(
-            started.elapsed() < Duration::from_secs(20),
-            "took {:?}",
-            started.elapsed()
+            clock.elapsed() < Duration::from_secs(30),
+            "bytes stopped it, not the command's own timeout: {:?}",
+            clock.elapsed()
         );
+        assert!(started.elapsed() < Duration::from_secs(1));
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// Output longer than the cap is truncated and marked, and the command
     /// still finishes (nothing blocks on a full pipe).
+    ///
+    /// This one stays a real `sh` too: `yes` into `head` is what a real,
+    /// bounded command writing past `CMD_CAP` looks like, and what it proves is
+    /// the *real* scratch-file read — the fake only ever hands back a string.
     #[test]
     fn long_output_is_capped_and_marked() {
         let (actor, _mailbox) = test_actor("long-output");
@@ -2295,6 +2390,39 @@ mod tests {
         model: Arc<dyn ModelClient>,
         cfg: Arc<Mutex<Config>>,
     ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
+        build_actor_about(label, model, cfg, Arc::new(Shell), Arc::new(clock::System))
+    }
+
+    /// A standalone actor over a scratch workspace whose shells are scripted
+    /// and whose clock only moves when the test says so: how a command ends and
+    /// how long time takes are both facts the test writes down, so a timeout or
+    /// an output cap costs neither a subprocess nor a wait.
+    fn scripted_tools_actor(
+        label: &str,
+        machine: Arc<dyn Machine>,
+        clock: Arc<dyn clock::Clock>,
+    ) -> (Actor, Sender<AgentMsg>) {
+        let cfg = test_cfg();
+        let (actor, _events, mailbox) = build_actor_about(
+            label,
+            Arc::new(HttpModel::new(cfg.clone())),
+            cfg,
+            machine,
+            clock,
+        );
+        (actor, mailbox)
+    }
+
+    /// The same, naming the machine and the clock it runs on. The endpoint in
+    /// the config is a port nothing listens on, so a test that reaches the
+    /// model at all fails loudly instead of using a socket.
+    fn build_actor_about(
+        label: &str,
+        model: Arc<dyn ModelClient>,
+        cfg: Arc<Mutex<Config>>,
+        machine: Arc<dyn Machine>,
+        clock: Arc<dyn clock::Clock>,
+    ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
         let root = std::env::temp_dir().join(format!("mush-actor-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
@@ -2303,8 +2431,8 @@ mod tests {
             cfg,
             model,
             events: recorder.clone(),
-            machine: Arc::new(Shell),
-            clock: Arc::new(clock::System),
+            machine,
+            clock,
             root: root.clone(),
             ids: Arc::new(AtomicU64::new(1)),
             live: Arc::new(AtomicU64::new(0)),
@@ -2363,6 +2491,40 @@ mod tests {
             matches!(state.deferred.first(), Some(AgentMsg::Nudge(text)) if text == "what about the tests?"),
             "the message must survive the interrupted wait: {:?}",
             state.deferred.len()
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The other shape a human message arrives in: the UI believed the agent
+    /// was idle and sent the whole transcript, whose last message is what the
+    /// human just typed. That must end a blocking wait too — an actor that only
+    /// listened for `Nudge` would sit here until the child finished.
+    #[test]
+    fn a_wait_that_no_child_ends_times_out_on_the_clock() {
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) =
+            scripted_tools_actor("wait-timeout", Arc::new(Shell), clock.clone());
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        // A child that exists and never finishes: the state a parent is in for
+        // the whole of a long wait.
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+        state.running.insert(1);
+
+        let started = Instant::now();
+        let result = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 600 })).unwrap();
+
+        assert!(result.contains("wait timed out"), "{result}");
+        assert!(
+            clock.elapsed() >= Duration::from_secs(600),
+            "the deadline is what ended the wait: {:?}",
+            clock.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "and it was reached without waiting for it: {:?}",
+            started.elapsed()
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }

@@ -527,6 +527,7 @@ fn read_chunked<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<String>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::clock::fake::Advanceable;
     use std::time::Instant;
 
     #[test]
@@ -627,6 +628,31 @@ mod tests {
             elapsed >= Duration::from_millis(250),
             "returned before the cancel was asked for: {elapsed:?}"
         );
+    }
+
+    /// The `Watch` is what turns a stalled endpoint into a decision, and its
+    /// clock is the one it was handed. Advancing a fake past the deadline is
+    /// how a five-minute read timeout is proved in no time at all — the test
+    /// above this one still covers the socket path with a real connection.
+    #[test]
+    fn a_watch_deadline_is_reached_by_advancing_the_clock() {
+        let clock = Advanceable::new();
+        let cancel = AtomicBool::new(false);
+        let watch = Watch::new(Some(&cancel), Duration::from_secs(300), &clock);
+
+        assert!(watch.check().is_ok(), "the deadline is in the future");
+        clock.advance(Duration::from_secs(299));
+        assert!(watch.check().is_ok(), "and it is a bound, not a guess");
+
+        clock.advance(Duration::from_secs(1));
+        let error = watch.check().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+
+        // A Stop outranks the deadline: the human's answer beats the clock's.
+        clock.advance(Duration::from_secs(300));
+        cancel.store(true, Ordering::SeqCst);
+        let error = watch.check().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
     }
 
     /// A cancellation that arrives before the request never pays for the call.

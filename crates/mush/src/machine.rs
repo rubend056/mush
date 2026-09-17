@@ -170,3 +170,161 @@ impl Scratch {
             .unwrap_or(0)
     }
 }
+
+#[cfg(test)]
+pub(crate) mod fake {
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use mush_core::workspace::truncate_for_model;
+
+    use super::{Job, Machine, ShellCommand};
+
+    /// What a scripted command does while it "runs".
+    ///
+    /// How long it runs for is deliberately *not* here: elapsed time is the
+    /// clock's business (see `crate::clock::fake`), and a script only says how
+    /// many polls pass before it ends. `grows` is how many bytes each poll adds
+    /// to the written total — that is how the output cap is reached without a
+    /// `yes` and without filling a disk.
+    #[derive(Default)]
+    pub struct Script {
+        pub stdout: String,
+        pub stderr: String,
+        pub grows: u64,
+        /// Polls that pass before it exits; `None` never exits — a command that
+        /// has to be timed out or killed.
+        pub exits_after: Option<usize>,
+        pub code: i32,
+    }
+
+    impl Script {
+        /// A command that ends on its own, with this exit code.
+        pub fn exits(code: i32) -> Self {
+            Self {
+                code,
+                exits_after: Some(0),
+                ..Self::default()
+            }
+        }
+
+        /// A command that never ends: the shape a timeout and a cancellation
+        /// are about.
+        pub fn hangs() -> Self {
+            Self::default()
+        }
+
+        /// What it prints.
+        pub fn says(mut self, stdout: &str) -> Self {
+            self.stdout = stdout.to_string();
+            self
+        }
+
+        /// What it complains about on stderr.
+        pub fn complains(mut self, stderr: &str) -> Self {
+            self.stderr = stderr.to_string();
+            self
+        }
+
+        /// A writer that never stops: `grows` bytes a poll, forever.
+        pub fn writes_without_end(mut self, grows: u64) -> Self {
+            self.grows = grows;
+            self.exits_after = None;
+            self
+        }
+    }
+
+    /// A machine that runs whatever the test wrote down, in order.
+    ///
+    /// It records every command it was asked to run and every job it was asked
+    /// to kill, so "the runaway writer was stopped" is an assertion about what
+    /// happened rather than about how long something took.
+    #[derive(Default)]
+    pub struct Scripted {
+        scripts: Mutex<VecDeque<Script>>,
+        spawned: Mutex<Vec<String>>,
+        kills: Arc<AtomicUsize>,
+    }
+
+    impl Scripted {
+        pub fn new() -> Self {
+            Self::default()
+        }
+
+        /// The next command run behaves like this.
+        pub fn runs(self, script: Script) -> Self {
+            self.scripts.lock().unwrap().push_back(script);
+            self
+        }
+
+        /// The commands that were started, in order.
+        pub fn spawned(&self) -> Vec<String> {
+            self.spawned.lock().unwrap().clone()
+        }
+
+        /// How many jobs were killed.
+        pub fn kills(&self) -> usize {
+            self.kills.load(Ordering::SeqCst)
+        }
+    }
+
+    impl Machine for Scripted {
+        fn spawn(&self, cmd: &ShellCommand) -> Result<Box<dyn Job>, String> {
+            self.spawned.lock().unwrap().push(cmd.command.to_string());
+            let script = self.scripts.lock().unwrap().pop_front().ok_or_else(|| {
+                format!(
+                    "no scripted job for {:?}: the test did not say what it does",
+                    cmd.command
+                )
+            })?;
+            Ok(Box::new(ScriptedJob {
+                script,
+                polls: 0,
+                written: 0,
+                killed: false,
+                kills: self.kills.clone(),
+            }))
+        }
+    }
+
+    struct ScriptedJob {
+        script: Script,
+        polls: usize,
+        written: u64,
+        killed: bool,
+        kills: Arc<AtomicUsize>,
+    }
+
+    impl Job for ScriptedJob {
+        fn poll(&mut self) -> Result<Option<i32>, String> {
+            self.written += self.script.grows;
+            let polls = self.polls;
+            self.polls += 1;
+            match self.script.exits_after {
+                // `exits_after` counts the polls that pass *before* it ends; a
+                // kill lands before the poll that would have ended it.
+                Some(after) if polls >= after && !self.killed => Ok(Some(self.script.code)),
+                _ => Ok(None),
+            }
+        }
+
+        fn written(&self) -> u64 {
+            self.written
+        }
+
+        fn output(&self, cap: usize) -> (String, String) {
+            (
+                truncate_for_model(self.script.stdout.clone(), cap),
+                truncate_for_model(self.script.stderr.clone(), cap),
+            )
+        }
+
+        fn kill(&mut self) {
+            if !self.killed {
+                self.killed = true;
+                self.kills.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+    }
+}
