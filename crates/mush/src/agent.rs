@@ -2300,9 +2300,11 @@ fn wait_commands_tool(
         &candidates,
         jobs::Waited::Jobs,
         |state, id| {
-            // A report is delivered once: the first wait (or the fold-in at a
-            // message boundary) consumes it, and a later one is told the job is
-            // already reported instead of reading it twice.
+            // The report is marked delivered as it is handed over, so the fold
+            // at the next message boundary cannot inject the same line again.
+            // Asking a second time answers with the job's line again — a wait
+            // is "tell me what happened", and the model that asks twice gets an
+            // answer twice rather than a silence it has to interpret.
             let report = state.done_jobs.get(&id)?.line.clone();
             state.delivered_jobs.insert(id);
             Some(report)
@@ -3789,6 +3791,159 @@ mod tests {
             started.elapsed() < Duration::from_secs(1),
             "and it was reached without waiting for it: {:?}",
             started.elapsed()
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// `wait_commands` is `wait_agents` over jobs, and it had no test at all —
+    /// not through `run_command`, not through the tool. This is the call site:
+    /// two jobs are started, the wait returns their reports, and a wait with no
+    /// `ids` reaches the jobs this agent started on its own books.
+    #[test]
+    fn wait_commands_returns_a_jobs_report() {
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::exits(0).says("build ok"))
+                .runs(Script::exits(0).says("test ok")),
+        );
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("wait-jobs", machine, clock);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut call =
+            |tool: ToolName, args: Value| exec_tool(&actor, &mut state, tool, &args, &cancel);
+
+        for command in ["make build", "make test"] {
+            let started = call(
+                ToolName::RunCommand,
+                json!({ "command": command, "detach": true }),
+            )
+            .unwrap();
+            assert!(started.contains("detached as #c"), "{started}");
+        }
+
+        // One report, by id: the wait answers with the job's own line.
+        let one = call(ToolName::WaitCommands, json!({ "ids": [1], "timeout": 5 })).unwrap();
+        assert!(one.contains("exit 0"), "{one}");
+        assert!(one.contains("make build"), "{one}");
+        assert!(
+            !one.contains("make test"),
+            "and only what was asked for: {one}"
+        );
+
+        // No ids: every job this agent started, and no `all` means the first
+        // report that is ready rather than every one.
+        let mine = call(ToolName::WaitCommands, json!({ "timeout": 5 })).unwrap();
+        assert!(mine.contains("exit 0"), "{mine}");
+        assert!(!mine.contains('\n'), "one result, not a list: {mine}");
+
+        // Nothing to wait for is an answer, not an error.
+        let (idle, _mailbox) = scripted_tools_actor(
+            "wait-jobs-idle",
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        assert_eq!(
+            exec_tool(
+                &idle,
+                &mut ActorState::default(),
+                ToolName::WaitCommands,
+                &json!({}),
+                &cancel
+            )
+            .unwrap(),
+            "no jobs to wait for"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = fs::remove_dir_all(idle.ws.root());
+    }
+
+    /// `all` asks for every result instead of the first one. It is the whole
+    /// difference between "one delegate is free" and "the whole set is in", and
+    /// it appeared nowhere in the suite — on either wait.
+    #[test]
+    fn a_wait_returns_the_first_result_or_all_of_them() {
+        let (actor, _mailbox) = test_actor("wait-all");
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        for id in [1u64, 2] {
+            state.children.insert(id, child.clone());
+        }
+        state
+            .completed
+            .insert(1, Outcome::Finished("wrote the parser".into()));
+        state
+            .completed
+            .insert(2, Outcome::Failed("no route".into()));
+
+        let first = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::WaitAgents,
+            &json!({ "timeout": 5 }),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(first, "#1 done: wrote the parser", "one result by default");
+
+        let every = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::WaitAgents,
+            &json!({ "all": true, "timeout": 5 }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(
+            every.contains("#1 done: wrote the parser") && every.contains("#2 failed: no route"),
+            "every result, in the order they were asked about: {every}"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The job-side deadline: a command that never ends cannot hold the run for
+    /// the rest of the timeout. What is known is returned and what is not is
+    /// named, and the clock is what ended the wait, not the command.
+    #[test]
+    fn a_command_wait_that_nothing_ends_times_out_on_the_clock() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("wait-jobs-timeout", machine, clock.clone());
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+
+        let started = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "npm run dev", "detach": true }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(started.contains("detached as #c1"), "{started}");
+
+        let begun = Instant::now();
+        let result = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::WaitCommands,
+            &json!({ "timeout": 30 }),
+            &cancel,
+        )
+        .unwrap();
+
+        assert!(result.contains("wait timed out"), "{result}");
+        assert!(result.contains("#c1 still running"), "{result}");
+        assert!(
+            clock.elapsed() >= Duration::from_secs(30),
+            "the deadline ended it: {:?}",
+            clock.elapsed()
+        );
+        assert!(
+            begun.elapsed() < Duration::from_secs(1),
+            "and it was reached without waiting for it: {:?}",
+            begun.elapsed()
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
