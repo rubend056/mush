@@ -6,11 +6,17 @@ members = ["crates/mush-core", "crates/mush"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+rust-version = "1.74"
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 crossbeam-channel = "0.5"
+
+# mush is a terminal application that talks to the network and shells out. It
+# has never needed `unsafe`, and it should stay that way.
+[workspace.lints.rust]
+unsafe_code = "forbid"
 
 [profile.release]
 opt-level = 3

@@ -1,8 +1,10 @@
 [package]
 name = "mush"
+description = "A small, fast, agent-agnostic terminal editor with a built-in coding agent."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+rust-version.workspace = true
 
 [[bin]]
 name = "mush"
@@ -18,3 +20,6 @@ unicode-width = "0.2"
 # stays hand-rolled and blocking.
 rustls = "0.23"
 webpki-roots = "0.26"
+
+[lints]
+workspace = true
