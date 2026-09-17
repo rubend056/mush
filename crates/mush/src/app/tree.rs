@@ -117,6 +117,21 @@ pub struct AgentNode {
     pub landed: Option<Landed>,
 }
 
+/// How many agents are in each of the states the pane title names.
+///
+/// A struct rather than a live count beside the list it counts: the two
+/// buckets are derived together, from one walk over the phases, so the title
+/// cannot add up a different set than the rows show (finding U2).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Roster {
+    /// Runs in flight: `Thinking`, `Activity`, `Cancelling`.
+    pub working: usize,
+    /// At rest with children working — waiting to be woken by a completion.
+    /// "Children" are its own, the same unit its row's `⏸N` mark counts: a
+    /// grandchild's work is its own parent's to wait for.
+    pub waiting: usize,
+}
+
 /// A child actor that now exists, as its parent reported it: everything the
 /// tree needs to give it a row, a mailbox, and an opening line.
 pub struct Spawn {
@@ -544,11 +559,101 @@ impl AgentTree {
         self.agent_cursor = self.agent_cursor.min(self.agents.len().saturating_sub(1));
     }
 
+    /// The tree's rows, in the order the pane paints them: pre-order over the
+    /// parent links, so every child sits directly under its parent — above that
+    /// parent's later siblings — and its own children under it (finding U4).
+    ///
+    /// Derived on read rather than stored beside `agents`: that vector is spawn
+    /// order (it is the order things happened, and the order a stored session
+    /// keeps), and a second copy of "the order" is one more thing that can
+    /// disagree with the tree the human is looking at. A node whose parent is
+    /// not in the tree — a leftover worktree, an agent whose parent was reaped
+    /// — is a top-level row, so a broken link can never hide an agent.
+    pub fn rows(&self) -> Vec<&AgentNode> {
+        let mut rows = Vec::with_capacity(self.agents.len());
+        for node in &self.agents {
+            if self.parent_in_tree(node).is_none() {
+                self.grow(node, &mut rows);
+            }
+        }
+        // A link that pointed back up its own line (which nothing here can
+        // build) would leave part of the tree unreachable, and a missing row is
+        // an agent the human cannot see: whatever the walk missed is taken in
+        // storage order. Every node is therefore painted exactly once.
+        for node in &self.agents {
+            if !rows.iter().any(|row| row.id == node.id) {
+                rows.push(node);
+            }
+        }
+        rows
+    }
+
+    /// The parent this node hangs under, when that parent is still in the tree.
+    fn parent_in_tree(&self, node: &AgentNode) -> Option<AgentId> {
+        node.parent.filter(|parent| self.has(*parent))
+    }
+
+    /// `node` and then its subtree, in spawn order among siblings — the order a
+    /// later brother appears after the earlier one's whole family.
+    fn grow<'a>(&'a self, node: &'a AgentNode, rows: &mut Vec<&'a AgentNode>) {
+        if rows.iter().any(|row| row.id == node.id) {
+            return;
+        }
+        rows.push(node);
+        for child in self.agents.iter().filter(|n| n.parent == Some(node.id)) {
+            self.grow(child, rows);
+        }
+    }
+
     /// Whether any agent in the tree is working. Derived from the phases, never
     /// stored: a cached flag is one more thing that can disagree with the rows
     /// it is drawn from (finding B5).
     pub fn busy(&self) -> bool {
         self.agents.iter().any(|node| node.phase.is_busy())
+    }
+
+    /// Who is doing what, one bucket per agent.
+    ///
+    /// The pane title reads these, and they are derived from the phases every
+    /// frame: a count is a fact like any other, and the title that counted
+    /// agents napping on their children as "running" was reading the wrong
+    /// fact (finding U2).
+    ///
+    /// Each agent lands in at most one bucket, so nothing is counted twice for
+    /// having children. A run being cancelled counts as working: the actor has
+    /// not yielded and the work really is in flight (its row wears `⊘` and says
+    /// `cancelling…`).
+    pub fn roster(&self) -> Roster {
+        let mut roster = Roster::default();
+        for node in &self.agents {
+            if node.phase.is_busy() {
+                roster.working += 1;
+            } else if matches!(node.phase, Phase::Idle | Phase::Done)
+                && self.busy_children(node.id) > 0
+            {
+                // At rest with work out: §5.5's napping orchestrator, which the
+                // row draws as `⏸`. Counted here and *nowhere else* — counting
+                // it as working as well is exactly what the title did wrong.
+                // A failed or stopped agent waits for nothing, so it is in no
+                // bucket: its own `✗`/`⊘` row is where that fact lives.
+                roster.waiting += 1;
+            }
+        }
+        roster
+    }
+
+    /// How many of `id`'s own children have work in flight.
+    ///
+    /// One derivation, read by the row's `⏸N` mark and by the title's count,
+    /// because "this agent has children working" is one fact and two copies of
+    /// it are two things that can disagree (finding U1). It is about the
+    /// children, never about the parent's own phase: a working agent whose
+    /// children work is still working.
+    pub fn busy_children(&self, id: AgentId) -> usize {
+        self.agents
+            .iter()
+            .filter(|node| node.parent == Some(id) && node.phase.is_busy())
+            .count()
     }
 
     /// Show one agent's transcript, if it is in the tree.
@@ -562,12 +667,25 @@ impl AgentTree {
 
     /// Focus the agent under the cursor, returning it.
     pub fn focus_cursor(&mut self) -> Option<AgentId> {
-        let id = self.agents.get(self.agent_cursor)?.id;
+        // Through the *painted* rows, not the storage vector: a child sits under
+        // its parent, so the two orders differ and `Enter` must focus the row
+        // the human is pointing at (finding U4).
+        let id = self.cursor_id()?;
         self.focused = id;
         Some(id)
     }
 
-    /// Move the tree cursor one row, without leaving the tree.
+    /// The id of the row under the cursor: the one place a cursor position is
+    /// turned into an agent. Every caller that asks "which row is selected"
+    /// comes through here, so the row painted with the highlight and the agent
+    /// a key acts on cannot be two different rows (finding U4).
+    pub fn cursor_id(&self) -> Option<AgentId> {
+        self.rows().get(self.cursor()).map(|node| node.id)
+    }
+
+    /// Move the tree cursor one row, without leaving the tree. Rows are the
+    /// painted ones: `j`/`k` walk the tree the human sees, not the order the
+    /// agents happened to be spawned in (finding U4).
     pub fn move_cursor(&mut self, delta: i64) {
         if delta > 0 {
             if self.agent_cursor + 1 < self.agents.len() {
@@ -583,11 +701,14 @@ impl AgentTree {
     }
 
     pub fn cursor_bottom(&mut self) {
+        // One row per agent, so the storage length is the number of rows.
         self.agent_cursor = self.agents.len().saturating_sub(1);
     }
 
     /// The row the agent pane paints as selected.
     pub fn cursor(&self) -> usize {
+        // Clamped by the storage length, which is the row count: `rows` paints
+        // every agent exactly once (finding U4).
         self.agent_cursor.min(self.agents.len().saturating_sub(1))
     }
 
@@ -637,6 +758,21 @@ mod tests {
             cmd: tx,
         });
         (opened, rx)
+    }
+
+    /// A child of `parent`, so a test can build a tree whose spawn order is not
+    /// its tree order.
+    fn spawn(tree: &mut AgentTree, id: u64, parent: u64, depth: usize) -> Receiver<AgentMsg> {
+        let (tx, rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        tree.insert(Spawn {
+            id: AgentId(id),
+            parent: AgentId(parent),
+            brief: format!("#{id}"),
+            depth,
+            branch: None,
+            cmd: tx,
+        });
+        rx
     }
 
     fn leftover(id: u64) -> Existing {
@@ -697,6 +833,102 @@ mod tests {
 
         tree.stopped(id);
         assert!(!tree.busy(), "and a stopped one");
+    }
+
+    /// The title's counts are derived from the phases, and no agent is in two
+    /// buckets: a parent napping on a working child is waiting, never also
+    /// working (finding U2).
+    #[test]
+    fn the_roster_buckets_each_agent_once() {
+        let mut tree = AgentTree::bare();
+        assert_eq!(tree.roster(), Roster::default(), "nothing is happening yet");
+
+        // One child, working, under an idle root.
+        let (opened, _rx) = child(&mut tree, 1);
+        assert_eq!(
+            tree.roster(),
+            Roster {
+                working: 1,
+                waiting: 1
+            },
+            "the working child, and the root napping on it"
+        );
+
+        // The child's run ends with a grandchild of its own working: the child
+        // naps on it (its own children are the unit, the same one its row's
+        // `⏸N` counts), and the root — whose own child is done — is in no
+        // bucket at all.
+        tree.finish(opened.id, Some("spawned #2".to_string()));
+        let (tx, _rx2) = crossbeam_channel::unbounded::<AgentMsg>();
+        let grandchild = tree.insert(Spawn {
+            id: AgentId(2),
+            parent: AgentId(1),
+            brief: "deep.txt".to_string(),
+            depth: 2,
+            branch: None,
+            cmd: tx,
+        });
+        assert_eq!(
+            tree.roster(),
+            Roster {
+                working: 1,
+                waiting: 1
+            },
+            "the grandchild works and its parent naps"
+        );
+
+        // A stopped agent waits for nothing, so it is in no bucket: its own
+        // `⊘` row is where that fact lives.
+        tree.stopped(grandchild.id);
+        assert_eq!(tree.roster(), Roster::default());
+    }
+
+    /// Rows come out in tree order, not in the order the agents were spawned
+    /// (finding U4).
+    #[test]
+    fn rows_are_pre_order_over_the_parent_links() {
+        let mut tree = AgentTree::bare();
+        // Spawn order that is deliberately not tree order: the root's second
+        // child exists before the first child's own child does.
+        let _a = spawn(&mut tree, 1, 0, 1);
+        let _b = spawn(&mut tree, 2, 0, 1);
+        let _c = spawn(&mut tree, 3, 1, 2); // spawned by #1
+        let _d = spawn(&mut tree, 4, 3, 3); // spawned by #3
+
+        let ids: Vec<u64> = tree.rows().iter().map(|node| node.id.0).collect();
+        assert_eq!(
+            ids,
+            vec![0, 1, 3, 4, 2],
+            "a child under its parent, above its parent's later brothers"
+        );
+
+        // The cursor indexes the painted rows, so it lands on the agent the
+        // human is pointing at — not on whatever spawn order holds there.
+        tree.move_cursor(1);
+        tree.move_cursor(1);
+        assert_eq!(tree.cursor_id(), Some(AgentId(3)));
+        tree.cursor_bottom();
+        assert_eq!(tree.cursor_id(), Some(AgentId(2)), "`G` is the last row");
+        tree.cursor_top();
+        assert_eq!(tree.focus_cursor(), Some(AgentId::ROOT), "`g` is the root");
+        tree.cursor_bottom();
+        assert_eq!(tree.focus_cursor(), Some(AgentId(2)));
+    }
+
+    /// Every agent is painted exactly once, even one whose parent is not in the
+    /// tree: a row that cannot be reached would be an agent the human cannot
+    /// see (finding U4).
+    #[test]
+    fn every_agent_is_painted_once_even_without_its_parent() {
+        let mut tree = AgentTree::bare();
+        let _child = spawn(&mut tree, 1, 0, 1);
+        tree.register(leftover(2));
+        // A child whose parent is gone: #3 hangs under #9, which is not here.
+        let _orphan = spawn(&mut tree, 3, 9, 2);
+
+        let ids: Vec<u64> = tree.rows().iter().map(|node| node.id.0).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3]);
+        assert_eq!(tree.rows().len(), tree.agents.len());
     }
 
     /// A status that arrives after the run ended must not put a finished agent

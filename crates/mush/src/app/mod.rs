@@ -672,16 +672,17 @@ impl App {
                 // reply that was empty: a line in the transcript, tagged with
                 // the agent it concerns (finding B19).
                 self.chat.note_for(id, text);
-                self.chat.scroll_to_bottom();
             }
             AgentEvent::Message(message) => {
+                // The pane is deliberately not sent to the bottom here: the
+                // position is the human's, and a pane that is at the bottom
+                // follows the newest line by construction (finding U3).
                 self.chat.push_message(id, message);
                 // Every message is part of what the file stores — a subagent's
                 // as much as the root's — but the mark is O(1): the rebuild and
                 // the write wait for the debounced tick, so a streamed tool
                 // result cannot stall the frame that shows it.
                 self.mark_session_dirty();
-                self.chat.scroll_to_bottom();
             }
             AgentEvent::Stopped => {
                 // Stopped is not failed and not done: the run produced nothing,
@@ -697,7 +698,6 @@ impl App {
                 if id == self.tree.focused {
                     self.say(format!("agent #{id} stopped — send a message to resume it"));
                 }
-                self.chat.scroll_to_bottom();
             }
             AgentEvent::Error(error) => {
                 self.tree.fail(id, error.clone());
@@ -707,7 +707,6 @@ impl App {
                 // dies with the next run, while this line is tagged, stamped and
                 // written to the session, so a restart still says what broke.
                 self.chat.note_error_for(id, error);
-                self.chat.scroll_to_bottom();
             }
             AgentEvent::Done => {
                 let summary = self.last_assistant_text(id);
@@ -765,7 +764,6 @@ impl App {
                 } else {
                     self.mark_session_dirty();
                 }
-                self.chat.scroll_to_bottom();
             }
         }
     }
@@ -961,9 +959,12 @@ impl App {
         if target == AgentId::ROOT {
             // The human's words belong in the transcript they can see, whether
             // the root is starting a run or already in one.
+            //
+            // Sending does not send the pane to the bottom either: the human
+            // chose where to read, and the key that puts a pane back at the
+            // newest line is the one they press (finding U3).
             self.chat
                 .push_message(AgentId::ROOT, Message::user(text.clone()));
-            self.chat.scroll_to_bottom();
             // The human's own words are the one thing worth blocking on: the
             // run they start may take minutes, and a crash in it must not lose
             // the request. This is one write per turn, not one per response.
@@ -1669,7 +1670,7 @@ impl App {
                 self.tree.focus(AgentId::ROOT);
             }
             Intent::Send => self.send_message(),
-            Intent::Chat(key) => self.chat.apply(key),
+            Intent::Chat(key) => self.chat.apply(self.tree.focused, key),
         }
     }
 
@@ -1784,7 +1785,9 @@ impl App {
     /// because it has no work in flight to cancel. Ending an agent is `/new`'s
     /// job.
     fn cancel_cursor_row(&mut self) {
-        let Some(id) = self.tree.agents.get(self.tree.cursor()).map(|node| node.id) else {
+        // The painted row under the cursor, not the storage vector: they are
+        // different orders (finding U4).
+        let Some(id) = self.tree.cursor_id() else {
             return;
         };
         // The same question `working_agents` answers: a run *or* a job is work
@@ -2013,6 +2016,15 @@ mod tests {
                     .trim_end()
                     .to_string()
             })
+            .collect()
+    }
+
+    /// What the chat pane paints, and only it: the agents pane is the columns
+    /// to its left at this size.
+    fn chat_rows(app: &mut App) -> Vec<String> {
+        screen(app, 120, 32)
+            .into_iter()
+            .map(|row| row.chars().skip(31).collect())
             .collect()
     }
 
@@ -3878,6 +3890,172 @@ mod tests {
         assert_eq!(app.activity_line(), None, "no `thinking` survives the run");
     }
 
+    /// The pane title counts the phases it names, and no agent is in two of its
+    /// counts (finding U2).
+    ///
+    /// It used to say `N running` over every busy phase, so an agent napping on
+    /// its children — a row wearing `⏸` — was counted as work the title could
+    /// not show. The counts now come from the phases as two disjoint buckets,
+    /// and each clause says which one it is.
+    #[test]
+    fn the_title_counts_working_and_waiting_agents_separately() {
+        let (mut app, _rx) = test_app("title-counts");
+        let conversation = app.tree.conversation();
+        // The root naps on two children, and one of those has a child of its
+        // own: three agents work, one waits, and nobody is both.
+        for (id, parent, depth) in [(1u64, 0u64, 1usize), (2, 0, 1), (3, 2, 2)] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId(parent),
+                event: AgentEvent::Spawned {
+                    child: id,
+                    parent,
+                    brief: format!("child {id}"),
+                    depth,
+                    branch: None,
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+        }
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Done,
+        });
+        // A branch with work on it, so the totals have something to say and
+        // must yield the line to the counts rather than be cut in half.
+        app.tree.agent_stats.insert(
+            AgentId(1),
+            mush_core::git::Stat {
+                files: 1,
+                added: 324,
+                removed: 40,
+            },
+        );
+        assert_eq!(
+            app.tree.roster(),
+            crate::app::tree::Roster {
+                working: 3,
+                waiting: 1
+            }
+        );
+
+        let rows = screen(&mut app, 200, 50);
+        assert!(
+            rows[0].contains(" agents · 3 working · 1 waiting"),
+            "the title counts what it names: {}",
+            rows[0]
+        );
+        assert!(
+            !rows[0].contains("Σ +324 −") || rows[0].contains("Σ +324 −40"),
+            "a total is painted whole or not at all: {}",
+            rows[0]
+        );
+    }
+
+    /// A clause that does not fit is dropped whole, and the totals are the last
+    /// to go: a pane 32 columns wide cannot hold ` agents · 3 working · 1
+    /// waiting · Σ +324 −40`, and the half of it that would fit (`Σ +324 −`) is
+    /// a total that is not the total.
+    #[test]
+    fn the_title_elides_clauses_instead_of_cutting_numbers() {
+        let (mut app, _rx) = test_app("title-elides");
+        app.tree.agent_stats.insert(
+            AgentId::ROOT,
+            mush_core::git::Stat {
+                files: 1,
+                added: 324,
+                removed: 40,
+            },
+        );
+
+        // Widest pane `draw` ever gives this pane, and nobody working: the
+        // totals fit and are shown in full.
+        let wide = screen(&mut app, 200, 50);
+        assert!(wide[0].contains(" agents · Σ +324 −40"), "{}", wide[0]);
+
+        // Too narrow for that clause: it goes entirely, rather than painting
+        // `Σ +324 −`.
+        let narrow = screen(&mut app, 80, 24);
+        assert!(!narrow[0].contains("Σ"), "{}", narrow[0]);
+        assert!(narrow[0].contains(" agents "), "{}", narrow[0]);
+    }
+
+    /// The pane paints tree order, and every key that moves or reads the cursor
+    /// follows what it paints: `j`/`k` walk the rows, `g`/`G` land on the first
+    /// and last of them, `Enter` focuses the agent under the highlight, and the
+    /// footer under the list names that same agent (finding U4).
+    #[test]
+    fn the_cursor_walks_the_rows_the_pane_paints() {
+        let (mut app, _rx) = test_app("row-order");
+        let conversation = app.tree.conversation();
+        // Spawn order that is not tree order: the root's second child is spawned
+        // before the first child's own child, so `#3` belongs under `#1` and
+        // above `#2`.
+        for (id, parent, depth) in [(1u64, 0u64, 1usize), (2, 0, 1), (3, 1, 2)] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId(parent),
+                event: AgentEvent::Spawned {
+                    child: id,
+                    parent,
+                    brief: format!("agent {id}"),
+                    depth,
+                    branch: None,
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+        }
+        app.focus = Focus::Agents;
+        // The pane's own columns only: the bar under it names agents too.
+        let pane = |app: &mut App| -> Vec<String> {
+            screen(app, 120, 32)
+                .into_iter()
+                .map(|row| row.chars().take(31).collect())
+                .collect()
+        };
+        let key = |app: &mut App, c: char| {
+            app.update(Msg::Key(KeyEvent::new(
+                KeyCode::Char(c),
+                KeyModifiers::NONE,
+            )));
+        };
+
+        // Painted order: the root, #1, #3 (its child), then #2 — while the
+        // storage order is the spawn order 0, 1, 2, 3.
+        let rows = pane(&mut app);
+        for (row, id) in rows[1..=4].iter().zip(["#0", "#1", "#3", "#2"]) {
+            assert!(row.contains(id), "the row for {id} is not there: {row:?}");
+        }
+
+        // `j` twice lands on the third painted row, which is #3: storage order
+        // would have put its sibling #2 there.
+        key(&mut app, 'j');
+        key(&mut app, 'j');
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(3)));
+        assert_eq!(app.tree.agents[2].id, AgentId(2), "storage order is not it");
+
+        // `Enter` focuses the row the highlight is on, and the footer under the
+        // list is that same row's facts.
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert_eq!(app.tree.focused, AgentId(3));
+        assert_eq!(text_of(&app), "agent #3: agent 3");
+        let rows = pane(&mut app);
+        assert!(
+            rows.iter().any(|row| row.contains("#3 agent 3")),
+            "the footer names the cursor row: {rows:?}"
+        );
+
+        // `k` back up one row is #1, and `G` is the last painted row — the
+        // root's second child, whose storage index is 2 of 3.
+        key(&mut app, 'k');
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(1)));
+        key(&mut app, 'G');
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(2)));
+        key(&mut app, 'g');
+        assert_eq!(app.tree.cursor_id(), Some(AgentId::ROOT));
+    }
+
     /// A napping root with live children is derived from the tree: nobody has
     /// to remember to write it, so it cannot be forgotten either.
     #[test]
@@ -3905,6 +4083,127 @@ mod tests {
         assert_eq!(
             app.activity_line().as_deref(),
             Some("waiting on 1 subagent(s) — the root resumes as they finish")
+        );
+    }
+
+    /// A working agent with working children is drawn working, and the children
+    /// are a second mark rather than a replacement glyph (finding U1).
+    ///
+    /// The row used to derive its glyph from "has live children", so an agent
+    /// mid-turn with children running wore `⏸` — "paused" about the one agent
+    /// the human was watching work. The glyph is now a function of the agent's
+    /// own phase and `⏸N` carries the children, so neither fact hides the other.
+    #[test]
+    fn a_working_agent_with_working_children_is_not_drawn_paused() {
+        let (mut app, _rx) = test_app("waiting-glyph");
+        let conversation = app.tree.conversation();
+        // The root is mid-turn, and two of its children are working.
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Running {
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        });
+        for id in [1u64, 2u64] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId::ROOT,
+                event: AgentEvent::Spawned {
+                    child: id,
+                    parent: 0,
+                    brief: format!("child {id}"),
+                    depth: 1,
+                    branch: None,
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+        }
+
+        let rows = screen(&mut app, 120, 32);
+        let root_row = rows
+            .iter()
+            .find(|row| row.contains("#0"))
+            .expect("the root has a row")
+            .clone();
+        assert!(
+            root_row.contains("◐ #0"),
+            "a working agent is `◐`, never `⏸`: {root_row}"
+        );
+        assert!(
+            root_row.contains("⏸2"),
+            "and its two working children are still on the row: {root_row}"
+        );
+
+        // A child with no children of its own wears the plain running glyph.
+        let child_row = rows
+            .iter()
+            .find(|row| row.contains("#1"))
+            .expect("the child has a row")
+            .clone();
+        assert!(child_row.contains("◐ #1"), "{child_row}");
+        assert!(!child_row.contains("⏸"), "{child_row}");
+    }
+
+    /// A pane's position is the human's: another agent's line cannot move it,
+    /// and neither can the pane's own line while they are away from the bottom
+    /// (finding U3).
+    #[test]
+    fn news_moves_only_the_pane_it_is_about_and_only_from_the_bottom() {
+        let (mut app, _rx) = test_app("scroll-pin");
+        let conversation = app.tree.conversation();
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Spawned {
+                child: 1,
+                parent: 0,
+                brief: "lexer".to_string(),
+                depth: 1,
+                branch: None,
+                cmd: crossbeam_channel::unbounded().0,
+            },
+        });
+        // A transcript long enough to scroll, in the pane the human is reading.
+        for index in 0..30 {
+            app.chat
+                .push_message(AgentId(1), Message::assistant(format!("line {index}")));
+        }
+        app.tree.focus(AgentId(1));
+        app.chat.scroll_by(AgentId(1), 4);
+        let held = chat_rows(&mut app);
+        assert!(
+            !held.join("\n").contains("line 29"),
+            "the pane is away from the newest line: {held:?}"
+        );
+
+        // Another agent's news: the root says something of its own.
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Message(Message::assistant("the root's line")),
+        });
+        assert_eq!(
+            chat_rows(&mut app),
+            held,
+            "another agent's line must not move this pane"
+        );
+
+        // And the pane's own agent speaks while the human is away from the
+        // bottom: they are still where they put themselves.
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId(1),
+            event: AgentEvent::Message(Message::assistant("its own line")),
+        });
+        assert_eq!(chat_rows(&mut app), held, "a held pane is the human's");
+
+        // At the bottom the same news is exactly what the pane shows: that is
+        // what following means, and it needs nothing to be told to it.
+        app.chat.scroll_by(AgentId(1), -4);
+        assert!(
+            chat_rows(&mut app).join("\n").contains("its own line"),
+            "a pane at the bottom follows the newest line"
         );
     }
 

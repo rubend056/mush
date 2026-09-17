@@ -106,7 +106,7 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border(focused))
-        .title(agents_title(app));
+        .title(agents_title(app, area.width.saturating_sub(2) as usize));
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -129,9 +129,11 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
     // `List` draws `› ` outside the item's width, so the selected row would be
     // two columns narrower than its neighbours. Budget for it up front.
     let row_width = (inner.width as usize).saturating_sub(2);
-    let items: Vec<ListItem> = app
-        .tree
-        .agents
+    // The rows in painted order: pre-order over the parent links, so a child is
+    // drawn under its parent rather than after everything spawned before it
+    // (finding U4). The tree derives that order, this only paints it.
+    let rows = app.tree.rows();
+    let items: Vec<ListItem> = rows
         .iter()
         .map(|node| ListItem::new(agent_line(app, node, row_width)))
         .collect();
@@ -144,7 +146,7 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, list_area, &mut state);
 
     if footer_rows > 0 {
-        let node = &app.tree.agents[cursor];
+        let node = rows[cursor];
         let lines = agent_footer(app, node, inner.width as usize);
         let start = inner.y + inner.height - lines.len() as u16;
         frame.render_widget(
@@ -163,18 +165,30 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
     }
 }
 
-/// `agents · 2 running · Σ +324 −40`: what the whole tree is doing, and how
-/// much its branches carry.
-fn agents_title(app: &App) -> String {
-    let mut title = String::from(" agents ");
-    let busy = app
-        .tree
-        .agents
-        .iter()
-        .filter(|node| node.phase.is_busy())
-        .count();
-    if busy > 0 {
-        title.push_str(&format!(" · {busy} running"));
+/// ` agents · 3 working · 2 waiting · Σ +324 −40`: what the whole tree is doing,
+/// and how much its branches carry.
+///
+/// Every clause is a count of the phases, named for what it counts, and no
+/// agent is in two of them: `N working` is the agents whose own run is in
+/// flight, `M waiting` the ones at rest with children working (the `⏸` rows),
+/// and the totals are the branches'. It used to say `N running` over a number
+/// that included the napping ones, which is how the title came to contradict
+/// the rows under it (finding U2).
+///
+/// The clauses are ranked and dropped whole from the right while they do not
+/// fit — the way `facts_line` elides — because this pane is 32 columns wide at
+/// its widest and a clause cut mid-number (`Σ +324 −`, `2 waitin`) is a count
+/// that is not the count. The totals are last because the least is lost last:
+/// every branch's own `+add −del` is on its row and in the selected row's
+/// footer, while who is working exists only here.
+fn agents_title(app: &App, width: usize) -> String {
+    let roster = app.tree.roster();
+    let mut cells = Vec::new();
+    if roster.working > 0 {
+        cells.push(format!("{} working", roster.working));
+    }
+    if roster.waiting > 0 {
+        cells.push(format!("{} waiting", roster.waiting));
     }
     let mut added = 0;
     let mut removed = 0;
@@ -183,9 +197,16 @@ fn agents_title(app: &App) -> String {
         removed += stat.removed;
     }
     if added + removed > 0 {
-        title.push_str(&format!(" · Σ +{added} −{removed}"));
+        cells.push(format!("Σ +{added} −{removed}"));
     }
-    title
+    while !cells.is_empty() {
+        let joined = format!(" agents · {}", cells.join(" · "));
+        if UnicodeWidthStr::width(joined.as_str()) <= width {
+            return joined;
+        }
+        cells.pop();
+    }
+    " agents ".to_string()
 }
 
 /// One tree row, with the fields it can afford.
@@ -200,16 +221,21 @@ fn agent_line(app: &App, node: &AgentNode, width: usize) -> String {
     } else {
         " "
     };
-    let waiting = app
-        .tree
-        .agents
-        .iter()
-        .any(|n| n.parent == Some(node.id) && n.phase.is_busy());
-    let head = format!(
-        "{indent}{marker}{} #{:<3}",
-        phase_glyph(&node.phase, waiting),
-        node.id
+    let waiting = app.tree.busy_children(node.id);
+    // Two facts, two marks: `glyph · id` is this agent's own phase, and `⏸N`
+    // counts the children that are working. The old row derived the glyph from
+    // "has live children", so a busy agent wore `⏸` and its own work vanished
+    // from the screen (finding U1).
+    let mut head = format!(
+        "{indent}{marker}{glyph} #{id}",
+        id = node.id,
+        glyph = phase_glyph(&node.phase),
     );
+    if waiting > 0 {
+        // R4's `⏸`, owned by the children it is about: the parent's own state
+        // stays in the glyph, and this says how much it has out.
+        head.push_str(&format!(" ⏸{waiting}"));
+    }
 
     let mut tail = Vec::new();
     let activity = phase_detail(node);
@@ -309,10 +335,16 @@ fn agent_detail(node: &AgentNode) -> Vec<String> {
     }
 }
 
-/// The glyph is derived from the phase and the tree, never stored: an agent is
-/// `·` until it does something, `✓` only when a run finished, `⏸` when it is
-/// busy *because* its children are, and `⊘` while a cancel is in flight.
-fn phase_glyph(phase: &Phase, waiting_on_children: bool) -> &'static str {
+/// The glyph is derived from the agent's own phase, never stored and never
+/// borrowed from the tree: `·` until it does something, `◐` while its own run is
+/// in flight, `⊘` while a cancel is in flight and after it lands, `✓` only when
+/// a run finished, `✗` when it failed.
+///
+/// Waiting on children is a *different fact* from working and is drawn as a
+/// different mark (`agent_line`'s `⏸N`), because a parent that is mid-turn with
+/// children running is working, not paused — the row that said `⏸` about it was
+/// claiming a park that never happened (finding U1).
+fn phase_glyph(phase: &Phase) -> &'static str {
     match phase {
         Phase::Failed(_) => "✗",
         // `⊘` while a cancel is in flight and after it lands: a stopped agent
@@ -320,13 +352,7 @@ fn phase_glyph(phase: &Phase, waiting_on_children: bool) -> &'static str {
         Phase::Cancelling | Phase::Stopped => "⊘",
         Phase::Idle => "·",
         Phase::Done => "✓",
-        Phase::Thinking | Phase::Activity(_) => {
-            if waiting_on_children {
-                "⏸"
-            } else {
-                "◐"
-            }
-        }
+        Phase::Thinking | Phase::Activity(_) => "◐",
     }
 }
 
@@ -654,21 +680,20 @@ mod tests {
     }
 
     /// A row's glyph is the whole status vocabulary in one character; it must
-    /// never claim a run that did not happen (`·`, not `✓`).
+    /// never claim a run that did not happen (`·`, not `✓`), and it is a
+    /// function of the agent's *own* phase only — an agent that is working is
+    /// `◐` even while its children work, because "waiting on children" is a
+    /// fact about the children, drawn as its own mark (finding U1).
     #[test]
     fn glyphs_are_truthful() {
-        assert_eq!(phase_glyph(&Phase::Idle, false), "·");
-        assert_eq!(phase_glyph(&Phase::Thinking, false), "◐");
-        assert_eq!(phase_glyph(&Phase::Thinking, true), "⏸");
-        assert_eq!(
-            phase_glyph(&Phase::Activity("edit_file a.rs".into()), true),
-            "⏸"
-        );
-        assert_eq!(phase_glyph(&Phase::Cancelling, false), "⊘");
-        assert_eq!(phase_glyph(&Phase::Done, false), "✓");
-        assert_eq!(phase_glyph(&Phase::Failed("boom".into()), false), "✗");
+        assert_eq!(phase_glyph(&Phase::Idle), "·");
+        assert_eq!(phase_glyph(&Phase::Thinking), "◐");
+        assert_eq!(phase_glyph(&Phase::Activity("edit_file a.rs".into())), "◐");
+        assert_eq!(phase_glyph(&Phase::Cancelling), "⊘");
+        assert_eq!(phase_glyph(&Phase::Done), "✓");
+        assert_eq!(phase_glyph(&Phase::Failed("boom".into())), "✗");
         // A stopped agent is not a finished one, and must not borrow the tick.
-        assert_eq!(phase_glyph(&Phase::Stopped, false), "⊘");
+        assert_eq!(phase_glyph(&Phase::Stopped), "⊘");
     }
 
     /// The detail line carries the age of the *phase*, so a slow model looks

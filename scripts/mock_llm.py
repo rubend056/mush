@@ -72,6 +72,13 @@ class Handler(BaseHTTPRequestHandler):
         joined = "\n".join(m.get("content") or "" for m in messages)
         system = messages[0].get("content") or "" if messages else ""
 
+        # A SLOWCHAIN or SLOWISO root asks for the same tree with a subagent
+        # that holds its reply open. The flag is on the server because every
+        # agent talks to the same one; the sleep itself is on the subagent turn
+        # below. It keeps a parent and its child at work together for long
+        # enough to photograph the tree (used by scripts/screen.py).
+        if "SLOWCHAIN" in joined or "SLOWISO" in joined:
+            self.server.slow = True
         if "Summarize everything important" in joined:
             # Context compaction: reply with a summary instead of a scripted turn.
             reply = {"role": "assistant",
@@ -97,6 +104,16 @@ class Handler(BaseHTTPRequestHandler):
         else:
             is_subagent = "mush subagent" in system
             depth2 = "at depth 2" in system
+
+            # The SLOW knob: a subagent's first reply is held, so the tree above
+            # it is still doing something when the screen is caught. The root is
+            # deliberately never held — what these shots need is the tree.
+            if (
+                getattr(self.server, "slow", False)
+                and is_subagent
+                and "wrote " not in joined
+            ):
+                time.sleep(3)
 
             if is_subagent and depth2:
                 # Grandchild (chain scenario only): the leaf that actually writes.

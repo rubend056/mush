@@ -154,6 +154,23 @@ pub struct Pane<'a> {
     pub label: &'a str,
 }
 
+/// Where one pane is reading from: a position the human owns.
+///
+/// The bottom is a *state*, not an offset. While a pane is at the bottom it
+/// follows the newest line; the moment the human scrolls away it is **holding**
+/// a window — the last `offset` rows of a transcript that was `up_to` messages
+/// long — so lines that arrive afterwards land *below* the window instead of
+/// pushing the text the human is reading up the pane (finding U3). Nothing in
+/// this program may reset it: the only thing that knows they want the bottom is
+/// them, and the next key they press says so.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Reading {
+    /// At the bottom: the newest line is the last row, and stays that way.
+    Following,
+    /// Holding a window `offset` rows above the bottom of `messages[..up_to]`.
+    Holding { offset: usize, up_to: usize },
+}
+
 /// One conversation: what has been said, what mush added to it, and what the
 /// human is typing.
 pub struct Chat {
@@ -171,9 +188,13 @@ pub struct Chat {
     notices: Vec<Notice>,
     /// The message box, whose cursor counts graphemes, not chars (finding N2).
     input: Input,
-    /// Rows of scrollback the pane is showing; 0 is the bottom, where a new
-    /// line puts it back.
-    scroll: usize,
+    /// Where each conversation's pane is reading from, keyed by the agent whose
+    /// transcript it shows. Per conversation because the position is the
+    /// human's *reading of one pane*: news about another agent must not move
+    /// it, and scrolling one pane must not carry its offset into another's
+    /// (finding U3). A pane nobody has scrolled is absent, which is exactly
+    /// `Reading::Following` — following costs no state at all.
+    reading: HashMap<AgentId, Reading>,
 }
 
 impl Chat {
@@ -184,7 +205,7 @@ impl Chat {
             agents: HashMap::new(),
             notices: Vec::new(),
             input: Input::default(),
-            scroll: 0,
+            reading: HashMap::new(),
         }
     }
 
@@ -245,10 +266,12 @@ impl Chat {
 
     /// Drop an agent's transcript, and the lines mush wrote about it: a
     /// forgotten agent is not coming back, and notes about a conversation
-    /// nobody can read or steer are text with no owner.
+    /// nobody can read or steer are text with no owner. Its reading position
+    /// goes with it — there is no pane left to be looking at.
     pub fn forget(&mut self, agent: AgentId) {
         self.agents.remove(&agent);
         self.notices.retain(|notice| notice.agent != agent);
+        self.reading.remove(&agent);
     }
 
     /// How big one conversation is, in tokens, roughly — the same
@@ -277,7 +300,7 @@ impl Chat {
         self.root.clear();
         self.agents.clear();
         self.notices.clear();
-        self.scroll = 0;
+        self.reading.clear();
     }
 
     /// A line for the transcript that is not a message: a hint, or a failure.
@@ -417,15 +440,62 @@ impl Chat {
         });
     }
 
-    /// Follow the newest line: a message, a notice, or the end of a run puts
-    /// the pane back at the bottom.
-    pub fn scroll_to_bottom(&mut self) {
-        self.scroll = 0;
+    /// Where the pane showing `agent` is reading from. A conversation nobody
+    /// has scrolled is at the bottom.
+    fn reading(&self, agent: AgentId) -> Reading {
+        self.reading
+            .get(&agent)
+            .copied()
+            .unwrap_or(Reading::Following)
     }
 
-    pub fn scroll_by(&mut self, delta: i64) {
-        let next = self.scroll as i64 + delta;
-        self.scroll = next.max(0) as usize;
+    /// The human moved the pane showing `agent` by `rows`: positive is older,
+    /// and the pane the key acts on is the conversation it shows (finding U3).
+    ///
+    /// Scrolling away from the bottom *holds* the window the pane now shows, so
+    /// the lines that arrive while the human reads are not what the pane
+    /// follows. Scrolling back down rejoins the newest line: the rows that
+    /// arrived meanwhile are one step further down, and the step that leaves the
+    /// held window is the step that takes them.
+    pub fn scroll_by(&mut self, agent: AgentId, rows: i64) {
+        let messages = self.transcript(agent).len();
+        // Nothing said yet: there is no window to hold, and an empty pane stays
+        // a pane at the bottom.
+        if messages == 0 {
+            return;
+        }
+        let held = match self.reading(agent) {
+            // A held window the transcript no longer has (it was folded, or
+            // restored from a shorter one) is not a position: the pane is at
+            // the bottom again, and this key starts from there.
+            Reading::Holding { offset, up_to } if up_to <= messages => Some((offset, up_to)),
+            _ => None,
+        };
+        let next = match (held, rows) {
+            // Already at the bottom, and asked for something below it: there is
+            // nothing under the bottom, and the pane still follows.
+            (None, rows) if rows <= 0 => return,
+            (None, rows) => Reading::Holding {
+                offset: rows as usize,
+                up_to: messages,
+            },
+            (Some((offset, up_to)), rows) => {
+                // Past the bottom of what the pane was holding: the rows that
+                // arrived in the meantime are one step further down, so the step
+                // that leaves the held window is the step that rejoins the
+                // newest line.
+                let moved = (offset as i64 + rows).max(0) as usize;
+                if moved == 0 {
+                    Reading::Following
+                } else {
+                    Reading::Holding {
+                        offset: moved,
+                        up_to,
+                    }
+                }
+            }
+        };
+        self.reading.insert(agent, next);
     }
 
     /// The rows a pane `height` rows tall and `width` columns wide is showing:
@@ -467,9 +537,23 @@ impl Chat {
     }
 
     /// The transcript itself, without the foot: the rows the conversation fills
-    /// in `height`, newest at the bottom.
+    /// in `height`, newest at the bottom — or, while the human is holding a
+    /// window, the rows they are holding, with everything that arrived since
+    /// still below them (finding U3).
     fn body(&self, pane: &Pane<'_>, width: usize, height: usize) -> Vec<Line<'static>> {
-        let messages = self.transcript(pane.agent);
+        let transcript = self.transcript(pane.agent);
+        // Which conversation this window is made of, and how far above its
+        // bottom it starts. Holding is a fact about the human's reading, so it
+        // is read here rather than guessed from the rows.
+        let (messages, scroll) = match self.reading(pane.agent) {
+            Reading::Holding { offset, up_to } if up_to <= transcript.len() => {
+                (&transcript[..up_to], offset)
+            }
+            // The transcript the pane was holding is gone: a fold replaced it,
+            // or the session was restored with less. Falling back to the bottom
+            // is the only position that still means something.
+            _ => (transcript, 0),
+        };
 
         // A pane with nothing in it says what it is waiting for rather than
         // being blank.
@@ -502,7 +586,7 @@ impl Chat {
         // Built back to front and then reversed: each chunk is one message's
         // rows in their own order, and the pane is anchored at the bottom, so
         // the newest line is the one that must be there.
-        let want = height + self.scroll;
+        let want = height + scroll;
         let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
         let mut count = 0usize;
 
@@ -529,7 +613,7 @@ impl Chat {
         // the only arithmetic that is right in both cases. Taking `0` when it
         // overshot painted the *oldest* rows of the window, which made a
         // message taller than the pane freeze the view and hide its own end.
-        let start = lines.len().saturating_sub(height + self.scroll);
+        let start = lines.len().saturating_sub(height + scroll);
         lines.into_iter().skip(start).take(height).collect()
     }
 
@@ -653,14 +737,15 @@ impl Chat {
     }
 
     /// Do one key the keymap handed to the chat: editing the message box, or
-    /// scrolling the transcript.
+    /// scrolling the transcript — `on` is the agent whose pane the chat is
+    /// showing, because a scrollback belongs to a conversation (finding U3).
     ///
     /// Which keys those are is [`crate::app::keys`]'s decision, not this one's
     /// — this is only where they happen, so the box cannot have a second,
     /// private key table that drifts from the app's. `<Enter>` never arrives
     /// here: sending is the agents' business, and the keymap asks the pane
     /// that question first.
-    pub fn apply(&mut self, key: ChatKey) {
+    pub fn apply(&mut self, on: AgentId, key: ChatKey) {
         match key {
             // A new line instead of sending. Only terminals that report the
             // modifier can deliver Shift+Enter (kitty, WezTerm, foot, Ghostty,
@@ -674,7 +759,7 @@ impl Chat {
             ChatKey::Home => self.input.move_home(),
             ChatKey::End => self.input.move_end(),
             ChatKey::Insert(c) => self.input.insert(&c.to_string()),
-            ChatKey::Scroll(rows) => self.scroll_by(rows),
+            ChatKey::Scroll(rows) => self.scroll_by(on, rows),
             ChatKey::Clear => self.input.clear(),
         }
     }
@@ -800,7 +885,8 @@ mod tests {
     fn press(chat: &mut Chat, key: KeyEvent) -> bool {
         match keys::key(Focus::Chat, false, key) {
             Intent::Chat(intent) => {
-                chat.apply(intent);
+                // The pane the key is about is the one the chat is showing.
+                chat.apply(AgentId::ROOT, intent);
                 true
             }
             _ => false,
@@ -866,8 +952,8 @@ mod tests {
         );
     }
 
-    /// The window follows the scrollback, and the bottom is where a new line
-    /// puts it back.
+    /// The window follows the scrollback, and the bottom is where the newest
+    /// line is: a pane that is at the bottom needs nothing done to it.
     #[test]
     fn the_window_follows_the_scrollback() {
         let mut chat = Chat::bare();
@@ -886,8 +972,69 @@ mod tests {
 
         assert!(press(&mut chat, key(KeyCode::Down)));
         assert_eq!(shown(&pane_rows(&chat, &pane, 20, 2)), bottom);
-        chat.scroll_to_bottom();
-        assert_eq!(shown(&pane_rows(&chat, &pane, 20, 2)), bottom);
+        // And a new line arrives at the bottom, where the pane already is.
+        chat.push_message(AgentId::ROOT, Message::user("line 5"));
+        assert_eq!(shown(&pane_rows(&chat, &pane, 20, 2)), vec!["you › line 5"]);
+    }
+
+    /// A pane the human has scrolled away from holds the window it is showing:
+    /// lines that arrive afterwards land below it instead of pushing the text
+    /// they are reading up the pane — and scrolling back down is what rejoins
+    /// the newest line (finding U3).
+    #[test]
+    fn a_held_window_does_not_follow_the_lines_that_arrive() {
+        let mut chat = Chat::bare();
+        for index in 0..6 {
+            chat.push_message(AgentId::ROOT, Message::user(format!("line {index}")));
+        }
+        let pane = pane(AgentId::ROOT);
+        chat.scroll_by(AgentId::ROOT, 4);
+        let held = shown(&pane_rows(&chat, &pane, 20, 2));
+        assert!(
+            !held.join("\n").contains("line 5"),
+            "the pane is away from the newest line: {held:?}"
+        );
+
+        chat.push_message(AgentId::ROOT, Message::user("arrived while held"));
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane, 20, 2)),
+            held,
+            "the rows the human was reading stayed where they were"
+        );
+
+        // The step that leaves the held window rejoins the newest line.
+        chat.scroll_by(AgentId::ROOT, -4);
+        let bottom = shown(&pane_rows(&chat, &pane, 20, 2));
+        assert!(
+            bottom.iter().any(|row| row.contains("arrived while held")),
+            "{bottom:?}"
+        );
+    }
+
+    /// Scrolling is per conversation: one pane's position is not another's, so
+    /// reading a child's scrollback cannot move the root's (finding U3).
+    #[test]
+    fn one_panes_position_is_not_anothers() {
+        let mut chat = Chat::bare();
+        for index in 0..6 {
+            chat.push_message(AgentId::ROOT, Message::user(format!("root {index}")));
+            chat.push_message(AgentId(1), Message::user(format!("child {index}")));
+        }
+        let root = pane(AgentId::ROOT);
+        let child = pane(AgentId(1));
+        let child_rows = shown(&pane_rows(&chat, &child, 20, 2));
+
+        chat.scroll_by(AgentId::ROOT, 3);
+        assert_ne!(
+            shown(&pane_rows(&chat, &root, 20, 2)),
+            shown(&pane_rows(&chat, &child, 20, 2)),
+            "the root scrolled"
+        );
+        assert_eq!(
+            shown(&pane_rows(&chat, &child, 20, 2)),
+            child_rows,
+            "the child's pane did not move"
+        );
     }
 
     /// A transcript belongs to one agent: what a child was told is in the
@@ -977,7 +1124,7 @@ mod tests {
         let text: Vec<String> = bottom.iter().map(|l| l.to_string()).collect();
         assert!(text.last().unwrap().contains("line 5"), "{text:?}");
 
-        chat.scroll_by(2);
+        chat.scroll_by(AgentId::ROOT, 2);
         let scrolled = pane_rows(&chat, &pane, 40, 3);
         assert_eq!(scrolled.len(), 3, "the window is the pane's height");
         assert!(
