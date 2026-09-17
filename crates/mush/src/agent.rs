@@ -2896,14 +2896,29 @@ mod tests {
     /// The child is held inside a real shell command that waits for a file the
     /// test only writes at the very end, so "the answer came back while the
     /// child still ran" is proven by that file's absence rather than by a race.
+    /// Two guards keep that shell from outliving a failure: the gate is opened
+    /// on the way out of the test however it ends, and the wait itself is
+    /// bounded, so even a killed test process cannot leave a child spinning.
     #[test]
     fn a_human_message_reaches_a_root_napping_on_wait_agents() {
+        /// Opens the gate when the test leaves, panic or not: the child is a
+        /// real command looping until the file appears, and an assertion that
+        /// fires before the write would otherwise leak that shell for good.
+        struct Gate(std::path::PathBuf);
+
+        impl Drop for Gate {
+            fn drop(&mut self) {
+                let _ = fs::write(&self.0, "go");
+            }
+        }
+
         let root = std::env::temp_dir().join(format!("mush-wake-e2e-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let gate = root.join("open-the-gate");
+        let _gate = Gate(gate.clone());
         let block = format!(
-            "while [ ! -f {} ]; do sleep 0.05; done; echo released",
+            "i=0; while [ ! -f {} ] && [ $i -lt 400 ]; do sleep 0.05; i=$((i+1)); done; echo released",
             gate.display()
         );
 
@@ -3007,8 +3022,22 @@ mod tests {
         );
         assert_eq!(seen.errors, Vec::<String>::new());
 
-        // Let the child go, then take the tree down.
+        // Let the child go, and wait for its command to come back before
+        // taking the tree down: the gate sits inside the workspace, so deleting
+        // it while the child still watched for it would re-arm a shell that
+        // then spins out its whole bound — the wake-test orphan again, only
+        // smaller. The next thing the child does after its command returns is
+        // ask the model, and that ask carries the output.
         fs::write(&gate, "go").unwrap();
+        let deadline = Instant::now() + WAIT;
+        while !scripted
+            .asked()
+            .iter()
+            .any(|ask| ask.depth() == Some(1) && ask.saw("released"))
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+        }
         let _ = root_tx.send(AgentMsg::Shutdown);
         let _ = fs::remove_dir_all(&root);
     }
