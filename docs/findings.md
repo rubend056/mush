@@ -107,3 +107,39 @@ the real screen at `docs/mush.md` §4.5's sizes (`scripts/screen.py`, including
 `--ask` when an endpoint is reachable), and fold U1/U2 in with everything it
 finds — see §11.12 and §4.6 for the two questions that are already open, and
 `docs/refactor.md` §6 for B3/B17, whose `Screen` view (Stage 3) is still unbuilt.
+
+---
+
+## 5. What made orchestrating mush hard (the harness, seen from inside)
+
+The root agent of the session this file was written in ran a hundred-odd
+subagents in parallel worktrees, and drove five review waves and five fix waves
+through them. These are the gaps that cost it real work — each one is a fact it
+could not get, or a fact that went stale, not a missing feature. `M3` (attach)
+and `M6` (per-agent accounting) are the milestones they belong to; the rest are
+cheap.
+
+| ID | What | Cost, in this session | Where it belongs |
+|---|---|---|---|
+| H1 | **No live view of a subagent.** The only window into the tree was `.mush/session.json` (3.7 MB, the *UI's* copy), so "did #2 ever see #6's result?" had to be answered by hand-parsing JSON. That copy cannot show what the actor knows — `delivered`, parked commands — which is the root of `B20`/`B22`. | The session's central diagnostic was archaeology, and the first diagnosis was wrong *because* the file could not say what the actor held. | `M3` (a `mush status`/attach read over a socket); until then `agent_status` should carry each child's branch, whether its worktree is dirty, its last activity, and whether a result is finished-but-unread — and the session file should carry the delivery/parked facts |
+| H2 | **A run that was cut off looks exactly like one that finished.** Agents #1 and #2 died when the harness process was SIGTERM'd and #18 died on a transport reset; on screen and in the file they were simply "idle", with no summary and no marker, and their work sat uncommitted until someone went looking. | Two runs' worth of work recovered by hand; four later agents spent their first minutes finishing someone else's tail. | a `CutOff`/`Interrupted` outcome distinct from `Done`/`Failed`/`Stopped`, written to `session.json`, painted on the row, and reported to the parent as "cut off, nothing committed" |
+| H3 | **An isolated run's automatic commit says `mush #N: <the whole brief as typed>`.** It saved the biggest branch of the wave from a killed process — and then had to be amended by hand because the subject was an 800-word paragraph. | One commit message rewritten; the auto-commit hides what a merge body then has to explain. | `agent.rs`'s `commit_subject`: a subject from the brief's first line (or the outcome), the brief in the body |
+| H4 | **Nothing tells the human that a child finished**; only the parent's transcript hears it (after the fold fix), and the row's mark changing is all the screen says. | A whole review pass answered "did #2 see #6?"; the human asked the same question. | a `Notice` or bar line on `ChildDone` in the *parent's* pane, and a row mark for "result unread" |
+| H5 | **Steering was not a capability you could trust.** `agent_control message` answered `messaged agent #N` for four agents, none of whose transcripts held the line, and an idle target was not woken. Fixed on `mush/15` (`AgentMsg::Steer` → `push_line`), but the *reply* still says "messaged" whether or not anything happened. | Four agents worked for an hour without the rule they were sent — including "do not spawn any more subagents". | done for delivery; left is the honest reply (delivered / parked / undeliverable) |
+| H6 | **Timing-sensitive tests in a suite that runs while ten agents build on one box.** `wait_commands_returns_a_jobs_report` failed about half the time under load (a test racing a clock it had told to lie; fixed), and `a_frame_fits_in_a_60fps_budget…` is still load-sensitive. | Every flake costs an agent a retry it cannot tell from a real failure, and a gate that is green "usually" is not a gate. | the `Clock`/`Machine`/`Events` seams exist for this: no test may depend on wall-clock availability, and a budget test should say "on an idle box" or be `#[ignore]`d |
+| H7 | **A spawn cannot name its base.** An isolated child branches from its parent's working tree — usually right, occasionally exactly wrong ("start from `master`"), and then merges had to be done by hand. | Merge labour; one branch re-cut. | an optional base (branch or sha) on `spawn_agent`, and mush saying which commit a child started from |
+| H8 | **No picture of the machine.** Each parallel worktree pays its own `cargo build`, so with a dozen agents the box is the bottleneck and nothing on screen says so. | Self-imposed serialisation; the same tree compiled many times. | `M2.8`'s registry shows jobs now; the other half is a shared `target/` or an honest warning |
+| H9 | **Quitting kills the agents' process groups — including agents mid-task.** Correct per §5.6, and exactly how #1/#2 lost their runs when the harness went down. | Two runs. | a quit that says what it is about to kill, or a detached mode, instead of silence |
+| H10 | **Worktrees and branches accumulate and nothing prunes them.** Twenty-two were live at the end, most finished and merged; `/worktrees` also claims "none" while one is on disk (`P10`). | Disk, and two audits that counted the source twice until it was cleaned. | a `mush prune`, and a `/worktrees` message that tells the truth about disk as well as the session |
+| H11 | **Docs and code drift silently, and the drift *is* a finding.** One wave left `docs/mush.md`'s key table, §4.5's glyphs, §4.6 in full, §8's deadline and §9's milestones stale, plus `docs/refactor.md`'s checklist statuses; every reviewer spent budget on it and one fix wave existed only for sentences the docs asserted. | Repeated re-derivation, and a doc-sync wave owed at the end of every wave. | a status row that must move when a finding closes (or a test that fails when a documented status and the code disagree), and docs updated in the same commit as the code |
+| H12 | **Context and reply caps were the quiet bottleneck.** A 20 480 reply cap truncated real work mid-task (`U9`), and several agents burned turns on runaway guards and compaction instead of the task. | Several runs cut off mid-edit. | done for the shipped defaults (`U9`); what is left is per-agent accounting (`M6`, §11.2) so the cost is visible while it is spent |
+
+**What already made it easier, and should not be traded away:** one worktree per
+isolated agent with its own branch, and mush committing that worktree's work when
+the run ends (it saved the whole `mush/4` milestone from a killed process); the
+`ModelClient`/`Machine`/`Clock`/`Events` fakes, which let every fix be tested with
+no socket, no subprocess and no sleep; `scripts/screen.py` and `smoke.py`, which
+are the only reason a UX review could quote painted rows as evidence;
+`docs/refactor.md`'s symbol-level map, which made a 20 000-line tree navigable by
+agents with no memory of each other; and this file's one-line-per-defect shape,
+which is what let five waves hand work to each other without losing an item.
