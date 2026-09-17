@@ -122,7 +122,7 @@ pub struct Message {
     pub role: String,
     /// Always a string on the way out — the spec's own request form, for both
     /// assistant history and tool results. On the way in, either wire shape
-    /// (see [`content_from_wire`]).
+    /// (see `content_from_wire`).
     #[serde(
         default,
         deserialize_with = "content_from_wire",
@@ -181,7 +181,7 @@ impl Message {
         self.tool_calls.as_deref().unwrap_or(&[])
     }
 
-    /// See [`assign_tool_call_ids`]: every call gets an id a strict server
+    /// See `assign_tool_call_ids`: every call gets an id a strict server
     /// accepts, and its result can then answer an id that exists. Idempotent,
     /// so a message that already has unique ids comes out unchanged.
     pub fn ensure_tool_call_ids(&mut self) {

@@ -658,6 +658,15 @@ fn tls_connect(
     Ok(stream)
 }
 
+/// A URL to connect to: scheme, host, port and path.
+///
+/// Deliberately strict — exactly the two schemes mush speaks, and a scheme is
+/// required — and a redirect is *not* followed: a 3xx comes back as its status
+/// and the caller reports the endpoint's own answer. Following one means
+/// keeping the `Location` header (which this client discards), deciding whether
+/// a 301/302/303 becomes a GET, and whether the API key may travel to another
+/// host. Three decisions, not two lines: an endpoint that redirects is one to
+/// point mush at directly.
 fn parse_url(url: &str) -> io::Result<(String, u16, String, bool)> {
     let (rest, tls) = if let Some(rest) = url.strip_prefix("https://") {
         (rest, true)
