@@ -551,14 +551,50 @@ reference workspace, and no command could clear them.
 
 - **Discovery asks the disk, not just the registry.** `Worktree::on_disk()` is
 the one predicate; a registry entry whose checkout is gone gets no row.
-  Pinned by `worktrees_clears_dead_git_entries_and_keeps_the_branch`.
-- **`/worktrees` reconciles.** The re-scan runs `git worktree prune` and its
-  line says `cleared N stale git entries (branches kept)`. **No new command** —
-  clearing dead entries is part of the re-scan the command already promises.
-  The prune touches only `.git/worktrees/` administration: every branch,
-  commit, and stored transcript remains, so the work is still there when a
-  failing test later wants it. Pinned by
-  `pruning_takes_the_dead_registry_entry_and_leaves_the_branch`.
+- **`/worktrees` reconciles.** The re-scan ran `git worktree prune` and its
+  line said `cleared N stale git entries (branches kept)`.
+
+**Amended by §8.17:** the `/worktrees` half is gone with the command family it
+belonged to. The discovery half stands and is what fixed the phantom rows;
+pruning the registry is now `git worktree prune`, run where git is run. The
+row this fixed had no test of its own left — it is pinned by the fixture in
+`porcelain_worktrees_parse_in_every_shape` (a `prunable` block parses, and
+`on_disk` is what judges it) and by every `isolation`/leftover test that
+still registers a real worktree.
 
 **Census at `e63a84c`:** total 42,614 (was 42,477), **prod 7,819 (+12)**, tests
 22,186 (+80), comments 9,829 (+37).
+
+---
+
+## 8.17 The command table, cut to what mush owns (`ad5b791`)
+
+The table had grown to seventeen slash commands, six of them wrappers around
+`git` (`/worktrees`, `/diff`, `/merge`, `/discard`) or around a row
+(`/forget`), one duplicating a key (`/new`, which is Ctrl-N), and one
+reporting what the bar already shows (`/context`). Removed all eight; nine
+rows remain, every one a fact only mush owns:
+
+| kept | why it is mush's |
+|---|---|
+| `/provider`, `/model`, `/url`, `/key`, `/models` | config and endpoint facts |
+| `/compact` | an actor operation with no key |
+| `/notes` | the reader of the foot's `+N more` line |
+| `/help`, `/quit` | the table and the exit |
+
+The Context *meter* stays on screen; only its setter and reporter went.
+
+The screen did not lose facts with the commands: a row's footer names
+`.mush/wt/<id>` and `git diff HEAD...mush/<branch>` (git's own spellings, no
+mush wrapper), and the landed story (`merged into HEAD` / `discarded`) is
+stored in the session. Discovery is automatic, so `rm -rf .mush` cannot
+resurrect a row. Nineteen tests died with the commands they pinned (456 →
+437, 3 ignored; mush-core 108 after its prune test went too).
+
+**Census at `ad5b791`:** total 41,343 (was 42,614), **prod 7,534 (−285)**,
+tests 21,503 (−683), comments 9,600 (−229). Net −1,271 lines.
+
+**Owed in the doc-sync pass:** `README.md`’s chat-command list and its
+“Isolated agents” section (the three commands and `/worktrees`), plus
+`docs/mush.md` §3 (spawn signature and tool table) and §5.5 (`isolated
+unavailable`), already owed from §8.13.
