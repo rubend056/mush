@@ -15,10 +15,12 @@
 mod chat;
 pub mod commands;
 pub mod keys;
+mod screen;
 mod settings;
 mod tree;
 
 pub use chat::{Chat, Pane, Rank};
+pub use screen::{AgentRow, AgentsPane, BarPane, ChatPane, PickerPane, Screen};
 pub use settings::{ConfigCell, ConfigHandle, WindowSource};
 pub use tree::{
     AgentId, AgentNode, AgentTree, Compacting, ConversationId, Existing, Landed, Phase, Spawn,
@@ -1505,7 +1507,7 @@ impl App {
         // from the same formula `ui::draw_picker` sizes with, so the lines fit
         // the list instead of being clipped by it (`picker_text_width` says
         // what).
-        let width = crate::ui::picker_text_width(self.term_width);
+        let width = screen::picker_text_width(self.term_width);
         let notes = self.chat.notes_report(agent, session::now_secs(), width);
         if notes.rows.is_empty() {
             self.say(format!("nothing written about #{agent} yet"));
@@ -2467,6 +2469,8 @@ mod tests {
     use crossbeam_channel::Receiver;
     use ratatui::backend::TestBackend;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
+    use ratatui::layout::Rect;
+    use ratatui::widgets::{Block, Borders};
     use ratatui::Terminal;
 
     use crate::session_save;
@@ -2838,27 +2842,308 @@ mod tests {
         app
     }
 
+    /// One painted frame: the `Screen` `App` derived and the grid it was
+    /// painted into, cell by cell and borders included.
+    ///
+    /// The layout tiers, the panes and the foot are only true together, which
+    /// is why the audit that found these defects read rows instead of reasoning
+    /// about them — and why the sweep reads the `Screen` too: a rect is a
+    /// promise about where the words are allowed to be.
+    struct Shot {
+        screen: Screen,
+        /// The frame, cell by cell: not the rows joined, because a cell can hold
+        /// a grapheme of more than one character and a column is a column.
+        cells: Vec<Vec<String>>,
+    }
+
+    impl Shot {
+        /// One row, as it is read.
+        fn line(&self, y: u16) -> String {
+            self.cells[y as usize].concat()
+        }
+
+        /// The rows as a test reads them, with a pane's border stripped.
+        fn rows(&self) -> Vec<String> {
+            self.cells
+                .iter()
+                .map(|row| row.concat().trim_matches('│').trim_end().to_string())
+                .collect()
+        }
+
+        /// The rows as a terminal *shows* them: the column after a wide glyph
+        /// belongs to that glyph, so the blank the buffer keeps there is not a
+        /// space of its own (finding B9's arithmetic, read back).
+        fn shown(&self) -> Vec<String> {
+            self.cells
+                .iter()
+                .map(|row| {
+                    let mut out = String::new();
+                    let mut covered = 0usize;
+                    for cell in row {
+                        if covered > 0 {
+                            covered -= 1;
+                            continue;
+                        }
+                        out.push_str(cell);
+                        covered =
+                            unicode_width::UnicodeWidthStr::width(cell.as_str()).saturating_sub(1);
+                    }
+                    out
+                })
+                .collect()
+        }
+
+        /// The whole frame as one string, for a `contains` assertion.
+        fn text(&self) -> String {
+            (0..self.cells.len() as u16)
+                .map(|y| self.line(y))
+                .collect::<Vec<_>>()
+                .join("\n")
+        }
+
+        /// The cells inside a rect, row by row.
+        fn inside(&self, rect: Rect) -> Vec<String> {
+            (rect.y..rect.y.saturating_add(rect.height))
+                .map(|y| {
+                    (rect.x..rect.x.saturating_add(rect.width))
+                        .map(|x| self.cell(x, y))
+                        .collect::<String>()
+                })
+                .collect()
+        }
+
+        fn cell(&self, x: u16, y: u16) -> String {
+            self.cells
+                .get(y as usize)
+                .and_then(|row| row.get(x as usize))
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        /// Every rect a pane owns, the popup included.
+        fn pane_rects(&self) -> Vec<Rect> {
+            match &self.screen {
+                Screen::Floor { .. } => Vec::new(),
+                Screen::Panes(panes) => {
+                    let mut rects = vec![
+                        panes.agents.area,
+                        panes.chat.transcript_area,
+                        panes.chat.input_area,
+                        panes.bar.area,
+                    ];
+                    if let Some(picker) = &panes.picker {
+                        rects.push(picker.area);
+                    }
+                    rects
+                }
+            }
+        }
+
+        /// Every rule a frame must keep whatever it says: nothing painted
+        /// outside a pane, every pane's own frame intact, the bar keeping its
+        /// row, and every line a pane was handed fitting the pane it is painted
+        /// in.
+        fn assert_shape(&self, case: &str, width: u16, height: u16) {
+            let at = format!("{case} at {width}×{height}");
+            let Screen::Panes(panes) = &self.screen else {
+                panic!("{at}: the floor notice has no panes to check");
+            };
+            let rects = self.pane_rects();
+            let holds = |rect: &Rect, x: u16, y: u16| {
+                (rect.x..rect.x + rect.width).contains(&x)
+                    && (rect.y..rect.y + rect.height).contains(&y)
+            };
+
+            // Nothing is painted outside a pane: the frame is blank everywhere
+            // else, so a cell that is not is a widget that spilled over its
+            // rect — or a pane whose rect is not where it paints.
+            for (y, row) in self.cells.iter().enumerate() {
+                for (x, cell) in row.iter().enumerate() {
+                    if cell == " " {
+                        continue;
+                    }
+                    assert!(
+                        rects.iter().any(|rect| holds(rect, x as u16, y as u16)),
+                        "{at}: `{cell}` at {x},{y} is outside every pane"
+                    );
+                }
+            }
+
+            // Every pane's own frame is intact — a border that moved, vanished
+            // or was painted over is a pane whose neighbour is wrong. The cells
+            // a popup covers are skipped: `Clear` erases what is under it on
+            // purpose.
+            let covered = panes.picker.as_ref().map(|picker| picker.area);
+            for rect in [
+                panes.agents.area,
+                panes.chat.transcript_area,
+                panes.chat.input_area,
+            ] {
+                // The sides, from just under the top border to just above the
+                // bottom one: the top row carries the pane's title, which may
+                // reach either corner.
+                for y in rect.y + 1..rect.y + rect.height.saturating_sub(1) {
+                    for x in [rect.x, rect.x + rect.width - 1] {
+                        if covered.is_some_and(|covered| holds(&covered, x, y)) {
+                            continue;
+                        }
+                        assert_eq!(self.cell(x, y), "│", "{at}: the border at {x},{y}");
+                    }
+                }
+                for x in rect.x..rect.x + rect.width {
+                    let y = rect.y + rect.height - 1;
+                    if covered.is_some_and(|covered| holds(&covered, x, y)) {
+                        continue;
+                    }
+                    assert!(
+                        "─└┘".contains(&self.cell(x, y)),
+                        "{at}: the bottom border at {x},{y}: {:?}",
+                        self.cell(x, y)
+                    );
+                }
+            }
+            if let Some(picker) = &panes.picker {
+                let rect = picker.area;
+                for y in rect.y + 1..rect.y + rect.height.saturating_sub(1) {
+                    for x in [rect.x, rect.x + rect.width - 1] {
+                        assert_eq!(self.cell(x, y), "│", "{at}: the popup's border at {x},{y}");
+                    }
+                }
+                for x in rect.x..rect.x + rect.width {
+                    let y = rect.y + rect.height - 1;
+                    assert!(
+                        "─└┘".contains(&self.cell(x, y)),
+                        "{at}: the popup's bottom border at {x},{y}: {:?}",
+                        self.cell(x, y)
+                    );
+                }
+            }
+
+            // The bar keeps its row on every terminal: the focus badge and the
+            // line that is the only home an Info line, a failure or a command's
+            // usage error has. It was the trailing constraint once, and at 40×10
+            // it was simply not painted.
+            let bar = self
+                .inside(Rect {
+                    height: 1,
+                    ..panes.bar.area
+                })
+                .join("");
+            assert!(
+                bar.contains(" chat ") || bar.contains(" agents "),
+                "{at}: the bar lost its badge: {bar:?}"
+            );
+            assert!(
+                bar.trim().chars().count() > " chat ".len(),
+                "{at}: the bar is a badge and nothing else: {bar:?}"
+            );
+
+            // Every row the agents pane was handed fits the columns it is
+            // painted in: `fit_row`'s promise, read at the width the row is
+            // really painted at, and a row that loses its tail to the renderer
+            // is the defect this reads for (R1).
+            let rows_area = Block::default()
+                .borders(Borders::ALL)
+                .inner(panes.agents.area);
+            for row in &panes.agents.rows {
+                let line = crate::ui::agent_line(row, rows_area.width as usize);
+                assert!(
+                    unicode_width::UnicodeWidthStr::width(line.as_str())
+                        <= rows_area.width as usize,
+                    "{at}: an agent row is wider than its pane: {line:?}"
+                );
+            }
+
+            // Every line a pane was handed fits the pane it is painted in. A
+            // wider line is clipped silently by the renderer, which is how a
+            // wrapped message loses its tail.
+            let room = Block::default()
+                .borders(Borders::ALL)
+                .inner(panes.chat.transcript_area);
+            if let Some(painted) = &panes.chat.transcript {
+                for line in &painted.lines {
+                    assert!(
+                        line.width() <= room.width as usize,
+                        "{at}: a transcript line is wider than its pane: {line:?}"
+                    );
+                }
+            }
+            let field = Block::default()
+                .borders(Borders::ALL)
+                .inner(panes.chat.input_area);
+            if let Some(input) = &panes.chat.input {
+                let prompt = unicode_width::UnicodeWidthStr::width(input.prompt.as_str());
+                for line in &input.lines {
+                    assert!(
+                        prompt + unicode_width::UnicodeWidthStr::width(line.as_str())
+                            <= field.width as usize,
+                        "{at}: a message-box line is wider than its pane: {line:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Paint one frame at a real terminal size, the way `main` does: the size
+    /// the next frame (and any `/notes` opened between frames) sees, one
+    /// `Screen` derived for the frame's own area, and it painted into a
+    /// `TestBackend`.
+    fn shot(app: &mut App, width: u16, height: u16) -> Shot {
+        app.set_term_size(width, height);
+        let screen = app.screen(Rect::new(0, 0, width, height));
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &screen))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let cells = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol().to_string())
+                    .collect()
+            })
+            .collect();
+        Shot { screen, cells }
+    }
+
+    /// One painted frame, cell by cell and borders included: a leak lands *on*
+    /// a border column, which is the one thing `screen` trims away.
+    fn frame_grid(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        shot(app, width, height).rows()
+    }
+
+    /// No cell may carry a character that commands the display instead of being
+    /// read: a control byte, a carriage return, an escape, or a bidi isolate.
+    /// Untrusted words — a model reply, a tool result, an endpoint's error body,
+    /// a model id, a job's command — reach every surface on this screen, so this
+    /// is asserted over the *painted frame*, borders included, and never over
+    /// the text those words came from (findings U9/N3).
+    fn assert_no_command(at: &str, shot: &Shot) {
+        for (y, row) in shot.cells.iter().enumerate() {
+            for (x, cell) in row.iter().enumerate() {
+                for ch in cell.chars() {
+                    assert!(
+                        !ch.is_control()
+                            && !matches!(
+                                ch,
+                                '\u{202a}'..='\u{202e}'
+                                    | '\u{2066}'..='\u{2069}'
+                                    | '\u{200e}'
+                                    | '\u{200f}'
+                            ),
+                        "{at}: {ch:?} at {x},{y} commands the display"
+                    );
+                }
+            }
+        }
+    }
+
     /// The painted screen, row by row, at a real terminal size. The layout
     /// tiers, the panes and the foot are only true together, which is why the
     /// audit that found these defects read rows instead of reasoning about
     /// them. A pane's border is stripped: what a test reads is the row's text.
     fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
-        // Exactly what `main` does at startup and on resize: the width the
-        // next frame (and any `/notes` opened between frames) sees.
-        app.set_term_size(width, height);
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
-        let buffer = terminal.backend().buffer();
-        (0..height)
-            .map(|y| {
-                (0..width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-                    .trim_matches('│')
-                    .trim_end()
-                    .to_string()
-            })
-            .collect()
+        shot(app, width, height).rows()
     }
 
     /// The painted rows that wear the agents pane's selection highlight — the
@@ -2868,8 +3153,11 @@ mod tests {
     /// excluded because its focus badge wears the same cyan and is not a row.
     fn selected_rows(app: &mut App, width: u16, height: u16) -> Vec<usize> {
         app.set_term_size(width, height);
+        let screen = app.screen(Rect::new(0, 0, width, height));
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &screen))
+            .unwrap();
         let buffer = terminal.backend().buffer();
         let bar_rows = if height >= 24 { 2 } else { 1 };
         (0..(height - bar_rows) as usize)
@@ -4178,11 +4466,21 @@ mod tests {
             );
         }
         let mut terminal = Terminal::new(TestBackend::new(120, 40)).unwrap();
-        terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+        // A frame is now two halves — `App` derives the `Screen` and the
+        // painter paints it — and the budget is for *both*: a screen built in
+        // 55 ms and painted in one is still 55 ms of lag.
+        let area = Rect::new(0, 0, 120, 40);
+        terminal
+            .draw(|f| {
+                let screen = app.screen(area);
+                crate::ui::draw(f, &screen)
+            })
+            .unwrap();
         const FRAMES: u32 = 30;
         let start = Instant::now();
         for _ in 0..FRAMES {
-            terminal.draw(|f| crate::ui::draw(f, &mut app)).unwrap();
+            let screen = app.screen(area);
+            terminal.draw(|f| crate::ui::draw(f, &screen)).unwrap();
         }
         let per_frame = start.elapsed() / FRAMES;
         eprintln!("measured: {per_frame:?} per frame");
@@ -6356,83 +6654,834 @@ mod tests {
         assert_eq!(short_age(Duration::from_secs(3600 + 120)), "1h02m");
     }
 
-    /// The layout must survive every terminal size.
+    /// The commands an untrusted word can carry: an OSC title rename, a carriage
+    /// return, a bidi isolate. Every one of them has leaked onto some one-line
+    /// surface of this screen at least once (findings U9/N3).
+    const HOSTILE: &str = "\x1b]0;PWNED\x07\r\u{2066}escaped";
+
+    /// Every size the draw sweep paints at: the seven the §4.5 audit
+    /// photographs, plus the tiers' own edges — the compact cut at 80 wide and
+    /// 20 tall, the bar's second row at 24 — and the degenerate 1×1 a resize can
+    /// reach mid-frame.
+    const SWEEP_SIZES: &[(u16, u16)] = &[
+        (200, 50),
+        (160, 26),
+        (120, 32),
+        (100, 25),
+        (80, 24),
+        (79, 24),
+        (60, 20),
+        (60, 17),
+        (50, 12),
+        (40, 10),
+        (39, 10),
+        (39, 9),
+        (30, 8),
+        (20, 5),
+        (1, 1),
+    ];
+
+    /// One state of the draw sweep: an app, and the words its frame must have
+    /// painted.
     ///
-    /// This is the regression guard for the arithmetic in `ui.rs`: subticks,
-    /// index math, and `Rect` construction all have to hold at the floor and at
-    /// sizes between the tiers — a panic there is a blank screen for the user.
-    #[test]
-    fn the_layout_survives_every_size() {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
+    /// `words` are painted at *every* size with a floor to paint in: the facts
+    /// that must survive the smallest screen, and the ones a bug in the size
+    /// tiers would take away. `roomy` are painted at every size at least 80×24,
+    /// where the transcript's foot, the selected row's footer and the facts line
+    /// all have the room they were built for. `reopen` is for the popups whose
+    /// item wrapping is derived from the terminal's width *when they open*
+    /// (`/notes`): the sweep opens them again for each size, which is what a
+    /// human resizing the terminal with the popup up would get.
+    struct Sweep {
+        name: &'static str,
+        app: App,
+        words: Vec<&'static str>,
+        roomy: Vec<&'static str>,
+        reopen: Option<fn(&mut App)>,
+    }
 
-        let (mut app, _rx) = test_app("layout-sizes");
-        // A tree with depth, a branch, and every phase, so no branch of the
-        // renderer goes unexercised.
+    /// One agent, as its parent reports it to the UI.
+    fn spawn_agent(
+        app: &mut App,
+        id: u64,
+        parent: u64,
+        depth: usize,
+        brief: &str,
+        branch: Option<&str>,
+    ) {
         let conversation = app.tree.conversation();
-        for (id, parent, depth) in [(1u64, 0u64, 1usize), (2, 1, 2)] {
-            app.update(Msg::Agent {
-                conversation,
-                id: AgentId(parent),
-                event: AgentEvent::Spawned {
-                    child: id,
-                    parent,
-                    brief: "a deliberately long brief that will not fit".to_string(),
-                    depth,
-                    branch: Some(format!("mush/{id}")),
-                    cmd: crossbeam_channel::unbounded().0,
-                },
-            });
-        }
-        app.tree.activity(AgentId(1), "edit_file src/lexer.rs 12s");
-        app.tree.fail(AgentId(2), "no route to host".to_string());
-        app.refresh_git();
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId(parent),
+            event: AgentEvent::Spawned {
+                child: id,
+                parent,
+                depth,
+                brief: brief.to_string(),
+                branch: branch.map(str::to_string),
+                cmd: crossbeam_channel::unbounded().0,
+            },
+        });
+    }
 
-        for (width, height) in [
-            (200u16, 50u16),
-            (160, 26),
-            (120, 32),
-            (100, 25),
-            (80, 24),
-            (79, 24),
-            (60, 20),
-            (60, 19),
-            (50, 12),
-            (40, 10),
-            (39, 9),
-            (20, 5),
-            (1, 1),
+    /// A run in flight on one agent: what its actor reports when it starts.
+    fn begin_run(app: &mut App, id: AgentId) {
+        app.on_agent(
+            id,
+            AgentEvent::Running {
+                cancel: Arc::new(AtomicBool::new(false)),
+            },
+        );
+    }
+
+    /// A job running on this machine, launched through the one registry the
+    /// rows, the selected row's footer and the bar all read.
+    fn running_job(app: &mut App, owner: u64) {
+        use crate::jobs::Launch;
+        use crate::machine::fake::{Script, Scripted};
+        use crate::machine::{Machine, ShellCommand};
+
+        let machine = Arc::new(Scripted::new().runs(Script::hangs()));
+        let job = machine
+            .spawn(&ShellCommand {
+                command: "cargo build --release",
+                root: std::path::Path::new("/tmp"),
+            })
+            .unwrap();
+        let (mailbox, _rx) = crossbeam_channel::unbounded();
+        app.tree
+            .handles()
+            .jobs
+            .launch(Launch::started(
+                owner,
+                "cargo build --release".to_string(),
+                false,
+                mailbox,
+                job,
+            ))
+            .unwrap();
+    }
+
+    /// Twenty agents three levels deep, with a branch on one of them, a run in
+    /// flight, a failure and a dirty repository: the shape the audit's worst
+    /// screen was.
+    fn a_twenty_agent_tree(label: &str) -> (App, Receiver<Msg>) {
+        let (mut app, rx) = test_app(label);
+        for id in 1..=12u64 {
+            // One isolated child, one working, one failed: the three states a
+            // row's tail can carry.
+            let branch = (id == 3).then(|| format!("mush/{id}"));
+            spawn_agent(
+                &mut app,
+                id,
+                0,
+                1,
+                &format!("task {id} for the sweep"),
+                branch.as_deref(),
+            );
+        }
+        for id in 13..=19u64 {
+            spawn_agent(&mut app, id, 1, 2, &format!("grandchild {id}"), None);
+        }
+        // A mixed tree: the states a row can wear, so the title's counts count
+        // something. Everything `insert` made thinking is put back at rest
+        // except the children that stay in flight.
+        app.tree.idle(AgentId(1));
+        app.tree.activity(AgentId(2), "edit_file src/lexer.rs");
+        app.tree
+            .finish(AgentId(3), Some("the parser is ported".to_string()));
+        app.tree.fail(AgentId(4), "no route to host".to_string());
+        app.tree.stopped(AgentId(5));
+        for id in 13..=19u64 {
+            app.tree.idle(AgentId(id));
+        }
+        app.tree.agent_stats.insert(
+            AgentId(3),
+            git::Stat {
+                files: 2,
+                added: 12,
+                removed: 4,
+            },
+        );
+        // A dirty repository read a moment ago, so the facts line has its
+        // branch, its dirty count and its delta.
+        app.git = Some(git::RepoStatus {
+            branch: "main".to_string(),
+            dirty: 3,
+            stat: git::Stat {
+                files: 1,
+                added: 9,
+                removed: 2,
+            },
+        });
+        app.git_at = Some(Instant::now());
+        (app, rx)
+    }
+
+    /// The states the sweep paints: one per fact a frame can carry, each built
+    /// the way its actor, its file or its keyboard would build it.
+    ///
+    /// The receivers are handed back with the states so the UI channel each app
+    /// was built with stays alive for as long as the app does — a dropped
+    /// receiver is a message that never lands.
+    fn sweep_states() -> (Vec<Sweep>, Vec<Receiver<Msg>>) {
+        let mut states: Vec<Sweep> = Vec::new();
+        let mut keep = Vec::new();
+
+        // Nothing has happened yet.
+        let (fresh, rx) = test_app("sweep-fresh");
+        states.push(Sweep {
+            name: "fresh",
+            app: fresh,
+            words: vec!["· #0", " agents ", " chat ", "Tab cycles panes"],
+            roomy: vec!["you", " message ", "Ask for a change"],
+            reopen: None,
+        });
+        keep.push(rx);
+
+        // A run in flight, naming the tool it is running.
+        let (mut run, rx) = test_app("sweep-run");
+        begin_run(&mut run, AgentId::ROOT);
+        run.on_agent(
+            AgentId::ROOT,
+            AgentEvent::Status("edit_file src/lib.rs".into()),
+        );
+        states.push(Sweep {
+            name: "a run in flight",
+            app: run,
+            words: vec!["◐ #0", "edit_file src/lib.rs", "working…", " chat "],
+            roomy: vec![" agents · 1 working"],
+            reopen: None,
+        });
+        keep.push(rx);
+
+        // A root parked on a child's result — and a grandchild of its own in
+        // flight under that child, because the count the bar prints, the `⏸N`
+        // on the row and the title's `M waiting` all have to be about the
+        // root's *own* children (finding U2).
+        let (mut parked, rx) = test_app("sweep-parked");
+        spawn_agent(
+            &mut parked,
+            1,
+            0,
+            1,
+            "build the lexer for the config format",
+            None,
+        );
+        spawn_agent(&mut parked, 2, 1, 2, "tokenize the samples", None);
+        states.push(Sweep {
+            name: "parked on children",
+            app: parked,
+            words: vec!["⏸1", "2 working", "waiting on 1 subagent"],
+            roomy: vec!["◐ #1", "◐ #2", "lexer", " agents · 2 working · 1 waiting"],
+            reopen: None,
+        });
+        keep.push(rx);
+
+        // The three folds the tree can be doing, each in its own words. The
+        // transcript is left empty on purpose: at 40×10 a pane with messages
+        // protects its last row, and the foot that carries the fold's longer
+        // spelling is the row it protects it *from* — the existing fold test
+        // keeps the message case.
+        for (label, why, words) in [
+            ("sweep-fold-requested", Compacting::Requested, "compacting"),
+            (
+                "sweep-fold-parked",
+                Compacting::Parked,
+                "folding at the next step",
+            ),
+            (
+                "sweep-fold-nearly-full",
+                Compacting::NearlyFull,
+                "context nearly full",
+            ),
         ] {
-            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-            terminal
-                .draw(|frame| crate::ui::draw(frame, &mut app))
-                .unwrap_or_else(|error| panic!("draw failed at {width}x{height}: {error}"));
-            // Both focus states, since a border is painted differently when it
-            // is focused and a focused-but-tiny pane is the awkward case.
-            app.focus = Focus::Agents;
-            terminal
-                .draw(|frame| crate::ui::draw(frame, &mut app))
-                .unwrap_or_else(|error| panic!("draw failed at {width}x{height}: {error}"));
-            app.focus = Focus::Chat;
+            let (mut fold, rx) = test_app(label);
+            fold.on_agent(AgentId::ROOT, AgentEvent::Compacting { why, cancel: None });
+            states.push(Sweep {
+                name: "a fold",
+                app: fold,
+                words: vec!["≡ #0", words, "keep typing"],
+                roomy: vec!["your message is answered after the fold"],
+                reopen: None,
+            });
+            keep.push(rx);
+        }
+
+        // A failed run: the model's own error words, on the row, the foot and
+        // the bar.
+        let (mut failed, rx) = test_app("sweep-failed");
+        begin_run(&mut failed, AgentId::ROOT);
+        failed.on_agent(AgentId::ROOT, AgentEvent::Error("no route to host".into()));
+        states.push(Sweep {
+            name: "a failed run",
+            app: failed,
+            words: vec!["✗ #0", "no route to host", "agent #0 failed"],
+            roomy: vec!["! no route to host"],
+            reopen: None,
+        });
+        keep.push(rx);
+
+        // A stopped run is not a failure and must not borrow `✓`.
+        let (mut stopped, rx) = test_app("sweep-stopped");
+        begin_run(&mut stopped, AgentId::ROOT);
+        stopped.on_agent(AgentId::ROOT, AgentEvent::Stopped);
+        states.push(Sweep {
+            name: "a stopped run",
+            app: stopped,
+            words: vec!["⊘ #0", "stopped"],
+            roomy: vec!["re-send to resume"],
+            reopen: None,
+        });
+        keep.push(rx);
+
+        // A session restored from a hand-written file: a failed child and the
+        // failure mush wrote about the root's last run.
+        states.push(Sweep {
+            name: "a restored session",
+            app: restored_session("sweep-restored"),
+            words: vec!["· #0", " agents ", " chat ", "mush › "],
+            roomy: vec!["✗ #1", "mush/1", "! the endpoint returned 503"],
+            reopen: None,
+        });
+
+        // A pane was scrolled away from the bottom: the title says so.
+        let (mut scrolled, rx) = test_app("sweep-scrolled");
+        for i in 1..=30 {
+            scrolled
+                .chat
+                .push_message(AgentId::ROOT, Message::user(format!("message {i}")));
+            scrolled
+                .chat
+                .push_message(AgentId::ROOT, Message::assistant(format!("reply {i}")));
+        }
+        scrolled.chat.scroll_by(AgentId::ROOT, 5);
+        states.push(Sweep {
+            name: "a transcript scrolled back",
+            app: scrolled,
+            words: vec!["scrolled ↑5 rows", "PgDn"],
+            roomy: vec![],
+            reopen: None,
+        });
+        keep.push(rx);
+
+        // More notes than the foot has rows: the pane says how many it is
+        // hiding, and where to read them.
+        let (mut noted, rx) = test_app("sweep-notes-foot");
+        for i in 1..=7 {
+            noted
+                .chat
+                .note_for(AgentId::ROOT, format!("mush wrote this: note {i}"));
+        }
+        states.push(Sweep {
+            name: "a foot with hidden lines",
+            app: noted,
+            words: vec!["more lines", "/notes"],
+            roomy: vec!["note 7", "note 6", "+5 more lines"],
+            reopen: None,
+        });
+        keep.push(rx);
+
+        // A job on this machine: the row's badge, the footer's line and the
+        // bar's report, all from the one registry.
+        let (mut jobbed, rx) = test_app("sweep-job");
+        running_job(&mut jobbed, 0);
+        jobbed.on_agent(
+            AgentId::ROOT,
+            AgentEvent::JobStarted {
+                job: 1,
+                command: "cargo build --release".to_string(),
+            },
+        );
+        states.push(Sweep {
+            name: "a job",
+            app: jobbed,
+            words: vec!["⚙1", "#c1"],
+            roomy: vec![" 1 jobs · #c1"],
+            reopen: None,
+        });
+        keep.push(rx);
+
+        // Twenty agents, three levels deep, with a dirty repository.
+        let (twenty, twenty_rx) = a_twenty_agent_tree("sweep-twenty");
+        states.push(Sweep {
+            name: "twenty agents",
+            app: twenty,
+            words: vec![" agents · ", " chat "],
+            roomy: vec![
+                "8 working",
+                "1 waiting",
+                "grandchild",
+                "mush/3",
+                "main ±3 +9−2",
+            ],
+            reopen: None,
+        });
+        keep.push(twenty_rx);
+
+        // The `/model` picker.
+        let (mut models, rx) = test_app("sweep-model-picker");
+        models.models = vec![
+            http::Model {
+                id: "test-model".to_string(),
+                context: Some(500_000),
+            },
+            http::Model {
+                id: "deepseek-chat".to_string(),
+                context: Some(128_000),
+            },
+            // An endpoint names its own models, and the picker paints the name
+            // whole: this one is a command, and the sweep's cell check is what
+            // reads it.
+            http::Model {
+                id: format!("{HOSTILE}model"),
+                context: None,
+            },
+        ];
+        models.open_model_picker();
+        states.push(Sweep {
+            name: "an open /model picker",
+            app: models,
+            words: vec![
+                " models · Enter picks ",
+                "• test-model · 500k",
+                "j/k or PgUp/PgDn",
+            ],
+            roomy: vec!["deepseek-chat · 128k"],
+            reopen: None,
+        });
+        keep.push(rx);
+
+        // The `/notes` popup, whose wrapping is derived from the terminal's
+        // width when it opens — so it is opened again for every size.
+        let (mut notes, rx) = test_app("sweep-notes-picker");
+        notes.chat.note_for(
+            AgentId::ROOT,
+            "the endpoint returned 503 while the run was folding the transcript",
+        );
+        notes.open_notes_picker();
+        states.push(Sweep {
+            name: "an open /notes popup",
+            app: notes,
+            words: vec![
+                "notes · newest last",
+                "the endpoint returned 503",
+                "j/k or PgUp/PgDn",
+            ],
+            roomy: vec![],
+            reopen: None,
+        });
+        keep.push(rx);
+
+        // Untrusted words on every one-line surface at once: a model reply, a
+        // run's failure, a brief, a job command and a model id, each carrying
+        // the commands the verifier used.
+        let (mut hostile, rx) = test_app("sweep-hostile");
+        spawn_agent(&mut hostile, 1, 0, 1, HOSTILE, Some("mush/1"));
+        // The cursor is on the child, whose brief is the hostile text: the
+        // selected row's *footer* is the one-line surface that carries a brief
+        // through `truncate`, and the root's own failure is on the bar.
+        hostile.tree.move_cursor(1);
+        hostile
+            .chat
+            .push_message(AgentId::ROOT, Message::assistant(HOSTILE));
+        hostile.on_agent(AgentId::ROOT, AgentEvent::Error(HOSTILE.to_string()));
+        hostile.chat.note_for(AgentId::ROOT, HOSTILE);
+        states.push(Sweep {
+            name: "hostile words",
+            app: hostile,
+            words: vec!["escaped", "␍", " chat "],
+            roomy: vec!["escaped", "␍"],
+            reopen: None,
+        });
+        keep.push(rx);
+
+        (states, keep)
+    }
+
+    /// A workspace whose `.mush/session.json` was written by hand: two root
+    /// messages, a child whose last run failed, and the failure notice mush
+    /// stored about the root. The app that adopts it is what a restart paints.
+    fn restored_session(label: &str) -> App {
+        let root = dir(label);
+        let session = root.join(".mush/session.json");
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        // Written as text, not built from `Session`: a hand-edited file is the
+        // input this path has to survive, and a round trip through the writer
+        // would test the writer instead.
+        std::fs::write(
+            &session,
+            r#"{
+  "root": "/tmp/sweep-restored",
+  "model": "test-model",
+  "updated": 1,
+  "messages": [
+    {"role": "user", "content": "port the parser module"},
+    {"role": "assistant", "content": "done, mostly"}
+  ],
+  "agents": [
+    {
+      "id": 1,
+      "parent": 0,
+      "depth": 1,
+      "brief": "port the parser module",
+      "branch": "mush/1",
+      "status": {"failed": "no route to host"},
+      "messages": []
+    }
+  ],
+  "notices": [
+    {
+      "agent": 0,
+      "at": 1,
+      "text": "the endpoint returned 503 while the run was folding the transcript"
+    }
+  ]
+}
+"#,
+        )
+        .unwrap();
+        reopened(&root)
+    }
+
+    /// The draw sweep: every state, at every size, read as *text*.
+    ///
+    /// What it replaced asserted "does not panic" — which is what a layout
+    /// arithmetic bug looks like from the outside and nothing more. This one
+    /// asserts what a frame *says*: the words each state is about, that no pane
+    /// painted over its own border or outside its rect, that the bar keeps its
+    /// row, that every line a pane was handed fits the pane, that no cell is a
+    /// control byte, and that the frame is exactly the terminal's size. The
+    /// words are the evidence; a layout that silently drops a fact is the bug
+    /// class the audit's ten defects all belonged to (refactor B17).
+    #[test]
+    fn the_draw_sweep_asserts_painted_text_not_that_it_did_not_panic() {
+        let (mut states, _keep) = sweep_states();
+        for state in &mut states {
+            let Sweep {
+                name,
+                app,
+                words,
+                roomy,
+                reopen,
+            } = state;
+            for &(width, height) in SWEEP_SIZES {
+                // A popup whose contents are wrapped to the terminal's width is
+                // opened again for each size, the way a resize would.
+                if let Some(reopen) = reopen {
+                    app.set_term_size(width, height);
+                    reopen(app);
+                }
+                let shot = shot(app, width, height);
+                let at = format!("{name} at {width}×{height}");
+                // The frame is the terminal: every row, every column, and not
+                // one cell that commands the display instead of being read.
+                assert_eq!(shot.cells.len(), height as usize, "{at}: the rows");
+                assert!(
+                    shot.cells.iter().all(|row| row.len() == width as usize),
+                    "{at}: a row is not {width} columns wide"
+                );
+                assert_no_command(&at, &shot);
+
+                if is_below_floor(width, height) {
+                    // Below the floor: one notice, centred on both axes, and
+                    // *nothing else* painted — the panes are not built at all,
+                    // so nothing can leak through the floor (R3, finding P11).
+                    assert!(
+                        matches!(shot.screen, Screen::Floor { .. }),
+                        "{at}: the floor notice"
+                    );
+                    let painted: Vec<usize> = (0..height as usize)
+                        .filter(|&y| !shot.line(y as u16).trim().is_empty())
+                        .collect();
+                    assert_eq!(
+                        painted,
+                        vec![(height as usize).saturating_sub(1) / 2],
+                        "{at}: one row, at the middle: {painted:?}"
+                    );
+                    if width >= 5 {
+                        let floor = format!("{MIN_WIDTH}×{MIN_HEIGHT}");
+                        assert!(
+                            shot.line(painted[0] as u16).contains(&floor),
+                            "{at}: the notice must name the floor"
+                        );
+                    }
+                    continue;
+                }
+
+                let text = shot.text();
+                for word in words.iter() {
+                    assert!(text.contains(word), "{at}: must paint `{word}`:\n{text}");
+                }
+                // The audit's two presentation sizes: the widest terminal mush
+                // is photographed on and the one a working session sits at.
+                // Every pane — the two-column tree, a foot with a count row, the
+                // bar's facts line — has the room it was built for there, which
+                // is what makes a word missing here a word that exists nowhere.
+                if (width, height) == (200, 50) || (width, height) == (120, 32) {
+                    for word in roomy.iter() {
+                        assert!(text.contains(word), "{at}: must paint `{word}`:\n{text}");
+                    }
+                }
+                shot.assert_shape(name, width, height);
+            }
         }
     }
 
-    /// One painted frame, cell by cell and borders included: a leak lands *on*
-    /// a border column, which is the one thing `screen` trims away.
-    fn frame_grid(app: &mut App, width: u16, height: u16) -> Vec<String> {
-        use ratatui::backend::TestBackend;
-        use ratatui::Terminal;
-        app.set_term_size(width, height);
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
-        let buffer = terminal.backend().buffer();
-        (0..height)
-            .map(|y| {
-                (0..width)
-                    .map(|x| buffer[(x, y)].symbol())
-                    .collect::<String>()
-            })
-            .collect()
+    /// A wide glyph is two columns of the pane, not one, and every pane paints
+    /// it inside its own border: the row's fields, the transcript's wrap, the
+    /// message box and the footer are all column arithmetic, and a width taken
+    /// for granted is how a CJK row ends up a column over its border (finding
+    /// B9).
+    #[test]
+    fn the_sweep_fits_wide_glyphs_in_their_panes() {
+        let (mut app, _rx) = test_app("sweep-wide-glyphs");
+        spawn_agent(&mut app, 1, 0, 1, "移植解析器与词法分析", Some("mush/1"));
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message::assistant("请把解析器移植过来，然后运行测试"),
+        );
+        app.on_agent(AgentId(1), AgentEvent::Error("端点的回应无法解析".into()));
+        for &(width, height) in SWEEP_SIZES {
+            if is_below_floor(width, height) {
+                continue;
+            }
+            let shot = shot(&mut app, width, height);
+            shot.assert_shape("wide glyphs", width, height);
+            assert_no_command(&format!("wide glyphs at {width}×{height}"), &shot);
+        }
+        let text = shot(&mut app, 200, 50).shown().join("\n");
+        assert!(
+            text.contains("移植解析器"),
+            "the row names the agent in its own script: {text}"
+        );
+        assert!(
+            text.contains("请把解析器移植过来"),
+            "and the transcript keeps the message: {text}"
+        );
+    }
+
+    /// The hidden-row counts and the arrows that name the side, read off the
+    /// painted title at the size where the pane is shortest.
+    ///
+    /// Nineteen rows hidden under a one-row window is the defect P12 named, and
+    /// a bare `+19` cannot say which way they went — at the bottom of the pane
+    /// every hidden row is *above* the window, which is the other half of the
+    /// same defect.
+    #[test]
+    fn the_sweep_counts_the_rows_the_pane_cannot_show() {
+        let (mut app, _rx) = a_twenty_agent_tree("sweep-hidden");
+        // The compact strip gives the tree one inner row at 40×10: the root is
+        // the window, and the other nineteen rows are below it.
+        let text = shot(&mut app, 40, 10).text();
+        assert!(text.contains("▼19"), "the rows below are named: {text}");
+        assert!(!text.contains('▲'), "nothing is above the top row: {text}");
+
+        app.tree.cursor_bottom();
+        let text = shot(&mut app, 40, 10).text();
+        assert!(
+            text.contains("▲19"),
+            "at the bottom they are all above: {text}"
+        );
+        assert!(!text.contains('▼'), "nothing is below: {text}");
+
+        // At the presentation size nothing is hidden, so nothing says it is.
+        app.tree.cursor_top();
+        let text = shot(&mut app, 200, 50).text();
+        assert!(!text.contains('▲') && !text.contains('▼'), "{text}");
+    }
+
+    /// The pane's title wears the counts that fit it and drops the rest whole:
+    /// a clause cut mid-number (`Σ +324 −`, `2 waitin`) is a count that is not
+    /// the count (finding U2).
+    #[test]
+    fn the_sweep_paints_the_title_clauses_that_fit() {
+        let (mut app, _rx) = test_app("sweep-title");
+        spawn_agent(
+            &mut app,
+            1,
+            0,
+            1,
+            "build the lexer for the config format",
+            None,
+        );
+        // At 40×10 the compact strip gives the tree the whole width, and both
+        // counts fit.
+        let text = shot(&mut app, 40, 10).text();
+        assert!(text.contains("1 working"), "{text}");
+        assert!(text.contains("1 waiting"), "{text}");
+        // At 80×24 the tree gets thirty columns, and the widest clause yields.
+        let text = shot(&mut app, 80, 24).text();
+        assert!(text.contains(" agents · 1 working"), "{text}");
+        assert!(
+            !text.contains("1 waiting"),
+            "a clause that does not fit is dropped whole, never cut: {text}"
+        );
+    }
+
+    /// A derived line is not a hidden line: a busy agent with nothing written
+    /// about it must not claim `+1 more lines` for its own spinner — a count
+    /// `/notes` cannot answer.
+    #[test]
+    fn the_sweep_never_counts_a_derived_line_as_hidden() {
+        let (mut app, _rx) = test_app("sweep-spinner-count");
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("what is happening"));
+        begin_run(&mut app, AgentId::ROOT);
+        // At 40×10 the pane has one row of transcript, it protects it for the
+        // message, and the foot therefore has no row at all: the spinner is not
+        // painted, and a pane that counted it would say so in its title.
+        let text = shot(&mut app, 40, 10).text();
+        assert!(!text.contains("working…"), "no row for it here: {text}");
+        assert!(
+            !text.contains("more lines"),
+            "a derived line is not a hidden line: {text}"
+        );
+        // Where the foot has a row, the spinner is painted and still nothing is
+        // counted as hidden.
+        for &(width, height) in SWEEP_SIZES {
+            if is_below_floor(width, height) || (width, height) == (40, 10) {
+                continue;
+            }
+            let text = shot(&mut app, width, height).text();
+            assert!(
+                text.contains("working…"),
+                "the spinner is the pane's activity at {width}×{height}: {text}"
+            );
+            assert!(
+                !text.contains("more lines"),
+                "the spinner is not a hidden line at {width}×{height}: {text}"
+            );
+        }
+    }
+
+    /// The stored failure survives the restart into the *painted* frame: a row
+    /// where the pane has one, and the title — which is the pane's way of
+    /// saying what it is hiding — where it does not.
+    #[test]
+    fn the_sweep_paints_a_restored_failure_at_every_size() {
+        let mut app = restored_session("sweep-restored-notice");
+        let text = shot(&mut app, 80, 24).text();
+        assert!(
+            text.contains("! the endpoint returned 503"),
+            "the stored failure is a row of the foot: {text}"
+        );
+        let text = shot(&mut app, 40, 10).text();
+        assert!(
+            text.contains("more lines") && text.contains("/notes"),
+            "a pane with no row for the line says how many it is hiding: {text}"
+        );
+    }
+
+    /// A wrapped message keeps its tail: the pane is anchored at the bottom, so
+    /// the last row of the newest message is the row that must be there at
+    /// every size, and the head is there when the pane has the rows for it.
+    #[test]
+    fn the_sweep_keeps_the_tail_of_a_wrapped_message() {
+        let (mut app, _rx) = test_app("sweep-wrapped");
+        let long = format!("HEADWORD {} TAILWORD", "wide ".repeat(40));
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant(&long));
+        for &(width, height) in SWEEP_SIZES {
+            if is_below_floor(width, height) {
+                continue;
+            }
+            let shot = shot(&mut app, width, height);
+            assert!(
+                shot.text().contains("TAILWORD"),
+                "the tail of the newest message at {width}×{height}:\n{}",
+                shot.text()
+            );
+            shot.assert_shape("a wrapped message", width, height);
+        }
+        let text = shot(&mut app, 200, 50).text();
+        assert!(text.contains("HEADWORD"), "the head, where it fits: {text}");
+    }
+
+    /// Scrolling holds the window: the pane says so, and what it shows is the
+    /// rows above the bottom rather than the ones following it.
+    #[test]
+    fn the_sweep_shows_the_rows_a_scrolled_pane_is_holding() {
+        let (mut app, _rx) = test_app("sweep-held");
+        for i in 1..=40 {
+            app.chat
+                .push_message(AgentId::ROOT, Message::user(format!("message {i}")));
+        }
+        let bottom = shot(&mut app, 120, 32).text();
+        app.chat.scroll_by(AgentId::ROOT, 20);
+        let held = shot(&mut app, 120, 32).text();
+        assert!(held.contains("scrolled ↑20 rows"), "{held}");
+        let older = (1..=40)
+            .map(|i| format!("message {i}"))
+            .find(|word| held.contains(word.as_str()) && !bottom.contains(word.as_str()))
+            .unwrap_or_else(|| {
+                panic!("the held window shows rows the bottom did not:\n{held}\n---\n{bottom}")
+            });
+        assert!(
+            !bottom.contains(&older),
+            "{older} is only in the held frame"
+        );
+    }
+
+    /// A popup's own text is read at every size too: the wrapped note, the
+    /// bullet on the current model and the hint are all painted, and the popup
+    /// leaves the panes it covers alone.
+    #[test]
+    fn the_sweep_paints_what_a_popup_says() {
+        let (mut app, _rx) = test_app("sweep-popup");
+        app.models = vec![
+            http::Model {
+                id: "test-model".to_string(),
+                context: Some(500_000),
+            },
+            http::Model {
+                id: "deepseek-chat".to_string(),
+                context: None,
+            },
+        ];
+        app.open_model_picker();
+        for &(width, height) in SWEEP_SIZES {
+            if is_below_floor(width, height) {
+                continue;
+            }
+            let shot = shot(&mut app, width, height);
+            let text = shot.text();
+            assert!(
+                text.contains(" models · Enter picks "),
+                "the popup's title at {width}×{height}: {text}"
+            );
+            assert!(
+                text.contains("• test-model"),
+                "the current model is marked at {width}×{height}: {text}"
+            );
+            assert!(
+                text.contains("j/k or PgUp/PgDn"),
+                "and the keys are named at {width}×{height}: {text}"
+            );
+            shot.assert_shape("an open /model picker", width, height);
+        }
+
+        // A note can carry a failure's own words, and a model id comes from the
+        // endpoint: both are painted whole in the popup, and both must be
+        // defanged where they are painted.
+        let (mut notes, _rx) = test_app("sweep-popup-hostile");
+        notes.chat.note_error_for(AgentId::ROOT, HOSTILE);
+        notes.open_notes_picker();
+        for &(width, height) in SWEEP_SIZES {
+            if is_below_floor(width, height) {
+                continue;
+            }
+            notes.set_term_size(width, height);
+            notes.open_notes_picker();
+            let shot = shot(&mut notes, width, height);
+            let at = format!("a hostile /notes popup at {width}×{height}");
+            assert_no_command(&at, &shot);
+            shot.assert_shape(&at, width, height);
+            assert!(
+                shot.shown().join("\n").contains("escaped"),
+                "{at}: the words survive the commands around them"
+            );
+        }
     }
 
     /// Deliver one hostile payload the way its actor does: a model reply (the

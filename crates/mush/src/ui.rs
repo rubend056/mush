@@ -1,184 +1,29 @@
-//! Rendering. This module is deliberately dumb: it reads `App` and paints it.
-//! No state transitions live here, which keeps the update logic testable.
+//! Painting. This module is deliberately dumb: it takes a [`Screen`] — a value
+//! [`App::screen`] derived every word of — and paints it, without reading any
+//! state. No state transitions and no derivation live here, which keeps the
+//! update logic testable and lets the draw sweep assert painted text instead of
+//! "does not panic" (refactor B17).
 
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
-use std::time::Duration;
 use unicode_width::UnicodeWidthStr;
 
-use mush_core::git;
-use mush_core::text::{fit_row, sanitize, truncate};
+use mush_core::text::fit_row;
 
-use crate::app::{
-    is_below_floor, short_age, AgentId, AgentNode, App, Focus, Landed, Pane, Phase, PickerKind,
-    Rank, StatusKind, MIN_HEIGHT, MIN_WIDTH,
-};
+use crate::app::{AgentRow, AgentsPane, BarPane, ChatPane, Focus, PickerPane, Rank, Screen};
 
 /// The idle bar hint, when there is nothing to report. The commands it names
 /// are checked against `app::commands::COMMANDS` by a test there, so the bar
 /// cannot advertise a command the parser does not have (finding B2).
 pub(crate) const HINT: &str = "Tab cycles panes · /help lists commands · Ctrl-P picks a model";
-/// Beyond this the transcript is unreadable, however wide the terminal is.
-const MAX_TRANSCRIPT: u16 = 110;
-/// How many columns the agent pane is given, and why it is a length rather than
-/// a share of the terminal.
-///
-/// R1's row spends its fields left to right — `state · branch +delta · what it
-/// is doing · its title` — and that is about forty-five columns of real labels.
-/// Below thirty the chat is the better use of a narrow screen; past fifty the
-/// tree has nothing else to put there (a tool label is the widest field it has)
-/// while a wider terminal is what the transcript's measure is for (it is capped
-/// at 110 columns anyway). The share this replaced was 26%, which is 31 columns
-/// at 120: `▶◐ #0` left 22 for a 23-column `edit_file src/lib.rs 12s`, so a busy
-/// agent's tool call and its age were dropped there — every frame, on the size
-/// the audit photographs.
-const AGENTS_MIN_COLUMNS: u16 = 30;
-const AGENTS_MAX_COLUMNS: u16 = 50;
-/// The chat below this is a column of broken words, whatever the tree wants.
-const CHAT_MIN_COLUMNS: u16 = 40;
-/// How old the git read may be before the facts line says so. The bar's
-/// convention is that a line is "just happened" within five seconds; a snapshot
-/// a little older than that is still a glance, but past ten seconds an
-/// untouched screen is showing a read no event has refreshed, and a cached fact
-/// must not read as a live one (finding P8).
-const GIT_STALE: Duration = Duration::from_secs(10);
-
-/// The popup the pickers paint in: a share of the terminal, floored so a model
-/// list is readable and capped so it does not sprawl on a wide one. One formula,
-/// because `draw_picker` sizes the popup with it and `picker_text_width` says
-/// how much of it a `/notes` row may use.
-const PICKER_MIN_WIDTH: u16 = 40;
-const PICKER_MAX_WIDTH: u16 = 80;
-
-fn picker_width(terminal_width: u16) -> u16 {
-    (terminal_width * 60 / 100).clamp(PICKER_MIN_WIDTH, PICKER_MAX_WIDTH)
-}
-
-/// The columns the agent pane is painted in — see the constants above for why
-/// this is a length: a row's four ranked fields need about forty of them, the
-/// chat keeps its own floor, and past the cap the extra columns are empty.
-fn agents_columns(terminal_width: u16) -> u16 {
-    let share = (terminal_width as u32 * 34 / 100) as u16;
-    share
-        .clamp(AGENTS_MIN_COLUMNS, AGENTS_MAX_COLUMNS)
-        .min(terminal_width.saturating_sub(CHAT_MIN_COLUMNS))
-}
-
-/// The columns the picker's list gives one item's text. The term carries the
-/// popup's two border columns, the two the `› ` symbol reserves, and the two the
-/// `  ` indent every row wears. `App` wraps a `/notes` report to this, so the
-/// lines it hands the list already fit the width they are painted at — wrapping
-/// to any other width (the old fixed 74) is how the documented escape hatch
-/// clipped.
-pub(crate) fn picker_text_width(terminal_width: u16) -> usize {
-    picker_width(terminal_width).saturating_sub(6) as usize
-}
-
-pub fn draw(frame: &mut Frame, app: &mut App) {
-    let area = frame.area();
-    // The floor is a predicate `App` also reads to refuse input: the frame's
-    // size is what this paints, and it is the same one `main` reported to the
-    // app, so the notice and the keys agree (finding P11 / refactor B3).
-    if is_below_floor(area.width, area.height) {
-        // One notice, centred on both axes. `Paragraph::centered` is
-        // horizontal only, and R3's "centred" means the middle of the screen,
-        // not the top row — the notice used to sit on row one (finding P11).
-        let line = Line::from(Span::styled(
-            floor_notice(area.width),
-            Style::default().fg(Color::Yellow),
-        ));
-        let y = area.y + area.height.saturating_sub(1) / 2;
-        frame.render_widget(
-            Paragraph::new(line).centered(),
-            Rect::new(area.x, y, area.width, 1),
-        );
-        return;
-    }
-
-    // Size tiers (docs/mush.md §4.5 R3). Narrow or short terminals stack the
-    // agent strip above the chat, because two columns starve both panes.
-    let compact = area.width < 80 || area.height < 20;
-    // Two rows from 24 up, so the facts line — the branch, the dirty count and
-    // the line delta — is on screen at the ubiquitous 80×24, where it used to
-    // need 26 and was simply absent (finding P12). Below 24 the extra row is
-    // worth more to the transcript, and the compact footer carries the selected
-    // agent's own branch and worktree instead.
-    let bar_rows = if area.height >= 24 { 2 } else { 1 };
-
-    if compact {
-        // Every pane's height is computed here, and every constraint is a
-        // `Length`, so the three add up to the terminal exactly and none of
-        // them can lose rows to another. The bar used to be a trailing
-        // `Length` behind a `Min(6)` chat, and at 40×10 the chat took the row
-        // the bar was owed: the frame painted the tree, the transcript and the
-        // message box, and the ` chat ` row — the focus badge, the key hint,
-        // and the only home an Info line or a command's usage error has — was
-        // simply absent.
-        // Six is the least the chat can be and still hold what it is for: a
-        // three-row transcript over a message box that has a row to type in.
-        // The box lost that row instead after the bar's floor was added, which
-        // is the same defect one pane over (§4.5's audit, defect 7).
-        let chat_min = 6;
-        let agent_rows = (app.tree.agents.len() as u16 + 2)
-            .clamp(3, 6)
-            .min(area.height.saturating_sub(bar_rows + chat_min));
-        let chat_rows = area.height - agent_rows - bar_rows;
-        let rows = Layout::vertical([
-            Constraint::Length(agent_rows),
-            Constraint::Length(chat_rows),
-            Constraint::Length(bar_rows),
-        ])
-        .split(area);
-        draw_agents(frame, app, rows[0]);
-        draw_chat(frame, app, rows[1]);
-        draw_status(frame, app, rows[2]);
-    } else {
-        let rows = Layout::vertical([
-            Constraint::Length(area.height - bar_rows),
-            Constraint::Length(bar_rows),
-        ])
-        .split(area);
-        // On a very wide terminal the tree stops growing: past a point it is
-        // empty space, and the chat is what the width belongs to. Below that it
-        // gets the columns R1's row needs, so the fields the row is built from
-        // are the fields it can paint.
-        let agents_pane = Constraint::Length(agents_columns(area.width));
-        let columns = Layout::horizontal([agents_pane, Constraint::Min(20)]).split(rows[0]);
-        draw_agents(frame, app, columns[0]);
-        draw_chat(frame, app, columns[1]);
-        draw_status(frame, app, rows[1]);
-    }
-    draw_picker(frame, app);
-}
-
-/// The longest honest spelling of the floor that fits `width` columns.
-///
-/// The notice was one fixed 25-column string, so a 24-column terminal painted
-/// `mush needs at least 40×1` — a truncation that names a size the program does
-/// not need, which is a lie the audit caught (finding P11). The spellings are
-/// ranked, longest first, and the first that fits is the one painted; only a
-/// terminal narrower than `40×10` itself gets a shorter form still.
-fn floor_notice(width: u16) -> String {
-    let size = format!("{MIN_WIDTH}×{MIN_HEIGHT}");
-    let candidates = [
-        format!("mush needs at least {size}"),
-        format!("needs at least {size}"),
-        format!("{size} minimum"),
-        format!("needs {size}"),
-        size,
-    ];
-    candidates
-        .into_iter()
-        .find(|text| UnicodeWidthStr::width(text.as_str()) <= width as usize)
-        .unwrap_or_else(|| format!("{MIN_WIDTH}×{MIN_HEIGHT}"))
-}
 
 pub(crate) fn dim() -> Style {
     Style::default().fg(Color::DarkGray)
 }
+
 fn border(focused: bool) -> Style {
     if focused {
         Style::default().fg(Color::Cyan)
@@ -187,73 +32,58 @@ fn border(focused: bool) -> Style {
     }
 }
 
-fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Focus::Agents;
+/// How the bar paints the line that won the precedence table. `chat::Rank` is
+/// the order; the colour of each rank is a painting decision and lives here.
+fn rank_style(rank: Rank) -> Style {
+    match rank {
+        Rank::Alert => Style::default().fg(Color::Red),
+        Rank::Activity => Style::default().fg(Color::Cyan),
+        Rank::Said => Style::default().fg(Color::Gray),
+    }
+}
+
+pub fn draw(frame: &mut Frame, screen: &Screen) {
+    match screen {
+        // One notice, centred on both axes, and nothing else. `Paragraph::centered`
+        // is horizontal only, and R3's "centred" means the middle of the screen,
+        // not the top row — the notice used to sit on row one (finding P11).
+        Screen::Floor { area, text } => {
+            let line = Line::from(Span::styled(
+                text.clone(),
+                Style::default().fg(Color::Yellow),
+            ));
+            let y = area.y + area.height.saturating_sub(1) / 2;
+            frame.render_widget(
+                Paragraph::new(line).centered(),
+                Rect::new(area.x, y, area.width, 1),
+            );
+        }
+        Screen::Panes(panes) => {
+            draw_agents(frame, &panes.agents);
+            draw_chat(frame, &panes.chat);
+            draw_status(frame, &panes.bar);
+            if let Some(picker) = &panes.picker {
+                draw_picker(frame, picker);
+            }
+        }
+    }
+}
+
+fn draw_agents(frame: &mut Frame, pane: &AgentsPane) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(border(focused));
-    let inner = block.inner(area);
+        .border_style(border(pane.focused))
+        // The pane's own title, from the clauses the tree derived: the hidden
+        // row counts and what the whole tree is doing, cut from the right while
+        // they do not fit. The columns are the painter's; the numbers are not.
+        .title(agents_title(
+            &pane.title_cells,
+            pane.area.width.saturating_sub(2) as usize,
+        ));
+    let inner = block.inner(pane.area);
+    frame.render_widget(block, pane.area);
 
-    // The rows in painted order: pre-order over the parent links, so a child is
-    // drawn under its parent rather than after everything spawned before it
-    // (finding U4). The tree derives that order, this only paints it.
-    let rows = app.tree.rows();
-    let cursor = app.tree.cursor();
-
-    // The cursor row's facts live in a footer under the list, so the list may
-    // degrade to `◐ #2` on a narrow pane without losing anything: facts move,
-    // they do not vanish. A tall pane spends up to three lines on it; a short
-    // (compact) pane still owes the selected row one line — under six inner
-    // rows it got none, so in compact the selected row's branch, worktree and
-    // landing commands were nowhere on screen (finding P12).
-    let footer = if inner.width == 0 || inner.height < 3 || rows.is_empty() {
-        Vec::new()
-    } else {
-        let budget = if inner.height >= 8 { 3 } else { 1 };
-        compact_footer(
-            agent_footer(app, rows[cursor], inner.width as usize),
-            budget,
-        )
-    };
-    // One row is the separator between the list and the facts.
-    let footer_rows = if footer.is_empty() {
-        0
-    } else {
-        footer.len() as u16 + 1
-    };
-    let list_area = Rect {
-        height: inner.height.saturating_sub(footer_rows),
-        ..inner
-    };
-
-    // How many rows the list leaves off screen, and which side. `List` scrolls
-    // to keep the cursor visible and this pane is one row per agent, so the
-    // window is arithmetic rather than a guess: with the cursor in view the
-    // first visible row is the cursor's row minus the rows above it. `▲`/`▼`
-    // name the side, which a bare `+17` cannot — at the bottom of a 4-row pane
-    // over nineteen agents the hidden rows are all above (finding P12).
-    let visible = list_area.height as usize;
-    let first = cursor.saturating_sub(visible.saturating_sub(1));
-    let above = if visible == 0 {
-        0
-    } else {
-        first.min(rows.len())
-    };
-    let below = if visible == 0 {
-        rows.len()
-    } else {
-        rows.len().saturating_sub(first + visible)
-    };
-
-    let block = block.title(agents_title(
-        app,
-        area.width.saturating_sub(2) as usize,
-        above,
-        below,
-    ));
-    frame.render_widget(block, area);
-
-    if inner.height == 0 || inner.width == 0 || app.tree.agents.is_empty() {
+    if inner.height == 0 || inner.width == 0 || pane.rows.is_empty() {
         return;
     }
 
@@ -261,17 +91,30 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
     // to be drawn outside it, which spent two columns on a mark the highlight
     // style already made — and put a second arrow beside the row's own `▶`.
     let row_width = inner.width as usize;
-    let items: Vec<ListItem> = rows
+    let items: Vec<ListItem> = pane
+        .rows
         .iter()
-        .map(|node| ListItem::new(agent_line(app, node, row_width)))
+        .map(|row| ListItem::new(agent_line(row, row_width)))
         .collect();
     let list = List::new(items).highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
     let mut state = ListState::default();
-    state.select(Some(cursor));
+    state.select(Some(pane.cursor));
+    // The list is the rows and nothing else: the cursor row's facts live in the
+    // footer below it, so a narrow pane degrades to `◐ #2` without losing them.
+    let footer_rows = if pane.footer.is_empty() {
+        0
+    } else {
+        pane.footer.len() as u16 + 1
+    };
+    let list_area = Rect {
+        height: inner.height.saturating_sub(footer_rows),
+        ..inner
+    };
     frame.render_stateful_widget(list, list_area, &mut state);
 
-    if !footer.is_empty() {
-        let start = inner.y + inner.height - footer.len() as u16;
+    if !pane.footer.is_empty() {
+        // One row is the separator between the list and the facts.
+        let start = inner.y + inner.height - pane.footer.len() as u16;
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "─".repeat(inner.width as usize),
@@ -279,430 +122,140 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
             ))),
             Rect::new(inner.x, start - 1, inner.width, 1),
         );
-        for (offset, line) in footer.into_iter().enumerate() {
+        for (offset, line) in pane.footer.iter().enumerate() {
             frame.render_widget(
-                Paragraph::new(line),
+                Paragraph::new(line.clone()),
                 Rect::new(inner.x, start + offset as u16, inner.width, 1),
             );
         }
     }
 }
 
-/// The footer lines a pane of `budget` rows can afford, chosen by what a short
-/// pane most needs to say. `agent_footer` builds the identity line (`#2 lexer`)
-/// first because it names the row; but a one-line footer keeps the *detail*
-/// line instead — where the work is and how to land it — because the selected
-/// row already wears its identity in the list, and the detail is the fact that
-/// exists nowhere else on a compact screen (finding P12).
-fn compact_footer(mut full: Vec<Line<'static>>, budget: usize) -> Vec<Line<'static>> {
-    if budget >= 2 || full.len() < 2 {
-        full.truncate(budget);
-        return full;
-    }
-    // budget == 1 and there is a detail line: keep it, drop the identity.
-    full.split_off(1).into_iter().take(1).collect()
-}
-
-/// ` agents · 3 working · 2 waiting · Σ +324 −40`: what the whole tree is doing,
-/// and how much its branches carry.
+/// The pane's title: ` agents · 3 working · 2 waiting · Σ +324 −40`, with the
+/// clauses that do not fit dropped whole from the right.
 ///
-/// Every clause is a count of the phases, named for what it counts, and no
-/// agent is in two of them: `N working` is the agents whose own run is in
-/// flight, `M waiting` the ones at rest with children working (the `⏸` rows),
-/// and the totals are the branches'. It used to say `N running` over a number
-/// that included the napping ones, which is how the title came to contradict
-/// the rows under it (finding U2).
-///
-/// The clauses are ranked and dropped whole from the right while they do not
-/// fit — the way `facts_line` elides — because this pane is 32 columns wide at
-/// its widest and a clause cut mid-number (`Σ +324 −`, `2 waitin`) is a count
-/// that is not the count. The totals are last because the least is lost last:
-/// every branch's own `+add −del` is on its row and in the selected row's
-/// footer, while who is working exists only here.
-///
-/// The hidden-row counts are first because they exist *only* here: a 4-row pane
-/// over nineteen agents used to hide fifteen with nothing on screen saying so
-/// (finding P12). `▲`/`▼` names the side the missing rows are on.
-fn agents_title(app: &App, width: usize, above: usize, below: usize) -> String {
-    let roster = app.tree.roster();
-    let mut cells = Vec::new();
-    if above > 0 {
-        cells.push(format!("▲{above}"));
-    }
-    if below > 0 {
-        cells.push(format!("▼{below}"));
-    }
-    if roster.working > 0 {
-        cells.push(format!("{} working", roster.working));
-    }
-    if roster.waiting > 0 {
-        cells.push(format!("{} waiting", roster.waiting));
-    }
-    let mut added = 0;
-    let mut removed = 0;
-    for stat in app.tree.agent_stats.values() {
-        added += stat.added;
-        removed += stat.removed;
-    }
-    if added + removed > 0 {
-        cells.push(format!("Σ +{added} −{removed}"));
-    }
-    while !cells.is_empty() {
-        let joined = format!(" agents · {}", cells.join(" · "));
-        if UnicodeWidthStr::width(joined.as_str()) <= width {
-            return joined;
+/// Whole, because this pane is 32 columns wide at its widest and a clause cut
+/// mid-number (`Σ +324 −`, `2 waitin`) is a count that is not the count. The
+/// pane keeps its own name when none of them fit.
+fn agents_title(cells: &[String], width: usize) -> String {
+    for kept in (0..=cells.len()).rev() {
+        let title = if kept == 0 {
+            " agents ".to_string()
+        } else {
+            format!(" agents · {}", cells[..kept].join(" · "))
+        };
+        if UnicodeWidthStr::width(title.as_str()) <= width {
+            return title;
         }
-        cells.pop();
     }
     " agents ".to_string()
 }
 
-/// One tree row, with the fields it can afford.
+/// One row of the tree, fitted into the columns the pane has.
 ///
-/// The row answers "what is happening" with the fields that answer it: the
-/// state, the branch and delta, what the agent is doing — and, when there is
-/// room, which agent this is. The name it spends those columns on is the node's
-/// derived *title* (`lexer`, `deep.txt`) rather than its brief: the brief opens
-/// with the boilerplate a model was asked in (`create a file called …`), which
-/// is the same words for two different children, and its full text is one row
-/// below in the footer and again as the transcript's opening line.
-fn agent_line(app: &App, node: &AgentNode, width: usize) -> String {
-    let indent = "  ".repeat(node.depth);
-    let marker = if app.tree.focused == node.id {
-        "▶"
-    } else {
-        " "
-    };
-    let waiting = app.tree.busy_children(node.id);
-    // Two facts, two marks: `glyph · id` is this agent's own phase, and `⏸N`
-    // counts the children that are working. The old row derived the glyph from
-    // "has live children", so a busy agent wore `⏸` and its own work vanished
-    // from the screen (finding U1).
+/// `fit_row` is the ranked-field rule R1 states: the state (`▶◐ #2)`, then the
+/// branch and its delta, then the activity with its age, then the title — the
+/// title yields first because the footer and the transcript carry the brief in
+/// full. The fields themselves are derived by the tree; this only spends the
+/// columns on them.
+///
+/// `pub(crate)`, not private, because "every row fits its pane" is an assertion
+/// a frame has to carry: the sweep fits each row at the width it is painted at
+/// and reads the result, which is the one way a row that silently loses its
+/// tail is caught (refactor B17).
+pub(crate) fn agent_line(row: &AgentRow, width: usize) -> String {
+    let indent = "  ".repeat(row.depth);
+    let marker = if row.focused { "▶" } else { " " };
     let mut head = format!(
         "{indent}{marker}{glyph} #{id}",
-        id = node.id,
-        glyph = phase_glyph(&node.phase),
+        id = row.id,
+        glyph = row.glyph
     );
-    if waiting > 0 {
+    if row.waiting > 0 {
         // R4's `⏸`, owned by the children it is about: the parent's own state
         // stays in the glyph, and this says how much it has out.
-        head.push_str(&format!(" ⏸{waiting}"));
+        head.push_str(&format!(" ⏸{}", row.waiting));
     }
-
-    let mut tail = Vec::new();
-    let activity = phase_detail(node);
-    if !activity.is_empty() {
-        tail.push(activity);
-    }
-    let mut where_and_how = node.branch.clone().unwrap_or_default();
-    if let Some(stat) = app.tree.agent_stats.get(&node.id) {
-        if !stat.is_empty() {
-            if !where_and_how.is_empty() {
-                where_and_how.push(' ');
-            }
-            where_and_how.push_str(&stat.compact());
-        }
-    }
-    // The jobs on this machine, on the row of whoever started them. It rides
-    // with the branch and the stat — facts that exist nowhere else on the
-    // screen — because the human should not have to ask a model what is
-    // running; the count is derived from the registry every frame, never
-    // stored, and the selected row's footer names each job.
-    let jobs = app.live_jobs(node.id).len();
-    if jobs > 0 {
-        if !where_and_how.is_empty() {
-            where_and_how.push(' ');
-        }
-        where_and_how.push_str(&format!("⚙{jobs}"));
-    }
-    fit_row(&head, &node.title(), &where_and_how, &tail, width)
+    let tail: Vec<String> = if row.activity.is_empty() {
+        Vec::new()
+    } else {
+        vec![row.activity.clone()]
+    };
+    fit_row(&head, &row.title, &row.place, &tail, width)
 }
 
-/// The footer under the tree: the cursor row's full facts, so a narrow pane
-/// still tells the whole story.
-fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(format!(" #{} ", node.id), Style::default().fg(Color::Cyan)),
-        Span::styled(
-            truncate(&node.brief, width.saturating_sub(6)),
-            Style::default(),
-        ),
-    ]));
-    // The cursor row's facts in full, and always: the row above may have had to
-    // give up its activity or its brief to fit, and this is where they are not
-    // lost — what the agent is doing *now*, where its work is, and the commands
-    // that land it. It used to be painted only for a landed, isolated, idle or
-    // stopped agent, so the one row the human is reading was the one whose
-    // activity could vanish from the screen entirely (finding P4).
-    let mut detail = agent_detail(node);
-    let activity = phase_detail(node);
-    if !activity.is_empty() {
-        detail.insert(0, activity);
-    }
-    if !detail.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(
-                " {}",
-                truncate(&detail.join(" · "), width.saturating_sub(2))
-            ),
-            dim(),
-        )));
-    }
-    // The selected row's jobs, in full: which command, how long, and whether it
-    // is the one holding the machine. Read from the same registry the row's
-    // count comes from, so the two can never disagree.
-    let jobs = app.job_lines(node.id);
-    if !jobs.is_empty() {
-        lines.push(Line::from(Span::styled(
-            format!(
-                " {} jobs · {}",
-                jobs.len(),
-                truncate(&jobs.join(" · "), width.saturating_sub(14))
-            ),
-            dim(),
-        )));
-    }
-    lines
-}
-
-/// Where an isolated agent's work is — or where it went. Pure, so the row's
-/// promise can be asserted: a landed worktree must not name a `git diff` or a
-/// `/merge` that can no longer work.
-fn agent_detail(node: &AgentNode) -> Vec<String> {
-    match node.landed {
-        Some(Landed::Merged) => vec!["merged into HEAD".to_string()],
-        Some(Landed::Discarded) => vec!["discarded — its work is gone".to_string()],
-        None => match &node.branch {
-            // This is the one place on screen that says an isolated agent
-            // exists at all, and the commands that land it.
-            Some(branch) => vec![
-                // The worktree path comes from core like every other one: the
-                // row must name the directory `/discard` would remove.
-                format!("{}/{}", git::WORKTREE_DIR, node.id),
-                format!("git diff HEAD...{branch}"),
-                format!("/merge {}", node.id),
-            ],
-            None => Vec::new(),
-        },
-    }
-}
-
-/// The glyph is derived from the agent's own phase, never stored and never
-/// borrowed from the tree: `·` until it does something, `◐` while its own run is
-/// in flight, `⊘` while a cancel is in flight and after it lands, `✓` only when
-/// a run finished, `✗` when it failed, `≡` while its conversation is being
-/// folded.
-///
-/// Waiting on children is a *different fact* from working and is drawn as a
-/// different mark (`agent_line`'s `⏸N`), because a parent that is mid-turn with
-/// children running is working, not paused — the row that said `⏸` about it was
-/// claiming a park that never happened (finding U1). Folding is a different
-/// fact again: it is a request of its own, and `◐` for it is what made a
-/// compaction look like the run's own model call (finding U11).
-fn phase_glyph(phase: &Phase) -> &'static str {
-    match phase {
-        Phase::Failed(_) => "✗",
-        // `⊘` while a cancel is in flight and after it lands: a stopped agent
-        // is not a finished one, and must not borrow `✓`.
-        Phase::Cancelling | Phase::Stopped => "⊘",
-        Phase::Idle => "·",
-        Phase::Done => "✓",
-        Phase::Compacting(_) => "≡",
-        Phase::Thinking | Phase::Activity(_) => "◐",
-    }
-}
-
-/// What the row says the agent is doing, ageing with the phase so a slow model
-/// is visible as `thinking 42s` rather than a static word.
-///
-/// A run parked in a wait says so instead of naming the tool: `wait_agents 3s`
-/// reads like a model call in flight, and the human asked for an hourglass for
-/// the case where nothing is being computed — a napping orchestrator was the
-/// one agent on the screen claiming work it was not doing (finding U7).
-///
-/// A fold says what it is too, and its own words: a fold the human asked for,
-/// one the window triggered, and one parked behind the run in flight are three
-/// answers, and `◐ #0 root` for all of them is how a compaction became
-/// invisible (finding U11).
-fn phase_detail(node: &AgentNode) -> String {
-    let age = short_age(node.since.elapsed());
-    match &node.phase {
-        Phase::Thinking => format!("thinking {age}"),
-        Phase::Activity(what) => match node.phase.waiting() {
-            Some(waiting) => format!("waiting on {} {age}", waiting.noun()),
-            // The actor's label is the tool name and its summarized arguments;
-            // with no arguments it ends in a space, which the row would paint
-            // as a double one (`wait_agents  3s`).
-            None => format!("{} {age}", what.trim_end()),
-        },
-        Phase::Compacting(kind) => format!("{} {age}", kind.words().trim_end_matches('…')),
-        Phase::Cancelling => "cancelling…".to_string(),
-        // A stopped run has no result to show: its last summary belongs to a
-        // run that was interrupted, so showing it would claim work that was
-        // never delivered. `node.summary` is deliberately not consulted.
-        Phase::Stopped => "stopped · re-send to resume".to_string(),
-        Phase::Failed(error) => error.clone(),
-        Phase::Idle | Phase::Done => node.summary.clone().unwrap_or_default(),
-    }
-}
-
-fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
-    let focused = app.focus == Focus::Chat;
-    // The box grows with the message: a multi-line draft has to be visible, not
-    // hidden behind a one-line window. It stops growing so the transcript keeps
-    // the screen.
-    const MAX_INPUT_LINES: u16 = 6;
-    let input_lines = (app.chat.input().line_count() as u16).clamp(1, MAX_INPUT_LINES);
-    let rows =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(input_lines + 2)]).split(area);
-
-    // The pane's own title, not one built here: a pane with no room for the
-    // foot's count line says what it is hiding in the title instead, and that
-    // is arithmetic about the conversation, not about the frame.
+fn draw_chat(frame: &mut Frame, pane: &ChatPane) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(border(focused));
-    let inner = block.inner(rows[0]);
-
-    if inner.height > 0 && inner.width > 0 {
-        // A 200-column transcript is not read, it is skimmed. Cap the measure
-        // and leave the rest as margin.
-        let width = (inner.width as usize).min(MAX_TRANSCRIPT as usize);
-        let height = inner.height as usize;
-        let label = app.cfg().label();
-        let pane = Pane {
-            agent: app.tree.focused,
-            // A run in flight is what the pane's own activity line is derived
-            // from, and the spinner is the frame `App::tick` advanced.
-            //
-            // A run parked in a wait is *not* one: the foot's `working…` may
-            // only claim a model call, and `wait_agents` is not one — the
-            // agent is waiting for somebody else's result, and the row says so
-            // (`waiting on agents 3s`). Painting the spinner over that was
-            // exactly the lie finding U7 named.
-            busy: app
-                .tree
-                .node(app.tree.focused)
-                .map(|node| node.phase.is_busy() && node.phase.waiting().is_none())
-                .unwrap_or(false),
-            compacting: app
-                .tree
-                .node(app.tree.focused)
-                .and_then(|node| node.phase.compacting()),
-            spin: app.spin,
-            label: &label,
-        };
-        // Only the rows the window can show are built — the whole scrollback to
-        // display forty lines cost 55 ms a frame on a long session, and `tick`
-        // repaints every frame while an agent works.
-        let painted = app.chat.painted(&pane, width, height);
-        frame.render_widget(block.title(painted.title), rows[0]);
-        frame.render_widget(Paragraph::new(Text::from(painted.lines)), inner);
-    } else {
-        frame.render_widget(block, rows[0]);
+        .border_style(border(pane.focused));
+    match &pane.transcript {
+        Some(painted) => {
+            let inner = block.inner(pane.transcript_area);
+            frame.render_widget(block.title(painted.title.clone()), pane.transcript_area);
+            frame.render_widget(Paragraph::new(Text::from(painted.lines.clone())), inner);
+        }
+        None => frame.render_widget(block, pane.transcript_area),
     }
 
     let input_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(border(focused))
+        .border_style(border(pane.focused))
         .title(" message ");
-    let input_inner = input_block.inner(rows[1]);
-    frame.render_widget(input_block, rows[1]);
+    let input_inner = input_block.inner(pane.input_area);
+    frame.render_widget(input_block, pane.input_area);
 
-    if input_inner.height > 0 && input_inner.width > 0 {
-        let prompt = if app.tree.focused == AgentId::ROOT {
-            "› ".to_string()
+    let Some(input) = &pane.input else {
+        return;
+    };
+    let prompt_width = UnicodeWidthStr::width(input.prompt.as_str());
+    let mut rendered: Vec<Line> = Vec::with_capacity(input.lines.len());
+    for (index, line) in input.lines.iter().enumerate() {
+        let (lead, style) = if index == 0 {
+            (input.prompt.clone(), Style::default().fg(Color::Cyan))
         } else {
-            format!("#{} › ", app.tree.focused)
+            // Continuation lines line up under the first, so the prompt reads
+            // as a margin rather than as part of the message.
+            (" ".repeat(prompt_width), Style::default())
         };
-        let prompt_width = UnicodeWidthStr::width(prompt.as_str());
-        let field = (input_inner.width as usize).saturating_sub(prompt_width);
-        // The box scrolls with the cursor instead of clipping its tail: what
-        // the human is editing is always the part on screen. Multi-line drafts
-        // are painted line by line, so the cursor's own line is the one kept in
-        // view.
-        let (lines, cursor_row, column) = app.chat.input().view(input_inner.height as usize, field);
-        let mut rendered: Vec<Line> = Vec::with_capacity(lines.len());
-        for (index, line) in lines.into_iter().enumerate() {
-            let (lead, style) = if index == 0 {
-                (prompt.clone(), Style::default().fg(Color::Cyan))
-            } else {
-                // Continuation lines line up under the first, so the prompt
-                // reads as a margin rather than as part of the message.
-                (" ".repeat(prompt_width), Style::default())
-            };
-            rendered.push(Line::from(vec![Span::styled(lead, style), Span::raw(line)]));
-        }
-        frame.render_widget(Paragraph::new(Text::from(rendered)), input_inner);
-        if focused {
-            let x = input_inner.x
-                + ((prompt_width + column).min(input_inner.width.saturating_sub(1) as usize)
-                    as u16);
-            let y = input_inner.y + (cursor_row as u16).min(input_inner.height.saturating_sub(1));
-            frame.set_cursor_position(Position::new(x, y));
-        }
+        rendered.push(Line::from(vec![
+            Span::styled(lead, style),
+            Span::raw(line.clone()),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(Text::from(rendered)), input_inner);
+    if pane.focused {
+        let x = input_inner.x
+            + ((prompt_width + input.column).min(input_inner.width.saturating_sub(1) as usize)
+                as u16);
+        let y = input_inner.y + (input.cursor_row as u16).min(input_inner.height.saturating_sub(1));
+        frame.set_cursor_position(Position::new(x, y));
     }
 }
 
 /// A centered modal list for `/model` and `/provider`. The current selection
 /// is marked with a bullet; Enter picks, Esc cancels.
-fn draw_picker(frame: &mut Frame, app: &App) {
-    let Some(picker) = &app.picker else {
-        return;
-    };
-    let area = frame.area();
-    let width = picker_width(area.width);
-    let height = ((picker.items.len() as u16 + 3).min(24)).min(area.height.saturating_sub(2));
-    let x = area.x + area.width.saturating_sub(width) / 2;
-    let y = area.y + area.height.saturating_sub(height) / 2;
-    let popup = Rect::new(x, y, width, height);
-
-    frame.render_widget(Clear, popup);
+fn draw_picker(frame: &mut Frame, picker: &PickerPane) {
+    frame.render_widget(Clear, picker.area);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan))
-        .title(picker.title());
-    let inner = block.inner(popup);
-    frame.render_widget(block, popup);
-    // A terminal this short has no room for a list; the hint line and the
-    // window below both need at least one row.
-    if inner.height == 0 || inner.width == 0 {
+        .title(picker.title.clone());
+    let inner = block.inner(picker.area);
+    frame.render_widget(block, picker.area);
+    if !picker.show_hint || inner.height == 0 || inner.width == 0 {
         return;
     }
 
-    // Window the list so many items never overflow the popup.
-    let visible = inner.height.saturating_sub(1) as usize;
-    let start = picker.cursor.saturating_sub(visible / 2);
-    let mut items = Vec::new();
-    for item in picker.items.iter().skip(start).take(visible) {
-        let current = match picker.kind {
-            PickerKind::Model => picker
-                .items
-                .get(picker.cursor)
-                .map(|item| item.split(" · ").next().unwrap_or(item) == app.cfg().model)
-                .unwrap_or(false),
-            PickerKind::Provider => item == app.cfg().provider.name(),
-            // Nothing in this list is a choice, so nothing is marked as one.
-            PickerKind::Notes => false,
-        };
-        let label = if current {
-            format!("• {item}")
-        } else {
-            format!("  {item}")
-        };
-        // A model id comes from the endpoint and a note can carry a failure's
-        // own words, so the row is defanged where it is painted rather than
-        // where it is stored: an item is *data* — the id itself is sent back to
-        // the endpoint when it is picked — and rewriting it would change what
-        // is chosen (see `mush_core::text::sanitize`).
-        items.push(ListItem::new(sanitize(&label)));
-    }
+    let items: Vec<ListItem> = picker
+        .items
+        .iter()
+        .map(|item| ListItem::new(item.clone()))
+        .collect();
     let list = List::new(items)
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
         .highlight_symbol("› ");
     let mut state = ListState::default();
-    state.select(Some(picker.cursor.saturating_sub(start)));
+    state.select(Some(picker.cursor));
     frame.render_stateful_widget(list, inner, &mut state);
 
     let hint = Rect::new(
@@ -712,21 +265,20 @@ fn draw_picker(frame: &mut Frame, app: &App) {
         1,
     );
     frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(picker.hint(), dim()))),
+        Paragraph::new(Line::from(Span::styled(picker.hint, dim()))),
         hint,
     );
 }
 
-fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
-    let focus = match app.focus {
+fn draw_status(frame: &mut Frame, pane: &BarPane) {
+    let focus = match pane.focus {
         Focus::Agents => "agents",
         Focus::Chat => "chat",
     };
-    // Priority: a failure first (the Ctrl-Q warning included, so it is never
-    // hidden behind work in progress), then what the whole tree is doing that
-    // its rows cannot say, then what just happened (fades), then the static
-    // hint.
-    let (message, style) = bar_line(app.status_line(), app.tree_line());
+    let (message, style) = match &pane.word {
+        Some((rank, text)) => (text.as_str(), rank_style(*rank)),
+        None => (HINT, dim()),
+    };
     let line = Line::from(vec![
         Span::styled(
             format!(" {focus} "),
@@ -735,304 +287,12 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw(" "),
         Span::styled(message, style),
     ]);
-    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
+    let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(pane.area);
     frame.render_widget(Paragraph::new(line), rows[0]);
-    if area.height > 1 {
-        // The facts line: where this is, what it is on, how much has moved.
-        // Elided from the right, so the repository survives longest and the
-        // hints go first.
+    if let Some(facts) = &pane.facts {
         frame.render_widget(
-            Paragraph::new(Line::from(Span::styled(
-                facts_line(app, area.width as usize),
-                dim(),
-            ))),
+            Paragraph::new(Line::from(Span::styled(facts.clone(), dim()))),
             rows[1],
         );
-    }
-}
-
-/// What the bar's first line says, and how it looks. Pure so the priority is
-/// testable without a frame: an error must never lose to work in progress
-/// (finding B12 — the Ctrl-Q warning included). The order itself is
-/// `chat::Rank`, the one table; this only maps it to a colour.
-///
-/// The focused agent's activity is deliberately not a candidate here. It has
-/// two homes already — the row's own tail, with its age, and the transcript's
-/// `⚙` line — and a bar that repeated it spent its only row on the same
-/// sentence a third time (finding U5). What the bar says instead is what no row
-/// and no transcript can: the newest *event* (a failure, a stop, a job's
-/// report, a command's answer) or the one derived state the rows only imply
-/// (`tree_line`'s napping root).
-fn bar_line(status: Option<(&str, StatusKind)>, tree: Option<String>) -> (String, Style) {
-    let alert = status
-        .filter(|(_, kind)| *kind == StatusKind::Error)
-        .map(|(text, _)| text);
-    let said = status
-        .filter(|(_, kind)| *kind == StatusKind::Info)
-        .map(|(text, _)| text);
-    match Rank::last_word(alert, tree.as_deref(), said) {
-        Some((rank, text)) => (
-            text.to_string(),
-            match rank {
-                Rank::Alert => Style::default().fg(Color::Red),
-                Rank::Activity => Style::default().fg(Color::Cyan),
-                Rank::Said => Style::default().fg(Color::Gray),
-            },
-        ),
-        None => (HINT.to_string(), dim()),
-    }
-}
-
-/// `⌂ ~/p/demo │ master ±3 +12 −3 │ qwen2.5-coder · ctx ~500k │ /help` — the
-/// stable facts, in the order that matters, cut from the right when the
-/// terminal is narrow.
-fn facts_line(app: &App, width: usize) -> String {
-    let root = app.ws.root_str();
-    let home = std::env::var("HOME").unwrap_or_default();
-    // `~` only stands for the home *directory*: `/home/ru` must not elide
-    // `/home/ruben/x` into `~ben/x` (finding B18).
-    let shown = if !home.is_empty() && root == home {
-        "~".to_string()
-    } else if let Some(rest) = root
-        .strip_prefix(&home)
-        .filter(|rest| rest.starts_with('/'))
-    {
-        format!("~{rest}")
-    } else {
-        root
-    };
-    let mut cells = vec![format!(" ⌂ {shown}")];
-    if let Some(git) = &app.git {
-        cells.push(git_cell(git, app.git_age()));
-    }
-    cells.push(format!("{} · {}", app.cfg().label(), app.context_meter()));
-    while cells.len() > 1 {
-        let joined: String = cells.join(" │ ");
-        if UnicodeWidthStr::width(joined.as_str()) <= width {
-            break;
-        }
-        cells.pop();
-    }
-    cells.join(" │ ")
-}
-
-/// The branch cell of the facts line: the branch, how many paths are dirty, the
-/// uncommitted delta — and, once the read has aged past [`GIT_STALE`], how old
-/// it is. A cached read must not read as a live one, so the age rides with the
-/// fact it qualifies and is elided with it, never after it (finding P8).
-fn git_cell(git: &git::RepoStatus, age: Option<Duration>) -> String {
-    let mut cell = if git.branch.is_empty() {
-        "detached".to_string()
-    } else {
-        git.branch.clone()
-    };
-    if git.dirty > 0 {
-        cell.push_str(&format!(" ±{}", git.dirty));
-    }
-    if !git.stat.is_empty() {
-        cell.push_str(&format!(" {}", git.stat.compact()));
-    }
-    if let Some(age) = age.filter(|age| *age >= GIT_STALE) {
-        cell.push_str(&format!(" · {} ago", short_age(age)));
-    }
-    cell
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn an_error_outranks_the_tree_line() {
-        let (text, _) = bar_line(
-            Some(("cannot reach http://127.0.0.1:1", StatusKind::Error)),
-            Some("waiting on 1 subagent(s) — the root resumes as they finish".to_string()),
-        );
-        assert_eq!(
-            text, "cannot reach http://127.0.0.1:1",
-            "an error is visible"
-        );
-
-        let (text, _) = bar_line(
-            Some(("opened notes.txt", StatusKind::Info)),
-            Some("#0 thinking 3s".to_string()),
-        );
-        assert_eq!(
-            text, "#0 thinking 3s",
-            "derived state beats a fading info line"
-        );
-
-        let (text, _) = bar_line(Some(("opened notes.txt", StatusKind::Info)), None);
-        assert_eq!(text, "opened notes.txt");
-
-        let (text, _) = bar_line(None, None);
-        assert!(text.contains("/help"), "{text}");
-    }
-
-    /// The `/notes` report is wrapped for the popup's own content width, and
-    /// that width is this one function: the popup the terminal size paints,
-    /// minus the two border columns, the two the `› ` symbol reserves and the
-    /// two the `  ` indent carries. A `/notes` line wider than this is a line
-    /// the list has to clip.
-    #[test]
-    fn the_notes_width_follows_the_popup_it_is_painted_in() {
-        // The two ends the tests name: the floor and the ceiling.
-        assert_eq!(picker_text_width(40), 34);
-        assert_eq!(picker_text_width(200), 74);
-        assert!(picker_text_width(60) < picker_text_width(200));
-
-        // Never wider than the popup it is painted in, at any size.
-        for terminal in 40..=240u16 {
-            assert!(
-                picker_text_width(terminal) <= picker_width(terminal) as usize,
-                "a report wider than its popup at {terminal}"
-            );
-        }
-    }
-
-    /// A row's glyph is the whole status vocabulary in one character; it must
-    /// never claim a run that did not happen (`·`, not `✓`), and it is a
-    /// function of the agent's *own* phase only — an agent that is working is
-    /// `◐` even while its children work, because "waiting on children" is a
-    /// fact about the children, drawn as its own mark (finding U1).
-    #[test]
-    fn glyphs_are_truthful() {
-        assert_eq!(phase_glyph(&Phase::Idle), "·");
-        assert_eq!(phase_glyph(&Phase::Thinking), "◐");
-        assert_eq!(phase_glyph(&Phase::Activity("edit_file a.rs".into())), "◐");
-        assert_eq!(phase_glyph(&Phase::Cancelling), "⊘");
-        assert_eq!(phase_glyph(&Phase::Done), "✓");
-        assert_eq!(phase_glyph(&Phase::Failed("boom".into())), "✗");
-        // A stopped agent is not a finished one, and must not borrow the tick.
-        assert_eq!(phase_glyph(&Phase::Stopped), "⊘");
-    }
-
-    /// The detail line carries the age of the *phase*, so a slow model looks
-    /// slow instead of looking stuck.
-    /// A node carrying nothing but the facts a row test needs.
-    fn node(phase: Phase, age: u64) -> AgentNode {
-        AgentNode {
-            id: AgentId(2),
-            parent: None,
-            depth: 0,
-            brief: "lexer".to_string(),
-            phase,
-            since: std::time::Instant::now() - std::time::Duration::from_secs(age),
-            branch: None,
-            summary: None,
-            leftover: false,
-            landed: None,
-        }
-    }
-
-    #[test]
-    fn details_age_with_the_phase() {
-        assert_eq!(phase_detail(&node(Phase::Thinking, 3)), "thinking 3s");
-        assert_eq!(
-            phase_detail(&node(Phase::Activity("edit_file src/a.rs".into()), 75)),
-            "edit_file src/a.rs 1m15s"
-        );
-        assert_eq!(phase_detail(&node(Phase::Cancelling, 1)), "cancelling…");
-        assert_eq!(
-            phase_detail(&node(Phase::Failed("no route".into()), 9)),
-            "no route"
-        );
-        assert_eq!(phase_detail(&node(Phase::Idle, 9)), "");
-
-        // A stopped run has no result; showing the interrupted run's summary
-        // would claim work that was never delivered.
-        let mut stopped = node(Phase::Stopped, 9);
-        stopped.summary = Some("wrote half the parser".to_string());
-        assert_eq!(phase_detail(&stopped), "stopped · re-send to resume");
-        assert!(
-            !phase_detail(&stopped).contains("half the parser"),
-            "a stop must not show the previous run's summary"
-        );
-    }
-
-    /// A landed worktree still has a branch recorded, so the row must key off
-    /// `landed` to stop offering a diff and a merge that can no longer work.
-    #[test]
-    fn a_landed_agent_does_not_offer_commands_that_cannot_work() {
-        let mut merged = node(Phase::Done, 1);
-        merged.branch = Some("mush/9".to_string());
-        merged.landed = Some(Landed::Merged);
-        let text = agent_detail(&merged).join(" · ");
-        assert_eq!(text, "merged into HEAD");
-        assert!(!text.contains("git diff"), "{text}");
-        assert!(!text.contains("/merge"), "{text}");
-
-        let mut discarded = node(Phase::Done, 1);
-        discarded.branch = Some("mush/9".to_string());
-        discarded.landed = Some(Landed::Discarded);
-        let text = agent_detail(&discarded).join(" · ");
-        assert!(text.contains("discarded"), "{text}");
-        assert!(!text.contains("/merge"), "{text}");
-    }
-
-    /// Before anything lands, the row is the one place that says where an
-    /// isolated agent's work is and how to bring it in.
-    #[test]
-    fn an_unmerged_agent_names_its_worktree_and_the_command_to_merge_it() {
-        let mut open = node(Phase::Done, 1);
-        open.branch = Some("mush/9".to_string());
-        let text = agent_detail(&open).join(" · ");
-        // The commands are keyed by the *id* (the worktree is `.mush/wt/<id>`),
-        // which need not match the number in the branch name.
-        assert_eq!(
-            text,
-            format!(
-                ".mush/wt/{} · git diff HEAD...mush/9 · /merge {}",
-                open.id, open.id
-            )
-        );
-    }
-
-    /// The floor notice must never name a size the program does not need: the
-    /// fixed 25-column string was truncated at 24 columns to `40×1` (finding
-    /// P11). Every spelling that fits is tried longest-first, and the one that
-    /// fits is the one painted.
-    #[test]
-    fn the_floor_notice_fits_the_terminal_it_is_painted_in() {
-        // The full sentence at its own width and wider.
-        assert_eq!(floor_notice(80), "mush needs at least 40×10");
-        assert_eq!(floor_notice(25), "mush needs at least 40×10");
-        // Narrower than the sentence: a shorter honest spelling.
-        assert_eq!(floor_notice(24), "needs at least 40×10");
-        assert_eq!(floor_notice(19), "40×10 minimum");
-        assert_eq!(floor_notice(11), "needs 40×10");
-        assert_eq!(floor_notice(5), "40×10");
-        // And it never lies about the size, at any narrow width.
-        for width in 0..=25u16 {
-            assert!(
-                floor_notice(width).contains(&format!("{MIN_WIDTH}×{MIN_HEIGHT}")),
-                "the notice at {width} must name the real floor"
-            );
-        }
-    }
-
-    /// The facts line's git cell says how old a read is once it has aged past
-    /// the point an event would have refreshed it (finding P8), and stays plain
-    /// while the read is fresh.
-    #[test]
-    fn a_stale_git_read_is_labelled_in_the_facts_cell() {
-        let git = git::RepoStatus {
-            branch: "main".to_string(),
-            dirty: 2,
-            stat: git::Stat {
-                files: 2,
-                added: 5,
-                removed: 1,
-            },
-        };
-        assert_eq!(git_cell(&git, Some(Duration::from_secs(1))), "main ±2 +5−1");
-        assert_eq!(git_cell(&git, None), "main ±2 +5−1");
-        assert_eq!(
-            git_cell(&git, Some(Duration::from_secs(30))),
-            "main ±2 +5−1 · 30s ago"
-        );
-        // An empty branch is a detached HEAD, not a blank cell.
-        let detached = git::RepoStatus::default();
-        assert_eq!(git_cell(&detached, None), "detached");
     }
 }
