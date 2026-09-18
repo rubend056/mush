@@ -860,22 +860,14 @@ impl App {
                     crate::jobs::label(job),
                     job_title(&command)
                 );
-                if id == self.tree.focused {
-                    self.say(note);
-                } else {
-                    self.say(format!("agent #{id}: {note}"));
-                }
+                self.say_for(id, note);
             }
             AgentEvent::JobDone { job, line } => {
                 // A job's report is the owner's to read in its transcript (the
                 // actor folds it in); on the screen it is the bar's line, and
                 // the badge the job was on goes out with it.
                 let _ = job;
-                if id == self.tree.focused {
-                    self.say(line);
-                } else {
-                    self.say(format!("agent #{id}: {line}"));
-                }
+                self.say_for(id, line);
             }
             AgentEvent::Context { tokens, source } => {
                 // The actor learned the endpoint's real window from a server
@@ -921,17 +913,22 @@ impl App {
         }
     }
 
-    /// Whether anything in the tree is working: derived from the phases, so it
-    /// cannot disagree with the rows. A detached job counts: the agent may be
-    /// napping, but the machine is not idle, and the tick uses this to keep the
-    /// git snapshot fresh while something runs.
+    /// Whether anything in the tree is working: derived from the phases and the
+    /// job registry, so it cannot disagree with the rows. A detached job counts:
+    /// the agent may be napping, but the machine is not idle, and the tick uses
+    /// this to keep the git snapshot fresh while something runs.
     pub fn busy(&self) -> bool {
-        self.tree.busy()
-            || self
-                .tree
-                .agents
-                .iter()
-                .any(|node| !self.tree.live_jobs(node.id).is_empty())
+        // The tree answers the common case with no registry read; the per-node
+        // check only adds the jobs.
+        self.tree.busy() || self.tree.agents.iter().any(|node| self.in_flight(node))
+    }
+
+    /// Whether one agent has work in flight: its own run, or one of its jobs.
+    /// The one per-node derivation behind [`Self::busy`] and
+    /// [`Self::working_agents`]. [`AgentTree::busy`] stays agent-only, with no
+    /// opinion about jobs.
+    fn in_flight(&self, node: &AgentNode) -> bool {
+        node.phase.is_busy() || !self.tree.live_jobs(node.id).is_empty()
     }
 
     /// The jobs `id` has running, read from the one registry that holds them.
@@ -958,21 +955,34 @@ impl App {
             .collect()
     }
 
-    /// Remember a transient line for the bar: what a command just did, what the
-    /// human just asked for. It fades.
-    ///
-    /// The line is [`mush_core::text::sanitize`]d here, at the one door into the
-    /// bar, because the bar paints it whole: it does no width arithmetic, so it
-    /// never calls `truncate` or `fit_row` and the rule those carry cannot reach
-    /// it. The same door serves [`Self::fail`], and between them they own every
-    /// string the bar's line can be.
-    pub fn say(&mut self, text: impl Into<String>) {
+    /// The one door a bar line goes through: the text is
+    /// [`mush_core::text::sanitize`]d here, because the bar paints it whole —
+    /// it does no width arithmetic, so the `truncate`/`fit_row` rule cannot
+    /// reach it. Private, so every string the bar can show is created by
+    /// [`Self::say`] or [`Self::fail`], which differ only in the kind.
+    fn set_status(&mut self, kind: StatusKind, text: impl Into<String>) {
         let text = text.into();
         self.status = Some(Status {
-            kind: StatusKind::Info,
+            kind,
             text: mush_core::text::sanitize(&text),
             set_at: Instant::now(),
         });
+    }
+
+    /// Remember a transient line for the bar: what a command just did, what the
+    /// human just asked for. It fades.
+    pub fn say(&mut self, text: impl Into<String>) {
+        self.set_status(StatusKind::Info, text);
+    }
+
+    /// A bar line about `id`, named with the agent unless it is the focused
+    /// one: the focused agent's own line needs no name.
+    fn say_for(&mut self, id: AgentId, text: String) {
+        if id == self.tree.focused {
+            self.say(text);
+        } else {
+            self.say(format!("agent #{id}: {text}"));
+        }
     }
 
     /// `500k`, `8192`, `1M` — one glance, no counting zeroes.
@@ -1034,15 +1044,10 @@ impl App {
     /// a later line replaces them.
     ///
     /// A failure is where the *endpoint's* own words reach the bar — a 500's
-    /// error body, a refusal's reason — so this is the other half of the rule
-    /// `say` carries (see its doc).
+    /// error body, a refusal's reason — so it goes through the same door `say`
+    /// does (see [`Self::set_status`]).
     pub fn fail(&mut self, text: impl Into<String>) {
-        let text = text.into();
-        self.status = Some(Status {
-            kind: StatusKind::Error,
-            text: mush_core::text::sanitize(&text),
-            set_at: Instant::now(),
-        });
+        self.set_status(StatusKind::Error, text);
     }
 
     /// The transient line, if it is still worth showing.
@@ -1739,16 +1744,12 @@ impl App {
     fn paint_diff(&mut self, id: AgentId, branch: &str) {
         let root = self.ws.root().to_path_buf();
         let command = format!("git diff HEAD...{branch}");
-        // Both names are resolved to commits before git reads them, for the same
-        // reason `git::branch_stat` does it: a branch name is untrusted input,
-        // and one beginning with `-` would be taken by `diff` as an option.
-        let resolve = |name: &str| {
-            git::run(
-                &root,
-                &["rev-parse", "--verify", &format!("{name}^{{commit}}")],
-            )
-        };
-        let (Ok(base), Ok(tip)) = (resolve("HEAD"), resolve(branch)) else {
+        // Both names are resolved to commits before git reads them, through the
+        // one home `git::resolve` keeps for that rule: a branch name is
+        // untrusted input, and one beginning with `-` would be taken by `diff`
+        // as an option.
+        let (Some(base), Some(tip)) = (git::resolve(&root, "HEAD"), git::resolve(&root, branch))
+        else {
             // The branch a node names can be gone — a hand-run `git branch -d`,
             // a worktree git pruned — and the honest answer is git's own, not a
             // diff against a name that does not resolve.
@@ -2129,13 +2130,12 @@ impl App {
     }
 
     /// The agents with work in flight: a run, or a job. `Stop` is aimed at the
-    /// work, not at the phase, so both count — an agent whose run ended while
-    /// its `cargo bench` still runs is not idle on the machine.
+    /// work, not at the phase, so both count ([`Self::in_flight`]).
     fn working_agents(&self) -> Vec<AgentId> {
         self.tree
             .agents
             .iter()
-            .filter(|node| node.phase.is_busy() || !self.tree.live_jobs(node.id).is_empty())
+            .filter(|node| self.in_flight(node))
             .map(|node| node.id)
             .collect()
     }
@@ -2525,39 +2525,32 @@ mod tests {
         );
     }
 
-    fn app_at(root: std::path::PathBuf) -> App {
-        let ws = Workspace::new(&root).unwrap();
+    /// The fixture every `App` test starts from: a real workspace at `root`, an
+    /// endpoint that answers nothing (`127.0.0.1:1`), and the session store the
+    /// caller chose. One construction, so the twelve call sites cannot drift
+    /// from what `App::new` takes.
+    fn app_root(
+        root: &std::path::Path,
+        stored: Option<Session>,
+        save: Arc<dyn SessionSave>,
+    ) -> (App, Receiver<Msg>) {
+        let ws = Workspace::new(root).unwrap();
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
-        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
         let cell = ConfigCell::own(cfg);
-        let handle = spawn(cell.handle(), tx.clone(), root.clone());
-        App::new(
-            ws,
-            cell,
-            None,
-            handle,
-            tx,
-            session_save::fake::Recorder::new(),
-        )
+        let handle = spawn(cell.handle(), tx.clone(), root.to_path_buf());
+        let app = App::new(ws, cell, stored, handle, tx, save);
+        (app, rx)
+    }
+
+    fn app_at(root: std::path::PathBuf) -> App {
+        app_root(&root, None, session_save::fake::Recorder::new()).0
     }
 
     /// An `App` with the UI channel kept, so a read that finishes on its own
     /// thread (`Msg::Git`) can be waited for instead of raced.
     fn app_and_rx(root: std::path::PathBuf) -> (App, Receiver<Msg>) {
-        let ws = Workspace::new(&root).unwrap();
-        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let cell = ConfigCell::own(cfg);
-        let handle = spawn(cell.handle(), tx.clone(), root.clone());
-        let app = App::new(
-            ws,
-            cell,
-            None,
-            handle,
-            tx,
-            session_save::fake::Recorder::new(),
-        );
-        (app, rx)
+        app_root(&root, None, session_save::fake::Recorder::new())
     }
 
     /// Adopt the next `Msg::Git` that arrives within the deadline, applying any
@@ -2813,27 +2806,16 @@ mod tests {
     /// the tests that read the file back. The writer is returned so a test can
     /// see how many writes the conversation cost.
     fn app_writing(root: &std::path::Path) -> (App, Arc<session_save::Writer>) {
-        let ws = Workspace::new(root).unwrap();
-        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
-        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let cell = ConfigCell::own(cfg);
-        let handle = spawn(cell.handle(), tx.clone(), root.to_path_buf());
         let writer = Arc::new(session_save::Writer::new(root.to_path_buf()));
-        let app = App::new(ws, cell, None, handle, tx, writer.clone());
+        let (app, _rx) = app_root(root, None, writer.clone());
         (app, writer)
     }
 
     /// An `App` on a scratch directory whose saves are recorded instead of
     /// written, so a test sees what the UI thread handed over and when.
     fn app_recording(label: &str) -> (App, Arc<session_save::fake::Recorder>) {
-        let root = dir(label);
-        let ws = Workspace::new(&root).unwrap();
-        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
-        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let cell = ConfigCell::own(cfg);
-        let handle = spawn(cell.handle(), tx.clone(), root.clone());
         let recorder = session_save::fake::Recorder::new();
-        let app = App::new(ws, cell, None, handle, tx, recorder.clone());
+        let (app, _rx) = app_root(&dir(label), None, recorder.clone());
         (app, recorder)
     }
 
@@ -2848,19 +2830,12 @@ mod tests {
     /// A real `App` that adopted what is on disk in `root`, the way a restart
     /// does.
     fn reopened(root: &std::path::Path) -> App {
-        let ws = Workspace::new(root).unwrap();
-        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
-        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let cell = ConfigCell::own(cfg);
-        let handle = spawn(cell.handle(), tx.clone(), root.to_path_buf());
-        App::new(
-            ws,
-            cell,
+        let (app, _rx) = app_root(
+            root,
             Session::load(root),
-            handle,
-            tx,
             session_save::fake::Recorder::new(),
-        )
+        );
+        app
     }
 
     /// The painted screen, row by row, at a real terminal size. The layout
@@ -3436,11 +3411,6 @@ mod tests {
     #[test]
     fn a_stored_conversation_restores_its_agents_with_a_live_mailbox() {
         let root = repo("restore");
-        let ws = Workspace::new(&root).unwrap();
-        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
-        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let cell = ConfigCell::own(cfg);
-        let handle = spawn(cell.handle(), tx.clone(), root.clone());
         let stored = Session {
             root: root.display().to_string(),
             model: "test-model".into(),
@@ -3464,14 +3434,7 @@ mod tests {
             notices: Vec::new(),
         };
 
-        let app = App::new(
-            ws,
-            cell,
-            Some(stored),
-            handle,
-            tx,
-            session_save::fake::Recorder::new(),
-        );
+        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
 
         let node = app
             .tree
@@ -3561,27 +3524,15 @@ mod tests {
     #[test]
     fn a_restored_agent_comes_back_at_rest() {
         let root = repo("restore-at-rest");
-        let ws = Workspace::new(&root).unwrap();
-        // Nothing answers here: an agent that ran would fail, loudly, in the
-        // events this test reads.
-        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let cell = ConfigCell::own(cfg);
-        let handle = spawn(cell.handle(), tx.clone(), root.clone());
         let stored = stored_with_agent(
             &root,
             session::StoredStatus::Done,
             vec![Message::user("port the parser"), Message::assistant("done")],
         );
 
-        let app = App::new(
-            ws,
-            cell,
-            Some(stored),
-            handle,
-            tx,
-            session_save::fake::Recorder::new(),
-        );
+        // Nothing answers here: an agent that ran would fail, loudly, in the
+        // events this test reads.
+        let (app, rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
 
         let seen = events_from(&rx, AgentId(2), Duration::from_millis(300));
         assert!(
@@ -3616,11 +3567,6 @@ mod tests {
     #[test]
     fn a_refused_attempt_does_not_turn_a_finished_agent_into_a_failure() {
         let root = repo("restore-refused");
-        let ws = Workspace::new(&root).unwrap();
-        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
-        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let cell = ConfigCell::own(cfg);
-        let handle = spawn(cell.handle(), tx.clone(), root.clone());
         let refusal = "model returned HTTP 400: The `reasoning_content` in the thinking \
                        mode must be passed back to the API.";
         let stored = stored_with_agent(
@@ -3629,14 +3575,7 @@ mod tests {
             vec![Message::user("port the parser"), Message::assistant("done")],
         );
 
-        let app = App::new(
-            ws,
-            cell,
-            Some(stored),
-            handle,
-            tx,
-            session_save::fake::Recorder::new(),
-        );
+        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
 
         let node = app.tree.node(AgentId(2)).expect("the agent is restored");
         assert_eq!(
@@ -3657,11 +3596,6 @@ mod tests {
     #[test]
     fn a_failure_that_left_the_transcript_mid_task_is_still_a_failure() {
         let root = repo("restore-mid-task");
-        let ws = Workspace::new(&root).unwrap();
-        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
-        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let cell = ConfigCell::own(cfg);
-        let handle = spawn(cell.handle(), tx.clone(), root.clone());
         let stored = stored_with_agent(
             &root,
             session::StoredStatus::Failed("the endpoint stopped responding".into()),
@@ -3672,14 +3606,7 @@ mod tests {
             ],
         );
 
-        let app = App::new(
-            ws,
-            cell,
-            Some(stored),
-            handle,
-            tx,
-            session_save::fake::Recorder::new(),
-        );
+        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
 
         assert_eq!(
             app.tree.node(AgentId(2)).map(|node| node.phase.clone()),
@@ -4207,12 +4134,7 @@ mod tests {
 
         let recorder = Recorder::new().fails("no space left on device");
         let root = dir("failed-write");
-        let ws = Workspace::new(&root).unwrap();
-        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
-        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let cell = ConfigCell::own(cfg);
-        let handle = spawn(cell.handle(), tx.clone(), root.clone());
-        let mut app = App::new(ws, cell, None, handle, tx, recorder);
+        let mut app = app_root(&root, None, recorder).0;
         streamed(&mut app, "lost");
 
         // The debounce hands it over; the scripted write fails; the next tick is
@@ -4885,20 +4807,7 @@ mod tests {
         let root = std::env::temp_dir().join(format!("mush-app-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
-        let ws = Workspace::new(&root).unwrap();
-        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
-        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let cell = ConfigCell::own(cfg);
-        let handle = spawn(cell.handle(), tx.clone(), root.clone());
-        let app = App::new(
-            ws,
-            cell,
-            None,
-            handle,
-            tx,
-            session_save::fake::Recorder::new(),
-        );
-        (app, rx)
+        app_root(&root, None, session_save::fake::Recorder::new())
     }
 
     /// `/new` must do what Ctrl-N does: a cleared chat with a live root, not
@@ -6876,19 +6785,7 @@ mod tests {
         git(&["commit", "-qm", "init"]);
         git(&["worktree", "add", "-q", "-b", "mush/7", ".mush/wt/7"]);
 
-        let ws = Workspace::new(&root).unwrap();
-        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
-        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        let cell = ConfigCell::own(cfg);
-        let handle = spawn(cell.handle(), tx.clone(), root.clone());
-        let mut app = App::new(
-            ws,
-            cell,
-            None,
-            handle,
-            tx,
-            session_save::fake::Recorder::new(),
-        );
+        let (mut app, _rx) = app_root(&root, None, session_save::fake::Recorder::new());
 
         assert!(
             app.tree.agents.iter().any(|node| node.id == AgentId(7)),

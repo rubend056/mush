@@ -1242,6 +1242,80 @@ fn tool_schemas(actor: &Actor) -> Vec<Value> {
     }
 }
 
+/// The thinking knobs a request sends. Unstated, they are the provider's own:
+/// DeepSeek asks for its thinking mode and `high`, every other endpoint gets
+/// neither field. Stated (flag, environment, or home config), they are the
+/// human's, wherever they pointed mush. One derivation, so the run's ask and
+/// the fold cannot disagree about what "stated" means.
+fn thinking_fields(cfg: &Config) -> (Option<Value>, Option<String>) {
+    (
+        cfg.thinking_enabled().then(|| json!({ "type": "enabled" })),
+        cfg.reasoning_effort().map(str::to_string),
+    )
+}
+
+/// The request shape both the run loop and the fold send: same model, same
+/// sampling, same thinking knobs, and the reply cap carried under the name the
+/// endpoint takes. `tool_choice` and `cap` are the only things a caller varies
+/// from the run's turn — a wrap-up turn withdraws tools, a fold asks for a
+/// smaller reply — so they travel in the arguments, and the swap between
+/// `max_tokens` and `max_completion_tokens` lives here and nowhere else. A
+/// second, hand-built request is how the fold came to send `max_tokens` to an
+/// endpoint that rejects it and silently never compacted.
+fn request<'a>(
+    cfg: &'a Config,
+    messages: &'a [Message],
+    tools: &'a [Value],
+    tool_choice: &'a str,
+    cap: u32,
+) -> ChatRequest<'a> {
+    let (thinking, reasoning_effort) = thinking_fields(cfg);
+    let mut request = ChatRequest {
+        model: &cfg.model,
+        messages,
+        tools,
+        tool_choice,
+        stream: false,
+        temperature: cfg.temperature(),
+        max_tokens: cap,
+        max_completion_tokens: None,
+        thinking,
+        reasoning_effort,
+    };
+    // The cap travels as `max_completion_tokens` only where that is the name
+    // the endpoint takes (OpenAI's reasoning models reject the old one);
+    // everywhere else keeps the field every OpenAI-compatible server
+    // documents. One swap, for every caller.
+    if cfg.uses_max_completion_tokens() {
+        request.max_completion_tokens = Some(request.max_tokens);
+        request.max_tokens = 0;
+    }
+    request
+}
+
+/// One turn's ask, with the bounded retry a transport hiccup gets: the pause
+/// waits on the run's clock, the cancel flag is read between attempts, and
+/// every retry is a line in this agent's transcript rather than a spinner that
+/// looks stuck (finding B23). Everything the endpoint *answered* — a status, a
+/// refusal, a body that did not parse — is returned unchanged, first time. Both
+/// callers ask through this; only their error arms differ.
+fn ask(
+    actor: &Actor,
+    request: &ChatRequest<'_>,
+    cancel: &AtomicBool,
+) -> Result<ChatResponse, ModelError> {
+    retrying(
+        actor.ctx.clock.as_ref(),
+        cancel,
+        |line| {
+            actor
+                .ctx
+                .emit(actor.id, AgentEvent::Notice(line.to_string()))
+        },
+        || actor.ctx.model.chat(request, cancel),
+    )
+}
+
 /// One run: model turns → tool calls → results, until the model answers.
 fn run_loop(
     actor: &Actor,
@@ -1323,58 +1397,22 @@ fn run_loop(
             messages
         };
 
-        let mut request = ChatRequest {
-            model: &cfg.model,
-            messages: request_messages,
-            // The schemas stay even on a wrap-up turn: the prompt starts with
-            // them, so withdrawing them re-prefills a history that is at its
-            // longest (see `tool_schemas`). `tool_choice` is what stops the
-            // calls, and a call the model makes anyway is answered, not run.
-            tools: &schemas,
-            // `auto` keeps models that ignore tools working: they simply answer.
-            tool_choice: if wrap_up { "none" } else { "auto" },
-            stream: false,
-            temperature: cfg.temperature(),
-            max_tokens: cfg.reply_cap(),
-            max_completion_tokens: None,
-            thinking: None,
-            reasoning_effort: None,
-        };
-        // The cap travels as `max_completion_tokens` only where that is the
-        // name the endpoint takes (OpenAI's reasoning models reject the old
-        // one); everywhere else keeps the field every OpenAI-compatible server
-        // documents.
-        if cfg.uses_max_completion_tokens() {
-            request.max_completion_tokens = Some(request.max_tokens);
-            request.max_tokens = 0;
-        }
-        // The thinking knobs. Unstated, they are the provider's own: DeepSeek
-        // asks for its thinking mode and `high`, every other endpoint gets
-        // neither field. Stated (flag, environment, or home config), they are
-        // the human's, wherever they pointed mush.
-        if cfg.thinking_enabled() {
-            request.thinking = Some(json!({ "type": "enabled" }));
-        }
-        if let Some(effort) = cfg.reasoning_effort() {
-            request.reasoning_effort = Some(effort.to_string());
-        }
+        // The schemas stay even on a wrap-up turn: the prompt starts with
+        // them, so withdrawing them re-prefills a history that is at its
+        // longest (see `tool_schemas`). `tool_choice` is what stops the
+        // calls, and a call the model makes anyway is answered, not run — and
+        // `auto` keeps models that ignore tools working: they simply answer.
+        let request = request(
+            &cfg,
+            request_messages,
+            &schemas,
+            if wrap_up { "none" } else { "auto" },
+            cfg.reply_cap(),
+        );
 
-        // One turn's ask, with the bounded retry a transport hiccup gets: the
-        // pause waits on the run's clock, the cancel flag is read between
-        // attempts, and every retry is a line in this agent's transcript rather
-        // than a spinner that looks stuck (finding B23). Everything the
-        // endpoint *answered* — a status, a refusal, a body that did not parse
-        // — is returned unchanged, first time.
-        let reply = match retrying(
-            actor.ctx.clock.as_ref(),
-            cancel,
-            |line| {
-                actor
-                    .ctx
-                    .emit(actor.id, AgentEvent::Notice(line.to_string()))
-            },
-            || actor.ctx.model.chat(&request, cancel),
-        ) {
+        // One turn's ask: the retry policy and the retry line are [`ask`]'s,
+        // the error arms below are the run's own.
+        let reply = match ask(actor, &request, cancel) {
             Ok(reply) => reply,
             // The reader stops the moment the human cancels; that is a
             // cancellation, not a failure to reach the endpoint.
@@ -1799,8 +1837,8 @@ fn compact_history(
         return Err(CANCELLED.to_string());
     }
 
-    let mut ask = messages.clone();
-    ask.push(Message::user(COMPACT_INSTRUCTION));
+    let mut folded = messages.clone();
+    folded.push(Message::user(COMPACT_INSTRUCTION));
     // A summarize request: the run's own request, byte for byte, plus that one
     // user message. Same system prompt, same tools, same `tool_choice`, same
     // thinking knobs. What shapes the prompt shapes the endpoint's cache, and
@@ -1817,32 +1855,11 @@ fn compact_history(
     // Sampling and length parameters are a separate matter: they are not prompt
     // text, so the summary's own cap costs no cache miss.
     let schemas = tool_schemas(actor);
-    let request = ChatRequest {
-        model: &cfg.model,
-        messages: &ask,
-        tools: &schemas,
-        tool_choice: "auto",
-        stream: false,
-        temperature: cfg.temperature(),
-        max_tokens: COMPACT_REPLY_TOKENS,
-        max_completion_tokens: None,
-        thinking: if cfg.thinking_enabled() {
-            Some(json!({ "type": "enabled" }))
-        } else {
-            None
-        },
-        reasoning_effort: cfg.reasoning_effort().map(str::to_string),
-    };
-    let reply = match retrying(
-        actor.ctx.clock.as_ref(),
-        cancel,
-        |line| {
-            actor
-                .ctx
-                .emit(actor.id, AgentEvent::Notice(line.to_string()))
-        },
-        || actor.ctx.model.chat(&request, cancel),
-    ) {
+    // The fold's cap is its own (`COMPACT_REPLY_TOKENS`) and it leaves
+    // `tool_choice` at `auto`; everything else — the field the cap travels
+    // under included — is [`request`]'s, shared with the run's own ask.
+    let request = request(cfg, &folded, &schemas, "auto", COMPACT_REPLY_TOKENS);
+    let reply = match ask(actor, &request, cancel) {
         Ok(reply) => reply,
         // A cancelled run is already ending; do not report a network failure.
         Err(ModelError::Cancelled) => return Err(CANCELLED.to_string()),
@@ -5468,8 +5485,12 @@ mod tests {
         run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
         let asked = scripted.asked();
         assert_eq!(
-            asked[0].reply_cap, 30_000,
-            "a quarter of the 120k window, not a fixed 20_480"
+            asked[0].max_tokens, 30_000,
+            "a quarter of the 120k window, not a fixed 20_480, under the field this config chose"
+        );
+        assert_eq!(
+            asked[0].max_completion_tokens, None,
+            "the documented field, since this endpoint takes it"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
@@ -8057,6 +8078,110 @@ mod tests {
             scripted.asked().is_empty(),
             "the refusal costs no model call: {:?}",
             scripted.asked().len()
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A fold is a model call like any other: the reply cap travels under the
+    /// endpoint's own field name, the same one the run's ask uses. The fold
+    /// used to build its own `ChatRequest` and always set `max_tokens`, so an
+    /// endpoint configured for `max_completion_tokens` (OpenAI's reasoning
+    /// models) refused the fold with a 400 — and `compact_history` swallowed
+    /// the refusal, so `/compact` silently never happened.
+    #[test]
+    fn a_fold_carries_the_cap_under_the_endpoints_field() {
+        let root = scratch_dir("compact-cap-field");
+        let summary = "the task was to say something; it was said";
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary)
+                .says("first answer"),
+        );
+        let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
+        cfg.max_completion_tokens = true;
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("say something".to_string()),
+            ]))
+            .unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the run must finish before the fold: {seen:?}"
+        );
+
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
+        assert!(
+            seen.wait(&events, WAIT, |seen| !seen.summaries.is_empty()),
+            "the endpoint's own field is what the fold must send: {seen:?}"
+        );
+
+        let asked = scripted.asked();
+        let fold = asked.last().expect("the fold asked the model");
+        assert!(fold.saw(COMPACT_INSTRUCTION), "the last ask is the fold");
+        assert_eq!(
+            fold.max_completion_tokens,
+            Some(COMPACT_REPLY_TOKENS),
+            "the fold's cap, under the field this endpoint requires"
+        );
+        assert_eq!(
+            fold.max_tokens, 0,
+            "and never the field this endpoint rejects"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A fold the endpoint refuses is not a silent one when the human asked for
+    /// it: mush must say the `/compact` did not happen, or it reads as one that
+    /// did. The automatic trigger stays quiet — its run's own request follows
+    /// and will say the same thing.
+    #[test]
+    fn a_refused_fold_is_not_silent_when_it_was_asked_for() {
+        let root = scratch_dir("compact-refused");
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .fails_with(
+                    400,
+                    "{\"error\":{\"message\":\"max_completion_tokens is required\"}}",
+                )
+                .says("first answer"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("say something".to_string()),
+            ]))
+            .unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the run must finish first: {seen:?}"
+        );
+
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen
+                .notices
+                .iter()
+                .any(|line| line.contains("could not compact"))),
+            "an asked fold the endpoint refused must be told, not swallowed: {seen:?}"
+        );
+        assert!(
+            seen.summaries.is_empty(),
+            "nothing was folded, so no summary was claimed"
         );
         let _ = fs::remove_dir_all(&root);
     }

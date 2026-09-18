@@ -313,10 +313,13 @@ pub(crate) mod fake {
         pub thinking: Option<Value>,
         /// The same for `reasoning_effort`.
         pub reasoning_effort: Option<String>,
-        /// The reply cap the request carried, under whichever of the two names
-        /// the config sends it. It is the number the endpoint cuts a reply off
-        /// at, so a test can assert what a window really buys.
-        pub reply_cap: u32,
+        /// The reply cap the request carried, in both of the names it can travel
+        /// under. Keeping the two apart is the point: a fold that sent
+        /// `max_tokens` to an endpoint configured for `max_completion_tokens` was
+        /// a request the endpoint refused, and a test can only tell which field
+        /// was used if `Asked` records them separately.
+        pub max_tokens: u32,
+        pub max_completion_tokens: Option<u32>,
     }
 
     impl Asked {
@@ -574,9 +577,8 @@ pub(crate) mod fake {
                 tool_choice: request.tool_choice.to_string(),
                 thinking: request.thinking.clone(),
                 reasoning_effort: request.reasoning_effort.clone(),
-                reply_cap: request
-                    .max_tokens
-                    .max(request.max_completion_tokens.unwrap_or(0)),
+                max_tokens: request.max_tokens,
+                max_completion_tokens: request.max_completion_tokens,
             };
             // The first reply still scripted whose matcher accepts this
             // request, and it is spent: that reply was written for this call.
