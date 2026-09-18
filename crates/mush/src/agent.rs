@@ -2063,6 +2063,25 @@ edit_file). Do not repeat work you already completed in earlier calls.";
 const NOTHING_TO_COMPACT: &str =
     "nothing to compact — this transcript is already short enough to send whole";
 
+/// A fold that came to nothing, said the one way: the refusal when the human is
+/// the one who asked, and the end of the phase either way.
+///
+/// One door, so neither arm can answer the human differently from the other and
+/// neither can leave a `compacting…` on the row — a fold that came to nothing
+/// must not outlive the request that justified it (finding U11), and the
+/// automatic trigger, which nobody asked for, has nothing to report (refactor
+/// R16).
+fn nothing_to_compact(actor: &Actor, in_run: bool, asked: bool) {
+    if asked {
+        actor
+            .ctx
+            .emit(actor.id, AgentEvent::Notice(NOTHING_TO_COMPACT.to_string()));
+    }
+    actor
+        .ctx
+        .emit(actor.id, AgentEvent::CompactingEnded { in_run });
+}
+
 /// Fold the transcript into a summary: ask the model to condense it, then
 /// replace the conversation with `[system, user(summary)]` — the summary is
 /// the new opening task message, which trimming protects. Does nothing when
@@ -2099,17 +2118,7 @@ fn compact_history(
         // that quietly failed. The automatic trigger never reaches this arm
         // with an empty transcript (there is nothing to weigh), and it is
         // never told anything anyway.
-        if asked && messages.is_empty() {
-            actor
-                .ctx
-                .emit(actor.id, AgentEvent::Notice(NOTHING_TO_COMPACT.to_string()));
-        }
-        // Nothing was replaced, whether the transcript was empty or its opening
-        // message was something else entirely: the fold ends here as every
-        // other `Ok(false)` does, this arm being reached before a `Compacting`.
-        actor
-            .ctx
-            .emit(actor.id, AgentEvent::CompactingEnded { in_run });
+        nothing_to_compact(actor, in_run, asked);
         return Ok(false);
     }
     // Nothing left to fold: system + one message is already minimal
@@ -2117,14 +2126,7 @@ fn compact_history(
     // request and re-summarize the summary. A human who asked for it is told
     // so rather than left watching a status line that never ends.
     if messages.len() <= 2 {
-        if asked {
-            actor
-                .ctx
-                .emit(actor.id, AgentEvent::Notice(NOTHING_TO_COMPACT.to_string()));
-        }
-        actor
-            .ctx
-            .emit(actor.id, AgentEvent::CompactingEnded { in_run });
+        nothing_to_compact(actor, in_run, asked);
         return Ok(false);
     }
     let actor_id = actor.id;
