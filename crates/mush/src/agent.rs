@@ -3589,7 +3589,13 @@ fn run_shell(
             exclusive,
         } = detach
         {
-            let id = detach_now(
+            // Read what it has written before handing it over. If the registry
+            // refuses the job (the budget filled between the decision and now),
+            // its refusal kills the process group, and the launch owns the only
+            // handle to the output — a report built after that would have
+            // nothing to show (audit row 2).
+            let (stdout, stderr) = running.output(CMD_CAP);
+            match detach_now(
                 actor,
                 registry,
                 jobs::Launch::held(
@@ -3599,9 +3605,22 @@ fn run_shell(
                     actor.my_tx.clone(),
                     running,
                 ),
-            )?;
-            state.running_jobs.insert(id);
-            return Ok(detached_line(id));
+            ) {
+                Ok(id) => {
+                    state.running_jobs.insert(id);
+                    return Ok(detached_line(id));
+                }
+                Err(ToolError::Refused(why)) => {
+                    let mut report = command_report(&stdout, &stderr);
+                    report.push_str(&format!(
+                        "[ran {}s and could not become a job: {why} — it was stopped; the output above is \
+                         what it wrote]",
+                        jobs::CMD_DETACH_AFTER.as_secs()
+                    ));
+                    return Ok(report);
+                }
+                Err(other) => return Err(other),
+            }
         }
     }
     // A kill that arrived from *outside* the watcher — a quit, which is what
@@ -3609,11 +3628,38 @@ fn run_shell(
     // reported as the command's own exit: `-1` is a signal nobody asked about.
     let ended = ending(ended, running.stopped());
     let (stdout, stderr) = running.output(CMD_CAP);
+    let mut report = command_report(&stdout, &stderr);
+    match ended {
+        Ended::Exited(code) => report.push_str(&format!("[exit {code}]")),
+        Ended::TimedOut => {
+            report.push_str(&format!("[timed out after {}s", timeout.as_secs()));
+            // The one case where "a long command detaches by itself" cannot
+            // happen: the machine-wide job budget is full. Saying only "timed
+            // out" hid the reason the model was never told about (audit row 2).
+            if matches!(detach, Detach::No) {
+                report.push_str(&format!(
+                    "; the {}-job budget is full, so it could not detach — stop one with \
+                     command_control or wait for one",
+                    jobs::MAX_JOBS
+                ));
+            }
+            report.push(']');
+        }
+        Ended::Cancelled => report.push_str("[cancelled]"),
+        Ended::TooMuchOutput => report.push_str(&format!(
+            "[killed: output passed {CMD_OUTPUT_LIMIT} bytes; the first {CMD_CAP} are above]"
+        )),
+        // Only reachable without a `Detach::Job`, which returns above.
+        Ended::Detached => report.push_str(&format!("[timed out after {}s]", timeout.as_secs())),
+    }
+    Ok(report)
+}
 
-    // No `$ {command}` echo: the tool call is already rendered from the
-    // assistant message that made it (`⚙ run_command …`), so printing it here
-    // again put the same command in the transcript twice — and, because tool
-    // results are stored, in the saved session twice as well.
+/// What a command wrote, with no `$ {command}` echo: the tool call is already
+/// rendered from the assistant message that made it (`⚙ run_command …`), so
+/// printing it here again put the same command in the transcript twice — and,
+/// because tool results are stored, in the saved session twice as well.
+fn command_report(stdout: &str, stderr: &str) -> String {
     let mut report = String::new();
     if !stdout.trim().is_empty() {
         report.push_str(stdout.trim_end());
@@ -3624,17 +3670,7 @@ fn run_shell(
         report.push_str(stderr.trim_end());
         report.push('\n');
     }
-    match ended {
-        Ended::Exited(code) => report.push_str(&format!("[exit {code}]")),
-        Ended::TimedOut => report.push_str(&format!("[timed out after {}s]", timeout.as_secs())),
-        Ended::Cancelled => report.push_str("[cancelled]"),
-        Ended::TooMuchOutput => report.push_str(&format!(
-            "[killed: output passed {CMD_OUTPUT_LIMIT} bytes; the first {CMD_CAP} are above]"
-        )),
-        // Only reachable without a `Detach::Job`, which returns above.
-        Ended::Detached => report.push_str(&format!("[timed out after {}s]", timeout.as_secs())),
-    }
-    Ok(report)
+    report
 }
 
 /// How a command's end is read once the watcher has returned.
@@ -9883,6 +9919,98 @@ mod tests {
         note_completion(&mut state, 2, 1, Outcome::Finished("new news".into()));
         let report = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 600 })).unwrap();
         assert!(report.contains("#2 done: new news"), "{report}");
+    }
+
+    /// A long command that cannot become a job — the budget filled after the
+    /// decision — must not be reported as its own timeout with its output
+    /// thrown away: it ran, it was stopped, and this is what it wrote (audit
+    /// row 2).
+    #[test]
+    fn a_launch_refused_at_the_deadline_keeps_the_output() {
+        use crate::machine::{Machine, ShellCommand};
+
+        let mut builder = ScriptedMachine::new();
+        for _ in 0..=jobs::MAX_JOBS {
+            builder = builder.runs(Script::hangs().says("built 40%\n"));
+        }
+        let machine = Arc::new(builder);
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("launch-refused", machine.clone(), clock);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        // Fill the machine-wide budget, so the launch at the deadline is
+        // refused while `run_shell` was told a job was possible.
+        for _ in 0..jobs::MAX_JOBS {
+            let job = machine
+                .spawn(&ShellCommand {
+                    command: "keep busy",
+                    root: std::path::Path::new("/tmp"),
+                })
+                .unwrap();
+            let (mailbox, _rx) = crossbeam_channel::unbounded();
+            actor
+                .ctx
+                .registry
+                .launch(jobs::Launch::started(
+                    actor.id,
+                    "keep busy".to_string(),
+                    false,
+                    mailbox,
+                    job,
+                ))
+                .unwrap();
+        }
+
+        let report = run_shell(
+            "cargo build --release",
+            &std::env::temp_dir(),
+            Duration::from_secs(CMD_TIMEOUT_SECS),
+            Detach::Job {
+                registry: &actor.ctx.registry,
+                exclusive: false,
+            },
+            &cancel,
+            &actor,
+            &mut state,
+        )
+        .unwrap();
+
+        assert!(
+            report.contains("built 40%"),
+            "the output survives: {report}"
+        );
+        assert!(
+            report.contains("could not become a job"),
+            "and the refusal is named: {report}"
+        );
+        assert!(!report.contains("timed out after"), "{report}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A command that times out with no room for a job says why it could not
+    /// detach, instead of a bare timeout (audit row 2).
+    #[test]
+    fn a_timed_out_command_names_the_full_job_budget() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("budget-timeout", machine, clock);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let report = run_shell(
+            "cargo build --release",
+            &std::env::temp_dir(),
+            Duration::from_secs(CMD_TIMEOUT_SECS),
+            Detach::No,
+            &cancel,
+            &actor,
+            &mut state,
+        )
+        .unwrap();
+
+        assert!(report.contains("timed out after"), "{report}");
+        assert!(report.contains("budget is full"), "{report}");
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// A scratch git repo with one initial commit, ready for worktrees. The
