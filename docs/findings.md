@@ -405,9 +405,60 @@ Still owed, in this file's own terms: **H5**'s honest reply half, **H1**'s
 actor-side facts (what the actor holds, a finished-but-unread result on the
 wire, delivery/parked in the session file), **H6** (the load-sensitive frame
 test), **H7/H8/H10/H12** (spawn base, machine picture, prune, per-agent
-accounting — milestones), and **H13**'s third fix.
+accounting — milestones), and **H13**'s third fix. **§8.9 closed H1, H5, H7,
+H8's warning half and H13's third fix; what it did not do is listed there.**
 
 For the doc hand (`README.md`, `docs/mush.md`): the rows now wear `✉`/`✉N`
 and `⚠ cut off`, `agent_status` is a bounded listing, a wait distinguishes
 unread from already-read, and `/new` steps the attach revision forward — none
 of which the glyph tables or the attach prose say yet.
+
+---
+
+## 8.9 Status moves owed by the T1/T2 wave (`f70374f`..`d753db8`)
+
+A criticality sort ranked the open queue by what each item costs a real session
+— runs that die or hang, then surfaces that lie or cost work, then polish. The
+wave above did the first two tiers: six commits, closed below. The row statuses
+in §§1–7 are still to be moved in the doc-sync pass, as usual.
+
+- **H13** ✅ — the third fix: a sibling's command queues for the machine lock
+  (bounded at 30 s, cancel-aware, on the actor's clock) and is refused only when
+  the lock outlasts that; the root is exempt from a lock it did not take and is
+  *told* in its own result that it ran beside `#N`'s exclusive command
+  (`1df1a53`). A root *exclusive* command is still refused — two claims to own
+  the machine is what the lock exists to prevent.
+- **A19** ✅ (refactor checklist, never a findings row) — `http::resolve_bounded`
+  runs the name lookup on its own thread and bounds the *wait* at 10 s on the
+  Clock, so a hung resolver is a `TimedOut` naming the host instead of a request
+  that outlives every deadline (`7dc5e1b`). `connect`'s doc no longer admits the
+  hole.
+- **H1** ✅ — the actor-side facts are on the wire and in the file:
+  `agent_status` lists each finished isolated run's worktree fact (branch;
+  committed, clean, or failed-to-commit) through `AgentMsg::Work`, paired by run
+  and never delivered; the attach roster carries `result_unread`/
+  `unread_children`; `session.json` stores `result_unread`; a spawn reply names
+  the branch it made (`3b6602d`). **Deliberately not persisted**: parked
+  commands — a parked command belongs to a run a restart kills, and replaying it
+  into a restored transcript would put words the model never read in front of it.
+- **H5** ✅ — the reply half: `agent_control message` answers at-rest (“this
+  resumes it”) or mid-run (“read at its next step”) instead of a flat “messaged”
+  (`88bc03c`).
+- **H7** ✅ — `spawn_agent {base}` resolves a branch, tag or sha to a commit
+  before anything is created, refuses a shared child with a base and a base that
+  cannot produce a worktree (instead of degrading into the wrong history), and
+  the reply names the commit read back from the new worktree's HEAD (`8a833ed`).
+- **H8** ✅ for the warning half — the pane title carries the whole tree's
+  running-command count (`2 jobs`), so the box's load is a fact on screen; a
+  shared build target was not added (`d753db8`).
+- **R21** ✅ (refactor queue) — `attach_agents` serializes `App::agent_row` plus
+  the wire-only extras, and `Phase::detail` is gone with its only reader
+  (`3b6602d`).
+- Census at `d753db8`: total **41,875** (was 41,123), **prod 7,783 (+104)**,
+  tests 21,691 (+414), comments 9,662 (+194). Five finding rows and one refactor
+  item for ~104 production lines; the rest is the tests that pin them.
+
+Still open from the sort, all Tier 3 — no run dies and no surface lies: **H6**
+(the load-sensitive frame test), **H10** (prune), **H12** (per-agent
+accounting), **A7**'s missing test, **V7**'s sweep blind spots, and the refactor
+queue's `D9`, `D10`, `R9`, `R10`, `R26`–`R29`.
