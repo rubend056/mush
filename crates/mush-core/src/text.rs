@@ -337,6 +337,37 @@ pub fn fit_row(
     line.trim_end().to_string()
 }
 
+/// The nearest character boundary at or before `at`, never past the end of
+/// `text`.
+///
+/// A byte budget lands inside a multi-byte character often enough that a
+/// caller slicing by bytes has to walk back for a boundary first, and the walk
+/// was hand-rolled in two places on the same file (`Workspace`'s head cut for a
+/// read and for a tool result) with a third going the other way
+/// (`tail_for_model`). They have to agree about the two ends — a walk that does
+/// not stop at zero panics, one that does not stop at the text's end runs off
+/// it — so the rule lives here, beside the width arithmetic it is a part of.
+///
+/// `at` past the end is the end, so a caller passing a size and a cap in any
+/// order cannot panic.
+pub fn boundary_at_or_before(text: &str, at: usize) -> usize {
+    let mut cut = at.min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
+}
+
+/// The nearest character boundary at or after `at`, never past the end of
+/// `text`: [`boundary_at_or_before`]'s twin, for the tail of a long result.
+pub fn boundary_at_or_after(text: &str, at: usize) -> usize {
+    let mut cut = at.min(text.len());
+    while cut < text.len() && !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    cut
+}
+
 /// Show only the edges of a secret for confirmation without leaking it.
 pub fn mask_key(key: &str) -> String {
     // Four *characters*, not four bytes: `/key aéééé` must not panic on a
@@ -483,6 +514,40 @@ mod tests {
         // Nothing fits in nothing.
         assert_eq!(truncate_flag("text", 0), (String::new(), true));
         assert_eq!(truncate_flag("", 0), (String::new(), false));
+    }
+
+    /// A byte budget lands on a character boundary from either side: the walk
+    /// is one rule, and the two ends it has to respect are the test.
+    #[test]
+    fn a_byte_cut_lands_on_a_character_boundary() {
+        // a|é|中|b — five bytes of characters, seven bytes of text.
+        let text = "aé中b";
+        assert_eq!(boundary_at_or_before(text, 2), 1, "é starts at 1");
+        assert_eq!(boundary_at_or_before(text, 3), 3);
+        assert_eq!(boundary_at_or_before(text, 4), 3);
+        assert_eq!(
+            boundary_at_or_before(text, 0),
+            0,
+            "nothing before the start"
+        );
+        assert_eq!(
+            boundary_at_or_before(text, 99),
+            text.len(),
+            "a cap past the end is the end, not a panic"
+        );
+
+        assert_eq!(boundary_at_or_after(text, 2), 3);
+        assert_eq!(boundary_at_or_after(text, 4), 6);
+        assert_eq!(boundary_at_or_after(text, 1), 1, "already a boundary");
+        assert_eq!(boundary_at_or_after(text, 99), text.len());
+
+        // Both halves of the same cut are strings the caller may slice with.
+        for cut in 0..=text.len() {
+            let head = boundary_at_or_before(text, cut);
+            let tail = boundary_at_or_after(text, cut);
+            assert!(text.is_char_boundary(head) && head <= cut, "{cut}");
+            assert!(text.is_char_boundary(tail) && tail >= cut, "{cut}");
+        }
     }
 
     /// The brief's first line, collapsed onto one row: the arithmetic the commit
