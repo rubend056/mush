@@ -2585,6 +2585,25 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         .get("isolated")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    // A base is a promise about history, so it is resolved before anything is
+    // created and never silently dropped: a child that asked to start from
+    // `master` must not be handed its parent's working tree instead (finding
+    // H7). A shared child has no worktree to fork, so the pair is refused up
+    // front rather than ignored.
+    let named = args.get("base").and_then(Value::as_str);
+    if named.is_some() && !isolated {
+        return Err(
+            "`base` needs isolated=true: a shared child runs in this workspace and has no \
+             history of its own to fork from"
+                .to_string(),
+        );
+    }
+    let base: Option<String> = match named {
+        Some(name) => Some(git::resolve(&ctx.root, name).ok_or_else(|| {
+            format!("unknown base `{name}`: no commit, branch or tag by that name")
+        })?),
+        None => None,
+    };
     if !isolated && !state.running.is_empty() {
         // Decide this *before* writing the brief: the check can only fail after
         // the brief exists, so the rule is stated in the tool schema and the
@@ -2608,21 +2627,31 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // commit to fork from, git's own refusal to add the worktree.
     let mut degraded: Option<String> = None;
     let (child_ws, branch) = if isolated {
-        // A private worktree on `mush/<id>`, based on the parent's branch (or
-        // HEAD). The reason it cannot be made is reported either way, so
+        // A private worktree on `mush/<id>`, based on the base the caller named
+        // (resolved to a commit), else the parent's branch, else HEAD. The
+        // reason it cannot be made is reported either way, so unnamed
         // isolation degrades to the shared workspace instead of failing the
-        // delegation.
-        match git::worktree_add(&ctx.root, id, actor.branch.as_deref()) {
+        // delegation — but a named base does not: see below.
+        match git::worktree_add(&ctx.root, id, base.as_deref().or(actor.branch.as_deref())) {
             Ok((path, branch)) => match Workspace::new(&path) {
                 Ok(child_ws) => (child_ws, Some(branch)),
                 // Isolation is best-effort: degrade to the shared workspace
                 // rather than fail the delegation outright.
                 Err(error) => {
+                    if let Some(name) = named {
+                        return Err(format!("cannot start from `{name}`: {error}"));
+                    }
                     degraded = Some(error.to_string());
                     (actor.ws.clone(), None)
                 }
             },
             Err(reason) => {
+                // A named base is a promise about history: degrading to the
+                // shared workspace would run the brief on the wrong commit
+                // (finding H7).
+                if let Some(name) = named {
+                    return Err(format!("cannot start from `{name}`: {reason}"));
+                }
                 degraded = Some(reason);
                 (actor.ws.clone(), None)
             }
@@ -2636,10 +2665,17 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     };
     // The branch the parent will need to land the work, said where it is born:
     // the parent chose the worktree, and a child whose branch it never learned
-    // is a child it cannot diff or merge by hand (finding H1).
+    // is a child it cannot diff or merge by hand (finding H1). The commit is
+    // read back from the new worktree, so the reply names the history the child
+    // *got*, not the one that was asked for (finding H7).
     let on = branch
         .as_deref()
         .map(|branch| format!(" on {branch}"))
+        .unwrap_or_default();
+    let at = branch
+        .as_ref()
+        .and_then(|_| git::resolve(&git::worktree_path(&ctx.root, id), "HEAD"))
+        .map(|sha| format!(" at {}", short_revision(&sha)))
         .unwrap_or_default();
 
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AgentMsg>();
@@ -2708,8 +2744,14 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // guard far past any real task, so this is not a budget to size a brief
     // against any more.
     Ok(format!(
-        "spawned agent #{id}{on} · runs until it stops calling tools · wait_agents returns its summary"
+        "spawned agent #{id}{on}{at} · runs until it stops calling tools · wait_agents returns its summary"
     ))
+}
+
+/// The short form of a commit id, for a line a model reads: the same shape
+/// `git rev-parse --short` gives a commit message.
+fn short_revision(sha: &str) -> &str {
+    sha.get(..7).unwrap_or(sha)
 }
 
 /// Who is waiting behind a blocking tool call.
@@ -9500,28 +9542,125 @@ mod tests {
         root
     }
 
-    /// A scratch git repo with one initial commit, ready for worktrees. The
-    /// label keeps parallel tests from sharing a directory.
-    fn init_git_repo(label: &str) -> PathBuf {
-        use std::process::Command;
-
-        let root = scratch_dir(&format!("git-{label}"));
-        let git = |args: &[&str]| {
-            let status = Command::new("git")
-                .arg("-C")
-                .arg(&root)
-                .args(args)
-                .status()
-                .unwrap();
-            assert!(status.success(), "git {args:?} failed");
-        };
+    /// A named base is the history the child gets: the worktree forks from that
+    /// commit even when HEAD has moved on, and the reply names the commit it
+    /// really started from (finding H7).
+    #[test]
+    fn a_spawn_forks_from_the_named_base_and_says_so() {
+        let (actor, _mailbox) = scripted_tools_actor(
+            "spawn-base",
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let root = actor.ctx.root.clone();
+        let git = |args: &[&str]| git_in(&root, args);
         git(&["init", "-q", "-b", "main"]);
         git(&["config", "user.email", "t@t"]);
         git(&["config", "user.name", "t"]);
-        fs::write(root.join("base.txt"), "base\n").unwrap();
+        fs::write(root.join("first.txt"), "first\n").unwrap();
         git(&["add", "-A"]);
-        git(&["commit", "-qm", "init"]);
+        git(&["commit", "-qm", "first"]);
+        let first = git_rev_parse(&root, "HEAD").unwrap();
+        // HEAD moves on: the base must beat it.
+        fs::write(root.join("second.txt"), "second\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "second"]);
+        assert_ne!(git_rev_parse(&root, "HEAD").unwrap(), first);
+
+        let mut state = ActorState::default();
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({
+                "brief": "start from the first commit",
+                "isolated": true,
+                "base": first.clone(),
+            }),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(report.contains("on mush/1"), "{report}");
+        assert!(
+            report.contains(&first[..7]),
+            "the reply names the commit the child started from: {report}"
+        );
+        let worktree = git::worktree_path(&root, 1);
+        assert_eq!(
+            git_rev_parse(&worktree, "HEAD").as_deref(),
+            Some(first.as_str()),
+            "the worktree forked from the named commit, not from HEAD"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A base that is not isolated, or does not exist, is refused up front —
+    /// never degraded into a child that runs on the wrong history (finding
+    /// H7).
+    #[test]
+    fn a_named_base_needs_isolation_and_a_real_commit() {
+        let (actor, _mailbox) = scripted_tools_actor(
+            "spawn-base-errors",
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+
+        let error = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "b", "base": "main" }),
+            &cancel,
+        )
+        .unwrap_err();
+        let ToolError::Failed(error) = error else {
+            panic!("a shared child with a base is a failed call");
+        };
+        assert!(error.contains("isolated=true"), "{error}");
+
+        // Isolated, but the scratch workspace is no repository at all: an
+        // unresolvable base is a refusal, not a silent fall back.
+        let error = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "b", "isolated": true, "base": "main" }),
+            &cancel,
+        )
+        .unwrap_err();
+        let ToolError::Failed(error) = error else {
+            panic!("an unknown base is a failed call");
+        };
+        assert!(error.contains("unknown base"), "{error}");
+    }
+
+    /// A scratch git repo with one initial commit, ready for worktrees. The
+    /// label keeps parallel tests from sharing a directory.
+    fn init_git_repo(label: &str) -> PathBuf {
+        let root = scratch_dir(&format!("git-{label}"));
+        git_in(&root, &["init", "-q", "-b", "main"]);
+        git_in(&root, &["config", "user.email", "t@t"]);
+        git_in(&root, &["config", "user.name", "t"]);
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        git_in(&root, &["add", "-A"]);
+        git_in(&root, &["commit", "-qm", "init"]);
         root
+    }
+
+    /// Run git in `dir`, failing the test if it does.
+    fn git_in(dir: &Path, args: &[&str]) {
+        use std::process::Command;
+
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed");
     }
 
     fn git_rev_parse(root: &Path, rev: &str) -> Option<String> {
