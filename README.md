@@ -98,7 +98,7 @@ toolset, so a leaf keeps five, and a live-agent budget (`MAX_AGENTS` 16) caps
 total fan-out.
 
 The orchestrator may end its turn while children still run: mush shows
-`waiting on 1 subagent — the root resumes as they finish`, and the root is
+`waiting on 1 subagent(s) — the root resumes as they finish`, and the root is
 **woken with each child's `#N done: summary`** as they finish — early End is not
 a lost result, it's a nap.
 
@@ -284,7 +284,8 @@ docs/mush.md        the design doc
 cargo test                    # offline unit tests; the agent-tree scenarios
                               # run in process on a scripted model client
 cargo test -- --ignored       # the three live-endpoint checks (the model list,
-                              # the shipped reply cap, a TLS handshake)
+                              # the shipped reply cap, a TLS handshake) plus the
+                              # frame-budget test, which needs an idle box
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke           # needs a model
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --resize  # needs none
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel  # needs none

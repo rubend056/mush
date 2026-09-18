@@ -690,6 +690,7 @@ mush/
       git.rs         branch, dirty count and per-branch diffstat, from `git` shell-outs
       message.rs     OpenAI-compatible message + request/response types
       prompt.rs      the system prompt and the tool schemas
+      provider.rs    the provider table: a vendor's endpoint, models and defaults
       session.rs     `.mush/` creation and conversation persistence
       text.rs        display-column arithmetic: wrap, truncate, fit_row, mask, sanitize
       tools.rs       tool names, argument helpers, exact-match edit semantics
