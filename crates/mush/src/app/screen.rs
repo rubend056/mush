@@ -433,8 +433,8 @@ impl App {
     }
 
     /// The same row with the parent's busy-child count supplied: the pane has
-    /// already built them all in one [`super::tree::AgentTree::counts`] walk, so
-    /// it does not ask the tree once per row (finding R29).
+    /// already built them all in one [`super::tree::AgentTree::busy_counts`]
+    /// walk, so it does not ask the tree once per row (finding R29).
     fn row(&self, node: &AgentNode, waiting: usize) -> AgentRow {
         // Two facts, two marks: `glyph · id` is this agent's own phase, and
         // `⏸N` counts the children that are working. The old row derived the
