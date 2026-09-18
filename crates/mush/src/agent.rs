@@ -194,24 +194,58 @@ impl From<&Outcome> for Committed {
     }
 }
 
+/// How wide a commit subject's brief may be, in columns.
+///
+/// A subject is one line in `git log --oneline`; a brief is a paragraph. The
+/// docs write the subject as `mush #N: <brief>` (`docs/mush.md` §…, README),
+/// which no commit subject can be — a subject cannot be unbounded — so this is
+/// the code's rule and the docs are the imprecise side (reported, not edited).
+const SUBJECT_COLUMNS: usize = 60;
+
+/// The task a commit subject carries: the brief's first line, trimmed to
+/// [`SUBJECT_COLUMNS`] columns and cut at a word boundary.
+///
+/// The first line because a subject is one line and the brief's first line is
+/// the task ("create a file called iso.txt…" — the reasons live below). The
+/// word boundary because [`truncate`] alone ends a subject mid-word
+/// (`isolated w…`), which neither reads as English nor matches the brief; the
+/// whole word that does not fit is dropped and the `…` says so. A first line
+/// with no space to cut on keeps the hard cut — a clipped subject is better
+/// than no subject.
+fn subject_brief(brief: &str) -> String {
+    let first = brief.lines().next().unwrap_or("").trim();
+    let cut = truncate(first, SUBJECT_COLUMNS);
+    if !cut.ends_with('…') {
+        return cut;
+    }
+    let body = cut.trim_end_matches('…');
+    match body.rfind(char::is_whitespace) {
+        Some(at) if at > 0 => {
+            // The `…` spends one of the columns, so the word is re-cut one
+            // short of the budget and the ellipsis added back.
+            format!("{}…", truncate(body[..at].trim_end(), SUBJECT_COLUMNS - 1))
+        }
+        _ => cut,
+    }
+}
+
 /// The commit subject for an isolated agent's work.
 ///
 /// The outcome is in the subject on purpose: an interrupted run commits its work
 /// in progress too, and a log full of identically-formatted `mush #3: <brief>`
-/// subjects cannot be told apart from finished work. [`parse_commit_subject`] is
-/// the inverse, and the two are tested against each other.
+/// subjects cannot be told apart from finished work. The brief is
+/// [`subject_brief`]'s, so a subject is one line, at a word boundary. The
+/// stopped and failed shapes therefore carry the outcome *and* the brief, each
+/// bounded. [`parse_commit_subject`] is the inverse, and the two are tested
+/// against each other.
 pub fn commit_subject(id: u64, brief: &str, outcome: &Outcome) -> String {
+    let brief = subject_brief(brief);
     match Committed::from(outcome) {
-        Committed::Finished => format!("mush #{id}: {}", truncate(brief, 60)),
-        Committed::Stopped => format!(
-            "mush #{id} (stopped, work in progress): {}",
-            truncate(brief, 60)
-        ),
-        Committed::Failed(error) => format!(
-            "mush #{id} (failed: {}): {}",
-            truncate(&error, 40),
-            truncate(brief, 60)
-        ),
+        Committed::Finished => format!("mush #{id}: {brief}"),
+        Committed::Stopped => format!("mush #{id} (stopped, work in progress): {brief}"),
+        Committed::Failed(error) => {
+            format!("mush #{id} (failed: {}): {brief}", truncate(&error, 40))
+        }
     }
 }
 
@@ -3005,6 +3039,33 @@ mod tests {
             assert_eq!(ended, expected, "{subject}");
             assert_eq!(brief, "port the parser", "{subject}");
         }
+    }
+
+    /// The subject is the brief's *first line*, cut at a word boundary with a
+    /// trailing `…` (finding S8(i)). The docs' `mush #N: <brief>` is the
+    /// imprecise side: a subject cannot be unbounded, and a subject that ends
+    /// mid-word (`isolated w…`) neither reads as English nor matches the brief.
+    #[test]
+    fn a_subject_is_the_briefs_first_line_cut_on_a_word_boundary() {
+        // A second line is a body, not a subject.
+        assert_eq!(
+            commit_subject(
+                7,
+                "first line\nsecond line here",
+                &Outcome::Finished("done".into())
+            ),
+            "mush #7: first line"
+        );
+        // A first line past the budget loses whole words, never half a word.
+        let brief = "port the parser module to the new configuration format and then run the tests";
+        let subject = commit_subject(7, brief, &Outcome::Finished("done".into()));
+        let cut = subject.strip_prefix("mush #7: ").unwrap();
+        let kept = cut.strip_suffix('…').expect("a cut subject says so");
+        assert!(
+            brief[kept.len()..].starts_with(' '),
+            "the cut must fall between words: {cut:?} of {brief:?}"
+        );
+        assert!(kept.starts_with("port the parser"), "{cut}");
     }
 
     /// A brief cut to a budget is cut by *columns*, not characters: a CJK brief

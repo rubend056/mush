@@ -1624,12 +1624,13 @@ impl App {
     ///
     /// * The **bar** gets the one-glance line — the stat, or "nothing changed"
     ///   — because a bar row is one row.
-    /// * The **transcript** gets the diff itself, capped at `cmd_cap()` bytes
-    ///   of whole lines, head first, with a last row naming the command that
-    ///   reads the rest. That is the cap idiom the tool results already keep
-    ///   (`READ_CAP`, `CMD_CAP`, and the eight rows one result is painted
-    ///   with): git's output is not special, and a branch that touched a
-    ///   lockfile can print more diff than every conversation in the session.
+    /// * The **transcript** gets the diff itself — each hunk named by its file
+    ///   ([`diff_rows`]), capped at `cmd_cap()` bytes of whole lines, head
+    ///   first, with a last row naming the command that reads the rest. That
+    ///   is the cap idiom the tool results already keep (`READ_CAP`, `CMD_CAP`,
+    ///   and the eight rows one result is painted with): git's output is not
+    ///   special, and a branch that touched a lockfile can print more diff than
+    ///   every conversation in the session.
     /// * The **model** gets nothing. `/diff` is the human's command: its answer
     ///   goes to `Chat`'s notices, never to the messages that are sent, so no
     ///   tokens are spent and there is no model-facing shape to pick. A model
@@ -1681,10 +1682,15 @@ impl App {
                 .note(format!("{command} — nothing changed; {branch} is at HEAD"));
             return;
         }
-        let (head, elided) = head_lines(&diff, self.cfg().cmd_cap());
-        let mut note = format!("{summary} · {command}");
-        note.push('\n');
-        note.push_str(&head);
+        // The head of the *change*, not of git's boilerplate: a pane spends
+        // two rows on this answer, and `diff --git`/`index` are not the answer
+        // (finding S8(ii)).
+        let rows = diff_rows(&diff);
+        let (head, elided) = head_lines(&rows, self.cfg().cmd_cap());
+        // The bar already carries the one-glance line, so the transcript is the
+        // diff itself rather than the same summary again; a second copy only
+        // pushed the change one row further out of the pane's two-row foot.
+        let mut note = head;
         if elided > 0 {
             note.push_str(&format!(
                 "\n[+{elided} more lines — {command} reads the rest]"
@@ -2261,6 +2267,88 @@ fn head_lines(text: &str, max: usize) -> (String, usize) {
     }
     let kept_lines = kept.lines().count();
     (kept, lines.len().saturating_sub(kept_lines))
+}
+
+/// git's diff, with each file's preamble folded into the hunks that belong to
+/// it: `more.txt @@ -0,0 +1,2 @@`.
+///
+/// A pane spends two rows on a `/diff` answer, and git's first two rows are
+/// always the same boilerplate — `diff --git a/x b/x`, then `index …` — so the
+/// change itself was never on screen without `/notes` (finding S8(ii)). The
+/// headline is the answer instead: the file, the hunk's line numbers, then the
+/// lines. A file with no hunk (`Binary files … differ`, a mode-only change)
+/// keeps a line of its own so it is still named.
+fn diff_rows(diff: &str) -> String {
+    /// Whether a line is git's per-file preamble: identity and mode, not a
+    /// change. Only dropped before the file's first `@@`, because a hunk's own
+    /// content can itself be a line beginning `---` (a removed line of `--`) or
+    /// `+++` (an added line of `++`).
+    fn preamble(line: &str) -> bool {
+        [
+            "index ",
+            "new file mode ",
+            "deleted file mode ",
+            "old mode ",
+            "new mode ",
+            "similarity index ",
+            "dissimilarity index ",
+            "rename from ",
+            "rename to ",
+            "copy from ",
+            "copy to ",
+            "--- ",
+            "+++ ",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+    }
+    /// The b-side path of git's `a/x b/x`, which is the file the hunk is in.
+    fn path_of(after: &str) -> String {
+        match after.rsplit_once(" b/") {
+            Some((_, b)) => b.to_string(),
+            None => after.strip_prefix("b/").unwrap_or(after).to_string(),
+        }
+    }
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut path = String::new();
+    // A file named but not yet spoken for: it is kept by name when nothing else
+    // of it survives (a mode-only change).
+    let mut pending = false;
+    let mut preamble_open = false;
+    for line in diff.lines() {
+        if let Some(after) = line.strip_prefix("diff --git ") {
+            if pending {
+                rows.push(path.clone());
+            }
+            path = path_of(after);
+            pending = true;
+            preamble_open = true;
+            continue;
+        }
+        if line.starts_with("@@") {
+            rows.push(if path.is_empty() {
+                line.to_string()
+            } else {
+                format!("{path} {line}")
+            });
+            pending = false;
+            preamble_open = false;
+            continue;
+        }
+        if preamble_open && preamble(line) {
+            continue;
+        }
+        // Anything outside the preamble is kept as it is: `Binary files …`,
+        // `GIT binary patch`, `\ No newline at end of file`.
+        rows.push(line.to_string());
+        pending = false;
+        preamble_open = false;
+    }
+    if pending {
+        rows.push(path);
+    }
+    rows.join("\n")
 }
 
 #[cfg(test)]
@@ -2927,19 +3015,60 @@ mod tests {
             .next()
             .map(|notice| notice.text.clone())
             .expect("the diff is the answer");
-        assert!(
-            note.starts_with("#1 mush/1 +1−0 · git diff HEAD...mush/1\n"),
-            "the answer names the work and the command that would re-read it: {note:?}"
-        );
-        assert!(
-            note.contains("diff --git a/work.txt b/work.txt") && note.contains("+the work"),
-            "and the diff itself is painted, not named: {note:?}"
+        assert_eq!(
+            note, "work.txt @@ -0,0 +1 @@\n+the work",
+            "the answer is the change itself, named by its file: {note:?}"
         );
         // The model pays nothing for a command the human typed: this is a
         // notice, not a message, and notices are never sent anywhere.
         assert!(
             app.chat.transcript(AgentId::ROOT).is_empty(),
             "the diff is the human's reading, not a turn"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The pane's own rows show the change, not git's file header (finding
+    /// S8(ii)): `/diff` keeps the head, and the head is the first hunks, each
+    /// named by its file — so a `+` line is on screen without `/notes`.
+    #[test]
+    fn the_diff_pane_shows_the_first_hunks_not_gits_preamble() {
+        let root = repo("diff-first-hunk");
+        isolated_work(&root, 1, "add work");
+        let worktree = git::worktree_path(&root, 1);
+        std::fs::write(worktree.join("more.txt"), "alpha\nbravo\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-qm", "more"]);
+        let mut app = app_at(root.clone());
+
+        run(&mut app, "/diff 1");
+
+        let note = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .next()
+            .map(|notice| notice.text.clone())
+            .expect("the diff is the answer");
+        assert!(
+            !note.contains("diff --git") && !note.contains("index "),
+            "git's preamble is not the answer: {note:?}"
+        );
+        assert!(
+            note.lines().any(|line| line.starts_with("more.txt @@")),
+            "each hunk is named by its file: {note:?}"
+        );
+
+        // What the human actually sees at a normal terminal: the pane's two
+        // note rows are the first hunk and its first changed line.
+        let rows = screen(&mut app, 80, 16);
+        assert!(
+            rows.iter().any(|row| row.contains("more.txt @@")),
+            "the first hunk is painted: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.trim_start().starts_with("+alpha")),
+            "and so is a changed line: {rows:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3004,8 +3133,8 @@ mod tests {
             .map(|notice| notice.text.clone())
             .expect("the diff is the answer");
         assert!(
-            note.contains("+line 0") && note.contains("diff --git a/big.txt"),
-            "the head of the diff is what is kept: {:?}",
+            note.contains("+line 0") && note.starts_with("big.txt @@"),
+            "the head of the change is what is kept: {:?}",
             &note[..note.len().min(200)]
         );
         assert!(
