@@ -28,7 +28,8 @@ cargo build --release
 
 `Tab` moves between the **agents** tree and the **chat**. Type in the message
 box and press `Enter`. The agent reads and edits the workspace through five file
-tools plus four delegation tools — see *Subagents* below.
+tools, four delegation tools, and three job tools (`command_status`,
+`command_control`, `wait_commands`) — see *Subagents* below.
 
 It talks to any OpenAI-compatible endpoint with function calling:
 
@@ -96,26 +97,31 @@ worktrees) but they need a model that actually delegates: small local models
 tend to flatten the chain and do the leaf work themselves. Prefer a capable
 model for orchestration.
 
-A run that reaches its turn limit (24 model turns) gets a **wrap-up turn**
-instead of an error: tools are withdrawn, the model summarizes what was done
-and what is left, and that summary is the run's result.
+A run ends when the model stops calling tools; a *loop* — the same tool batch
+five rounds over with nothing changed in between — ends it early, and a 200-turn
+runaway guard gets a **wrap-up turn** instead of an error: tools are withdrawn,
+the model summarizes what was done and what is left, and that summary is the
+run's result.
 
 ## The agents pane
 
 The pane shows the whole tree: depth by indentation, `·` idle, `◐` running,
-`⏸` waiting on children, `⊘` a cancel in flight, `✓` done (with its final
-summary), `✗` failed. A running row ages with its phase (`◐ #1 edit_file
-src/lex.rs 12s`), an isolated row carries its branch and line delta
-(`mush/2 +8−0`), the pane title totals them (`agents · 2 running · Σ +324 −40`),
-and the selected row's full facts — including the merge commands — sit in the
-footer under the list.
+`⊘` a cancel in flight or a run that landed stopped, `✓` done (with its final
+summary), `✗` failed. A running agent that has children out wears `⏸N`, counting
+them, and a running job adds `⚙N` to its owner's row. A row spends its columns on
+state, then the branch and line delta (`mush/2 +8−0`), then the activity with its
+age (`edit_file src/lex.rs 12s`), then a short title derived from the brief
+(`lexer`); the pane title totals the tree (`agents · 2 running · Σ +324 −40`), and
+the selected row's full facts — the brief, the worktree, the merge commands, its
+jobs — sit in a footer under the list.
 
 `Enter` on a row focuses that agent — the chat switches to its transcript and
-typing nudges it. `Esc` returns to the root, `c` cancels the selected agent,
-`Ctrl-C` cancels everything that is running (an idle agent is left alone — it
-has nothing to cancel). A cancel reaches the model call itself: the request is
-read in short slices, so Ctrl-C stops a model that has not answered instead of
-waiting for its reply.
+typing nudges it. `←`/`→` put the selection on that agent's parent or its first
+child, and `PgUp`/`PgDn` page the rows. `Esc` returns to the root, `c` cancels the
+selected agent, `Ctrl-C` stops the **focused** agent, and `Ctrl-X` stops every
+running one (an idle agent is left alone — it has nothing to cancel). A cancel
+reaches the model call itself: the request is read in short slices, so Ctrl-C
+stops a model that has not answered instead of waiting for its reply.
 
 ## Isolated agents
 
@@ -123,12 +129,13 @@ waiting for its reply.
 (`.mush/wt/<id>` on branch `mush/<id>`), so parallel agents edit real files
 without colliding. A run's work is **committed** to that branch when the run
 ends (`mush #3: <brief>`), so the branch really carries it. **mush never
-auto-merges** — the tree shows the branch and these print the exact commands:
+auto-merges** — the tree shows the branch, and these run the git that reads and
+lands it:
 
 ```
-/diff <id>      git diff HEAD...mush/3
-/merge <id>     git merge mush/3
-/discard <id>   git worktree remove --force .mush/wt/3 && git branch -D mush/3
+/diff <id>      runs `git diff HEAD...mush/3`: a stat line, then the hunks (capped)
+/merge <id>     runs `git merge mush/3`, then reclaims the worktree and the branch
+/discard <id>   runs `git worktree remove --force .mush/wt/3 && git branch -D mush/3`
 ```
 
 Leftover worktrees (`mush/*` branches) are rediscovered on startup and shown
@@ -147,12 +154,15 @@ trimming only cuts in when the model itself cannot produce a summary.
 |---|---|
 | `Tab` / `Shift-Tab` | cycle panes (agents, chat) |
 | `Enter` | send message (chat) · focus agent (agents) |
-| `←` `→` `Home` `End` · `Backspace` `Delete` | edit the message box |
-| `↑` `↓` `PgUp` `PgDn` | scroll the transcript |
-| `j` `k` · `Enter` · `c` · `Esc` | select, focus, cancel, back to root (agents) |
+| `j` `k` · `↑` `↓` · `g` `G` `Home` `End` | move down/up the rows (agents) or the transcript (chat) |
+| `PgUp` `PgDn` | page the rows (agents), the transcript (chat), or a picker's list |
+| `←` `→` | the selected agent's parent / first child (agents) |
+| `Enter` · `c` · `Esc` | focus · cancel · back to the root (agents) |
+| `←` `→` `Home` `End` · `Backspace` `Delete` | edit the message box (chat) |
 | `Ctrl-P` | model picker |
 | `Ctrl-N` | new chat (stops every agent, restarts the root) |
-| `Ctrl-C` | cancel running agents — an idle root is left alone, and a cancel reaches a model that is still thinking |
+| `Ctrl-C` | stop the focused agent — an idle one is left alone, and a cancel reaches a model that is still thinking |
+| `Ctrl-X` | stop every running agent |
 | `Ctrl-Q` | quit |
 
 Chat commands: `/provider`, `/model`, `/context`, `/url`, `/key`, `/models`,
@@ -161,10 +171,12 @@ Chat commands: `/provider`, `/model`, `/context`, `/url`, `/key`, `/models`,
 ## The screen
 
 The line above the facts is a model of the workspace, not a log. Its **first
-line** is what just happened: the tree's activity (`◐ #1 edit_file src/lex.rs
-12s`), else the last command's result for a few seconds, else a hint. Its
-**second line** (on terminals at least 26 rows tall) is the stable facts, cut
-from the right when the terminal is narrow:
+line** is the newest event that has no other home — a failure, a stop, a job's
+report, a command's answer — or the one derived fact the rows only imply (a root
+that ended its turn with children still working and will resume by itself), else
+a fading status, else a hint. It never repeats the activity a row and the
+transcript already show. Its **second line** (on terminals at least 24 rows tall)
+is the stable facts, cut from the right when the terminal is narrow:
 
 ```
 ⌂ ~/p/mush │ master ±3 +12−3 │ deepseek-flash · ctx ~500k
@@ -214,6 +226,12 @@ first of these that knows:
    silently treated as an 8k local model.
 4. **The provider default**: 120k for DeepSeek, 8192 for a custom endpoint.
 
+One reply is capped at a quarter of that window — floored at 1 024 tokens and
+capped at 120 000 — so a thinking model has room to answer without the request
+overshooting the window it is sent to. The cap is what mush sends as `max_tokens`
+(or `max_completion_tokens`, see `/help`), and `mush --print-config` prints the
+number it resolved to.
+
 The tool caps (a read, command output, a listing) scale with the window, so one
 `read_file` can never fill an 8k transcript. If a server rejects a request over
 its context length, mush reads the number out of the complaint, tells the UI,
@@ -239,18 +257,17 @@ crates/mush-core/   pure domain: workspace, sessions, prompt, messages, config, 
 crates/mush/        the binary: TUI, agent actors, HTTP client
 scripts/smoke.py    end-to-end test that drives the real TUI over a pty
 scripts/screen.py   prints the painted screen as text at six terminal sizes
-scripts/mock_llm.py scripted model server for the deterministic agent tests
+scripts/mock_llm.py scripted model server, kept for manual pty smoke (no test refers to it)
 docs/mush.md        the design doc
 ```
 
 ## Tests
 
 ```sh
-cargo test                    # offline unit tests
-cargo test -- --ignored       # live endpoint tests, plus isolated_subagent,
-                              # deep_chain, compaction, steering and the
-                              # turn-limit wrap-up (deterministic, via
-                              # scripts/mock_llm.py)
+cargo test                    # offline unit tests; the agent-tree scenarios
+                              # run in process on a scripted model client
+cargo test -- --ignored       # the three live-endpoint checks (the model list,
+                              # the shipped reply cap, a TLS handshake)
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke           # needs a model
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --resize  # needs none
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel  # needs none

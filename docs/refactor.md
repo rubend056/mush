@@ -1,11 +1,15 @@
 # mush — refactor plan: seams and owners
 
-> Status: **Stages 0, 1.1, 1.2 and 2 complete; Stage 1.3 in flight.** On master:
-> Stage 0 (all four moves), `AgentTree` (`app/tree.rs`), `Chat` (`app/chat.rs`),
-> the `ModelClient` seam, the other three seams (`Machine`, `Clock`, `Events`),
-> and the `#[ignore]`d actor tests rewritten in process. What is left of Stage 1
-> is `ConfigCell` (§3.3) and its row B7; Stage 3 (`Screen` + `Intent`) is
-> untouched. The delegation-honesty family (N1, N3–N6) is closed.
+> Status: **Stages 0, 1, 2 and 3.5 complete.** On master: Stage 0 (all four
+> moves), `AgentTree` (`app/tree.rs`), `Chat` (`app/chat.rs`), `ConfigCell`
+> (`app/settings.rs`), the four seams (`ModelClient`, `Machine`, `Clock`,
+> `Events`), the `#[ignore]`d actor tests rewritten in process, and Stage 3.5
+> (`Intent` + parsed commands, `app/keys.rs` + `app/commands.rs`). Stage 3.4
+> (`ToolHost`) was dropped with the editor: there is one dispatcher per side, not
+> three. What is left of Stage 3 is the other half — the `Screen` value and the
+> draw sweep that asserts painted text (B17). The delegation-honesty family (N1,
+> N3–N6) is closed, and so is the wave this plan's checklist now also tracks
+> (`findings.md` U1–U10, B20–B23).
 >
 > Written 2026-09-17 against `d4f80ae` plus the
 > in-flight findings pass (`input.rs`, `config.rs`, `git.rs`, `http.rs`,
@@ -19,11 +23,13 @@
 > it stop recurring. It is not a rewrite proposal. Nothing in the design doc's
 > §6 architecture (single owner, no async, two crates) changes.
 
-At the time of writing the working tree has changed shape mid-pass: `Focus` is
+At the time of writing the working tree had changed shape mid-pass: `Focus` is
 `{Agents, Chat}`, and there is no editor pane or `Buffer` in `ui.rs`/`app.rs`.
-If that is the intended shape, delete the editor-facing rows below (Buffer,
-M6 undo); if it is transient, put them back before Stage 0, because the Buffer
-extraction in Stage 0 assumes §4 of the design doc is still the target.
+That was the intended shape, and the editor-facing rows were dropped with it:
+there is no `Buffer` extraction, no `app/editor.rs`, and no `ToolHost` — a
+mush that does not open files has nothing for the live-buffer rule to own, and
+the tool dispatch is one function per side (`agent::exec_tool` for orchestration
+and shell, `agent::direct_tool` for the file tools).
 
 ---
 
@@ -37,12 +43,13 @@ dependencies:
 | 1 | `AgentTree` (ids, focus, phases, per-id maps, derived `busy`) | `app.rs` | B1, B5, B6, B10, B11, B14 |
 | 2 | `Chat` (root + per-agent transcripts, notices, input, context meter) | `app.rs` | B4, B8, B12, B19, N2 |
 | 3 | `ConfigCell` (one owner of endpoint/model/key/window) | `app.rs` + `agent.rs` | B7, A5 |
-| 4 | `ToolHost` (the live-buffer rule in one place) | `app.rs` | three dispatchers → one; M3 reuse |
+| 4 | ~~`ToolHost`~~ (dropped with the editor) | `app.rs` | — |
 | 5 | `Intent` keymap + parsed slash commands | `app.rs` | B2; help/status drift |
 | 6 | core `transcript.rs`, `text.rs`, `ToolName`, git verbs | `agent.rs`, `ui.rs`, `app.rs` | B9, B13, name/path/cap drift |
 
 Four traits, each with one real and one fake impl: `ModelClient`, `Machine`,
-`Clock`, `Events` (+ `ToolHost`).
+`Clock`, `Events`. (`ToolHost` would have been a fifth, but the editor it existed
+for is gone.)
 
 Acceptance test for the whole program: **the default `cargo test` needs no
 socket, no subprocess, and no sleep longer than 50 ms; `--ignored` is only for
@@ -50,9 +57,11 @@ live endpoints.**
 
 ---
 
-## 1. What makes change expensive today
+## 1. What made change expensive (the diagnosis, then)
 
-Five causes, each with the evidence in the tree:
+Five causes, each with the evidence in the tree as it stood at `d4f80ae`. They
+are kept in the present tense because they are what motivated the moves; §0 and
+the "Landed" notes below say which of them the extractions actually removed.
 
 1. **`app.rs` is five subsystems in one `impl`.** Event routing, agent-tree
    state, the tool host, buffers/editor, chat, config/persistence, pickers, slash
@@ -79,10 +88,11 @@ Five causes, each with the evidence in the tree:
    five, truncation with three different meanings, the token heuristic in three.
    M4 (merge) and M6 (undo) have no clean place to land.
 
-The design doc is also stale on this: §1 claims "roughly 5,000 lines… across two
-crates"; the real source (excluding `.mush/wt/`) is ~8,900 lines, with
-`agent.rs` ~2,500 and `app.rs` ~2,300. §7's "seven crates" predates the
-dependency pass.
+The design doc was also stale on this: §1 claimed "roughly 5,000 lines… across
+two crates"; the real source at the time (excluding `.mush/wt/`) was ~8,900
+lines, with `agent.rs` ~2,500 and `app.rs` ~2,300. (The tree is ~32,000 lines
+now, and `app.rs` is `app/mod.rs` plus its modules.) §7's "seven crates"
+predates the dependency pass.
 
 ---
 
@@ -109,6 +119,15 @@ crates/mush-core/src/            crates/mush/src/
                                    http.rs                 transport only
                                    ui/mod.rs + view.rs     draw(frame, &Screen)
 ```
+
+What is actually there, and what is not. All of `mush-core`'s list landed, plus
+`transcript.rs` and `text.rs`; on the binary side `app/{mod,tree,chat,settings,
+keys,commands}.rs`, `model.rs`, `machine.rs`, `clock.rs`, `events.rs`,
+`session_save.rs` and `jobs.rs` all exist. What did **not** land, and is now
+ruled out rather than pending: `app/editor.rs` and `app/host.rs` (the editor was
+dropped, so there is no `Buffer` and no `ToolHost` — dispatch is one function per
+side), the `agent/` split (`agent.rs` is still one file), `tui.rs` (`main.rs`
+holds the event loop), and `ui/mod.rs + view.rs` (Stage 3's `Screen` value).
 
 Rules that keep it from becoming a framework:
 
@@ -165,7 +184,10 @@ every push site.
 
 ### 3.3 `ConfigCell` — `app/settings.rs`
 
-One owner for provider/model/url/key/window, shared with the actors:
+**Landed (Stage 1.3).** `ConfigCell` holds the UI copy and an `Arc<Mutex<Config>>`
+shared with every actor in the tree, so the two sides cannot disagree; the file
+is `crates/mush/src/app/settings.rs` and one `ConfigHandle` travels to the
+agents. One owner for provider/model/url/key/window, shared with the actors:
 
 ```rust
 pub struct ConfigCell { ui: Config, shared: Arc<Mutex<Config>> }
@@ -180,7 +202,7 @@ B7 is "the UI and the actor each have a `Config` and only one of them learns".
 With a cell, `learn_context` is the only mutator and it goes through one path;
 "the UI shows a window the actor does not have" stops being representable.
 
-### 3.4 `ToolHost` — `app/host.rs`
+### 3.4 `ToolHost` — `app/host.rs` — **dropped**
 
 The live-buffer rule (design doc §2) as one function:
 
@@ -191,33 +213,39 @@ impl ToolHost for App {
 ```
 
 `list_files` / `read_file` / `write_file` / `edit_file` over buffers + workspace,
-plus the `Msg::Tool` reply plumbing. Today this logic is triplicated between
-`agent::exec_tool`, `agent::direct_tool` and `app::exec_tool`; after the move
-there is one dispatcher per *side* (UI vs worktree) and one tool-name table. The
-same trait is what M3's socket server should call, so an external agent and a
-built-in one cannot get different semantics.
+plus the `Msg::Tool` reply plumbing. This was written when the logic was
+triplicated between `agent::exec_tool`, `agent::direct_tool` and
+`app::exec_tool`. The editor was then dropped, so `app::exec_tool` went with it
+and there is no live-buffer rule left to own: there is now **one dispatcher per
+side** (`agent::exec_tool` for orchestration and shell, `agent::direct_tool` for
+the four file tools) and no `ToolHost` trait. M3's socket server, if it lands,
+calls those two directly rather than a buffer host.
 
 ### 3.5 `Intent` keys and parsed commands — `app/keys.rs`, `app/commands.rs`
 
-- `fn key(focus, mode, picker_open, key) -> Intent` is pure; `App::update`
-  applies intents. No more side effects hidden in match arms (the `mask_key`
-  class, B2), and key handling is testable without an `App`.
-- `fn parse_command(&str) -> Command` is pure and exhaustive; the help text and
-  the status hint render from the same table, so `main.rs`'s help cannot drift
-  from `run_command`'s arms.
+**Landed.** `keys::key(focus, picker_open, key) -> Intent` is pure and calls no
+side effect of its own; `App::apply_intent` is the only thing that carries an
+intent out, and nothing below `App::on_key` reads a `KeyCode`, so a binding is
+testable without an `App` (the `mask_key` class, B2). The sketch's `mode`
+argument is not there: the only modal state the keyboard has is the picker, held
+as a bool, and the editor that had insert and normal modes is gone.
+`commands::parse_command(&str) -> Result<Command, CommandError>` is pure, and
+both help surfaces — `mush --help`'s KEYS/COMMANDS blocks and the in-app
+`/help` notice — render from `keys::KEYS` and `commands::COMMANDS`, so neither
+can drift from what the parser accepts.
 
 ### 3.6 Core modules — `transcript.rs`, `text.rs`, `ToolName`, git verbs
 
 | Move | From | Notes |
 |---|---|---|
 | `trim_history`, `repair_tool_pairs`, `sanitize_tool_calls`, `COMPACT_INSTRUCTION`, the compaction trigger and the weight/budget arithmetic | `agent.rs` | all pure; tests move with them; core already owns `history_budget` |
-| `wrap_text`, `truncate`, `slice_columns`, `fit_row`, `display_column`, `mask_secret` | `ui.rs`, `app.rs` | one meaning of "width" for cursor, wrap, rows and masks (B9) |
+| `wrap_text`, `truncate`, `slice_columns`, `fit_row`, `display_column`, `mask_key` | `ui.rs`, `app.rs` | one meaning of "width" for cursor, wrap, rows and masks (B9) |
 | `enum ToolName { ListFiles, ReadFile, WriteFile, EditFile, RunCommand, SpawnAgent, WaitAgents, AgentStatus, AgentControl }` with `as_str`/`parse`; `TOOL_NAMES` derived; schemas keyed by it; dispatch matches on it | `tools.rs`, `prompt.rs`, `agent.rs`, `app.rs` | adding a tool becomes a compile error in every place that must know |
 | one `Git` value with `run`/`status`/`branch_stat` + `worktree_add/list/remove/commit` | `git.rs`, `agent.rs` (`create_worktree`, `commit_worktree`, `git_output`), `app.rs` (`discover_worktrees`) | one invocation style instead of three; `.mush/wt/{id}` and `mush/{id}` formatted in one place |
 
-`Buffer` itself goes to `app/editor.rs` rather than core: core is about files and
-messages, the binary is about this session's UI. (If the editor does not come
-back, skip it.)
+`Buffer` itself would have gone to `app/editor.rs` rather than core: core is about
+files and messages, the binary is about this session's UI. The editor did not
+come back, so there is no `Buffer` and no `app/editor.rs` — skip it.
 
 **Landed (Stage 0).** Three notes where the tree ended up differing from the
 table above, so Stage 1 starts from what is really there:
@@ -237,8 +265,8 @@ table above, so Stage 1 starts from what is really there:
   outcome are.
 - `app.rs` has no `exec_tool` and no editor pane, so 3.4's "triplicated" is now
   two dispatchers (`agent::exec_tool` for orchestration + shell,
-  `agent::direct_tool` for the four file tools); `ToolHost` in Stage 1 is a move
-  of the second one, not a merge of three.
+  `agent::direct_tool` for the four file tools) — and with `ToolHost` dropped
+  those two are the whole story, one dispatcher per side.
 
 ---
 
@@ -278,20 +306,21 @@ when* the new modules' tests are the old tests and the gate is green with no
 assertion edits — both held (the two later commits added tests; no existing
 assertion was edited).
 
-**Stage 1 — one owner per fact.** 1.1 ✅ `AgentTree`, 1.2 ✅ `Chat`, 1.3 ⬜
-`ConfigCell`. *Done when* nothing outside `tree.rs` writes
+**Stage 1 — one owner per fact.** ✅ 1.1 `AgentTree`, 1.2 `Chat`, 1.3
+`ConfigCell` (`app/settings.rs`). *Done when* nothing outside `tree.rs` writes
 `node.phase`, `node.summary`, `focused` or `agent_cursor`, `busy` is a method,
-and the context meter is a method — all three hold; §3.3's cell is what is left,
-and its finding is B7 (A5 turned out to be closed already: `rederive_context`
+and the context meter is a method — all three hold, and §3.3's cell landed with
+them (its finding was B7; A5 turned out to be closed already: `rederive_context`
 runs on every runtime switch).
 
 **Stage 2 — the seams.** ✅ Rewrite the `#[ignore]`d actor tests in-process and
 delete `scripts/mock_llm.py` from the test path (keep it for the pty smoke
 scenarios if they still want a scripted model). *Done when* the default suite
 needs no socket, no subprocess and no sleep over 50 ms, and `--ignored` contains
-only live-endpoint tests — held: the five actor scenarios it used to hold (five,
-not the four this line claimed) run in the default suite, and `--ignored` is now
-exactly the two live-endpoint tests in `http.rs`.
+only live-endpoint tests — held: the actor scenarios it used to hold (five, not
+the four this line first claimed; more have grown beside them since) run in the
+default suite, and `--ignored` is now exactly the three live-endpoint tests in
+`http.rs` (the model list, the reply cap, and the TLS handshake).
 
 **Stage 2.1 — `ModelClient`.** ✅ `crates/mush/src/model.rs` holds one trait
 (`chat(&ChatRequest, &AtomicBool) -> Result<ChatResponse, ModelError>`), the
@@ -346,15 +375,19 @@ commit is another agent's) and `AgentTree`'s stale-cancel window, which already
 has `age` for tests. The default suite still opens local mock sockets in
 `http.rs`.
 
-**Stage 3 — `Screen` view and intents.** `ui::draw(frame, &Screen)` where
-`Screen` is built by `App::screen()`; panes become pure functions of a value, so
-the draw sweep can assert painted text at every size instead of only "does not
-panic" (B17), and keys go through `Intent`. *Done when* no render function takes
-`&App`.
+**Stage 3 — `Screen` view and intents.** Stage 3.5 ✅ — keys go through `Intent`
+(`app/keys.rs`), and slash commands are parsed values (`app/commands.rs`), with
+both help surfaces rendered from the one table (§3.5). The `Screen` half is **not
+built**: `ui::draw(frame, &Screen)` where `Screen` is built by `App::screen()`,
+so panes become pure functions of a value and the draw sweep can assert painted
+text at every size instead of only "does not panic" (B17). *Done when* no render
+function takes `&App`.
 
 **Stage 4 — roadmap.** M2.8 = a job registry + `Machine`; M3 = the socket server
-over `ToolHost`; M4 = a base revision on `Buffer` + merge in core `text.rs`; M6 =
-undo inside `Buffer`. None of them should need to touch `app.rs`'s routing.
+over the two dispatchers; M4 = a base revision on `Buffer` + merge in core
+`text.rs`; M6 = undo inside `Buffer`. None of them should need to touch `app.rs`'s
+routing. (M2.8 landed: `jobs.rs` sits on the `Machine` seam, and M4/M6's `Buffer`
+is gone with the editor.)
 
 Sequencing with the concurrent findings pass: Stage 0.1 (`transcript.rs`)
 touches only `agent.rs` + `mush-core`, so it can start immediately. The stages
@@ -364,15 +397,11 @@ that touch `ui.rs`/`app.rs` should wait until that pass lands.
 
 ## 6. Checklist: finding → disposition → structural home
 
-Status at the time of writing: ✅ verified closed in the working tree, 🔄 the
-concurrent pass is in those files, ⬜ open or unverified. The findings doc stays
-the queue of record; this column says where the *fix belongs*.
-
-> **Drift:** `docs/findings.md` — the "queue of record" this section defers to —
-> is not in the tree (only `docs/mush.md` and this file are). Rows N3–N6 and A20
-> below were therefore recorded here, against this table, because there was
-> nowhere else for them to go. Either restore `findings.md` or stop pointing at
-> it.
+Status: ✅ verified closed, ⬜ open or unverified. The findings doc is the queue
+of record — `docs/findings.md` is in the tree and every row below that has an
+alpha-numeric/short id there is kept in step with it; this column says where the
+*fix belongs*, so a row may appear here without a finding (a structural rule) but
+not with a status that contradicts `findings.md`.
 
 | ID | What | Status | Structural home |
 |---|---|---|---|
@@ -384,24 +413,24 @@ the queue of record; this column says where the *fix belongs*.
 | A6 | CLI provider never selects its endpoint | ✅ | `config::resolve_with` test |
 | A7 | no cap on response body | ✅ | `http` `MAX_BODY_BYTES` |
 | A8 | localized git output parses as ±0 | ✅ | `git()` sets `LC_ALL=C` |
-| A9 | model discovery runs even when a model is known | ⬜ | `main.rs` — skip when known, or fetch after first paint |
+| A9 | model discovery runs even when a model is known | ✅ | `main.rs`: discovery is `config.model.is_empty().then(…)`, so a named model skips it, and it runs on `/model`, `/models` and `/url` |
 | A10 | branch name read as an argv option | ✅ | `git` ref→sha guard |
 | A11 | `adopt_context` accepts 1 | ✅ | `config::adopt_context` clamp |
 | A12 | `Stat` is `u32`, git counts are 64-bit | ✅ | `git::Stat` is `u64` (`a_huge_diff_keeps_its_count`) |
 | A13 | `--` does not stop flag parsing | ✅ | `main::parse_args` |
-| A14 | a second positional silently replaces the first | ⬜ | `main::parse_args` — error |
+| A14 | a second positional silently replaces the first | ✅ | `main::set_dir` errors on a second directory (`only one directory may be given`) |
 | A15 | unparsable `Content-Length` treated as absent | ✅ | `http` `InvalidData` |
 | A16 | bad `MUSH_CONTEXT` silently ignored | ✅ | `config::parse_context_env` |
 | A17 | `openai` alias sends the key to the LAN default | ✅ | `Provider::parse` (aliases removed) |
 | A18 | git test hardcodes `master` | ✅ | `git` test `init_repo` |
 | A19 | DNS resolution unbounded | ⬜ | `Clock` seam + `http::connect` |
 | B1 | leftover worktree id collides with a fresh child | ✅ | `AgentTree::reserve_ids` — raised from the leftover scan (`discover_worktrees`), pinned in `tree.rs` |
-| B2 | `mask_key` slices on a byte boundary | ✅ | core `text::mask_secret` (3.6) |
-| B3 | zero-row pane still focusable | 🔄 | `Screen`/layout tiers (Stage 3) |
-| B4 | at 40×10 the only transcript row is a blank | ✅ | `Chat::visible_lines` (3.2) |
+| B2 | `mask_key` slices on a byte boundary | ✅ | core `text::mask_key` (3.6) |
+| B3 | zero-row pane still focusable | ✅ | `App::below_floor` (`app/mod.rs`) refuses every intent but `Quit`, and `ui::draw` paints one notice below `min` — one `is_below_floor` predicate both read |
+| B4 | at 40×10 the only transcript row is a blank | ✅ | `Chat::body` trims trailing blank separators before windowing (`trim_trailing_blanks`) |
 | B5 | `Status` after `Done` restarts a finished agent | ✅ | `AgentTree::activity` ignores it after `Done`/`Failed`, and `busy` is derived from the phases (`tree.rs`) |
 | B6 | failed/idle `Stop` leaves `Cancelling` + `busy` stuck | ✅ | `AgentTree::cancel_requested` (only a run in flight is marked) + the actor's end-of-run event as the ack |
-| B7 | learned window never reaches the UI, then is clobbered | 🔄 | `ConfigCell` (3.3) |
+| B7 | learned window never reaches the UI, then is clobbered | ✅ | `app/settings.rs` — `ConfigCell` + `ConfigHandle`; `learn_context` is the one mutator and it writes both sides |
 | B8 | context meter ignores the human's own message | ✅ | `Chat::used_tokens_for` derives it on read, per conversation |
 | B9 | `fit_row` budgets columns, `truncate` counts chars | ✅ | core `text` (3.6) |
 | B10 | a failed nudge rewrites the node's phase | ✅ | `AgentTree::nudge_failed` |
@@ -411,7 +440,7 @@ the queue of record; this column says where the *fix belongs*.
 | B14 | the row's summary is from the first run, forever | ✅ | `AgentTree::{begin, finish}` |
 | B15 | `screen.py` mis-reads CSI / `--keys` escapes | ✅ | `scripts/screen.py` — cursor clamped to the grid (a row past the bottom, or a shrink under a low cursor, raised `IndexError` on the next `X`), and `--keys` decodes the escapes it means instead of `unicode_escape`, which turned `é` into `Ã©` and left `\e` literal. `--self-test` pins both. |
 | B16 | `smoke.py --cancel` forks after starting a thread | ✅ | `scripts/smoke.py` — the pty is forked before the endpoint's thread exists; verified by running the scenario. |
-| B17 | the layout sweep never exercises an open file | 🔄 | `Screen` sweep (Stage 3) |
+| B17 | the layout sweep asserts "does not panic", not painted text | ⬜ | `Screen` view + the draw sweep (Stage 3) |
 | B18 | `~` elision matches a prefix, not a directory | ✅ | `ui::facts_line` |
 | B19 | global notices render into every transcript | ✅ | `Notice.agent` + `Chat::notices_for` — no unscoped read exists |
 | N1 | `MAX_TURNS` turns "long" into "failed" | ✅ | `agent/run.rs`: `RUNAWAY_TURNS` + `LOOP_ROUNDS` (a run ends when it stops calling tools; only a *loop* ends it early) |
@@ -420,29 +449,53 @@ the queue of record; this column says where the *fix belongs*.
 | N4 | Ctrl-C stopped *every* busy agent, and blanked a stopped one to `Idle` | ✅ | `App::interrupt` (focused) + `Ctrl-X` (`interrupt_all`); `Phase::Stopped` |
 | N5 | the one-non-isolated-sibling rule fails only *after* the brief is written | ✅ | `spawn_tool` message + the rule stated in `prompt` schemas and the system prompt |
 | N6 | an interrupted run commits under the same subject as a finished one | ✅ | `commit_worktree` subject carries the `Outcome` |
-| A20 | `needs_compaction` compares byte weights against a *token* budget, and `budget * 3 / 4` can overflow `usize` | ⬜ | `mush-core::transcript`; same shape as A2 (`clamp_context`) |
+| A20 | `needs_compaction` compares byte weights against a *token* budget, and `budget * 3 / 4` can overflow `usize` | ✅ | `mush-core::transcript::compaction_trigger` is saturating and the byte↔token conversion lives once in `Config::history_budget` (same shape as A2) |
+| U1 | a working agent drawn as paused (`⏸` from "has children") | ✅ | `ui::phase_glyph` is a function of the node's own `Phase` only, and the children are a separate `⏸N` mark (`ui::agent_line`) |
+| U2 | the pane title counts waiting agents as working | ✅ | `AgentTree::roster` derives `working`/`waiting` from the phases (`app/tree.rs`), and `ui::agents_title` names each count |
+| U3 | another agent's news snaps a read pane back to the bottom | ✅ | `Chat`'s `reading` is per conversation (`Reading::Holding`), and `painted` marks a held window in the title |
+| U4 | a grandchild drawn after everything spawned before it | ✅ | `AgentTree::rows` walks pre-order over the parent links |
+| U5 | the newest activity on screen three times | ✅ | `App::tree_line` no longer repeats the activity; the bar says the napping root instead |
+| U6 | an agent is a bare number | ✅ | `AgentNode::title` derives a handle from the brief (a path first, else the first non-filler word) |
+| U7 | a waiting agent still says `working…` | ✅ | `Phase::waiting` (`app/tree.rs`) tells a model call from `wait_agents`/`wait_commands`, and the row/foot say which |
+| U8 | a transient notice never leaves | ✅ | `Chat`'s chatter lifetime (`clear_notes_for`, `dismiss_said`, `SAID_TTL`) + repeat collapse (`Notice.count`) |
+| U9 | the shipped DeepSeek window/reply cap is too small | ✅ | `provider::PROVIDERS` fallback 120 000 + `Config::reply_cap` (a quarter of the window, floored at 1 024 and capped at 120 000) |
+| U10 | walking back up a deep tree costs a keypress per ancestor | ✅ | `Intent::TreeWalk` on `←`/`→` (`app/keys.rs`) + `PickerMove(±PAGE)` |
+| U11 | compaction has no visible state anywhere | ⬜ | `agent.rs` (state on accept), `app/tree.rs` (`Phase::compacting`), `ui.rs` (glyph + row/bar/foot), `App` ("you can keep typing") — fix in flight (`mush/38`) |
+| B20 | a child's completion reaches the model but not the screen, and can fold twice | ✅ | `agent::push_line` emits `AgentEvent::Message` with the fold, and `absorb` marks the adopted line delivered |
+| B21 | a parent in a tool-calling chain never heard its child finish | ✅ | the fold runs at every message boundary (`fold_completions`), not only on the tool-free turn |
+| B22 | a steering message to a subagent is invisible / an idle target not woken | ✅ | `AgentMsg::Steer` → `push_line` (delivered and emitted), and it is work to answer; the reply wording left over is H5's |
+| B23 | a transient transport failure ends the run instead of being retried | ✅ | `model.rs::retrying` — `RETRY_ATTEMPTS = 3` over the `Clock` seam, transport failures only, each retry announced in the transcript |
 
 ---
 
 ## 7. Design-doc sync
 
-When this lands, `docs/mush.md` wants:
+Done in the doc-sync wave that closed this plan's checklist. What `docs/mush.md`
+was asked for, and what it now says:
 
-- §1: the line count (~8,900, not ~5,000) and the real file sizes.
-- §6: the module tree from §2 of this plan.
-- §7: the dependency table after the dependency pass, plus the rule that a new
-  crate must *replace* hand-rolled code that drifted, not sit beside it.
-- §9: **M2.75 — Seams** before M2.8, with the stage list from §5 and the
-  acceptance test from §0.
+- §1: the line count — the design doc claimed "roughly 5,000" /
+  "roughly 9,000" lines; it now says ~32,000, the real total of the two crates'
+  sources including tests.
+- §6: the module tree now names the modules that actually landed (`app/{mod,tree,
+  chat,settings,keys,commands}.rs`, `jobs.rs`, `model.rs`, `machine.rs`,
+  `clock.rs`, `events.rs`, `session_save.rs`, core `transcript.rs`/`text.rs`),
+  with a note on what was dropped (`editor.rs`, `host.rs`, the `agent/` split).
+- §7: the dependency table is unchanged by the wave — "no new dependencies" held
+  — plus the rule that a new crate must *replace* hand-rolled code that drifted,
+  not sit beside it.
+- §9: **M2.7**, **M2.75** and **M2.8** read as done, with what each actually does;
+  M3/M5/M6 say plainly that they are not started.
 - §10: **done** — "deterministic orchestration needs `python3` and `git`" became
   "the model is scripted; the work is real". The default suite still runs a real
   `git` (the worktree scenarios are about git), three real commands whose point
   *is* the process group or the scratch file, and the local mock sockets in
   `http.rs` — with their 200–600 ms read slices — left after Stage 2.3.
 - §0's acceptance test: **held** for the default suite, whose only remaining
-  `#[ignore]`s are the two live-endpoint tests in `http.rs`.
-- §12: two decisions — "one owner per fact" and "a trait is justified only by a
-  fake that a test actually uses".
+  `#[ignore]`s are the three live-endpoint tests in `http.rs`.
+- §12: the decisions the wave made — one owner per fact; a trait is justified
+  only by a fake a test actually uses; a delivered result has one owner; notices
+  have kinds and lifetimes; a transport hiccup is retried and an answer is not; a
+  window a human states beats a default.
 
 Housekeeping: `.mush/wt/2` was still registered, and `mush/2` pointed at `d4f80ae`
 = master with a clean worktree, so `/discard 2` lost nothing. **Done**: wave 0
@@ -456,7 +509,7 @@ exactly one worktree (the main checkout).
 
 - **No third crate.** The pure/binary split is right; the problem was never the
   crate boundary.
-- **No `Tool` trait / plugin registry.** Nine tools with a name enum is the
+- **No `Tool` trait / plugin registry.** Twelve tools with a name enum is the
   honest shape.
 - **No Elm-style `update -> Vec<Effect>` rewrite.** `AgentTree`/`Chat`/`ConfigCell`
   plus four seams give the same testability at a fraction of the churn.
@@ -469,12 +522,13 @@ exactly one worktree (the main checkout).
 
 ## 9. Open questions
 
-1. Does the editor pane come back? Stage 0's `Buffer`/`text` split and Stage 4's
-   undo work assume it does; if `mush` is becoming agents+chat, the plan loses
-   that row and §1's diagnosis shrinks by one cluster.
+1. Does the editor pane come back? **No** — the v0.2 decision dropped it, so
+   Stage 0's `Buffer`/`text` split has no `Buffer` half and Stage 4's undo work
+   has no home; §1's diagnosis loses that cluster.
 2. Is `dirty_screen` moved into a `Screen`/`Redraw` type (Stage 3), or does
    `update` return a `Changed` bool? The former is more honest; the latter is
-   smaller.
+   smaller. Open — the `Screen` value it belongs to is the unbuilt half of
+   Stage 3.
 3. Should `AgentTree` own `agent_stats` (git facts) too, or does the git snapshot
    stay a separate value refreshed by events? Today the coupling is one-way
    (`refresh_git` reads the tree), so it probably stays separate.
