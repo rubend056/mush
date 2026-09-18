@@ -285,6 +285,34 @@ impl Live {
         }
     }
 
+    /// Whether mush stopped this command from outside its own watcher — a quit
+    /// (`kill_all`), a `/new`, or a `Stop` aimed at the agent that started it.
+    fn stopped(&self) -> bool {
+        self.stop.load(Ordering::SeqCst)
+    }
+
+    /// The three questions a foreground watcher asks its command, asked through
+    /// the registry's grip on it. A poison outside this module must not take
+    /// the waiter down with it: the command cannot be waited for any more, and
+    /// that is what the answer says.
+    fn poll(&self) -> Result<Option<i32>, String> {
+        match self.job.lock() {
+            Ok(mut job) => job.poll(),
+            Err(_) => Err("the command's handle was poisoned".to_string()),
+        }
+    }
+
+    fn written(&self) -> u64 {
+        self.job.lock().map(|job| job.written()).unwrap_or(0)
+    }
+
+    fn output(&self, cap: usize) -> (String, String) {
+        self.job
+            .lock()
+            .map(|job| job.output(cap))
+            .unwrap_or_default()
+    }
+
     /// The end of what it has written so far, at most `cap` bytes of it: the
     /// window a completion keeps is `JOB_TAIL`, and a `command_status` that
     /// lists several jobs reads a smaller one for each (see `status_for`).
@@ -294,6 +322,88 @@ impl Live {
         };
         let (stdout, stderr) = job.tail(cap);
         preview(&stdout, &stderr, cap)
+    }
+}
+
+/// A command running as a *tool call* — `run_command` without `detach`, which
+/// the agent waits on — held where everything that stops mush's work can reach
+/// it.
+///
+/// It used to live only on the actor's stack: spawned for the duration of the
+/// call, killed by the watcher when the call ended, and invisible to
+/// [`Registry::kill_all`], which is what `App::drop` runs on the way out. So a
+/// plain `sleep 10; touch marker` survived a clean `Ctrl-Q` in its own process
+/// group and did its work after mush was gone — while a *detached* job, the
+/// same process group by another name, died correctly (finding S4). This is the
+/// missing half: the registry holds the command for the life of the call, so
+/// `kill_all` on quit and `kill_owned` on `Stop`/`/new` reach it exactly as they
+/// reach a job.
+///
+/// It is not a job. It has no id, no line, no output window and no place in the
+/// machine-wide budget: the model is the one waiting for its result, and the
+/// transcript is where that result is read. What it has is a slot that a kill
+/// can find.
+pub struct Foreground {
+    registry: Arc<Registry>,
+    /// Which slot this call holds. Slots are never reused, so a stale release
+    /// cannot free somebody else's command.
+    slot: u64,
+    live: Live,
+}
+
+impl Foreground {
+    /// Hand the process group over: the slot goes with this call, and whoever
+    /// takes the [`Live`] owns the command from now on (see `Launch::held`).
+    fn release(&self) -> Live {
+        self.registry.forget_foreground(self.slot);
+        self.live.clone()
+    }
+
+    /// Whether mush stopped this command from outside its own watcher — a quit,
+    /// a `/new`, or a `Stop` aimed at the agent that started it. The answer the
+    /// watcher gives the model must not read as the command's own exit code.
+    pub fn stopped(&self) -> bool {
+        self.live.stopped()
+    }
+}
+
+impl Drop for Foreground {
+    /// The call is over: the slot goes.
+    ///
+    /// Nothing is killed here, on purpose. Every path that ends the call early
+    /// kills the command itself (`wait_bounded` does, before it returns), and a
+    /// command that ended by itself must not be signalled afterwards: its
+    /// process group id is free to be handed to somebody else's process, and a
+    /// `kill -9 -pgid` that landed there would kill work mush never started.
+    /// What keeps a *running* command from escaping is that the slot is
+    /// registered for the whole of the call, not this drop.
+    fn drop(&mut self) {
+        self.registry.forget_foreground(self.slot);
+    }
+}
+
+impl Job for Foreground {
+    fn poll(&mut self) -> Result<Option<i32>, String> {
+        self.live.poll()
+    }
+
+    fn written(&self) -> u64 {
+        self.live.written()
+    }
+
+    fn output(&self, cap: usize) -> (String, String) {
+        self.live.output(cap)
+    }
+
+    fn tail(&self, cap: usize) -> (String, String) {
+        let Ok(job) = self.live.job.lock() else {
+            return (String::new(), String::new());
+        };
+        job.tail(cap)
+    }
+
+    fn kill(&mut self) {
+        self.live.kill();
     }
 }
 
@@ -340,15 +450,84 @@ impl Refused {
 
 /// What to start. Built by the caller (`run_command`), which owns the decision
 /// to detach; the registry owns admission and watching.
+///
 pub struct Launch {
     pub owner: u64,
     pub command: String,
     /// Whether this command owns the machine for its whole life.
     pub exclusive: bool,
-    pub job: Box<dyn Job>,
+    /// A command that has never been held, or one a foreground call was already
+    /// holding (finding S4): either way this is the process group the registry
+    /// watches from here on. A foreground command is handed over, never
+    /// re-spawned and never unheld, so the process group is in the registry's
+    /// reach every moment of its life.
+    source: Source,
     /// Where the completion lands: the owner's own mailbox, exactly as a child's
     /// completion does.
     pub mailbox: Sender<AgentMsg>,
+}
+
+/// Where a `Launch`'s running process group comes from.
+enum Source {
+    /// Started by the caller and handed over now — what `detach: true` does.
+    Started(Box<dyn Job>),
+    /// Held by a `Foreground` the caller has finished with: the command keeps
+    /// running, and the slot it held becomes this job's record.
+    Held(Foreground),
+}
+
+impl Launch {
+    /// A command that has just been started.
+    pub fn started(
+        owner: u64,
+        command: String,
+        exclusive: bool,
+        mailbox: Sender<AgentMsg>,
+        job: Box<dyn Job>,
+    ) -> Self {
+        Self {
+            owner,
+            command,
+            exclusive,
+            source: Source::Started(job),
+            mailbox,
+        }
+    }
+
+    /// A command a tool call was holding and has outlived `CMD_DETACH_AFTER`
+    /// for: the same process group, watched from now on as a job. Releasing the
+    /// hold is part of the move — there is no moment where it is in neither the
+    /// foreground slot nor the job list.
+    pub fn held(
+        owner: u64,
+        command: String,
+        exclusive: bool,
+        mailbox: Sender<AgentMsg>,
+        held: Foreground,
+    ) -> Self {
+        Self {
+            owner,
+            command,
+            exclusive,
+            source: Source::Held(held),
+            mailbox,
+        }
+    }
+}
+
+impl Source {
+    /// The registry's grip on the process group this launch is about: a command
+    /// that just arrived wrapped here, or the one a foreground call was already
+    /// holding, released as part of the move.
+    fn into_live(self) -> Live {
+        match self {
+            Source::Started(job) => Live {
+                job: Arc::new(Mutex::new(job)),
+                stop: Arc::new(AtomicBool::new(false)),
+            },
+            Source::Held(held) => held.release(),
+        }
+    }
 }
 
 /// Every live job in one conversation, and the machine-wide lock.
@@ -368,6 +547,14 @@ struct Inner {
     /// The agent holding the machine, its command, and the job holding it while
     /// that job runs.
     holder: Option<(u64, String, Option<u64>)>,
+    /// The commands running as tool calls, keyed by slot and owned by the agent
+    /// that started each: what [`Registry::kill_all`] and
+    /// [`Registry::kill_owned`] reach beyond the job list. In slot order, one
+    /// per agent that is running a command, so a handful at most.
+    foregrounds: BTreeMap<u64, (u64, Live)>,
+    /// The next foreground slot. It never repeats: a release from a dropped
+    /// handle cannot free a later command's slot.
+    next_slot: u64,
 }
 
 impl Registry {
@@ -410,6 +597,11 @@ impl Registry {
 
     /// The jobs still running for `owner`, oldest first: what a row, a footer or
     /// the bar shows. No command handle is touched, so the painter may ask.
+    ///
+    /// A command running as a *tool call* is deliberately not in here: it has no
+    /// id to name and no window to show — the transcript's `⚙` line and the
+    /// model's own result are where it is read. It is stopped like a job
+    /// (finding S4), but it is not one.
     pub fn live_for(&self, owner: u64) -> Vec<JobView> {
         let now = self.clock.now();
         let held = self.held();
@@ -423,6 +615,55 @@ impl Registry {
                 exclusive: matches!(&held, Some((_, _, Some(job))) if *job == record.id),
             })
             .collect()
+    }
+
+    /// Hold a command that is running as a tool call, so that everything which
+    /// stops mush's work can reach it (finding S4).
+    ///
+    /// The handle returned *is* the tool call's grip: while it lives, the
+    /// process group is in the registry; when it is dropped, the call is over
+    /// and the slot goes. Nothing here is admission — a foreground command is
+    /// not a job, does not spend the machine-wide budget, and is not refused —
+    /// because the command is already running when this is called.
+    pub fn hold(self: &Arc<Self>, owner: u64, job: Box<dyn Job>) -> Foreground {
+        let live = Live {
+            job: Arc::new(Mutex::new(job)),
+            stop: Arc::new(AtomicBool::new(false)),
+        };
+        let slot = {
+            let mut inner = self.inner();
+            let slot = inner.next_slot;
+            inner.next_slot += 1;
+            inner.foregrounds.insert(slot, (owner, live.clone()));
+            slot
+        };
+        Foreground {
+            registry: Arc::clone(self),
+            slot,
+            live,
+        }
+    }
+
+    /// The slot a finished tool call held. Idempotent: the handover releases it
+    /// and the handle's own `Drop` releases it again.
+    fn forget_foreground(&self, slot: u64) {
+        self.inner().foregrounds.remove(&slot);
+    }
+
+    /// Every command running as a tool call, as `(owner, live)` pairs — a copy,
+    /// so nothing is killed or read while the registry's own lock is held.
+    fn foregrounds(&self) -> Vec<(u64, Live)> {
+        self.inner().foregrounds.values().cloned().collect()
+    }
+
+    /// Whether this agent is still holding a command as a tool call. Test-only:
+    /// the screen's question about a *job* is `live_for`, and this is the same
+    /// question about the call the model is waiting on.
+    #[cfg(test)]
+    pub fn holding_foreground(&self, owner: u64) -> bool {
+        self.foregrounds()
+            .iter()
+            .any(|(holder, _)| *holder == owner)
     }
 
     /// How many jobs are alive right now — the number the budget is about.
@@ -510,13 +751,10 @@ impl Registry {
             owner,
             command,
             exclusive,
-            job,
             mailbox,
+            source,
         } = launch;
-        let live = Live {
-            job: Arc::new(Mutex::new(job)),
-            stop: Arc::new(AtomicBool::new(false)),
-        };
+        let live = source.into_live();
         let admitted = {
             let mut inner = self.inner();
             let refusal = if exclusive {
@@ -621,9 +859,15 @@ impl Registry {
         }
     }
 
-    /// Stop every job one agent started. A `Stop` aimed at an agent means "stop
-    /// the work in flight", and a job is work in flight.
+    /// Stop every job one agent started, and every command it is running as a
+    /// tool call. A `Stop` aimed at an agent means "stop the work in flight",
+    /// and a `run_command` the agent is waiting on is work in flight.
     pub fn kill_owned(&self, owner: u64) {
+        for (holder, live) in self.foregrounds() {
+            if holder == owner {
+                live.kill();
+            }
+        }
         for record in self.jobs() {
             if record.owner == owner {
                 if let Some(live) = record.live {
@@ -634,8 +878,14 @@ impl Registry {
     }
 
     /// Stop everything. This is what quitting mush runs, where a build an agent
-    /// started used to outlive a clean quit.
+    /// started used to outlive a clean quit — and, until finding S4, an ordinary
+    /// foreground command with it: the process group was spawned for the length
+    /// of a tool call and registered nowhere, so nothing on the way out could
+    /// see it.
     pub fn kill_all(&self) {
+        for (_, live) in self.foregrounds() {
+            live.kill();
+        }
         for record in self.jobs() {
             if let Some(live) = record.live {
                 live.kill();
@@ -933,13 +1183,13 @@ mod tests {
             .unwrap();
         let (tx, rx) = crossbeam_channel::unbounded();
         let id = registry
-            .launch(Launch {
+            .launch(Launch::started(
                 owner,
-                command: "cargo build".to_string(),
-                exclusive: false,
+                "cargo build".to_string(),
+                false,
+                tx,
                 job,
-                mailbox: tx,
-            })
+            ))
             .unwrap();
         (id, rx)
     }
@@ -1217,6 +1467,58 @@ mod tests {
         lone.kill_all();
     }
 
+    /// A command running as a *tool call* is held where the same kills reach it
+    /// (finding S4) — but it is not a job: it has no id in the list, no line,
+    /// no window, and no place in the machine-wide budget. Two owners' held
+    /// commands, one `Stop` and one quit.
+    #[test]
+    fn a_held_command_is_killed_by_its_owners_stop_and_by_kill_all() {
+        let (registry, _events, _clock) = registry();
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::hangs())
+                .runs(Script::hangs()),
+        );
+        let hold = |owner: u64| {
+            let job = machine
+                .spawn(&ShellCommand {
+                    command: "cargo build",
+                    root: Path::new("/tmp"),
+                })
+                .unwrap();
+            registry.hold(owner, job)
+        };
+        let mine = hold(7);
+        let other = hold(8);
+        assert!(registry.holding_foreground(7) && registry.holding_foreground(8));
+        assert_eq!(
+            registry.live_for(7),
+            Vec::new(),
+            "a tool call is not a job: it has no id to list and no window to show"
+        );
+        assert_eq!(registry.running(), 0, "and it spends no job budget");
+
+        // A `Stop` aimed at one agent reaches that agent's command, and only
+        // that one.
+        registry.kill_owned(7);
+        assert_eq!(machine.kills(), 1, "the owner's command was stopped");
+        assert!(!other.stopped(), "and a sibling's keeps running");
+
+        // Quitting stops everything, wherever the command was spawned.
+        registry.kill_all();
+        assert_eq!(machine.kills(), 2, "quitting killed the other one too");
+        // The call is over: the slots go, so a later quit cannot find them.
+        drop(mine);
+        drop(other);
+        assert!(!registry.holding_foreground(7) && !registry.holding_foreground(8));
+        registry.kill_all();
+        assert_eq!(
+            machine.kills(),
+            2,
+            "and a finished call leaves nothing to kill"
+        );
+    }
+
     /// The budget is the machine's, not one agent's: `MAX_JOBS` live jobs are
     /// the limit, and the next launch is refused with something the model can
     /// act on.
@@ -1246,13 +1548,13 @@ mod tests {
             })
             .unwrap();
         let (tx, _rx) = crossbeam_channel::unbounded();
-        let refused = registry.launch(Launch {
-            owner: 8,
-            command: "cargo build".to_string(),
-            exclusive: false,
+        let refused = registry.launch(Launch::started(
+            8,
+            "cargo build".to_string(),
+            false,
+            tx,
             job,
-            mailbox: tx,
-        });
+        ));
         assert_eq!(refused, Err(Refused::Budget));
         assert_eq!(
             machine.kills(),
@@ -1287,13 +1589,7 @@ mod tests {
             .unwrap();
         let (tx, _rx) = crossbeam_channel::unbounded();
         assert_eq!(
-            registry.launch(Launch {
-                owner: 9,
-                command: "cargo build".to_string(),
-                exclusive: true,
-                job,
-                mailbox: tx,
-            }),
+            registry.launch(Launch::started(9, "cargo build".to_string(), true, tx, job,)),
             Err(Refused::Machine(Held {
                 agent: 7,
                 command: "cargo bench".to_string(),

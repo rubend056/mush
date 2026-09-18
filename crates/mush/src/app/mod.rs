@@ -1008,6 +1008,28 @@ impl App {
         format!("ctx {used_label}/{mark}{window_label}{state}")
     }
 
+    /// The conversation this workspace was left holding could not be read, and
+    /// the human has to hear it before they mistake the empty screen for an
+    /// empty workspace (finding S3).
+    ///
+    /// It takes the two homes a failure takes: the root pane's foot — wrapped
+    /// to the pane, ranked `Alert`, read back whole by `/notes` — and the bar's
+    /// line one, so it is visible without opening anything and stays visible
+    /// until something replaces it. It is news rather than chatter, so the
+    /// human's next send does not end it, and the session is marked dirty so
+    /// the next save writes it: a workspace that could not be read is a fact
+    /// about the workspace, not about the moment it was noticed. (The root's
+    /// own next run supersedes it, as it supersedes any failure — but by then
+    /// the human has run something in the conversation it opened.) The words
+    /// come from the caller (`main`), which is the one place that knows the
+    /// path, the reason and where the only copy went.
+    pub fn session_unreadable(&mut self, text: impl Into<String>) {
+        let text = text.into();
+        self.chat.note_error_for(AgentId::ROOT, text.clone());
+        self.fail(text);
+        self.mark_session_dirty();
+    }
+
     /// Remember something that went wrong. Errors do not fade: they stay until
     /// a later line replaces them.
     ///
@@ -3908,13 +3930,13 @@ mod tests {
                 .unwrap();
             let (tx, rx) = crossbeam_channel::unbounded();
             registry
-                .launch(Launch {
+                .launch(Launch::started(
                     owner,
-                    command: "cargo build".to_string(),
-                    exclusive: false,
+                    "cargo build".to_string(),
+                    false,
+                    tx,
                     job,
-                    mailbox: tx,
-                })
+                ))
                 .unwrap();
             job_rx.push(rx);
         }
@@ -3935,6 +3957,56 @@ mod tests {
             );
         }
         assert_eq!(registry.running(), 0, "nothing is left running");
+    }
+
+    /// Quitting kills the command an agent is *waiting on*, not only a detached
+    /// job. A `run_command` without `detach` is spawned for the length of a tool
+    /// call and used to be registered nowhere, so `kill_all` — the last thing
+    /// `App::drop` does — could not see it: a plain `sleep 10; touch marker`
+    /// survived a clean `Ctrl-Q`, in its own process group, and did its work
+    /// after mush was gone (finding S4). The hold below is the same one the
+    /// agent takes, and the quit is the same one the human's `Ctrl-Q` runs.
+    #[test]
+    fn quitting_kills_a_running_foreground_command() {
+        use crate::machine::fake::{Script, Scripted as ScriptedMachine};
+        use crate::machine::{Machine, ShellCommand};
+
+        let (app, _rx) = test_app("foreground-dies-on-quit");
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let registry = app.tree.handles().jobs;
+        let job = machine
+            .spawn(&ShellCommand {
+                command: "sleep 10; touch marker",
+                root: std::path::Path::new("/tmp"),
+            })
+            .unwrap();
+        let held = registry.hold(0, job);
+        assert!(
+            registry.holding_foreground(0),
+            "the call holds it while the model waits on it"
+        );
+        assert_eq!(machine.kills(), 0, "and nothing has stopped it yet");
+
+        drop(app);
+
+        assert_eq!(
+            machine.kills(),
+            1,
+            "quitting killed the command the agent was waiting on"
+        );
+        // The call is over, so its slot is gone: the registry is left holding
+        // nothing, and this test keeps it alive precisely to check that.
+        drop(held);
+        assert!(
+            !registry.holding_foreground(0),
+            "a finished call leaves no slot behind"
+        );
+        registry.kill_all();
+        assert_eq!(
+            machine.kills(),
+            1,
+            "so the next quit cannot kill the same command twice"
+        );
     }
 
     /// `c` on a row is aimed at the work, and a detached job is work in flight:
@@ -3959,13 +4031,13 @@ mod tests {
             .unwrap();
         let (tx, job_rx) = crossbeam_channel::unbounded();
         registry
-            .launch(Launch {
-                owner: 0,
-                command: "cargo bench".to_string(),
-                exclusive: false,
+            .launch(Launch::started(
+                0,
+                "cargo bench".to_string(),
+                false,
+                tx,
                 job,
-                mailbox: tx,
-            })
+            ))
             .unwrap();
         // The root is idle — and the row must not say so as if the machine were.
         assert!(!app.tree.agents[0].phase.is_busy());
@@ -4031,6 +4103,74 @@ mod tests {
         assert_eq!(landed.landed, Some(session::StoredLanded::Merged));
         drop(app);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A session file mush cannot read is *said*, not silently dropped
+    /// (finding S3). The human comes back to an empty screen; "empty" must not
+    /// be the whole story, so the line names the file, the reason and where the
+    /// only copy went — in the pane's foot, in `/notes`, and on the bar without
+    /// opening anything. A workspace with nothing stored says none of it.
+    #[test]
+    fn an_unreadable_session_is_said_rather_than_dropped() {
+        let (mut app, _rx) = test_app("unreadable-session");
+
+        // Nothing stored: no line about a session, and the bar keeps its hint.
+        assert!(
+            app.chat.notices_for(AgentId::ROOT).next().is_none(),
+            "an absent session is not news"
+        );
+        let rows = screen(&mut app, 200, 40);
+        assert!(
+            !rows.join("\n").contains("could not read"),
+            "and nothing is said about one: {rows:?}"
+        );
+
+        let notice = "could not read .mush/session.json — expected value at line 1 column 2; \
+                      kept as .mush/session.json.bak · starting a new conversation";
+        app.session_unreadable(notice);
+
+        // The bar says it without anything being opened: line one, in red,
+        // after the focus badge — and the pane's foot carries it whole.
+        let rows = screen(&mut app, 200, 40);
+        assert!(
+            rows.iter().any(|row| row.starts_with(" chat ")
+                && row.contains("could not read .mush/session.json")),
+            "the bar carries it: {rows:?}"
+        );
+        let painted = rows.join("\n");
+        assert!(
+            painted.contains("expected value at line 1 column 2"),
+            "the reason is on screen: {painted}"
+        );
+        assert!(
+            painted.contains("kept as .mush/session.json.bak"),
+            "and where the only copy went: {painted}"
+        );
+        // `/notes` reads it back, so a line that wrapped or scrolled is still
+        // readable in full.
+        run(&mut app, "/notes");
+        assert!(
+            screen(&mut app, 200, 40)
+                .join("\n")
+                .contains("could not read .mush/session.json"),
+            "the report holds it"
+        );
+        // It is news, not chatter: the human's next send does not take it away,
+        // and the session is marked dirty so the next save carries it.
+        assert!(
+            !app.chat.dismiss_said(),
+            "a send must not end what the workspace said about itself"
+        );
+        assert_eq!(
+            app.chat
+                .notices_for(AgentId::ROOT)
+                .filter(|notice| notice.rank() == crate::app::chat::Rank::Alert)
+                .count(),
+            1,
+            "and it ranks as a failure, so the foot and the bar cannot hide it"
+        );
+        assert_eq!(app.chat.stored_notices().len(), 1);
+        let _ = std::fs::remove_dir_all(app.ws.root());
     }
 
     /// A compaction is what a restart resumes from, so the folded transcript is

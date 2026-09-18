@@ -18,7 +18,7 @@ mod ui;
 
 use std::error::Error;
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -274,6 +274,40 @@ fn help_text() -> String {
     )
 }
 
+/// What the human is told when the stored conversation is there and cannot be
+/// read.
+///
+/// Three things, because they are the three a human needs to get the work
+/// back: which file, why mush could not use it, and where the only copy went.
+/// It is a *failure* rather than a note — mush was supposed to bring this
+/// conversation back and did not, and the fresh empty one on screen is not what
+/// the human left here.
+///
+/// Paths are shown relative to the workspace: the bar already names where that
+/// is (`⌂ …`), and an absolute prefix would spend the line on something the
+/// human knows.
+fn unreadable_session_notice(root: &Path, reason: &str, kept: Result<PathBuf, String>) -> String {
+    let file = shown_under(root, &session::session_path(root));
+    match kept {
+        Ok(kept) => format!(
+            "could not read {file} — {reason}; kept as {} · starting a new conversation",
+            shown_under(root, &kept)
+        ),
+        // The copy could not be set aside either. That is the worse half of the
+        // news and it is said second, because naming a backup that is not there
+        // would be the one lie this line must not tell.
+        Err(error) => format!("could not read {file} — {reason}; {error}"),
+    }
+}
+
+/// A path as the human reads it: relative to the workspace they opened.
+fn shown_under(root: &Path, path: &Path) -> String {
+    path.strip_prefix(root)
+        .unwrap_or(path)
+        .display()
+        .to_string()
+}
+
 /// `--print-config`: the resolved config and nothing else — no workspace, no
 /// `.mush/`, no request to an endpoint. This is what makes a hand-edited home
 /// file debuggable, and the only way to see the precedence chain rather than
@@ -396,7 +430,25 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     // CLI flags > environment > saved session > home config > defaults; the
     // whole precedence lives in one tested function in mush-core.
-    let stored = Session::load(workspace.root());
+    //
+    // A session file mush cannot read is *not* the same as no session file
+    // (finding S3): the first is a conversation the human still has, and the
+    // save below would be the first thing to write over it. So the two are told
+    // apart here, the unreadable one is kept beside itself before anything can
+    // write, and the human is told — the app opens empty either way, and an
+    // empty app with no explanation is how a lost conversation reads as one
+    // that was never there.
+    let (stored, unreadable) = match session::Session::read(workspace.root()) {
+        session::Stored::Loaded(session) => (Some(session), None),
+        session::Stored::Absent => (None, None),
+        session::Stored::Unusable(reason) => {
+            let kept = session::keep_unreadable(workspace.root());
+            (
+                None,
+                Some(unreadable_session_notice(workspace.root(), &reason, kept)),
+            )
+        }
+    };
     let config = config::resolve(&overrides, &UserConfig::load(), stored.as_ref())?;
 
     // Model discovery happens *after* the first frame, on its own thread. A
@@ -438,6 +490,13 @@ fn run() -> Result<(), Box<dyn Error>> {
                 models: Vec::new(),
             });
         }
+    }
+
+    // Before the first frame, so the line is one of the first things painted:
+    // a workspace whose conversation could not be read is not a workspace with
+    // nothing in it.
+    if let Some(notice) = unreadable {
+        app.session_unreadable(notice);
     }
 
     install_panic_hook();
@@ -684,6 +743,52 @@ mod tests {
             let error = error_of(&["--temperature", value]);
             assert!(error.contains(value), "{error}");
         }
+    }
+
+    /// The sentence a workspace whose session could not be read is told. It has
+    /// to name the file, the reason and where the only copy went — and it must
+    /// say *that* the copy could not be kept rather than name a backup that is
+    /// not there.
+    #[test]
+    fn the_unreadable_session_notice_names_the_file_the_reason_and_the_backup() {
+        let root = Path::new("/w");
+        let kept = Ok(root.join(".mush/session.json.bak"));
+        let notice = unreadable_session_notice(root, "expected value at line 1 column 2", kept);
+        assert_eq!(
+            notice,
+            "could not read .mush/session.json — expected value at line 1 column 2; \
+             kept as .mush/session.json.bak · starting a new conversation"
+        );
+        // Relative to the workspace: the bar already says where that is, and an
+        // absolute `/w/.mush/…` would spend the line on a prefix the human
+        // already knows.
+        assert!(!notice.contains("/w/"), "{notice}");
+
+        // The copy could not be set aside either. That is the worse half of the
+        // news, and the line says it instead of pointing at a file that is not
+        // there.
+        let notice = unreadable_session_notice(
+            root,
+            "expected value at line 1 column 2",
+            Err("cannot keep session.json — Permission denied".to_string()),
+        );
+        assert!(notice.contains("cannot keep session.json"), "{notice}");
+        assert!(!notice.contains("kept as"), "{notice}");
+    }
+
+    /// A path that is not under the root is shown as it is: a workspace opened
+    /// as another directory must not have a real path rewritten into a relative
+    /// one that means something else.
+    #[test]
+    fn a_path_outside_the_workspace_is_shown_whole() {
+        assert_eq!(
+            shown_under(Path::new("/w"), Path::new("/elsewhere/session.json")),
+            "/elsewhere/session.json"
+        );
+        assert_eq!(
+            shown_under(Path::new("/w"), Path::new("/w/.mush/session.json.bak.2")),
+            ".mush/session.json.bak.2"
+        );
     }
 
     /// A second positional is an error rather than a silent replacement

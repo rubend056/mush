@@ -151,14 +151,122 @@ pub struct Session {
     pub notices: Vec<StoredNotice>,
 }
 
+/// What a workspace's `.mush/session.json` holds, as read.
+///
+/// `Option<Session>` could not tell "there is no session here" apart from
+/// "there is one and mush cannot use it": both came back `None`, the app opened
+/// empty either way, and the first save wrote a fresh conversation over the only
+/// copy of the old one — no warning, no backup. This is the distinction, so the
+/// caller can say which of the two it found.
+pub enum Stored {
+    /// There is no session file. A fresh workspace, and nothing to say about
+    /// it: silence is the honest answer here, and the one `Unusable` must not
+    /// be mistaken for.
+    Absent,
+    /// The conversation, as it was left.
+    Loaded(Session),
+    /// The file is there and cannot be used. The string is *why* — what serde
+    /// objected to, or the IO error — for the human who has to decide what to
+    /// do with the copy that [`keep_unreadable`] sets aside.
+    Unusable(String),
+}
+
+/// Spelled by hand because a [`Session`] is a whole conversation and printing
+/// one in a test failure would bury the fact being asserted.
+impl std::fmt::Debug for Stored {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Stored::Absent => write!(f, "Absent"),
+            Stored::Loaded(_) => write!(f, "Loaded(<session>)"),
+            Stored::Unusable(reason) => write!(f, "Unusable({reason:?})"),
+        }
+    }
+}
+/// How many backup names mush will try beside an unreadable session before it
+/// gives up looking. A workspace that has been hand-broken a hundred times has
+/// a problem that no file name solves.
+const BACKUP_TRIES: u32 = 100;
+
+/// Where an unreadable session is kept, before the caller starts numbering:
+/// `.mush/session.json.bak`.
+fn first_backup(root: &Path) -> PathBuf {
+    mushroom_dir(root).join(format!("{SESSION_FILE}.bak"))
+}
+
+/// Move a session file mush cannot read beside itself, so the save that
+/// follows cannot destroy the only copy of the human's conversation.
+///
+/// A rename in the same directory: the bytes are never rewritten and never
+/// leave the workspace. A backup that is already there is *not* overwritten —
+/// the next free name (`.bak.2`, `.bak.3`, …) is used instead, so hand-breaking
+/// the file twice does not lose the first copy either. Returns where it went.
+///
+/// This is deliberately not called for an [`Stored::Absent`] workspace: there
+/// is nothing to keep, and creating a backup of nothing would be a file a human
+/// has to wonder about.
+pub fn keep_unreadable(root: &Path) -> Result<PathBuf, String> {
+    let from = session_path(root);
+    let base = first_backup(root);
+    for step in 1..=BACKUP_TRIES {
+        let to = if step == 1 {
+            base.clone()
+        } else {
+            PathBuf::from(format!("{}.{step}", base.display()))
+        };
+        if to.exists() {
+            continue;
+        }
+        return fs::rename(&from, &to).map(|()| to).map_err(|error| {
+            format!(
+                "cannot keep {} — {error}",
+                from.file_name().unwrap_or_default().to_string_lossy()
+            )
+        });
+    }
+    Err(format!(
+        "cannot keep {} — every backup name beside it is taken",
+        from.file_name().unwrap_or_default().to_string_lossy()
+    ))
+}
+
 impl Session {
+    /// Read what the workspace stores, distinguishing *absent* from
+    /// *unreadable* (see [`Stored`]). Callers that only need the conversation —
+    /// the config precedence, a test — want [`Self::load`].
+    pub fn read(root: &Path) -> Stored {
+        Self::read_from(&session_path(root))
+    }
+
+    pub fn read_from(path: &Path) -> Stored {
+        let bytes = match fs::read(path) {
+            Ok(bytes) => bytes,
+            // No file is not a file mush cannot use: a workspace nobody has
+            // opened yet must stay silent.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Stored::Absent,
+            Err(error) => return Stored::Unusable(format!("cannot read the file — {error}")),
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(session) => Stored::Loaded(session),
+            // The position serde names is what makes a hand edit findable, so
+            // it is carried through rather than flattened into "bad json".
+            Err(error) => Stored::Unusable(error.to_string()),
+        }
+    }
+
+    /// The conversation, or `None` when there is none *or* when the one there
+    /// is cannot be used. `None` is the truth for the layers that only want the
+    /// stored endpoint selection, and it is why [`Self::read`] exists: the two
+    /// cases must not be indistinguishable to the caller that overwrites the
+    /// file.
     pub fn load(root: &Path) -> Option<Self> {
         Self::load_from(&session_path(root))
     }
 
     pub fn load_from(path: &Path) -> Option<Self> {
-        let bytes = fs::read(path).ok()?;
-        serde_json::from_slice(&bytes).ok()
+        match Self::read_from(path) {
+            Stored::Loaded(session) => Some(session),
+            Stored::Absent | Stored::Unusable(_) => None,
+        }
     }
 
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
@@ -174,6 +282,109 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An `absent` session and one mush *cannot read* are two different facts,
+    /// and telling them apart is what stops the second from being silently
+    /// overwritten: the conversation the human left here — plus one agent, in
+    /// the finding — has to survive the first save of the fresh one.
+    #[test]
+    fn an_unreadable_session_is_told_apart_from_an_absent_one() {
+        let root = std::env::temp_dir().join(format!("mush-session4-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        ensure_mush_dir(&root).unwrap();
+
+        // Nothing stored: silence, and no backup of nothing.
+        assert!(matches!(Session::read(&root), Stored::Absent));
+        assert!(Session::load(&root).is_none(), "absent is still `None`");
+
+        // A session a schema change (or a hand edit) made unreadable. The one
+        // finding S3 bisected to: `"status": "failed"` where the real encoding
+        // is `{"failed": "…"}`.
+        let broken = r#"{
+          "root": "/tmp/ws",
+          "model": "deepseek-chat",
+          "updated": 7,
+          "messages": [
+            {"role": "user", "content": "a conversation worth keeping"},
+            {"role": "assistant", "content": "and the reply to it"}
+          ],
+          "agents": [
+            {"id": 1, "brief": "port the parser", "status": "failed", "messages": []}
+          ]
+        }"#;
+        fs::write(session_path(&root), broken).unwrap();
+
+        let reason = match Session::read(&root) {
+            Stored::Unusable(reason) => reason,
+            other => panic!("expected Unusable, got {other:?}"),
+        };
+        assert!(
+            reason.contains("status") || reason.contains("line"),
+            "the reason must be something a human can act on: {reason}"
+        );
+        assert!(
+            Session::load(&root).is_none(),
+            "an unreadable session is still `None` for the layers that only want the conversation"
+        );
+
+        // Keep it, then save the fresh conversation over the path it had.
+        let kept = keep_unreadable(&root).unwrap();
+        assert_eq!(kept, root.join(".mush/session.json.bak"));
+        assert!(
+            !session_path(&root).exists(),
+            "the unreadable file is not both kept and in the way"
+        );
+        saying("the new conversation").save(&root).unwrap();
+
+        assert!(
+            matches!(Session::read(&root), Stored::Loaded(_)),
+            "the save wrote a session the next start can read"
+        );
+        assert_eq!(
+            fs::read_to_string(&kept).unwrap(),
+            broken,
+            "and the only copy of the old conversation is byte for byte what it was"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Breaking the file twice must not lose the first copy: the backup name is
+    /// searched, not reused.
+    #[test]
+    fn keeping_a_second_unreadable_session_does_not_overwrite_the_first() {
+        let root = std::env::temp_dir().join(format!("mush-session5-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        ensure_mush_dir(&root).unwrap();
+
+        fs::write(session_path(&root), "first").unwrap();
+        let first = keep_unreadable(&root).unwrap();
+        fs::write(session_path(&root), "second").unwrap();
+        let second = keep_unreadable(&root).unwrap();
+
+        assert_ne!(first, second);
+        assert_eq!(fs::read_to_string(&first).unwrap(), "first");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "second");
+        assert_eq!(second, root.join(".mush/session.json.bak.2"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The session a test writes, so the round trip below is about the file
+    /// rather than about the fields.
+    fn saying(text: &str) -> Session {
+        Session {
+            root: String::new(),
+            model: "test".into(),
+            provider: "custom".into(),
+            base_url: String::new(),
+            context: None,
+            updated: 0,
+            messages: vec![Message::user(text)],
+            agents: Vec::new(),
+            notices: Vec::new(),
+        }
+    }
 
     #[test]
     fn ensure_creates_self_ignoring_dir() {

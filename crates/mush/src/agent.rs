@@ -1739,6 +1739,22 @@ fn compact_history(
     // the automatic trigger would not have fired, so it has nothing to report.
     let asked = std::mem::take(&mut state.compact_requested);
     if !matches!(messages.first(), Some(message) if message.role == "system") {
+        // Nothing to fold *and* nothing to replace: a fresh actor's transcript
+        // is empty until its first `Run`, so the fold below has no `system` to
+        // keep. The transcript is not made minimal by that, so this is not the
+        // `system + one message` refusal — but a human who typed `/compact` is
+        // owed the same answer, for the same reason: the bar says
+        // `compacting #0…`, and silence there is indistinguishable from a fold
+        // that quietly failed. The automatic trigger never reaches this arm
+        // with an empty transcript (there is nothing to weigh), and it is
+        // never told anything anyway.
+        if asked && messages.is_empty() {
+            actor
+                .ctx
+                .emit(actor.id, AgentEvent::Notice(NOTHING_TO_COMPACT.to_string()));
+        }
+        // Nothing was replaced, whether the transcript was empty or the fold's
+        // opening message was something else entirely — the phase stays false.
         return Ok(false);
     }
     // Nothing left to fold: system + one message is already minimal
@@ -2233,30 +2249,41 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     }
 
     let id = ctx.ids.fetch_add(1, Ordering::SeqCst);
-    let (child_ws, branch, note) = if isolated {
+    // Why isolation was not available, if it was asked for and refused. One
+    // reason, two readers: the child's brief carries it for the model (which
+    // wrote `isolated: true` and has to know it did not get its own worktree),
+    // and the parent's pane carries it for the human — who asked for two
+    // siblings that would not touch the same files, and whose rows would
+    // otherwise look exactly like a child that never asked to be isolated.
+    // Every way `worktree_add` refuses takes this road: no repository, no
+    // commit to fork from, git's own refusal to add the worktree.
+    let mut degraded: Option<String> = None;
+    let (child_ws, branch) = if isolated {
         // A private worktree on `mush/<id>`, based on the parent's branch (or
         // HEAD). The reason it cannot be made is reported either way, so
         // isolation degrades to the shared workspace instead of failing the
         // delegation.
         match git::worktree_add(&ctx.root, id, actor.branch.as_deref()) {
             Ok((path, branch)) => match Workspace::new(&path) {
-                Ok(child_ws) => (child_ws, Some(branch), String::new()),
+                Ok(child_ws) => (child_ws, Some(branch)),
                 // Isolation is best-effort: degrade to the shared workspace
                 // rather than fail the delegation outright.
-                Err(error) => (
-                    actor.ws.clone(),
-                    None,
-                    format!(" (isolated unavailable: {error}; running in place)"),
-                ),
+                Err(error) => {
+                    degraded = Some(error.to_string());
+                    (actor.ws.clone(), None)
+                }
             },
-            Err(reason) => (
-                actor.ws.clone(),
-                None,
-                format!(" (isolated unavailable: {reason}; running in place)"),
-            ),
+            Err(reason) => {
+                degraded = Some(reason);
+                (actor.ws.clone(), None)
+            }
         }
     } else {
-        (actor.ws.clone(), None, String::new())
+        (actor.ws.clone(), None)
+    };
+    let note = match &degraded {
+        Some(reason) => format!(" (isolated unavailable: {reason}; running in place)"),
+        None => String::new(),
     };
 
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AgentMsg>();
@@ -2273,6 +2300,21 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
             cmd: cmd_tx.clone(),
         },
     );
+
+    // The same fact, to the human. The child's brief below tells the model; a
+    // row with no branch is not an explanation, and two "isolated" siblings
+    // editing one workspace while the human believes they are apart is the
+    // failure this line exists to prevent. It is a notice on the parent — the
+    // pane the human is reading when they asked for this child — and it says
+    // which child, because a parent may spawn several.
+    if let Some(reason) = &degraded {
+        ctx.emit(
+            parent,
+            AgentEvent::Notice(format!(
+                "#{id} isolated unavailable: {reason} — it shares this workspace"
+            )),
+        );
+    }
 
     // Who the child is goes in the system prompt; the parent's task is the
     // first user message, mirroring the root's system+user shape. Some
@@ -2742,7 +2784,17 @@ fn run_command(
                 }
                 error
             })?;
-        let id = detach_now(actor, &registry, command, exclusive, spawned)?;
+        let id = detach_now(
+            actor,
+            &registry,
+            jobs::Launch::started(
+                actor.id,
+                command.to_string(),
+                exclusive,
+                actor.my_tx.clone(),
+                spawned,
+            ),
+        )?;
         state.running_jobs.insert(id);
         return Ok(detached_line(id));
     }
@@ -2800,31 +2852,27 @@ impl Detach<'_> {
     }
 }
 
-/// Hand a running command to the registry and return its id.
+/// Hand a running command to the registry as a job and return its id.
+///
+/// The `launch` is built by the caller, because where the process group comes
+/// from is the caller's fact: one that has just been started (`detach: true`),
+/// or the one a foreground call was holding when it outlived
+/// `CMD_DETACH_AFTER` (see `jobs::Launch::held`).
 fn detach_now(
     actor: &Actor,
     registry: &Arc<jobs::Registry>,
-    command: &str,
-    exclusive: bool,
-    job: Box<dyn Job>,
+    launch: jobs::Launch,
 ) -> Result<u64, String> {
-    let id = registry
-        .launch(jobs::Launch {
-            owner: actor.id,
-            command: command.to_string(),
-            exclusive,
-            job,
-            mailbox: actor.my_tx.clone(),
-        })
-        .map_err(|refused| {
-            registry.release_machine(actor.id);
-            refused.message(actor.id)
-        })?;
+    let command = launch.command.clone();
+    let id = registry.launch(launch).map_err(|refused| {
+        registry.release_machine(actor.id);
+        refused.message(actor.id)
+    })?;
     actor.ctx.emit(
         actor.id,
         AgentEvent::JobStarted {
             job: id,
-            command: command.to_string(),
+            command: command.clone(),
         },
     );
     Ok(id)
@@ -2875,20 +2923,40 @@ fn run_shell(
     actor: &Actor,
     state: &mut ActorState,
 ) -> Result<String, String> {
-    let mut job = actor.ctx.machine.spawn(&ShellCommand { command, root })?;
-    let ended = wait_bounded(job.as_mut(), timeout, detach.after(), cancel, actor, state)?;
+    let spawned = actor.ctx.machine.spawn(&ShellCommand { command, root })?;
+    // From here to the end of the call the command is the registry's as much as
+    // this actor's: quitting mush, a `Stop` and `/new` all reach it (finding
+    // S4). It is *not* a job — no id, no line, no budget — it is a tool call
+    // whose result the model is waiting for, which is exactly why nothing was
+    // watching it before.
+    let mut running = actor.ctx.registry.hold(actor.id, spawned);
+    let ended = wait_bounded(&mut running, timeout, detach.after(), cancel, actor, state)?;
     if matches!(ended, Ended::Detached) {
         if let Detach::Job {
             registry,
             exclusive,
         } = detach
         {
-            let id = detach_now(actor, registry, command, exclusive, job)?;
+            let id = detach_now(
+                actor,
+                registry,
+                jobs::Launch::held(
+                    actor.id,
+                    command.to_string(),
+                    exclusive,
+                    actor.my_tx.clone(),
+                    running,
+                ),
+            )?;
             state.running_jobs.insert(id);
             return Ok(detached_line(id));
         }
     }
-    let (stdout, stderr) = job.output(CMD_CAP);
+    // A kill that arrived from *outside* the watcher — a quit, which is what
+    // finding S4 is about, or the registry's half of a `Stop` — must not be
+    // reported as the command's own exit: `-1` is a signal nobody asked about.
+    let ended = ending(ended, running.stopped());
+    let (stdout, stderr) = running.output(CMD_CAP);
 
     // No `$ {command}` echo: the tool call is already rendered from the
     // assistant message that made it (`⚙ run_command …`), so printing it here
@@ -2915,6 +2983,28 @@ fn run_shell(
         Ended::Detached => report.push_str(&format!("[timed out after {}s]", timeout.as_secs())),
     }
     Ok(report)
+}
+
+/// How a command's end is read once the watcher has returned.
+///
+/// Three ways a foreground command stops must not be confusable in the report:
+///
+/// - A command the watcher stopped — its time was up, it wrote past the output
+///   cap, or a `Stop` reached the run — is reported with *that* reason. The
+///   watcher's own kill sets the same flag an outside one does, which is why
+///   the arm below only touches an exit.
+/// - A command killed from *outside* the watcher — quitting mush (`kill_all`),
+///   `/new`, or the registry's half of a `Stop` — is reported as a cancel. The
+///   process died from the signal mush sent it, and `-1` handed to the model as
+///   an exit code would read as the command's own doing; this is the arm
+///   finding S4's fix needs.
+/// - A command that ended by itself keeps its real exit status, signal deaths
+///   included: nobody asked for those.
+fn ending(ended: Ended, stopped_from_outside: bool) -> Ended {
+    match ended {
+        Ended::Exited(_) if stopped_from_outside => Ended::Cancelled,
+        ended => ended,
+    }
 }
 
 /// Wait for a command, stopping it when its time is up, a cancellation arrives,
@@ -5863,6 +5953,175 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// The three ways a foreground command can stop must not be confusable in
+    /// the report the model reads, and the flag mush sets when it kills a
+    /// command is the same one for all of them: what tells them apart is *who*
+    /// killed it and *how* the watcher learned of it.
+    #[test]
+    fn the_three_ways_a_foreground_command_ends_are_not_confusable() {
+        // A kill from outside the watcher: the process died of a signal, and
+        // that is a cancel — not `[exit -1]`, which reads as the command's own
+        // doing. This is the arm finding S4 added.
+        assert!(matches!(ending(Ended::Exited(-1), true), Ended::Cancelled));
+        // A command that ended by itself keeps its exit status, whoever else's
+        // signal it was.
+        assert!(matches!(ending(Ended::Exited(3), false), Ended::Exited(3)));
+        assert!(matches!(
+            ending(Ended::Exited(-1), false),
+            Ended::Exited(-1)
+        ));
+        // The watcher's own kills keep their own reasons. They set the same
+        // flag on the way out, so an arm that keyed off the flag rather than
+        // off the *shape* of the end would report a timeout as a cancel — which
+        // is exactly what happened when this was written, and what
+        // `a_command_that_runs_forever_is_killed_on_time` and
+        // `a_runaway_writer_is_stopped_at_the_output_limit` caught.
+        assert!(matches!(ending(Ended::TimedOut, true), Ended::TimedOut));
+        assert!(matches!(
+            ending(Ended::TooMuchOutput, true),
+            Ended::TooMuchOutput
+        ));
+        assert!(matches!(ending(Ended::Cancelled, true), Ended::Cancelled));
+    }
+
+    /// The quit half of finding S4, at the seam: a command killed from *outside*
+    /// the watcher — nothing sets the run's own cancel flag, which is the shape
+    /// a quit has — is reported as a cancel rather than as an exit code of `-1`.
+    /// The kill is the registry's, the same call `App::drop` makes.
+    ///
+    /// The real clock here on purpose: the watcher sleeps ten milliseconds a
+    /// poll, so the test has the whole sixty-second detach window to land its
+    /// kill, and the command dies within one poll of it. No fake-clock race
+    /// against a deadline nobody is testing.
+    #[test]
+    fn a_foreground_command_killed_from_outside_reports_cancelled() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let (actor, _mailbox) =
+            scripted_tools_actor("killed-outside", machine.clone(), Arc::new(clock::System));
+        let registry = actor.ctx.registry.clone();
+        let owner = actor.id;
+
+        let running = std::thread::spawn(move || {
+            let mut state = ActorState::default();
+            let cancel = AtomicBool::new(false);
+            exec_tool(
+                &actor,
+                &mut state,
+                ToolName::RunCommand,
+                &json!({ "command": "make" }),
+                &cancel,
+            )
+        });
+        // Wait for the call to be holding the command, which is the state the
+        // whole fix is about: until it is held, there is nothing to kill.
+        let mut held = false;
+        for _ in 0..2_000 {
+            if registry.holding_foreground(owner) {
+                held = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(held, "the command never got going");
+
+        registry.kill_owned(owner);
+        let report = running
+            .join()
+            .expect("the agent thread must finish")
+            .unwrap();
+
+        assert_eq!(
+            report, "[cancelled]",
+            "a kill from outside is not an exit code"
+        );
+        assert_eq!(machine.kills(), 1, "and the command was killed once");
+        assert!(
+            !registry.holding_foreground(owner),
+            "the call holds nothing now"
+        );
+    }
+
+    /// `Stop` cancels the work in flight, and a `run_command` the agent is
+    /// waiting on *is* work in flight (§5.5). The kill reaches the command the
+    /// same way it reaches a job — the registry's `kill_owned`, through the
+    /// same slot the call is held in — and the model is told the command was
+    /// cancelled rather than handed a signal's `-1` as if it were an exit code.
+    #[test]
+    fn a_stop_kills_the_foreground_command() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, mailbox) = scripted_tools_actor("stop-foreground", machine.clone(), clock);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        // The human's Ctrl-C, in the actor's own terms: the mailbox is drained
+        // by the watcher's next pass, which is the latency a Stop has.
+        mailbox.send(AgentMsg::Stop).unwrap();
+
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "make" }),
+            &cancel,
+        )
+        .unwrap();
+
+        assert_eq!(report, "[cancelled]", "a stop is not an exit code");
+        assert_eq!(machine.kills(), 1, "and the command really was killed");
+        assert!(
+            !actor.ctx.registry.holding_foreground(actor.id),
+            "the call is over, so its slot is gone"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A command that ends by itself is reported with *its* exit status, leaves
+    /// no slot held, and is never signalled afterwards — by the call's own end
+    /// or by a later `kill_all`. That last part is the safety half of finding
+    /// S4's fix: a process group id is free once the command is reaped, so a
+    /// kill that landed on a slot a finished call had left behind could kill
+    /// somebody else's process. Nothing here is killed, so the count says so.
+    #[test]
+    fn a_foreground_command_that_ends_normally_leaves_nothing_behind() {
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::exits(3).says("first"))
+                .runs(Script::exits(0).says("second")),
+        );
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("foreground-ends", machine.clone(), clock);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut call = |command: &str| {
+            exec_tool(
+                &actor,
+                &mut state,
+                ToolName::RunCommand,
+                &json!({ "command": command }),
+                &cancel,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(call("ouch"), "first\n[exit 3]", "its own exit status");
+        assert!(
+            !actor.ctx.registry.holding_foreground(actor.id),
+            "a finished call holds nothing"
+        );
+        // A later command is a fresh call with a fresh slot, and the finished
+        // one is not in the way of it.
+        assert_eq!(call("again"), "second\n[exit 0]");
+        assert!(!actor.ctx.registry.holding_foreground(actor.id));
+        assert_eq!(machine.kills(), 0, "nothing that ended was signalled");
+        actor.ctx.registry.kill_all();
+        assert_eq!(
+            machine.kills(),
+            0,
+            "and no later kill lands on a slot a finished call left behind"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// The same fact without a subprocess: a foreground `run_command` asks the
     /// machine for one job. The fake machine refuses to invent a script for a
     /// second spawn, so a double start fails loudly rather than silently.
@@ -6853,6 +7112,99 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// `isolated: true` in a workspace that is not a git repository: the child
+    /// runs in the shared workspace, and until now *only the model* was told —
+    /// the reason travelled in the child's brief and nowhere else. The human
+    /// asked for a child of their own, and what they got was one sharing their
+    /// checkout, with a row that looks exactly like a child that never asked to
+    /// be isolated: two of them would edit the same files while the human
+    /// believed they were apart.
+    ///
+    /// Both halves are pinned here: the spawn's answer to the model is
+    /// unchanged (the same result line, and the brief still carrying why), and
+    /// the same fact now reaches the parent's pane as a notice.
+    #[test]
+    fn a_degraded_isolation_is_said_to_the_human_too() {
+        let gate = Arc::new(Gate::new());
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .held(gate.clone())
+                .says("child answered"),
+        );
+        // A scratch directory, not `init_git_repo`: the workspace this test
+        // opens is exactly the plain one the finding describes.
+        let (actor, events, _mailbox) = build_actor_about(
+            "isolation-in-place",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "do the thing", "isolated": true }),
+            &cancel,
+        )
+        .unwrap();
+
+        // The model's answer is unchanged: the same line it always got, and the
+        // child's own brief still carries the reason it has no worktree.
+        assert_eq!(
+            report,
+            "spawned agent #1 · runs until it stops calling tools · wait_agents returns its summary"
+        );
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the child must ask for its first turn"
+        );
+        let asked = scripted.asked();
+        assert!(
+            asked[0].saw("(isolated unavailable: not a git repository; running in place)"),
+            "the model is still told: {:?}",
+            asked[0].messages
+        );
+        gate.release();
+
+        // The human's half: a notice on the parent, naming the child and the
+        // reason, and — the row's own honesty — a spawn with no branch, so no
+        // surface can claim a worktree this child does not have.
+        let notices: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            vec![
+                "#1 isolated unavailable: not a git repository — it shares this workspace"
+                    .to_string()
+            ],
+            "the human must be told what the model was told"
+        );
+        let spawned_branch = events
+            .events()
+            .into_iter()
+            .find_map(|(_, event)| match event {
+                AgentEvent::Spawned { branch, .. } => Some(branch),
+                _ => None,
+            })
+            .expect("the child was spawned");
+        assert_eq!(
+            spawned_branch, None,
+            "the row has no branch, so it cannot imply a worktree that does not exist"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// Root -> child -> grandchild, each isolated: the grandchild's file must
     /// land in `.mush/wt/2/` on a branch that carries it, branched off the
     /// child's worktree (`mush/2` based on `mush/1`), and the summaries bubble up
@@ -7659,6 +8011,52 @@ mod tests {
             scripted.asked().len(),
             1,
             "the refusal costs no summarize call"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `/compact` typed into a *fresh* workspace: the actor has never run, so
+    /// its transcript is not even a system message, and the fold cannot
+    /// replace what is not there. That is still a human who typed a command,
+    /// and the answer they got was nothing at all — the bar painted
+    /// `compacting #0…` and then the bar went quiet: no fold, no refusal, no
+    /// request. Silence there is the failure mode `/compact` exists to avoid,
+    /// so the empty case says the same refusal the short one does.
+    #[test]
+    fn a_fold_of_an_empty_transcript_says_so_instead_of_nothing() {
+        let root = scratch_dir("compact-empty");
+        let scripted = Arc::new(Scripted::new().says("answered"));
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        // No `Run` at all: this is the transcript a launch leaves behind. The
+        // UI's copy is empty too, so the actor stays without one — which is the
+        // case the refusal is about.
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| !seen.notices.is_empty()),
+            "an empty /compact must be answered: {seen:?}"
+        );
+        assert_eq!(
+            seen.notices,
+            vec![NOTHING_TO_COMPACT.to_string()],
+            "the same refusal a too-short transcript gets"
+        );
+        assert!(
+            seen.summaries.is_empty() && seen.done == 0,
+            "nothing was folded and no run started: {seen:?}"
+        );
+        assert!(
+            scripted.asked().is_empty(),
+            "the refusal costs no model call: {:?}",
+            scripted.asked().len()
         );
         let _ = fs::remove_dir_all(&root);
     }

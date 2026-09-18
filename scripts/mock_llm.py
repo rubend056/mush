@@ -31,6 +31,12 @@ root's first user message:
    the request carries the wrap-up instruction ("turn limit"), which is
    answered with a summary. (Exercises the final turn of a run.)
 
+6. ORPHAN (user message contains "ORPHAN"): the first turn runs
+   `sleep 10; touch /tmp/mush-orphan-marker` as an ordinary *foreground*
+   `run_command` and waits for it; the turn after the command's result says it
+   finished. Quitting mush while it runs is the S4 check: the `sh`, its `sleep`
+   and its marker must not outlive mush.
+
 Subagents are told apart by "mush subagent" in the system prompt, and child
 vs grandchild by "at depth 1" vs "at depth 2". The parent's task travels as
 subagent's first user message, so task keywords ("iso.txt") are found in the
@@ -83,6 +89,15 @@ class Handler(BaseHTTPRequestHandler):
             # Context compaction: reply with a summary instead of a scripted turn.
             reply = {"role": "assistant",
                      "content": "mock summary: the original task and progress were condensed"}
+        elif "ORPHAN" in joined and "[exit" not in joined:
+            # A long foreground command: no `detach`, so mush waits on it (see
+            # scenario 6). The command's own result carries `[exit`, so the turn
+            # after it is the reply above.
+            reply = self.tool_call("run_command", {
+                "command": "sleep 10; touch /tmp/mush-orphan-marker",
+            })
+        elif "ORPHAN" in joined:
+            reply = {"role": "assistant", "content": "the command finished"}
         elif "STEER" in joined and not getattr(self.server, "steer_started", False):
             # Hold the first reply so the test can nudge while it is in flight;
             # the marker says the request is in hand, so the test never races.
