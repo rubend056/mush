@@ -2666,6 +2666,25 @@ mod tests {
             .collect()
     }
 
+    /// The painted rows that wear the agents pane's selection highlight — the
+    /// cyan background `List` gives the cursor row. `screen` reads text only,
+    /// and after the `› ` marker went the selection *is* that style, so this is
+    /// how a test still reads which row the pane paints as selected. The bar is
+    /// excluded because its focus badge wears the same cyan and is not a row.
+    fn selected_rows(app: &mut App, width: u16, height: u16) -> Vec<usize> {
+        app.set_term_size(width, height);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        let bar_rows = if height >= 24 { 2 } else { 1 };
+        (0..(height - bar_rows) as usize)
+            .filter(|&y| {
+                (0..width as usize)
+                    .any(|x| buffer[(x as u16, y as u16)].bg == ratatui::style::Color::Cyan)
+            })
+            .collect()
+    }
+
     /// What the chat pane paints, and only it: the agents pane is the columns
     /// to its left at this size.
     fn chat_rows(app: &mut App) -> Vec<String> {
@@ -5155,8 +5174,9 @@ mod tests {
         app.on_key(down);
         assert_eq!(app.tree.cursor_id(), Some(bottom));
         let rows = screen(&mut app, 80, 24);
-        // The row and the cursor row's footer both name the agent; exactly one
-        // of them wears the highlight the pane paints on the selection.
+        // The row and the cursor row's footer both name the agent; the row is
+        // the one the pane paints as selected, and it says so with the
+        // highlight alone — no marker beside it.
         let named: Vec<&String> = rows
             .iter()
             .filter(|row| row.contains(&format!("#{bottom}")))
@@ -5166,9 +5186,15 @@ mod tests {
             "the page's row is on the pane now — the list followed the cursor:\n{}",
             rows.join("\n")
         );
+        let selected = selected_rows(&mut app, 80, 24);
         assert_eq!(
-            named.iter().filter(|row| row.contains('›')).count(),
+            selected.len(),
             1,
+            "exactly one row wears the pane's selection highlight: {selected:?}\n{}",
+            rows.join("\n")
+        );
+        assert!(
+            rows[selected[0]].contains(&format!("#{bottom}")),
             "and it is the row the pane paints as selected:\n{}",
             rows.join("\n")
         );
