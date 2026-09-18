@@ -1021,6 +1021,12 @@ fn absorb(
             Fold::Run
         }
         AgentMsg::Nudge(text) => {
+            if worktree_gone(actor) {
+                actor
+                    .ctx
+                    .emit(actor.id, AgentEvent::Notice(worktree_gone_line(actor.id)));
+                return Fold::Idle;
+            }
             transcript.push(Message::user(text));
             Fold::Run
         }
@@ -1028,6 +1034,12 @@ fn absorb(
         // like a completion — the human has no other way to see the words their
         // subagent was given.
         AgentMsg::Steer(text) => {
+            if worktree_gone(actor) {
+                actor
+                    .ctx
+                    .emit(actor.id, AgentEvent::Notice(worktree_gone_line(actor.id)));
+                return Fold::Idle;
+            }
             push_line(actor, transcript, text);
             Fold::Run
         }
@@ -1070,6 +1082,28 @@ fn absorb(
             }
         }
     }
+}
+
+/// Whether this actor is an isolated agent whose worktree has been reclaimed
+/// (`/merge`, `/discard`, or a hand-run `git worktree remove`).
+///
+/// It must not run again: its file tools resolve their directory from the
+/// workspace it was spawned with, so a write would recreate the dead path as a
+/// plain directory that no surface — not `git status`, not `/diff`, not
+/// `/merge` — can show, diff or land (finding S1). `App::deliver` refuses the
+/// human's own message before it is sent; this is the backstop for every other
+/// sender (a parent's `agent_control message`).
+fn worktree_gone(actor: &Actor) -> bool {
+    actor.branch.is_some() && !actor.ws.root().exists()
+}
+
+/// What such an actor reports when work arrives anyway: nothing ran, and where
+/// to work instead.
+fn worktree_gone_line(id: u64) -> String {
+    format!(
+        "agent #{id}'s worktree is gone (it was merged or discarded) — \
+         work in the root or spawn a fresh agent; this message did not run"
+    )
 }
 
 /// The tool schemas this agent's requests carry: the leaf set at the deepest
@@ -6132,6 +6166,179 @@ mod tests {
         assert!(
             deleted.is_ok(),
             "/discard must delete the branch: {deleted:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A tree whose isolated child has finished its first run, left `iso.txt` on
+    /// `mush/1`, and is now idle — the state `/merge` and `/discard` start from.
+    ///
+    /// Returns the repository, the recorded events, and the *live* child's
+    /// mailbox, so a test can do what the commands do and then nudge it. The
+    /// child's script answers the nudge with a `write_file extra.txt`, so a test
+    /// that forgot to land the worktree would see the file really written.
+    fn finished_isolated_child(label: &str) -> (PathBuf, Arc<Recorder>, Sender<AgentMsg>) {
+        let root = init_git_repo(label);
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.depth() == Some(1) && !asked.saw("wrote iso.txt"))
+                .calls(vec![tool_call(
+                    "c1",
+                    "write_file",
+                    json!({ "path": "iso.txt", "content": "isolated work" }),
+                )])
+                // The nudge turn: only ever reached if the worktree-nudge is
+                // allowed to run, which is the bug this test pins.
+                .when(|asked: &Asked| asked.depth() == Some(1) && asked.saw("write extra.txt"))
+                .calls(vec![tool_call(
+                    "c2",
+                    "write_file",
+                    json!({ "path": "extra.txt", "content": "phantom" }),
+                )])
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .says("created iso.txt in my worktree")
+                .when(|asked: &Asked| asked.saw("#1 done"))
+                .says("child finished")
+                .when(|asked: &Asked| asked.saw("spawned agent"))
+                .says("child left running")
+                .calls(vec![tool_call(
+                    "c0",
+                    "spawn_agent",
+                    json!({
+                        "brief": "create a file called iso.txt containing exactly: isolated work",
+                        "isolated": true
+                    }),
+                )]),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user("delegate: create iso.txt via an isolated subagent".to_string()),
+            ]))
+            .unwrap();
+
+        let mut seen = Watched::default();
+        // The root, the child and the woken root: three runs. The child is then
+        // idle with its worktree intact and `iso.txt` on `mush/1`.
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 3),
+            "the child must finish and wake its parent: {seen:?}"
+        );
+        assert!(
+            root.join(".mush/wt/1/iso.txt").exists(),
+            "the child must have written its worktree"
+        );
+        let child_tx = events
+            .events()
+            .into_iter()
+            .find_map(|(_, event)| match event {
+                AgentEvent::Spawned { child: 1, cmd, .. } => Some(cmd),
+                _ => None,
+            })
+            .expect("the child's Spawned event carries its mailbox");
+        (root, events, child_tx)
+    }
+
+    /// Do what `/merge` does to a child, with real git: land the branch, then
+    /// reclaim the worktree and the branch.
+    fn land_with_merge(root: &Path) {
+        git::run(root, &["merge", "--no-edit", "mush/1"]).expect("merge mush/1");
+        let worktree = git::worktree_path(root, 1);
+        git::run(
+            root,
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+        )
+        .expect("reclaim the worktree");
+        git::run(root, &["branch", "-d", "mush/1"]).expect("delete the branch");
+    }
+
+    /// Do what `/discard` does: reclaim the worktree and delete the branch,
+    /// without merging.
+    fn land_with_discard(root: &Path) {
+        let worktree = git::worktree_path(root, 1);
+        git::run(
+            root,
+            &["worktree", "remove", "--force", worktree.to_str().unwrap()],
+        )
+        .expect("reclaim the worktree");
+        git::run(root, &["branch", "-D", "mush/1"]).expect("delete the branch");
+    }
+
+    /// After `/merge`, a nudge to the child must be refused: its actor is alive
+    /// but its worktree is gone, so a run would recreate `.mush/wt/1` as a plain
+    /// directory where no surface could see, diff or land the file — the work
+    /// would exist somewhere nothing can reach (finding S1). The test asserts
+    /// the refusal, the untouched main tree, and no recreated directory.
+    #[test]
+    fn a_nudge_to_a_merged_child_is_refused_not_run_in_the_phantom_path() {
+        let (root, events, child_tx) = finished_isolated_child("s1-merged");
+        let worktree = git::worktree_path(&root, 1);
+        land_with_merge(&root);
+
+        child_tx
+            .send(AgentMsg::Nudge("write extra.txt".to_string()))
+            .unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen
+                .notices
+                .iter()
+                .any(|line| line.contains("worktree is gone"))),
+            "the child says why it did not run: {seen:?}"
+        );
+        assert!(
+            !worktree.exists(),
+            "the reclaimed path must not be recreated"
+        );
+        assert!(
+            !root.join("extra.txt").exists(),
+            "and no run landed in the root either"
+        );
+        assert_eq!(
+            git::run(&root, &["status", "--porcelain"]).unwrap_or_default(),
+            "",
+            "the main tree is untouched"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The same after `/discard`: the work was thrown away on purpose, and a
+    /// nudge must not quietly recreate the path it was thrown from.
+    #[test]
+    fn a_nudge_to_a_discarded_child_is_refused_not_run_in_the_phantom_path() {
+        let (root, events, child_tx) = finished_isolated_child("s1-discarded");
+        let worktree = git::worktree_path(&root, 1);
+        land_with_discard(&root);
+
+        child_tx
+            .send(AgentMsg::Nudge("write extra.txt".to_string()))
+            .unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen
+                .notices
+                .iter()
+                .any(|line| line.contains("worktree is gone"))),
+            "the child says why it did not run: {seen:?}"
+        );
+        assert!(
+            !worktree.exists(),
+            "the reclaimed path must not be recreated"
+        );
+        assert_eq!(
+            git::run(&root, &["status", "--porcelain"]).unwrap_or_default(),
+            "",
+            "the main tree is untouched"
         );
         let _ = fs::remove_dir_all(&root);
     }

@@ -1119,6 +1119,37 @@ impl App {
         }
     }
 
+    /// Why a message to `id` cannot run, if it cannot: its worktree is gone.
+    ///
+    /// `/merge` and `/discard` reclaim an isolated agent's worktree and branch
+    /// but leave its actor alive, and that actor's file tools resolve their
+    /// directory from the workspace it was spawned with — so a run would
+    /// recreate the reclaimed path as a plain directory where no surface could
+    /// see the work (finding S1). The row, the footer and `/diff`/`/merge`/
+    /// `/worktrees` already tell the landed story; this is the same story for
+    /// typing. A worktree a hand-run `git worktree remove` took reads the same
+    /// way: the branch is named, the worktree is not on disk, so a run would
+    /// write into a phantom.
+    fn worktree_gone(&self, id: AgentId) -> Option<String> {
+        let node = self.tree.node(id)?;
+        if let Some(landed) = node.landed {
+            let past = match landed {
+                Landed::Merged => "merged",
+                Landed::Discarded => "discarded",
+            };
+            return Some(format!(
+                "agent #{id} was {past} — its worktree is gone; \
+                 spawn a fresh agent or work in the root"
+            ));
+        }
+        if node.branch.is_some() && !git::worktree_path(self.ws.root(), id.0).exists() {
+            return Some(format!(
+                "agent #{id}'s worktree is gone — spawn a fresh agent or work in the root"
+            ));
+        }
+        None
+    }
+
     /// A typed message, from the human to the focused agent.
     fn deliver(&mut self, text: String) {
         // A request without a model is a guaranteed refusal from the endpoint,
@@ -1183,6 +1214,16 @@ impl App {
                 }
             }
         } else {
+            // A landed agent cannot run again: its file tools resolve their
+            // directory from the workspace it was spawned with, so a run would
+            // recreate the reclaimed path as a plain directory where no surface
+            // — not `git status`, not `/diff`, not `/merge` — could see the work
+            // (finding S1). The words stay in the box and nothing runs.
+            if let Some(line) = self.worktree_gone(target) {
+                self.chat.insert(&text);
+                self.fail(line);
+                return;
+            }
             // Nudge a specific agent; running ones fold it in, idle ones rerun.
             // If the mailbox is gone the node's phase is put back exactly as it
             // was, instead of leaving a lie on the row (finding B10).
@@ -2969,6 +3010,78 @@ mod tests {
             .find(|node| node.id == AgentId(2))
             .unwrap();
         assert_eq!(node.landed, Some(Landed::Discarded));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A nudge to a landed agent is refused, not run into the reclaimed path
+    /// (finding S1). Landing already took the worktree and the branch, so the
+    /// run would recreate `.mush/wt/N` as a plain directory nothing can show,
+    /// diff or land; the words stay in the box and tell the same story the row,
+    /// the footer and `/diff`/`/merge`/`/worktrees` do.
+    #[test]
+    fn a_nudge_to_a_merged_agent_is_refused_and_writes_nothing() {
+        let root = repo("nudge-merged");
+        isolated_work(&root, 1, "add the parser");
+        let mut app = app_at(root.clone());
+        run(&mut app, "/merge 1");
+
+        app.tree.focus(AgentId(1));
+        app.chat.insert("write extra.txt");
+        app.send_message();
+
+        assert!(
+            text_of(&app).contains("agent #1 was merged — its worktree is gone"),
+            "the refusal says what happened: {}",
+            text_of(&app)
+        );
+        assert_eq!(
+            app.chat.input().text(),
+            "write extra.txt",
+            "the words are still in the box: nothing ran"
+        );
+        assert!(
+            !app.chat
+                .transcript(AgentId(1))
+                .iter()
+                .any(|message| message.text().contains("write extra.txt")),
+            "a refused message is not a message"
+        );
+        assert!(
+            !root.join(".mush/wt/1").exists(),
+            "the reclaimed path was not recreated"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same for `/discard`: its work is gone on purpose, and typing must
+    /// not bring the path back.
+    #[test]
+    fn a_nudge_to_a_discarded_agent_is_refused_and_writes_nothing() {
+        let root = repo("nudge-discarded");
+        isolated_work(&root, 2, "throwaway");
+        let mut app = app_at(root.clone());
+        run(&mut app, "/discard 2");
+
+        app.tree.focus(AgentId(2));
+        app.chat.insert("write extra.txt");
+        app.send_message();
+
+        assert!(
+            text_of(&app).contains("agent #2 was discarded — its worktree is gone"),
+            "the refusal says what happened: {}",
+            text_of(&app)
+        );
+        assert!(
+            !app.chat
+                .transcript(AgentId(2))
+                .iter()
+                .any(|message| message.text().contains("write extra.txt")),
+            "a refused message is not a message"
+        );
+        assert!(
+            !root.join(".mush/wt/2").exists(),
+            "the reclaimed path was not recreated"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 
