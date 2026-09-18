@@ -30,7 +30,9 @@ use mush_core::transcript::{
 };
 use mush_core::{prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_SECS};
 
-use crate::app::{tokens_label, AgentId, ConfigHandle, ConversationId, Msg, WindowSource};
+use crate::app::{
+    tokens_label, AgentId, Compacting, ConfigHandle, ConversationId, Msg, WindowSource,
+};
 use crate::clock;
 use crate::events::{Events, Ui};
 use crate::jobs::{self, Refused};
@@ -285,7 +287,13 @@ pub enum AgentMsg {
     /// for the window to fill (`/compact`). A summarize request and a
     /// transcript replacement, not work to answer: an idle agent does it at
     /// once and stays idle.
-    Compact,
+    ///
+    /// `messages` is the UI's copy of the conversation, used only by an actor
+    /// that has none yet: a session restored from disk starts every actor with
+    /// an empty transcript (the UI holds the history until the human's next
+    /// message hands it over), and a fold is not a run, so nothing else would
+    /// ever hand it over — the request folded nothing at all, silently.
+    Compact(Vec<Message>),
     /// Cancel the current run. An idle agent ignores it — Stop cancels work,
     /// it does not end an agent.
     Stop,
@@ -294,7 +302,14 @@ pub enum AgentMsg {
     /// let go — it has to be told.
     Shutdown,
     /// A child's run ended. The outcome says *how*: a stop is not a result.
-    ChildDone { id: u64, outcome: Outcome },
+    /// `run` is which of that child's runs this was (its own counter, 1 for the
+    /// first). The parent needs it to tell two reports apart: the *same* run
+    /// reported twice is one piece of news, while a run after it is a new one
+    /// even when it reads identically — two runs that both fail
+    /// `Connection reset by peer (os error 104)` are two failures, and a bare
+    /// `Outcome` cannot say which of the two it is holding
+    /// (`docs/findings.md` B24).
+    ChildDone { id: u64, run: u64, outcome: Outcome },
     /// A job this agent started ended. `line` is the report its owner reads,
     /// rendered once by the registry; `news` says whether it is worth waking a
     /// napping agent for (`ChildDone` and `Outcome::is_news` again: a job mush
@@ -361,6 +376,35 @@ pub enum AgentEvent {
     /// conversation is now `[system, user(summary)]`.
     Compact {
         summary: String,
+        /// Whether the fold was part of a run that is still going: the row
+        /// falls back to the run's own phase, not to `done` (see
+        /// [`AgentTree::compacted`](crate::app::AgentTree::compacted)).
+        in_run: bool,
+    },
+    /// A fold started: accepted now, or parked until the next message boundary
+    /// because a run is in flight. Emitted the moment the actor takes the
+    /// request, so a `/compact` that is going to wait says so instead of
+    /// looking like a command nobody heard (finding U11).
+    ///
+    /// `cancel` is the fold's own flag when the fold owns one; an idle fold has
+    /// no run behind it, so this is the only handle a Stop can reach. A fold
+    /// inside a run leaves it out: the run's flag is already the UI's.
+    Compacting {
+        why: Compacting,
+        cancel: Option<Arc<AtomicBool>>,
+    },
+    /// The fold is over and the transcript is unchanged: the summarize call
+    /// failed, or its reply could not be read as a summary. The `compacting…`
+    /// phase must not outlive the request that justified it — a row claiming
+    /// work forever after a failed fold is the same lie as a fold nobody can
+    /// see. The cancelled case is [`AgentEvent::Stopped`], which already means
+    /// "the work in flight was interrupted, the actor is alive".
+    CompactingEnded {
+        /// Whether the run the fold was part of is still in flight. A fold that
+        /// came to nothing inside a run leaves that run's agent at work
+        /// (`thinking…`, the phase a run wears between the request and the tool
+        /// it names); an idle fold's agent is back at rest.
+        in_run: bool,
     },
 }
 
@@ -424,20 +468,31 @@ impl AgentCtx {
 struct ActorState {
     children: HashMap<u64, Sender<AgentMsg>>,
     running: HashSet<u64>,
-    /// The latest outcome of each child, whether or not the model has read it.
-    /// A completion is recorded the moment it arrives — even mid-batch — and
-    /// folded into the transcript by [`fold_completions`].
-    completed: HashMap<u64, Outcome>,
-    /// Completions already handed to the model (via `wait_agents` or a folded
-    /// line); a fresh completion clears the mark, so it is announced again.
-    delivered: HashSet<u64>,
+    /// The latest outcome of each child, with the run it came from, whether or
+    /// not the model has read it. A completion is recorded the moment it
+    /// arrives — even mid-batch — and folded into the transcript by
+    /// [`fold_completions`].
+    completed: HashMap<u64, Completion>,
+    /// The run of each child whose outcome the model has read (via `wait_agents`
+    /// or a folded line). A *later* run leaves this mark naming an older run, so
+    /// the new outcome is announced; re-recording the run the mark names changes
+    /// nothing, which is what keeps one piece of news from folding twice
+    /// (`docs/findings.md` B24).
+    delivered: HashMap<u64, u64>,
     /// The jobs this agent started and has not yet read a report about, and the
     /// reports it has read. The same three books as `running`/`completed`/
     /// `delivered` above, because a job's completion travels the same road as a
-    /// child's: delivered once, folded into the transcript, never twice.
+    /// child's: delivered once, folded into the transcript, never twice. The
+    /// mark is the bare id, not a run: a job ends once, under an id nothing else
+    /// reuses, so a report recorded again is the *same* report and there is no
+    /// newer one to re-arm for (`docs/findings.md` B24).
     running_jobs: HashSet<u64>,
     done_jobs: HashMap<u64, JobReport>,
     delivered_jobs: HashSet<u64>,
+    /// How many runs this actor has finished — the identity a parent records on
+    /// `ChildDone { run, .. }`. It counts runs, not turns, and is incremented
+    /// where the run's outcome is decided.
+    runs: u64,
     /// Commands parked while a blocking tool call was in flight; folded in at
     /// the next message boundary (see `drain_signals`).
     deferred: Vec<AgentMsg>,
@@ -451,6 +506,28 @@ struct ActorState {
     /// A `Stop` arrived with the work this actor is about to start; the run it
     /// points at is born cancelled (finding B6).
     stop_requested: bool,
+}
+
+/// One child's run ending, as its parent keeps it: which run it was, and how it
+/// ended. Identity is by run, not by outcome: two runs can carry the same error
+/// text (and must be told about twice), while one run can be reported twice (and
+/// must be folded once) — `Outcome` alone cannot separate those two cases
+/// (`docs/findings.md` B24).
+#[derive(Clone)]
+struct Completion {
+    run: u64,
+    outcome: Outcome,
+}
+
+impl ActorState {
+    /// The latest outcome recorded for a child. The run it came from is kept
+    /// beside it (`completed`), so a reader that only wants "how did #N end"
+    /// does not have to know about run identity.
+    fn outcome(&self, id: u64) -> Option<&Outcome> {
+        self.completed
+            .get(&id)
+            .map(|completion| &completion.outcome)
+    }
 }
 
 /// A job's completion, as its owner keeps it: the line the model reads, and
@@ -718,6 +795,8 @@ fn start(actor: Actor, initial: Vec<Message>, start_immediately: bool) {
         ctx.emit(id, AgentEvent::Error(summary.clone()));
         let _ = parent_tx.send(AgentMsg::ChildDone {
             id,
+            // The run it never got to take: its first, and only.
+            run: 1,
             outcome: Outcome::Failed(summary),
         });
     }
@@ -776,8 +855,13 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
                 }
             }
         }
+        // This run is over, and this is its number: a parent that hears the
+        // same run again has heard this report twice, while a run after it is
+        // news even when the two read identically (`docs/findings.md` B24).
+        state.runs += 1;
         let _ = actor.parent_tx.send(AgentMsg::ChildDone {
             id: actor.id,
+            run: state.runs,
             outcome: outcome.clone(),
         });
         match outcome {
@@ -952,16 +1036,24 @@ fn absorb(
             // puts their words between an assistant's calls and their results;
             // strict servers reject that shape.
             repair_tool_pairs(transcript);
-            let announced: Vec<u64> = state
+            // Which run each line is asked about is the completion's own run:
+            // a transcript that carries the line for the *current* record has
+            // read that record, and one that carries an older line has not. The
+            // line comes from `Outcome::line`, the one place that says all three
+            // shapes, so a replayed `#N failed: …` (or a `#N stopped: …`) is
+            // recognised exactly like a `#N done: …` — the old scan knew only
+            // the `done:` shape, so a failure read in the transcript looked
+            // unread and was folded again (`docs/findings.md` B24).
+            let announced: Vec<(u64, u64)> = state
                 .completed
-                .keys()
-                .filter(|id| {
-                    let line = format!("#{id} done:");
+                .iter()
+                .filter(|(id, completion)| {
+                    let line = completion.outcome.line(**id);
                     transcript
                         .iter()
                         .any(|message| message.text().contains(&line))
                 })
-                .copied()
+                .map(|(id, completion)| (*id, completion.run))
                 .collect();
             // Adoption may only *add* marks, never remove one. Every line this
             // actor folds is now emitted as a `Message` event, so the copy the
@@ -969,7 +1061,11 @@ fn absorb(
             // emit (the human typed in between). Un-marking a delivery the
             // model has already read would inject the same result a second
             // time; the two copies converge at the next adoption instead.
-            state.delivered.extend(announced);
+            // Adoption may only *add* marks, never move one backwards: a mark
+            // that names a *later* run than the adopted transcript holds stays.
+            for (id, run) in announced {
+                state.delivered.entry(id).or_insert(run);
+            }
             // The same question for jobs, answered on the line itself: it
             // carries the job's id, its exit status, its command and its tail,
             // so a transcript that holds it is a transcript that has read it.
@@ -1000,20 +1096,35 @@ fn absorb(
         // The human asked for a fold now. Not work to answer, so not a run:
         // the flag is honoured by `wait_for_work`'s idle loop, and by the
         // next turn of a run already in flight.
-        AgentMsg::Compact => {
+        AgentMsg::Compact(messages) => {
+            // An actor restored from a session starts with no transcript — the
+            // UI holds the conversation until the human's next message hands it
+            // over. A fold is not a run, so this is that hand-over: without it
+            // the command folded nothing and said nothing.
+            if transcript.is_empty() {
+                *transcript = messages;
+            }
             state.compact_requested = true;
             Fold::Idle
         }
-        AgentMsg::ChildDone { id, outcome } => {
+        AgentMsg::ChildDone { id, run, outcome } => {
             // The parent ended (or napped) while a child still ran: waking it
             // with the completion restarts its run with the result folded in,
             // so an early End is not a lost result, it is a nap. The
             // completion counts as delivered because the model is about to
             // read it in this very run.
             let news = outcome.is_news();
-            let line = note_completion(state, id, outcome);
+            let line = note_completion(state, id, run, outcome);
+            // A run the model has already read is not news however often it is
+            // reported: folding it here would hand the model a line it has
+            // answered, and a result would even pay for a turn to repeat it
+            // (`docs/findings.md` B24). The record itself is kept — it is what
+            // makes a *later* run newsworthy.
+            if state.delivered.get(&id) == Some(&run) {
+                return Fold::Idle;
+            }
             push_line(actor, transcript, line);
-            state.delivered.insert(id);
+            state.delivered.insert(id, run);
             // A stopped child is the human's doing, not news that warrants
             // waking a napping parent into a fresh (paid) run: the line is in
             // the transcript for whenever the parent runs next.
@@ -1025,8 +1136,14 @@ fn absorb(
         }
         AgentMsg::CommandDone { id, line, news } => {
             // `ChildDone` for a job: the same wake, the same once-only
-            // delivery, the same "the human's stop is not a result".
+            // delivery, the same "the human's stop is not a result" — and the
+            // same silence when the report has already been read, so a report
+            // recorded again cannot repeat a line the model has answered
+            // (`docs/findings.md` B24).
             let line = note_job(state, id, line, news);
+            if state.delivered_jobs.contains(&id) {
+                return Fold::Idle;
+            }
             push_line(actor, transcript, line);
             state.delivered_jobs.insert(id);
             if news {
@@ -1062,7 +1179,7 @@ fn run_loop(
     actor: &Actor,
     state: &mut ActorState,
     messages: &mut Vec<Message>,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
 ) -> Result<Option<String>, String> {
     let schemas = tool_schemas(actor);
     // One learning attempt per run: a context-limit complaint teaches the
@@ -1109,7 +1226,15 @@ fn run_loop(
         // fire while it still fits; beyond that, trimming stays the last
         // resort.
         if state.compact_requested || needs_compaction(messages, budget) {
-            compact_history(actor, &cfg, messages, cancel, state)?;
+            // A fold that came to nothing (a history nothing can be made of):
+            // the run carries on, and the phase the fold put on the row goes
+            // back to what a run wears between the request and the tool it
+            // names.
+            if !compact_history(actor, &cfg, messages, cancel, state, true)? {
+                actor
+                    .ctx
+                    .emit(actor.id, AgentEvent::CompactingEnded { in_run: true });
+            }
         }
         // Keep the whole request inside the endpoint's context window.
         trim_history(messages, budget);
@@ -1526,19 +1651,27 @@ const NOTHING_TO_COMPACT: &str =
 /// The one compaction routine: the automatic trigger (the window filling up)
 /// and the human's `/compact` both come through here, so they cannot disagree
 /// about what "the summary message" is or about when folding is worth a call.
+///
+/// The `bool` in the `Ok` says whether the transcript was replaced: a fold that
+/// came to nothing (a short history, a refusal mush cannot read as a summary)
+/// is over, and the phase it put on the row has to be cleared by whoever knows
+/// what the actor is doing next. `in_run` is that answer, from the caller that
+/// knows it: a fold at a run's message boundary is part of the run, one
+/// `compact_now` makes belongs to no run at all.
 fn compact_history(
     actor: &Actor,
     cfg: &Config,
     messages: &mut Vec<Message>,
-    cancel: &AtomicBool,
+    cancel: &Arc<AtomicBool>,
     state: &mut ActorState,
-) -> Result<(), String> {
+    in_run: bool,
+) -> Result<bool, String> {
     // Whether the human asked for this fold, as opposed to the window filling
     // on its own. Only the first is owed a line when there is nothing to do:
     // the automatic trigger would not have fired, so it has nothing to report.
     let asked = std::mem::take(&mut state.compact_requested);
     if !matches!(messages.first(), Some(message) if message.role == "system") {
-        return Ok(());
+        return Ok(false);
     }
     // Nothing left to fold: system + one message is already minimal
     // (usually a previous summary), so compacting again would just cost a
@@ -1550,20 +1683,31 @@ fn compact_history(
                 .ctx
                 .emit(actor.id, AgentEvent::Notice(NOTHING_TO_COMPACT.to_string()));
         }
-        return Ok(());
+        return Ok(false);
     }
     let actor_id = actor.id;
     // The human is told why this is happening: "nearly full" is a fact about
     // the automatic trigger, and saying it for a fold they asked for would be
-    // a line about a condition that is not true.
+    // a line about a condition that is not true. It travels as a phase, not as
+    // a status line: a status is dropped for an agent that is not already busy
+    // (`AgentTree::activity`), which is exactly the agent an idle `/compact`
+    // runs on — the fold that never woke anything up (finding U11).
     let why = if asked {
-        "compacting on request…"
+        Compacting::Requested
     } else {
-        "context nearly full — summarizing…"
+        Compacting::NearlyFull
     };
-    actor
-        .ctx
-        .emit(actor_id, AgentEvent::Status(why.to_string()));
+    actor.ctx.emit(
+        actor_id,
+        AgentEvent::Compacting {
+            why,
+            // A fold inside a run does not own a flag: the run's is already the
+            // UI's, and handing over a second copy of it would let a Stop's
+            // cleanup take the run's away. A fold from rest has no run, so this
+            // Arc is the only handle anything can stop it with.
+            cancel: if in_run { None } else { Some(cancel.clone()) },
+        },
+    );
 
     // Fold pending nudges/completions in first; a Stop cancels the run.
     drain_mailbox(actor, cancel, messages, state);
@@ -1629,8 +1773,31 @@ fn compact_history(
         Err(ModelError::Encode(error)) => return Err(format!("could not encode request: {error}")),
         // The endpoint complained, or answered something we cannot read: the
         // run will fail on its real request anyway, and a summary mush could
-        // not make is not that failure.
-        Err(ModelError::Status { .. }) | Err(ModelError::Malformed(_)) => return Ok(()),
+        // not make is not that failure. A human who *asked* for this fold is
+        // owed the reason all the same — a `/compact` that quietly does nothing
+        // is the hole this whole state exists to close (finding U11) — while the
+        // automatic trigger, which the human never asked about, stays quiet.
+        Err(error @ (ModelError::Status { .. } | ModelError::Malformed(_))) => {
+            if asked {
+                // The endpoint's own words, the way a run reports them: a
+                // refusal and an unreadable body are different things, and the
+                // human is the one who can act on either.
+                let why = match &error {
+                    ModelError::Status { status, body } => {
+                        format!("the endpoint answered {status}: {body}")
+                    }
+                    ModelError::Malformed(what) => {
+                        format!("the endpoint's reply could not be read: {what}")
+                    }
+                    _ => unreachable!("the arm above matched a status or a malformed reply"),
+                };
+                actor.ctx.emit(
+                    actor.id,
+                    AgentEvent::Notice(format!("could not compact: {why}")),
+                );
+            }
+            return Ok(false);
+        }
     };
     let summary = reply
         .choices
@@ -1645,7 +1812,7 @@ fn compact_history(
                 AgentEvent::Notice("could not compact — the model returned no summary".to_string()),
             );
         }
-        return Ok(());
+        return Ok(false);
     }
 
     let system = messages[0].clone();
@@ -1654,9 +1821,10 @@ fn compact_history(
         actor.id,
         AgentEvent::Compact {
             summary: summary.clone(),
+            in_run,
         },
     );
-    Ok(())
+    Ok(true)
 }
 
 /// Fold an idle agent's conversation into a summary because the human asked
@@ -1682,18 +1850,43 @@ fn compact_now(actor: &Actor, state: &mut ActorState, transcript: &mut Vec<Messa
         .cfg
         .config()
         .unwrap_or_else(|_| Config::new("http://127.0.0.1:1", "", None));
-    // A fresh flag: an idle agent has no run for a Stop to cancel. One that
-    // arrives while the summary is in flight still ends the request early,
-    // and is then swallowed exactly as it is for any idle actor.
-    let cancel = AtomicBool::new(false);
-    match compact_history(actor, &cfg, transcript, &cancel, state) {
-        Ok(()) => {}
-        // The human stopped it; that is not a failure to report.
-        Err(error) if error == CANCELLED => {}
-        Err(error) => actor.ctx.emit(
-            actor.id,
-            AgentEvent::Notice(format!("could not compact: {error}")),
-        ),
+    // A flag of the fold's own, and not a private one: an idle agent has no run
+    // for a Stop to cancel, so this Arc is the *only* handle anything can reach
+    // the summarize request through. It travels to the UI with the
+    // `Compacting` event, which puts it where Ctrl-C looks (`agent_cancel`) —
+    // a fold that spins an hourglass while no key can stop it is worse than one
+    // nobody can see.
+    let cancel = Arc::new(AtomicBool::new(false));
+    match compact_history(actor, &cfg, transcript, &cancel, state, false) {
+        // A fold that landed needs nothing here: its `Compact` event is what
+        // the pane, the session and the meter read.
+        Ok(true) => {}
+        // Nothing came of it — the history was too short, or the endpoint
+        // answered something mush could not read as a summary. Either way the
+        // row must stop saying `compacting…`.
+        Ok(false) => {
+            actor
+                .ctx
+                .emit(actor.id, AgentEvent::CompactingEnded { in_run: false });
+        }
+        // The human stopped it. A stop is its own event, not a failure: the
+        // actor is alive and resumable, and the row must say which of the two
+        // just happened.
+        Err(error) if error == CANCELLED => {
+            actor.ctx.emit(actor.id, AgentEvent::Stopped);
+        }
+        Err(error) => {
+            actor.ctx.emit(
+                actor.id,
+                AgentEvent::Notice(format!("could not compact: {error}")),
+            );
+            // The endpoint refused, could not be reached, or answered
+            // something unreadable: the fold is over either way, and the row
+            // must stop claiming it.
+            actor
+                .ctx
+                .emit(actor.id, AgentEvent::CompactingEnded { in_run: false });
+        }
     }
 }
 
@@ -1720,11 +1913,26 @@ fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
                 state.shutdown = true;
                 actor.ctx.registry.kill_owned(actor.id);
             }
-            AgentMsg::ChildDone { id, outcome } => {
-                note_completion(state, id, outcome);
+            AgentMsg::ChildDone { id, run, outcome } => {
+                note_completion(state, id, run, outcome);
             }
             AgentMsg::CommandDone { id, line, news } => {
                 note_job(state, id, line, news);
+            }
+            // A fold that arrived while a tool call was in flight: parked for
+            // the next message boundary, like a nudge. Said out loud, because
+            // this is the one window in which the request exists and nothing is
+            // happening yet — the human who typed `/compact` has to be able to
+            // see that it was taken and is waiting (finding U11).
+            AgentMsg::Compact(_) => {
+                state.compact_requested = true;
+                actor.ctx.emit(
+                    actor.id,
+                    AgentEvent::Compacting {
+                        why: Compacting::Parked,
+                        cancel: None,
+                    },
+                );
             }
             parked => state.deferred.push(parked),
         }
@@ -1751,8 +1959,10 @@ fn drain_mailbox(
             AgentMsg::Steer(text) => push_line(actor, messages, text),
             // A message-boundary job like a nudge: the transcript is folded
             // into a summary at the next turn, never between an assistant's
-            // tool calls and their results.
-            AgentMsg::Compact => state.compact_requested = true,
+            // tool calls and their results. The transcript the request carries
+            // is for an actor that has none (see `absorb`); mid-run, the
+            // transcript this actor owns is the newer one.
+            AgentMsg::Compact(_) => state.compact_requested = true,
             AgentMsg::Stop => {
                 cancel.store(true, Ordering::SeqCst);
                 actor.ctx.registry.kill_owned(actor.id);
@@ -1763,16 +1973,21 @@ fn drain_mailbox(
                 state.shutdown = true;
                 actor.ctx.registry.kill_owned(actor.id);
             }
-            AgentMsg::ChildDone { id, outcome } => {
-                note_completion(state, id, outcome);
+            AgentMsg::ChildDone { id, run, outcome } => {
+                note_completion(state, id, run, outcome);
             }
             // A job's report is folded into the transcript as a user message:
             // the model reads `#c2 done: exit 0 · …` in the next request, and
-            // the line is marked delivered so it is never injected twice.
+            // the line is marked delivered so it is never injected twice. A
+            // report the model has *already* read is not folded again however
+            // often it is recorded (`docs/findings.md` B24), which is what makes
+            // a replayed record cost nothing.
             AgentMsg::CommandDone { id, line, news } => {
                 let line = note_job(state, id, line, news);
-                push_line(actor, messages, line);
-                state.delivered_jobs.insert(id);
+                if !state.delivered_jobs.contains(&id) {
+                    push_line(actor, messages, line);
+                    state.delivered_jobs.insert(id);
+                }
             }
             // The UI sends a whole transcript when it believes we are idle.
             // We are mid-run, so the only new information is the message the
@@ -1790,20 +2005,30 @@ fn drain_mailbox(
     }
 }
 
-/// Record a child's completion and return the line the model reads. A fresh
-/// completion also supersedes any earlier delivery of the same child.
-fn note_completion(state: &mut ActorState, id: u64, outcome: Outcome) -> String {
+/// Record a child's completion and return the line the model reads.
+///
+/// A *newer run* supersedes the recorded outcome — a child that was stopped and
+/// then nudged finishes later, and the stale `stopped` must not outlive the
+/// result. The same run recorded again is not newer: it changes nothing, and in
+/// particular it does **not** clear the delivery mark. Clearing it there is
+/// precisely what let one outcome fold twice — the mark is a fact about what the
+/// model read, and hearing the same report again cannot make it unread
+/// (`docs/findings.md` B24: the defect was the unconditional
+/// `state.delivered.remove(&id)` that used to end this function).
+fn note_completion(state: &mut ActorState, id: u64, run: u64, outcome: Outcome) -> String {
     state.running.remove(&id);
-    // Always the latest outcome: a child that was stopped and then nudged
-    // finishes later, and the stale `stopped` must not outlive the result.
     let line = outcome.line(id);
-    state.completed.insert(id, outcome);
-    state.delivered.remove(&id);
+    if state.completed.get(&id).map(|completion| completion.run) != Some(run) {
+        state.completed.insert(id, Completion { run, outcome });
+    }
     line
 }
 
-/// The same bookkeeping for a job: it is no longer running, its report is the
-/// line the model reads, and it has not been delivered yet.
+/// The same bookkeeping for a job: it is no longer running, and its report is
+/// the line the model reads. A job ends once, under an id nothing else reuses,
+/// so a report recorded again is the *same* report: the delivery mark stands,
+/// and it is not cleared here. Clearing it unconditionally is what let a job's
+/// line fold twice (`docs/findings.md` B24, `note_completion`'s twin).
 fn note_job(state: &mut ActorState, id: u64, line: String, news: bool) -> String {
     state.running_jobs.remove(&id);
     state.done_jobs.insert(
@@ -1813,7 +2038,6 @@ fn note_job(state: &mut ActorState, id: u64, line: String, news: bool) -> String
             news,
         },
     );
-    state.delivered_jobs.remove(&id);
     line
 }
 
@@ -1866,16 +2090,16 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
     // summary it asked for, even of a child that was stopped (`Outcome::is_news`
     // decides that only for an *idle* actor, where the run it wakes has a
     // price).
-    let children: Vec<(u64, Outcome)> = state
+    let children: Vec<(u64, u64, Outcome)> = state
         .completed
         .iter()
-        .filter(|(child, _)| !state.delivered.contains(child))
-        .map(|(child, outcome)| (*child, outcome.clone()))
+        .filter(|(child, completion)| state.delivered.get(*child) != Some(&completion.run))
+        .map(|(child, completion)| (*child, completion.run, completion.outcome.clone()))
         .collect();
-    for (child, outcome) in children {
-        let line = note_completion(state, child, outcome);
+    for (child, run, outcome) in children {
+        let line = note_completion(state, child, run, outcome);
         push_line(actor, messages, line);
-        state.delivered.insert(child);
+        state.delivered.insert(child, run);
         news = true;
     }
     news
@@ -2102,10 +2326,11 @@ fn wait_tool(
         |state, id| {
             // Not always `done`: a stopped child is reported as stopped, so a
             // waiter knows there is no result yet rather than receiving one that
-            // says "cancelled".
-            let outcome = state.completed.get(&id)?.clone();
-            state.delivered.insert(id);
-            Some(outcome.line(id))
+            // says "cancelled". The mark names the run this answer came from: a
+            // run recorded *after* it is still unread, and folds then.
+            let completion = state.completed.get(&id)?.clone();
+            state.delivered.insert(id, completion.run);
+            Some(completion.outcome.line(id))
         },
     )
 }
@@ -2204,7 +2429,7 @@ fn status_tool(state: &ActorState) -> Result<String, String> {
     let mut ids: Vec<u64> = state.children.keys().copied().collect();
     ids.sort_unstable();
     for id in ids {
-        match state.completed.get(&id) {
+        match state.outcome(id) {
             // Each state gets its own mark: a stopped child was neither
             // finished (✓) nor failed (✗), and a parent that cannot tell them
             // apart treats a stop as a result.
@@ -2909,15 +3134,11 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
         let mut state = ActorState::default();
         state.children.insert(1, tx.clone());
-        state.completed.insert(1, Outcome::Stopped);
+        note_completion(&mut state, 1, 1, Outcome::Stopped);
         state.children.insert(2, tx.clone());
-        state
-            .completed
-            .insert(2, Outcome::Finished("did the thing".into()));
+        note_completion(&mut state, 2, 1, Outcome::Finished("did the thing".into()));
         state.children.insert(3, tx);
-        state
-            .completed
-            .insert(3, Outcome::Failed("no route".into()));
+        note_completion(&mut state, 3, 1, Outcome::Failed("no route".into()));
 
         let lines = status_tool(&state).unwrap();
         assert!(lines.contains("#1 ⊘ stopped"), "a stop is not a ✓: {lines}");
@@ -2964,6 +3185,7 @@ mod tests {
                 &mut messages,
                 AgentMsg::ChildDone {
                     id: 1,
+                    run: 1,
                     outcome: Outcome::Stopped
                 }
             ),
@@ -2978,6 +3200,7 @@ mod tests {
                 &mut messages,
                 AgentMsg::ChildDone {
                     id: 1,
+                    run: 2,
                     outcome: Outcome::Finished("all done".into())
                 }
             ),
@@ -3055,9 +3278,7 @@ mod tests {
     fn adoption_does_not_re_arm_a_delivery_that_already_happened() {
         let (actor, _mailbox) = test_actor("stale-copy");
         let mut state = ActorState::default();
-        state
-            .completed
-            .insert(1, Outcome::Finished("did the thing".into()));
+        note_completion(&mut state, 1, 1, Outcome::Finished("did the thing".into()));
         let mut messages = vec![Message::system("you are mush")];
         assert!(fold_completions(&actor, &mut state, &mut messages));
 
@@ -3069,7 +3290,7 @@ mod tests {
             Fold::Run
         ));
         assert!(
-            state.delivered.contains(&1),
+            state.delivered.get(&1) == Some(&1),
             "the model has read it, whatever the copy says"
         );
         assert!(
@@ -3174,7 +3395,7 @@ mod tests {
     fn a_parents_steering_ends_a_wait_and_names_the_speaker() {
         let (actor, mailbox) = test_actor("steer-wait");
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         // A child that has not finished: the state a parent waits in.
         let (child, _child_rx) = crossbeam_channel::unbounded();
         state.children.insert(1, child);
@@ -3206,15 +3427,16 @@ mod tests {
 
     /// A child that was stopped and then resumed finishes later; the stale
     /// `stopped` must not outlive the result, or the parent waits on a stop
-    /// forever.
+    /// forever. The two outcomes are two *runs*: the same run reported again is
+    /// the same news, a later run is not (finding B24).
     #[test]
     fn a_later_finish_replaces_a_stale_stop() {
         let mut state = ActorState::default();
-        note_completion(&mut state, 1, Outcome::Stopped);
-        assert_eq!(state.completed.get(&1), Some(&Outcome::Stopped));
-        let line = note_completion(&mut state, 1, Outcome::Finished("done now".into()));
+        note_completion(&mut state, 1, 1, Outcome::Stopped);
+        assert_eq!(state.outcome(1), Some(&Outcome::Stopped));
+        let line = note_completion(&mut state, 1, 2, Outcome::Finished("done now".into()));
         assert_eq!(
-            state.completed.get(&1),
+            state.outcome(1),
             Some(&Outcome::Finished("done now".into()))
         );
         assert_eq!(line, "#1 done: done now");
@@ -3251,10 +3473,8 @@ mod tests {
         let (actor, _mailbox) = test_actor("delivered-yes");
         let mut state = ActorState::default();
         let mut messages = Vec::new();
-        state
-            .completed
-            .insert(1, Outcome::Finished("did the thing".into()));
-        state.delivered.insert(1);
+        note_completion(&mut state, 1, 1, Outcome::Finished("did the thing".into()));
+        state.delivered.insert(1, 1);
         let fresh = vec![
             Message::system("you are mush"),
             Message::user("task"),
@@ -3267,7 +3487,7 @@ mod tests {
             Fold::Run
         ));
         assert!(
-            state.delivered.contains(&1),
+            state.delivered.contains_key(&1),
             "the model reads it in the transcript, so it is already delivered"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
@@ -3286,9 +3506,12 @@ mod tests {
     fn a_child_completion_is_delivered_once_across_an_idle_run() {
         let (actor, events, _mailbox) = recording_actor("once-child");
         let mut state = ActorState::default();
-        state
-            .completed
-            .insert(1, Outcome::Finished("wrote the parser".into()));
+        note_completion(
+            &mut state,
+            1,
+            1,
+            Outcome::Finished("wrote the parser".into()),
+        );
         let mut messages = vec![Message::system("you are mush")];
 
         assert!(fold_completions(&actor, &mut state, &mut messages));
@@ -3367,6 +3590,282 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// The human's shape, seen live (`docs/findings.md` B24): a parent folds a
+    /// child's failure, so the model has read it — and then the *same run* is
+    /// reported again, which used to clear the delivery mark (`note_completion`
+    /// ended with an unconditional `state.delivered.remove`) and hand the model
+    /// the failure it had just answered a second time.
+    ///
+    /// A *later* run of the same child is a different matter, and is covered by
+    /// `a_second_run_failing_the_same_way_is_news_again`: that one is genuinely
+    /// new news even when it reads identically.
+    #[test]
+    fn a_child_run_reported_again_is_not_folded_twice() {
+        let (actor, _events, mailbox) = recording_actor("re-reported");
+        let mut state = ActorState::default();
+        let mut messages = vec![Message::system("you are mush")];
+        let error = "Connection reset by peer (os error 104)";
+        let line = format!("#2 failed: {error}");
+
+        // The child fails while the parent naps: the record is delivered, and
+        // the model reads it in the run it starts.
+        assert!(matches!(
+            absorb(
+                &actor,
+                &mut state,
+                &mut messages,
+                AgentMsg::ChildDone {
+                    id: 2,
+                    run: 1,
+                    outcome: Outcome::Failed(error.into()),
+                }
+            ),
+            Fold::Run
+        ));
+        assert_eq!(messages.last().unwrap().text(), line);
+
+        // The same run arrives a second time — the re-record. This is the road
+        // the defect lived on: the *recording* path cleared the mark on its way
+        // past, so the next boundary folded a line the model had already
+        // answered into the transcript again.
+        mailbox
+            .send(AgentMsg::ChildDone {
+                id: 2,
+                run: 1,
+                outcome: Outcome::Failed(error.into()),
+            })
+            .unwrap();
+        drain_mailbox(&actor, &AtomicBool::new(false), &mut messages, &mut state);
+        assert!(
+            !fold_completions(&actor, &mut state, &mut messages),
+            "a run the model has read is not news when it is reported again"
+        );
+        assert_eq!(
+            messages.iter().filter(|m| m.text() == line).count(),
+            1,
+            "one failure, one line: {messages:?}"
+        );
+
+        // And the same message absorbed by an idle actor is the same news: no
+        // line pushed, and no run paid for to repeat it.
+        assert!(matches!(
+            absorb(
+                &actor,
+                &mut state,
+                &mut messages,
+                AgentMsg::ChildDone {
+                    id: 2,
+                    run: 1,
+                    outcome: Outcome::Failed(error.into()),
+                }
+            ),
+            Fold::Idle
+        ));
+        assert_eq!(messages.iter().filter(|m| m.text() == line).count(), 1);
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The batch the human saw: three children failed while the parent worked,
+    /// one of them had already been answered through `wait_agents`, and then
+    /// the records were replayed. Before the fix the next boundary pushed the
+    /// answered failure as well — a second copy of a line the model had just
+    /// been told, in a message that read as freshly replayed news.
+    #[test]
+    fn a_replayed_batch_delivers_each_unread_outcome_once() {
+        let (actor, mailbox) = test_actor("replayed-batch");
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::system("you are mush")];
+        let error = "Connection reset by peer (os error 104)";
+        for id in [4u64, 5, 6] {
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            state.children.insert(id, tx);
+            mailbox
+                .send(AgentMsg::ChildDone {
+                    id,
+                    run: 1,
+                    outcome: Outcome::Failed(error.into()),
+                })
+                .unwrap();
+        }
+        // Mid-run: recorded where the boundary can see them, and folded nowhere
+        // yet (a completion is a user message, which belongs after a batch's
+        // results, not between calls and them).
+        drain_signals(&actor, &cancel, &mut state);
+        assert_eq!(messages.len(), 1, "nothing is folded between tool calls");
+
+        // The model asks for #4's result first: the wait answers with the line
+        // and that answer is what the model has read.
+        let answered = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::WaitAgents,
+            &json!({ "ids": [4], "timeout": 5 }),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(answered, format!("#4 failed: {error}"));
+        assert_eq!(
+            state.delivered.get(&4),
+            Some(&1),
+            "an answer from `wait_agents` is a delivery"
+        );
+
+        // And now every record is sent again — the replay.
+        for id in [4u64, 5, 6] {
+            mailbox
+                .send(AgentMsg::ChildDone {
+                    id,
+                    run: 1,
+                    outcome: Outcome::Failed(error.into()),
+                })
+                .unwrap();
+        }
+        drain_mailbox(&actor, &AtomicBool::new(false), &mut messages, &mut state);
+
+        assert!(
+            fold_completions(&actor, &mut state, &mut messages),
+            "the two results nobody has read are still news"
+        );
+        let folded: Vec<&str> = messages.iter().map(Message::text).collect();
+        assert_eq!(
+            folded
+                .iter()
+                .filter(|line| line.starts_with("#4 failed"))
+                .count(),
+            0,
+            "the failure the wait answered with is not folded again: {folded:?}"
+        );
+        for id in [5u64, 6] {
+            let line = format!("#{id} failed: {error}");
+            assert_eq!(
+                folded.iter().filter(|folded| **folded == line).count(),
+                1,
+                "one line for #{id}: {folded:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// Two runs, the same failure text: the second is news, and folds once of
+    /// its own. This is what makes plain `Outcome` equality (or a scan for the
+    /// line) the wrong identity for a delivery — it would swallow a real second
+    /// failure, or swallow the first and repeat the second.
+    #[test]
+    fn a_second_run_failing_the_same_way_is_news_again() {
+        let (actor, _mailbox) = test_actor("same-text-twice");
+        let mut state = ActorState::default();
+        let mut messages = vec![Message::system("you are mush")];
+        let error = "Connection reset by peer (os error 104)";
+        let line = format!("#3 failed: {error}");
+
+        for run in 1..=2 {
+            assert!(matches!(
+                absorb(
+                    &actor,
+                    &mut state,
+                    &mut messages,
+                    AgentMsg::ChildDone {
+                        id: 3,
+                        run,
+                        outcome: Outcome::Failed(error.into()),
+                    }
+                ),
+                Fold::Run
+            ));
+            assert_eq!(messages.last().unwrap().text(), line);
+            assert!(
+                !fold_completions(&actor, &mut state, &mut messages),
+                "run {run} is folded once, not again at the next boundary"
+            );
+        }
+        assert_eq!(
+            messages.iter().filter(|m| m.text() == line).count(),
+            2,
+            "two runs, two failures, told twice: {messages:?}"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// Adoption asks "has this transcript already read this child?", and the
+    /// answer has to be yes for all three shapes `Outcome::line` writes. The
+    /// scan knew only `#N done:`, so a replayed failure — or a stop — read as
+    /// unread and was folded in again (`docs/findings.md` B24).
+    #[test]
+    fn adoption_reads_a_failed_or_stopped_line_as_delivered() {
+        let (actor, _mailbox) = test_actor("adopt-shapes");
+        let mut state = ActorState::default();
+        note_completion(&mut state, 2, 1, Outcome::Failed("no route".into()));
+        note_completion(&mut state, 3, 1, Outcome::Stopped);
+        let mut messages = Vec::new();
+        let fresh = vec![
+            Message::system("you are mush"),
+            Message::user("task"),
+            Message::tool("a", "#2 failed: no route"),
+            Message::tool("b", Outcome::Stopped.line(3)),
+        ];
+        assert!(matches!(
+            absorb(&actor, &mut state, &mut messages, AgentMsg::Run(fresh)),
+            Fold::Run
+        ));
+        assert_eq!(
+            state.delivered.get(&2),
+            Some(&1),
+            "a failed line is a completion the model has read"
+        );
+        assert_eq!(state.delivered.get(&3), Some(&1), "and so is a stopped one");
+        assert!(
+            !fold_completions(&actor, &mut state, &mut messages),
+            "so neither is folded in a second time"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The job half of the same rule: a report the model has read is not folded
+    /// again when the same record arrives a second time. `note_job` cleared the
+    /// mark exactly as `note_completion` did, and the boundary that folds a job
+    /// straight into the transcript pushed it without asking either.
+    #[test]
+    fn a_job_report_recorded_again_is_not_folded_twice() {
+        let (actor, _events, mailbox) = recording_actor("re-reported-job");
+        let mut state = ActorState::default();
+        state.running_jobs.insert(1);
+        let mut messages = vec![Message::system("you are mush")];
+        let line = "#c1 done: exit 0 · 3m12s · cargo test — test result: ok";
+        let report = || AgentMsg::CommandDone {
+            id: 1,
+            line: line.into(),
+            news: true,
+        };
+
+        assert!(matches!(
+            absorb(&actor, &mut state, &mut messages, report()),
+            Fold::Run
+        ));
+        assert_eq!(messages.last().unwrap().text(), line);
+
+        // The record arrives again while the owner is mid-run, so it is only
+        // *recorded* for the boundary: `note_job` used to drop the mark there.
+        mailbox.send(report()).unwrap();
+        drain_signals(&actor, &AtomicBool::new(false), &mut state);
+        assert!(
+            !fold_completions(&actor, &mut state, &mut messages),
+            "a report the model has read is not news again"
+        );
+        assert_eq!(messages.iter().filter(|m| m.text() == line).count(), 1);
+
+        // And the boundary that folds a job's line itself asks the same
+        // question before pushing it.
+        mailbox.send(report()).unwrap();
+        drain_mailbox(&actor, &AtomicBool::new(false), &mut messages, &mut state);
+        assert_eq!(
+            messages.iter().filter(|m| m.text() == line).count(),
+            1,
+            "one report, one line: {messages:?}"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// A job that ends while its owner is mid-run is folded in at the message
     /// boundary by `drain_mailbox`, not by `absorb`. That path has to tell the
     /// UI too, or the human's copy is missing exactly the lines the model read
@@ -3411,7 +3910,7 @@ mod tests {
     fn a_background_job_does_not_hold_the_tool_hostage() {
         let (actor, _mailbox) = test_actor("background");
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let started = Instant::now();
         let report = run_shell(
             "sleep 30 & echo started",
@@ -3446,7 +3945,7 @@ mod tests {
         let clock = Arc::new(Advanceable::new());
         let (actor, _mailbox) = scripted_tools_actor("timeout", machine.clone(), clock.clone());
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let timeout = Duration::from_secs(5);
         let started = Instant::now();
         let report = run_shell(
@@ -3491,7 +3990,7 @@ mod tests {
         let clock = Arc::new(Advanceable::new());
         let (actor, _mailbox) = scripted_tools_actor("exits", machine.clone(), clock.clone());
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
 
         let report = run_shell(
             "false",
@@ -3526,7 +4025,7 @@ mod tests {
         let clock = Arc::new(Advanceable::new());
         let (actor, _mailbox) = scripted_tools_actor("cancel", machine.clone(), clock.clone());
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(true);
+        let cancel = Arc::new(AtomicBool::new(true));
         let started = Instant::now();
         let report = run_shell(
             "sleep 30",
@@ -3558,7 +4057,7 @@ mod tests {
         let clock = Arc::new(Advanceable::new());
         let (actor, mailbox) = scripted_tools_actor("stop-command", machine.clone(), clock.clone());
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         mailbox.send(AgentMsg::Stop).unwrap();
 
         let report = run_shell(
@@ -3595,7 +4094,7 @@ mod tests {
         let clock = Arc::new(Advanceable::new());
         let (actor, _mailbox) = scripted_tools_actor("runaway", machine.clone(), clock.clone());
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let started = Instant::now();
         let report = run_shell(
             "yes mush",
@@ -3630,7 +4129,7 @@ mod tests {
     fn long_output_is_capped_and_marked() {
         let (actor, _mailbox) = test_actor("long-output");
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let report = run_shell(
             "yes mush | head -c 40000",
             &std::env::temp_dir(),
@@ -3861,7 +4360,7 @@ mod tests {
     fn a_human_message_ends_a_wait_on_children() {
         let (actor, mailbox) = test_actor("wake-wait");
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         // A child that exists and has not finished: the state a parent is in
         // for the whole of a long wait.
         let (child, _child_rx) = crossbeam_channel::unbounded();
@@ -3903,7 +4402,7 @@ mod tests {
         let (actor, _mailbox) =
             scripted_tools_actor("wait-timeout", Arc::new(Shell), clock.clone());
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         // A child that exists and never finishes: the state a parent is in for
         // the whole of a long wait.
         let (child, _child_rx) = crossbeam_channel::unbounded();
@@ -3941,7 +4440,7 @@ mod tests {
         let clock = Arc::new(Advanceable::new());
         let (actor, _mailbox) = scripted_tools_actor("wait-jobs", machine, clock);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
 
         for command in ["make build", "make test"] {
             let started = exec_tool(
@@ -4034,17 +4533,25 @@ mod tests {
     fn a_wait_returns_the_first_result_or_all_of_them() {
         let (actor, _mailbox) = test_actor("wait-all");
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let (child, _child_rx) = crossbeam_channel::unbounded();
         for id in [1u64, 2] {
             state.children.insert(id, child.clone());
         }
-        state
-            .completed
-            .insert(1, Outcome::Finished("wrote the parser".into()));
-        state
-            .completed
-            .insert(2, Outcome::Failed("no route".into()));
+        state.completed.insert(
+            1,
+            Completion {
+                run: 1,
+                outcome: Outcome::Finished("wrote the parser".into()),
+            },
+        );
+        state.completed.insert(
+            2,
+            Completion {
+                run: 1,
+                outcome: Outcome::Failed("no route".into()),
+            },
+        );
 
         let first = exec_tool(
             &actor,
@@ -4080,7 +4587,7 @@ mod tests {
         let clock = Arc::new(Advanceable::new());
         let (actor, _mailbox) = scripted_tools_actor("wait-jobs-timeout", machine, clock.clone());
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
 
         let started = exec_tool(
             &actor,
@@ -4125,7 +4632,7 @@ mod tests {
     fn a_transcript_sent_as_a_message_also_ends_a_wait() {
         let (actor, mailbox) = test_actor("wake-wait-run");
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let (child, _child_rx) = crossbeam_channel::unbounded();
         state.children.insert(1, child);
 
@@ -4330,7 +4837,7 @@ mod tests {
         );
         let (actor, rx, mailbox) = scripted_actor("cut-off", &scripted);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![
             Message::system("you are mush"),
             Message::user("write big.rs"),
@@ -4390,7 +4897,7 @@ mod tests {
         );
         let (actor, _events, mailbox) = scripted_actor("id-less-calls", &scripted);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![
             Message::system("you are mush"),
             Message::user("look around"),
@@ -4460,7 +4967,7 @@ mod tests {
         );
         let (actor, _events, mailbox) = scripted_actor("reasoning", &scripted);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![
             Message::system("you are mush"),
             Message::user("write the note"),
@@ -4522,7 +5029,7 @@ mod tests {
         let (actor, _events, _mailbox) =
             build_actor("knobs", scripted.clone(), ConfigHandle::own(local));
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![Message::system("you are mush"), Message::user("hi")];
 
         let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
@@ -4557,7 +5064,7 @@ mod tests {
             Arc::new(Scripted::new().finishing(Message::assistant(""), "content_filter"));
         let (actor, events, mailbox) = scripted_actor("filtered", &scripted);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![
             Message::system("you are mush"),
             Message::user("say something"),
@@ -4585,7 +5092,7 @@ mod tests {
             Arc::new(Scripted::new().finishing(Message::assistant("half a th"), "safety"));
         let (actor, _events, mailbox) = scripted_actor("unknown-reason", &scripted);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![Message::user("do the thing")];
 
         let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
@@ -4609,7 +5116,7 @@ mod tests {
         let scripted = Arc::new(Scripted::new().finishing(assistant, "content_filter"));
         let (actor, _events, mailbox) = scripted_actor("filtered-call", &scripted);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![Message::user("write the file")];
 
         let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
@@ -4642,7 +5149,7 @@ mod tests {
         );
         let (actor, events, mailbox) = scripted_actor("usage", &scripted);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![Message::system("you are mush"), Message::user("say hi")];
 
         let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
@@ -4673,7 +5180,7 @@ mod tests {
         );
         let (actor, events, mailbox) = scripted_actor("usage-sum", &scripted);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![Message::user("look around")];
 
         run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
@@ -4694,7 +5201,7 @@ mod tests {
         let scripted = Arc::new(Scripted::new().says("all done"));
         let (actor, events, mailbox) = scripted_actor("usage-none", &scripted);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![Message::user("say hi")];
 
         run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
@@ -4746,7 +5253,7 @@ mod tests {
         let scripted = Arc::new(scripted);
         let (actor, _rx, _mailbox) = scripted_actor("always-cut", &scripted);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![Message::user("write everything")];
 
         let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
@@ -4770,7 +5277,7 @@ mod tests {
         let (actor, _events, _mailbox) =
             build_actor("reply-cap", scripted.clone(), ConfigHandle::own(cfg));
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![Message::user("hi")];
 
         run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
@@ -4798,7 +5305,7 @@ mod tests {
         );
 
         // A `/compact` parked mid-tool-call: a fold to do, not a run to start.
-        state.deferred.push(AgentMsg::Compact);
+        state.deferred.push(AgentMsg::Compact(Vec::new()));
         assert_eq!(
             fold_parked(&actor, &mut state, &mut messages),
             Some(Fold::Idle)
@@ -4884,15 +5391,14 @@ mod tests {
         );
         // Both arrive while the model is thinking: the cancel is honoured as
         // soon as the reply comes back, and the fold is left parked.
-        root_tx.send(AgentMsg::Compact).unwrap();
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
         root_tx.send(AgentMsg::Stop).unwrap();
         gate.release();
 
         let folded = |events: &Recorder| {
-            events
-                .events_for(AgentId::ROOT)
-                .iter()
-                .any(|event| matches!(event, AgentEvent::Compact { summary } if summary == summary))
+            events.events_for(AgentId::ROOT).iter().any(
+                |event| matches!(event, AgentEvent::Compact { summary, .. } if summary == summary),
+            )
         };
         let deadline = Instant::now() + WAIT;
         while !folded(&events) && Instant::now() < deadline {
@@ -4914,7 +5420,7 @@ mod tests {
     fn drain_signals_parks_nudges_for_the_next_boundary() {
         let (actor, mailbox) = test_actor("signals");
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         mailbox.send(AgentMsg::Nudge("steer left".into())).unwrap();
         mailbox.send(AgentMsg::Stop).unwrap();
 
@@ -4945,7 +5451,7 @@ mod tests {
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
 
         mailbox.send(AgentMsg::Stop).unwrap();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         drain_mailbox(&actor, &cancel, &mut messages, &mut state);
         assert!(cancel.load(Ordering::SeqCst), "a Stop cancels the run");
         assert!(!state.shutdown, "a Stop must not end the actor");
@@ -5025,7 +5531,7 @@ mod tests {
         let clock = Arc::new(Advanceable::new());
         let (actor, _mailbox) = scripted_tools_actor("detach", machine.clone(), clock.clone());
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
 
         let report = run_shell(
             "cargo build",
@@ -5091,7 +5597,7 @@ mod tests {
         let clock = Arc::new(Advanceable::new());
         let (actor, _mailbox) = scripted_tools_actor("exclusive-detach", machine.clone(), clock);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
 
         let report = exec_tool(
             &actor,
@@ -5139,7 +5645,7 @@ mod tests {
         let clock = Arc::new(Advanceable::new());
         let (actor, _mailbox) = scripted_tools_actor("exclusive-foreground", machine, clock);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
 
         let report = exec_tool(
             &actor,
@@ -5168,7 +5674,7 @@ mod tests {
         let clock = Arc::new(Advanceable::new());
         let (actor, _mailbox) = scripted_tools_actor("detach-now", machine.clone(), clock.clone());
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut call =
             |tool: ToolName, args: Value| exec_tool(&actor, &mut state, tool, &args, &cancel);
 
@@ -5271,7 +5777,7 @@ mod tests {
         let clock = Arc::new(Advanceable::new());
         let (actor, _mailbox) = scripted_tools_actor("one-spawn", machine.clone(), clock);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
 
         let report = exec_tool(
             &actor,
@@ -5319,7 +5825,7 @@ mod tests {
 
         // And they work: a leaf detaches a job, lists it and stops it.
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut call =
             |tool: ToolName, args: Value| exec_tool(&actor, &mut state, tool, &args, &cancel);
         let started = call(
@@ -5405,9 +5911,7 @@ mod tests {
         let (actor, events, _mailbox) = recording_actor("fold-boundary");
         let mut state = ActorState::default();
         state.deferred.push(AgentMsg::Nudge("steer".into()));
-        state
-            .completed
-            .insert(1, Outcome::Finished("did the thing".into()));
+        note_completion(&mut state, 1, 1, Outcome::Finished("did the thing".into()));
         let mut messages = vec![
             Message::system("you are mush"),
             Message::assistant("working"),
@@ -5418,7 +5922,10 @@ mod tests {
             "a child's result is worth a turn"
         );
         assert_eq!(messages.last().unwrap().text(), "#1 done: did the thing");
-        assert!(state.delivered.contains(&1), "and it counts as delivered");
+        assert!(
+            state.delivered.contains_key(&1),
+            "and it counts as delivered"
+        );
 
         // A job's report travels the same road, and is news only when the job
         // ended on its own.
@@ -5525,6 +6032,7 @@ mod tests {
         root_tx
             .send(AgentMsg::ChildDone {
                 id: 1,
+                run: 1,
                 outcome: Outcome::Finished("did the thing".into()),
             })
             .unwrap();
@@ -5583,9 +6091,7 @@ mod tests {
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
         // A completion that arrived between boundaries and has not been folded
         // into the model's transcript yet.
-        state
-            .completed
-            .insert(1, Outcome::Finished("did the thing".into()));
+        note_completion(&mut state, 1, 1, Outcome::Finished("did the thing".into()));
 
         let fresh = vec![Message::system("you are mush"), Message::user("carry on")];
         assert!(matches!(
@@ -5593,7 +6099,7 @@ mod tests {
             Fold::Run
         ));
         assert!(
-            !state.delivered.contains(&1),
+            !state.delivered.contains_key(&1),
             "the model has not read it yet"
         );
         assert!(
@@ -5620,7 +6126,7 @@ mod tests {
         );
         let (actor, _events, _mailbox) = scripted_actor("scripted-run", &model);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![
             Message::system("you are mush"),
             Message::user("write note.txt"),
@@ -5665,7 +6171,7 @@ mod tests {
         );
         let (actor, _events, mailbox) = scripted_actor("child-done-mid-batch", &model);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![
             Message::system("you are mush"),
             Message::user("orchestrate"),
@@ -5676,6 +6182,7 @@ mod tests {
         mailbox
             .send(AgentMsg::ChildDone {
                 id: 1,
+                run: 1,
                 outcome: Outcome::Finished("wrote the parser".into()),
             })
             .unwrap();
@@ -5705,9 +6212,12 @@ mod tests {
         let (actor, _mailbox) = test_actor("delivered-once");
         let mut state = ActorState::default();
         let mut messages = vec![Message::system("you are mush")];
-        state
-            .completed
-            .insert(1, Outcome::Finished("wrote the parser".into()));
+        note_completion(
+            &mut state,
+            1,
+            1,
+            Outcome::Finished("wrote the parser".into()),
+        );
 
         assert!(fold_completions(&actor, &mut state, &mut messages));
         assert_eq!(messages.len(), 2, "one line for the one completion");
@@ -5736,7 +6246,7 @@ mod tests {
         );
         let (actor, events, _mailbox) = scripted_actor("learned-context", &model);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
 
         let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
@@ -5776,7 +6286,7 @@ mod tests {
         let (actor, events, _mailbox) =
             scripted_actor_on_clock("transport-hiccup", &model, clock.clone());
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
 
         let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
@@ -5820,7 +6330,7 @@ mod tests {
         let (actor, _events, _mailbox) =
             scripted_actor_on_clock("transport-dead", &model, Arc::new(Advanceable::new()));
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
 
         let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
@@ -5848,7 +6358,7 @@ mod tests {
         let model = Arc::new(Scripted::new().cancels());
         let (actor, _events, _mailbox) = scripted_actor("cancelled", &model);
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
+        let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
 
         let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
@@ -6339,7 +6849,7 @@ mod tests {
             "the run must finish before the fold: {seen:?}"
         );
 
-        root_tx.send(AgentMsg::Compact).unwrap();
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
         assert!(
             seen.wait(&events, WAIT, |seen| !seen.summaries.is_empty()),
             "an idle /compact must fold the transcript: {seen:?}"
@@ -6451,7 +6961,7 @@ mod tests {
             gate.wait_until_asked(WAIT),
             "the run never reached the model"
         );
-        root_tx.send(AgentMsg::Compact).unwrap();
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
         gate.release();
 
         let mut seen = Watched::default();
@@ -6490,6 +7000,293 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A fold the human asked for is said out loud, at every step it takes:
+    /// parked while the run it arrived behind is still going, on the wire when
+    /// it fires, and landed when the transcript is replaced. Exactly once — the
+    /// half of the bug where a request was *silent* (finding U11).
+    ///
+    /// The actor reads its mailbox between the things it does, not while a
+    /// request is in flight, so what this pins is the order: the request is
+    /// acknowledged as parked before anything is folded, and the fold is asked
+    /// for once.
+    #[test]
+    fn a_compact_request_mid_run_says_where_it_is_every_step() {
+        let root = scratch_dir("compact-parked-visible");
+        let gate = Arc::new(Gate::new());
+        let summary = "wrote note.txt; nothing else happened";
+        let scripted = Arc::new(
+            Scripted::new()
+                .held(gate.clone())
+                .calls(vec![tool_call(
+                    "c1",
+                    "write_file",
+                    json!({ "path": "note.txt", "content": "worth folding" }),
+                )])
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary)
+                .says("carried on after the fold"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("write the note".to_string()),
+            ]))
+            .unwrap();
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the run never reached the model"
+        );
+
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
+        gate.release();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the run must finish with the fold folded in: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+        assert_eq!(
+            seen.folds,
+            vec![
+                "Parked".to_string(),
+                "Requested".to_string(),
+                "landed".to_string()
+            ],
+            "the whole fold, once, step by step: {seen:?}"
+        );
+        let folds = scripted
+            .asked()
+            .into_iter()
+            .filter(|asked| asked.saw(COMPACT_INSTRUCTION))
+            .count();
+        assert_eq!(folds, 1, "a parked request folds once, not once per turn");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A fold the window triggered — nobody asked, the history is three quarters
+    /// of the budget — reaches the same visible state, and says *why* it is
+    /// happening: the human did not ask for this one. It folds once.
+    #[test]
+    fn a_full_history_folds_once_and_says_the_window_asked() {
+        let root = scratch_dir("compact-auto-visible");
+        let summary = "condensed work so far";
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary)
+                .calls(vec![tool_call(
+                    "c1",
+                    "write_file",
+                    json!({ "path": "after.txt", "content": "written after the fold" }),
+                )])
+                .says("done"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        let budget = scripted_budget();
+        // Past the trigger, and still one the summarize request can carry: the
+        // window the automatic fold fires in.
+        let long = "x".repeat(mush_core::transcript::compaction_trigger(budget) + 1_000);
+        assert!(
+            long.len() <= budget,
+            "the transcript must fit the whole budget"
+        );
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("read this".to_string()),
+                Message::assistant(long),
+            ]))
+            .unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the run must finish: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+        assert_eq!(
+            seen.folds,
+            vec!["NearlyFull".to_string(), "landed".to_string()],
+            "the window's fold is visible too, and it fires once: {seen:?}"
+        );
+        assert_eq!(seen.summaries, vec![summary.to_string()]);
+        let folds = scripted
+            .asked()
+            .into_iter()
+            .filter(|asked| asked.saw(COMPACT_INSTRUCTION))
+            .count();
+        assert_eq!(
+            folds, 1,
+            "the folded transcript is small again, so no turn folds a second time"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `compacting…` cannot outlive the fold that justified it. An endpoint that
+    /// refuses the summarize call, or answers something mush cannot read as a
+    /// summary, is the notice's to report — the row goes quiet either way, and a
+    /// human who asked is told (finding U11).
+    #[test]
+    fn a_fold_that_fails_leaves_no_fold_on_the_row() {
+        let root = scratch_dir("compact-failed");
+        let scripted = Arc::new(
+            Scripted::new()
+                .says("the run's answer")
+                .fails_with(500, "no summarizer today"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("answer me".to_string()),
+            ]))
+            .unwrap();
+        let mut ran = Watched::default();
+        assert!(
+            ran.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the run must finish: {ran:?}"
+        );
+
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen
+                .folds
+                .contains(&"ended".to_string())),
+            "the fold must end, however it ends: {seen:?}"
+        );
+        assert_eq!(
+            seen.folds,
+            vec!["Requested+flag".to_string(), "ended".to_string()],
+            "a fold from rest owns the flag that can stop it: {seen:?}"
+        );
+        assert!(
+            seen.notices
+                .iter()
+                .any(|notice| notice.contains("could not compact")),
+            "a human who asked is told why nothing happened: {:?}",
+            seen.notices
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An idle fold can be stopped, and a stop is a stop: the actor says
+    /// `Stopped`, which is what takes the `⊘` off the row's fold and leaves the
+    /// agent resumable. A cancelled fold is not a failure to report.
+    #[test]
+    fn a_stopped_fold_is_a_stop_and_not_a_failure() {
+        let root = scratch_dir("compact-stopped");
+        let scripted = Arc::new(Scripted::new().says("the run's answer").cancels());
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("answer me".to_string()),
+            ]))
+            .unwrap();
+        let mut ran = Watched::default();
+        assert!(ran.wait(&events, WAIT, |seen| seen.done >= 1), "{ran:?}");
+
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.stopped >= 1),
+            "the actor must say the fold was stopped: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+        assert_eq!(seen.summaries, Vec::<String>::new());
+        assert!(
+            seen.notices.is_empty(),
+            "a stop is the human's doing, not a failure: {:?}",
+            seen.notices
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An actor restored from a session starts with no transcript — the UI
+    /// holds the conversation until the human's next message. A fold is not a
+    /// run, so the request carries it: without that a `/compact` on a restored
+    /// agent folded nothing, and said nothing about it (finding U11).
+    #[test]
+    fn a_compact_request_carries_the_transcript_an_actor_has_none_of() {
+        let root = scratch_dir("compact-adopted");
+        let summary = "the task and where it got to";
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        // No `Run` first: this is the actor a restart leaves behind.
+        root_tx
+            .send(AgentMsg::Compact(vec![
+                Message::system("you are mush"),
+                Message::user("the old task".to_string()),
+                Message::assistant("the old answer"),
+            ]))
+            .unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| !seen.summaries.is_empty()),
+            "a fold with nothing to fold is a command that does nothing: {seen:?}"
+        );
+        assert_eq!(seen.summaries, vec![summary.to_string()]);
+        let asked = scripted.asked();
+        assert_eq!(
+            asked.len(),
+            1,
+            "one summarize call, and the transcript it carried"
+        );
+        assert!(
+            asked[0].saw("the old task"),
+            "the fold is of the conversation the request carried"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The history budget of the config the tests spawn actors with, so a test
+    /// can build a transcript that sits in the compaction window.
+    fn scripted_budget() -> usize {
+        Config::new("http://127.0.0.1:1", "scripted", None).history_budget()
+    }
+
     /// A `/compact` sent while the model is writing the run's *last* reply
     /// arrives at the boundary the run ends on. It must not be dropped with the
     /// run: the actor folds as it goes idle, after the completion — once.
@@ -6523,7 +7320,7 @@ mod tests {
             gate.wait_until_asked(WAIT),
             "the run never reached the model"
         );
-        root_tx.send(AgentMsg::Compact).unwrap();
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
         gate.release();
 
         let mut seen = Watched::default();
@@ -6580,7 +7377,7 @@ mod tests {
         );
         assert_eq!(scripted.asked().len(), 1, "the run's own request");
 
-        root_tx.send(AgentMsg::Compact).unwrap();
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
         assert!(
             seen.wait(&events, WAIT, |seen| !seen.notices.is_empty()),
             "the refusal must be visible: {seen:?}"
@@ -6768,6 +7565,10 @@ mod tests {
         replies: Vec<String>,
         summaries: Vec<String>,
         stopped: usize,
+        /// Every fold state this actor reported, in order: what the row, the
+        /// bar and the foot were told (finding U11). `Parked`, `Requested`,
+        /// `NearlyFull`, `ended`, `landed`.
+        folds: Vec<String>,
     }
 
     impl Watched {
@@ -6812,7 +7613,15 @@ mod tests {
                 AgentEvent::Error(why) => self.errors.push(why),
                 AgentEvent::Notice(what) => self.notices.push(what),
                 AgentEvent::Stopped => self.stopped += 1,
-                AgentEvent::Compact { summary } => self.summaries.push(summary),
+                AgentEvent::Compact { summary, .. } => {
+                    self.summaries.push(summary);
+                    self.folds.push("landed".to_string());
+                }
+                AgentEvent::Compacting { why, cancel } => self.folds.push(format!(
+                    "{why:?}{}",
+                    if cancel.is_some() { "+flag" } else { "" }
+                )),
+                AgentEvent::CompactingEnded { .. } => self.folds.push("ended".to_string()),
                 AgentEvent::Message(message)
                     if message.role == "assistant" && !message.text().is_empty() =>
                 {
