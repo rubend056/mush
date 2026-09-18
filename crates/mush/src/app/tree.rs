@@ -1525,14 +1525,6 @@ mod tests {
         assert_eq!(Phase::Activity(String::new()).doing(), "working");
     }
 
-    /// A landing's past tense is one word, so the row's prose and the refusal
-    /// that stops a nudge cannot tell the same story two ways (refactor R12).
-    #[test]
-    fn a_landing_has_one_past_tense() {
-        assert_eq!(Landed::Merged.past(), "merged");
-        assert_eq!(Landed::Discarded.past(), "discarded");
-    }
-
     /// A fold from rest is visible — the hole `activity` could not fill, because
     /// it refuses a status line from an agent that is not already busy — and it
     /// leaves the row when it ends, whichever way it ends (finding U11).

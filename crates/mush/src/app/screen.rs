@@ -944,7 +944,8 @@ fn unread_footer(app: &App, node: &AgentNode) -> String {
 
 /// Where an isolated agent's work is — or where it went. Pure, so the row's
 /// promise can be asserted: a landed worktree must not name a `git diff` that
-/// can no longer work.
+/// can no longer work, and its landing must be spelled in [`Landed::past`]'s
+/// own word, which the row's own prose is painted around.
 fn agent_detail(node: &AgentNode) -> Vec<String> {
     match node.landed {
         Some(Landed::Merged) => vec!["merged into HEAD".to_string()],
@@ -1181,22 +1182,45 @@ mod tests {
     }
 
     /// A landed worktree still has a branch recorded, so the row must key off
-    /// `landed` to stop offering a `git diff` that can no longer work.
+    /// `landed` to stop offering a `git diff` that can no longer work — and say
+    /// how it landed. The facts, not the sentence: the prose around the word is
+    /// the row's to word.
     #[test]
     fn a_landed_agent_does_not_offer_commands_that_cannot_work() {
-        let mut merged = node(Phase::Done, 1);
-        merged.branch = Some("mush/9".to_string());
-        merged.landed = Some(Landed::Merged);
-        let text = agent_detail(&merged).join(" · ");
-        assert_eq!(text, "merged into HEAD");
-        assert!(!text.contains("git diff"), "{text}");
+        for landed in [Landed::Merged, Landed::Discarded] {
+            let mut node = node(Phase::Done, 1);
+            node.branch = Some("mush/9".to_string());
+            node.landed = Some(landed);
+            let text = agent_detail(&node).join(" · ");
+            assert!(!text.contains("git diff"), "{text}");
+            assert!(
+                !text.contains("mush/9"),
+                "nor a branch nobody can read any more: {text}"
+            );
+            assert!(
+                text.contains(landed.past()),
+                "and it says how it landed: {text}"
+            );
+        }
+    }
 
-        let mut discarded = node(Phase::Done, 1);
-        discarded.branch = Some("mush/9".to_string());
-        discarded.landed = Some(Landed::Discarded);
-        let text = agent_detail(&discarded).join(" · ");
-        assert!(text.contains("discarded"), "{text}");
-        assert!(!text.contains("git diff"), "{text}");
+    /// A landing *is* one word, and the row is where that word is read: this
+    /// asserts the coupling — the row contains `Landed::past()` — so a row that
+    /// re-spells the landing (`landed in HEAD`, typed by hand) fails here, where
+    /// asserting the constant `Landed::Merged.past() == "merged"` could not
+    /// fail however the row was worded (refactor R12).
+    #[test]
+    fn a_landed_row_spells_the_landing_in_the_landings_own_word() {
+        for landed in [Landed::Merged, Landed::Discarded] {
+            let mut node = node(Phase::Done, 1);
+            node.branch = Some("mush/9".to_string());
+            node.landed = Some(landed);
+            let text = agent_detail(&node).join(" · ");
+            assert!(
+                text.contains(landed.past()),
+                "the row says where the work went, in the landing's own word: {text:?}"
+            );
+        }
     }
 
     /// Before anything lands, the row is the one place that says where an
