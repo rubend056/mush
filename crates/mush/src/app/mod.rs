@@ -2065,9 +2065,6 @@ impl App {
         }
     }
 
-    /// Focus the row the tree's cursor is on, and say whose pane the chat now
-    /// shows: `Enter` in the agent pane is a move of the *view*, so the brief
-    /// goes to the bar where a human can read it before typing.
     /// `←`/`→` in the agents pane: walk the painted rows along the parent links
     /// (finding U10). `direction < 0` selects the selected agent's parent;
     /// `> 0` its first child. Both read the order the pane paints and `j`/`k`
@@ -2112,8 +2109,20 @@ impl App {
         }
     }
 
+    /// Focus the row the tree's cursor is on, and say whose pane the chat now
+    /// shows: `Enter` in the agent pane is a move of the *view*, so the brief
+    /// goes to the bar where a human can read it before typing.
+    ///
+    /// The keyboard moves with the view. `Enter` used to show the agent's
+    /// transcript but leave the tree holding the keys, so the next thing the
+    /// human typed went to the tree — `g`/`G` jumped the cursor, a `c` in the
+    /// message cancelled the agent, and the pane snapped back to the root with
+    /// the words nowhere (finding S2). Focus is one value, so moving it moves
+    /// the bar's `chat`/`agents` badge, the pane borders and the key table
+    /// together.
     fn focus_cursor_row(&mut self) {
         if let Some(id) = self.tree.focus_cursor() {
+            self.focus = Focus::Chat;
             let brief = self
                 .tree
                 .node(id)
@@ -4888,6 +4897,98 @@ mod tests {
         assert_eq!(text_of(&app), "agent #1 is gone");
     }
 
+    /// `Enter` on a tree row shows that agent *and* hands it the keyboard
+    /// (finding S2): typing then reaches the agent, the letters are a message
+    /// and not tree bindings, and the bar's badge moves with the keyboard.
+    #[test]
+    fn enter_on_a_row_moves_the_keyboard_with_the_focus() {
+        let (mut app, _rx) = test_app("enter-focus");
+        app.focus = Focus::Agents;
+        // Two rows, so a leaked `g`/`G` would move the cursor somewhere the
+        // message could hide.
+        let (cmd, mailbox) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "lexer".to_string(),
+            depth: 1,
+            branch: None,
+            cmd,
+        });
+        app.tree.insert(Spawn {
+            id: AgentId(2),
+            parent: AgentId::ROOT,
+            brief: "parser".to_string(),
+            depth: 1,
+            branch: None,
+            cmd: crossbeam_channel::unbounded().0,
+        });
+        app.tree.cursor_top();
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(1)));
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.tree.focused, AgentId(1), "the pane shows #1");
+        assert_eq!(app.focus, Focus::Chat, "and the keyboard went with it");
+        let cursor = app.tree.cursor();
+        assert!(
+            screen(&mut app, 80, 24)
+                .iter()
+                .any(|row| row.contains(" chat ")),
+            "the bar's badge agrees with the key table"
+        );
+
+        // `g`, the space and `c` are ordinary letters now.
+        for ch in "go c".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match mailbox.recv_timeout(Duration::from_secs(5)) {
+            Ok(AgentMsg::Nudge(text)) => assert_eq!(text, "go c"),
+            other => panic!("the words must reach #1, not the tree: {:?}", other.is_ok()),
+        }
+        assert_eq!(
+            app.tree.cursor(),
+            cursor,
+            "a `g` in the message must not jump the cursor"
+        );
+        assert_eq!(
+            app.tree.node(AgentId(1)).unwrap().phase,
+            Phase::Thinking,
+            "a `c` in the message must not cancel the agent"
+        );
+    }
+
+    /// The other half of the same rule: while the chat owns the keyboard, `c`
+    /// is a letter, not a tree binding (finding S2).
+    #[test]
+    fn a_c_in_the_chat_types_a_c_and_cancels_nothing() {
+        let (mut app, _rx) = test_app("chat-c");
+        app.focus = Focus::Chat;
+        let (cmd, mailbox) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "lexer".to_string(),
+            depth: 1,
+            branch: None,
+            cmd,
+        });
+        app.tree.begin(AgentId(1), None);
+        app.tree.focus(AgentId(1));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        assert_eq!(app.chat.input().text(), "c", "the letter went into the box");
+        assert!(mailbox.try_recv().is_err(), "no Stop was sent");
+        assert!(
+            app.tree.node(AgentId(1)).unwrap().phase.is_busy(),
+            "the agent is still running"
+        );
+    }
+
     /// `/compact` asks the *focused* agent to fold its conversation, and says
     /// so on the bar. Nothing about the row's phase changes: the fold is the
     /// actor's job, and its `Compact` event is what replaces the transcript.
@@ -5532,6 +5633,11 @@ mod tests {
             rows.iter().any(|row| row.contains("#3 agent 3")),
             "the footer names the cursor row: {rows:?}"
         );
+
+        // `Enter` hands the keyboard to the agent it focused (finding S2), so
+        // the rest of this walk — which is about the *rows* — takes it back the
+        // way a human does.
+        app.focus = Focus::Agents;
 
         // `k` back up one row is #1, and `G` is the last painted row — the
         // root's second child, whose storage index is 2 of 3.
