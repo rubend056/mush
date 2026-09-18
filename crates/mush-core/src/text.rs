@@ -169,7 +169,42 @@ fn wrap_capped(text: &str, width: usize, max_lines: Option<usize>) -> Vec<String
 /// Shorten to at most `max` display columns *including* the ellipsis, so a
 /// caller budgeting columns gets text that really fits (finding B9: counting
 /// characters made a CJK row twice as wide as its budget).
+///
+/// The text is [`sanitize`]d first. This is what a one-line painter calls to
+/// fit a fact into its columns, and the facts it is handed are the same
+/// untrusted ones the transcript wraps — a model's summary, an endpoint's error
+/// body, a job's command. The wrapper sanitized and this did not, so the rule
+/// reached the transcript and missed every one-line surface beside it: a reply
+/// of `…and then\rREPLACED…` returned the cursor over the pane's own border, and
+/// an error body's `ESC ]0;PWNED BEL` renamed the window. Sanitizing here closes
+/// all of those at once, for callers nobody has written yet, and it cannot turn
+/// into work per frame: the text is about to be walked to `max` columns anyway.
 pub fn truncate(text: &str, max: usize) -> String {
+    cut(&sanitize_upto(text, max), max)
+}
+
+/// [`sanitize`], over no more than what `max` columns can be made from.
+///
+/// A one-line painter is handed `max` columns and whatever text the actor had:
+/// an endpoint's whole error body (up to `http::MAX_BODY_BYTES`), a model's
+/// 20000-character summary on a row the frame repaints sixty times a second.
+/// Every painted column comes from at least one character, so a prefix of
+/// `4 * max + 64` characters holds every column that can be shown, with room
+/// for the escape sequences that are removed whole; and because a sequence cut
+/// at the bound is dropped whole by [`skip_escape`], what comes back is always a
+/// *prefix* of the safe line — never more of it than there is. The cost of a
+/// row is therefore the row's width, not the length of the text behind it.
+fn sanitize_upto(text: &str, max: usize) -> String {
+    let limit = max.saturating_mul(4).saturating_add(64);
+    let mut chars = text.chars();
+    let cut: usize = chars.by_ref().take(limit).map(char::len_utf8).sum();
+    sanitize(&text[..cut])
+}
+
+/// [`truncate`] over text that is already safe to paint: the column arithmetic
+/// alone, so a caller that has sanitized its own field does not pay for it
+/// twice.
+fn cut(text: &str, max: usize) -> String {
     if max == 0 {
         return String::new();
     }
@@ -198,6 +233,11 @@ pub fn truncate(text: &str, max: usize) -> String {
 ///
 /// A field is dropped whole rather than cut to a letter or two: a brief of
 /// three columns is not a brief, and the footer carries the real one.
+///
+/// Every field is [`sanitize`]d before it is measured, because a row is a
+/// terminal too: the head carries the branch a model chose, the tail carries
+/// its own words about what it is doing, and the tail is never truncated, so
+/// the rule cannot ride on [`truncate`] alone (see its doc).
 pub fn fit_row(
     head: &str,
     brief: &str,
@@ -210,12 +250,16 @@ pub fn fit_row(
     /// a word that is not one.
     const MIN_FIELD: usize = 7;
 
-    let head_width = UnicodeWidthStr::width(head);
+    let head = sanitize_upto(head, width);
+    let brief = sanitize_upto(brief, width);
+    let branch_stat = sanitize_upto(branch_stat, width);
+
+    let head_width = UnicodeWidthStr::width(head.as_str());
     if width <= head_width + 2 {
-        return head.to_string();
+        return head;
     }
     let budget = width - head_width - 1;
-    let branch_width = UnicodeWidthStr::width(branch_stat);
+    let branch_width = UnicodeWidthStr::width(branch_stat.as_str());
     let show_branch = branch_width > 0 && branch_width + 2 <= budget.saturating_sub(4);
     let after_branch = budget.saturating_sub(if show_branch { branch_width + 2 } else { 0 });
 
@@ -223,6 +267,7 @@ pub fn fit_row(
     let mut cells = Vec::new();
     let mut remaining = after_branch;
     for cell in tail {
+        let cell = sanitize_upto(cell, remaining);
         let cell_width = UnicodeWidthStr::width(cell.as_str());
         if remaining < cell_width + 2 {
             break;
@@ -231,25 +276,25 @@ pub fn fit_row(
         remaining -= cell_width + 2;
     }
 
-    let mut line = head.to_string();
+    let mut line = head;
     if !brief.is_empty() {
         // Whole, if it fits — a short title costs nothing — and otherwise only
         // when the columns left are enough to say something: a brief cut to
         // `cre…` is not a brief, and the row spends those columns on nothing
         // instead.
         let room = remaining.saturating_sub(1);
-        if UnicodeWidthStr::width(brief) <= room || room >= MIN_FIELD {
+        if UnicodeWidthStr::width(brief.as_str()) <= room || room >= MIN_FIELD {
             line.push(' ');
-            line.push_str(&truncate(brief, room));
+            line.push_str(&cut(&brief, room));
         }
     }
     if show_branch {
         line.push_str("  ");
-        line.push_str(branch_stat);
+        line.push_str(&branch_stat);
     }
     for cell in cells {
         line.push_str("  ");
-        line.push_str(cell);
+        line.push_str(&cell);
     }
     line.trim_end().to_string()
 }
@@ -331,6 +376,42 @@ mod tests {
                 "{row:?} is wider than {width}"
             );
         }
+    }
+
+    /// The one-line path carries the rule too, so a caller that formats a fact
+    /// into columns cannot leak what the wrapper would have removed. The rule
+    /// used to ride on `wrap_capped` alone, and every surface that truncated
+    /// instead of wrapping painted the raw bytes: an error body's `\r` returned
+    /// the cursor over the pane's own border and its OSC renamed the window.
+    #[test]
+    fn a_fitted_line_is_defanged_before_it_is_cut() {
+        assert_eq!(truncate("and then\rREPLACED", 40), "and then␍REPLACED");
+        assert_eq!(truncate("\x1b]0;PWNED\x07done", 40), "done");
+        assert_eq!(truncate("\x1b[2J\x1b[Hwiped", 5), "wiped");
+        assert_eq!(truncate("saf\u{2066}e", 40), "safe");
+        // The cut still counts columns of what is left, so a sequence that was
+        // dropped cannot widen the result past its budget.
+        let cut = truncate("safe \x1b]0;PWNED\x07 tail", 8);
+        assert!(UnicodeWidthStr::width(cut.as_str()) <= 8, "{cut:?}");
+
+        // Every field of a row, not only the brief that goes through
+        // `truncate`: the head is built by the painter and the tail cells are
+        // placed whole, with no cut to ride on.
+        let row = fit_row(
+            "▶◐ #2",
+            "lexer",
+            "mush/2 +1−0",
+            &["boom\rREST \x1b[2J\x1b[Hwiped \x1b]0;PWNED\x07\u{2066}now".to_string()],
+            60,
+        );
+        assert!(!row.contains('\x1b'), "{row:?}");
+        assert!(!row.contains('\r'), "{row:?}");
+        assert!(row.ends_with("boom␍REST wiped now"), "{row:?}");
+        // And a row whose *title* carries the bytes: the brief is measured after
+        // it is made safe, so the row still fits the columns it was given.
+        let row = fit_row("▶ #1", &("x".repeat(30) + "\x1b]0;PWNED\x07"), "", &[], 20);
+        assert!(!row.contains('\x1b'), "{row:?}");
+        assert!(UnicodeWidthStr::width(row.as_str()) <= 20, "{row:?}");
     }
 
     #[test]

@@ -943,10 +943,17 @@ impl App {
 
     /// Remember a transient line for the bar: what a command just did, what the
     /// human just asked for. It fades.
+    ///
+    /// The line is [`mush_core::text::sanitize`]d here, at the one door into the
+    /// bar, because the bar paints it whole: it does no width arithmetic, so it
+    /// never calls `truncate` or `fit_row` and the rule those carry cannot reach
+    /// it. The same door serves [`Self::fail`], and between them they own every
+    /// string the bar's line can be.
     pub fn say(&mut self, text: impl Into<String>) {
+        let text = text.into();
         self.status = Some(Status {
             kind: StatusKind::Info,
-            text: text.into(),
+            text: mush_core::text::sanitize(&text),
             set_at: Instant::now(),
         });
     }
@@ -986,10 +993,15 @@ impl App {
 
     /// Remember something that went wrong. Errors do not fade: they stay until
     /// a later line replaces them.
+    ///
+    /// A failure is where the *endpoint's* own words reach the bar — a 500's
+    /// error body, a refusal's reason — so this is the other half of the rule
+    /// `say` carries (see its doc).
     pub fn fail(&mut self, text: impl Into<String>) {
+        let text = text.into();
         self.status = Some(Status {
             kind: StatusKind::Error,
-            text: text.into(),
+            text: mush_core::text::sanitize(&text),
             set_at: Instant::now(),
         });
     }
@@ -5772,6 +5784,184 @@ mod tests {
                 .draw(|frame| crate::ui::draw(frame, &mut app))
                 .unwrap_or_else(|error| panic!("draw failed at {width}x{height}: {error}"));
             app.focus = Focus::Chat;
+        }
+    }
+
+    /// One painted frame, cell by cell and borders included: a leak lands *on*
+    /// a border column, which is the one thing `screen` trims away.
+    fn frame_grid(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        app.set_term_size(width, height);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Deliver one hostile payload the way its actor does: a model reply (the
+    /// run then ends, so the reply becomes the row's and the footer's summary),
+    /// a run's failure (the endpoint's own words), and a tool result.
+    fn feed_hostile(app: &mut App, case: &str, text: &str) {
+        let conversation = app.tree.conversation();
+        let event = match case {
+            "reply" => {
+                app.update(Msg::Agent {
+                    conversation,
+                    id: AgentId::ROOT,
+                    event: AgentEvent::Message(Message::assistant(text)),
+                });
+                AgentEvent::Done
+            }
+            "error" => AgentEvent::Error(text.to_string()),
+            "result" => AgentEvent::Message(Message::tool("call_1", text)),
+            other => unreachable!("no case {other}"),
+        };
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event,
+        });
+    }
+
+    /// A pane is a terminal, and a terminal acts on what it is given — so the
+    /// one-line surfaces are fed the same bytes the verifier used, and what is
+    /// asserted is the *painted frame*, not the source string.
+    ///
+    /// The wrapped transcript was already defanged when this leaked: a reply of
+    /// `…\rREPLACED…` returned the cursor over the agents pane's own border from
+    /// the *footer*, an error body's `ESC ]0;PWNED BEL` renamed the window from
+    /// the *bar*, and a CSI in either wiped the frame. A test that reads the
+    /// transcript is exactly what let the other four surfaces through, so this
+    /// one reads the cells, at the audit's 80×24 and at the compact 40×10.
+    #[test]
+    fn a_one_line_surface_cannot_be_commanded_by_the_text_it_paints() {
+        const CR: &str = "\r";
+        const OSC: &str = "\x1b]0;PWNED\x07";
+        const CSI: &str = "\x1b[2J\x1b[H";
+        const BIDI: &str = "\u{2066}";
+
+        // Each case, with the commands in it and with plain words in the same
+        // places: the second is what the frame is measured against, so a pane
+        // that a leak moved is a pane whose border is somewhere else.
+        let payload = |case: &str, hostile: bool| -> String {
+            match (case, hostile) {
+                ("reply", true) => {
+                    format!("final reply{CR}STEP1 {OSC}{CSI}{BIDI}middle")
+                }
+                ("reply", false) => "final reply STEP1 middle".to_string(),
+                ("error", true) => {
+                    format!("model returned HTTP 500: boom{CR}REST {OSC} {CSI}{BIDI}after")
+                }
+                ("error", false) => "model returned HTTP 500: boom REST  after".to_string(),
+                ("result", true) => format!("boom{CR}REST {OSC} {CSI}{BIDI}after"),
+                ("result", false) => "boom REST  after".to_string(),
+                other => unreachable!("no case {other:?}"),
+            }
+        };
+        // What the surface still says once the commands are gone: the CR is
+        // marked, never taken away, and the words around it are the words.
+        let says = |case: &str| match case {
+            "reply" => "final reply␍STEP1",
+            _ => "boom␍REST",
+        };
+
+        for (width, height) in [(80u16, 24u16), (40, 10)] {
+            for case in ["reply", "error", "result"] {
+                let (mut app, _rx) = test_app("hostile-one-line");
+                feed_hostile(&mut app, case, &payload(case, true));
+                let frame = frame_grid(&mut app, width, height);
+
+                let (mut clean, _rx) = test_app("hostile-one-line-plain");
+                feed_hostile(&mut clean, case, &payload(case, false));
+                let pristine = frame_grid(&mut clean, width, height);
+
+                let painted = frame.join("\n");
+                for bad in ['\x1b', '\r'] {
+                    assert!(
+                        !painted.contains(bad),
+                        "{case} at {width}×{height} painted {bad:?}: {painted:?}"
+                    );
+                }
+                // Cell by cell, and never the newline this test joined them with:
+                // every other control byte, and the bidi isolates, are a command
+                // to a display rather than something to read.
+                for row in &frame {
+                    for ch in row.chars() {
+                        assert!(
+                            !ch.is_control()
+                                && !matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'),
+                            "{case} at {width}×{height} painted {ch:?}, which commands the display: {row:?}"
+                        );
+                    }
+                }
+                assert!(
+                    painted.contains(says(case)),
+                    "{case} at {width}×{height} lost its words: {painted:?}"
+                );
+
+                // The box skeleton belongs to the frame, not to the text: a
+                // border that moved or vanished is a pane that was overwritten.
+                for (y, (row, base)) in frame.iter().zip(pristine.iter()).enumerate() {
+                    for (x, (cell, want)) in row.chars().zip(base.chars()).enumerate() {
+                        if "─│┌┐└┘├┤┬┴┼".contains(want) {
+                            assert_eq!(
+                                cell, want,
+                                "{case} at {width}×{height} overwrote the border at {x},{y}: {row:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A long unbroken token — the model reply that is one 20 000-character
+    /// word — must be cut at a one-line surface's edge, with the `…` the rest of
+    /// the UI uses, and never have its middle painted into a pane.
+    #[test]
+    fn a_one_line_surface_cuts_a_long_token_at_its_edge() {
+        let token = "S".repeat(20_000);
+        let reply = format!("final model reply\rSTEP1 middle {token}");
+
+        for (width, height) in [(80u16, 24u16), (40, 10)] {
+            let (mut app, _rx) = test_app("long-token");
+            feed_hostile(&mut app, "reply", &reply);
+            let frame = frame_grid(&mut app, width, height);
+            let painted = frame.join("\n");
+
+            assert!(!painted.contains('\r'), "{painted:?}");
+            // The agents pane paints none of the token: at 80×24 it is the
+            // thirty columns on the left, at 40×10 the three rows on top. (The
+            // transcript is *meant* to wrap the token — that is the one surface
+            // that may show its text.)
+            let pane: Vec<&String> = if width >= 80 {
+                frame.iter().collect()
+            } else {
+                frame.iter().take(3).collect()
+            };
+            for row in pane {
+                let cells: String = row
+                    .chars()
+                    .take(if width >= 80 { 30 } else { 40 })
+                    .collect();
+                assert!(
+                    !cells.contains("SSSS"),
+                    "the agents pane painted the token at {width}×{height}: {row:?}"
+                );
+            }
+            if width >= 80 {
+                assert!(
+                    painted.contains('…'),
+                    "the footer must say it cut the token: {painted:?}"
+                );
+            }
         }
     }
 
