@@ -13,9 +13,9 @@
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Read, Write};
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use mush_core::Config;
@@ -651,11 +651,9 @@ fn body_too_large() -> io::Error {
     )
 }
 
-/// Connect to the endpoint. Every step here is bounded except one: resolving
-/// `host` has no timeout, because std's `to_socket_addrs` cannot be given one.
-/// The TCP connect, the write, and every read are bounded (`CONNECT_TIMEOUT`,
-/// `WRITE_TIMEOUT`, the read watch); a resolver that hangs is the one known way
-/// this call can outlive its deadline (docs/mush.md §8).
+/// Connect to the endpoint. Every step here is bounded: the name lookup by
+/// [`resolve_bounded`], the TCP connect by [`CONNECT_TIMEOUT`], the write by
+/// [`WRITE_TIMEOUT`], and every read by the read watch (finding A19).
 fn connect(
     host: &str,
     port: u16,
@@ -666,7 +664,12 @@ fn connect(
     // Opening a connection happens before there is a request to cancel, so the
     // calls below have no watch: they retry the signal and are bounded by
     // their own timeouts.
-    for address in retrying_interrupted(None, || (host, port).to_socket_addrs())? {
+    let name = host.to_string();
+    let addresses = resolve_bounded(host, port, clock::system(), move || {
+        retrying_interrupted(None, || (name.as_str(), port).to_socket_addrs())
+            .map(|addresses| addresses.collect())
+    })?;
+    for address in addresses {
         let stream = match retrying_interrupted(None, || {
             TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
         }) {
@@ -697,6 +700,62 @@ fn connect(
             format!("no address for {host}:{port}"),
         )
     }))
+}
+
+/// How long a name gets to resolve. std's `to_socket_addrs` cannot be given a
+/// timeout, and it is the last step of `connect` that could hang past every
+/// deadline mush sets (a dead DNS server, a wedged VPN) — so the lookup runs on
+/// its own thread and this is the deadline the caller waits on (finding A19).
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
+/// The resolver wait loop's slice: short enough that a deadline or a shutdown
+/// is noticed promptly, long enough not to spin.
+const RESOLVE_SLICE: Duration = Duration::from_millis(50);
+
+/// Resolve `host:port`, bounded by [`RESOLVE_TIMEOUT`] on `clock`.
+///
+/// The lookup itself still blocks on its own thread; what is bounded is the
+/// *wait* for it. A lookup that outlives the deadline is abandoned, not killed
+/// — the resolver thread belongs to the OS to collect — and the caller gets a
+/// `TimedOut` naming the host, which is a fact it can report instead of
+/// hanging. The clock is a parameter so a test reaches the deadline by
+/// advancing a fake instead of waiting ten seconds (finding A19).
+fn resolve_bounded(
+    host: &str,
+    port: u16,
+    clock: &dyn Clock,
+    lookup: impl FnOnce() -> io::Result<Vec<SocketAddr>> + Send + 'static,
+) -> io::Result<Vec<SocketAddr>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::Builder::new()
+        .name("mush-resolve".to_string())
+        .spawn(move || {
+            // The receiver may be gone (the deadline won), and then the answer is
+            // nobody's.
+            let _ = tx.send(lookup());
+        })
+        .map_err(io::Error::other)?;
+    let deadline = clock.now() + RESOLVE_TIMEOUT;
+    loop {
+        match rx.try_recv() {
+            Ok(result) => return result,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(io::Error::other(format!(
+                    "the resolver for {host}:{port} went away"
+                )))
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        if clock.now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "{host}:{port} did not resolve within {}s",
+                    RESOLVE_TIMEOUT.as_secs()
+                ),
+            ));
+        }
+        clock.sleep(RESOLVE_SLICE);
+    }
 }
 
 /// Wrap a TCP connection in TLS for `https://` endpoints, verifying against
@@ -969,6 +1028,45 @@ mod tests {
         cancel.store(true, Ordering::SeqCst);
         let error = watch.check().unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+    }
+
+    /// A resolver that never answers must not hold the caller: the lookup runs
+    /// on its own thread and the wait is bounded by the clock, so advancing a
+    /// fake is the whole test. Before this, when the wait ended was the OS
+    /// resolver's to decide (finding A19).
+    #[test]
+    fn a_resolver_that_never_answers_is_bounded_by_the_clock() {
+        let clock = Advanceable::new();
+        let started = Instant::now();
+        let error = resolve_bounded("mush.invalid", 80, &clock, || {
+            std::thread::sleep(Duration::from_secs(3600));
+            Err(io::Error::other("too late"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert!(error.to_string().contains("mush.invalid"), "{error}");
+        assert!(
+            clock.elapsed() >= RESOLVE_TIMEOUT,
+            "the deadline is what ended it: {:?}",
+            clock.elapsed()
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "and it was reached by moving the clock, not by waiting: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The other road: a lookup that answers is returned as it is. The real
+    /// clock, because this is the one case the fake cannot stage: the answer
+    /// arrives on a thread, and a virtual wait that costs no time can reach the
+    /// deadline before the OS ever schedules it.
+    #[test]
+    fn a_resolver_answer_is_returned() {
+        let address: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let addresses =
+            resolve_bounded("127.0.0.1", 1, clock::system(), move || Ok(vec![address])).unwrap();
+        assert_eq!(addresses, vec![address]);
     }
 
     /// A cancellation that arrives before the request never pays for the call.
