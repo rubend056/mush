@@ -1538,6 +1538,20 @@ fn compact_history(
     // the automatic trigger would not have fired, so it has nothing to report.
     let asked = std::mem::take(&mut state.compact_requested);
     if !matches!(messages.first(), Some(message) if message.role == "system") {
+        // Nothing to fold *and* nothing to replace: a fresh actor's transcript
+        // is empty until its first `Run`, so the fold below has no `system` to
+        // keep. The transcript is not made minimal by that, so this is not the
+        // `system + one message` refusal — but a human who typed `/compact` is
+        // owed the same answer, for the same reason: the bar says
+        // `compacting #0…`, and silence there is indistinguishable from a fold
+        // that quietly failed. The automatic trigger never reaches this arm
+        // with an empty transcript (there is nothing to weigh), and it is
+        // never told anything anyway.
+        if asked && messages.is_empty() {
+            actor
+                .ctx
+                .emit(actor.id, AgentEvent::Notice(NOTHING_TO_COMPACT.to_string()));
+        }
         return Ok(());
     }
     // Nothing left to fold: system + one message is already minimal
@@ -6594,6 +6608,50 @@ mod tests {
             scripted.asked().len(),
             1,
             "the refusal costs no summarize call"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `/compact` typed into a *fresh* workspace: the actor has never run, so
+    /// its transcript is not even a system message, and the fold cannot
+    /// replace what is not there. That is still a human who typed a command,
+    /// and the answer they got was nothing at all — the bar painted
+    /// `compacting #0…` and then the bar went quiet: no fold, no refusal, no
+    /// request. Silence there is the failure mode `/compact` exists to avoid,
+    /// so the empty case says the same refusal the short one does.
+    #[test]
+    fn a_fold_of_an_empty_transcript_says_so_instead_of_nothing() {
+        let root = scratch_dir("compact-empty");
+        let scripted = Arc::new(Scripted::new().says("answered"));
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        // No `Run` at all: this is the transcript a launch leaves behind.
+        root_tx.send(AgentMsg::Compact).unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| !seen.notices.is_empty()),
+            "an empty /compact must be answered: {seen:?}"
+        );
+        assert_eq!(
+            seen.notices,
+            vec![NOTHING_TO_COMPACT.to_string()],
+            "the same refusal a too-short transcript gets"
+        );
+        assert!(
+            seen.summaries.is_empty() && seen.done == 0,
+            "nothing was folded and no run started: {seen:?}"
+        );
+        assert!(
+            scripted.asked().is_empty(),
+            "the refusal costs no model call: {:?}",
+            scripted.asked().len()
         );
         let _ = fs::remove_dir_all(&root);
     }
