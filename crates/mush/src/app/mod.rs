@@ -884,11 +884,23 @@ impl App {
     /// being sent to: `ctx 3.1k/500k`. The window alone says how much room there
     /// is, never how much of it this conversation has taken — and the pane can
     /// be a subagent's, whose own next request is what this number measures.
+    ///
+    /// At the window and past it there is no longer a fraction to print: a
+    /// learned window can be smaller than the transcript already held, so the
+    /// meter read `ctx 1.2k/1k` — a ratio greater than one with nothing saying
+    /// so (finding P9). At the limit it says `full`; past it, it says `over`.
     pub fn context_meter(&self) -> String {
         let used = self.context_used_tokens();
-        let window = tokens_label(self.cfg().context_tokens);
+        let window = self.cfg().context_tokens;
         let mark = if self.cfg().context_explicit { "" } else { "~" };
-        format!("ctx {used}/{mark}{window}", used = tokens_label(used))
+        let used_label = tokens_label(used);
+        let window_label = tokens_label(window);
+        let state = match used.cmp(&window) {
+            std::cmp::Ordering::Greater => " over",
+            std::cmp::Ordering::Equal => " full",
+            std::cmp::Ordering::Less => "",
+        };
+        format!("ctx {used_label}/{mark}{window_label}{state}")
     }
 
     /// Remember something that went wrong. Errors do not fade: they stay until
