@@ -25,8 +25,11 @@ edit the files.
   **job** it can check on later through three more.
 - mush holds **no file state**: agents read and write files directly, and the
   UI shows their tree, their transcripts, and the git facts.
-- The agent's **system prompt is ~10 lines** and the tool set is twelve
-  functions. Simple prompt is a consequence of a small, honest interface.
+- The agent's **system prompt is three short blocks** — the rules, the
+  delegation policy, and what the machine is like — and the root's tool set is
+  twelve functions. A leaf keeps eight of them: the four delegation tools are
+  omitted, which is what bounds the tree. Small prompt, small interface, one
+  consequence of the other.
 - Everything mush writes lives in `<DIR>/.mush/`, which **git-ignores itself**.
 - Architecture is a single-owner **event loop**: `Msg` in, `App::update`, `ui::draw`.
 - KISS is enforced by the dependency budget of §7.
@@ -42,7 +45,9 @@ edit the files.
   delta, updated while agents work.
 - **Endpoint-neutral**: anything speaking the OpenAI chat-completions API with
   function calling works (llama.cpp, Ollama, vLLM, LM Studio, hosted APIs).
-- **Small on purpose.** Roughly 32,000 lines including tests, across two crates.
+- **Small on purpose.** Two crates and about 41 000 lines including tests;
+  `scripts/census.py` prints the split (production, tests, comments), so the
+  number is checked rather than remembered.
 
 ### Is not
 
@@ -104,35 +109,38 @@ and never share state with the painter.
 
 ### System prompt
 
-`mush-core/src/prompt.rs` generates the entire prompt. It is one paragraph, then
-the delegation rules and the closing paragraph on the shared machine (§5.6):
+`mush-core/src/prompt.rs` generates the entire prompt: one line naming the
+workspace, then the rules, the delegation policy, and what the machine is like
+(§5.6). The blocks are shared with the subagent prompt, so a rule has one home
+rather than two copies that drift:
 
 ```text
 You are mush, a coding agent working in the workspace at <ROOT>.
 
-Use the tools to inspect and change files. Rules:
-- Read a file before you edit it.
-- Prefer edit_file for small, surgical changes; use write_file only for new files or full rewrites.
-- Do the work instead of describing it. Keep replies short.
+Rules:
+- Every tool already works inside the workspace: paths are workspace-relative ("src/main.rs", not an absolute path) and run_command/edit/read already runs there with its cwd at the workspace root.
 - Never touch paths outside the workspace.
-- When the task is done, stop calling tools and reply with a one-sentence summary.
+- When you are done finish with a concise summary of what you did.
 
 Delegation:
-- spawn_agent(brief, isolated?) starts a subagent that has NO memory … the brief must carry every fact …
+- spawn_agent(brief, title, base?) starts a subagent with no memory of this conversation: the brief must carry every fact, file, and the exact deliverable; title is three words naming it in the tree.
+- base gives the child its own worktree and branch forked from that ref, so siblings with bases run in parallel; without one the child works in this workspace, and only one such child may run at a time. Decide up front, or wait_agents for the running one first. (The check can only fail after the brief exists, so decide before writing it.)
+- A subagent runs until it stops calling tools, so a brief is bounded by the work, not a turn count: split by what is independent, not by how long you think it takes.
 - Delegate independent, large, or context-heavy subtasks; do single edits and lookups yourself. Prefer a few big delegations over many small ones.
-- wait_agents blocks until a child finishes … agent_status lists your children; agent_control stops or messages one.
-- Ending your turn while children still run is fine: they keep working and you are woken …
+- wait_agents blocks until a child finishes: no ids means the *first* finish, all=true every child; its answer hands over an unread result's full summary, and an already-read one comes back as a digest. Ending your turn while children still run is fine: they keep working and you are woken with their "#N done: summary" results as each finishes.
 
 The machine is shared (CPU, ports, /tmp — a worktree isolates files, nothing else):
-- A long command detaches instead of dying …; command_status lists your jobs, wait_commands waits for one, command_control stops one.
-- Pass exclusive=true for anything timing- or port-sensitive …: it owns the machine while it runs, and a sibling is refused, not interleaved.
+- A long command detaches into a job instead of dying: run_command answers "[still running — detached as #c2]", detach=true asks for one at once, and any command that outlives 60s does it by itself. command_status lists your jobs, wait_commands waits for one, command_control stops one.
+- exclusive=true owns the machine for timing- or port-sensitive work (a benchmark, a profiler, a fixed port): a sibling's command queues behind it and is refused if the lock outlasts the wait (`#N holds the machine`) — do not retry in a loop.
 ```
 
-A subagent gets its own system prompt: who it is (depth), the workspace it works
-in (the shared one, or its isolated worktree), and the same rules — the brief
-travels as the first user message, mirroring the root's system+user shape. The
-UI shows that same brief as the child's first message, so the human's picture of
-a child starts where the child's does.
+The DELEGATION block is only in a prompt whose tools include delegation: a leaf
+at `MAX_DEPTH` has no orchestration tools, so it is not told how to use them. A
+subagent's prompt is otherwise the same shape — who it is (depth), the workspace
+it works in (the shared one, or its own worktree with a `base`) — and the brief
+travels as the first user message, not in the system prompt, mirroring the
+root's system+user shape. The UI shows that same brief as the child's first
+message, so the human's picture of a child starts where the child's does.
 
 ### Tools
 
@@ -141,10 +149,10 @@ a child starts where the child's does.
 | `list_files` | `path?` | recursive, skips `.git`, `.mush`, `target`, `node_modules`, … |
 | `read_file` | `path` | capped per result (the cap scales with the context window) |
 | `write_file` | `path`, `content` | atomic; creates parent directories |
-| `edit_file` | `path`, `old_string`, `new_string` | exact and unique match required |
-| `run_command` | `command` | `sh -c` in the root, own process group; 120 s timeout, 8 MB output limit, cancellable |
-| `spawn_agent` | `brief`, `isolated?` | a new agent with its own transcript (and worktree) |
-| `wait_agents` | `ids?`, `timeout?` | blocks until a child finishes; returns its summary |
+| `edit_file` | `path`, `old_string?`, `new_string?`, `edits?` | exact and unique match required; a batch of `edits` lands all-or-nothing in one call, and `replace_all` allows a rename |
+| `run_command` | `command`, `detach?`, `exclusive?` | `sh -c` in the root, own process group; 120 s timeout, 8 MB output limit, cancellable; `detach` starts a job at once, `exclusive` takes the machine lock (§5.6) |
+| `spawn_agent` | `brief`, `title`, `base?` | a new agent with its own transcript; `title` names its row, and `base` forks a worktree on `mush/<id>` for it (§5.5) |
+| `wait_agents` | `ids?`, `timeout?`, `all?` | blocks until a child finishes; an unread result's summary, an already-read one as a digest |
 | `agent_status` | — | lists the children and their state |
 | `agent_control` | `id`, `action`, `text?` | stops or messages one child |
 | `command_status` | — | lists this agent's jobs: state, age, and the end of what each wrote |
@@ -152,9 +160,10 @@ a child starts where the child's does.
 | `wait_commands` | `ids?`, `timeout?`, `all?` | blocks until one of them ends; `all` waits for every one |
 
 The four delegation rows are omitted from a leaf agent's schema (`MAX_DEPTH`),
-which is what bounds the tree; the three job rows are not, because a leaf may run
-a build in the background while it edits (§5.6). `mush_core::tools::TOOL_NAMES`
-is the single list of names, and a test asserts the schemas match it.
+which is what bounds the tree, so a root has twelve tools and a leaf eight; the
+three job rows are not omitted, because a leaf may run a build in the background
+while it edits (§5.6). `mush_core::tools::TOOL_NAMES` is the single list of
+names, and a test asserts the schemas match it.
 
 Tool calls execute as a normal OpenAI function-calling loop: the assistant
 message, then one `role: "tool"` message per call, then the next request. Every
@@ -229,10 +238,15 @@ elided, and the cursor is always on screen.
 
 | Context | Keys |
 |---|---|
-| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit · `Ctrl-N` new chat · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker |
-| picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End`, `PgUp`/`PgDn`, `Enter` take the row, `Esc` close |
-| agents | `j`/`k`, arrows, `g`/`G`, `PgUp`/`PgDn` page the rows, `←` the row's parent, `→` its first child, `Enter` focus a row, `c` cancel that agent, `Esc` back to the root |
-| chat | typing, `Enter` send, `←`/`→`/`Home`/`End`, `Backspace`/`Delete`, `↑`/`↓`/`PgUp`/`PgDn` scroll, `Esc` clear · `/new` `/help` `/quit` `/notes` · `/model` and `/provider` open a picker · `/compact` folds the focused agent's conversation (§3) |
+| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit · `Ctrl-N` new chat (stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker |
+| picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End`, `PgUp`/`PgDn` move the list, `Enter` take the row, `Esc` close |
+| agents | `j`/`k`, arrows, `g`/`G`, `PgUp`/`PgDn` move the rows, `←` the row's parent, `→` its first child, `Enter` show its transcript, `c` cancel that agent, `Esc` back to the root |
+| chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete`, `↑`/`↓`/`PgUp`/`PgDn` scroll, `Esc` clear · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/compact` `/notes` `/help` `/quit` |
+
+`Enter` in the agents pane moves the *view*, not the keyboard: the row's
+transcript replaces the chat pane while the keys stay in the tree, and `Tab` is
+what puts them in the box, where typing reaches the agent on screen. A page is
+always ten rows, in every pane and every list.
 
 The transcript is not only the human's words, and it says so. `you › ` marks a
 line the human typed — and only a line the human typed: a subagent's brief opens
@@ -250,11 +264,11 @@ repaint the frame they are drawn on.
 `[DECIDED]` Beyond editing, the UI has one job: answer three questions without
 typing anything, at whatever size the terminal is.
 
-| Question | Then (the audit) | Where the data already was |
-|---|---|---|
-| What is each agent doing? | Nothing. A row reads `◐ #1 delegate file c…`, and only the *focused* agent's status reaches the status bar. | the node's activity, rendered only while it is running |
-| Where is its work, and on what branch? | Nowhere: the row was `brief + activity + branch`, truncated in that order, so the branch was always the first field lost. | `AgentNode::branch` |
-| How much has changed? | Not implemented — no `git diff`, `--shortstat`, or `status` call existed. | — (M2.6 made the branches real, so a per-agent stat can be computed) |
+| Question | What the frame derives it from |
+|---|---|
+| What is each agent doing? | its `Phase` and the instant it began — the glyph and the activity text are the same fact twice read |
+| Where is its work, and on what branch? | `AgentNode::branch`, kept ahead of the activity and the title when the columns run out |
+| How much has changed? | one cached `git diff --shortstat` per branch, measured against the parent's branch |
 
 An audit of real screens (200×50, 120×32, 80×24, 60×17, 40×10, 30×8) found ten
 defects. They share one shape: the data exists, the pixels do not.
@@ -292,9 +306,10 @@ are computed in `App`.
 
 - **R0 — Derive, don't store.** `[DONE]` The three defects above were one bug: the
   screen kept *conclusions* (a status string, a `running` flag) instead of *facts*.
-  An agent now has a `Phase` (`Idle · Thinking · Activity(label) · Cancelling ·
-  Stopped · Done · Failed`) and the instant it began; the row glyph, the activity
-  text, and the bar are derived from those every frame. `App::status` is a typed line with a
+  An agent now has a `Phase` (`Idle · Thinking · Activity(label) ·
+  Compacting(kind) · Cancelling · Stopped · CutOff · Done · Failed`) and the
+  instant it began; the row glyph, the activity text, and the bar are derived from
+  those every frame. `App::status` is a typed line with a
   lifetime: `Info` fades after five seconds, `Error` stays, and work in progress is
   never stored at all — which is what makes `✓` on an idle agent and a lingering
   `thinking…` impossible rather than merely fixed.
@@ -305,19 +320,22 @@ are computed in `App`.
   title is *derived* from the brief (`deep.txt`, `lexer`), so two children never
   read the same. The selected row's full facts get a footer under the list, up to
   three lines when the pane is tall and one when it is compact, isolated agents
-  included (`.mush/wt/2 · git diff HEAD...mush/2 · /merge 2`). `fit_row` is a pure
-  function with tests, and the pane's title carries `agents · 2 working ·
-  1 waiting · Σ +324 −40` — each count named, each agent in exactly one.
-- **R2 — One bar, two lines.** `[DONE]` Line one is the newest *event* with no
-  other home — a failure, a stop, a job's report, a command's answer — or the one
-  derived fact the rows only imply (a napping root that will resume by itself),
-  else the fading status, else the hint; it never repeats an activity the row and
-  the transcript already carry. Line two (on terminals at least **24** rows tall)
+  included (`.mush/wt/2 · git diff HEAD...mush/2` — git's own spellings, no mush
+  wrapper to learn). `fit_row` is a pure function with tests, and the pane's
+  title carries `agents · 2 working · 1 waiting · Σ +324 −40` — each count named,
+  each agent in exactly one.
+- **R2 — One bar, two lines.** `[DONE]` Line one is one word chosen by rank: an
+  alert (a failure, the quit prompt) beats the tree's own line (a napping root
+  that will resume by itself), which beats a said line (a stop, a job's report, a
+  command's answer), which beats the idle hint. The ranking is the whole point:
+  the bar is forbidden from showing what a row or the transcript already carries.
+  Line two (on terminals at least **24** rows tall)
   is the stable facts, elided from the right: `⌂ path │ branch ±dirty +add −del │
-  model · ctx ~500k`, with the read's own age appended once it is past ten
-  seconds, so a cached fact cannot read as a live one. The meter says `full` at
-  the window and `over` past it. The window's size is never a mystery again, and
-  the repository survives the narrowest of them.
+  model @ endpoint · ctx 12k/~500k`, with the read's own age appended once it is
+  past ten seconds, so a cached fact cannot read as a live one. The meter's `~`
+  says the window was assumed rather than stated, and it says `full` at the
+  window and `over` past it. The window's size is never a mystery again, and the
+  repository survives the narrowest of them.
 - **R3 — Size tiers with a floor.** `[DONE]` `w<40 || h<10` → a single notice,
   centred on both axes, that falls back to a shorter spelling and always names
   40×10; below it every key is refused except `Ctrl-Q`, because a screen that is
@@ -325,23 +343,26 @@ are computed in `App`.
   agent strip on top, chat below; `h≥24` → the two-line bar; the transcript is
   capped at 110 columns however wide the terminal is.
 - **R4 — Truthful glyphs.** `[DONE]` `·` idle/never ran, `◐` running, `✓`
-  finished, `✗` failed; a running agent with children out wears `⏸N` — the
-  count, beside its own phase and never instead of it — and `⊘` marks both a
-  cancel in flight and a run that landed stopped, so a guard-stop is not dressed
-  as a failure. Tool calls are `⚙ name summarized-args` (never raw JSON, the
-  orchestration tools included: `⚙ agent_control #4 message "…"`), and notices
-  are neutral `·` unless something actually failed (`!`).
+  finished, `✗` failed, `⚠` a run that was cut off (the process went away with it
+  and nothing was committed), `≡` a conversation being folded. A running agent
+  with children out wears `⏸N` — the count, beside its own phase and never
+  instead of it — and `⊘` marks both a cancel in flight and a run that landed
+  stopped, so a guard-stop is not dressed as a failure. `✉` marks a result its
+  parent has not read, `✉N` the ones from an agent's own children. Tool calls are
+  `⚙ name summarized-args` (never raw JSON, the orchestration tools included:
+  `⚙ agent_control #4 message "…"`), and notices are neutral `·` unless something
+  actually failed (`!`).
 
 ```
-┌ agents · 2 working · 1 waiting · Σ +324 −40 ┐
-│   ◐ #0 you        edit src/lib.rs           │
-│   ◐ #1 ⏸2 lexer   wait_agents               │
-│     ◐ #2 tests    write tests/lex.rs        │
-│   ✓ #3 docs       wrote README.md           │
-├─────────────────────────────────────────────┤
-│ #2 tests · 0:41 · ⑂ mush/2 +8 −0            │
-│ .mush/wt/2 · git diff HEAD...mush/2         │
-└─────────────────────────────────────────────┘
+┌ agents · 2 working · 1 waiting · Σ +324 −40 ───────────────────┐
+│   ◐ #0 you        edit src/lib.rs                              │
+│   ◐ #1 ⏸2 lexer   wait_agents                                  │
+│     ◐ #2 tests    write tests/lex.rs                           │
+│   ✓ #3 docs       wrote README.md                              │
+├────────────────────────────────────────────────────────────────┤
+│ #2 write tests/lex.rs                                          │
+│ write tests/lex.rs 3s · .mush/wt/2 · git diff HEAD...mush/2    │
+└────────────────────────────────────────────────────────────────┘
 ```
 
 The cursor row is the one wearing the pane's selection colour; there is no
@@ -352,19 +373,19 @@ The plumbing is a `mush-core/src/git.rs` (shell-outs like the worktree code, no
 new crates) exposing `status(dir)`, `branch(dir)`, `branch_stat(dir, base)` and a
 `--shortstat` parser, plus one `App` snapshot (`git`, `agent_stats`) refreshed on
 agent `Done`/`Error`/`Stop`, on a focus change, after a command, on a durable
-session flush and on `/worktrees`, and every two seconds while anything is
-running. A nested agent is measured against its *parent's* branch, which is what
-makes the Σ in the title exact.
+session flush, and every two seconds while anything is running. A nested agent is
+measured against its *parent's* branch, which is what makes the Σ in the title
+exact.
 
-The context window is resolved the same way: `MUSH_CONTEXT` / `--context` /
-the home config's `context` / `/context` (and a stored explicit choice) › what
-the endpoint advertises (`meta.n_ctx`, `max_model_len`, `context_length`) › the
-model's documented window (`deepseek-flash` and `deepseek-v4-pro`: 500k) › the
-provider default. Derived windows are never persisted — they are re-read, so a
-stale guess cannot outlive its cause — and the caps a tool result may use follow
-the window, so one `read_file` can never fill an 8k transcript. A server that
-complains about the context length teaches mush the number it names, and the run
-retries once.
+The context window is resolved the same way: a window the human stated
+(`--context` / `MUSH_CONTEXT`, the home config's `context`, or this workspace's
+stored choice) › what the endpoint advertises (`max_model_len`, `context_length`,
+`context_window`, `n_ctx`, at the top level or under `meta`) › the model's
+documented window (`deepseek-flash` and `deepseek-v4-pro`: 500k) › the provider
+default. Derived windows are never persisted — they are re-read, so a stale guess
+cannot outlive its cause — and the caps a tool result may use follow the window,
+so one `read_file` can never fill an 8k transcript. A server that complains about
+the context length teaches mush the number it names, and the run retries once.
 
 Everything mush knows about a named vendor — the name a human types, its
 default endpoint, the models it documents, their windows, whether the thinking
@@ -479,10 +500,10 @@ needs to be added to the project's own `.gitignore`.
 `session.json` is written on its own thread. A streamed message only marks the
 conversation dirty, and the file is rewritten at most once a second — so a tool
 result costs the screen nothing — while a sent message, a command that changed
-what is stored, a compaction and `/new` are written before they return, and
-quitting writes whatever is still only in memory. Quitting therefore loses
-nothing, and a crash can cost at most the last second of a streamed reply. On
-startup the conversation resumes where it left off. `/new` clears it.
+what is stored, a compaction and a new chat (Ctrl-N) are written before they
+return, and quitting writes whatever is still only in memory. Quitting therefore
+loses nothing, and a crash can cost at most the last second of a streamed reply.
+On startup the conversation resumes where it left off. Ctrl-N clears it.
 
 It carries every subagent's transcript too, so a relaunch brings the tree back
 with its briefs and its context. It also carries each agent's last **failure**
@@ -501,15 +522,22 @@ Agents are one thread each, owning one transcript; parents and children talk
 directly through mailboxes (`spawn_agent`, `wait_agents`, `agent_status`,
 `agent_control`), while the UI observes via id-tagged events. Depth and live
 count are hard budgets; the delegation tools are simply omitted from a leaf's
-schema. Every agent does its own file I/O on its own thread, an `isolated` one
-inside its own git worktree — and where that is impossible (a workspace that is
-not a git repository) mush says so in the parent's pane (`isolated unavailable:
-not a git repository — it shares this workspace`) rather than letting two
-"isolated" siblings collide in silence. Human-in-the-loop is the merge story: a run's work
-is committed to its branch when the run ends, `/diff` runs the diff of that work
-against HEAD (a one-line stat, then the hunks capped, or `nothing changed`), and
-`/merge` and `/discard` run the git that lands or throws it away — mush never
-auto-merges.
+schema. Every agent does its own file I/O on its own thread. A child given a
+`base` gets its own git worktree (`.mush/wt/<id>`, branch `mush/<id>`) forked
+from that ref; without one it shares the checkout, and only one shared child may
+run at a time. A `base` git cannot resolve is a *failed delegation* —
+`cannot start from <ref>` — refused before anything is created, never a child
+that quietly runs somewhere else.
+
+Human-in-the-loop is the merge story: a run's work is committed to its branch
+when the run ends (`mush #<id>: <brief>`, with the outcome spelled into the
+subject when the run stopped, was cut off, or failed), so the branch really
+carries it. The selected row's footer names where it is (`.mush/wt/<id>`) and the
+git command that reads it (`git diff HEAD...mush/<id>`, git's own spelling), and
+landing or dropping it is git's own work too — `git merge mush/<id>`, `git
+worktree remove .mush/wt/<id>`, `git branch -D mush/<id>`. mush never
+auto-merges. Leftover worktrees are rediscovered on startup from `git worktree
+list`, so those commands keep working across a restart.
 
 An orchestrator that ends its turn while children still run is not finished, it
 is napping: the completion is folded into its transcript as a user message and
@@ -518,11 +546,11 @@ the run restarts, so a result is never lost just because nobody called
 
 Two different messages end an agent's work, and the difference matters:
 `Stop` cancels the run in flight (Ctrl-C, `c` on a running row) and leaves the
-actor alive to be nudged again; `Shutdown` ends the actor (`/new`, Ctrl-N). An
-actor holds a handle to its own mailbox, so it can never infer that everyone
-else let go — it has to be told. Every event carries the conversation it
-belongs to, so an actor that is still finishing a request when the human starts
-a new chat cannot write into it.
+actor alive to be nudged again; `Shutdown` ends the actor (Ctrl-N, the new
+chat). An actor holds a handle to its own mailbox, so it can never infer that
+everyone else let go — it has to be told. Every event carries the conversation
+it belongs to, so an actor that is still finishing a request when the human
+starts a new chat cannot write into it.
 
 A `Stop` has two halves, because one of them cannot wait for a mailbox: the
 message reaches the actor, and the flag it sets is *shared with the UI* when the
@@ -544,7 +572,7 @@ problem.
 | A worktree isolates | Shared anyway |
 |---|---|
 | files, HEAD, index, branch | CPU, RAM, IO, GPU |
-| history until it is merged | ports (mush's own tests bind 18731…) |
+| history until it is merged | ports (a dev server, a benchmark's fixed port) |
 | | build caches, package stores, `~/.cargo`, `/tmp` |
 | | databases, containers, dev servers |
 | | wall-clock, so every timing measurement |
@@ -572,7 +600,7 @@ once, and folds in as `#c2 done: exit 0 · 3m12s · cargo test — test result: 
 
 Jobs are budgeted (`MAX_JOBS = 8`, machine-wide and beside `MAX_AGENTS`) because
 each is a thread, a process group, and disk. They die with their agent
-(`Shutdown`, `/new`), with mush itself — its process groups are killed on exit,
+(`Shutdown`, Ctrl-N), with mush itself — its process groups are killed on exit,
 where a build an agent started used to outlive a clean quit — and with a `Stop`
 aimed at their owner, because Ctrl-C means “stop the work in flight”, and a job
 is work in flight.
@@ -581,10 +609,13 @@ is work in flight.
 `run_command({command, exclusive: true})` takes a workspace-wide lock.
 Timing-sensitive work — benchmarks, profiling, `--test-threads=1`, anything that
 binds a fixed port — then runs without a sibling stealing cores or a port, and
-everyone else is told `#3 holds the machine; retry when it finishes` instead of
-silently interleaving. A detached exclusive job holds the lock for its whole life.
-The lock coordinates *agents*; it cannot see the human's own build or an unrelated
-process, so it is “agents do not fight each other”, not isolation.
+everyone else is queued behind it and then refused, by name, rather than
+silently interleaving: `#3 holds the machine with an exclusive command (…); this
+call queued and the lock was still held — do not retry in a loop; do other work
+and try once after it finishes (no tool can wait on another agent's job)`. A
+detached exclusive job holds the lock for its whole life. The lock coordinates
+*agents*; it cannot see the human's own build or an unrelated process, so it is
+“agents do not fight each other”, not isolation.
 
 `[DECIDED]` The job budget is one machine-wide cap (`MAX_JOBS`), not a per-agent
 one — a per-agent cap would let eight agents hold eight builds each, which is the
@@ -668,8 +699,8 @@ mush/
       input.rs       the message box's grapheme cursor and horizontal window
       http.rs        a few hundred lines of blocking HTTP/1.1 client
       ui.rs          the painter: reads a `Screen` a value at a time and paints it
-     app/screen.rs  every painted value, derived by `App` (layout, rows, words)
-     attach.rs      the M3 socket: `.mush/mush.sock`, one JSON request per line
+      app/screen.rs  every painted value, derived by `App` (layout, rows, words)
+      attach.rs      the M3 socket: `.mush/mush.sock`, one JSON request per line
   docs/mush.md
   scripts/          pty smoke test + screen printer + scripted mock model server
 ```
@@ -699,11 +730,12 @@ wrapping) is where the tests live.
 
 Not used, on purpose: `tokio`, `reqwest`, `clap`, `ropey`, `notify`, `anyhow`,
 `blake3`, `diffy`. HTTP is hand-rolled because the target is a plain-HTTP server
-(or a rustls-wrapped socket), and ~400 lines beats a dependency tree. `ureq` is
-the tempting swap, but its receive timeout is a total budget rather than a
-per-read one, and the cancel flag is polled *between* socket reads — that is the
-feature Ctrl-C depends on. CLI parsing is ~75 lines. Each omitted crate is one
-less thing to version, audit, and wait for.
+(or a rustls-wrapped socket), and a few hundred lines beats a dependency tree.
+`ureq` is the tempting swap, but its receive timeout is a total budget rather
+than a per-read one, and the cancel flag is polled *between* socket reads — that
+is the feature Ctrl-C depends on. CLI parsing is a hand-written `match` over the
+arguments, and it stays that way. Each omitted crate is one less thing to
+version, audit, and wait for.
 
 ---
 
@@ -726,14 +758,15 @@ cancellation — and the deadline and cancel flag are checked after every
 successful read too, not only on a timeout, so a server dribbling one byte per
 slice cannot outlive them. Ctrl-C therefore stops a model that has not answered
 instead of waiting for its reply, and a wedged endpoint still cannot pin a
-thread forever. One hole is documented rather than papered over: name resolution
-(`to_socket_addrs`) has no timeout, because std cannot give it one.
+thread forever. Name resolution is the one step std cannot bound itself, so it
+runs on its own thread behind a 10 s deadline the caller waits on: a lookup
+that outlives it is abandoned with a `TimedOut` naming the host, never a hang.
 
 Rules: no full-buffer scan per frame, no redraw without a state change, and no
 subprocess inside `draw` — the git snapshot is cached in `App`, read on its own
 thread, and refreshed on the transitions a human drives (a focus change, a
-command, a durable session flush), on agent `Done`/`Error`/`Stop` and on
-`/worktrees`, and by a two-second tick while anything is running. A read older
+command, a durable session flush), on agent `Done`/`Error`/`Stop`, and by a
+two-second tick while anything is running. A read older
 than ten seconds is labelled with its age, because a cached fact must not read as
 a live one. Release profile uses `lto = "thin"`, `codegen-units = 1`,
 `strip = true`.
@@ -754,20 +787,22 @@ a live one. Release profile uses `lto = "thin"`, `codegen-units = 1`,
 - **M2.5 — Subagents.** actor-per-agent with mailboxes, delegation tools, the
   agent tree, isolated git worktrees, wake-on-completion, bounded depth and
   fan-out.
-- **M2.6 — Honest worktrees.** An isolated run ends by committing its worktree
-  (`mush #N: <brief>`, synthetic identity, hooks skipped), so the branch carries
-  the work and `/diff`, `/merge`, and `/discard --force` do what they say. The
-  pty test asserts all three.
+- **M2.6 — Honest worktrees.** `[DONE]` An isolated run ends by committing its
+  worktree (`mush #<id>: <brief>`, synthetic identity, hooks skipped), so the
+  branch carries the work and `git diff HEAD...mush/<id>`, `git merge mush/<id>`
+  and `git branch -D` do what they say.
 - **M2.7 — Glance layer.** `[DONE]` Ranked agent rows with a selected-row footer;
   the workspace bar (one line of what just happened, then the stable facts); size
   tiers with a 40×10 floor and a width cap; truthful glyphs; tool calls as
   `name(summarized args)`; typed notices with kinds and lifetimes;
   `mush-core/src/git.rs` and one cached, aged snapshot (§4.5). The context window
-  is discovered (endpoint → model table → provider default), shown, settable with
-  `/context`, and the tool caps scale with it.
+  is discovered (endpoint → model table → provider default), shown, stated with
+  `--context` / `MUSH_CONTEXT` (and remembered in the session), and the tool caps
+  scale with it.
 - **M2.75 — Seams.** `[DONE]` [docs/refactor.md](refactor.md): the extractions so
   every fact has one owner, and the four test seams (`ModelClient`, `Machine`,
-  `Clock`, `Events`) so the gate needs no socket, subprocess, or sleep. Stage
+  `Clock`, `Events`) so the gate needs no model server, no free port, and no
+  wall-clock wait. Stage
   3.5's `Intent` keymap and parsed commands landed with it; the `Screen` view half
   of Stage 3 is not built.
 - **M2.8 — Concurrent work (jobs + one lock).** `[DONE]` A command that outlives
@@ -787,13 +822,14 @@ a live one. Release profile uses `lto = "thin"`, `codegen-units = 1`,
   reply, so the event loop stays the only effector. `read` answers an agent's
   transcript lines with a monotone revision, `agents` answers the roster the
   tree pane paints (this is the half of finding H1 that no longer needs
-  `.mush/session.json`), `focus` focuses an agent exactly as `Enter` on its row
-  does, and `edit` replaces the shared message box — or, with `send`, delivers
-  the human's message — only when the base revision still matches.
+  `.mush/session.json`), `focus` selects an agent and shows its transcript
+exactly as `Enter` on its row does, and `edit` replaces the shared message box —
+or, with `send`, delivers the human's message — only when the base revision still
+matches.
 
 **Next**
 
-None of these is started.
+M5 and M6 are not started; M4 is dead.
 - **M4 — FS watching.** `[OBSOLETE v0.2]` There are no buffers to merge into;
   the periodic git snapshot already tells the human what moved.
 - **M5 — Spawn mode.** `mush` launches a configured agent in a pty pane with
@@ -823,13 +859,13 @@ stop), an oversized or malformed response body, the git snapshot (branch, dirty
 count, per-branch diffstat, ref names that look like flags), the context-window
 precedence and the caps that follow it, row field priority and column-aware
 truncation, the `~` elision boundary, a draw sweep over fifteen terminal sizes ×
-fourteen states that asserts the *painted* text (not "does not panic"), the
+a sweep of states that asserts the *painted* text (not "does not panic"), the
 attach protocol's ops and one real socket exchange,
 the job registry (detach, the machine lock, the `all` waits, the tail window),
 the transport retry and what it must *not* retry, the notices' kinds and
 lifetimes, per-conversation scrollback, the floor refusing every key but `Ctrl-Q`,
 config precedence, schema/prompt invariants, word wrapping, the actor mailbox
-(parked nudges, Stop vs Shutdown, completion delivery), and the `/new`, Ctrl-C,
+(parked nudges, Stop vs Shutdown, completion delivery), and the new-chat, Ctrl-C,
 stale-event, steering-echo, stale-status, id-floor, and phase-restore state
 transitions.
 - **End-to-end (pty).** `scripts/smoke.py` drives the real binary over a
@@ -838,21 +874,22 @@ transitions.
   resize (needs nothing), cancel (needs nothing — a socket that accepts the chat
   request and never answers must be abandoned by a single Ctrl-C, which is only
   observable from outside the process).
-- **Deterministic orchestration.** A family of `cargo test` scenarios — more
-  than a dozen — run a real agent tree in process, on a scripted `ModelClient`
-  rather than a server: a root → child → grandchild chain, an isolated child whose
-  run must commit its worktree (the test then merges it, removes the worktree, and
-  deletes the branch — the documented commands, executed), a context overflow that
-  must compact (and the corners where a fold is refused or parked), a nudge that
-  arrives mid-reply and must be answered, a root that ends its turn while a child
-  still runs and is woken by its result, a stop acknowledged as a stop, and a run
-  that hits its runaway guard and must end with a summary. The model is scripted;
-  the work — git worktrees, files, the commit, the merge — is real, so they need
-  neither a socket, nor `python3`, nor a sleep over 20 ms. `scripts/mock_llm.py` is
-  kept for the pty smoke scenarios; no test refers to it.
-- **Live.** Three `#[ignore]`d tests talk to the configured endpoint — the model
-  list, the shipped reply cap, and a TLS handshake against a public https endpoint
-  — so the default suite stays green offline.
+- **Deterministic orchestration.** More than twenty `cargo test` scenarios
+  drive the real actor loop in process, on a scripted `ModelClient` rather than a
+  server; six of them spawn a real subagent actor. Between them: a root → child →
+  grandchild chain, an isolated child whose run must commit its worktree (the test
+  then runs git's own merge, worktree remove and branch delete), a context
+  overflow that must compact (and the corners where a fold is refused or parked),
+  a nudge that arrives mid-reply and must be answered, a root that ends its turn
+  while a child still runs and is woken by its result, a stop acknowledged as a
+  stop, and a run that hits its runaway guard and must end with a summary. The
+  model is scripted; the work — git worktrees, files, the commit, the merge — is
+  real, so they need no socket and no `python3`, though they do need `git`, and one
+  scenario waits on a real shell sleep. `scripts/mock_llm.py` is kept for
+  hand-driven runs; no test and no script refers to it.
+- **Live.** Three `#[ignore]`d tests keep the default suite green offline: two
+talk to the configured endpoint (the model list and the shipped reply cap), and
+one makes a TLS handshake against `https://api.deepseek.com`.
 - **The checks.** `cargo fmt --all --check`, `cargo clippy --all-targets --
   -D warnings`, the unit tests, and the pty resize and cancel scenarios are the
   whole gate; they run anywhere rust and python3 do, so any CI can call them.
@@ -861,8 +898,8 @@ transitions.
   defects of §4.5 were found and how the next layer gets reviewed. Pass `--ask`
   with a reachable endpoint to see the agent's own screens (thinking, cancel,
   done); without it the empty screens need no model at all.
-- **Not yet.** Property tests for the merge verbs, and a fuzz target for the path
-  jail.
+- **Not yet.** A fuzz target for the path jail. Property tests for the merge
+  verbs are moot now the merge commands are gone — git is what runs them.
 
 Run it:
 
@@ -881,21 +918,26 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
    scrollback enough?
 2. `[OPEN]` Token accounting per agent: a rough meter per row would make a
    `MAX_AGENTS` fan-out legible, but the character heuristic is wrong by design.
-3. `[OPEN]` Config file format: `mush.toml` in `.mush/` vs environment only.
+3. `[DECIDED]` Config file format: a machine-global JSON file (`$MUSH_CONFIG`,
+   else the platform config directory), hand-editable and self-documenting. Not
+   `mush.toml` in `.mush/`, which would make the endpoint a workspace fact, and
+   not environment-only, which would make a hand-edited setting impossible.
 4. `[OPEN]` Should `run_command` be denied by default and enabled per session?
 5. `[OPEN]` Do we ship the MCP bridge ourselves, or leave it to the community?
 6. `[DECIDED]` The M2.7 tiers cut at 80×20: narrower or shorter stacks the agent strip
    above the chat, and 40×10 is the floor, below which mush says so instead of
    painting shreds. Very wide terminals cap the agent pane at 50 columns and the
    transcript at 110.
-7. `[DECIDED]` Notices are typed, scoped to an agent and aged (§4.5): neutral `·`
-   for chatter, yellow `⊘` for a run mush stopped, `!` in red only when something
-   actually failed. A command's answer ends with its moment (the agent's next run,
-   the human's next send, or `SAID_TTL`); a failure belongs to its run and is
-   written to the session. The bar's line one carries the newest event with no
-   other home, never a repeat of the activity strip.
+7. `[DECIDED]` Notices have an owner agent, a kind and a lifetime (§4.5): neutral
+   `·` for chatter, yellow `⊘` for a run mush stopped, `!` in red only when
+   something actually failed. A command's answer ends with its moment (the
+   agent's next run, the human's next send, or `SAID_TTL`); a failure belongs to
+   its run, is written to the session, and survives a restart. The bar's line one
+   carries the newest event with no other home, never a repeat of the activity
+   strip, and the row's `✗` is derived from the phase, so it cannot go stale.
 8. `[OPEN]` Does the human need to *type into* a subagent's pane (today that path
-   is a nudge), or is watching enough once §2 gap 3 is closed?
+   is a nudge), or is watching enough now that the row and its footer carry the
+   brief?
 9. `[DECIDED]` Job output is a **tail**, consistently, in the completion line and
    in `command_status` alike: a job is read when it ends, and what ended it is at
    the bottom of the log. The head is what a *foreground* command keeps, because
@@ -909,10 +951,6 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
     per-agent cap would let eight agents hold eight builds each). A job does not
     count against `MAX_AGENTS`: the two are separate budgets for separate
     resources.
-12. `[DECIDED]` Notices have an owner agent, a kind and a lifetime (§4.5): a
-    command's answer is chatter that ages out, a run's failure is news that
-    outlives the run and survives a restart, and the row's `✗` is derived from the
-    phase and cannot go stale.
 
 ---
 
@@ -935,7 +973,8 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
 - **The direct crates in §7 are the budget.** Anything else must earn its place.
 - **`.mush/` ignores itself.** Zero setup, zero footprint in the host repo.
 - **An isolated agent's work is committed when its run ends.** A branch that stays
-  at its base commit makes every merge command a lie, however good the diff looks.
+  at its base commit makes the merge git is asked to do a lie, however good the
+  diff looks.
 - **Every agent gets the workspace rules.** A subagent prompt without them invited
   edits without reading, and "same tools as always" was false for a leaf.
 - **The schema reserve is measured, not guessed.** A prompt test fails if the tool
@@ -966,5 +1005,5 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
   status the endpoint chose, a body past the cap, or a cancellation is returned as
   it is, first time.
 - **A window a human states always beats a default.** `--context` / `MUSH_CONTEXT`
-  / `/context` win over what an endpoint advertises, a model table and the
-  provider's own fallback, and are remembered in the session.
+  / the home config's `context` win over what an endpoint advertises, a model
+table and the provider's own fallback, and are remembered in the session.
