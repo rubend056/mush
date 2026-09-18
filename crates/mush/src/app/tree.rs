@@ -129,6 +129,37 @@ impl Phase {
             _ => None,
         }
     }
+
+    /// A stable, one-word name for this phase, for a reader that is not the
+    /// painter: the attach protocol's roster (M3). The glyph and the row's own
+    /// words stay `ui.rs`'s; this is the same distinction in text, so a client
+    /// can tell a `thinking` agent from a `working`, `compacting`, `stopped`
+    /// one without parsing a glyph.
+    pub fn label(&self) -> &'static str {
+        match self {
+            Phase::Idle => "idle",
+            Phase::Thinking => "thinking",
+            Phase::Activity(_) => "working",
+            Phase::Compacting(_) => "compacting",
+            Phase::Cancelling => "cancelling",
+            Phase::Stopped => "stopped",
+            Phase::Done => "done",
+            Phase::Failed(_) => "failed",
+        }
+    }
+
+    /// What this phase is doing, in its own words: the tool label an actor
+    /// wrote, the fold's words, or a failure. `None` for the phases whose whole
+    /// story is their name — a `thinking` agent has nothing else to say, and a
+    /// `done`/`idle` agent's result is the node's `summary`, not the phase's.
+    pub fn detail(&self) -> Option<&str> {
+        match self {
+            Phase::Activity(what) => Some(what),
+            Phase::Compacting(kind) => Some(kind.words()),
+            Phase::Failed(error) => Some(error),
+            _ => None,
+        }
+    }
 }
 
 /// A fold of an agent's conversation: the summarize call `/compact` asks for,
@@ -1006,6 +1037,21 @@ impl AgentTree {
         let id = self.cursor_id()?;
         self.focused = id;
         Some(id)
+    }
+
+    /// Point the tree cursor at one agent's row, if the tree has one, so a
+    /// caller that holds an id rather than a keystroke can act on the row the
+    /// human would. Returns whether the agent is in the tree; a caller that
+    /// then focuses the cursor (`focus_cursor`) focuses exactly the agent
+    /// `Enter` on its row would (M3's `focus`).
+    pub fn point_cursor_at(&mut self, id: AgentId) -> bool {
+        match self.rows().iter().position(|node| node.id == id) {
+            Some(index) => {
+                self.agent_cursor = index;
+                true
+            }
+            None => false,
+        }
     }
 
     /// The id of the row under the cursor: the one place a cursor position is

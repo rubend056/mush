@@ -6,6 +6,7 @@
 
 mod agent;
 mod app;
+mod attach;
 mod clock;
 mod events;
 mod http;
@@ -36,6 +37,7 @@ use ratatui::Terminal;
 
 use mush_core::text::mask_key;
 use mush_core::{config, session, Config, Overrides, Session, UserConfig, Workspace};
+use serde_json::Value;
 
 use app::{App, ConfigCell, Msg};
 
@@ -212,6 +214,220 @@ fn set_dir(dir: &mut Option<PathBuf>, value: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A subcommand that drives a *running* mush instead of opening a TUI (M3).
+///
+/// Each speaks one request to `<dir>/.mush/mush.sock`, prints the answer, and
+/// exits — the directory is the same single optional argument the TUI takes,
+/// and the subcommand's own value (an id, the text) comes before it.
+#[derive(Debug, PartialEq)]
+enum Cli {
+    Agents {
+        dir: PathBuf,
+    },
+    Read {
+        dir: PathBuf,
+        agent: u64,
+        since: usize,
+    },
+    Focus {
+        dir: PathBuf,
+        agent: u64,
+    },
+    Edit {
+        dir: PathBuf,
+        agent: u64,
+        base: u64,
+        send: bool,
+        text: String,
+    },
+}
+
+impl Cli {
+    /// Recognise a subcommand as the first argument, or `None` for the TUI's
+    /// own parsing. A directory named like a subcommand is not opened this way
+    /// — the subcommand wins, and `--` is the escape hatch a human has.
+    fn detect(argv: &[String]) -> Result<Option<Cli>, String> {
+        let Some(name) = argv.first().map(String::as_str) else {
+            return Ok(None);
+        };
+        if !matches!(name, "agents" | "read" | "focus" | "edit") {
+            return Ok(None);
+        }
+        let mut agent: Option<u64> = None;
+        let mut since = 0usize;
+        let mut base = 0u64;
+        let mut send = false;
+        let mut positional: Vec<String> = Vec::new();
+        let mut args = argv[1..].iter();
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "-h" | "--help" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                "--agent" => agent = Some(number(args.next(), "--agent")?),
+                "--since" => since = number(args.next(), "--since")? as usize,
+                "--base" => base = number(args.next(), "--base")?,
+                "--send" => send = true,
+                other if other.starts_with("--") => {
+                    return Err(format!(
+                        "unknown option `{other}` for `mush {name}` (try --help)"
+                    ));
+                }
+                other => positional.push(other.to_string()),
+            }
+        }
+        let cli = match name {
+            "agents" => Cli::Agents {
+                dir: trailing_dir(&positional, 0)?,
+            },
+            "read" => Cli::Read {
+                dir: trailing_dir(&positional, 0)?,
+                agent: agent.unwrap_or(0),
+                since,
+            },
+            "focus" => Cli::Focus {
+                dir: trailing_dir(&positional, 1)?,
+                agent: match positional.first() {
+                    Some(value) => parse_id(value, "focus")?,
+                    None => agent.ok_or("`mush focus` needs an agent id")?,
+                },
+            },
+            "edit" => Cli::Edit {
+                dir: trailing_dir(&positional, 1)?,
+                agent: agent.unwrap_or(0),
+                base,
+                send,
+                text: positional
+                    .first()
+                    .ok_or("`mush edit` needs the text to set or send")?
+                    .clone(),
+            },
+            _ => unreachable!(),
+        };
+        Ok(Some(cli))
+    }
+
+    fn dir(&self) -> &PathBuf {
+        match self {
+            Cli::Agents { dir }
+            | Cli::Read { dir, .. }
+            | Cli::Focus { dir, .. }
+            | Cli::Edit { dir, .. } => dir,
+        }
+    }
+
+    fn request(&self) -> attach::Request {
+        let op = match self {
+            Cli::Agents { .. } => attach::Op::Agents,
+            Cli::Read { agent, since, .. } => attach::Op::Read {
+                agent: *agent,
+                since: *since,
+            },
+            Cli::Focus { agent, .. } => attach::Op::Focus { agent: *agent },
+            Cli::Edit {
+                agent,
+                base,
+                send,
+                text,
+                ..
+            } => attach::Op::Edit {
+                agent: *agent,
+                base: *base,
+                send: *send,
+                text: text.clone(),
+            },
+        };
+        attach::Request {
+            id: serde_json::json!(1),
+            op,
+        }
+    }
+
+    /// Send the one request and act on the one answer: the rows on stdout for
+    /// `read`/`agents`, nothing on success for `focus`/`edit`, and the message
+    /// on stderr (as an `Err`, which `main` prints) when it failed.
+    fn run(self) -> Result<(), String> {
+        let response = attach::ask(self.dir(), &self.request())?;
+        match response.reply {
+            attach::Reply::Err(error) => Err(error.describe()),
+            attach::Reply::Ok(body) => {
+                match &self {
+                    Cli::Read { .. } => print_lines(&body),
+                    Cli::Agents { .. } => print_agents(&body),
+                    Cli::Focus { .. } | Cli::Edit { .. } => {}
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+/// The directory a subcommand takes: the positional *after* the ones the
+/// subcommand owns, if there is one. At most one, like the TUI.
+fn trailing_dir(positional: &[String], own: usize) -> Result<PathBuf, String> {
+    match positional.len().saturating_sub(own) {
+        0 => Ok(PathBuf::from(".")),
+        1 => Ok(PathBuf::from(&positional[own])),
+        _ => Err("only one directory may be given".to_string()),
+    }
+}
+
+/// A flag's value as a number, reported by name when it is not one.
+fn number(value: Option<&String>, flag: &str) -> Result<u64, String> {
+    let value = value.ok_or_else(|| format!("{flag} needs a value"))?;
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("{flag} needs a number, got `{value}`"))
+}
+
+fn parse_id(value: &str, command: &str) -> Result<u64, String> {
+    value
+        .parse::<u64>()
+        .map_err(|_| format!("`mush {command}` needs an agent id, got `{value}`"))
+}
+
+/// `read`: the transcript lines, one per line as `index<TAB>text`.
+fn print_lines(body: &Value) {
+    if let Some(lines) = body.get("lines").and_then(Value::as_array) {
+        for line in lines {
+            let index = line.get("line").and_then(Value::as_u64).unwrap_or(0);
+            let text = line.get("text").and_then(Value::as_str).unwrap_or("");
+            println!("{index}\t{text}");
+        }
+    }
+}
+
+/// `agents`: the roster the tree paints, one row per line, tab-separated:
+/// `id parent phase activity title branch worktree children-working`.
+fn print_agents(body: &Value) {
+    let Some(agents) = body.get("agents").and_then(Value::as_array) else {
+        return;
+    };
+    for node in agents {
+        let field = |key: &str| match node.get(key) {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Null) | None => String::new(),
+            Some(other) => other.to_string(),
+        };
+        let parent = node
+            .get("parent")
+            .and_then(Value::as_u64)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        println!(
+            "{id}\t{parent}\t{phase}\t{activity}\t{title}\t{branch}\t{worktree}\t{children}",
+            id = field("id"),
+            phase = field("phase"),
+            activity = field("activity"),
+            title = field("title"),
+            branch = field("branch"),
+            worktree = field("worktree"),
+            children = field("children_working"),
+        );
+    }
+}
+
 fn print_help() {
     print!("{}", help_text());
 }
@@ -261,6 +477,13 @@ fn help_text() -> String {
          KEYS:\n{keys}\n\n\
          COMMANDS (type in the chat):\n\
          {commands}\n\
+         ATTACH (drive a running mush from another shell; newline-delimited JSON):\n\
+         \x20   mush agents [DIR]      list the agents and their state\n\
+         \x20   mush read [DIR] [--agent N] [--since N]\n\
+         \x20                        an agent's transcript lines\n\
+         \x20   mush focus [DIR] ID   focus that agent, as Enter on its row does\n\
+         \x20   mush edit [DIR] [--agent N] --base R [--send] TEXT\n\
+         \x20                        set the message box's draft, or send it as the human\n\
          Endpoint, API key, model, and the request knobs live in\n\
          $MUSH_CONFIG or the platform config directory. That file is hand-editable,\n\
          every field is optional, and the one mush writes documents itself.\n\
@@ -388,6 +611,14 @@ fn describe(config: &Config, approved: bool) -> Vec<(String, String)> {
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
+    // A subcommand drives a *running* mush and never opens the TUI: it is
+    // recognised before any config is resolved, so it needs no endpoint, key
+    // or workspace of its own (M3).
+    let argv: Vec<String> = std::env::args().skip(1).collect();
+    if let Some(cli) = Cli::detect(&argv)? {
+        cli.run()?;
+        return Ok(());
+    }
     let args = parse_args()?;
     // `-y` is a fact about this session, not a config value: it is recorded here
     // and read by the features that will ask (and by `--print-config`). Nothing
@@ -464,7 +695,19 @@ fn run() -> Result<(), Box<dyn Error>> {
     // snapshot over and keeps painting (see `session_save`). `App`'s drop is the
     // exit flush.
     let save = Arc::new(session_save::Writer::new(workspace.root().to_path_buf()));
+    let attach_root = workspace.root().to_path_buf();
     let mut app = App::new(workspace, cell, stored, root, tx.clone(), save);
+    // The attach socket comes up before the first frame, so a client can
+    // connect the moment mush is running. A bind that fails is said on stderr
+    // and mush runs without it — never a reason to die (M3); the guard removes
+    // the socket file on the way out.
+    let _attach = match attach::serve(&attach_root, tx.clone()) {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            eprintln!("mush: attach disabled — {error}");
+            None
+        }
+    };
 
     if let Some(cfg) = discovery {
         let tx = tx.clone();
@@ -962,5 +1205,119 @@ mod tests {
         );
         assert!(help.contains("KEYS:"));
         assert!(help.contains("COMMANDS (type in the chat):"));
+    }
+
+    /// The `--help` text lists the attach subcommands, so a human learns they
+    /// exist from the one place every other surface is advertised.
+    #[test]
+    fn the_help_lists_the_attach_subcommands() {
+        let help = help_text();
+        for sub in ["mush agents", "mush read", "mush focus", "mush edit"] {
+            assert!(help.contains(sub), "`{sub}` is not in --help:\n{help}");
+        }
+    }
+
+    /// The subcommands parse before anything else: a directory, the flag forms
+    /// `read`/`edit` take, and the id `focus` takes before its directory.
+    #[test]
+    fn the_attach_subcommands_parse() {
+        let parse = |argv: &[&str]| {
+            Cli::detect(&argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            parse(&["agents"]).unwrap(),
+            Some(Cli::Agents { dir: ".".into() })
+        );
+        assert_eq!(
+            parse(&["agents", "/w"]).unwrap(),
+            Some(Cli::Agents { dir: "/w".into() })
+        );
+        assert_eq!(
+            parse(&["read", "--agent", "3", "--since", "12", "/w"]).unwrap(),
+            Some(Cli::Read {
+                dir: "/w".into(),
+                agent: 3,
+                since: 12
+            })
+        );
+        assert_eq!(
+            parse(&["read"]).unwrap(),
+            Some(Cli::Read {
+                dir: ".".into(),
+                agent: 0,
+                since: 0
+            })
+        );
+        assert_eq!(
+            parse(&["focus", "1", "/w"]).unwrap(),
+            Some(Cli::Focus {
+                dir: "/w".into(),
+                agent: 1
+            })
+        );
+        assert_eq!(
+            parse(&["edit", "--agent", "2", "--base", "34", "--send", "hello"]).unwrap(),
+            Some(Cli::Edit {
+                dir: ".".into(),
+                agent: 2,
+                base: 34,
+                send: true,
+                text: "hello".to_string(),
+            })
+        );
+        assert_eq!(
+            parse(&["edit", "--base", "0", "a draft", "/w"]).unwrap(),
+            Some(Cli::Edit {
+                dir: "/w".into(),
+                agent: 0,
+                base: 0,
+                send: false,
+                text: "a draft".to_string(),
+            })
+        );
+
+        // The directory is still the TUI's one optional argument, and a value
+        // that is not one is named, like every other flag.
+        assert!(parse(&["agents", "/a", "/b"]).is_err());
+        assert!(parse(&["focus"]).is_err(), "focus needs an id");
+        assert!(parse(&["edit"]).is_err(), "edit needs the text");
+        assert!(parse(&["read", "--agent", "x"]).is_err());
+        assert!(parse(&["read", "--nope"]).is_err());
+
+        // Anything else is not a subcommand: the TUI's own parsing sees it.
+        assert_eq!(parse(&["--help"]).unwrap(), None);
+        assert_eq!(parse(&["/w"]).unwrap(), None);
+        assert_eq!(parse(&[]).unwrap(), None);
+    }
+
+    /// The CLI builds the one request line its subcommand means, and echoes it
+    /// to the running mush.
+    #[test]
+    fn the_attach_subcommands_build_their_request() {
+        let request = Cli::Focus {
+            dir: ".".into(),
+            agent: 2,
+        }
+        .request();
+        assert_eq!(request.op, attach::Op::Focus { agent: 2 });
+        assert_eq!(request.encode(), r#"{"agent":2,"id":1,"op":"focus"}"#);
+
+        let request = Cli::Edit {
+            dir: ".".into(),
+            agent: 0,
+            base: 34,
+            send: false,
+            text: "hi".to_string(),
+        }
+        .request();
+        assert_eq!(
+            request.op,
+            attach::Op::Edit {
+                agent: 0,
+                base: 34,
+                text: "hi".to_string(),
+                send: false,
+            }
+        );
     }
 }
