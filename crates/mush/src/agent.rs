@@ -294,7 +294,14 @@ pub enum AgentMsg {
     /// let go — it has to be told.
     Shutdown,
     /// A child's run ended. The outcome says *how*: a stop is not a result.
-    ChildDone { id: u64, outcome: Outcome },
+    /// `run` is which of that child's runs this was (its own counter, 1 for the
+    /// first). The parent needs it to tell two reports apart: the *same* run
+    /// reported twice is one piece of news, while a run after it is a new one
+    /// even when it reads identically — two runs that both fail
+    /// `Connection reset by peer (os error 104)` are two failures, and a bare
+    /// `Outcome` cannot say which of the two it is holding
+    /// (`docs/findings.md` B24).
+    ChildDone { id: u64, run: u64, outcome: Outcome },
     /// A job this agent started ended. `line` is the report its owner reads,
     /// rendered once by the registry; `news` says whether it is worth waking a
     /// napping agent for (`ChildDone` and `Outcome::is_news` again: a job mush
@@ -424,20 +431,31 @@ impl AgentCtx {
 struct ActorState {
     children: HashMap<u64, Sender<AgentMsg>>,
     running: HashSet<u64>,
-    /// The latest outcome of each child, whether or not the model has read it.
-    /// A completion is recorded the moment it arrives — even mid-batch — and
-    /// folded into the transcript by [`fold_completions`].
-    completed: HashMap<u64, Outcome>,
-    /// Completions already handed to the model (via `wait_agents` or a folded
-    /// line); a fresh completion clears the mark, so it is announced again.
-    delivered: HashSet<u64>,
+    /// The latest outcome of each child, with the run it came from, whether or
+    /// not the model has read it. A completion is recorded the moment it
+    /// arrives — even mid-batch — and folded into the transcript by
+    /// [`fold_completions`].
+    completed: HashMap<u64, Completion>,
+    /// The run of each child whose outcome the model has read (via `wait_agents`
+    /// or a folded line). A *later* run leaves this mark naming an older run, so
+    /// the new outcome is announced; re-recording the run the mark names changes
+    /// nothing, which is what keeps one piece of news from folding twice
+    /// (`docs/findings.md` B24).
+    delivered: HashMap<u64, u64>,
     /// The jobs this agent started and has not yet read a report about, and the
     /// reports it has read. The same three books as `running`/`completed`/
     /// `delivered` above, because a job's completion travels the same road as a
-    /// child's: delivered once, folded into the transcript, never twice.
+    /// child's: delivered once, folded into the transcript, never twice. The
+    /// mark is the bare id, not a run: a job ends once, under an id nothing else
+    /// reuses, so a report recorded again is the *same* report and there is no
+    /// newer one to re-arm for (`docs/findings.md` B24).
     running_jobs: HashSet<u64>,
     done_jobs: HashMap<u64, JobReport>,
     delivered_jobs: HashSet<u64>,
+    /// How many runs this actor has finished — the identity a parent records on
+    /// `ChildDone { run, .. }`. It counts runs, not turns, and is incremented
+    /// where the run's outcome is decided.
+    runs: u64,
     /// Commands parked while a blocking tool call was in flight; folded in at
     /// the next message boundary (see `drain_signals`).
     deferred: Vec<AgentMsg>,
@@ -451,6 +469,28 @@ struct ActorState {
     /// A `Stop` arrived with the work this actor is about to start; the run it
     /// points at is born cancelled (finding B6).
     stop_requested: bool,
+}
+
+/// One child's run ending, as its parent keeps it: which run it was, and how it
+/// ended. Identity is by run, not by outcome: two runs can carry the same error
+/// text (and must be told about twice), while one run can be reported twice (and
+/// must be folded once) — `Outcome` alone cannot separate those two cases
+/// (`docs/findings.md` B24).
+#[derive(Clone)]
+struct Completion {
+    run: u64,
+    outcome: Outcome,
+}
+
+impl ActorState {
+    /// The latest outcome recorded for a child. The run it came from is kept
+    /// beside it (`completed`), so a reader that only wants "how did #N end"
+    /// does not have to know about run identity.
+    fn outcome(&self, id: u64) -> Option<&Outcome> {
+        self.completed
+            .get(&id)
+            .map(|completion| &completion.outcome)
+    }
 }
 
 /// A job's completion, as its owner keeps it: the line the model reads, and
@@ -718,6 +758,8 @@ fn start(actor: Actor, initial: Vec<Message>, start_immediately: bool) {
         ctx.emit(id, AgentEvent::Error(summary.clone()));
         let _ = parent_tx.send(AgentMsg::ChildDone {
             id,
+            // The run it never got to take: its first, and only.
+            run: 1,
             outcome: Outcome::Failed(summary),
         });
     }
@@ -776,8 +818,13 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
                 }
             }
         }
+        // This run is over, and this is its number: a parent that hears the
+        // same run again has heard this report twice, while a run after it is
+        // news even when the two read identically (`docs/findings.md` B24).
+        state.runs += 1;
         let _ = actor.parent_tx.send(AgentMsg::ChildDone {
             id: actor.id,
+            run: state.runs,
             outcome: outcome.clone(),
         });
         match outcome {
@@ -952,16 +999,24 @@ fn absorb(
             // puts their words between an assistant's calls and their results;
             // strict servers reject that shape.
             repair_tool_pairs(transcript);
-            let announced: Vec<u64> = state
+            // Which run each line is asked about is the completion's own run:
+            // a transcript that carries the line for the *current* record has
+            // read that record, and one that carries an older line has not. The
+            // line comes from `Outcome::line`, the one place that says all three
+            // shapes, so a replayed `#N failed: …` (or a `#N stopped: …`) is
+            // recognised exactly like a `#N done: …` — the old scan knew only
+            // the `done:` shape, so a failure read in the transcript looked
+            // unread and was folded again (`docs/findings.md` B24).
+            let announced: Vec<(u64, u64)> = state
                 .completed
-                .keys()
-                .filter(|id| {
-                    let line = format!("#{id} done:");
+                .iter()
+                .filter(|(id, completion)| {
+                    let line = completion.outcome.line(**id);
                     transcript
                         .iter()
                         .any(|message| message.text().contains(&line))
                 })
-                .copied()
+                .map(|(id, completion)| (*id, completion.run))
                 .collect();
             // Adoption may only *add* marks, never remove one. Every line this
             // actor folds is now emitted as a `Message` event, so the copy the
@@ -969,7 +1024,11 @@ fn absorb(
             // emit (the human typed in between). Un-marking a delivery the
             // model has already read would inject the same result a second
             // time; the two copies converge at the next adoption instead.
-            state.delivered.extend(announced);
+            // Adoption may only *add* marks, never move one backwards: a mark
+            // that names a *later* run than the adopted transcript holds stays.
+            for (id, run) in announced {
+                state.delivered.entry(id).or_insert(run);
+            }
             // The same question for jobs, answered on the line itself: it
             // carries the job's id, its exit status, its command and its tail,
             // so a transcript that holds it is a transcript that has read it.
@@ -1004,16 +1063,24 @@ fn absorb(
             state.compact_requested = true;
             Fold::Idle
         }
-        AgentMsg::ChildDone { id, outcome } => {
+        AgentMsg::ChildDone { id, run, outcome } => {
             // The parent ended (or napped) while a child still ran: waking it
             // with the completion restarts its run with the result folded in,
             // so an early End is not a lost result, it is a nap. The
             // completion counts as delivered because the model is about to
             // read it in this very run.
             let news = outcome.is_news();
-            let line = note_completion(state, id, outcome);
+            let line = note_completion(state, id, run, outcome);
+            // A run the model has already read is not news however often it is
+            // reported: folding it here would hand the model a line it has
+            // answered, and a result would even pay for a turn to repeat it
+            // (`docs/findings.md` B24). The record itself is kept — it is what
+            // makes a *later* run newsworthy.
+            if state.delivered.get(&id) == Some(&run) {
+                return Fold::Idle;
+            }
             push_line(actor, transcript, line);
-            state.delivered.insert(id);
+            state.delivered.insert(id, run);
             // A stopped child is the human's doing, not news that warrants
             // waking a napping parent into a fresh (paid) run: the line is in
             // the transcript for whenever the parent runs next.
@@ -1025,8 +1092,14 @@ fn absorb(
         }
         AgentMsg::CommandDone { id, line, news } => {
             // `ChildDone` for a job: the same wake, the same once-only
-            // delivery, the same "the human's stop is not a result".
+            // delivery, the same "the human's stop is not a result" — and the
+            // same silence when the report has already been read, so a report
+            // recorded again cannot repeat a line the model has answered
+            // (`docs/findings.md` B24).
             let line = note_job(state, id, line, news);
+            if state.delivered_jobs.contains(&id) {
+                return Fold::Idle;
+            }
             push_line(actor, transcript, line);
             state.delivered_jobs.insert(id);
             if news {
@@ -1720,8 +1793,8 @@ fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
                 state.shutdown = true;
                 actor.ctx.registry.kill_owned(actor.id);
             }
-            AgentMsg::ChildDone { id, outcome } => {
-                note_completion(state, id, outcome);
+            AgentMsg::ChildDone { id, run, outcome } => {
+                note_completion(state, id, run, outcome);
             }
             AgentMsg::CommandDone { id, line, news } => {
                 note_job(state, id, line, news);
@@ -1763,16 +1836,21 @@ fn drain_mailbox(
                 state.shutdown = true;
                 actor.ctx.registry.kill_owned(actor.id);
             }
-            AgentMsg::ChildDone { id, outcome } => {
-                note_completion(state, id, outcome);
+            AgentMsg::ChildDone { id, run, outcome } => {
+                note_completion(state, id, run, outcome);
             }
             // A job's report is folded into the transcript as a user message:
             // the model reads `#c2 done: exit 0 · …` in the next request, and
-            // the line is marked delivered so it is never injected twice.
+            // the line is marked delivered so it is never injected twice. A
+            // report the model has *already* read is not folded again however
+            // often it is recorded (`docs/findings.md` B24), which is what makes
+            // a replayed record cost nothing.
             AgentMsg::CommandDone { id, line, news } => {
                 let line = note_job(state, id, line, news);
-                push_line(actor, messages, line);
-                state.delivered_jobs.insert(id);
+                if !state.delivered_jobs.contains(&id) {
+                    push_line(actor, messages, line);
+                    state.delivered_jobs.insert(id);
+                }
             }
             // The UI sends a whole transcript when it believes we are idle.
             // We are mid-run, so the only new information is the message the
@@ -1790,20 +1868,30 @@ fn drain_mailbox(
     }
 }
 
-/// Record a child's completion and return the line the model reads. A fresh
-/// completion also supersedes any earlier delivery of the same child.
-fn note_completion(state: &mut ActorState, id: u64, outcome: Outcome) -> String {
+/// Record a child's completion and return the line the model reads.
+///
+/// A *newer run* supersedes the recorded outcome — a child that was stopped and
+/// then nudged finishes later, and the stale `stopped` must not outlive the
+/// result. The same run recorded again is not newer: it changes nothing, and in
+/// particular it does **not** clear the delivery mark. Clearing it there is
+/// precisely what let one outcome fold twice — the mark is a fact about what the
+/// model read, and hearing the same report again cannot make it unread
+/// (`docs/findings.md` B24: the defect was the unconditional
+/// `state.delivered.remove(&id)` that used to end this function).
+fn note_completion(state: &mut ActorState, id: u64, run: u64, outcome: Outcome) -> String {
     state.running.remove(&id);
-    // Always the latest outcome: a child that was stopped and then nudged
-    // finishes later, and the stale `stopped` must not outlive the result.
     let line = outcome.line(id);
-    state.completed.insert(id, outcome);
-    state.delivered.remove(&id);
+    if state.completed.get(&id).map(|completion| completion.run) != Some(run) {
+        state.completed.insert(id, Completion { run, outcome });
+    }
     line
 }
 
-/// The same bookkeeping for a job: it is no longer running, its report is the
-/// line the model reads, and it has not been delivered yet.
+/// The same bookkeeping for a job: it is no longer running, and its report is
+/// the line the model reads. A job ends once, under an id nothing else reuses,
+/// so a report recorded again is the *same* report: the delivery mark stands,
+/// and it is not cleared here. Clearing it unconditionally is what let a job's
+/// line fold twice (`docs/findings.md` B24, `note_completion`'s twin).
 fn note_job(state: &mut ActorState, id: u64, line: String, news: bool) -> String {
     state.running_jobs.remove(&id);
     state.done_jobs.insert(
@@ -1813,7 +1901,6 @@ fn note_job(state: &mut ActorState, id: u64, line: String, news: bool) -> String
             news,
         },
     );
-    state.delivered_jobs.remove(&id);
     line
 }
 
@@ -1866,16 +1953,16 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
     // summary it asked for, even of a child that was stopped (`Outcome::is_news`
     // decides that only for an *idle* actor, where the run it wakes has a
     // price).
-    let children: Vec<(u64, Outcome)> = state
+    let children: Vec<(u64, u64, Outcome)> = state
         .completed
         .iter()
-        .filter(|(child, _)| !state.delivered.contains(child))
-        .map(|(child, outcome)| (*child, outcome.clone()))
+        .filter(|(child, completion)| state.delivered.get(*child) != Some(&completion.run))
+        .map(|(child, completion)| (*child, completion.run, completion.outcome.clone()))
         .collect();
-    for (child, outcome) in children {
-        let line = note_completion(state, child, outcome);
+    for (child, run, outcome) in children {
+        let line = note_completion(state, child, run, outcome);
         push_line(actor, messages, line);
-        state.delivered.insert(child);
+        state.delivered.insert(child, run);
         news = true;
     }
     news
@@ -2102,10 +2189,11 @@ fn wait_tool(
         |state, id| {
             // Not always `done`: a stopped child is reported as stopped, so a
             // waiter knows there is no result yet rather than receiving one that
-            // says "cancelled".
-            let outcome = state.completed.get(&id)?.clone();
-            state.delivered.insert(id);
-            Some(outcome.line(id))
+            // says "cancelled". The mark names the run this answer came from: a
+            // run recorded *after* it is still unread, and folds then.
+            let completion = state.completed.get(&id)?.clone();
+            state.delivered.insert(id, completion.run);
+            Some(completion.outcome.line(id))
         },
     )
 }
@@ -2204,7 +2292,7 @@ fn status_tool(state: &ActorState) -> Result<String, String> {
     let mut ids: Vec<u64> = state.children.keys().copied().collect();
     ids.sort_unstable();
     for id in ids {
-        match state.completed.get(&id) {
+        match state.outcome(id) {
             // Each state gets its own mark: a stopped child was neither
             // finished (✓) nor failed (✗), and a parent that cannot tell them
             // apart treats a stop as a result.
@@ -2909,15 +2997,11 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
         let mut state = ActorState::default();
         state.children.insert(1, tx.clone());
-        state.completed.insert(1, Outcome::Stopped);
+        note_completion(&mut state, 1, 1, Outcome::Stopped);
         state.children.insert(2, tx.clone());
-        state
-            .completed
-            .insert(2, Outcome::Finished("did the thing".into()));
+        note_completion(&mut state, 2, 1, Outcome::Finished("did the thing".into()));
         state.children.insert(3, tx);
-        state
-            .completed
-            .insert(3, Outcome::Failed("no route".into()));
+        note_completion(&mut state, 3, 1, Outcome::Failed("no route".into()));
 
         let lines = status_tool(&state).unwrap();
         assert!(lines.contains("#1 ⊘ stopped"), "a stop is not a ✓: {lines}");
@@ -2964,6 +3048,7 @@ mod tests {
                 &mut messages,
                 AgentMsg::ChildDone {
                     id: 1,
+                    run: 1,
                     outcome: Outcome::Stopped
                 }
             ),
@@ -2978,6 +3063,7 @@ mod tests {
                 &mut messages,
                 AgentMsg::ChildDone {
                     id: 1,
+                    run: 2,
                     outcome: Outcome::Finished("all done".into())
                 }
             ),
@@ -3055,9 +3141,7 @@ mod tests {
     fn adoption_does_not_re_arm_a_delivery_that_already_happened() {
         let (actor, _mailbox) = test_actor("stale-copy");
         let mut state = ActorState::default();
-        state
-            .completed
-            .insert(1, Outcome::Finished("did the thing".into()));
+        note_completion(&mut state, 1, 1, Outcome::Finished("did the thing".into()));
         let mut messages = vec![Message::system("you are mush")];
         assert!(fold_completions(&actor, &mut state, &mut messages));
 
@@ -3069,7 +3153,7 @@ mod tests {
             Fold::Run
         ));
         assert!(
-            state.delivered.contains(&1),
+            state.delivered.get(&1) == Some(&1),
             "the model has read it, whatever the copy says"
         );
         assert!(
@@ -3206,15 +3290,16 @@ mod tests {
 
     /// A child that was stopped and then resumed finishes later; the stale
     /// `stopped` must not outlive the result, or the parent waits on a stop
-    /// forever.
+    /// forever. The two outcomes are two *runs*: the same run reported again is
+    /// the same news, a later run is not (finding B24).
     #[test]
     fn a_later_finish_replaces_a_stale_stop() {
         let mut state = ActorState::default();
-        note_completion(&mut state, 1, Outcome::Stopped);
-        assert_eq!(state.completed.get(&1), Some(&Outcome::Stopped));
-        let line = note_completion(&mut state, 1, Outcome::Finished("done now".into()));
+        note_completion(&mut state, 1, 1, Outcome::Stopped);
+        assert_eq!(state.outcome(1), Some(&Outcome::Stopped));
+        let line = note_completion(&mut state, 1, 2, Outcome::Finished("done now".into()));
         assert_eq!(
-            state.completed.get(&1),
+            state.outcome(1),
             Some(&Outcome::Finished("done now".into()))
         );
         assert_eq!(line, "#1 done: done now");
@@ -3251,10 +3336,8 @@ mod tests {
         let (actor, _mailbox) = test_actor("delivered-yes");
         let mut state = ActorState::default();
         let mut messages = Vec::new();
-        state
-            .completed
-            .insert(1, Outcome::Finished("did the thing".into()));
-        state.delivered.insert(1);
+        note_completion(&mut state, 1, 1, Outcome::Finished("did the thing".into()));
+        state.delivered.insert(1, 1);
         let fresh = vec![
             Message::system("you are mush"),
             Message::user("task"),
@@ -3267,7 +3350,7 @@ mod tests {
             Fold::Run
         ));
         assert!(
-            state.delivered.contains(&1),
+            state.delivered.contains_key(&1),
             "the model reads it in the transcript, so it is already delivered"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
@@ -3286,9 +3369,12 @@ mod tests {
     fn a_child_completion_is_delivered_once_across_an_idle_run() {
         let (actor, events, _mailbox) = recording_actor("once-child");
         let mut state = ActorState::default();
-        state
-            .completed
-            .insert(1, Outcome::Finished("wrote the parser".into()));
+        note_completion(
+            &mut state,
+            1,
+            1,
+            Outcome::Finished("wrote the parser".into()),
+        );
         let mut messages = vec![Message::system("you are mush")];
 
         assert!(fold_completions(&actor, &mut state, &mut messages));
@@ -3363,6 +3449,282 @@ mod tests {
                 .count(),
             1,
             "one job completion, one line"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The human's shape, seen live (`docs/findings.md` B24): a parent folds a
+    /// child's failure, so the model has read it — and then the *same run* is
+    /// reported again, which used to clear the delivery mark (`note_completion`
+    /// ended with an unconditional `state.delivered.remove`) and hand the model
+    /// the failure it had just answered a second time.
+    ///
+    /// A *later* run of the same child is a different matter, and is covered by
+    /// `a_second_run_failing_the_same_way_is_news_again`: that one is genuinely
+    /// new news even when it reads identically.
+    #[test]
+    fn a_child_run_reported_again_is_not_folded_twice() {
+        let (actor, _events, mailbox) = recording_actor("re-reported");
+        let mut state = ActorState::default();
+        let mut messages = vec![Message::system("you are mush")];
+        let error = "Connection reset by peer (os error 104)";
+        let line = format!("#2 failed: {error}");
+
+        // The child fails while the parent naps: the record is delivered, and
+        // the model reads it in the run it starts.
+        assert!(matches!(
+            absorb(
+                &actor,
+                &mut state,
+                &mut messages,
+                AgentMsg::ChildDone {
+                    id: 2,
+                    run: 1,
+                    outcome: Outcome::Failed(error.into()),
+                }
+            ),
+            Fold::Run
+        ));
+        assert_eq!(messages.last().unwrap().text(), line);
+
+        // The same run arrives a second time — the re-record. This is the road
+        // the defect lived on: the *recording* path cleared the mark on its way
+        // past, so the next boundary folded a line the model had already
+        // answered into the transcript again.
+        mailbox
+            .send(AgentMsg::ChildDone {
+                id: 2,
+                run: 1,
+                outcome: Outcome::Failed(error.into()),
+            })
+            .unwrap();
+        drain_mailbox(&actor, &AtomicBool::new(false), &mut messages, &mut state);
+        assert!(
+            !fold_completions(&actor, &mut state, &mut messages),
+            "a run the model has read is not news when it is reported again"
+        );
+        assert_eq!(
+            messages.iter().filter(|m| m.text() == line).count(),
+            1,
+            "one failure, one line: {messages:?}"
+        );
+
+        // And the same message absorbed by an idle actor is the same news: no
+        // line pushed, and no run paid for to repeat it.
+        assert!(matches!(
+            absorb(
+                &actor,
+                &mut state,
+                &mut messages,
+                AgentMsg::ChildDone {
+                    id: 2,
+                    run: 1,
+                    outcome: Outcome::Failed(error.into()),
+                }
+            ),
+            Fold::Idle
+        ));
+        assert_eq!(messages.iter().filter(|m| m.text() == line).count(), 1);
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The batch the human saw: three children failed while the parent worked,
+    /// one of them had already been answered through `wait_agents`, and then
+    /// the records were replayed. Before the fix the next boundary pushed the
+    /// answered failure as well — a second copy of a line the model had just
+    /// been told, in a message that read as freshly replayed news.
+    #[test]
+    fn a_replayed_batch_delivers_each_unread_outcome_once() {
+        let (actor, mailbox) = test_actor("replayed-batch");
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![Message::system("you are mush")];
+        let error = "Connection reset by peer (os error 104)";
+        for id in [4u64, 5, 6] {
+            let (tx, _rx) = crossbeam_channel::unbounded();
+            state.children.insert(id, tx);
+            mailbox
+                .send(AgentMsg::ChildDone {
+                    id,
+                    run: 1,
+                    outcome: Outcome::Failed(error.into()),
+                })
+                .unwrap();
+        }
+        // Mid-run: recorded where the boundary can see them, and folded nowhere
+        // yet (a completion is a user message, which belongs after a batch's
+        // results, not between calls and them).
+        drain_signals(&actor, &cancel, &mut state);
+        assert_eq!(messages.len(), 1, "nothing is folded between tool calls");
+
+        // The model asks for #4's result first: the wait answers with the line
+        // and that answer is what the model has read.
+        let answered = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::WaitAgents,
+            &json!({ "ids": [4], "timeout": 5 }),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(answered, format!("#4 failed: {error}"));
+        assert_eq!(
+            state.delivered.get(&4),
+            Some(&1),
+            "an answer from `wait_agents` is a delivery"
+        );
+
+        // And now every record is sent again — the replay.
+        for id in [4u64, 5, 6] {
+            mailbox
+                .send(AgentMsg::ChildDone {
+                    id,
+                    run: 1,
+                    outcome: Outcome::Failed(error.into()),
+                })
+                .unwrap();
+        }
+        drain_mailbox(&actor, &AtomicBool::new(false), &mut messages, &mut state);
+
+        assert!(
+            fold_completions(&actor, &mut state, &mut messages),
+            "the two results nobody has read are still news"
+        );
+        let folded: Vec<&str> = messages.iter().map(Message::text).collect();
+        assert_eq!(
+            folded
+                .iter()
+                .filter(|line| line.starts_with("#4 failed"))
+                .count(),
+            0,
+            "the failure the wait answered with is not folded again: {folded:?}"
+        );
+        for id in [5u64, 6] {
+            let line = format!("#{id} failed: {error}");
+            assert_eq!(
+                folded.iter().filter(|folded| **folded == line).count(),
+                1,
+                "one line for #{id}: {folded:?}"
+            );
+        }
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// Two runs, the same failure text: the second is news, and folds once of
+    /// its own. This is what makes plain `Outcome` equality (or a scan for the
+    /// line) the wrong identity for a delivery — it would swallow a real second
+    /// failure, or swallow the first and repeat the second.
+    #[test]
+    fn a_second_run_failing_the_same_way_is_news_again() {
+        let (actor, _mailbox) = test_actor("same-text-twice");
+        let mut state = ActorState::default();
+        let mut messages = vec![Message::system("you are mush")];
+        let error = "Connection reset by peer (os error 104)";
+        let line = format!("#3 failed: {error}");
+
+        for run in 1..=2 {
+            assert!(matches!(
+                absorb(
+                    &actor,
+                    &mut state,
+                    &mut messages,
+                    AgentMsg::ChildDone {
+                        id: 3,
+                        run,
+                        outcome: Outcome::Failed(error.into()),
+                    }
+                ),
+                Fold::Run
+            ));
+            assert_eq!(messages.last().unwrap().text(), line);
+            assert!(
+                !fold_completions(&actor, &mut state, &mut messages),
+                "run {run} is folded once, not again at the next boundary"
+            );
+        }
+        assert_eq!(
+            messages.iter().filter(|m| m.text() == line).count(),
+            2,
+            "two runs, two failures, told twice: {messages:?}"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// Adoption asks "has this transcript already read this child?", and the
+    /// answer has to be yes for all three shapes `Outcome::line` writes. The
+    /// scan knew only `#N done:`, so a replayed failure — or a stop — read as
+    /// unread and was folded in again (`docs/findings.md` B24).
+    #[test]
+    fn adoption_reads_a_failed_or_stopped_line_as_delivered() {
+        let (actor, _mailbox) = test_actor("adopt-shapes");
+        let mut state = ActorState::default();
+        note_completion(&mut state, 2, 1, Outcome::Failed("no route".into()));
+        note_completion(&mut state, 3, 1, Outcome::Stopped);
+        let mut messages = Vec::new();
+        let fresh = vec![
+            Message::system("you are mush"),
+            Message::user("task"),
+            Message::tool("a", "#2 failed: no route"),
+            Message::tool("b", Outcome::Stopped.line(3)),
+        ];
+        assert!(matches!(
+            absorb(&actor, &mut state, &mut messages, AgentMsg::Run(fresh)),
+            Fold::Run
+        ));
+        assert_eq!(
+            state.delivered.get(&2),
+            Some(&1),
+            "a failed line is a completion the model has read"
+        );
+        assert_eq!(state.delivered.get(&3), Some(&1), "and so is a stopped one");
+        assert!(
+            !fold_completions(&actor, &mut state, &mut messages),
+            "so neither is folded in a second time"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The job half of the same rule: a report the model has read is not folded
+    /// again when the same record arrives a second time. `note_job` cleared the
+    /// mark exactly as `note_completion` did, and the boundary that folds a job
+    /// straight into the transcript pushed it without asking either.
+    #[test]
+    fn a_job_report_recorded_again_is_not_folded_twice() {
+        let (actor, _events, mailbox) = recording_actor("re-reported-job");
+        let mut state = ActorState::default();
+        state.running_jobs.insert(1);
+        let mut messages = vec![Message::system("you are mush")];
+        let line = "#c1 done: exit 0 · 3m12s · cargo test — test result: ok";
+        let report = || AgentMsg::CommandDone {
+            id: 1,
+            line: line.into(),
+            news: true,
+        };
+
+        assert!(matches!(
+            absorb(&actor, &mut state, &mut messages, report()),
+            Fold::Run
+        ));
+        assert_eq!(messages.last().unwrap().text(), line);
+
+        // The record arrives again while the owner is mid-run, so it is only
+        // *recorded* for the boundary: `note_job` used to drop the mark there.
+        mailbox.send(report()).unwrap();
+        drain_signals(&actor, &AtomicBool::new(false), &mut state);
+        assert!(
+            !fold_completions(&actor, &mut state, &mut messages),
+            "a report the model has read is not news again"
+        );
+        assert_eq!(messages.iter().filter(|m| m.text() == line).count(), 1);
+
+        // And the boundary that folds a job's line itself asks the same
+        // question before pushing it.
+        mailbox.send(report()).unwrap();
+        drain_mailbox(&actor, &AtomicBool::new(false), &mut messages, &mut state);
+        assert_eq!(
+            messages.iter().filter(|m| m.text() == line).count(),
+            1,
+            "one report, one line: {messages:?}"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
@@ -4039,12 +4401,20 @@ mod tests {
         for id in [1u64, 2] {
             state.children.insert(id, child.clone());
         }
-        state
-            .completed
-            .insert(1, Outcome::Finished("wrote the parser".into()));
-        state
-            .completed
-            .insert(2, Outcome::Failed("no route".into()));
+        state.completed.insert(
+            1,
+            Completion {
+                run: 1,
+                outcome: Outcome::Finished("wrote the parser".into()),
+            },
+        );
+        state.completed.insert(
+            2,
+            Completion {
+                run: 1,
+                outcome: Outcome::Failed("no route".into()),
+            },
+        );
 
         let first = exec_tool(
             &actor,
@@ -5398,9 +5768,7 @@ mod tests {
         let (actor, events, _mailbox) = recording_actor("fold-boundary");
         let mut state = ActorState::default();
         state.deferred.push(AgentMsg::Nudge("steer".into()));
-        state
-            .completed
-            .insert(1, Outcome::Finished("did the thing".into()));
+        note_completion(&mut state, 1, 1, Outcome::Finished("did the thing".into()));
         let mut messages = vec![
             Message::system("you are mush"),
             Message::assistant("working"),
@@ -5411,7 +5779,10 @@ mod tests {
             "a child's result is worth a turn"
         );
         assert_eq!(messages.last().unwrap().text(), "#1 done: did the thing");
-        assert!(state.delivered.contains(&1), "and it counts as delivered");
+        assert!(
+            state.delivered.contains_key(&1),
+            "and it counts as delivered"
+        );
 
         // A job's report travels the same road, and is news only when the job
         // ended on its own.
@@ -5518,6 +5889,7 @@ mod tests {
         root_tx
             .send(AgentMsg::ChildDone {
                 id: 1,
+                run: 1,
                 outcome: Outcome::Finished("did the thing".into()),
             })
             .unwrap();
@@ -5576,9 +5948,7 @@ mod tests {
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
         // A completion that arrived between boundaries and has not been folded
         // into the model's transcript yet.
-        state
-            .completed
-            .insert(1, Outcome::Finished("did the thing".into()));
+        note_completion(&mut state, 1, 1, Outcome::Finished("did the thing".into()));
 
         let fresh = vec![Message::system("you are mush"), Message::user("carry on")];
         assert!(matches!(
@@ -5586,7 +5956,7 @@ mod tests {
             Fold::Run
         ));
         assert!(
-            !state.delivered.contains(&1),
+            !state.delivered.contains_key(&1),
             "the model has not read it yet"
         );
         assert!(
@@ -5669,6 +6039,7 @@ mod tests {
         mailbox
             .send(AgentMsg::ChildDone {
                 id: 1,
+                run: 1,
                 outcome: Outcome::Finished("wrote the parser".into()),
             })
             .unwrap();
@@ -5698,9 +6069,12 @@ mod tests {
         let (actor, _mailbox) = test_actor("delivered-once");
         let mut state = ActorState::default();
         let mut messages = vec![Message::system("you are mush")];
-        state
-            .completed
-            .insert(1, Outcome::Finished("wrote the parser".into()));
+        note_completion(
+            &mut state,
+            1,
+            1,
+            Outcome::Finished("wrote the parser".into()),
+        );
 
         assert!(fold_completions(&actor, &mut state, &mut messages));
         assert_eq!(messages.len(), 2, "one line for the one completion");
