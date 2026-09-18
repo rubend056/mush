@@ -462,3 +462,42 @@ Still open from the sort, all Tier 3 — no run dies and no surface lies: **H6**
 (the load-sensitive frame test), **H10** (prune), **H12** (per-agent
 accounting), **A7**'s missing test, **V7**'s sweep blind spots, and the refactor
 queue's `D9`, `D10`, `R9`, `R10`, `R26`–`R29`.
+
+---
+
+## 8.11 The agent-contract audit (`d8c75e2`..`00571b4`)
+
+A subagent read the working tree (read-only) for claims **an agent reads** that
+the code does not honour — prompts, schemas, tool results, refusals — after the
+prompt/schema dedup pass. It verified ~15 claims sound (delivery once per run,
+wrap-up and truncation answering "was not run", base spawns, job reports,
+edit-batch semantics, path enforcement, wait defaults) and found the rows
+below, all now fixed:
+
+| What an agent read | What the code did | Closed by |
+|---|---|---|
+| the resume story: a message to an at-rest child starts a run | a resume never re-entered the parent's `running` book, so a wait answered the stale result, `agent_status` said stopped while the child worked, and the one-shared-child guard could be bypassed by a resume — two shared children in one tree | `cec9713`: `control_tool` re-arms the book and the UI sends `AgentMsg::ChildRunning` on a human nudge |
+| "any command that outlives 60s detaches by itself" | auto-detach needs a free job slot (8 machine-wide); with none, a long command was killed at 120 s, and a launch refused at the deadline threw the output away | `ab90c68`: the output is snapshotted before hand-over, a refused launch reports "ran Ns, could not become a job," and a no-room timeout names the budget |
+| "wait_agents blocks until a child finishes" | it returned the first *recorded* result, even one already read, while a sibling still ran | `cec9713`: while a candidate runs only an unread result is ready; a fresh result outranks an already-read one for the single answer |
+| "An isolated subagent works in its own copy" | degraded isolation reached the child's brief and a human notice, but the parent's tool result only omitted `on mush/N` | `3e006c5`: the result carries `(isolated unavailable: …; running in place)` |
+| a sibling's lock refusal advised `wait_commands` | no tool can wait on another agent's job | `3e006c5`: it says do not retry in a loop, do other work and try once after |
+| depth-1/2 agents have the orchestration tools | the delegation policy lived only in the root prompt, and `brief` had no description | `3e006c5`: one `DELEGATION` block, included exactly when the subagent gets the tools |
+| "only one shared child may run at a time" | the guard counted *any* running sibling, so an isolated one blocked a shared spawn with a false sentence | `cec9713`: only children that share the workspace count, and the refusal names the one that blocks |
+| the file tools read any path | `list_files` hid every dotfile (`.github/`, `.gitignore`) and stopped at its limit silently | `3e006c5`: dotfiles are listed (build/VCS dirs still skipped) and the limit is reported |
+| "Read a file." | a capped read gave no size and no way to the rest | `3e006c5`: "N of M bytes shown … `sed -n`" |
+| "cut off … 4 times in a row" | the counter never reset, so scattered truncations were called consecutive | `00571b4` |
+
+**Deliberately left, each for a stated reason:** a *stopped* child does not wake
+its parent (`Outcome::is_news` — the human's stop is not news, and the line is
+in the transcript for the next run); the loop guard still counts a timed-out
+wait as an unchanged repeat (no result changed, which is what the guard is for,
+and a run gets six waits, not one); the root's lock exemption is learned from
+the result note rather than stated in advance; and `RUNAWAY_TURNS`'s wrap-up
+turn explains itself when it fires.
+
+**Census at `00571b4`** (the six commits above plus the dedup): total 42,448
+(was 41,875), **prod 7,808 (+25)**, tests 22,065 (+374), comments 9,804
+(+142). Test-heavy on purpose: every trip-level row has a test that fails
+without its fix. The audit itself ran against a `prompt.rs` that was being
+edited by hand, so its prompt quotes are a snapshot; the executor-side rows are
+not.
