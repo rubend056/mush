@@ -1517,6 +1517,20 @@ impl App {
     /// `Enter` on a row, `edit` is the message box and the send — so the
     /// socket cannot reach a state the human could not.
     pub fn handle_attach(&mut self, from: &str, request: &attach::Request) -> attach::Response {
+        // A client's op is not the human's own key. A key means the human
+        // changed their mind, and every door a key takes a quit's warning back
+        // through is a deliberate [`Self::disarm_quit`]; a client's `focus`,
+        // draft or send must not end a confirmation the human is in the middle
+        // of. The warning *is* the arm (finding H9), so an op that says its own
+        // line would cancel the press they are holding — so the warning is put
+        // back exactly as it stood, same `set_at`, so it still fades when it
+        // would have. The client's answer travels on the socket it asked from.
+        //
+        // A *failure* the op caused is not put back under: it is the thing the
+        // human has to read (`chat::Rank::Alert`, the rank the warning holds
+        // too), and the bar has one row for the two — overwriting it would lose
+        // the op's own failure entirely (findings §6, H9).
+        let armed_quit = self.status.clone().filter(|_| self.quit_armed());
         let reply = match &request.op {
             attach::Op::Read { agent, since } => self.attach_read(*agent, *since),
             attach::Op::Agents => self.attach_agents(),
@@ -1528,6 +1542,13 @@ impl App {
                 send,
             } => self.attach_edit(from, *agent, *base, text, *send),
         };
+        if let Some(warning) = armed_quit {
+            let said = self.status.as_ref().map(|status| status.kind);
+            if !matches!(said, Some(StatusKind::Error)) {
+                self.status = Some(warning);
+                self.dirty_screen = true;
+            }
+        }
         attach::Response {
             id: request.id.clone(),
             reply,
@@ -8822,6 +8843,87 @@ mod tests {
             &attach_request(4, attach::Op::Focus { agent: 9 }),
         ));
         assert_eq!(error.kind, "bad_request");
+    }
+
+    /// A client's op is not the human's own key. The warning a `Ctrl-Q` armed
+    /// *is* the arm (finding H9), so an op that says its own line — `focus`'s
+    /// agent line, `edit`'s draft line — must not take the human's confirmation
+    /// out from under them; the second press is still theirs (findings §6).
+    #[test]
+    fn an_attach_op_does_not_disarm_the_humans_quit() {
+        let (mut app, _rx) = test_app("attach-quit-arm");
+        spawn_agent(&mut app, 1, 0, 1, "port the parser", None);
+        begin_run(&mut app, AgentId(1));
+
+        ctrl(&mut app, 'q');
+        assert!(app.quit_armed(), "a live agent's run armed the quit");
+        let warning = text_of(&app).to_string();
+
+        let body = attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(1, attach::Op::Focus { agent: 1 }),
+        ));
+        assert_eq!(body, serde_json::json!({}), "the op still did its work");
+        assert_eq!(app.tree.focused, AgentId(1), "the client moved the pane");
+        assert!(app.quit_armed(), "and the human's warning is still there");
+        assert_eq!(text_of(&app), warning, "word for word, and with its clock");
+
+        attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(
+                2,
+                attach::Op::Edit {
+                    agent: 1,
+                    base: app.chat.revision(AgentId(1)),
+                    text: "half typed".to_string(),
+                    send: false,
+                },
+            ),
+        ));
+        assert!(app.quit_armed(), "a draft does not take it either");
+        assert_eq!(text_of(&app), warning);
+
+        ctrl(&mut app, 'q');
+        assert!(
+            app.should_quit,
+            "the press the human was holding still ends it"
+        );
+    }
+
+    /// The one line an op may take the warning with: a failure of its own.
+    /// `Rank::Alert` is the rank the warning holds too, and the bar has one row
+    /// for the two — so the client's failure reaches the human, and the arm
+    /// goes with the line it lives on, as any other failure does (findings §6).
+    #[test]
+    fn an_attach_failure_lands_over_the_humans_warning() {
+        let (mut app, _rx) = test_app("attach-quit-failure");
+        // A node whose actor is gone: `spawn_agent` drops the mailbox, so the
+        // send this op is about to take fails the way a dead agent's does.
+        spawn_agent(&mut app, 1, 0, 1, "port the parser", None);
+        begin_run(&mut app, AgentId(1));
+
+        ctrl(&mut app, 'q');
+        assert!(app.quit_armed());
+
+        attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(
+                3,
+                attach::Op::Edit {
+                    agent: 1,
+                    base: app.chat.revision(AgentId(1)),
+                    text: "are you there?".to_string(),
+                    send: true,
+                },
+            ),
+        ));
+
+        assert_eq!(
+            text_of(&app),
+            "agent #1 is gone",
+            "the op's own failure is what the human reads"
+        );
+        assert!(!app.quit_armed(), "and the line it lives on went with it");
     }
 
     /// A read's revision is only meaningful inside one conversation. Ctrl-N
