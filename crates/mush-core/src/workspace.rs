@@ -221,6 +221,27 @@ mod tests {
         Workspace::new(&dir).unwrap()
     }
 
+    /// A path that is not under the root is shown as it is: a workspace opened
+    /// as another directory must not have a real path rewritten into a relative
+    /// one that means something else. This is the one elision rule — the session
+    /// notice reads it rather than keeping its own copy (refactor R17).
+    #[test]
+    fn a_path_outside_the_workspace_is_shown_whole() {
+        let ws = temp_workspace("rel");
+        assert_eq!(
+            ws.rel(Path::new("/elsewhere/session.json")),
+            "/elsewhere/session.json"
+        );
+        assert_eq!(
+            ws.rel(&ws.root().join(".mush/session.json.bak.2")),
+            ".mush/session.json.bak.2"
+        );
+        // And the rule folds `\` to `/`: a path built on Windows, or a name a
+        // model wrote, reads with the one separator — which the second rule
+        // did not do.
+        assert_eq!(ws.rel(&ws.root().join("a\\b")), "a/b");
+    }
+
     #[test]
     fn resolve_rejects_escapes_and_absolutes() {
         let ws = temp_workspace("resolve");
