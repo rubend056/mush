@@ -433,6 +433,18 @@ pub enum AgentEvent {
     /// The run was stopped by a request (a Stop, Ctrl-C, `/new`). The actor is
     /// still alive, so the row goes quiet instead of claiming a failure.
     Stopped,
+    /// The parent has read a child's result: the line is in its transcript now,
+    /// wherever it came from — the fold at a message boundary, the wake-up a
+    /// napping parent got, or a `wait_agents` that asked for it.
+    ///
+    /// Emitted by the *parent* (the id it is tagged with) about the child it
+    /// names, because the parent owns the `delivered` set. This is that fact
+    /// leaving the actor, so the child's row can stop wearing `✉` on the
+    /// parent's reading rather than on a guess from the shape of the rows
+    /// (finding H4).
+    ResultRead {
+        child: u64,
+    },
     Error(String),
     /// A job this agent started began running in the background. The registry
     /// is where a job lives; this is only what tells the screen to look at it.
@@ -1228,6 +1240,13 @@ fn absorb(
             }
             push_line(actor, transcript, line);
             state.delivered.insert(id, run);
+            // The line is in this parent's transcript now, so the child's row
+            // stops claiming nobody has read it — the one moment that fact
+            // changes hands, told to the UI from the actor that owns it
+            // (finding H4).
+            actor
+                .ctx
+                .emit(actor.id, AgentEvent::ResultRead { child: id });
             // A stopped child is the human's doing, not news that warrants
             // waking a napping parent into a fresh (paid) run: the line is in
             // the transcript for whenever the parent runs next.
@@ -2258,6 +2277,7 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
         let line = note_completion(state, child, run, outcome);
         push_line(actor, messages, line);
         state.delivered.insert(child, run);
+        actor.ctx.emit(actor.id, AgentEvent::ResultRead { child });
         news = true;
     }
     news
@@ -2514,6 +2534,11 @@ fn wait_tool(
             // run recorded *after* it is still unread, and folds then.
             let completion = state.completed.get(&id)?.clone();
             state.delivered.insert(id, completion.run);
+            // A `wait_agents` that asked for the result is a parent reading it,
+            // by definition, so the child's `✉` goes out with the line.
+            actor
+                .ctx
+                .emit(actor.id, AgentEvent::ResultRead { child: id });
             Some(completion.outcome.line(id))
         },
     )
@@ -3765,6 +3790,64 @@ mod tests {
             roles(&messages),
             ["system", "user", "assistant", "tool", "user"]
         );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The other half of a delivery, on every road the line can take into a
+    /// parent's transcript: the UI is told that the parent has *read* it, which
+    /// is the one fact the child's row cannot derive from its own phase — and
+    /// the one the human's question is about ("did #2 see #6?"). The actor owns
+    /// it (`delivered`), so the actor is what says so (finding H4).
+    #[test]
+    fn a_result_the_parent_has_read_is_reported_to_the_ui() {
+        let (actor, events, _mailbox) = recording_actor("read-report");
+        let read = |events: &Recorder| {
+            events
+                .events_for(AgentId(7))
+                .into_iter()
+                .filter_map(|event| match event {
+                    AgentEvent::ResultRead { child } => Some(child),
+                    _ => None,
+                })
+                .collect::<Vec<u64>>()
+        };
+
+        // 1. The idle road: a napping parent is woken by the completion and
+        //    folds it before the run it starts.
+        let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let mut state = ActorState::default();
+        state.children.insert(1, tx.clone());
+        state.children.insert(2, tx.clone());
+        state.children.insert(3, tx);
+        let mut messages = vec![Message::system("you are mush")];
+        assert!(matches!(
+            absorb(
+                &actor,
+                &mut state,
+                &mut messages,
+                AgentMsg::ChildDone {
+                    id: 1,
+                    run: 1,
+                    outcome: Outcome::Finished("did it".into())
+                }
+            ),
+            Fold::Run
+        ));
+        assert_eq!(read(&events), vec![1], "the wake-up is a reading");
+
+        // 2. The mid-run road: the completion is recorded while a tool call is
+        //    in flight and folded at the next message boundary.
+        note_completion(&mut state, 2, 1, Outcome::Finished("and this".into()));
+        assert!(fold_completions(&actor, &mut state, &mut messages));
+        assert_eq!(read(&events), vec![1, 2], "the fold is a reading too");
+
+        // 3. The road the model asked for: `wait_agents` hands the result over
+        //    itself, so the mark goes out with the line.
+        note_completion(&mut state, 3, 1, Outcome::Finished("waited for".into()));
+        let cancel = AtomicBool::new(false);
+        let waited = wait_tool(&actor, &mut state, &cancel, &json!({ "ids": [3] })).unwrap();
+        assert!(waited.contains("#3 done"), "{waited}");
+        assert_eq!(read(&events), vec![1, 2, 3], "and so is a wait");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 

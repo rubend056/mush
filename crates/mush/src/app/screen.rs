@@ -180,6 +180,13 @@ pub struct AgentRow {
     pub focused: bool,
     /// Children whose own run is in flight, drawn as `⏸N`.
     pub waiting: usize,
+    /// This agent's own is in the list and its parent has not read its result
+    /// yet, drawn as `✉` (finding H4).
+    pub result_unread: bool,
+    /// How many of this agent's children's results it owes a read on, drawn as
+    /// `✉N`: the same fact as the children's own `✉`, read from the other end,
+    /// and the one that survives a pane too short to show their rows.
+    pub unread_children: usize,
     pub title: String,
     /// The branch, its delta and any jobs: `mush/3 +12−4 ⚙1`.
     pub place: String,
@@ -411,12 +418,22 @@ impl App {
             }
             place.push_str(&format!("⚙{jobs}"));
         }
+        // Two more facts, both marks rather than text, because a row is a
+        // glance: `✉` on a result its parent has not read, and `✉N` for how many
+        // of this agent's own children's results *it* has not read. One fact
+        // read from either end — the child's mark says which result, the
+        // parent's count says who is owed a read (finding H4). The value is
+        // derived here, from the tree, because it is a fact about the agent and
+        // not a decision about the frame: the painter only fits it into the
+        // columns it has.
         AgentRow {
             id: node.id,
             depth: node.depth,
             glyph: phase_glyph(&node.phase),
             focused: self.tree.focused == node.id,
             waiting: self.tree.busy_children(node.id),
+            result_unread: node.result_unread,
+            unread_children: self.tree.unread_children(node.id).len(),
             title: node.title(),
             place,
             activity: phase_detail(node),
@@ -751,6 +768,17 @@ fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>>
             dim(),
         )));
     }
+    // The selected row's unread results, in full. A mark is a glance and this is
+    // the sentence under it: which results nobody has read yet, and by whom —
+    // the question a human arrives at the pane with ("did #2 see #6?"), which
+    // one envelope on one row cannot answer for a tree of twelve (finding H4).
+    let unread = unread_footer(app, node);
+    if !unread.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(" {}", truncate(&unread, width.saturating_sub(2))),
+            dim(),
+        )));
+    }
     // The selected row's jobs, in full: which command, how long, and whether it
     // is the one holding the machine. Read from the same registry the row's
     // count comes from, so the two can never disagree.
@@ -766,6 +794,48 @@ fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>>
         )));
     }
     lines
+}
+
+/// What the selected row's `✉` marks mean, spelled out: its own result if its
+/// parent has not read it, and how many of its children's results it owes a
+/// read on.
+///
+/// Derived from the nodes here rather than stored beside them, so the sentence
+/// and the marks are the same fact twice read (finding H4). It lives in this
+/// module because it is a derived value like every other one the frame paints;
+/// `ui.rs` never sees `App` (refactor B17).
+fn unread_footer(app: &App, node: &AgentNode) -> String {
+    /// How many ids a list names before it counts the rest: three is what fits a
+    /// row of the footer at the pane's narrowest, and the count behind it is
+    /// what a human needs next. The same shape the hidden-row counts use.
+    const NAMED: usize = 3;
+
+    let named = |ids: &[AgentId]| {
+        let head = ids
+            .iter()
+            .take(NAMED)
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if ids.len() > NAMED {
+            format!("{head} +{}", ids.len() - NAMED)
+        } else {
+            head
+        }
+    };
+
+    let mut parts = Vec::new();
+    if node.result_unread {
+        parts.push(match node.parent {
+            Some(parent) => format!("✉ result unread by #{parent}"),
+            None => "✉ result unread".to_string(),
+        });
+    }
+    let owed = app.tree.unread_children(node.id);
+    if !owed.is_empty() {
+        parts.push(format!("✉{} unread from {}", owed.len(), named(&owed)));
+    }
+    parts.join(" · ")
 }
 
 /// Where an isolated agent's work is — or where it went. Pure, so the row's
@@ -951,6 +1021,7 @@ mod tests {
             summary: None,
             leftover: false,
             landed: None,
+            result_unread: false,
         }
     }
 

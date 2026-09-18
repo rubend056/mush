@@ -352,6 +352,17 @@ pub struct AgentNode {
     pub leftover: bool,
     /// Set once `/merge` or `/discard` reclaimed the worktree.
     pub landed: Option<Landed>,
+    /// The agent's last run ended and its parent has not read the result yet.
+    ///
+    /// It is a *mirror* of the actor's own `delivered` set — the one owner of
+    /// "has the model read this line" — kept here because the row has to paint
+    /// it every frame, and it is only ever moved by events from that owner
+    /// ([`AgentTree::result_read`], which the parent's actor emits as it hands
+    /// the line over) or by the thing that supersedes the result itself (a new
+    /// run, exactly as `note_completion` re-arms a delivery). Nothing else
+    /// clears it, so a `✉` means one thing: the parent has not read this yet
+    /// (finding H4).
+    pub result_unread: bool,
 }
 
 impl AgentNode {
@@ -555,6 +566,8 @@ impl AgentTree {
             branch: None,
             summary: None,
             leftover: false,
+            // The root has no parent, so there is nobody to read its result.
+            result_unread: false,
             landed: None,
         });
         tree
@@ -613,6 +626,8 @@ impl AgentTree {
             summary: None,
             leftover: false,
             landed: None,
+            // Its run has not produced anything yet: there is no result to read.
+            result_unread: false,
         });
         Opened {
             id: spawn.id,
@@ -638,6 +653,11 @@ impl AgentTree {
             summary: node.summary,
             leftover: node.leftover,
             landed: node.landed,
+            // Nothing here was read by anybody: a restored result was never
+            // handed to a parent *in this process*, so there is no fact to
+            // paint. Claiming `✉` would be a guess about a conversation the file
+            // does not record (finding H4).
+            result_unread: false,
         });
     }
 
@@ -658,6 +678,10 @@ impl AgentTree {
             node.phase = Phase::Thinking;
             node.since = Instant::now();
             node.summary = None;
+            // A new run supersedes the last result — the actor's
+            // `note_completion` re-arms delivery for exactly this reason — so
+            // the mark that result wore goes with it.
+            node.result_unread = false;
             // A landed agent that runs again is not a landed agent: its
             // worktree is gone (which is why `land` cleared the branch), so the
             // new run happens in the main checkout, and a footer still saying
@@ -774,19 +798,24 @@ impl AgentTree {
     /// long ago (finding B14). An empty reply replaces it with nothing.
     pub fn finish(&mut self, id: AgentId, summary: Option<String>) {
         if let Some(node) = self.node_mut(id) {
+            let unread = node.parent.is_some();
             node.phase = Phase::Done;
             node.since = Instant::now();
             node.summary = summary;
+            node.result_unread = unread;
         }
         self.agent_cancel.remove(&id);
     }
 
     /// The run failed: the error is what the human has to read, and it is the
-    /// phase until a later run replaces it.
+    /// phase until a later run replaces it. A failure is a result like any
+    /// other, so a parent that has not read it says so too.
     pub fn fail(&mut self, id: AgentId, error: String) {
         if let Some(node) = self.node_mut(id) {
+            let unread = node.parent.is_some();
             node.phase = Phase::Failed(error);
             node.since = Instant::now();
+            node.result_unread = unread;
         }
         self.agent_cancel.remove(&id);
     }
@@ -796,10 +825,28 @@ impl AgentTree {
     /// mid-flight is the fact the human needs.
     pub fn stopped(&mut self, id: AgentId) {
         if let Some(node) = self.node_mut(id) {
+            let unread = node.parent.is_some();
             node.phase = Phase::Stopped;
             node.since = Instant::now();
+            // A stopped child's line (`#N stopped: …`) still has to be folded
+            // into its parent's transcript before the parent knows there is no
+            // result coming, so "unread" is the truth about it as well.
+            node.result_unread = unread;
         }
         self.agent_cancel.remove(&id);
+    }
+
+    /// The parent has read this agent's result: the line is in its transcript
+    /// now, wherever it came from — a fold at the next message boundary, the
+    /// wake-up a napping parent got, or a `wait_agents` that asked for it.
+    ///
+    /// Only its own actor can say this (it owns the `delivered` set), so this is
+    /// only ever called from the event that actor emits, and never as a guess
+    /// from the shape of the row (finding H4).
+    pub fn result_read(&mut self, id: AgentId) {
+        if let Some(node) = self.node_mut(id) {
+            node.result_unread = false;
+        }
     }
 
     /// Put a node back at rest: an agent whose mailbox is gone is not running,
@@ -1048,6 +1095,22 @@ impl AgentTree {
             }
         }
         roster
+    }
+
+    /// The children of `id` whose results it has not read, in tree order.
+    ///
+    /// The same fact the children's own rows wear as `✉`, read from the other
+    /// end: the child's mark says *which* result is unread, and this says who is
+    /// owed a read — which is the question a human arrives with ("did #2 see
+    /// #6?"), and the only half of it that survives a short pane showing a
+    /// window of a big tree (finding H4). Derived from the nodes on every call,
+    /// like [`Self::busy_children`], so the two ends cannot disagree.
+    pub fn unread_children(&self, id: AgentId) -> Vec<AgentId> {
+        self.agents
+            .iter()
+            .filter(|node| node.parent == Some(id) && node.result_unread)
+            .map(|node| node.id)
+            .collect()
     }
 
     /// How many of `id`'s own children have work in flight.

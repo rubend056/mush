@@ -886,6 +886,14 @@ impl App {
                 // result cannot stall the frame that shows it.
                 self.mark_session_dirty();
             }
+            AgentEvent::ResultRead { child } => {
+                // The parent's actor has handed a child's result to the model —
+                // folded it, or answered a `wait_agents` for it — so the child's
+                // row stops wearing `✉`. Only the owner of that fact moves the
+                // mark: a row that guessed itself clear would be claiming a
+                // reading that never happened (finding H4).
+                self.tree.result_read(AgentId(child));
+            }
             AgentEvent::Stopped => {
                 // Stopped is not failed and not done: the run produced nothing,
                 // and the actor is idle and resumable. Saying which one it is
@@ -8312,6 +8320,104 @@ mod tests {
                 .is_some_and(|(text, _)| text.contains("cut off")),
             "the key that did nothing says so: {:?}",
             app.status_line()
+        );
+    }
+
+    /// A child's result is unread until its *parent's actor* has read it, and
+    /// the screen says so from both ends of the relationship: the child's row
+    /// wears `✉`, and the parent's row counts what it owes a read (finding H4).
+    ///
+    /// It is the one fact a child's own phase cannot give: a `✓` says a run
+    /// finished, not that anybody was told.
+    #[test]
+    fn a_result_its_parent_has_not_read_is_marked_on_the_row() {
+        let (mut app, _rx) = test_app("unread-result");
+        let conversation = app.tree.conversation();
+        for (child, parent, depth) in [(1, 0, 1), (2, 1, 2)] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId::ROOT,
+                event: AgentEvent::Spawned {
+                    child,
+                    parent,
+                    brief: format!("task {child}"),
+                    depth,
+                    branch: None,
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+        }
+
+        // #2 finishes. Nobody has read that yet — #1 was not even running.
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId(2),
+            event: AgentEvent::Done,
+        });
+        let rows = screen(&mut app, 120, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("✓ #2 ✉")),
+            "the child's row says its result is unread: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("#1 ✉1")),
+            "and its parent's row says how many it owes: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("#0 ✉")),
+            "the root has no parent, so nothing of its is unread: {rows:?}"
+        );
+        // The selected row spells the mark out, so `✉` is not a glyph a human
+        // has to guess at: which result, and who owes a read on it.
+        app.tree.cursor_bottom();
+        let rows = screen(&mut app, 120, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("✉ result unread by #1")),
+            "the child's own footer says who has not read it: {rows:?}"
+        );
+        app.tree.move_cursor(-1);
+        let rows = screen(&mut app, 120, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("✉1 unread from #2")),
+            "and its parent's footer names what it owes: {rows:?}"
+        );
+        app.tree.cursor_top();
+
+        // #1's actor folds the line in: the result is read, and both marks go.
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId(1),
+            event: AgentEvent::ResultRead { child: 2 },
+        });
+        let rows = screen(&mut app, 120, 24);
+        assert!(
+            !rows.iter().any(|row| row.contains('✉')),
+            "a result that has been read wears no mark: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("✓ #2")),
+            "while the result itself is still there: {rows:?}"
+        );
+
+        // A new run supersedes the old result the way the actor's own
+        // `delivered` set does, so a mark cannot outlive what it is about.
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId(2),
+            event: AgentEvent::Running {
+                cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+        });
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId(2),
+            event: AgentEvent::Done,
+        });
+        assert!(
+            screen(&mut app, 120, 24)
+                .iter()
+                .any(|row| row.contains("✓ #2 ✉")),
+            "a second result is unread again"
         );
     }
 
