@@ -6,6 +6,7 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
+use std::time::Duration;
 use unicode_width::UnicodeWidthStr;
 
 use mush_core::git;
@@ -37,6 +38,12 @@ const AGENTS_MIN_COLUMNS: u16 = 30;
 const AGENTS_MAX_COLUMNS: u16 = 50;
 /// The chat below this is a column of broken words, whatever the tree wants.
 const CHAT_MIN_COLUMNS: u16 = 40;
+/// How old the git read may be before the facts line says so. The bar's
+/// convention is that a line is "just happened" within five seconds; a snapshot
+/// a little older than that is still a glance, but past ten seconds an
+/// untouched screen is showing a read no event has refreshed, and a cached fact
+/// must not read as a live one (finding P8).
+const GIT_STALE: Duration = Duration::from_secs(10);
 /// Below this mush has no room to be honest: say so instead of painting shreds.
 const MIN_WIDTH: u16 = 40;
 const MIN_HEIGHT: u16 = 10;
@@ -680,19 +687,7 @@ fn facts_line(app: &App, width: usize) -> String {
     };
     let mut cells = vec![format!(" ⌂ {shown}")];
     if let Some(git) = &app.git {
-        let branch = if git.branch.is_empty() {
-            "detached".to_string()
-        } else {
-            git.branch.clone()
-        };
-        let mut cell = branch;
-        if git.dirty > 0 {
-            cell.push_str(&format!(" ±{}", git.dirty));
-        }
-        if !git.stat.is_empty() {
-            cell.push_str(&format!(" {}", git.stat.compact()));
-        }
-        cells.push(cell);
+        cells.push(git_cell(git, app.git_age()));
     }
     cells.push(format!("{} · {}", app.cfg().label(), app.context_meter()));
     while cells.len() > 1 {
@@ -703,6 +698,28 @@ fn facts_line(app: &App, width: usize) -> String {
         cells.pop();
     }
     cells.join(" │ ")
+}
+
+/// The branch cell of the facts line: the branch, how many paths are dirty, the
+/// uncommitted delta — and, once the read has aged past [`GIT_STALE`], how old
+/// it is. A cached read must not read as a live one, so the age rides with the
+/// fact it qualifies and is elided with it, never after it (finding P8).
+fn git_cell(git: &git::RepoStatus, age: Option<Duration>) -> String {
+    let mut cell = if git.branch.is_empty() {
+        "detached".to_string()
+    } else {
+        git.branch.clone()
+    };
+    if git.dirty > 0 {
+        cell.push_str(&format!(" ±{}", git.dirty));
+    }
+    if !git.stat.is_empty() {
+        cell.push_str(&format!(" {}", git.stat.compact()));
+    }
+    if let Some(age) = age.filter(|age| *age >= GIT_STALE) {
+        cell.push_str(&format!(" · {} ago", short_age(age)));
+    }
+    cell
 }
 
 #[cfg(test)]

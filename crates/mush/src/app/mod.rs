@@ -491,6 +491,15 @@ impl App {
         self.chat.used_tokens_for(self.tree.focused)
     }
 
+    /// How long ago the git snapshot was read, for the bar to say when it is
+    /// old. The read is refreshed on the transitions a human drives (a focus
+    /// change, a command, a save) and every two seconds while an agent works,
+    /// so between events it ages — and an aged fact must not look live
+    /// (finding P8).
+    pub fn git_age(&self) -> Option<Duration> {
+        self.git_at.map(|at| at.elapsed())
+    }
+
     /// Register git worktrees left over from earlier sessions (`mush/<id>`
     /// branches) as finished tree nodes, so `/diff`, `/merge`, `/discard` keep
     /// working after a restart.
@@ -1144,6 +1153,11 @@ impl App {
                 });
             }
         }
+        // A command is a transition the human drove: whatever they asked for
+        // may have changed the workspace, and the bar they read next should
+        // not be yesterday's answer (finding P8). The arms that already
+        // refreshed are no worse for the second ask — `git_in_flight` drops it.
+        self.refresh_git();
     }
 
     // ------------------------------------------------------------ providers
@@ -1615,6 +1629,13 @@ impl App {
         if let Some(error) = self.session_save.take_error() {
             self.fail(format!("could not save session: {error}"));
         }
+        // A save is a moment the state is being fixed; the repository is part
+        // of that picture, so refresh it here rather than leaving the bar with
+        // a read older than the file on disk (finding P8). Only the human-
+        // driven flushes come through here — a streamed response uses the
+        // debounced `save_session` — so this does not put a git process on the
+        // message path.
+        self.refresh_git();
     }
 
     /// The conversation as it is stored: the root transcript, every subagent's,
@@ -1808,6 +1829,12 @@ impl App {
         };
         let next = (index as i64 + direction).rem_euclid(order.len() as i64) as usize;
         self.focus = order[next];
+        // Looking somewhere new is a moment the human reads the bar, and the
+        // git line has no other reason to move: refresh on the transition, or
+        // a file written outside mush stays invisible on a screen nobody has
+        // touched (finding P8). The read is cheap and `git_in_flight` drops a
+        // second ask while the first is out.
+        self.refresh_git();
     }
 
     /// Focus the row the tree's cursor is on, and say whose pane the chat now
@@ -1865,6 +1892,9 @@ impl App {
                 .map(|node| node.brief.clone())
                 .unwrap_or_default();
             self.say(format!("agent #{id}: {brief}"));
+            // A focus change is a read-the-bar moment; refresh the git line so
+            // it is current when the human looks (finding P8).
+            self.refresh_git();
         }
     }
 
