@@ -350,6 +350,9 @@ pub struct AgentNode {
     pub parent: Option<AgentId>,
     pub depth: usize,
     pub brief: String,
+    /// The name the caller gave this agent, if it gave one: what the row
+    /// shows instead of [`Self::title`]'s derived handle.
+    pub title: Option<String>,
     /// What it is doing now, and since when — the row and the bar derive from
     /// this instead of storing rendered text.
     pub phase: Phase,
@@ -378,13 +381,15 @@ pub struct AgentNode {
 }
 
 impl AgentNode {
-    /// A short handle for this agent, derived from its brief on read.
+    /// A short handle for this agent: the name its caller gave it, else one
+    /// derived from the brief on read.
     ///
     /// A row used to spend its identity columns on the brief's first clause,
     /// which is usually boilerplate: `create a file called deep.txt …` and
     /// `create a file called wide.txt …` read the same for fifteen columns, and
     /// the human could not tell two children apart without opening them (finding
-    /// U6). Two rules, in the order the value is in:
+    /// U6). A named agent is exactly what its parent called it; otherwise two
+    /// rules, in the order the value is in:
     ///
     /// 1. a *path* in the brief is the artifact the agent was asked to make —
     ///    `deep.txt`, `crates/mush/src/ui.rs` — and it tells two children apart
@@ -393,10 +398,14 @@ impl AgentNode {
     /// 2. otherwise the first word that is not filler: `build a lexer for the
     ///    config format` is `lexer`, not `build a lexer for`.
     ///
-    /// Derived, never stored: the brief is the fact and this is a view of it,
-    /// and a stored copy is one more thing that can disagree with the
-    /// transcript's opening line.
+    /// Never stored when it is derived: the brief is the fact and this is a
+    /// view of it, and a stored copy is one more thing that can disagree with
+    /// the transcript's opening line. A *given* title is stored, because
+    /// nothing else can produce it.
     pub fn title(&self) -> String {
+        if let Some(given) = &self.title {
+            return truncate(given, TITLE_COLUMNS);
+        }
         let words: Vec<&str> = self
             .brief
             .lines()
@@ -462,6 +471,9 @@ pub struct Existing {
     pub parent: Option<AgentId>,
     pub depth: usize,
     pub brief: String,
+    /// The name the caller gave the agent, when one was stored with the
+    /// session; the row falls back to a handle derived from the brief.
+    pub title: Option<String>,
     pub phase: Phase,
     pub branch: Option<String>,
     pub summary: Option<String>,
@@ -583,6 +595,7 @@ impl AgentTree {
             branch: None,
             summary: None,
             leftover: false,
+            title: None,
             // The root has no parent, so there is nobody to read its result.
             result_unread: false,
             landed: None,
@@ -650,6 +663,7 @@ impl AgentTree {
             summary: None,
             leftover: false,
             landed: None,
+            title: None,
             // Its run has not produced anything yet: there is no result to read.
             result_unread: false,
         });
@@ -671,6 +685,7 @@ impl AgentTree {
             parent: node.parent,
             depth: node.depth,
             brief: node.brief,
+            title: node.title,
             phase: node.phase,
             since: Instant::now(),
             branch: node.branch,
@@ -684,6 +699,15 @@ impl AgentTree {
             // conversation behind it to have read or not read.
             result_unread: node.result_unread,
         });
+    }
+
+    /// Give an agent the name its caller chose. One fact, one home: the row,
+    /// the wire roster and the session snapshot all render [`AgentNode::title`]
+    /// from the node, so the name lands there and nowhere else.
+    pub fn named(&mut self, id: AgentId, title: String) {
+        if let Some(node) = self.node_mut(id) {
+            node.title = Some(title);
+        }
     }
 
     /// A run began, possibly one the UI did not ask for (an idle agent woken by
@@ -1305,6 +1329,7 @@ mod tests {
             parent: None,
             depth: 1,
             brief: "leftover worktree".to_string(),
+            title: None,
             phase: Phase::Done,
             branch: Some(format!("mush/{id}")),
             summary: Some("found on startup".to_string()),

@@ -503,6 +503,9 @@ pub enum AgentEvent {
         brief: String,
         depth: usize,
         branch: Option<String>,
+        /// The three-word name the caller chose, if it did; the row falls back
+        /// to a handle derived from the brief.
+        title: Option<String>,
         cmd: Sender<AgentMsg>,
     },
     /// A run began — including one the UI did not ask for, because an idle
@@ -2613,29 +2616,26 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         ));
     }
     let brief = tools::arg_string(args, "brief")?;
-    let isolated = args
-        .get("isolated")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    // A base is the isolation switch: with one, the child gets its own worktree
+    // and branch forked from that ref; without one it shares this workspace.
     // A base is a promise about history, so it is resolved before anything is
-    // created and never silently dropped: a child that asked to start from
-    // `master` must not be handed its parent's working tree instead (finding
-    // H7). A shared child has no worktree to fork, so the pair is refused up
-    // front rather than ignored.
+    // created and never silently dropped (finding H7).
     let named = args.get("base").and_then(Value::as_str);
-    if named.is_some() && !isolated {
-        return Err(
-            "`base` needs isolated=true: a shared child runs in this workspace and has no \
-             history of its own to fork from"
-                .to_string(),
-        );
-    }
     let base: Option<String> = match named {
         Some(name) => Some(git::resolve(&ctx.root, name).ok_or_else(|| {
             format!("unknown base `{name}`: no commit, branch or tag by that name")
         })?),
         None => None,
     };
+    let isolated = base.is_some();
+    // The name the caller chose for the row, trimmed; blank means none, and the
+    // row falls back to its handle from the brief.
+    let title = args
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|title| !title.is_empty())
+        .map(str::to_string);
     if !isolated {
         // Decide this *before* writing the brief: the check can only fail after
         // the brief exists, so the rule is stated in the tool schema and the
@@ -2660,61 +2660,25 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
                 .join(", ");
             return Err(format!(
                 "cannot spawn: {names} already runs in this shared workspace, and only one shared child \
-                 may run at a time. Set isolated=true (its own git worktree) to run siblings in parallel, \
-                 or wait_agents for it first."
+                 may run at a time. Pass base=<branch or commit> to give a sibling its own worktree, or \
+                 wait_agents for it first."
             ));
         }
     }
 
     let id = ctx.ids.fetch_add(1, Ordering::SeqCst);
-    // Why isolation was not available, if it was asked for and refused. One
-    // reason, two readers: the child's brief carries it for the model (which
-    // wrote `isolated: true` and has to know it did not get its own worktree),
-    // and the parent's pane carries it for the human — who asked for two
-    // siblings that would not touch the same files, and whose rows would
-    // otherwise look exactly like a child that never asked to be isolated.
-    // Every way `worktree_add` refuses takes this road: no repository, no
-    // commit to fork from, git's own refusal to add the worktree.
-    let mut degraded: Option<String> = None;
-    let (child_ws, branch) = if isolated {
-        // A private worktree on `mush/<id>`, based on the base the caller named
-        // (resolved to a commit), else the parent's branch, else HEAD. The
-        // reason it cannot be made is reported either way, so unnamed
-        // isolation degrades to the shared workspace instead of failing the
-        // delegation — but a named base does not: see below.
-        match git::worktree_add(&ctx.root, id, base.as_deref().or(actor.branch.as_deref())) {
+    let (child_ws, branch) = match named {
+        // A worktree on `mush/<id>`, forked from the base. A base is a promise
+        // about history: if git cannot make the worktree, the delegation fails
+        // rather than running the brief in the wrong tree (finding H7).
+        Some(name) => match git::worktree_add(&ctx.root, id, base.as_deref()) {
             Ok((path, branch)) => match Workspace::new(&path) {
                 Ok(child_ws) => (child_ws, Some(branch)),
-                // Isolation is best-effort: degrade to the shared workspace
-                // rather than fail the delegation outright.
-                Err(error) => {
-                    if let Some(name) = named {
-                        return Err(format!("cannot start from `{name}`: {error}"));
-                    }
-                    degraded = Some(error.to_string());
-                    (actor.ws.clone(), None)
-                }
+                Err(error) => return Err(format!("cannot start from `{name}`: {error}")),
             },
-            Err(reason) => {
-                // A named base is a promise about history: degrading to the
-                // shared workspace would run the brief on the wrong commit
-                // (finding H7).
-                if let Some(name) = named {
-                    return Err(format!("cannot start from `{name}`: {reason}"));
-                }
-                degraded = Some(reason);
-                (actor.ws.clone(), None)
-            }
-        }
-    } else {
-        (actor.ws.clone(), None)
-    };
-    let note = match &degraded {
-        // The parent reads this too: a child that asked for isolation and did
-        // not get it is running in the parent's tree, and a reply that only
-        // omitted `on mush/N` let the parent believe otherwise (audit row 4).
-        Some(reason) => format!(" (isolated unavailable: {reason}; running in place)"),
-        None => String::new(),
+            Err(reason) => return Err(format!("cannot start from `{name}`: {reason}")),
+        },
+        None => (actor.ws.clone(), None),
     };
     // The branch the parent will need to land the work, said where it is born:
     // the parent chose the worktree, and a child whose branch it never learned
@@ -2730,9 +2694,8 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         .and_then(|_| git::resolve(&git::worktree_path(&ctx.root, id), "HEAD"))
         .map(|sha| format!(" at {}", short_revision(&sha)))
         .unwrap_or_default();
-    // A degraded isolation lands in this workspace: it shares the tree, and the
-    // one-shared-child rule is about it exactly as much as about a child that
-    // never asked for a worktree.
+    // A child with no base runs in this workspace: it is one of the children
+    // the one-shared-child rule is about.
     let shares_workspace = branch.is_none();
 
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AgentMsg>();
@@ -2746,24 +2709,10 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
             brief: brief.clone(),
             depth: depth + 1,
             branch: branch.clone(),
+            title,
             cmd: cmd_tx.clone(),
         },
     );
-
-    // The same fact, to the human. The child's brief below tells the model; a
-    // row with no branch is not an explanation, and two "isolated" siblings
-    // editing one workspace while the human believes they are apart is the
-    // failure this line exists to prevent. It is a notice on the parent — the
-    // pane the human is reading when they asked for this child — and it says
-    // which child, because a parent may spawn several.
-    if let Some(reason) = &degraded {
-        ctx.emit(
-            parent,
-            AgentEvent::Notice(format!(
-                "#{id} isolated unavailable: {reason} — it shares this workspace"
-            )),
-        );
-    }
 
     // Who the child is goes in the system prompt; the parent's task is the
     // first user message, mirroring the root's system+user shape. Some
@@ -2774,14 +2723,13 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         branch.is_some(),
         depth + 1 < MAX_DEPTH,
     );
-    let brief_text = format!("{brief}{note}");
-    let initial = if brief_text.trim().is_empty() {
+    let initial = if brief.trim().is_empty() {
         vec![
             Message::system(whoami),
             Message::user("Begin the task now."),
         ]
     } else {
-        vec![Message::system(whoami), Message::user(brief_text)]
+        vec![Message::system(whoami), Message::user(brief.clone())]
     };
     // The child's own mailbox is where grandchildren report; the parent's
     // mailbox is where this child reports its completion.
@@ -2801,7 +2749,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     state.children.insert(id, cmd_tx);
     state.running.insert(id);
     // Which children share this workspace: the ones the one-shared-child rule
-    // is about. A degraded isolation lands here too — it is running in place.
+    // is about.
     if shares_workspace {
         state.shared.insert(id);
     }
@@ -2811,7 +2759,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // guard far past any real task, so this is not a budget to size a brief
     // against any more.
     Ok(format!(
-        "spawned agent #{id}{on}{at}{note} · runs until it stops calling tools · wait_agents returns its summary"
+        "spawned agent #{id}{on}{at} · runs until it stops calling tools · wait_agents returns its summary"
     ))
 }
 
@@ -8068,7 +8016,7 @@ mod tests {
                     "spawn_agent",
                     json!({
                         "brief": "create a file called iso.txt containing exactly: isolated work",
-                        "isolated": true
+                        "base": "main"
                     }),
                 )]),
         );
@@ -8196,7 +8144,7 @@ mod tests {
                     "spawn_agent",
                     json!({
                         "brief": "create a file called iso.txt containing exactly: isolated work",
-                        "isolated": true
+                        "base": "main"
                     }),
                 )]),
         );
@@ -8333,99 +8281,45 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// `isolated: true` in a workspace that is not a git repository: the child
-    /// runs in the shared workspace, and until now *only the model* was told —
-    /// the reason travelled in the child's brief and nowhere else. The human
-    /// asked for a child of their own, and what they got was one sharing their
-    /// checkout, with a row that looks exactly like a child that never asked to
-    /// be isolated: two of them would edit the same files while the human
-    /// believed they were apart.
-    ///
-    /// Both halves are pinned here: the spawn's answer to the model is
-    /// unchanged (the same result line, and the brief still carrying why), and
-    /// the same fact now reaches the parent's pane as a notice.
+    /// A `base` that cannot become a worktree fails the whole delegation: the
+    /// parent's call comes back as an error naming the ref, no child is
+    /// spawned, and no event pretends otherwise. The old contract degraded to a
+    /// child in the shared checkout instead — two agents in one tree while the
+    /// parent believed it had given one its own (finding H7).
     #[test]
-    fn a_degraded_isolation_is_said_to_the_human_too() {
-        let gate = Arc::new(Gate::new());
-        let scripted = Arc::new(
-            Scripted::new()
-                .when(|asked: &Asked| asked.depth() == Some(1))
-                .held(gate.clone())
-                .says("child answered"),
-        );
-        // A scratch directory, not `init_git_repo`: the workspace this test
-        // opens is exactly the plain one the finding describes.
-        let (actor, events, _mailbox) = build_actor_about(
-            "isolation-in-place",
-            scripted.clone(),
-            test_cfg(),
+    fn a_spawn_that_cannot_make_its_worktree_is_refused() {
+        let (actor, _mailbox) = scripted_tools_actor(
+            "spawn-worktree-refused",
             Arc::new(ScriptedMachine::new()),
-            Arc::new(clock::System),
+            Arc::new(Advanceable::new()),
         );
+        let root = actor.ctx.root.clone();
+        git_in(&root, &["init", "-q", "-b", "main"]);
+        git_in(&root, &["config", "user.email", "t@t"]);
+        git_in(&root, &["config", "user.name", "t"]);
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        git_in(&root, &["add", "-A"]);
+        git_in(&root, &["commit", "-qm", "init"]);
+        // The child's id already owns a real directory there, which is the one
+        // thing `git worktree add` refuses.
+        fs::create_dir_all(root.join(".mush/wt/1")).unwrap();
+        fs::write(root.join(".mush/wt/1/in the way.txt"), "mine\n").unwrap();
         let mut state = ActorState::default();
-        let cancel = AtomicBool::new(false);
 
-        let report = exec_tool(
+        let error = exec_tool(
             &actor,
             &mut state,
             ToolName::SpawnAgent,
-            &json!({ "brief": "do the thing", "isolated": true }),
-            &cancel,
+            &json!({ "brief": "do the thing", "base": "main" }),
+            &AtomicBool::new(false),
         )
-        .unwrap();
-
-        // The model's answer names the degradation too: a reply that only
-        // omitted `on mush/N` let the parent believe it had a worktree child
-        // while the child ran in its tree (audit row 4).
-        assert_eq!(
-            report,
-            "spawned agent #1 (isolated unavailable: not a git repository; running in place) · runs \
-             until it stops calling tools · wait_agents returns its summary"
-        );
-        assert!(
-            gate.wait_until_asked(WAIT),
-            "the child must ask for its first turn"
-        );
-        let asked = scripted.asked();
-        assert!(
-            asked[0].saw("(isolated unavailable: not a git repository; running in place)"),
-            "the model is still told: {:?}",
-            asked[0].messages
-        );
-        gate.release();
-
-        // The human's half: a notice on the parent, naming the child and the
-        // reason, and — the row's own honesty — a spawn with no branch, so no
-        // surface can claim a worktree this child does not have.
-        let notices: Vec<String> = events
-            .events_for(AgentId(7))
-            .into_iter()
-            .filter_map(|event| match event {
-                AgentEvent::Notice(text) => Some(text),
-                _ => None,
-            })
-            .collect();
-        assert_eq!(
-            notices,
-            vec![
-                "#1 isolated unavailable: not a git repository — it shares this workspace"
-                    .to_string()
-            ],
-            "the human must be told what the model was told"
-        );
-        let spawned_branch = events
-            .events()
-            .into_iter()
-            .find_map(|(_, event)| match event {
-                AgentEvent::Spawned { branch, .. } => Some(branch),
-                _ => None,
-            })
-            .expect("the child was spawned");
-        assert_eq!(
-            spawned_branch, None,
-            "the row has no branch, so it cannot imply a worktree that does not exist"
-        );
-        let _ = fs::remove_dir_all(actor.ws.root());
+        .unwrap_err();
+        let ToolError::Failed(error) = error else {
+            panic!("a worktree that cannot be made is a failed call");
+        };
+        assert!(error.contains("cannot start from `main`"), "{error}");
+        assert!(state.children.is_empty(), "nothing may be spawned");
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Root -> child -> grandchild, each isolated: the grandchild's file must
@@ -8463,7 +8357,7 @@ mod tests {
                     json!({
                         "brief": "create a file called deep.txt containing exactly: deep work; \
                                   you must delegate this to your own subagent",
-                        "isolated": true
+                        "base": "mush/1"
                     }),
                 )])
                 // The root: delegate, wait for the child, report.
@@ -8480,9 +8374,9 @@ mod tests {
                     "spawn_agent",
                     json!({
                         "brief": "delegate file creation to your own subagent: spawn one with \
-                                  brief 'create a file called deep.txt containing exactly: deep \
-                                  work' and isolated true, then wait for it, then report",
-                        "isolated": true
+                                  base mush/1, brief 'create a file called deep.txt containing \
+                                  exactly: deep work', then wait for it, then report",
+                        "base": "main"
                     }),
                 )]),
         );
@@ -8578,7 +8472,7 @@ mod tests {
                     "spawn_agent",
                     json!({
                         "brief": "create a file called iso.txt containing exactly: isolated work",
-                        "isolated": true
+                        "base": "main"
                     }),
                 )]),
         );
@@ -9747,7 +9641,6 @@ mod tests {
             ToolName::SpawnAgent,
             &json!({
                 "brief": "start from the first commit",
-                "isolated": true,
                 "base": first.clone(),
             }),
             &AtomicBool::new(false),
@@ -9768,11 +9661,11 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A base that is not isolated, or does not exist, is refused up front —
-    /// never degraded into a child that runs on the wrong history (finding
-    /// H7).
+    /// A named base is resolved to a commit before anything is created: a
+    /// scratch workspace that is no repository at all refuses the call, and no
+    /// child is spawned on some other history (finding H7).
     #[test]
-    fn a_named_base_needs_isolation_and_a_real_commit() {
+    fn a_named_base_is_resolved_before_anything_is_created() {
         let (actor, _mailbox) = scripted_tools_actor(
             "spawn-base-errors",
             Arc::new(ScriptedMachine::new()),
@@ -9781,6 +9674,8 @@ mod tests {
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
 
+        // The scratch workspace is no repository at all: an unresolvable base
+        // is a refusal, not a silent fall back.
         let error = exec_tool(
             &actor,
             &mut state,
@@ -9790,24 +9685,10 @@ mod tests {
         )
         .unwrap_err();
         let ToolError::Failed(error) = error else {
-            panic!("a shared child with a base is a failed call");
-        };
-        assert!(error.contains("isolated=true"), "{error}");
-
-        // Isolated, but the scratch workspace is no repository at all: an
-        // unresolvable base is a refusal, not a silent fall back.
-        let error = exec_tool(
-            &actor,
-            &mut state,
-            ToolName::SpawnAgent,
-            &json!({ "brief": "b", "isolated": true, "base": "main" }),
-            &cancel,
-        )
-        .unwrap_err();
-        let ToolError::Failed(error) = error else {
             panic!("an unknown base is a failed call");
         };
         assert!(error.contains("unknown base"), "{error}");
+        assert!(state.children.is_empty(), "nothing may be spawned");
     }
 
     /// A child the parent resumed with a message counts as running again: the
@@ -9855,6 +9736,57 @@ mod tests {
         assert!(refused.contains("shared workspace"), "{refused}");
     }
 
+    /// `spawn_agent` can name its child: the name travels in the `Spawned`
+    /// event, trimmed, and a blank or missing one leaves the row to derive its
+    /// own handle from the brief (finding U14).
+    #[test]
+    fn a_spawn_carries_the_name_its_caller_gave() {
+        let (actor, events, _mailbox) = build_actor_about(
+            "spawn-title",
+            Arc::new(
+                Scripted::new()
+                    .when(|asked: &Asked| asked.depth() == Some(1))
+                    .says("done"),
+            ),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let spawn = |state: &mut ActorState, args: Value| {
+            exec_tool(&actor, state, ToolName::SpawnAgent, &args, &cancel)
+        };
+
+        spawn(
+            &mut state,
+            json!({ "brief": "port the parser", "title": "  parser port  " }),
+        )
+        .unwrap();
+        note_completion(&mut state, 1, 1, Outcome::Stopped);
+        spawn(&mut state, json!({ "brief": "port the lexer" })).unwrap();
+        note_completion(&mut state, 2, 1, Outcome::Stopped);
+        spawn(
+            &mut state,
+            json!({ "brief": "port the loader", "title": "   " }),
+        )
+        .unwrap();
+
+        let titles: Vec<Option<String>> = events
+            .events()
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                AgentEvent::Spawned { title, .. } => Some(title),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            vec![Some("parser port".to_string()), None, None],
+            "only a real name is carried, and it is trimmed"
+        );
+    }
+
     /// An isolated sibling edits its own worktree, so it must not block a
     /// shared spawn — the old guard counted it and then said something false
     /// about this workspace (audit row 7).
@@ -9879,7 +9811,7 @@ mod tests {
             &actor,
             &mut state,
             ToolName::SpawnAgent,
-            &json!({ "brief": "in my own worktree", "isolated": true }),
+            &json!({ "brief": "in my own worktree", "base": "main" }),
             &cancel,
         )
         .unwrap();

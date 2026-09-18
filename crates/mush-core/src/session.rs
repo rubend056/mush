@@ -99,6 +99,11 @@ pub struct AgentSession {
     pub depth: usize,
     #[serde(default)]
     pub brief: String,
+    /// The name the caller gave this agent (`spawn_agent`'s `title`), so a
+    /// restored row keeps it; absent means the row falls back to the handle it
+    /// derives from the brief.
+    #[serde(default)]
+    pub title: Option<String>,
     #[serde(default)]
     pub branch: Option<String>,
     #[serde(default)]
@@ -448,6 +453,7 @@ mod tests {
                 parent: Some(0),
                 depth: 1,
                 brief: "port the parser".into(),
+                title: Some("parser port".into()),
                 branch: Some("mush/3".into()),
                 status: StoredStatus::Stopped,
                 landed: Some(StoredLanded::Merged),
@@ -479,6 +485,7 @@ mod tests {
         let child = &loaded.agents[0];
         assert_eq!(child.id, 3);
         assert_eq!(child.brief, "port the parser");
+        assert_eq!(child.title.as_deref(), Some("parser port"));
         assert_eq!(child.status, StoredStatus::Stopped);
         assert_eq!(child.landed, Some(StoredLanded::Merged));
         assert!(child.leftover);

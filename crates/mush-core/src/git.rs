@@ -253,8 +253,9 @@ fn head_answer(probe: Result<String, String>) -> Option<bool> {
 ///
 /// The three ways this can refuse each carry a reason a human has to read: no
 /// repository, no commit to start from, and git's own message when the add
-/// itself fails (an id whose branch or directory is still taken). Callers treat
-/// every one of them as "isolate in place" rather than as a failed delegation.
+/// itself fails (an id whose branch or directory is still taken). The spawn
+/// tool treats every one of them as a refused delegation: a base is a promise
+/// about history, and a child running on the wrong one is worse than no child.
 pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf, String), String> {
     if !dir.join(".git").exists() {
         return Err("not a git repository".to_string());

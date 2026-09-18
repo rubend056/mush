@@ -1059,6 +1059,7 @@ mod tests {
             id: AgentId(2),
             parent: None,
             depth: 0,
+            title: None,
             brief: "lexer".to_string(),
             phase,
             since: std::time::Instant::now() - std::time::Duration::from_secs(age),

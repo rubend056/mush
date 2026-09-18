@@ -577,6 +577,7 @@ impl App {
                 parent,
                 depth: agent.depth.max(1),
                 brief: agent.brief,
+                title: agent.title,
                 phase,
                 branch,
                 summary,
@@ -750,6 +751,7 @@ impl App {
                 parent: None,
                 depth: 1,
                 brief,
+                title: None,
                 phase,
                 branch: Some(full),
                 summary: Some(summary.to_string()),
@@ -912,6 +914,7 @@ impl App {
                 brief,
                 depth,
                 branch,
+                title,
                 cmd,
             } => {
                 let opened = self.tree.insert(Spawn {
@@ -922,6 +925,12 @@ impl App {
                     branch,
                     cmd,
                 });
+                // The caller's name for this child, when it chose one: the row
+                // prefers it over the handle derived from the brief (the
+                // spawn tool's `title`).
+                if let Some(title) = title {
+                    self.tree.named(AgentId(child), title);
+                }
                 // The brief opens the child's transcript: the model sees the
                 // brief, so the human should too (finding B13).
                 self.chat.push_message(opened.id, opened.opening);
@@ -2372,6 +2381,7 @@ impl App {
                 parent: node.parent.map(|parent| parent.0),
                 depth: node.depth,
                 brief: node.brief.clone(),
+                title: node.title.clone(),
                 branch: node.branch.clone(),
                 status: match &node.phase {
                     Phase::Done => session::StoredStatus::Done,
@@ -3383,6 +3393,7 @@ mod tests {
                     brief: format!("task {id}"),
                     depth: 1,
                     branch: Some(format!("mush/{id}")),
+                    title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
             });
@@ -4316,6 +4327,7 @@ mod tests {
                 parent: Some(0),
                 depth: 1,
                 brief: "port the parser".into(),
+                title: Some("parser port".into()),
                 branch: None,
                 status: session::StoredStatus::Done,
                 landed: None,
@@ -4336,6 +4348,11 @@ mod tests {
             .find(|node| node.id == AgentId(2))
             .expect("the stored agent comes back");
         assert_eq!(node.brief, "port the parser");
+        assert_eq!(
+            node.title.as_deref(),
+            Some("parser port"),
+            "the name the caller gave survives the restart"
+        );
         assert_eq!(node.phase, Phase::Done);
         assert_eq!(node.summary.as_deref(), Some("finished it"));
         assert!(
@@ -4381,6 +4398,7 @@ mod tests {
                 parent: Some(0),
                 depth: 1,
                 brief: "port the parser".into(),
+                title: None,
                 branch: None,
                 status,
                 landed: None,
@@ -5834,6 +5852,7 @@ mod tests {
                     brief: format!("task {id}"),
                     depth: 1,
                     branch: None,
+                    title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
             });
@@ -5887,6 +5906,7 @@ mod tests {
                     depth: 1,
                     brief: format!("create a file called {path} containing exactly: work"),
                     branch: None,
+                    title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
             });
@@ -5899,6 +5919,38 @@ mod tests {
         assert!(
             rows.iter().any(|row| row.contains("#2 wide.txt")),
             "and its sibling by its own: {rows:?}"
+        );
+    }
+
+    /// A title the caller gave wins over the handle derived from the brief; a
+    /// spawn that was given none keeps the derived handle (finding U14).
+    #[test]
+    fn the_row_prefers_the_title_its_caller_gave() {
+        let (mut app, _rx) = test_app("agent-given-titles");
+        let conversation = app.tree.conversation();
+        for (id, title) in [(1u64, Some("parser port")), (2, None)] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId::ROOT,
+                event: AgentEvent::Spawned {
+                    child: id,
+                    parent: 0,
+                    depth: 1,
+                    brief: "create a file called deep.txt containing exactly: work".to_string(),
+                    branch: None,
+                    title: title.map(str::to_string),
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+        }
+        let rows = screen(&mut app, 120, 32);
+        assert!(
+            rows.iter().any(|row| row.contains("#1 parser port")),
+            "a named agent is exactly what its caller called it: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("#2 deep.txt")),
+            "and a nameless one still gets its handle from the brief: {rows:?}"
         );
     }
 
@@ -7345,6 +7397,7 @@ mod tests {
                 brief: "sneaky".to_string(),
                 depth: 1,
                 branch: None,
+                title: None,
                 cmd: child_tx,
             },
         });
@@ -7488,6 +7541,7 @@ mod tests {
                     brief: format!("child {id}"),
                     depth,
                     branch: None,
+                    title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
             });
@@ -7600,6 +7654,7 @@ mod tests {
                     brief: format!("agent {id}"),
                     depth,
                     branch: None,
+                    title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
             });
@@ -7674,6 +7729,7 @@ mod tests {
                 brief: "lexer".to_string(),
                 depth: 1,
                 branch: None,
+                title: None,
                 cmd: crossbeam_channel::unbounded().0,
             },
         });
@@ -7718,6 +7774,7 @@ mod tests {
                     brief: format!("child {id}"),
                     depth: 1,
                     branch: None,
+                    title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
             });
@@ -7764,6 +7821,7 @@ mod tests {
                 brief: "lexer".to_string(),
                 depth: 1,
                 branch: None,
+                title: None,
                 cmd: crossbeam_channel::unbounded().0,
             },
         });
@@ -7948,6 +8006,7 @@ mod tests {
                 depth,
                 brief: brief.to_string(),
                 branch: branch.map(str::to_string),
+                title: None,
                 cmd: crossbeam_channel::unbounded().0,
             },
         });
@@ -8978,6 +9037,7 @@ mod tests {
                     brief: "a task".to_string(),
                     depth,
                     branch: None,
+                    title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
             });
@@ -9105,6 +9165,7 @@ mod tests {
                     brief: format!("task {child}"),
                     depth,
                     branch: None,
+                    title: None,
                     cmd,
                 },
             });
@@ -9182,6 +9243,7 @@ mod tests {
                     brief: format!("task {child}"),
                     depth,
                     branch: None,
+                    title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
             });
@@ -9275,6 +9337,7 @@ mod tests {
                 brief: "count the lexer tokens".to_string(),
                 depth: 1,
                 branch: None,
+                title: None,
                 cmd: crossbeam_channel::unbounded().0,
             },
         });

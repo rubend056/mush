@@ -40,12 +40,12 @@ machine`) — do not retry in a loop.";
 /// had to be self-contained (audit row 6).
 const DELEGATION: &str = "\
 Delegation:\n\
-- spawn_agent(brief, isolated?, base?) starts a subagent with no memory of this conversation: the brief \
-must carry every fact, file, and the exact deliverable.\n\
-- An isolated subagent works in its own copy of the repository (its own git worktree and branch); a \
-shared one works in this workspace, so only one of those may run at a time. Decide up front: pass \
-isolated=true for siblings that should run in parallel, or wait_agents for the running one first. (The \
-check can only fail after the brief exists, so decide before writing it.)\n\
+- spawn_agent(brief, title, base?) starts a subagent with no memory of this conversation: the brief \
+must carry every fact, file, and the exact deliverable; title is three words naming it in the tree.\n\
+- base gives the child its own worktree and branch forked from that ref, so siblings with bases run in \
+parallel; without one the child works in this workspace, and only one such child may run at a time. \
+Decide up front, or wait_agents for the running one first. (The check can only fail after the brief \
+exists, so decide before writing it.)\n\
 - A subagent runs until it stops calling tools, so a brief is bounded by the work, not a turn count: \
 split by what is independent, not by how long you think it takes.\n\
 - Delegate independent, large, or context-heavy subtasks; do single edits and lookups yourself. Prefer \
@@ -217,10 +217,10 @@ pub fn tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "brief": { "type": "string" },
-                    "isolated": { "type": "boolean", "description": "Own git worktree. Default false." },
-                    "base": { "type": "string", "description": "Branch, tag or commit an isolated worktree forks from. Default: this agent's branch. Requires isolated=true." }
+                    "title": { "type": "string", "description": "A 3 word description of this agent's brief." },
+                    "base": { "type": "string", "description": "Branch, tag or commit for the child's own worktree and branch. Without one the child shares this workspace." }
                 },
-                "required": ["brief"]
+                "required": ["brief", "title"]
             }),
         ),
         tool(
