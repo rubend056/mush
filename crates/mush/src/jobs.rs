@@ -286,6 +286,16 @@ struct Live {
 }
 
 impl Live {
+    /// A grip on a command that has just been handed over: nothing has asked it
+    /// to stop yet. One constructor, so the two places that take a process group
+    /// into the registry build the same handle (refactor R20).
+    fn new(job: Box<dyn Job>) -> Self {
+        Self {
+            job: Arc::new(Mutex::new(job)),
+            stop: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     /// Stop it and everything it started, now. Killing is idempotent and goes
     /// through the handle rather than the flag: on Ctrl-N and on quit the
     /// process groups must be gone before this returns, not ten milliseconds
@@ -360,6 +370,12 @@ pub struct Foreground {
     /// Which slot this call holds. Slots are never reused, so a stale release
     /// cannot free somebody else's command.
     slot: u64,
+    /// The agent whose command this is — the same value the registry's
+    /// `foregrounds` map records against the slot. It is carried here so
+    /// [`Launch::held`] reads the owner off the handle instead of being told it
+    /// a second time: two statements of one owner is how a job comes to be
+    /// recorded against an agent that did not start it (refactor R20).
+    owner: u64,
     live: Live,
 }
 
@@ -515,15 +531,18 @@ impl Launch {
     /// released once the job's record exists: there is no moment where it is in
     /// neither the foreground slot nor the job list, so a kill that lands in
     /// this window still reaches it.
+    ///
+    /// The owner is the held command's own ([`Foreground::owner`]), not a
+    /// parameter: the registry already recorded who started it, and a second
+    /// statement of the same fact is one that can disagree (refactor R20).
     pub fn held(
-        owner: u64,
         command: String,
         exclusive: bool,
         mailbox: Sender<AgentMsg>,
         held: Foreground,
     ) -> Self {
         Self {
-            owner,
+            owner: held.owner,
             command,
             exclusive,
             source: Source::Held(held),
@@ -543,13 +562,7 @@ impl Source {
     /// miss the very process group it exists to kill (finding S4).
     fn into_live(self) -> (Live, Option<Foreground>) {
         match self {
-            Source::Started(job) => (
-                Live {
-                    job: Arc::new(Mutex::new(job)),
-                    stop: Arc::new(AtomicBool::new(false)),
-                },
-                None,
-            ),
+            Source::Started(job) => (Live::new(job), None),
             Source::Held(held) => (held.live.clone(), Some(held)),
         }
     }
@@ -651,10 +664,7 @@ impl Registry {
     /// not a job, does not spend the machine-wide budget, and is not refused —
     /// because the command is already running when this is called.
     pub fn hold(self: &Arc<Self>, owner: u64, job: Box<dyn Job>) -> Foreground {
-        let live = Live {
-            job: Arc::new(Mutex::new(job)),
-            stop: Arc::new(AtomicBool::new(false)),
-        };
+        let live = Live::new(job);
         let slot = {
             let mut inner = self.inner();
             let slot = inner.next_slot;
@@ -665,6 +675,7 @@ impl Registry {
         Foreground {
             registry: Arc::clone(self),
             slot,
+            owner,
             live,
         }
     }
@@ -1566,6 +1577,46 @@ mod tests {
             2,
             "and a finished call leaves nothing to kill"
         );
+    }
+
+    /// A tool call that outlives `CMD_DETACH_AFTER` becomes the job of the agent
+    /// that held it: the owner comes off the handle the registry wrote it into,
+    /// not off a second parameter, so the record and the slot cannot name two
+    /// agents (refactor R20).
+    #[test]
+    fn a_handed_over_command_belongs_to_the_agent_that_held_it() {
+        // The real clock here: a scripted command that never ends is a thread
+        // with nothing to wait for on the fake one.
+        let registry = Registry::new(
+            Arc::new(crate::clock::System),
+            Recorder::new(),
+            Arc::new(AtomicU64::new(1)),
+        );
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let held = registry.hold(
+            7,
+            machine
+                .spawn(&ShellCommand {
+                    command: "cargo build",
+                    root: Path::new("/tmp"),
+                })
+                .unwrap(),
+        );
+        let (tx, _rx) = crossbeam_channel::unbounded();
+
+        let id = registry
+            .launch(Launch::held("cargo build".to_string(), false, tx, held))
+            .unwrap();
+
+        let mine = registry.live_for(7);
+        assert_eq!(mine.len(), 1, "the holder owns the job it handed over");
+        assert_eq!(mine[0].id, id);
+        assert!(registry.live_for(8).is_empty(), "and nobody else does");
+        assert!(
+            !registry.holding_foreground(7),
+            "the job's record names it from here on, so the slot is gone"
+        );
+        registry.kill_all();
     }
 
     /// The budget is the machine's, not one agent's: `MAX_JOBS` live jobs are

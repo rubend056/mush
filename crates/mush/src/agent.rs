@@ -3567,13 +3567,7 @@ fn run_shell(
             match detach_now(
                 actor,
                 registry,
-                jobs::Launch::held(
-                    actor.id,
-                    command.to_string(),
-                    exclusive,
-                    actor.my_tx.clone(),
-                    running,
-                ),
+                jobs::Launch::held(command.to_string(), exclusive, actor.my_tx.clone(), running),
             ) {
                 Ok(id) => {
                     state.running_jobs.insert(id);
