@@ -114,7 +114,13 @@ pub fn label(id: u64) -> String {
 ///
 /// One enum rather than three parallel strings (a noun, a tool name and a label
 /// builder), because they have to agree: a message that says "your agents are
-/// still running" in a job's wait is worse than no message.
+/// still running" in a job's wait is worse than no message. It is also what a
+/// run in flight is parked on with no model call behind it — [`Phase::waiting`]
+/// derives it from the actor's label, so the row, the footer and the transcript
+/// foot all read the one answer, and an hourglass is never painted as a
+/// spinner (finding U7).
+///
+/// [`Phase::waiting`]: crate::app::tree::Phase::waiting
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Waited {
     Agents,

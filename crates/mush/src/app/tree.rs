@@ -95,14 +95,15 @@ impl Phase {
     /// (finding U7) — this is the derivation that tells them apart, made once
     /// from the label the actor wrote (which is the tool's own name, from
     /// `ToolName`), so the row, the footer and the transcript foot all read the
-    /// same answer.
-    pub fn waiting(&self) -> Option<Waiting> {
+    /// same answer. The distinction itself is [`jobs::Waited`], the enum the
+    /// wait tools answer with.
+    pub fn waiting(&self) -> Option<jobs::Waited> {
         let Phase::Activity(label) = self else {
             return None;
         };
         match ToolName::parse(label.split_whitespace().next()?) {
-            Some(ToolName::WaitAgents) => Some(Waiting::Agents),
-            Some(ToolName::WaitCommands) => Some(Waiting::Jobs),
+            Some(ToolName::WaitAgents) => Some(jobs::Waited::Agents),
+            Some(ToolName::WaitCommands) => Some(jobs::Waited::Jobs),
             _ => None,
         }
     }
@@ -200,27 +201,6 @@ fn bare_word(word: &str) -> &str {
 /// Whether a word says nothing about the task (see [`FILLER`]).
 fn is_filler(word: &str) -> bool {
     FILLER.contains(&bare_word(word).to_ascii_lowercase().as_str())
-}
-
-/// What a run in flight is parked on.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Waiting {
-    /// A child's result: `wait_agents`.
-    Agents,
-    /// A detached job's report: `wait_commands`.
-    Jobs,
-}
-
-impl Waiting {
-    /// The noun a line uses: `waiting on agents 3s`. The subject is whoever is
-    /// being waited on, which is what an hourglass says without naming a
-    /// count — the row's `⏸N` mark already carries how many.
-    pub fn noun(self) -> &'static str {
-        match self {
-            Waiting::Agents => "agents",
-            Waiting::Jobs => "jobs",
-        }
-    }
 }
 
 /// Where an isolated agent's work ended up, once the human landed it.
@@ -1032,11 +1012,11 @@ mod tests {
         // which are empty for a wait with none — hence the trailing space.
         assert_eq!(
             Phase::Activity("wait_agents ".to_string()).waiting(),
-            Some(Waiting::Agents)
+            Some(jobs::Waited::Agents)
         );
         assert_eq!(
             Phase::Activity("wait_commands #c2 #c3".to_string()).waiting(),
-            Some(Waiting::Jobs)
+            Some(jobs::Waited::Jobs)
         );
     }
 
