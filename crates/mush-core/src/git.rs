@@ -102,7 +102,7 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
 /// commit mush made for it carries the agent's id, the task it was given, and
 /// how the run ended, so the UI can show a real brief instead of a placeholder.
 pub fn subject_of(dir: &Path, name: &str) -> Option<String> {
-    let sha = commit(dir, name)?;
+    let sha = resolve(dir, name)?;
     let subject = git(dir, &["log", "-1", "--format=%s", &sha])?;
     if subject.is_empty() {
         None
@@ -144,8 +144,8 @@ pub fn status(dir: &Path) -> Option<RepoStatus> {
 /// input, and git would read one that begins with `-` (say
 /// `--output=/tmp/x`) as an option to `diff` rather than as a revision.
 pub fn branch_stat(dir: &Path, base: &str, branch: &str) -> Option<Stat> {
-    let base = commit(dir, base)?;
-    let branch = commit(dir, branch)?;
+    let base = resolve(dir, base)?;
+    let branch = resolve(dir, branch)?;
     diff_stat(dir, &["diff", "--shortstat", &format!("{base}...{branch}")])
 }
 
@@ -322,9 +322,10 @@ pub fn commit_all(dir: &Path, subject: &str) -> Result<Option<String>, String> {
     Ok(Some(run(dir, &["rev-parse", "--short", "HEAD"])?))
 }
 
-/// A revision resolved to its commit id, or `None` when it does not exist.
-/// The id is what gets passed on: it cannot be mistaken for an option.
-fn commit(dir: &Path, name: &str) -> Option<String> {
+/// A revision resolved to its commit id, or `None` when it does not exist. The
+/// id is what gets passed on: it cannot be mistaken for an option, and this is
+/// the one home for resolving an untrusted name to a sha.
+pub fn resolve(dir: &Path, name: &str) -> Option<String> {
     let sha = git(
         dir,
         &[

@@ -1641,16 +1641,12 @@ impl App {
     fn paint_diff(&mut self, id: AgentId, branch: &str) {
         let root = self.ws.root().to_path_buf();
         let command = format!("git diff HEAD...{branch}");
-        // Both names are resolved to commits before git reads them, for the same
-        // reason `git::branch_stat` does it: a branch name is untrusted input,
-        // and one beginning with `-` would be taken by `diff` as an option.
-        let resolve = |name: &str| {
-            git::run(
-                &root,
-                &["rev-parse", "--verify", &format!("{name}^{{commit}}")],
-            )
-        };
-        let (Ok(base), Ok(tip)) = (resolve("HEAD"), resolve(branch)) else {
+        // Both names are resolved to commits before git reads them, through the
+        // one home `git::resolve` keeps for that rule: a branch name is
+        // untrusted input, and one beginning with `-` would be taken by `diff`
+        // as an option.
+        let (Some(base), Some(tip)) = (git::resolve(&root, "HEAD"), git::resolve(&root, branch))
+        else {
             // The branch a node names can be gone — a hand-run `git branch -d`,
             // a worktree git pruned — and the honest answer is git's own, not a
             // diff against a name that does not resolve.
