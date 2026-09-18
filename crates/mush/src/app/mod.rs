@@ -1153,6 +1153,37 @@ impl App {
         }
     }
 
+    /// Why a message to `id` cannot run, if it cannot: its worktree is gone.
+    ///
+    /// `/merge` and `/discard` reclaim an isolated agent's worktree and branch
+    /// but leave its actor alive, and that actor's file tools resolve their
+    /// directory from the workspace it was spawned with — so a run would
+    /// recreate the reclaimed path as a plain directory where no surface could
+    /// see the work (finding S1). The row, the footer and `/diff`/`/merge`/
+    /// `/worktrees` already tell the landed story; this is the same story for
+    /// typing. A worktree a hand-run `git worktree remove` took reads the same
+    /// way: the branch is named, the worktree is not on disk, so a run would
+    /// write into a phantom.
+    fn worktree_gone(&self, id: AgentId) -> Option<String> {
+        let node = self.tree.node(id)?;
+        if let Some(landed) = node.landed {
+            let past = match landed {
+                Landed::Merged => "merged",
+                Landed::Discarded => "discarded",
+            };
+            return Some(format!(
+                "agent #{id} was {past} — its worktree is gone; \
+                 spawn a fresh agent or work in the root"
+            ));
+        }
+        if node.branch.is_some() && !git::worktree_path(self.ws.root(), id.0).exists() {
+            return Some(format!(
+                "agent #{id}'s worktree is gone — spawn a fresh agent or work in the root"
+            ));
+        }
+        None
+    }
+
     /// A typed message, from the human to the focused agent.
     fn deliver(&mut self, text: String) {
         // A request without a model is a guaranteed refusal from the endpoint,
@@ -1217,6 +1248,16 @@ impl App {
                 }
             }
         } else {
+            // A landed agent cannot run again: its file tools resolve their
+            // directory from the workspace it was spawned with, so a run would
+            // recreate the reclaimed path as a plain directory where no surface
+            // — not `git status`, not `/diff`, not `/merge` — could see the work
+            // (finding S1). The words stay in the box and nothing runs.
+            if let Some(line) = self.worktree_gone(target) {
+                self.chat.insert(&text);
+                self.fail(line);
+                return;
+            }
             // Nudge a specific agent; running ones fold it in, idle ones rerun.
             // If the mailbox is gone the node's phase is put back exactly as it
             // was, instead of leaving a lie on the row (finding B10).
@@ -1658,12 +1699,13 @@ impl App {
     ///
     /// * The **bar** gets the one-glance line — the stat, or "nothing changed"
     ///   — because a bar row is one row.
-    /// * The **transcript** gets the diff itself, capped at `cmd_cap()` bytes
-    ///   of whole lines, head first, with a last row naming the command that
-    ///   reads the rest. That is the cap idiom the tool results already keep
-    ///   (`READ_CAP`, `CMD_CAP`, and the eight rows one result is painted
-    ///   with): git's output is not special, and a branch that touched a
-    ///   lockfile can print more diff than every conversation in the session.
+    /// * The **transcript** gets the diff itself — each hunk named by its file
+    ///   ([`diff_rows`]), capped at `cmd_cap()` bytes of whole lines, head
+    ///   first, with a last row naming the command that reads the rest. That
+    ///   is the cap idiom the tool results already keep (`READ_CAP`, `CMD_CAP`,
+    ///   and the eight rows one result is painted with): git's output is not
+    ///   special, and a branch that touched a lockfile can print more diff than
+    ///   every conversation in the session.
     /// * The **model** gets nothing. `/diff` is the human's command: its answer
     ///   goes to `Chat`'s notices, never to the messages that are sent, so no
     ///   tokens are spent and there is no model-facing shape to pick. A model
@@ -1715,10 +1757,15 @@ impl App {
                 .note(format!("{command} — nothing changed; {branch} is at HEAD"));
             return;
         }
-        let (head, elided) = head_lines(&diff, self.cfg().cmd_cap());
-        let mut note = format!("{summary} · {command}");
-        note.push('\n');
-        note.push_str(&head);
+        // The head of the *change*, not of git's boilerplate: a pane spends
+        // two rows on this answer, and `diff --git`/`index` are not the answer
+        // (finding S8(ii)).
+        let rows = diff_rows(&diff);
+        let (head, elided) = head_lines(&rows, self.cfg().cmd_cap());
+        // The bar already carries the one-glance line, so the transcript is the
+        // diff itself rather than the same summary again; a second copy only
+        // pushed the change one row further out of the pane's two-row foot.
+        let mut note = head;
         if elided > 0 {
             note.push_str(&format!(
                 "\n[+{elided} more lines — {command} reads the rest]"
@@ -2110,9 +2157,6 @@ impl App {
         }
     }
 
-    /// Focus the row the tree's cursor is on, and say whose pane the chat now
-    /// shows: `Enter` in the agent pane is a move of the *view*, so the brief
-    /// goes to the bar where a human can read it before typing.
     /// `←`/`→` in the agents pane: walk the painted rows along the parent links
     /// (finding U10). `direction < 0` selects the selected agent's parent;
     /// `> 0` its first child. Both read the order the pane paints and `j`/`k`
@@ -2157,8 +2201,20 @@ impl App {
         }
     }
 
+    /// Focus the row the tree's cursor is on, and say whose pane the chat now
+    /// shows: `Enter` in the agent pane is a move of the *view*, so the brief
+    /// goes to the bar where a human can read it before typing.
+    ///
+    /// The keyboard moves with the view. `Enter` used to show the agent's
+    /// transcript but leave the tree holding the keys, so the next thing the
+    /// human typed went to the tree — `g`/`G` jumped the cursor, a `c` in the
+    /// message cancelled the agent, and the pane snapped back to the root with
+    /// the words nowhere (finding S2). Focus is one value, so moving it moves
+    /// the bar's `chat`/`agents` badge, the pane borders and the key table
+    /// together.
     fn focus_cursor_row(&mut self) {
         if let Some(id) = self.tree.focus_cursor() {
+            self.focus = Focus::Chat;
             let brief = self
                 .tree
                 .node(id)
@@ -2297,6 +2353,88 @@ fn head_lines(text: &str, max: usize) -> (String, usize) {
     }
     let kept_lines = kept.lines().count();
     (kept, lines.len().saturating_sub(kept_lines))
+}
+
+/// git's diff, with each file's preamble folded into the hunks that belong to
+/// it: `more.txt @@ -0,0 +1,2 @@`.
+///
+/// A pane spends two rows on a `/diff` answer, and git's first two rows are
+/// always the same boilerplate — `diff --git a/x b/x`, then `index …` — so the
+/// change itself was never on screen without `/notes` (finding S8(ii)). The
+/// headline is the answer instead: the file, the hunk's line numbers, then the
+/// lines. A file with no hunk (`Binary files … differ`, a mode-only change)
+/// keeps a line of its own so it is still named.
+fn diff_rows(diff: &str) -> String {
+    /// Whether a line is git's per-file preamble: identity and mode, not a
+    /// change. Only dropped before the file's first `@@`, because a hunk's own
+    /// content can itself be a line beginning `---` (a removed line of `--`) or
+    /// `+++` (an added line of `++`).
+    fn preamble(line: &str) -> bool {
+        [
+            "index ",
+            "new file mode ",
+            "deleted file mode ",
+            "old mode ",
+            "new mode ",
+            "similarity index ",
+            "dissimilarity index ",
+            "rename from ",
+            "rename to ",
+            "copy from ",
+            "copy to ",
+            "--- ",
+            "+++ ",
+        ]
+        .iter()
+        .any(|prefix| line.starts_with(prefix))
+    }
+    /// The b-side path of git's `a/x b/x`, which is the file the hunk is in.
+    fn path_of(after: &str) -> String {
+        match after.rsplit_once(" b/") {
+            Some((_, b)) => b.to_string(),
+            None => after.strip_prefix("b/").unwrap_or(after).to_string(),
+        }
+    }
+
+    let mut rows: Vec<String> = Vec::new();
+    let mut path = String::new();
+    // A file named but not yet spoken for: it is kept by name when nothing else
+    // of it survives (a mode-only change).
+    let mut pending = false;
+    let mut preamble_open = false;
+    for line in diff.lines() {
+        if let Some(after) = line.strip_prefix("diff --git ") {
+            if pending {
+                rows.push(path.clone());
+            }
+            path = path_of(after);
+            pending = true;
+            preamble_open = true;
+            continue;
+        }
+        if line.starts_with("@@") {
+            rows.push(if path.is_empty() {
+                line.to_string()
+            } else {
+                format!("{path} {line}")
+            });
+            pending = false;
+            preamble_open = false;
+            continue;
+        }
+        if preamble_open && preamble(line) {
+            continue;
+        }
+        // Anything outside the preamble is kept as it is: `Binary files …`,
+        // `GIT binary patch`, `\ No newline at end of file`.
+        rows.push(line.to_string());
+        pending = false;
+        preamble_open = false;
+    }
+    if pending {
+        rows.push(path);
+    }
+    rows.join("\n")
 }
 
 #[cfg(test)]
@@ -2920,6 +3058,78 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A nudge to a landed agent is refused, not run into the reclaimed path
+    /// (finding S1). Landing already took the worktree and the branch, so the
+    /// run would recreate `.mush/wt/N` as a plain directory nothing can show,
+    /// diff or land; the words stay in the box and tell the same story the row,
+    /// the footer and `/diff`/`/merge`/`/worktrees` do.
+    #[test]
+    fn a_nudge_to_a_merged_agent_is_refused_and_writes_nothing() {
+        let root = repo("nudge-merged");
+        isolated_work(&root, 1, "add the parser");
+        let mut app = app_at(root.clone());
+        run(&mut app, "/merge 1");
+
+        app.tree.focus(AgentId(1));
+        app.chat.insert("write extra.txt");
+        app.send_message();
+
+        assert!(
+            text_of(&app).contains("agent #1 was merged — its worktree is gone"),
+            "the refusal says what happened: {}",
+            text_of(&app)
+        );
+        assert_eq!(
+            app.chat.input().text(),
+            "write extra.txt",
+            "the words are still in the box: nothing ran"
+        );
+        assert!(
+            !app.chat
+                .transcript(AgentId(1))
+                .iter()
+                .any(|message| message.text().contains("write extra.txt")),
+            "a refused message is not a message"
+        );
+        assert!(
+            !root.join(".mush/wt/1").exists(),
+            "the reclaimed path was not recreated"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same for `/discard`: its work is gone on purpose, and typing must
+    /// not bring the path back.
+    #[test]
+    fn a_nudge_to_a_discarded_agent_is_refused_and_writes_nothing() {
+        let root = repo("nudge-discarded");
+        isolated_work(&root, 2, "throwaway");
+        let mut app = app_at(root.clone());
+        run(&mut app, "/discard 2");
+
+        app.tree.focus(AgentId(2));
+        app.chat.insert("write extra.txt");
+        app.send_message();
+
+        assert!(
+            text_of(&app).contains("agent #2 was discarded — its worktree is gone"),
+            "the refusal says what happened: {}",
+            text_of(&app)
+        );
+        assert!(
+            !app.chat
+                .transcript(AgentId(2))
+                .iter()
+                .any(|message| message.text().contains("write extra.txt")),
+            "a refused message is not a message"
+        );
+        assert!(
+            !root.join(".mush/wt/2").exists(),
+            "the reclaimed path was not recreated"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// Landing work under a *running* agent would race the commits it is still
     /// making, so both commands refuse instead of interleaving with it.
     #[test]
@@ -2963,19 +3173,60 @@ mod tests {
             .next()
             .map(|notice| notice.text.clone())
             .expect("the diff is the answer");
-        assert!(
-            note.starts_with("#1 mush/1 +1−0 · git diff HEAD...mush/1\n"),
-            "the answer names the work and the command that would re-read it: {note:?}"
-        );
-        assert!(
-            note.contains("diff --git a/work.txt b/work.txt") && note.contains("+the work"),
-            "and the diff itself is painted, not named: {note:?}"
+        assert_eq!(
+            note, "work.txt @@ -0,0 +1 @@\n+the work",
+            "the answer is the change itself, named by its file: {note:?}"
         );
         // The model pays nothing for a command the human typed: this is a
         // notice, not a message, and notices are never sent anywhere.
         assert!(
             app.chat.transcript(AgentId::ROOT).is_empty(),
             "the diff is the human's reading, not a turn"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The pane's own rows show the change, not git's file header (finding
+    /// S8(ii)): `/diff` keeps the head, and the head is the first hunks, each
+    /// named by its file — so a `+` line is on screen without `/notes`.
+    #[test]
+    fn the_diff_pane_shows_the_first_hunks_not_gits_preamble() {
+        let root = repo("diff-first-hunk");
+        isolated_work(&root, 1, "add work");
+        let worktree = git::worktree_path(&root, 1);
+        std::fs::write(worktree.join("more.txt"), "alpha\nbravo\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-qm", "more"]);
+        let mut app = app_at(root.clone());
+
+        run(&mut app, "/diff 1");
+
+        let note = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .next()
+            .map(|notice| notice.text.clone())
+            .expect("the diff is the answer");
+        assert!(
+            !note.contains("diff --git") && !note.contains("index "),
+            "git's preamble is not the answer: {note:?}"
+        );
+        assert!(
+            note.lines().any(|line| line.starts_with("more.txt @@")),
+            "each hunk is named by its file: {note:?}"
+        );
+
+        // What the human actually sees at a normal terminal: the pane's two
+        // note rows are the first hunk and its first changed line.
+        let rows = screen(&mut app, 80, 16);
+        assert!(
+            rows.iter().any(|row| row.contains("more.txt @@")),
+            "the first hunk is painted: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.trim_start().starts_with("+alpha")),
+            "and so is a changed line: {rows:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -3040,8 +3291,8 @@ mod tests {
             .map(|notice| notice.text.clone())
             .expect("the diff is the answer");
         assert!(
-            note.contains("+line 0") && note.contains("diff --git a/big.txt"),
-            "the head of the diff is what is kept: {:?}",
+            note.contains("+line 0") && note.starts_with("big.txt @@"),
+            "the head of the change is what is kept: {:?}",
             &note[..note.len().min(200)]
         );
         assert!(
@@ -4935,6 +5186,98 @@ mod tests {
         assert_eq!(text_of(&app), "agent #1 is gone");
     }
 
+    /// `Enter` on a tree row shows that agent *and* hands it the keyboard
+    /// (finding S2): typing then reaches the agent, the letters are a message
+    /// and not tree bindings, and the bar's badge moves with the keyboard.
+    #[test]
+    fn enter_on_a_row_moves_the_keyboard_with_the_focus() {
+        let (mut app, _rx) = test_app("enter-focus");
+        app.focus = Focus::Agents;
+        // Two rows, so a leaked `g`/`G` would move the cursor somewhere the
+        // message could hide.
+        let (cmd, mailbox) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "lexer".to_string(),
+            depth: 1,
+            branch: None,
+            cmd,
+        });
+        app.tree.insert(Spawn {
+            id: AgentId(2),
+            parent: AgentId::ROOT,
+            brief: "parser".to_string(),
+            depth: 1,
+            branch: None,
+            cmd: crossbeam_channel::unbounded().0,
+        });
+        app.tree.cursor_top();
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(1)));
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert_eq!(app.tree.focused, AgentId(1), "the pane shows #1");
+        assert_eq!(app.focus, Focus::Chat, "and the keyboard went with it");
+        let cursor = app.tree.cursor();
+        assert!(
+            screen(&mut app, 80, 24)
+                .iter()
+                .any(|row| row.contains(" chat ")),
+            "the bar's badge agrees with the key table"
+        );
+
+        // `g`, the space and `c` are ordinary letters now.
+        for ch in "go c".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
+        }
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        match mailbox.recv_timeout(Duration::from_secs(5)) {
+            Ok(AgentMsg::Nudge(text)) => assert_eq!(text, "go c"),
+            other => panic!("the words must reach #1, not the tree: {:?}", other.is_ok()),
+        }
+        assert_eq!(
+            app.tree.cursor(),
+            cursor,
+            "a `g` in the message must not jump the cursor"
+        );
+        assert_eq!(
+            app.tree.node(AgentId(1)).unwrap().phase,
+            Phase::Thinking,
+            "a `c` in the message must not cancel the agent"
+        );
+    }
+
+    /// The other half of the same rule: while the chat owns the keyboard, `c`
+    /// is a letter, not a tree binding (finding S2).
+    #[test]
+    fn a_c_in_the_chat_types_a_c_and_cancels_nothing() {
+        let (mut app, _rx) = test_app("chat-c");
+        app.focus = Focus::Chat;
+        let (cmd, mailbox) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "lexer".to_string(),
+            depth: 1,
+            branch: None,
+            cmd,
+        });
+        app.tree.begin(AgentId(1), None);
+        app.tree.focus(AgentId(1));
+
+        app.on_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE));
+
+        assert_eq!(app.chat.input().text(), "c", "the letter went into the box");
+        assert!(mailbox.try_recv().is_err(), "no Stop was sent");
+        assert!(
+            app.tree.node(AgentId(1)).unwrap().phase.is_busy(),
+            "the agent is still running"
+        );
+    }
+
     /// `/compact` asks the *focused* agent to fold its conversation, and says
     /// so on the bar. Nothing about the row's phase changes: the fold is the
     /// actor's job, and its `Compact` event is what replaces the transcript.
@@ -5736,6 +6079,11 @@ mod tests {
             rows.iter().any(|row| row.contains("#3 agent 3")),
             "the footer names the cursor row: {rows:?}"
         );
+
+        // `Enter` hands the keyboard to the agent it focused (finding S2), so
+        // the rest of this walk — which is about the *rows* — takes it back the
+        // way a human does.
+        app.focus = Focus::Agents;
 
         // `k` back up one row is #1, and `G` is the last painted row — the
         // root's second child, whose storage index is 2 of 3.

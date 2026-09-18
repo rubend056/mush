@@ -125,7 +125,16 @@ class Handler(BaseHTTPRequestHandler):
                         "content": "deep work",
                     })
             elif is_subagent:
-                if "iso.txt" in joined:
+                if "extra.txt" in joined and "wrote extra.txt" not in joined:
+                    # A nudge after the child's first run. Used by the S1
+                    # evidence run: the child's worktree is gone by then, so a
+                    # run here would recreate the dead path as a plain
+                    # directory. mush refuses it instead.
+                    reply = self.tool_call("write_file", {
+                        "path": "extra.txt",
+                        "content": "phantom",
+                    })
+                elif "iso.txt" in joined:
                     # ISO scenario child: write the file itself.
                     if "wrote iso.txt" in joined:
                         reply = {"role": "assistant", "content": "created iso.txt in my worktree"}
