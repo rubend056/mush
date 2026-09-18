@@ -501,3 +501,40 @@ turn explains itself when it fires.
 without its fix. The audit itself ran against a `prompt.rs` that was being
 edited by hand, so its prompt quotes are a snapshot; the executor-side rows are
 not.
+
+---
+
+## 8.13 The spawn contract: a name, and one switch (`15648ae`)
+
+The tool that writes the tree's rows could not name them, and the flag that
+meant "give this child its own tree" was a boolean the executor had to trust.
+One contract now says both: `spawn_agent(brief, title, base?)`.
+
+- **U14 ✅ — `spawn_agent` can name its child.** `title` ("A 3 word description
+  of this agent's brief.") is a *required* schema argument, because a row's name
+  is the only way to know what an agent is doing at a glance; it travels in
+  `AgentEvent::Spawned`, is stored in `session.json`, and comes back on restore.
+  A blank or missing title still falls back to `AgentNode::title`'s handle
+  derived from the brief (U6), so a stale call or a server that ignores
+  `required` cannot leave a row nameless. Pinned by
+  `a_spawn_carries_the_name_its_caller_gave`,
+  `the_row_prefers_the_title_its_caller_gave`, and the restore assertion in
+  `a_stored_conversation_restores_its_agents_with_a_live_mailbox`.
+- **H7, corrected — `base` *is* isolation.** The `isolated` boolean and the
+  whole degradation path are removed: pass `base` and the child gets its own
+  worktree and branch forked from that ref; omit it and the child shares the
+  workspace, where the one-shared-child rule applies. Anything git refuses is
+  now a *failed delegation* (``cannot start from `{name}`: …``) instead of a
+  child that silently runs in the shared checkout — superseding §8.11's
+  `(isolated unavailable: …)` row, its notice, and its test. An unknown ref is
+  refused before anything is created. Pinned by
+  `a_spawn_that_cannot_make_its_worktree_is_refused`,
+  `a_named_base_is_resolved_before_anything_is_created`, and
+  `a_spawn_forks_from_the_named_base_and_says_so`.
+
+**Census at `15648ae`:** total 42,477 (was 42,448), **prod 7,807 (−1)**, tests
+22,106 (+41), comments 9,792 (−12). The production side is a net removal: the
+name rides a path the brief already travelled, and deleting the degradation
+path paid for it. Owed in the doc-sync pass: `docs/mush.md` §3's signature and
+tool table (`brief, title, base?`) and §5.5's `isolated unavailable` sentence,
+which no longer exists.
