@@ -896,17 +896,22 @@ impl App {
         }
     }
 
-    /// Whether anything in the tree is working: derived from the phases, so it
-    /// cannot disagree with the rows. A detached job counts: the agent may be
-    /// napping, but the machine is not idle, and the tick uses this to keep the
-    /// git snapshot fresh while something runs.
+    /// Whether anything in the tree is working: derived from the phases and the
+    /// job registry, so it cannot disagree with the rows. A detached job counts:
+    /// the agent may be napping, but the machine is not idle, and the tick uses
+    /// this to keep the git snapshot fresh while something runs.
     pub fn busy(&self) -> bool {
-        self.tree.busy()
-            || self
-                .tree
-                .agents
-                .iter()
-                .any(|node| !self.tree.live_jobs(node.id).is_empty())
+        // The tree answers the common case with no registry read; the per-node
+        // check only adds the jobs.
+        self.tree.busy() || self.tree.agents.iter().any(|node| self.in_flight(node))
+    }
+
+    /// Whether one agent has work in flight: its own run, or one of its jobs.
+    /// The one per-node derivation behind [`Self::busy`] and
+    /// [`Self::working_agents`]. [`AgentTree::busy`] stays agent-only, with no
+    /// opinion about jobs.
+    fn in_flight(&self, node: &AgentNode) -> bool {
+        node.phase.is_busy() || !self.tree.live_jobs(node.id).is_empty()
     }
 
     /// The jobs `id` has running, read from the one registry that holds them.
@@ -2011,13 +2016,12 @@ impl App {
     }
 
     /// The agents with work in flight: a run, or a job. `Stop` is aimed at the
-    /// work, not at the phase, so both count — an agent whose run ended while
-    /// its `cargo bench` still runs is not idle on the machine.
+    /// work, not at the phase, so both count ([`Self::in_flight`]).
     fn working_agents(&self) -> Vec<AgentId> {
         self.tree
             .agents
             .iter()
-            .filter(|node| node.phase.is_busy() || !self.tree.live_jobs(node.id).is_empty())
+            .filter(|node| self.in_flight(node))
             .map(|node| node.id)
             .collect()
     }
