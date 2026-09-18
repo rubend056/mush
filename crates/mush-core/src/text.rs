@@ -203,17 +203,8 @@ pub fn truncate(text: &str, max: usize) -> String {
 
 /// [`truncate`], and whether it dropped anything: `(text, cut_short)`.
 ///
-/// A caller that has to *say* that it cut — a subject, a digest — is asking a
-/// question only the arithmetic can answer, and two callers used to answer it by
-/// looking at the string instead: `subject_brief` read a trailing `…`, and
-/// `Outcome::digest` compared character counts. Both were wrong about the same
-/// edge, in opposite directions: a brief that really ends in `…` is not a brief
-/// that was cut (the word before it was swallowed), and a cut whose `…` stands in
-/// for a dropped wide glyph has the same number of characters as the body (so the
-/// digest fell silent about the very text it hid).
-///
-/// The flag is “the returned text is not the whole text”, so `truncate(text, 0)`
-/// on a non-empty text is a cut and on an empty text is not.
+/// A caller cannot read whether the text came back whole off the string, so the
+/// arithmetic says so.
 pub fn truncate_flag(text: &str, max: usize) -> (String, bool) {
     cut(&sanitize_upto(text, max), max)
 }
@@ -239,9 +230,6 @@ fn sanitize_upto(text: &str, max: usize) -> String {
 /// [`truncate`] over text that is already safe to paint: the column arithmetic
 /// alone, so a caller that has sanitized its own field does not pay for it
 /// twice.
-///
-/// The flag says whether the text came back whole, which is the one thing a
-/// caller cannot read off the string (see [`truncate_flag`]).
 fn cut(text: &str, max: usize) -> (String, bool) {
     if max == 0 {
         return (String::new(), !text.is_empty());
@@ -338,18 +326,8 @@ pub fn fit_row(
 }
 
 /// The nearest character boundary at or before `at`, never past the end of
-/// `text`.
-///
-/// A byte budget lands inside a multi-byte character often enough that a
-/// caller slicing by bytes has to walk back for a boundary first, and the walk
-/// was hand-rolled in two places on the same file (`Workspace`'s head cut for a
-/// read and for a tool result) with a third going the other way
-/// (`tail_for_model`). They have to agree about the two ends — a walk that does
-/// not stop at zero panics, one that does not stop at the text's end runs off
-/// it — so the rule lives here, beside the width arithmetic it is a part of.
-///
-/// `at` past the end is the end, so a caller passing a size and a cap in any
-/// order cannot panic.
+/// `text`: `at` past the end is the end, so a caller passing a size and a cap in
+/// any order cannot panic.
 pub fn boundary_at_or_before(text: &str, at: usize) -> usize {
     let mut cut = at.min(text.len());
     while cut > 0 && !text.is_char_boundary(cut) {

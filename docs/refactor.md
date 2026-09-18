@@ -592,11 +592,13 @@ ledger that outlives it; the review subsection each row came from is where the
 evidence's commit is named, and a price re-set by a later review says so (the
 sixth review, after the `Screen` rewrite, re-priced `D9` and `R9`).
 
-The census the reviews read, and the tree this ledger anchors to: 41 447 lines —
-prod 7 568, tests 21 531, comments 9 635, the last three unchanged since
-`960e073` (`findings.md` §8.19). `scripts/census.py` is the method; `findings.md`
-§8.5 has the per-wave deltas, from 9 200 lines at `143325a15` to 41 123 at
-`f70374f` (prod ×1.8, tests ×6.9, comments ×7.5).
+The census the reviews read, and the tree this ledger anchors to, measured at
+`b8d8baa`: 42 425 lines (prod 7 010, tests 22 476, comments 10 153) — from the
+`960e073` baseline it was seeded with, 41 447 (prod 7 568, tests 21 531, comments
+9 635; `findings.md` §8.19), so prod −558 / tests +945 / comments +518.
+`scripts/census.py` is the method; `findings.md` §8.5 has the per-wave deltas,
+from 9 200 lines at `143325a15` to 41 123 at `f70374f` (prod ×1.8, tests ×6.9,
+comments ×7.5).
 
 | # | What is duplicated | Net | Risk | Protecting test | Status |
 |---|---|---|---|---|---|

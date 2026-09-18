@@ -56,6 +56,10 @@ a few big delegations over many small ones.\n\
 \"#N done: summary\". wait is optional — use it when you want the results now (its schema says what it \
 hands over).";
 
+/// The opening a blank brief leaves: the child's first user message and the
+/// transcript's first line, so the model and the human read the same words.
+pub const BEGIN_TASK: &str = "Begin the task now.";
+
 /// The whole root-agent system prompt. If this grows much, something else went
 /// wrong.
 pub fn system_prompt(root: &str) -> String {
@@ -328,7 +332,7 @@ mod tests {
         assert!(!prompt.contains("port the parser"));
         // Subagents get the same workspace rules as the root, from one block.
         assert!(prompt.contains("Rules:"));
-        assert!(prompt.contains("Read before you edit"));
+        assert!(prompt.contains(RULES));
         assert!(prompt.contains("`/tmp/x`"));
     }
 

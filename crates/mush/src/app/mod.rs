@@ -315,7 +315,7 @@ fn job_title(command: &str) -> String {
 const QUIT_LINE_COLUMNS: usize = 72;
 
 /// The line a quit over live work paints: `Ctrl-Q again quits · kills #0
-/// thinking, #3 wait_commands + 1 job`.
+/// thinking, #3 wait + 1 job`.
 ///
 /// The first clause is the decision the human is making twice; everything after
 /// it is [`App::what_a_quit_kills`], one item per thing, joined until the row
@@ -965,7 +965,7 @@ impl App {
             }
             AgentEvent::ResultRead { child } => {
                 // The parent's actor has handed a child's result to the model —
-                // folded it, or answered a `wait_agents` for it — so the child's
+                // folded it, or answered a `wait` for it — so the child's
                 // row stops wearing `✉`. Only the owner of that fact moves the
                 // mark: a row that guessed itself clear would be claiming a
                 // reading that never happened (finding H4).
@@ -1507,7 +1507,7 @@ impl App {
                     Ok(())
                 }
                 _ => {
-                    let line = format!("agent #{target} is gone");
+                    let line = agent::gone(target);
                     self.tree.nudge_failed(target, previous);
                     self.fail(&line);
                     Err(line)
@@ -1541,19 +1541,10 @@ impl App {
     /// `Enter` on a row, `edit` is the message box and the send — so the
     /// socket cannot reach a state the human could not.
     pub fn handle_attach(&mut self, from: &str, request: &attach::Request) -> attach::Response {
-        // A client's op is not the human's own key. A key means the human
-        // changed their mind, and every door a key takes a quit's warning back
-        // through is a deliberate [`Self::disarm_quit`]; a client's `focus`,
-        // draft or send must not end a confirmation the human is in the middle
-        // of. The warning *is* the arm (finding H9), so an op that says its own
-        // line would cancel the press they are holding — so the warning is put
-        // back exactly as it stood, same `set_at`, so it still fades when it
-        // would have. The client's answer travels on the socket it asked from.
-        //
-        // A *failure* the op caused is not put back under: it is the thing the
-        // human has to read (`chat::Rank::Alert`, the rank the warning holds
-        // too), and the bar has one row for the two — overwriting it would lose
-        // the op's own failure entirely (findings §6, H9).
+        // A client's op must not end the quit a key armed
+        // ([`Self::disarm_quit`]), so the warning is put back exactly as it
+        // stood — but not over a failure the op itself caused, a line the
+        // human has to read (finding H9).
         let armed_quit = self.status.clone().filter(|_| self.quit_armed());
         let reply = match &request.op {
             attach::Op::Read { agent, since } => self.attach_read(*agent, *since),
@@ -2099,7 +2090,7 @@ impl App {
                 // next step…`.
                 self.say(format!("{} #{target}…", Compacting::Requested.verb()));
             }
-            _ => self.fail(format!("agent #{target} is gone")),
+            _ => self.fail(agent::gone(target)),
         }
     }
 
@@ -3366,7 +3357,6 @@ mod tests {
         (screen, terminal.backend().buffer().clone())
     }
 
-    /// One painted frame as a [`Shot`]: the `Screen` and its cells.
     fn shot(app: &mut App, width: u16, height: u16) -> Shot {
         let (screen, buffer) = painted(app, width, height);
         let cells = (0..height)
@@ -8402,7 +8392,7 @@ mod tests {
     }
 
     /// One frame with a nested tree: the root is at rest with work out, its own
-    /// child #1 is parked in `wait_agents`, and the grandchild #2 is working.
+    /// child #1 is parked in `wait`, and the grandchild #2 is working.
     ///
     /// The bar's sentence is a promise about when the root resumes — "the root
     /// resumes as they finish" — and the root resumes when *its* children
@@ -8444,7 +8434,7 @@ mod tests {
             id: AgentId::ROOT,
             event: AgentEvent::Done,
         });
-        app.tree.activity(AgentId(1), "wait_agents 3s");
+        app.tree.activity(AgentId(1), "wait 3s");
         app.tree.activity(AgentId(2), "read_file deep.txt 2s");
         assert_eq!(
             (
@@ -9075,7 +9065,7 @@ mod tests {
             ),
         ));
         assert_eq!(error.kind, "bad_request", "the sender is told: {error:?}");
-        assert_eq!(error.message.as_deref(), Some("agent #1 is gone"));
+        assert_eq!(error.message, Some(agent::gone(1)));
 
         assert_eq!(
             text_of(&app),

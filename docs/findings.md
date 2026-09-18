@@ -406,7 +406,7 @@ the code does not honour — prompts, schemas, tool results, refusals — after 
 prompt/schema dedup pass. It verified ~15 claims sound (delivery once per run,
 wrap-up and truncation answering "was not run", base spawns, job reports,
 edit-batch semantics, path enforcement, wait defaults) and found the rows
-below, all now fixed:
+below, all now fixed but the last:
 
 | What an agent read | What the code did | Closed by |
 |---|---|---|
@@ -421,6 +421,7 @@ below, all now fixed:
 | "Read a file." | a capped read gave no size and no way to the rest | `3e006c5`: "N of M bytes shown … `sed -n`" — `read_file` too was later removed by the twelve-to-six cut, so the fix's home is gone |
 | "**Workspace jail.** Every agent path is resolved against the root and rejected if it escapes (`..`, absolute paths). The agent cannot touch `/etc`." (`docs/mush.md` §2) | only `edit_file` ever did that, and only to its own `path`; `run_command` was always a real shell with nothing confining it, and the file tools read any path | reworded to what the code does: the workspace is named in the prompt, commands run with cwd at its root, and the rules say never to touch paths outside it (`prompt.rs` `RULES`) — §2 of `docs/mush.md` now says plainly that this is a convention, not a jail (the twelve-to-six cut) |
 | "cut off … 4 times in a row" | the counter never reset, so scattered truncations were called consecutive | `00571b4` |
+| a child at rest, for one drain, while it has resumed | the run-start report the last wave added announces a resume to the parent's `running` book (`AgentMsg::ChildRunning`, sent as the run begins), but leans on the parent draining the child's `ChildDone` first and the ordering is not enforced: a child ends run N with its result unread, the human nudges it (a `Steer` is sent), the parent's boundary drains the completion and clears the running mark, and the child's `ChildRunning(N+1)` lands one drain later — `drain_mailbox` takes whatever `try_iter` holds and the report was not in that snapshot, so a drain between the two clears the mark for one drain (a momentary wrong `status` and one-shared-child guard answer, no crash) | ⬜ **open** — a run sequence the parent can compare (`ChildDone` already carries one) or a drain that settles before it acts |
 
 **Deliberately left, each for a stated reason:** a *stopped* child does not wake
 its parent (`Outcome::is_news` — the human's stop is not news, and the line is

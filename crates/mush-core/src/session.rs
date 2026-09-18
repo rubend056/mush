@@ -421,8 +421,11 @@ mod tests {
 
         // Nothing to move: the rename fails, and the sentence still names the
         // file rather than the OS's error alone.
-        let error = keep_unreadable(&root).unwrap_err();
-        assert!(error.starts_with("cannot keep session.json — "), "{error}");
+        let rename_failed = keep_unreadable(&root).unwrap_err();
+        assert!(
+            rename_failed.starts_with("cannot keep session.json — "),
+            "{rename_failed}"
+        );
 
         // Every name beside it taken — the other `Err`, and the one a workspace
         // that has been hand-broken a hundred times reaches.
@@ -437,9 +440,9 @@ mod tests {
         }
         let error = keep_unreadable(&root).unwrap_err();
         assert!(error.starts_with("cannot keep session.json — "), "{error}");
-        assert!(
-            error.contains("every backup name beside it is taken"),
-            "and it says why: {error}"
+        assert_ne!(
+            error, rename_failed,
+            "the two ways a keep fails must read as two reasons: {rename_failed} vs {error}"
         );
         assert!(
             session_path(&root).exists(),

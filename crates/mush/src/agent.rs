@@ -2475,23 +2475,10 @@ fn drain_mailbox(
 
 /// Record a child's completion and return the line the model reads.
 ///
-/// A *newer run* supersedes the recorded outcome — a child that was stopped and
-/// then nudged finishes later, and the stale `stopped` must not outlive the
-/// result. The same run recorded again is not newer: it changes nothing, and in
-/// particular it does **not** clear the delivery mark. Clearing it there is
-/// precisely what let one outcome fold twice — the mark is a fact about what the
-/// model read, and hearing the same report again cannot make it unread
-/// (`docs/findings.md` B24: the defect was the unconditional
-/// `state.delivered.remove(&id)` that used to end this function).
-///
-/// The *running* mark is the same kind of fact and is cleared under the same
-/// rule: only a run ending — a run the books have not heard of — is a child
-/// coming to rest. A result recorded again is not. It used to clear the mark
-/// unconditionally, so the timeout's fresh path (`wait_digest(fresh_only)`,
-/// which re-records what it hands over) took the running mark off a child the
-/// human had nudged: `status` reported an idle child, the one-shared-child guard
-/// saw the workspace free, and the next `wait` answered a result the child was
-/// busy pasting over (audit row 1).
+/// A newer run supersedes the recorded outcome, and the delivery and running
+/// marks share one rule: only a run the books have not heard of is an ending,
+/// so recording the same run again clears neither (`docs/findings.md` B24,
+/// audit row 1).
 fn note_completion(state: &mut ActorState, id: u64, run: u64, outcome: Outcome) -> String {
     let line = outcome.line(id);
     if state.completed.get(&id).map(|completion| completion.run) != Some(run) {
@@ -2761,10 +2748,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         depth + 1 < MAX_DEPTH,
     );
     let initial = if brief.trim().is_empty() {
-        vec![
-            Message::system(whoami),
-            Message::user("Begin the task now."),
-        ]
+        vec![Message::system(whoami), Message::user(prompt::BEGIN_TASK)]
     } else {
         vec![Message::system(whoami), Message::user(brief.clone())]
     };
@@ -2928,6 +2912,12 @@ fn in_flight(state: &ActorState) -> Vec<String> {
     out
 }
 
+/// The digest a repeat `wait` answers with: the same sentence the listing
+/// carries, plus the mark that it is not news.
+fn already_read(digest: &str) -> String {
+    format!("{digest} (already read — no new run since)")
+}
+
 /// Every result this agent has, in id order: children first, then jobs. A
 /// child's result nobody has read comes in full and is marked read; one already
 /// read comes as its digest, never the body again, and never the past reported
@@ -2962,7 +2952,7 @@ fn wait_digest(actor: &Actor, state: &mut ActorState, fresh_only: bool) -> Vec<S
                 .emit(actor.id, AgentEvent::ResultRead { child: id });
             out.push(body);
         } else {
-            out.push(format!("{digest} (already read — no new run since)"));
+            out.push(already_read(&digest));
         }
     }
     let mut jobs: Vec<u64> = state.done_jobs.keys().copied().collect();
@@ -3083,6 +3073,12 @@ fn parse_target(raw: &str) -> Result<Target, String> {
     })
 }
 
+/// The actor a message was aimed at no longer answers: the mailboxes, the UI
+/// and a nudge all reach the same dead end and the same words.
+pub(crate) fn gone(id: impl std::fmt::Display) -> String {
+    format!("agent #{id} is gone")
+}
+
 /// Stop a child this agent owns. Stopping is not finishing: the child keeps its
 /// context and work, and a later `control message` resumes it.
 fn stop_agent(state: &mut ActorState, id: u64) -> Result<String, String> {
@@ -3093,7 +3089,7 @@ fn stop_agent(state: &mut ActorState, id: u64) -> Result<String, String> {
     // have the model wait on a result that can never arrive.
     cmd.send(AgentMsg::Stop)
         .map(|_| format!("stopping agent #{id}"))
-        .map_err(|_| format!("agent #{id} is gone"))
+        .map_err(|_| gone(id))
 }
 
 /// Message a child this agent owns. The words resume an idle child, so the
@@ -3123,7 +3119,7 @@ fn message_agent(state: &mut ActorState, args: &Value, id: u64) -> Result<String
         Ok(()) => Ok(format!(
             "messaged agent #{id} — it is mid-run, so it reads this at its next step"
         )),
-        Err(_) => Err(format!("agent #{id} is gone")),
+        Err(_) => Err(gone(id)),
     }
 }
 
@@ -3904,7 +3900,7 @@ mod tests {
             let id = index as u64 + 1;
             assert_eq!(
                 answers[index],
-                format!("{} (already read — no new run since)", outcome.digest(id)),
+                already_read(&outcome.digest(id)),
                 "the wait's digest is the same sentence"
             );
         }
