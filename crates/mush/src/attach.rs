@@ -427,3 +427,203 @@ pub fn decode(line: &str) -> Result<Response, String> {
     }
     Err("a response with neither `ok` nor `error`".to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    fn round_trip(request: Request) -> Request {
+        let line = request.encode();
+        parse_request(&line).expect("its own line parses")
+    }
+
+    #[test]
+    fn every_op_round_trips_through_its_line() {
+        for request in [
+            Request {
+                id: json!(1),
+                op: Op::Read {
+                    agent: 2,
+                    since: 12,
+                },
+            },
+            Request {
+                id: json!(7),
+                op: Op::Agents,
+            },
+            Request {
+                id: json!(3),
+                op: Op::Focus { agent: 5 },
+            },
+            Request {
+                id: json!("given"),
+                op: Op::Edit {
+                    agent: 0,
+                    base: 34,
+                    text: "a new line\nwith a break".to_string(),
+                    send: true,
+                },
+            },
+        ] {
+            assert_eq!(round_trip(request.clone()), request, "{request:?}");
+        }
+    }
+
+    #[test]
+    fn missing_optional_fields_read_as_their_default() {
+        // `since` absent is from the start; `send` absent is a draft.
+        let read = parse_request(r#"{"id":1,"op":"read","agent":0}"#).unwrap();
+        assert_eq!(read.op, Op::Read { agent: 0, since: 0 });
+        let edit = parse_request(r#"{"id":2,"op":"edit","agent":0,"base":1,"text":"x"}"#).unwrap();
+        assert_eq!(
+            edit.op,
+            Op::Edit {
+                agent: 0,
+                base: 1,
+                text: "x".to_string(),
+                send: false,
+            }
+        );
+    }
+
+    #[test]
+    fn an_unknown_op_is_a_bad_request_with_its_id() {
+        let error = parse_request(r#"{"id":9,"op":"dance"}"#).unwrap_err();
+        assert_eq!(error.id, json!(9));
+        assert!(error.message.contains("dance"), "{}", error.message);
+    }
+
+    #[test]
+    fn malformed_json_is_a_bad_request_with_a_null_id() {
+        let error = parse_request("{not json").unwrap_err();
+        assert_eq!(error.id, Value::Null, "there was no id to read");
+        assert!(!error.message.is_empty());
+
+        let error = parse_request("[1,2,3]").unwrap_err();
+        assert_eq!(error.id, Value::Null);
+        assert!(error.message.contains("object"), "{}", error.message);
+    }
+
+    #[test]
+    fn a_wrongly_typed_field_is_a_bad_request_that_keeps_the_id() {
+        let error = parse_request(r#"{"id":4,"op":"read","agent":"zero"}"#).unwrap_err();
+        assert_eq!(error.id, json!(4), "the id survived the bad field");
+        assert!(error.message.contains("agent"), "{}", error.message);
+
+        let error =
+            parse_request(r#"{"id":5,"op":"edit","agent":0,"base":1,"text":7}"#).unwrap_err();
+        assert_eq!(error.id, json!(5));
+        assert!(error.message.contains("text"), "{}", error.message);
+    }
+
+    /// A `null` id is a legal one and must come back as `null`, not be replaced
+    /// by a number the client never sent.
+    #[test]
+    fn a_null_id_survives_the_round_trip() {
+        let request = parse_request(r#"{"id":null,"op":"agents"}"#).unwrap();
+        assert_eq!(request.id, Value::Null);
+        let response = Response::ok(request.id.clone(), json!({"agents": []}));
+        assert_eq!(decode(&response.encode()).unwrap().id, Value::Null);
+
+        // And a request that carried no id at all answers with `null` too.
+        let error = parse_request(r#"{"op":"nope"}"#).unwrap_err();
+        assert_eq!(error.id, Value::Null);
+    }
+
+    #[test]
+    fn a_response_is_one_line_and_round_trips() {
+        let ok = Response::ok(
+            json!(1),
+            json!({"agent": 0, "revision": 3, "lines": [{"line": 0, "role": "user", "text": "hi\nthere"}]}),
+        );
+        let line = ok.encode();
+        assert!(!line.contains('\n'), "no raw newline: {line}");
+        assert_eq!(decode(&line).unwrap(), ok);
+
+        let conflict = Response::error(json!(4), ReplyError::conflict(37));
+        assert_eq!(
+            conflict.encode(),
+            r#"{"error":{"kind":"conflict","revision":37},"id":4}"#
+        );
+        assert_eq!(decode(&conflict.encode()).unwrap(), conflict);
+
+        let bad = Response::error(json!(null), ReplyError::bad_request("no op"));
+        assert_eq!(
+            decode(&bad.encode()).unwrap().reply,
+            Reply::Err(ReplyError {
+                kind: "bad_request".to_string(),
+                message: Some("no op".to_string()),
+                revision: None,
+            })
+        );
+    }
+
+    // ------------------------------------------------------------- over a socket
+
+    /// The whole transport, on a real socket in a scratch directory: a request
+    /// answered, a bad line answered *and the connection kept*, then a valid
+    /// line again — which is the property the smoke suite's other sockets do
+    /// not exercise. `serve` spawns the accept thread; this test stands in for
+    /// the UI, reading `Msg::Attach` off the channel and replying.
+    #[test]
+    fn a_socket_answers_a_request_a_bad_line_and_then_more() {
+        let root = std::env::temp_dir().join(format!("mush-attach-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let guard = serve(&root, tx).unwrap();
+        let socket = socket_path(&root);
+        assert!(socket.exists(), "the socket is bound at {socket:?}");
+
+        let mut client = UnixStream::connect(&socket).unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+
+        // A request that reaches the UI, answered by the stand-in `App`.
+        writeln!(client, r#"{{"id":1,"op":"agents"}}"#).unwrap();
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Msg::Attach { request, reply, .. } => {
+                assert_eq!(request.op, Op::Agents);
+                reply
+                    .send(Response::ok(request.id, json!({"agents": []})))
+                    .unwrap();
+            }
+            _ => panic!("expected Msg::Attach"),
+        }
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(decode(line.trim_end()).unwrap().id, json!(1));
+
+        // A bad line is answered from the socket thread, without the UI.
+        writeln!(client, "not json at all").unwrap();
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let reply = decode(line.trim_end()).unwrap();
+        assert_eq!(reply.id, Value::Null);
+        assert!(matches!(reply.reply, Reply::Err(_)));
+        assert!(
+            rx.try_recv().is_err(),
+            "a bad line must not wake the UI thread"
+        );
+
+        // And the same connection still works afterwards.
+        writeln!(client, r#"{{"id":2,"op":"agents"}}"#).unwrap();
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Msg::Attach { request, reply, .. } => {
+                reply
+                    .send(Response::ok(request.id, json!({"agents": []})))
+                    .unwrap();
+            }
+            _ => panic!("expected Msg::Attach"),
+        }
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(decode(line.trim_end()).unwrap().id, json!(2));
+
+        drop(client);
+        drop(guard);
+        assert!(!socket.exists(), "the guard removed the socket file");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+}

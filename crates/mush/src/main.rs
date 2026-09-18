@@ -1200,4 +1200,118 @@ mod tests {
         assert!(help.contains("KEYS:"));
         assert!(help.contains("COMMANDS (type in the chat):"));
     }
+
+    /// The `--help` text lists the attach subcommands, so a human learns they
+    /// exist from the one place every other surface is advertised.
+    #[test]
+    fn the_help_lists_the_attach_subcommands() {
+        let help = help_text();
+        for sub in ["mush agents", "mush read", "mush focus", "mush edit"] {
+            assert!(help.contains(sub), "`{sub}` is not in --help:\n{help}");
+        }
+    }
+
+    /// The subcommands parse before anything else: a directory, the flag forms
+    /// `read`/`edit` take, and the id `focus` takes before its directory.
+    #[test]
+    fn the_attach_subcommands_parse() {
+        let parse = |argv: &[&str]| {
+            Cli::detect(&argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            parse(&["agents"]).unwrap(),
+            Some(Cli::Agents { dir: ".".into() })
+        );
+        assert_eq!(
+            parse(&["agents", "/w"]).unwrap(),
+            Some(Cli::Agents { dir: "/w".into() })
+        );
+        assert_eq!(
+            parse(&["read", "--agent", "3", "--since", "12", "/w"]).unwrap(),
+            Some(Cli::Read {
+                dir: "/w".into(),
+                agent: 3,
+                since: 12
+            })
+        );
+        assert_eq!(
+            parse(&["read"]).unwrap(),
+            Some(Cli::Read {
+                dir: ".".into(),
+                agent: 0,
+                since: 0
+            })
+        );
+        assert_eq!(
+            parse(&["focus", "1", "/w"]).unwrap(),
+            Some(Cli::Focus {
+                dir: "/w".into(),
+                agent: 1
+            })
+        );
+        assert_eq!(
+            parse(&["edit", "--agent", "2", "--base", "34", "--send", "hello"]).unwrap(),
+            Some(Cli::Edit {
+                dir: ".".into(),
+                agent: 2,
+                base: 34,
+                send: true,
+                text: "hello".to_string(),
+            })
+        );
+        assert_eq!(
+            parse(&["edit", "--base", "0", "a draft", "/w"]).unwrap(),
+            Some(Cli::Edit {
+                dir: "/w".into(),
+                agent: 0,
+                base: 0,
+                send: false,
+                text: "a draft".to_string(),
+            })
+        );
+
+        // The directory is still the TUI's one optional argument, and a value
+        // that is not one is named, like every other flag.
+        assert!(parse(&["agents", "/a", "/b"]).is_err());
+        assert!(parse(&["focus"]).is_err(), "focus needs an id");
+        assert!(parse(&["edit"]).is_err(), "edit needs the text");
+        assert!(parse(&["read", "--agent", "x"]).is_err());
+        assert!(parse(&["read", "--nope"]).is_err());
+
+        // Anything else is not a subcommand: the TUI's own parsing sees it.
+        assert_eq!(parse(&["--help"]).unwrap(), None);
+        assert_eq!(parse(&["/w"]).unwrap(), None);
+        assert_eq!(parse(&[]).unwrap(), None);
+    }
+
+    /// The CLI builds the one request line its subcommand means, and echoes it
+    /// to the running mush.
+    #[test]
+    fn the_attach_subcommands_build_their_request() {
+        let request = Cli::Focus {
+            dir: ".".into(),
+            agent: 2,
+        }
+        .request();
+        assert_eq!(request.op, attach::Op::Focus { agent: 2 });
+        assert_eq!(request.encode(), r#"{"agent":2,"id":1,"op":"focus"}"#);
+
+        let request = Cli::Edit {
+            dir: ".".into(),
+            agent: 0,
+            base: 34,
+            send: false,
+            text: "hi".to_string(),
+        }
+        .request();
+        assert_eq!(
+            request.op,
+            attach::Op::Edit {
+                agent: 0,
+                base: 34,
+                text: "hi".to_string(),
+                send: false,
+            }
+        );
+    }
 }

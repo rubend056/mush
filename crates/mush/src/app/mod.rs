@@ -2641,6 +2641,7 @@ fn diff_rows(diff: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::attach;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use crossbeam_channel::Receiver;
@@ -6988,5 +6989,280 @@ mod tests {
             "focus cannot point at a ghost"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    // ------------------------------------------------------------- attach (M3)
+    //
+    // The socket's own half — framing, a bad line, a kept connection — lives in
+    // `crate::attach`'s tests. These are the `App` half: the ops, over the tree
+    // and the chat, on the same `handle_attach` the message loop calls.
+
+    fn attach_request(id: u64, op: attach::Op) -> attach::Request {
+        attach::Request {
+            id: serde_json::json!(id),
+            op,
+        }
+    }
+
+    fn attach_ok(response: attach::Response) -> serde_json::Value {
+        match response.reply {
+            attach::Reply::Ok(body) => body,
+            attach::Reply::Err(error) => panic!("expected ok, got {error:?}"),
+        }
+    }
+
+    fn attach_err(response: attach::Response) -> attach::ReplyError {
+        match response.reply {
+            attach::Reply::Err(error) => error,
+            attach::Reply::Ok(body) => panic!("expected an error, got {body}"),
+        }
+    }
+
+    /// `read` hands back the transcript lines with the revision a client hands
+    /// to `edit`, and `since` skips the lines it has already seen.
+    #[test]
+    fn attach_read_returns_the_lines_and_a_revision() {
+        let (mut app, _rx) = test_app("attach-read");
+        app.chat.push_message(AgentId::ROOT, Message::user("first"));
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("second"));
+
+        let body = attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(1, attach::Op::Read { agent: 0, since: 0 }),
+        ));
+        assert_eq!(body["agent"], serde_json::json!(0));
+        assert_eq!(
+            body["revision"].as_u64(),
+            Some(app.chat.revision(AgentId::ROOT))
+        );
+        let lines = body["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["line"], serde_json::json!(0));
+        assert_eq!(lines[0]["role"], "user");
+        assert_eq!(lines[0]["text"], "first");
+        assert_eq!(lines[1]["text"], "second");
+
+        // `since` is the first line to read, so the second read is the tail.
+        let body = attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(2, attach::Op::Read { agent: 0, since: 1 }),
+        ));
+        let lines = body["lines"].as_array().unwrap();
+        assert_eq!(lines.len(), 1);
+        assert_eq!(lines[0]["line"], serde_json::json!(1));
+        assert_eq!(lines[0]["text"], "second");
+    }
+
+    /// An id the tree does not have is a bad request, not an empty transcript.
+    #[test]
+    fn attach_read_of_an_unknown_agent_is_a_bad_request() {
+        let (mut app, _rx) = test_app("attach-read-missing");
+        let error = attach_err(app.handle_attach(
+            "a client",
+            &attach_request(1, attach::Op::Read { agent: 9, since: 0 }),
+        ));
+        assert_eq!(error.kind, "bad_request");
+        assert!(error.message.unwrap().contains('9'));
+    }
+
+    /// The roster is read from the tree: parents, phases, the focused flag, and
+    /// the working-children count the row paints as `⏸N` (M3 / H1).
+    #[test]
+    fn attach_agents_reflects_the_tree() {
+        let (mut app, _rx) = test_app("attach-agents");
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "lexer".to_string(),
+            depth: 1,
+            branch: Some("mush/1".to_string()),
+            cmd: crossbeam_channel::unbounded().0,
+        });
+
+        let body = attach_ok(app.handle_attach("a client", &attach_request(2, attach::Op::Agents)));
+        let agents = body["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 2, "the root and its child");
+
+        assert_eq!(agents[0]["id"], serde_json::json!(0));
+        assert_eq!(agents[0]["parent"], serde_json::Value::Null);
+        assert_eq!(agents[0]["phase"], "idle");
+        assert_eq!(agents[0]["focused"], serde_json::json!(true));
+        assert_eq!(
+            agents[0]["children_working"],
+            serde_json::json!(1),
+            "the root has one child thinking"
+        );
+
+        assert_eq!(agents[1]["id"], serde_json::json!(1));
+        assert_eq!(agents[1]["parent"], serde_json::json!(0));
+        assert_eq!(agents[1]["phase"], "thinking");
+        assert_eq!(agents[1]["activity"], serde_json::Value::Null);
+        assert_eq!(agents[1]["branch"], "mush/1");
+        assert_eq!(agents[1]["focused"], serde_json::json!(false));
+        assert_eq!(
+            agents[1]["revision"].as_u64(),
+            Some(app.chat.revision(AgentId(1)))
+        );
+    }
+
+    /// `focus` moves the pane, the keyboard and the tree cursor exactly as
+    /// `Enter` on the row does — the same `focus_cursor_row` path.
+    #[test]
+    fn attach_focus_moves_the_focus_like_enter() {
+        let (mut app, _rx) = test_app("attach-focus");
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "lexer".to_string(),
+            depth: 1,
+            branch: None,
+            cmd: crossbeam_channel::unbounded().0,
+        });
+        app.focus = Focus::Agents;
+        app.tree.cursor_top();
+
+        let body = attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(3, attach::Op::Focus { agent: 1 }),
+        ));
+        assert_eq!(body, serde_json::json!({}));
+        assert_eq!(app.tree.focused, AgentId(1), "the pane shows #1");
+        assert_eq!(app.focus, Focus::Chat, "and the keyboard went with it");
+        assert_eq!(
+            app.tree.cursor_id(),
+            Some(AgentId(1)),
+            "the row is selected"
+        );
+
+        let error = attach_err(app.handle_attach(
+            "a client",
+            &attach_request(4, attach::Op::Focus { agent: 9 }),
+        ));
+        assert_eq!(error.kind, "bad_request");
+    }
+
+    /// A stale base is a `conflict` that names the revision that moved, and it
+    /// changes nothing — not the box, not the transcript.
+    #[test]
+    fn attach_edit_with_a_stale_base_conflicts_and_changes_nothing() {
+        let (mut app, _rx) = test_app("attach-conflict");
+        let stale = app.chat.revision(AgentId::ROOT);
+        // Something moved the transcript after the client last read.
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("a reply"));
+
+        let response = app.handle_attach(
+            "a client",
+            &attach_request(
+                5,
+                attach::Op::Edit {
+                    agent: 0,
+                    base: stale,
+                    text: "a draft".to_string(),
+                    send: false,
+                },
+            ),
+        );
+        let error = attach_err(response);
+        assert_eq!(error.kind, "conflict");
+        assert_eq!(
+            error.revision,
+            Some(app.chat.revision(AgentId::ROOT)),
+            "the client is told where the transcript went"
+        );
+        assert_eq!(app.chat.input().text(), "", "the draft was not written");
+        assert_eq!(
+            app.chat.transcript(AgentId::ROOT).len(),
+            1,
+            "and nothing was appended"
+        );
+    }
+
+    /// A fresh base lands a draft in the box and moves the revision, so the
+    /// same base cannot be spent twice.
+    #[test]
+    fn attach_edit_with_a_fresh_base_lands_a_draft() {
+        let (mut app, _rx) = test_app("attach-draft");
+        let base = app.chat.revision(AgentId::ROOT);
+        let body = attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(
+                6,
+                attach::Op::Edit {
+                    agent: 0,
+                    base,
+                    text: "a draft from the agent".to_string(),
+                    send: false,
+                },
+            ),
+        ));
+        assert_eq!(body["revision"].as_u64(), Some(base + 1));
+        assert_eq!(app.chat.input().text(), "a draft from the agent");
+
+        // The revision the first edit returned is the base a second one needs;
+        // the old base is refused.
+        let error = attach_err(app.handle_attach(
+            "a client",
+            &attach_request(
+                7,
+                attach::Op::Edit {
+                    agent: 0,
+                    base,
+                    text: "again".to_string(),
+                    send: false,
+                },
+            ),
+        ));
+        assert_eq!(error.kind, "conflict");
+    }
+
+    /// `send: true` speaks to the agent the way a typed message does: the line
+    /// lands in its transcript as the human's and its mailbox gets a nudge —
+    /// without moving the human's own focus off the agent they were watching.
+    #[test]
+    fn attach_edit_that_sends_reaches_the_mailbox() {
+        let (mut app, _rx) = test_app("attach-send");
+        let (cmd, mailbox) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "lexer".to_string(),
+            depth: 1,
+            branch: None,
+            cmd,
+        });
+        let base = app.chat.revision(AgentId(1));
+
+        let body = attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(
+                8,
+                attach::Op::Edit {
+                    agent: 1,
+                    base,
+                    text: "also rename the module".to_string(),
+                    send: true,
+                },
+            ),
+        ));
+        assert_eq!(body["revision"].as_u64(), Some(base + 1));
+        assert_eq!(
+            app.chat.transcript(AgentId(1)).last().map(Message::text),
+            Some("also rename the module"),
+            "the words are in the agent's transcript"
+        );
+        assert_eq!(
+            app.tree.focused,
+            AgentId::ROOT,
+            "the human's pane did not move"
+        );
+        assert!(
+            matches!(
+                mailbox.try_recv(),
+                Ok(AgentMsg::Nudge(text)) if text == "also rename the module"
+            ),
+            "the message reaches the agent's mailbox the way a typed one does"
+        );
     }
 }
