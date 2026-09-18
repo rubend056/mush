@@ -304,8 +304,8 @@ are computed in `App`.
   read the same. The selected row's full facts get a footer under the list, up to
   three lines when the pane is tall and one when it is compact, isolated agents
   included (`.mush/wt/2 · git diff HEAD...mush/2 · /merge 2`). `fit_row` is a pure
-  function with tests, and the pane's title carries `agents · 2 running · Σ +324
-  −40`.
+  function with tests, and the pane's title carries `agents · 2 working ·
+  1 waiting · Σ +324 −40` — each count named, each agent in exactly one.
 - **R2 — One bar, two lines.** `[DONE]` Line one is the newest *event* with no
   other home — a failure, a stop, a job's report, a command's answer — or the one
   derived fact the rows only imply (a napping root that will resume by itself),
@@ -331,9 +331,9 @@ are computed in `App`.
   are neutral `·` unless something actually failed (`!`).
 
 ```
-┌ agents · 2 running · Σ +324 −40 ────────────┐
+┌ agents · 2 working · 1 waiting · Σ +324 −40 ┐
 │   ◐ #0 you        edit src/lib.rs           │
-│ ▸ ◐ #1 ⏸2 lexer   wait_agents               │
+│   ◐ #1 ⏸2 lexer   wait_agents               │
 │     ◐ #2 tests    write tests/lex.rs        │
 │   ✓ #3 docs       wrote README.md           │
 ├─────────────────────────────────────────────┤
@@ -341,6 +341,10 @@ are computed in `App`.
 │ .mush/wt/2 · git diff HEAD...mush/2         │
 └─────────────────────────────────────────────┘
 ```
+
+The cursor row is the one wearing the pane's selection colour; there is no
+separate marker glyph, because the row's own `▶` already says which agent the
+chat pane is showing and two arrows beside each other said two things at once.
 
 The plumbing is a `mush-core/src/git.rs` (shell-outs like the worktree code, no
 new crates) exposing `status(dir)`, `branch(dir)`, `branch_stat(dir, base)` and a
