@@ -601,9 +601,12 @@ impl App {
 }
 
 /// What the bar's first line says. Pure so the priority is testable without a
-/// frame: an error must never lose to work in progress (finding B12 — the Ctrl-Q
-/// warning included). The order itself is `chat::Rank`, the one table; this only
-/// picks the winner, and the painter maps its rank to a colour.
+/// frame: an error must never lose to work in progress (finding B12), and a quit
+/// warning ranks with a failure for the same reason (finding H9) — the human who
+/// pressed `Ctrl-Q` must not see the derived activity line instead of the names
+/// of what their second press kills, or the arm becomes a silent one. The order
+/// itself is `chat::Rank`, the one table; this only picks the winner, and the
+/// painter maps its rank to a colour.
 ///
 /// The focused agent's activity is deliberately not a candidate here. It has two
 /// homes already — the row's own tail, with its age, and the transcript's `⚙`
@@ -614,7 +617,7 @@ impl App {
 /// the rows only imply (`tree_line`'s napping root).
 fn bar_word(status: Option<(&str, StatusKind)>, tree: Option<&str>) -> Option<(Rank, String)> {
     let alert = status
-        .filter(|(_, kind)| *kind == StatusKind::Error)
+        .filter(|(_, kind)| matches!(*kind, StatusKind::Error | StatusKind::Quit))
         .map(|(text, _)| text);
     let said = status
         .filter(|(_, kind)| *kind == StatusKind::Info)
@@ -966,6 +969,23 @@ mod tests {
         assert_eq!(text, "opened notes.txt");
 
         assert!(bar_word(None, None).is_none(), "nothing to say is the hint");
+    }
+
+    /// The quit warning is the one line that explains what a second `Ctrl-Q`
+    /// kills, so it ranks with a failure: the derived activity line — the work
+    /// the human is quitting *from* — must not hide it (finding H9).
+    #[test]
+    fn the_quit_warning_outranks_the_tree_line() {
+        let (rank, text) = bar_word(
+            Some(("Ctrl-Q again quits · kills #0 thinking", StatusKind::Quit)),
+            Some("#0 thinking 3s"),
+        )
+        .expect("the warning is a word");
+        assert_eq!(rank, Rank::Alert, "a quit warning ranks with a failure");
+        assert_eq!(
+            text, "Ctrl-Q again quits · kills #0 thinking",
+            "and it is what the human reads, not the run it names"
+        );
     }
 
     /// The `/notes` report is wrapped for the popup's own content width, and

@@ -169,6 +169,31 @@ impl Phase {
             _ => None,
         }
     }
+
+    /// What this phase is, in the fewest words: `thinking`, `edit_file`,
+    /// `compacting`, `cancelling`, or `idle` for a phase at rest.
+    ///
+    /// The row spells the same phase out with its age (`ui::phase_detail`, for
+    /// the one agent the human is looking at). This is the form that fits
+    /// beside an id in the single line naming every live agent a quit is about
+    /// to kill (finding H9). A tool label answers with its first word, which is
+    /// the tool's own name — `edit_file` says what the agent is at without
+    /// spending the bar on the path it is editing.
+    pub fn doing(&self) -> &str {
+        match self {
+            Phase::Thinking => "thinking",
+            Phase::Activity(what) => what.split_whitespace().next().unwrap_or("working"),
+            Phase::Compacting(_) => "compacting",
+            Phase::Cancelling => "cancelling",
+            Phase::Idle | Phase::Stopped | Phase::Done | Phase::Failed(_) => "idle",
+            // A cut-off run is not at rest the way `idle` means — it never
+            // ended and committed nothing — and it is not in flight either, so
+            // a quit never names it in this list. The arm says which phase it
+            // is, and matches `Phase::label`, so a reader of one can read the
+            // other (finding H2).
+            Phase::CutOff => "cut off",
+        }
+    }
 }
 
 /// A fold of an agent's conversation: the summarize call `/compact` asks for,
