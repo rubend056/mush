@@ -654,11 +654,16 @@ impl AgentTree {
         self.jobs.live_for(id.0)
     }
 
-    /// How many commands the whole tree runs right now, for the pane title's
+    /// How many jobs the whole tree has running right now, for the pane title's
     /// machine picture: every parallel worktree builds its own artifacts, so
     /// the number is what says *why* a dozen agents feel slow (finding H8).
+    ///
+    /// It counts exactly what the rows count — a job is a command that outlived
+    /// its tool call, one `⚙` each. It used to sum in the commands a tool call
+    /// was still holding, which is one number for something no row can name and
+    /// no job id can list: the title said `1 job` over a tree with no job in it.
     pub fn live_job_count(&self) -> usize {
-        self.jobs.live_total()
+        self.jobs.running()
     }
 
     /// Keep the id counter above `floor`. A leftover worktree or a restored
@@ -1520,14 +1525,6 @@ mod tests {
         assert_eq!(Phase::Activity(String::new()).doing(), "working");
     }
 
-    /// A landing's past tense is one word, so the row's prose and the refusal
-    /// that stops a nudge cannot tell the same story two ways (refactor R12).
-    #[test]
-    fn a_landing_has_one_past_tense() {
-        assert_eq!(Landed::Merged.past(), "merged");
-        assert_eq!(Landed::Discarded.past(), "discarded");
-    }
-
     /// A fold from rest is visible — the hole `activity` could not fill, because
     /// it refuses a status line from an agent that is not already busy — and it
     /// leaves the row when it ends, whichever way it ends (finding U11).
@@ -2155,5 +2152,63 @@ mod tests {
             Some(AgentId::ROOT),
             "the root is always a row, so the cursor is never empty"
         );
+    }
+
+    /// The pane title's `N jobs` and a row's `⚙N` count one thing: a **job**,
+    /// the command that outlived its tool call. A command a tool call is still
+    /// holding is not one — it has no id, no line and no window to show
+    /// (finding S4) — so the title may not count it and no row may wear it.
+    ///
+    /// The title used to sum the foreground calls in (`Registry::live_total`),
+    /// whose own doc claimed the sum was what a row counts: a held command made
+    /// a tree with no job in it read `1 job` above rows with no `⚙`.
+    #[test]
+    fn the_title_and_the_rows_count_the_same_thing() {
+        use std::path::Path;
+
+        use crate::machine::fake::{Script, Scripted};
+        use crate::machine::{Machine, ShellCommand};
+
+        let build = || ShellCommand {
+            command: "cargo build",
+            root: Path::new("/tmp"),
+        };
+        let tree = AgentTree::bare();
+
+        // A command under a tool call: the model is waiting for its result.
+        let machine = Arc::new(Scripted::new().runs(Script::hangs()));
+        let held = tree
+            .jobs
+            .hold(AgentId::ROOT.0, machine.spawn(&build()).unwrap());
+        assert_eq!(
+            tree.live_job_count(),
+            0,
+            "a held command is not a job, so the title says none"
+        );
+        assert!(
+            tree.live_jobs(AgentId::ROOT).is_empty(),
+            "and its owner's row wears no ⚙"
+        );
+        drop(held);
+
+        // The same command, outliving its tool call: a job, on both surfaces.
+        let machine = Arc::new(Scripted::new().runs(Script::hangs()));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        tree.jobs
+            .launch(jobs::Launch::started(
+                AgentId::ROOT.0,
+                "cargo build".to_string(),
+                false,
+                tx,
+                machine.spawn(&build()).unwrap(),
+            ))
+            .unwrap();
+        assert_eq!(tree.live_job_count(), 1, "the title counts the job");
+        assert_eq!(
+            tree.live_jobs(AgentId::ROOT).len(),
+            1,
+            "and its owner's row wears ⚙1"
+        );
+        tree.jobs.kill_all();
     }
 }

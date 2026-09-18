@@ -418,7 +418,17 @@ impl App {
             area,
             list_area,
             focused,
-            title: elide_title(&title_cells(self, above, below), inner.width as usize),
+            // The pane's title: ` agents · 3 working · 2 jobs · 2 waiting ·
+            // Σ +324 −40`, with the clauses that do not fit dropped whole from
+            // the right and the pane's own name kept when none of them fit.
+            title: elide(
+                &title_cells(self, above, below),
+                " · ",
+                " agents · ",
+                " agents ",
+                0,
+                inner.width as usize,
+            ),
             rows,
             cursor,
             footer,
@@ -691,41 +701,48 @@ fn facts_line(app: &App, width: usize) -> String {
         cells.push(git_cell(git, app.git_age()));
     }
     cells.push(format!("{} · {}", app.cfg().label(), app.context_meter()));
-    while cells.len() > 1 {
-        let joined: String = cells.join(" │ ");
-        if UnicodeWidthStr::width(joined.as_str()) <= width {
-            break;
+    // The workspace cell is never given up: it is the one fact that says which
+    // tree the screen is about, so it is this line's floor.
+    elide(&cells, " │ ", "", &cells[0], 1, width)
+}
+
+/// Drop cells from the right until the line fits: one rule for the two lines
+/// that are built this way — the pane's title and the facts under it — and the
+/// one home of it (finding D9; the loop left the painter, and what stayed
+/// behind was a copy per caller).
+///
+/// A cell goes whole, because a clause cut mid-number (`Σ +324 −`, `2 waitin`)
+/// is a count that is not the count. The first `min_kept` cells are never given
+/// up, and `floor` is what is painted when even they do not fit: the pane keeps
+/// its own name, and the facts line keeps the `⌂` cell that says which tree the
+/// screen is about. `prefix` opens every kept line, so the separator *inside*
+/// the line (` · `, ` │ `) and the one joining it to what precedes are each
+/// said once.
+fn elide(
+    cells: &[String],
+    separator: &str,
+    prefix: &str,
+    floor: &str,
+    min_kept: usize,
+    width: usize,
+) -> String {
+    for kept in (min_kept..=cells.len()).rev() {
+        let line = if kept == 0 {
+            floor.to_string()
+        } else {
+            format!("{prefix}{}", cells[..kept].join(separator))
+        };
+        if UnicodeWidthStr::width(line.as_str()) <= width {
+            return line;
         }
-        cells.pop();
     }
-    cells.join(" │ ")
+    floor.to_string()
 }
 
 /// The branch cell of the facts line: the branch, how many paths are dirty, the
 /// uncommitted delta — and, once the read has aged past [`GIT_STALE`], how old
 /// it is. A cached read must not read as a live one, so the age rides with the
 /// fact it qualifies and is elided with it, never after it (finding P8).
-/// The pane's title: ` agents · 3 working · 2 jobs · 2 waiting · Σ +324 −40`,
-/// with the clauses that do not fit dropped whole from the right.
-///
-/// Whole, because this pane is 32 columns wide at its widest and a clause cut
-/// mid-number (`Σ +324 −`, `2 waitin`) is a count that is not the count. The
-/// pane keeps its own name when none of them fit. The loop lives here, beside
-/// the cells it elides, so the painter only paints (finding D9).
-fn elide_title(cells: &[String], width: usize) -> String {
-    for kept in (0..=cells.len()).rev() {
-        let title = if kept == 0 {
-            " agents ".to_string()
-        } else {
-            format!(" agents · {}", cells[..kept].join(" · "))
-        };
-        if UnicodeWidthStr::width(title.as_str()) <= width {
-            return title;
-        }
-    }
-    " agents ".to_string()
-}
-
 fn git_cell(git: &git::RepoStatus, age: Option<Duration>) -> String {
     let mut cell = if git.branch.is_empty() {
         "detached".to_string()
@@ -764,7 +781,7 @@ fn git_cell(git: &git::RepoStatus, age: Option<Duration>) -> String {
 /// working exists only here. The machine's job count rides between the two
 /// counts it is read beside: it is the box's load, the one fact that says why a
 /// dozen isolated children feel slow (finding H8). This knows the numbers;
-/// [`elide_title`] spends the columns on them.
+/// [`elide`] spends the columns on them.
 fn title_cells(app: &App, above: usize, below: usize) -> Vec<String> {
     let roster = app.tree.roster();
     let mut cells = Vec::new();
@@ -777,12 +794,13 @@ fn title_cells(app: &App, above: usize, below: usize) -> Vec<String> {
     if roster.working > 0 {
         cells.push(format!("{} working", roster.working));
     }
-    // The machine's load, not one agent's: every isolated worktree builds its
-    // own artifacts, so with a dozen children the box is the bottleneck and
-    // this is the only surface that can say so — a row's `⚙N` is one agent's
-    // share (finding H8). Ranked before `waiting` because a napping agent is
-    // already visible on its own row as `⏸N`, while the load exists nowhere
-    // else.
+    // The machine's job count: the same fact every row wears as `⚙N`, summed
+    // over the tree, because every isolated worktree builds its own artifacts
+    // and with a dozen children the box is the bottleneck — a row is one
+    // agent's share, this is the whole (finding H8). It is jobs and only jobs:
+    // a command still under its tool call is not one, so it is on neither.
+    // Ranked before `waiting` because a napping agent is already visible on its
+    // own row as `⏸N`, while the machine's load exists nowhere else.
     let load = app.tree.live_job_count();
     if load > 0 {
         cells.push(if load == 1 {
@@ -926,7 +944,8 @@ fn unread_footer(app: &App, node: &AgentNode) -> String {
 
 /// Where an isolated agent's work is — or where it went. Pure, so the row's
 /// promise can be asserted: a landed worktree must not name a `git diff` that
-/// can no longer work.
+/// can no longer work, and its landing must be spelled in [`Landed::past`]'s
+/// own word, which the row's own prose is painted around.
 fn agent_detail(node: &AgentNode) -> Vec<String> {
     match node.landed {
         Some(Landed::Merged) => vec!["merged into HEAD".to_string()],
@@ -1163,22 +1182,45 @@ mod tests {
     }
 
     /// A landed worktree still has a branch recorded, so the row must key off
-    /// `landed` to stop offering a `git diff` that can no longer work.
+    /// `landed` to stop offering a `git diff` that can no longer work — and say
+    /// how it landed. The facts, not the sentence: the prose around the word is
+    /// the row's to word.
     #[test]
     fn a_landed_agent_does_not_offer_commands_that_cannot_work() {
-        let mut merged = node(Phase::Done, 1);
-        merged.branch = Some("mush/9".to_string());
-        merged.landed = Some(Landed::Merged);
-        let text = agent_detail(&merged).join(" · ");
-        assert_eq!(text, "merged into HEAD");
-        assert!(!text.contains("git diff"), "{text}");
+        for landed in [Landed::Merged, Landed::Discarded] {
+            let mut node = node(Phase::Done, 1);
+            node.branch = Some("mush/9".to_string());
+            node.landed = Some(landed);
+            let text = agent_detail(&node).join(" · ");
+            assert!(!text.contains("git diff"), "{text}");
+            assert!(
+                !text.contains("mush/9"),
+                "nor a branch nobody can read any more: {text}"
+            );
+            assert!(
+                text.contains(landed.past()),
+                "and it says how it landed: {text}"
+            );
+        }
+    }
 
-        let mut discarded = node(Phase::Done, 1);
-        discarded.branch = Some("mush/9".to_string());
-        discarded.landed = Some(Landed::Discarded);
-        let text = agent_detail(&discarded).join(" · ");
-        assert!(text.contains("discarded"), "{text}");
-        assert!(!text.contains("git diff"), "{text}");
+    /// A landing *is* one word, and the row is where that word is read: this
+    /// asserts the coupling — the row contains `Landed::past()` — so a row that
+    /// re-spells the landing (`landed in HEAD`, typed by hand) fails here, where
+    /// asserting the constant `Landed::Merged.past() == "merged"` could not
+    /// fail however the row was worded (refactor R12).
+    #[test]
+    fn a_landed_row_spells_the_landing_in_the_landings_own_word() {
+        for landed in [Landed::Merged, Landed::Discarded] {
+            let mut node = node(Phase::Done, 1);
+            node.branch = Some("mush/9".to_string());
+            node.landed = Some(landed);
+            let text = agent_detail(&node).join(" · ");
+            assert!(
+                text.contains(landed.past()),
+                "the row says where the work went, in the landing's own word: {text:?}"
+            );
+        }
     }
 
     /// Before anything lands, the row is the one place that says where an

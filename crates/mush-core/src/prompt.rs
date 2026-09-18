@@ -30,9 +30,8 @@ the exact text it replaces, and refuses a match that is missing or not unique.\n
 const MACHINE: &str = "\
 The machine is shared (CPU, ports, /tmp — a worktree isolates files, nothing else):\n\
 - A long command detaches into a job instead of dying: run_command answers \"[still running — detached \
-as #c2]\", detach=true asks for one at once, and any command that outlives 60s does it by itself. \
-status lists your children and your jobs, wait blocks until every one of them has finished, and \
-control stops one.\n\
+as #c2]\" and the command keeps its own process group. The tools' schemas say what starts one, and \
+what reads, waits on or stops it.\n\
 - exclusive=true owns the machine for timing- or port-sensitive work (a benchmark, a profiler, a fixed \
 port): a sibling's command queues behind it and is refused if the lock outlasts the wait (`#N holds the \
 machine`) — do not retry in a loop.";
@@ -53,11 +52,9 @@ exists, so decide before writing it.)\n\
 split by what is independent, not by how long you think it takes.\n\
 - Delegate independent, large, or context-heavy subtasks; do single edits and lookups yourself. Prefer \
 a few big delegations over many small ones.\n\
-- wait blocks until every child and every job you own has finished, then answers with one digest: a \
-result you have not read comes in full, one you have already read as a line. status lists what is in \
-flight; control stops or messages one.\n\
 - Ending your turn while children still run is fine: they keep working and a finish wakes you with its \
-\"#N done: summary\". wait is optional — use it when you want the results now.";
+\"#N done: summary\". wait is optional — use it when you want the results now (its schema says what it \
+hands over).";
 
 /// The whole root-agent system prompt. If this grows much, something else went
 /// wrong.

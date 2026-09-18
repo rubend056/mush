@@ -684,23 +684,10 @@ impl Registry {
             .any(|(holder, _)| *holder == owner)
     }
 
-    /// How many jobs are alive right now — the number the budget is about.
+    /// How many jobs are alive right now — the number the budget is about, and
+    /// the number the pane title's `N jobs` and a row's `⚙N` both count.
     pub fn running(&self) -> usize {
         self.jobs().iter().filter(|record| record.running()).count()
-    }
-
-    /// How many commands the whole machine is running right now: the jobs plus
-    /// the foreground tool calls, which is what a row's `⚙N` counts. One sum
-    /// for the pane's title, so the box's load is a fact on screen and not
-    /// something a human has to infer from a dozen rows (finding H8).
-    pub fn live_total(&self) -> usize {
-        let inner = self.inner();
-        inner
-            .jobs
-            .values()
-            .filter(|record| record.running())
-            .count()
-            + inner.foregrounds.len()
     }
 
     /// Whether there is room for one more job, as of right now.
@@ -931,6 +918,18 @@ impl Registry {
         }
     }
 
+    /// Bounded on its own terms, windows first: they share [`STATUS_WINDOW`],
+    /// so a status spends the same budget on one job or on sixteen, and no job
+    /// is ever dropped from the list for being old. What rides on top is one
+    /// headline per job.
+    ///
+    /// The headline is the one line that is not cut. It names the command the
+    /// model chose, and half a command is a job that cannot be told from the
+    /// next one in the list it is choosing between; a command that is a
+    /// paragraph costs the status one longer line, where a cut window would
+    /// cost it what the job died of. The windows — the text nobody chose — are
+    /// what the budget is spent on.
+    ///
     /// The jobs `owner` should know about: what is running, and what recently
     /// ended. One line each with the window under it — read live from the
     /// command while it runs, so `status` is never a stale copy.
@@ -1196,7 +1195,6 @@ mod tests {
     use crate::events::fake::Recorder;
     use crate::machine::fake::{Script, Scripted as ScriptedMachine};
     use crate::machine::{Machine, ShellCommand};
-    use mush_core::CMD_CAP;
 
     /// A registry over a scripted machine and an advanceable clock, so a job's
     /// whole life is asserted without a subprocess and without waiting.
@@ -1437,7 +1435,7 @@ mod tests {
     /// `status` is one bounded tool result, however many jobs there
     /// are. It used to carry the full `JOB_TAIL` window of every job: sixteen
     /// jobs — `MAX_JOBS` running plus `JOB_HISTORY` finished — were 32 KB in
-    /// one answer, while every other tool in the tree stops at `CMD_CAP`.
+    /// one answer, past every cap in the tree.
     ///
     /// Every job keeps its headline, because what the model does with a status
     /// is choose one to wait for or stop, and a job dropped from the list
@@ -1481,9 +1479,16 @@ mod tests {
                 status.len()
             );
         }
+        // The windows share `STATUS_WINDOW` — sixteen jobs together are bounded
+        // by that one budget, not by sixteen `JOB_TAIL`s — and what rides on
+        // top of it is furniture: one headline per job and, on a window that
+        // was cut, `tail_for_model`'s marker and the two-space indent its lines
+        // wear. This is the bound the test used to miss: it asserted `CMD_CAP`
+        // (16 000), so a status that had gone back to 16 KB passed.
+        let furniture = (MAX_JOBS + JOB_HISTORY) * 256;
         assert!(
-            status.len() <= CMD_CAP,
-            "one status must stay inside the tree's per-result cap: {} bytes",
+            status.len() <= STATUS_WINDOW + furniture,
+            "one status must stay inside the window it spends, plus a line per job: {} bytes",
             status.len()
         );
         assert!(

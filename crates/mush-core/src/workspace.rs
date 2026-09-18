@@ -1,37 +1,10 @@
-//! Workspace filesystem access: safe paths, listings, reads, atomic writes.
+//! Workspace filesystem access: safe paths, reads, atomic writes.
 
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
 use tempfile::NamedTempFile;
-use walkdir::WalkDir;
-
-/// Directories that are never worth showing or walking into.
-const SKIP_DIRS: &[&str] = &[
-    ".git",
-    ".mush",
-    "target",
-    "node_modules",
-    ".venv",
-    "venv",
-    "__pycache__",
-    ".idea",
-    ".vscode",
-    "dist",
-    "build",
-    ".next",
-    ".cache",
-];
-
-/// Whether a walk should skip this entry: VCS and build directories by name —
-/// their contents are never the workspace's work. Hidden names are *not*
-/// skipped: `.github/`, `.gitignore` and `.env.example` are exactly the files
-/// an agent is asked about (audit of the prompt vs behaviour, row 8).
-fn skipped(entry: &walkdir::DirEntry) -> bool {
-    let name = entry.file_name().to_string_lossy();
-    entry.file_type().is_dir() && SKIP_DIRS.contains(&name.as_ref())
-}
 
 /// A single workspace root. All agent file access goes through here, which is
 /// what keeps a runaway model inside the directory the human opened.
@@ -90,59 +63,21 @@ impl Workspace {
         self.resolve(rel).map(|p| p.exists()).unwrap_or(false)
     }
 
-    /// List workspace-relative file paths, sorted, up to `limit`. The flag is
-    /// whether at least one more file exists: a listing that stopped silently read
-    /// as "there is no more" (audit row 8).
+    /// Read a text file whole. Binary files are refused.
     ///
-    /// Build and VCS directories are skipped by name; a dotfile is workspace
-    /// content — `.gitignore`, `.github/workflows/ci.yml`, `.env.example` — so
-    /// hidden names are listed. Hiding them was a listing that disagreed with what
-    /// the file tools would happily read.
-    pub fn list_files(&self, limit: usize) -> (Vec<String>, bool) {
-        let mut out = Vec::new();
-        let mut truncated = false;
-        let walk = WalkDir::new(&self.root)
-            .min_depth(1)
-            .follow_links(false)
-            .into_iter()
-            .filter_entry(|entry| !skipped(entry));
-        for entry in walk {
-            // A per-entry error (a racing delete, a permission wall) skips
-            // that entry, not the rest of the walk.
-            let Ok(entry) = entry else { continue };
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            if out.len() >= limit {
-                truncated = true;
-                break;
-            }
-            out.push(self.rel(entry.path()));
-        }
-        out.sort();
-        (out, truncated)
-    }
-
-    /// Read a text file, capping the returned bytes. Binary files are refused.
-    /// A capped read says how much of how many bytes it is showing, so the
-    /// model knows there is a rest and roughly how big it is (audit row 9).
-    pub fn read_file(&self, rel: &str, cap: usize) -> Result<String, String> {
+    /// It used to take a `cap`, keep the head of a long file and mark the cut
+    /// with a sentence of its own — but the file tools that read that way are
+    /// gone (the six-tool cut), and its one caller is `edit_file`, which must
+    /// see the whole file or refuse the edit. A too-big result is the command
+    /// result's problem now, and `truncate_for_model` is the one place that
+    /// says so.
+    pub fn read_file(&self, rel: &str) -> Result<String, String> {
         let path = self.resolve(rel)?;
         let bytes = fs::read(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
         if bytes.contains(&0) {
             return Err(format!("{rel} looks like a binary file"));
         }
-        let text = String::from_utf8_lossy(&bytes).into_owned();
-        if text.len() <= cap {
-            return Ok(text);
-        }
-        let cut = head_cut(&text, cap);
-        Ok(format!(
-            "{}\n\n[mush: read truncated — {cut} of {} bytes shown; a wider read needs run_command \
-             (e.g. sed -n '1,200p' {rel})]",
-            &text[..cut],
-            text.len()
-        ))
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
     }
 
     /// Atomically create or replace a file, creating parent directories.
@@ -163,7 +98,8 @@ impl Workspace {
 /// cut, so a partial result can never be mistaken for the whole output. The
 /// marker says how much was kept and what to do next — the command result is
 /// now the one road big text travels, and a model that cannot tell truncation
-/// from completion is the defect this prevents. `usize::MAX` keeps everything.
+/// from completion is the defect this prevents. This is the one home of that
+/// sentence: a file read is whole or refused (see [`Workspace::read_file`]).
 pub fn truncate_for_model(mut text: String, cap: usize) -> String {
     if text.len() <= cap {
         return text;
@@ -266,22 +202,24 @@ mod tests {
     fn write_then_read_roundtrips() {
         let ws = temp_workspace("roundtrip");
         ws.write_file("src/lib.rs", "fn a() {}\n").unwrap();
-        assert_eq!(ws.read_file("src/lib.rs", 1024).unwrap(), "fn a() {}\n");
+        assert_eq!(ws.read_file("src/lib.rs").unwrap(), "fn a() {}\n");
         assert!(!ws.exists("src/missing.rs"));
     }
 
+    /// The whole file or a refusal: `edit_file` is the one caller left, and an
+    /// exact replacement needs every byte it is replacing. A binary file is the
+    /// one thing refused, because lossy UTF-8 would rewrite it.
     #[test]
-    fn read_truncates_at_char_boundary() {
-        let ws = temp_workspace("truncate");
-        ws.write_file("a.txt", "éééééééééé").unwrap();
-        let text = ws.read_file("a.txt", 5).unwrap();
-        assert!(text.starts_with("é"));
-        // A capped read says how much of how many bytes it is showing, so the
-        // model knows there is a rest (audit row 9).
-        assert!(
-            text.contains("[mush: read truncated — 4 of 20 bytes shown"),
-            "{text}"
-        );
+    fn read_refuses_a_binary_file_and_reads_the_rest_whole() {
+        let ws = temp_workspace("binary");
+        fs::write(ws.root().join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
+        let refused = ws.read_file("blob.bin").unwrap_err();
+        assert!(refused.contains("binary"), "{refused}");
+        // And nothing is cut: a file well past any window a model would want
+        // comes back in full, because the caller is an editor.
+        let long = "x".repeat(64 * 1024);
+        ws.write_file("long.txt", &long).unwrap();
+        assert_eq!(ws.read_file("long.txt").unwrap(), long);
     }
 
     #[test]
@@ -312,34 +250,5 @@ mod tests {
         let tail = tail_for_model("éééééé", 5);
         assert!(tail.ends_with("é"), "{tail}");
         assert!(tail.starts_with("[mush: output truncated"), "{tail}");
-    }
-
-    #[test]
-    fn listing_never_hides_files_and_marks_its_limit() {
-        let ws = temp_workspace("listing");
-        fs::create_dir_all(ws.root().join(".git")).unwrap();
-        fs::create_dir_all(ws.root().join("target")).unwrap();
-        fs::create_dir_all(ws.root().join(".github")).unwrap();
-        fs::write(ws.root().join(".git/config"), "x").unwrap();
-        fs::write(ws.root().join("target/out"), "x").unwrap();
-        fs::write(ws.root().join(".github/ci.yml"), "x").unwrap();
-        fs::write(ws.root().join(".gitignore"), "x").unwrap();
-        fs::write(ws.root().join("main.rs"), "x").unwrap();
-        let (files, truncated) = ws.list_files(100);
-        assert_eq!(
-            files,
-            vec![
-                ".github/ci.yml".to_string(),
-                ".gitignore".to_string(),
-                "main.rs".to_string(),
-            ],
-            "build and VCS dirs are skipped; a dotfile is workspace content"
-        );
-        assert!(!truncated);
-
-        // The limit is a fact the caller can pass on, never a silent stop.
-        let (shown, truncated) = ws.list_files(2);
-        assert_eq!(shown.len(), 2);
-        assert!(truncated, "there was a third file");
     }
 }

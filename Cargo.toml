@@ -14,8 +14,6 @@ serde_json = "1"
 crossbeam-channel = "0.5"
 # Secure scratch files (agent command output) and atomic writes.
 tempfile = "3"
-# Directory walks with a real per-entry API instead of a hand-rolled stack.
-walkdir = "2"
 # Platform-correct config locations.
 dirs = "6"
 # Cursor edits by grapheme cluster, and display-width truncation that matches
