@@ -119,6 +119,45 @@ asserts painted text (Stage 3). B3 is closed: below the floor every key but
 
 ---
 
+## 4.5 Driven end to end: the stories a human tells
+
+A usability pass drove the real binary over a pty through the stories a human
+actually tells — isolate a child, read its work with `/diff`, land it with
+`/merge`, restart, steer, quit — and reported where the story breaks for a
+person in earnest. The `S` rows are that pass. What worked is at the end; do not
+re-run it.
+
+| ID | What | Status | Where it breaks |
+|---|---|---|---|
+| S1 | **After `/merge` (or `/discard`), re-running that agent writes into a worktree nothing can see.** Merge agent #1 (row `· merged mush/1 into HEAD · mush/1 deleted`, `git worktree list` back to the main tree, `git branch` back to `master`), focus it again, ask for one more change: the pane says `⚙ write_file extra.txt` / `wrote extra.txt`, but the file lands in `.mush/wt/1/extra.txt` — a *plain directory* `write_file` recreated at the reclaimed path. `git status` is clean, `git worktree list` lists nothing, `/diff 1` and `/merge 1` say `agent #1 has no worktree branch (not isolated)`, and `/worktrees` says there are none. Every surface denies the file exists, and the work can never be landed. `AgentTree::land` clears the branch (its comment says the new run "happens in the main checkout"); it does not — the node still carries the worktree path, so the next run's file I/O goes back to the dead path. | ⬜ | `app/tree.rs` (`land`/`discard` must clear the worktree path too, so a later run is honestly in the main checkout), `agent.rs`'s file tools (resolve through the node, so a stale path cannot be used), and a test that merges, re-runs, and asserts the file is in the root and `git status` shows it |
+| S2 | **`Enter` on an agent row focuses the transcript but not the keyboard — the message you type is eaten.** After `Enter` the pane is `agent #1` and the box prompt reads `#1 ›`, but the bar still says ` agents `: the tree kept the keyboard. Typing `hi again` sends nothing (0 model requests); the tree cursor moved and the visible pane silently switched back to the root — and a stray `c` in the text would have cancelled the agent. Only after a further `Tab` does the nudge reach the child. `README` promises "`Enter` on a row focuses that agent — the chat switches to its transcript and typing nudges it". | ⬜ | `app/keys.rs` / `app/mod.rs` (`focus_cursor_row` must move the keyboard with the focus, or `Intent` must make the tree unable to eat printable keys), the bar's ` chat `/` agents ` badge must agree, and a test that types after `Enter` and asserts the message reached that agent |
+| S3 | **A `session.json` mush cannot parse is dropped silently, then overwritten.** A 648-byte session with a long conversation and one agent, if any field does not match the schema (a bisect showed `"status": "failed"` — the real encoding is `{"failed": "…"}` — is enough), comes back as an empty app with the empty-state hint, no warning on screen, no entry in `/notes`. `Session::load` returning `None` is indistinguishable from "there is no session file", and the first save rewrites the file: the old conversation is gone, with no backup. Docs §5.2 promise "Restarting mush brings the session back at rest", and mush is the only writer — so version skew or a hand edit reaches this. | ⬜ | `main.rs` (`load` must distinguish absent from unreadable), `app/mod.rs` (say it: a notice/status naming the file and the problem), and the save path (keep the unreadable file — a `.bak` beside it — instead of overwriting the only copy) |
+| S4 | **Ctrl-Q does not kill a foreground `run_command`'s process group.** A root `run_command` of `sleep 10; touch marker` is still alive after mush exits cleanly, and the marker appears 10 s later; a `sleep 40` was resident the moment after quit. Detached *jobs* are killed correctly (the heartbeat job stops at Ctrl-Q). Docs §5.6 rule 2 promise "they die with … mush itself — its process groups are killed on exit". | ⬜ | `agent.rs`'s foreground shell path (`run_shell`) and `machine.rs`: a foreground command's process group is not in the job registry, so `Registry::kill_all`/`App::drop` cannot reach it — it must be tracked for the life of the call and killed on quit (this is S4's sibling of `1de2849`, which made it run *once*) |
+| S5 | **The docs and README disagree with the keys for stopping agents.** Live: `Ctrl-C` stops the focused agent and the child kept working; `Ctrl-X` stops them all. `mush --help` and `/help` say exactly that; `README.md` says "`Ctrl-C` cancels everything that is running" and has no `Ctrl-X` row; `docs/mush.md` §4's key table says "cancel running agents". A human who learned the keys from the README presses `Ctrl-C` on a runaway tree and one agent keeps burning tokens. | ⬜ | `README.md` and `docs/mush.md` §4 (the doc hand), not code |
+| S6 | **`/compact` on a transcript with nothing in it does nothing and says nothing.** Immediately after launch, `/compact` paints the bar's `compacting #0…` and then the untouched empty state forever: 3 s later the same, `/notes` empty, nothing on the wire. After any run the documented refusal does appear (`· nothing to compact — this transcript is already short enough to send whole`), because the guard is `matches!(messages.first(), Some(system))`, which is false for an empty transcript and returns without a word. Docs §3 promise "The refusal is said out loud because a human typed a command — silence there is indistinguishable from a fold that quietly failed". | ⬜ | `agent.rs::compact_history` (the empty case must say the same refusal as the short case) and a test that pins the line for a fresh actor |
+| S7 | **In a non-git workspace, `isolated: true` runs in the shared workspace and only the model is told.** In a plain directory, asking for an isolated child puts `iso.txt` in the root, the row has no branch, and the spawn line says nothing; the model's request *did* carry `(isolated unavailable: not a git repository; running in place)`, but no notice reaches the pane, `/notes` or the bar. Two "isolated" siblings would edit the same files while the human believes otherwise. Undocumented either way. | ⬜ | `agent.rs`'s spawn path: emit the same fact as a notice in the parent's pane (the model already gets it), and say it in docs §5.5 |
+| S8 | **Four places where the screen or the docs read badly, none of them a lie at the seam.** (i) The commit subject is the brief **truncated at 60 chars with `…`** (`mush #1: create a file iso.txt containing exactly: isolated w…`), so a landed commit's history cannot be matched to the brief verbatim, while docs/README write it as `mush #N: <brief>`. (ii) `/diff` paints only the tail two rows of the diff above a `+N more lines · /notes` row, so no `+`/`-` line is visible until you type `/notes` — "read `/diff 2`" does not, by itself, show the change. (iii) the pane title says `agents · 2 working` where docs §4.5 still say `2 running`. (iv) `scripts/mock_llm.py`'s `TURNS` scenario waits for the phrase "turn limit", which the prompt no longer contains, so that scripted run ends on the loop guard instead; `README` says the ignored tests run through `mock_llm.py` while `docs/mush.md` §10 says no test refers to it. | ⬜ | (i)/(ii) `agent.rs`'s `commit_subject` and `app/mod.rs`'s `paint_diff` (or the docs: decide which is right); (iii) `docs/mush.md` §4.5 (the doc hand); (iv) `scripts/mock_llm.py` + `README.md`/`docs/mush.md` §10 (pick one home for the script's role) |
+
+**The same pass, driven and found sound (do not re-run).** Isolate → commit →
+`/diff` → `/merge` on a real repo (`git worktree list` → `.mush/wt/1 [mush/1]`;
+one commit whose subject is the brief; `iso.txt | 1 +`; the diff in `/notes`;
+merge lands the file, reclaims the worktree and deletes the branch; a second
+`/merge`/`/diff` says `was already merged`). Restart: the tree comes back with
+its rows at rest, the landed state persists, a leftover worktree is re-registered
+and `/worktrees` reports it, `/discard` removes the worktree and branch and keeps
+the row. `/diff`'s edges: `no agent #99`, `not isolated`, `±0 — nothing changed`,
+a clean no-op merge. `/notes` reads the whole foot (a diff, a refusal, a stored
+failure) as a scrollable popup. Restart mid-run: rows at rest, **no replay**, no
+phantom file. `/compact`: idle folds into a summary, a request mid-reply parks
+and is honoured at the boundary, the automatic fold runs before the next request.
+Detached job: `[still running — detached as #c1…]`, one `#c1 done: exit 0 · 6s`
+folded in, killed at quit. Scrollback/typing seam: a child finishing while the
+root is scrolled back 3 pages with a draft leaves both alone. A detached HEAD
+repo: the child gets `mush/1`, `/merge` fast-forwards the detached HEAD. Tree
+pane: pre-order nesting, `▼N`/`▲N`, `PgDn`, cursor clamp, `Enter`/`Esc`.
+
+---
+
 ## 5. What made orchestrating mush hard (the harness, seen from inside)
 
 The root agent of the session this file was written in ran a hundred-odd
