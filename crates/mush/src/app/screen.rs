@@ -777,12 +777,13 @@ fn title_cells(app: &App, above: usize, below: usize) -> Vec<String> {
     if roster.working > 0 {
         cells.push(format!("{} working", roster.working));
     }
-    // The machine's load, not one agent's: every isolated worktree builds its
-    // own artifacts, so with a dozen children the box is the bottleneck and
-    // this is the only surface that can say so — a row's `⚙N` is one agent's
-    // share (finding H8). Ranked before `waiting` because a napping agent is
-    // already visible on its own row as `⏸N`, while the load exists nowhere
-    // else.
+    // The machine's job count: the same fact every row wears as `⚙N`, summed
+    // over the tree, because every isolated worktree builds its own artifacts
+    // and with a dozen children the box is the bottleneck — a row is one
+    // agent's share, this is the whole (finding H8). It is jobs and only jobs:
+    // a command still under its tool call is not one, so it is on neither.
+    // Ranked before `waiting` because a napping agent is already visible on its
+    // own row as `⏸N`, while the machine's load exists nowhere else.
     let load = app.tree.live_job_count();
     if load > 0 {
         cells.push(if load == 1 {
