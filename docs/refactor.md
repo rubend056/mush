@@ -8,8 +8,8 @@
 > other half — the `Screen` value and the draw sweep that asserts painted text
 > (`app/screen.rs` + `ui.rs`, B17, `7e123e1`). Stage 3.4 (`ToolHost`) was
 > dropped with the editor: there is one dispatcher per side, not three. The
-> delegation-honesty family (N1, N3–N6) is closed, and so is the wave this
-> plan's checklist now also tracks (`findings.md` U1–U10, B20–B23).
+> delegation-honesty family (N1, N3–N6) is closed, and so is the findings wave
+> whose rows §6 carries (`findings.md` U1–U11, B20–B23).
 >
 > Written 2026-09-17 against `d4f80ae` plus the
 > in-flight findings pass (`input.rs`, `config.rs`, `git.rs`, `http.rs`,
@@ -396,76 +396,77 @@ that touch `ui.rs`/`app.rs` should wait until that pass lands.
 
 ---
 
-## 6. Checklist: finding → disposition → structural home
+## 6. Checklist: finding → structural home
 
-Status: ✅ verified closed, ⬜ open or unverified. The findings doc is the queue
-of record — `docs/findings.md` is in the tree and every row below that has an
-alpha-numeric/short id there is kept in step with it; this column says where the
-*fix belongs*, so a row may appear here without a finding (a structural rule) but
-not with a status that contradicts `findings.md`.
+Every row below is closed, so the Status column this table used to carry is
+gone: the disposition ledger is `docs/findings.md` — the queue of record, which
+carries each of its own rows' status and the commit that closed it. What
+this table keeps is the structural half: where the fix belongs, so a later
+change to that same invariant knows its home. The `A1`–`A8` here are the
+starting audit's, not `findings.md` §6's attach rows of the same letters.
 
-| ID | What | Status | Structural home |
-|---|---|---|---|
-| A1 | cancel/deadline only consulted on read timeout | ✅ | http `Watch` (regression test) |
-| A2 | `tokens * 3` overflow | ✅ | `config::clamp_context` |
-| A3 | `parse_context_hint` misfires / misses | ✅ | `config` (markers + range) |
-| A4 | caps as floors; reserve > window | ✅ | `config::{read_cap, cmd_cap, list_limit, history_budget}` |
-| A5 | window derived once; runtime switches never re-derive | ✅ | `git::rederive_context` on every runtime switch (`/url`, `/provider`, `set_model`, `set_base_url`), pinned in `config.rs` |
-| A6 | CLI provider never selects its endpoint | ✅ | `config::resolve_with` test |
-| A7 | no cap on response body | ✅ | `http` `MAX_BODY_BYTES` |
-| A8 | localized git output parses as ±0 | ✅ | `git()` sets `LC_ALL=C` |
-| A9 | model discovery runs even when a model is known | ✅ | `main.rs`: discovery is `config.model.is_empty().then(…)`, so a named model skips it, and it runs on `/model`, `/models` and `/url` |
-| A10 | branch name read as an argv option | ✅ | `git` ref→sha guard |
-| A11 | `adopt_context` accepts 1 | ✅ | `config::adopt_context` clamp |
-| A12 | `Stat` is `u32`, git counts are 64-bit | ✅ | `git::Stat` is `u64` (`a_huge_diff_keeps_its_count`) |
-| A13 | `--` does not stop flag parsing | ✅ | `main::parse_args` |
-| A14 | a second positional silently replaces the first | ✅ | `main::set_dir` errors on a second directory (`only one directory may be given`) |
-| A15 | unparsable `Content-Length` treated as absent | ✅ | `http` `InvalidData` |
-| A16 | bad `MUSH_CONTEXT` silently ignored | ✅ | `config::parse_context_env` |
-| A17 | `openai` alias sends the key to the LAN default | ✅ | `Provider::parse` (aliases removed) |
-| A18 | git test hardcodes `master` | ✅ | `git` test `init_repo` |
-| A19 | DNS resolution unbounded | ⬜ | `Clock` seam + `http::connect` |
-| B1 | leftover worktree id collides with a fresh child | ✅ | `AgentTree::reserve_ids` — raised from the leftover scan (`discover_worktrees`), pinned in `tree.rs` |
-| B2 | `mask_key` slices on a byte boundary | ✅ | core `text::mask_key` (3.6) |
-| B3 | zero-row pane still focusable | ✅ | `App::below_floor` (`app/mod.rs`) refuses every intent but `Quit`, and `ui::draw` paints one notice below `min` — one `is_below_floor` predicate both read |
-| B4 | at 40×10 the only transcript row is a blank | ✅ | `Chat::body` trims trailing blank separators before windowing (`trim_trailing_blanks`) |
-| B5 | `Status` after `Done` restarts a finished agent | ✅ | `AgentTree::activity` ignores it after `Done`/`Failed`, and `busy` is derived from the phases (`tree.rs`) |
-| B6 | failed/idle `Stop` leaves `Cancelling` + `busy` stuck | ✅ | `AgentTree::cancel_requested` (only a run in flight is marked) + the actor's end-of-run event as the ack |
-| B7 | learned window never reaches the UI, then is clobbered | ✅ | `app/settings.rs` — `ConfigCell` + `ConfigHandle`; `learn_context` is the one mutator and it writes both sides |
-| B8 | context meter ignores the human's own message | ✅ | `Chat::used_tokens_for` derives it on read, per conversation |
-| B9 | `fit_row` budgets columns, `truncate` counts chars | ✅ | core `text` (3.6) |
-| B10 | a failed nudge rewrites the node's phase | ✅ | `AgentTree::nudge_failed` |
-| B11 | reaping a leftover leaves `focused` on a ghost | ✅ | `AgentTree::reap` + `repair_focus`; `discover_worktrees` reaps through it |
-| B12 | an `Error` status loses to the activity line | ✅ | one precedence table (3.2) |
-| B13 | a child's brief is never shown | ✅ | `Spawned` pushes the opening message |
-| B14 | the row's summary is from the first run, forever | ✅ | `AgentTree::{begin, finish}` |
-| B15 | `screen.py` mis-reads CSI / `--keys` escapes | ✅ | `scripts/screen.py` — cursor clamped to the grid (a row past the bottom, or a shrink under a low cursor, raised `IndexError` on the next `X`), and `--keys` decodes the escapes it means instead of `unicode_escape`, which turned `é` into `Ã©` and left `\e` literal. `--self-test` pins both. |
-| B16 | `smoke.py --cancel` forks after starting a thread | ✅ | `scripts/smoke.py` — the pty is forked before the endpoint's thread exists; verified by running the scenario. |
-| B17 | the layout sweep asserts "does not panic", not painted text | ✅ | `app/screen.rs` + `ui::draw(frame, &Screen)`; `the_draw_sweep_asserts_painted_text_not_that_it_did_not_panic` over 15 sizes × 14 states, plus seven focused `the_sweep_*` tests (`7e123e1`) |
-| B18 | `~` elision matches a prefix, not a directory | ✅ | `app/screen.rs::facts_line` (moved from `ui.rs` by B17) |
-| B19 | global notices render into every transcript | ✅ | `Notice.agent` + `Chat::notices_for` — no unscoped read exists |
-| N1 | `MAX_TURNS` turns "long" into "failed" | ✅ | `agent/run.rs`: `RUNAWAY_TURNS` + `LOOP_ROUNDS` (a run ends when it stops calling tools; only a *loop* ends it early) |
-| N2 | message box is append-only and clips at the right edge | ✅ | `Input` (grapheme cursor + window), `Chat::key` owns the editing keys |
-| N3 | a stopped child is reported to its parent as `#N done: cancelled` | ✅ | `agent::Outcome` (one enum, not a `summary == CANCELLED` string sentinel) |
-| N4 | Ctrl-C stopped *every* busy agent, and blanked a stopped one to `Idle` | ✅ | `App::interrupt` (focused) + `Ctrl-X` (`interrupt_all`); `Phase::Stopped` |
-| N5 | the one-non-isolated-sibling rule fails only *after* the brief is written | ✅ | `spawn_tool` message + the rule stated in `prompt` schemas and the system prompt |
-| N6 | an interrupted run commits under the same subject as a finished one | ✅ | `commit_worktree` subject carries the `Outcome` |
-| A20 | `needs_compaction` compares byte weights against a *token* budget, and `budget * 3 / 4` can overflow `usize` | ✅ | `mush-core::transcript::compaction_trigger` is saturating and the byte↔token conversion lives once in `Config::history_budget` (same shape as A2) |
-| U1 | a working agent drawn as paused (`⏸` from "has children") | ✅ | `ui::phase_glyph` is a function of the node's own `Phase` only, and the children are a separate `⏸N` mark (`ui::agent_line`) |
-| U2 | the pane title counts waiting agents as working | ✅ | `AgentTree::roster` derives `working`/`waiting` from the phases (`app/tree.rs`), and `ui::agents_title` names each count |
-| U3 | another agent's news snaps a read pane back to the bottom | ✅ | `Chat`'s `reading` is per conversation (`Reading::Holding`), and `painted` marks a held window in the title |
-| U4 | a grandchild drawn after everything spawned before it | ✅ | `AgentTree::rows` walks pre-order over the parent links |
-| U5 | the newest activity on screen three times | ✅ | `App::tree_line` no longer repeats the activity; the bar says the napping root instead |
-| U6 | an agent is a bare number | ✅ | `AgentNode::title` derives a handle from the brief (a path first, else the first non-filler word) |
-| U7 | a waiting agent still says `working…` | ✅ | `Phase::waiting` (`app/tree.rs`) tells a model call from `wait_agents`/`wait_commands`, and the row/foot say which |
-| U8 | a transient notice never leaves | ✅ | `Chat`'s chatter lifetime (`clear_notes_for`, `dismiss_said`, `SAID_TTL`) + repeat collapse (`Notice.count`) |
-| U9 | the shipped DeepSeek window/reply cap is too small | ✅ | `provider::PROVIDERS` fallback 120 000 + `Config::reply_cap` (a quarter of the window, floored at 1 024 and capped at 120 000) |
-| U10 | walking back up a deep tree costs a keypress per ancestor | ✅ | `Intent::TreeWalk` on `←`/`→` (`app/keys.rs`) + `PickerMove(±PAGE)` |
-| U11 | compaction has no visible state anywhere | ✅ | `Phase::Compacting(Parked\|Requested\|NearlyFull)` (`app/tree.rs`), `≡` + the fold's words (`app/screen.rs`), the bar's "keep typing" sentence (`App::tree_line`), and `compact_now` owning the fold's cancel flag (`mush/38`) |
-| B20 | a child's completion reaches the model but not the screen, and can fold twice | ✅ | `agent::push_line` emits `AgentEvent::Message` with the fold, and `absorb` marks the adopted line delivered |
-| B21 | a parent in a tool-calling chain never heard its child finish | ✅ | the fold runs at every message boundary (`fold_completions`), not only on the tool-free turn |
-| B22 | a steering message to a subagent is invisible / an idle target not woken | ✅ | `AgentMsg::Steer` → `push_line` (delivered and emitted), and it is work to answer; the reply wording left over is H5's |
-| B23 | a transient transport failure ends the run instead of being retried | ✅ | `model.rs::retrying` — `RETRY_ATTEMPTS = 3` over the `Clock` seam, transport failures only, each retry announced in the transcript |
+| ID | What | Structural home |
+|---|---|---|
+| A1 | cancel/deadline only consulted on read timeout | http `Watch` (regression test) |
+| A2 | `tokens * 3` overflow | `config::clamp_context` |
+| A3 | `parse_context_hint` misfires / misses | `config` (markers + range) |
+| A4 | caps as floors; reserve > window | `config::{read_cap, cmd_cap, list_limit, history_budget}` |
+| A5 | window derived once; runtime switches never re-derive | `git::rederive_context` on every runtime switch (`/url`, `/provider`, `set_model`, `set_base_url`), pinned in `config.rs` |
+| A6 | CLI provider never selects its endpoint | `config::resolve_with` test |
+| A7 | no cap on response body | `http` `MAX_BODY_BYTES` |
+| A8 | localized git output parses as ±0 | `git()` sets `LC_ALL=C` |
+| A9 | model discovery runs even when a model is known | `main.rs`: discovery is `config.model.is_empty().then(…)`, so a named model skips it, and it runs on `/model`, `/models` and `/url` |
+| A10 | branch name read as an argv option | `git` ref→sha guard |
+| A11 | `adopt_context` accepts 1 | `config::adopt_context` clamp |
+| A12 | `Stat` is `u32`, git counts are 64-bit | `git::Stat` is `u64` (`a_huge_diff_keeps_its_count`) |
+| A13 | `--` does not stop flag parsing | `main::parse_args` |
+| A14 | a second positional silently replaces the first | `main::set_dir` errors on a second directory (`only one directory may be given`) |
+| A15 | unparsable `Content-Length` treated as absent | `http` `InvalidData` |
+| A16 | bad `MUSH_CONTEXT` silently ignored | `config::parse_context_env` |
+| A17 | `openai` alias sends the key to the LAN default | `Provider::parse` (aliases removed) |
+| A18 | git test hardcodes `master` | `git` test `init_repo` |
+| A19 | DNS resolution unbounded | `http::resolve_bounded` runs the lookup on its own thread and bounds the wait at 10 s on the `Clock`, so a hung resolver is a `TimedOut` naming the host |
+| B1 | leftover worktree id collides with a fresh child | `AgentTree::reserve_ids` — raised from the leftover scan (`discover_worktrees`), pinned in `tree.rs` |
+| B2 | `mask_key` slices on a byte boundary | core `text::mask_key` (3.6) |
+| B3 | zero-row pane still focusable | `App::below_floor` (`app/mod.rs`) refuses every intent but `Quit`, and `ui::draw` paints one notice below `min` — one `is_below_floor` predicate both read |
+| B4 | at 40×10 the only transcript row is a blank | `Chat::body` trims trailing blank separators before windowing (`trim_trailing_blanks`) |
+| B5 | `Status` after `Done` restarts a finished agent | `AgentTree::activity` ignores it after `Done`/`Failed`, and `busy` is derived from the phases (`tree.rs`) |
+| B6 | failed/idle `Stop` leaves `Cancelling` + `busy` stuck | `AgentTree::cancel_requested` (only a run in flight is marked) + the actor's end-of-run event as the ack |
+| B7 | learned window never reaches the UI, then is clobbered | `app/settings.rs` — `ConfigCell` + `ConfigHandle`; `learn_context` is the one mutator and it writes both sides |
+| B8 | context meter ignores the human's own message | `Chat::used_tokens_for` derives it on read, per conversation |
+| B9 | `fit_row` budgets columns, `truncate` counts chars | core `text` (3.6) |
+| B10 | a failed nudge rewrites the node's phase | `AgentTree::nudge_failed` |
+| B11 | reaping a leftover leaves `focused` on a ghost | `AgentTree::reap` + `repair_focus`; `discover_worktrees` reaps through it |
+| B12 | an `Error` status loses to the activity line | one precedence table (3.2) |
+| B13 | a child's brief is never shown | `Spawned` pushes the opening message |
+| B14 | the row's summary is from the first run, forever | `AgentTree::{begin, finish}` |
+| B15 | `screen.py` mis-reads CSI / `--keys` escapes | `scripts/screen.py` — cursor clamped to the grid (a row past the bottom, or a shrink under a low cursor, raised `IndexError` on the next `X`), and `--keys` decodes the escapes it means instead of `unicode_escape`, which turned `é` into `Ã©` and left `\e` literal. `--self-test` pins both. |
+| B16 | `smoke.py --cancel` forks after starting a thread | `scripts/smoke.py` — the pty is forked before the endpoint's thread exists; verified by running the scenario. |
+| B17 | the layout sweep asserts "does not panic", not painted text | `app/screen.rs` + `ui::draw(frame, &Screen)`; `the_draw_sweep_asserts_painted_text_not_that_it_did_not_panic` over 15 sizes × 14 states, plus seven focused `the_sweep_*` tests (`7e123e1`) |
+| B18 | `~` elision matches a prefix, not a directory | `app/screen.rs::facts_line` (moved from `ui.rs` by B17) |
+| B19 | global notices render into every transcript | `Notice.agent` + `Chat::notices_for` — no unscoped read exists |
+| N1 | `MAX_TURNS` turns "long" into "failed" | `agent/run.rs`: `RUNAWAY_TURNS` + `LOOP_ROUNDS` (a run ends when it stops calling tools; only a *loop* ends it early) |
+| N2 | message box is append-only and clips at the right edge | `Input` (grapheme cursor + window), `Chat::key` owns the editing keys |
+| N3 | a stopped child is reported to its parent as `#N done: cancelled` | `agent::Outcome` (one enum, not a `summary == CANCELLED` string sentinel) |
+| N4 | Ctrl-C stopped *every* busy agent, and blanked a stopped one to `Idle` | `App::interrupt` (focused) + `Ctrl-X` (`interrupt_all`); `Phase::Stopped` |
+| N5 | the one-non-isolated-sibling rule fails only *after* the brief is written | `spawn_tool` message + the rule stated in `prompt` schemas and the system prompt |
+| N6 | an interrupted run commits under the same subject as a finished one | `commit_worktree` subject carries the `Outcome` |
+| A20 | `needs_compaction` compares byte weights against a *token* budget, and `budget * 3 / 4` can overflow `usize` | `mush-core::transcript::compaction_trigger` is saturating and the byte↔token conversion lives once in `Config::history_budget` (same shape as A2) |
+| U1 | a working agent drawn as paused (`⏸` from "has children") | `screen::phase_glyph` is a function of the node's own `Phase` only, and the children are a separate `⏸N` mark (`ui::agent_line`) |
+| U2 | the pane title counts waiting agents as working | `AgentTree::roster` derives `working`/`waiting` from the phases (`app/tree.rs`), and `ui::agents_title` names each count |
+| U3 | another agent's news snaps a read pane back to the bottom | `Chat`'s `reading` is per conversation (`Reading::Holding`), and `painted` marks a held window in the title |
+| U4 | a grandchild drawn after everything spawned before it | `AgentTree::rows` walks pre-order over the parent links |
+| U5 | the newest activity on screen three times | `App::tree_line` no longer repeats the activity; the bar says the napping root instead |
+| U6 | an agent is a bare number | `AgentNode::title` derives a handle from the brief (a path first, else the first non-filler word) |
+| U7 | a waiting agent still says `working…` | `Phase::waiting` (`app/tree.rs`) tells a model call from `wait_agents`/`wait_commands`, and the row/foot say which |
+| U8 | a transient notice never leaves | `Chat`'s chatter lifetime (`clear_notes_for`, `dismiss_said`, `SAID_TTL`) + repeat collapse (`Notice.count`) |
+| U9 | the shipped DeepSeek window/reply cap is too small | `provider::PROVIDERS` fallback 120 000 + `Config::reply_cap` (a quarter of the window, floored at 1 024 and capped at 120 000) |
+| U10 | walking back up a deep tree costs a keypress per ancestor | `Intent::TreeWalk` on `←`/`→` (`app/keys.rs`) + `PickerMove(±PAGE)` |
+| U11 | compaction has no visible state anywhere | `Phase::Compacting(Parked\|Requested\|NearlyFull)` (`app/tree.rs`), `≡` + the fold's words (`app/screen.rs`), the bar's "keep typing" sentence (`App::tree_line`), and `compact_now` owning the fold's cancel flag (`mush/38`) |
+| B20 | a child's completion reaches the model but not the screen, and can fold twice | `agent::push_line` emits `AgentEvent::Message` with the fold, and `absorb` marks the adopted line delivered |
+| B21 | a parent in a tool-calling chain never heard its child finish | the fold runs at every message boundary (`fold_completions`), not only on the tool-free turn |
+| B22 | a steering message to a subagent is invisible / an idle target not woken | `AgentMsg::Steer` → `push_line` (delivered and emitted), and it is work to answer; the reply wording left over is H5's |
+| B23 | a transient transport failure ends the run instead of being retried | `model.rs::retrying` — `RETRY_ATTEMPTS = 3` over the `Clock` seam, transport failures only, each retry announced in the transcript |
 
 ---
 
@@ -564,30 +565,78 @@ The rule the waves have settled into, so it is not re-derived each time:
 
 ---
 
-## 11. The duplication queue (what the review after the last integration found)
+## 11. The duplication queue (line numbers are the tree at `6ffa7bf`)
 
-Measured at `0bd7e8a`: 32 150 lines total, ~19 250 of them tests (`app/mod.rs`
-6 224 / 3 966 test, `agent.rs` 6 872 / 4 104, `app/chat.rs` 2 524, `jobs.rs` 1 358,
-`ui.rs` 1 024). At `7e123e1` the same `ui.rs` is **298** lines and
-`app/screen.rs` is **1 064**; the census below is the one the reviews read.
-Ranked by (net lines × confidence) ÷ risk. `D1`–`D8` were the fix
-wave (landed in `58a309c`); `⬜` are still open and a `✅` says what it measured.
+The review that follows every integration onto `master` (§10.3) reports the same
+fact, rule or shape written more than once, ranked by (net lines × confidence) ÷
+risk. This is the one ledger of what those reviews have found: a row per item,
+what it costs, and — while it is open — the risk the fix removes and the test
+that would protect it. The reviews themselves are the subsections below, kept for
+their evidence: what each measured, which bugs it injected, and which semantic
+changes it proved byte-identical.
 
-| # | What | Net | Status |
-|---|---|---|---|
-| D1 | The `App` test fixture is hand-rolled twelve times (`app/mod.rs`: `app_at`, `app_and_rx`, `app_writing`, `app_recording`, `reopened`, `test_app` + six inline). One `app_root(root, stored, save) -> (App, Receiver<Msg>)`. | ≈ −70 | ✅ (−103) |
-| D2 | Two enums answer "what is a wait waiting on": `tree::Waiting` and `jobs::Waited`, with the same `noun()` and the same tool names spelled again in `Waited::tool()`. Keep `jobs::Waited`; `Phase::waiting() -> Option<jobs::Waited>`. | ≈ −20 | ✅ (−14) |
-| D3 | `retrying(...)` + its announce closure are copied verbatim (`agent.rs` run loop and `compact_history`). One `fn ask(actor, request, cancel)`; the error arms stay per-caller. | ≈ −9 | ✅ (+1) |
-| D4 | `App::say`/`App::fail` differ only in `kind`, and the "name the agent if it is not focused" branch is written twice. One `set_status(kind, text)` + `say_for(id, text)`. | ≈ −12 | ✅ (±0) |
-| D5 | `describe()` derives "stated / the provider's default" twice (`main.rs`), and `AgentTree::has` re-spells `node(id).is_some()`. | ≈ −6 | ✅ (−4) |
-| D6 | `paint_diff` re-implements `git::commit`'s `rev-parse --verify ^{commit}` probe (`git.rs` keeps the one home). | ≈ −5 | ✅ (−3) |
-| D7 | `App::busy` and `App::working_agents` are two derivations of "own run or a job". One `in_flight(node)`; `tree.busy()` stays agent-only on purpose. | ≈ −3 | ✅ (+4) |
-| D8 | The `ChatRequest` shape and the thinking/reasoning knobs are built twice (`agent.rs` run loop and `compact_history`) — **and this copy is where the bug lives**: the fold sends `max_tokens` even on an endpoint configured for `max_completion_tokens`, and `compact_history` swallows a `Status`/`Malformed` as `Ok(())`, so compaction silently never happens there. | ≈ −10 | ✅ (+151, tests included) |
-| D9 | Two "elide cells from the right until they fit" loops (`ui.rs` `agents_title`, `facts_line`) — **deferred**: item 7's `Screen` refactor rewrites `ui.rs`, so this lands after B17. | ≈ −8 | ⬜ (`7e123e1` landed the `Screen`; ready for the next fix wave) |
-| D10 | The `bar_rows` rule (`>= 24`) is written in the painter and again in the test helper `selected_rows`; one `ui::bar_rows(height)`. Same file, same deferral as D9. | ≈ −2 | ⬜ (`7e123e1` landed the `Screen`; ready for the next fix wave) |
+How to read a row. `Net` is the fix's size — the measured delta for a landed row,
+the review's estimate for an open one. `Status` names the commit that landed a
+row, or `⬜` while it is open; `R6` is judged and deliberately left, and its row
+says why, so it is not mistaken for forgotten. Line numbers are the tree at
+`6ffa7bf`; a row found in an earlier review has been re-anchored, and a price
+re-set by a later review says so (the sixth review, after the `Screen` rewrite,
+re-priced `D9` and `R9`).
+
+The census the reviews read, and the tree this ledger anchors to: 41 447 lines —
+prod 7 568, tests 21 531, comments 9 635, the last three unchanged since
+`960e073` (`findings.md` §8.19). `scripts/census.py` is the method; `findings.md`
+§8.5 has the per-wave deltas, from 9 200 lines at `143325a15` to 41 123 at
+`f70374f` (prod ×1.8, tests ×6.9, comments ×7.5).
+
+| # | What is duplicated | Net | Risk | Protecting test | Status |
+|---|---|---|---|---|---|
+| D1 | The `App` test fixture is hand-rolled twelve times (`app/mod.rs`: `app_at`, `app_and_rx`, `app_writing`, `app_recording`, `reopened`, `test_app` + six inline). One `app_root(root, stored, save) -> (App, Receiver<Msg>)`. | ≈ −70 | — | — | ✅ `58a309c` (−103) |
+| D2 | Two enums answer "what is a wait waiting on": `tree::Waiting` and `jobs::Waited`, with the same `noun()` and the same tool names spelled again in `Waited::tool()`. Keep `jobs::Waited`; `Phase::waiting() -> Option<jobs::Waited>`. | ≈ −20 | — | — | ✅ `58a309c` (−14) |
+| D3 | `retrying(...)` + its announce closure are copied verbatim (`agent.rs` run loop and `compact_history`). One `fn ask(actor, request, cancel)`; the error arms stay per-caller. | ≈ −9 | — | — | ✅ `58a309c` (+1) |
+| D4 | `App::say`/`App::fail` differ only in `kind`, and the "name the agent if it is not focused" branch is written twice. One `set_status(kind, text)` + `say_for(id, text)`. | ≈ −12 | — | — | ✅ `58a309c` (±0) |
+| D5 | `describe()` derives "stated / the provider's default" twice (`main.rs`), and `AgentTree::has` re-spells `node(id).is_some()`. | ≈ −6 | — | — | ✅ `58a309c` (−4) |
+| D6 | `paint_diff` re-implements `git::commit`'s `rev-parse --verify ^{commit}` probe (`git.rs` keeps the one home). | ≈ −5 | — | — | ✅ `58a309c` (−3) |
+| D7 | `App::busy` and `App::working_agents` are two derivations of "own run or a job". One `in_flight(node)`; `tree.busy()` stays agent-only on purpose. | ≈ −3 | — | — | ✅ `58a309c` (+4) |
+| D8 | The `ChatRequest` shape and the thinking/reasoning knobs are built twice (`agent.rs` run loop and `compact_history`) — **and this copy is where the bug lived**: the fold sent `max_tokens` even on an endpoint configured for `max_completion_tokens`, and swallowed a `Status`/`Malformed` as `Ok(())`, so compaction silently never happened there. | ≈ −10 | — | — | ✅ `58a309c` (+151, tests included) |
+| D9 | Two "drop cells from the right until they fit" loops, now cross-module: `ui::agents_title` (`ui.rs:133`) joins clauses with ` · `, `screen::facts_line` (`app/screen.rs:639`) with ` │ `; their floors differ (the title falls back to `" agents "`, the facts line never drops its first cell). The cheaper shape is to pre-elide in `screen::agents_pane`, so `title_cells` becomes a `String` and the painter's loop goes. | ≈ −5 (was −8) | A shared helper would move pane layout into the painter; the sixth review proved the build/elide split byte-identical, so what is left is the floors — a clause cut mid-number, or a facts line that gives up its workspace cell. | `the_title_elides_clauses_instead_of_cutting_numbers` (`app/mod.rs:6715`) reads the painted title at 200×50 and 80×24; the draw sweep paints it at every size. | ⬜ |
+| D10 | The `bar_rows` rule (`area.height >= 24`) is written in the prover (`app/screen.rs:283`) and again in the test helper `selected_rows` (`app/mod.rs:3357`); one pure `screen::bar_rows(height)`. | ≈ −2 | The tier edge moves in the prover and not in the helper, so `selected_rows` reads rows the bar paints over. | `the_facts_line_survives_at_80x24` (`app/mod.rs:2939`) pins the 24 edge; `selected_rows` is what the tree's highlight tests read. | ⬜ |
+| R1 | `absorb`'s `Run` arm carried the same "adoption may only *add* marks, never move one backwards" paragraph twice, one per author. It is one paragraph above the single `delivered.entry(id).or_insert(run)` loop. | ≈ −2 | — | — | ✅ `45116ad` |
+| R2 | `AgentTree::compacted` (`app/tree.rs:800`) and `compacting_ended` (`:820`) are the same body twice, differing only in the at-rest phase (`Phase::Done` vs `Phase::Idle`). One private `fold_over(id, in_run, at_rest)`. | ≈ −5 | A third fold surface picks one of the two and the at-rest phase drifts. | `a_landed_fold_takes_its_state_off_the_screen` and `a_fold_that_ends_without_landing_leaves_a_quiet_row` (`app/mod.rs:6118`, `:6156`) assert the phase each end leaves. | ⬜ |
+| R3 | The "deliver a completion once" rule was open-coded seven times (both `absorb` arms, `drain_mailbox`, `fold_completions`' two loops, both wait tools). `ActorState::record_child(id, run, outcome) -> (String, bool)` and `record_job(...)` (`agent.rs:766`, `:779`) are the one home of "mark it read and say whether it was fresh"; each caller keeps only its own decision. | ≈ −15 | — | — | ✅ `45116ad` (with `R7`) |
+| R4 | The "at rest with children working" predicate was derived twice and the two disagreed. `AgentTree::napping(id)` (`app/tree.rs:1143`) is read by `roster` and by `tree_line`. | ≈ −4 + fix | — | — | ✅ `642fda8` |
+| R5 | A fold that came to nothing was ended by each caller for the same `Ok(false)`; `compact_history` now emits its own `CompactingEnded { in_run }` on every `Ok(false)` return (`agent.rs:2110`, `:2125`, `:2222`, `:2241`). | ≈ −5 | — | — | ✅ `45116ad` |
+| R6 | Run identity is four homes plus the adoption scan. Folding `completed`+`delivered` into one `Completion { run, outcome, read }` (and `done_jobs`+`delivered_jobs` likewise) is **not** clearly better: `completed` says what the child last reported, `delivered` what the model has read, and the merged shape would clobber the newer record on an out-of-order arrival. The delivery road's one home is `R3`'s `record_child`/`record_job` instead. | ≈ −8 | **Judged and left on purpose**: the merge would trade one duplication for a wrong answer on an out-of-order arrival. Not an oversight. | — | ⬜ judged |
+| R7 | Overlapped `R3` (the two `absorb` arms are one shape); the fix picked one home — `record_child`/`record_job` — not both. | — | — | — | ✅ `45116ad` |
+| R8 | The fold's *verb* is spelled again in the bar (`app/mod.rs:1277`) and in `/compact`'s acknowledgement (`app/mod.rs:2026`) while `Compacting::words()` (`app/tree.rs:211`) owns the row's words — so the bar says `compacting` for a fold its own row calls `folding at the next step`. Derive the verb from `Compacting`. | ≈ 0 | The bar and the row disagree about the same fold. | `a_fold_in_flight_is_painted_on_every_surface` (`app/mod.rs:6068`) reads the row's and the bar's words together, but only for `Compacting::Requested`. | ⬜ |
+| R9 | `screen::chat_pane` looks `self.tree.node(self.tree.focused)` up twice for two projections, `busy` and `compacting` (`app/screen.rs:482`, `:487`), where one binding has both. | ≈ −3 | None within a frame — both reads see the same tree, and the sixth review proved the split byte-identical. One lookup fewer to keep in step. | the chat-pane assertions in `a_fold_in_flight_is_painted_on_every_surface` (`app/mod.rs:6068`). | ⬜ |
+| R10 | Two stale comments the integration left: `app/tree.rs:64` still offers `summarizing…` as an `Activity` example (no `AgentEvent::Status` sends it), and `app/screen.rs:696` says the title's `M waiting` are "the `⏸` rows" — false since U1, because `AgentRow.waiting` is `busy_children` (a *working* parent wears `⏸N` too) while `roster.waiting` counts only the at-rest. (The third comment, the bar's claim that `say`/`fail` own every line, and the `roomy` doc landed in `f70374f`.) | ≈ −4 | The two docs in the tree contradict each other about the same count, so either reader is misled about what `waiting` means. | `the_title_counts_working_and_waiting_agents_separately` (`app/mod.rs:6638`) pins the title's meaning; nothing pins a comment. | ⬜ |
+| R11 | "The brief's first line, whitespace collapsed" is written four times: `first_line` (`agent.rs:3792`), `subject_brief` (`agent.rs:285`), `job_title`'s body (`app/mod.rs:295`) and `AgentNode::title` (`app/tree.rs:406`). One home in `mush_core::text`, where the string arithmetic already lives (B9). | ≈ −8 | A fifth spelling is what the next surface adds; the four already disagree at the edges (`subject_brief` trims, `job_title` keeps only the last `&&` clause). | `a_subject_is_the_briefs_first_line_cut_on_a_word_boundary` (`agent.rs:4151`), `a_title_is_derived_from_the_brief` (`app/tree.rs:1560`), `a_job_is_named_by_its_command_on_one_line` (`app/mod.rs`). | ⬜ |
+| R12 | `Landed`'s past word is spelled where it is rendered in two modules: `worktree_gone` (`app/mod.rs:1371`) and `screen::agent_detail` (`app/screen.rs:873`) — the second site this row named, `worktree_command`, went with the command cut (`ad5b791`). One `Landed::past()`, beside `Waiting::noun` (`jobs.rs:138`). | ≈ −6 | The refusal and the row tell a landed agent's story in different words, and a third surface adds a third. | `a_landed_agent_does_not_offer_commands_that_cannot_work` (`app/screen.rs:1110`) reads the row's words; `worktree_gone`'s refusal is read at `app/mod.rs:3590`. | ⬜ |
+| R13 | The UI's `worktree_gone` and the actor's are deliberately two-sided (the UI keeps the words in the box and out of the transcript; the actor is the backstop for a sender the UI never sees) — keep both — but their predicates disagreed after a restore: `restore_agents` passed the stored `branch` unfiltered while `revive` filtered it on the worktree's existence. `agent::live_branch(root, id, branch)` (`agent.rs:956`) is the one decision, shared by both. | +2 | — | — | ✅ `642fda8` |
+| R14 | The registry's one reach was walked three times: `kill_owned`, `kill_all` and `Registry::drop` each walked `foregrounds`+`jobs` — except `Drop`, which walked only `jobs` while its own doc claimed the backstop. One `fn kill(&self, owner: Option<u64>)` (`jobs.rs:927`); `drop` is `kill(None)`. | ≈ −8 | — | — | ✅ `45116ad` |
+| R15 | `Ended`'s three "mush stopped it" variants are `jobs::Stopped` copied: `wait_bounded` translates 1:1 (`agent.rs:3705–3707`) and `watch` translates the same three into `JobOutcome` (`jobs.rs:1142–1148`). `Ended::Stopped(jobs::Stopped)`, built by `jobs::stopping` (`jobs.rs:174`). The unreachable `Ended::Detached` report arm (`agent.rs:3616`) rides along and prints a *timeout* sentence it cannot be. | ≈ −8 | A fourth stop reason is added to `Stopped` and one translator misses it — the model reads the wrong sentence. | `ending`'s unit tests (`agent.rs:7136–7155`) pin the translation table; the unreachable arm needs one too. | ⬜ |
+| R16 | The `/compact` refusal — the `asked` guard, the `emit` and the `Ok(false)` — is written twice in `compact_history` (`agent.rs:2103` and `:2121`); the second copy was added by the `mush/47` merge. One `fn nothing_to_compact(actor)`. | ≈ −4 | A third "nothing to fold" arm tells the human something the other two do not, or stays silent where the row says `compacting…`. | the `NOTHING_TO_COMPACT` tests (`agent.rs:9125`, `:9169`) assert both arms' words. | ⬜ |
+| R17 | `main::shown_under` (`main.rs:547`) re-states `Workspace::rel` (`workspace.rs:82`): the same strip-prefix/unwrap-or dance, except `rel` also folds `\` to `/`. Pass the `&Workspace` the caller already has and delete `shown_under`. | ≈ −6 | A second elision rule drifts from `rel`'s (a path outside the root, a Windows separator), and the session's own name is shown by whichever one is used. | `a_path_outside_the_workspace_is_shown_whole` (`main.rs`) moves to `workspace.rs` beside `rel`. | ⬜ |
+| R18 | `keep_unreadable`'s two `Err` branches repeat the name formatting and the sentence shape (`mush-core/src/session.rs:249–254` and `:256–259`) — one `cannot_keep(from, why)`. This is also the only untested path in the session code: no test covers an `Err`. | ≈ −4 | A third failure gets a sentence that does not name the file the human must go find. | an `Err` test: a read-only directory, or a name every backup step is already taken for. | ⬜ |
+| R19 | `App::session_unreadable` is the second spelling of "a failure takes the notice, the bar and the dirty mark" (`app/mod.rs:1205–1210` against the `AgentEvent::Error` arm at `:989–996`); D4's `set_status`/`say_for` should swallow it or the two will drift. | ≈ −4 | The durable notice and the bar's line stop agreeing about one failure. | the session-unreadable tests (`app/mod.rs:4565`), which assert the notice, the bar and the stored line. | ⬜ |
+| R20 | `Launch::held` states the owner `Registry::hold` already recorded (`jobs.rs:518` vs `:653`) — one owner per fact, so `Foreground` should carry it; and the same edit builds `Live` by hand twice (`:547–550`, `:654–657`) → `Live::new(job)`. | ≈ −2 | The owner on the record and the owner in the slot disagree, and `kill_owned` kills the wrong set. | the foreground tests (`Registry::hold`'s and `Foreground::stopped`'s). | ⬜ |
+| R21 | `attach_agents` was a second derivation of the row the painter derives, re-computing `focused`, `children_working`, `title`, `branch` and the phase words by hand. It now serializes `App::agent_row` plus the wire-only extras (`worktree`, `summary`, `leftover`, `revision`) at `app/mod.rs:1567`. | ≈ −20 | — | — | ✅ `3b6602d` |
+| R22 | "What a phase is called" is spelled three ways in two modules: `Phase::label`/`doing` (`app/tree.rs:146`, `:169`) and the painter's `phase_glyph`/`phase_detail` (`app/screen.rs:908`, `:934`). `doing()` overlaps `label()` on thinking/compacting/cancelling and collapses `Stopped`/`Done`/`Failed` to `idle`. Owner: `screen.rs` owns painted prose, `Phase` owns the machine name; `doing()` derives from `label()`, `phase_detail` composes from them instead of re-spelling the stems — and one doc comment still points at `ui.rs` (`Phase::doing`'s, `app/tree.rs:163`), which no longer derives a phase word. | ≈ −15 | Every new `Phase` variant breaks the exhaustive matches that spell it (the compiler doing its job); the drift is the quit line reading `#0 idle + 1 job` for a stopped agent that owns a live job. | `glyphs_are_truthful` and `details_age_with_the_phase` (`app/screen.rs:1042`, `:1074`); the quit line is read by `a_live_run_arms_the_quit_and_names_what_dies` (`app/mod.rs:4058`). | ⬜ |
+| R23 | The attach response body is an untyped `Value` whose keys are spelled in producer and consumer, and the consumer silently defaults a missing key (`print_agents`' `field` closure returns `""`), so a rename is a silent blank rather than an error. `print_lines`/`print_agents` (`main.rs:410`, `:422`) should take a `String` built by the producer, and be tested against a real `handle_attach` body. | ±0 | A wire key renamed on one side paints an empty column forever, and nothing fails. | a unit test over a real `handle_attach` body (both printers are untested today). | ⬜ |
+| R24 | `attach_focus` asks "is #N in the tree?" twice: `tree.has(id)` (`app/mod.rs:1627`) then `point_cursor_at` (`app/tree.rs:1202`), whose `bool` is ignored. They agree only because `rows()` paints every node; use the one return value. | ≈ −3 | A tree that hides a node (a future filter) accepts a focus that lands on no row. | `attach_focus_moves_the_focus_like_enter` (`app/mod.rs:8687`). | ⬜ |
+| R25 | The tree pane's window geometry was derived twice — `inner`/`footer_rows`/`list_area` in `screen.rs` (to derive `▲`/`▼`) and again in `ui.rs` (to place the `List`) — so the counts were a model of the scroll. One `AgentsPane::list_area: Rect` (`app/screen.rs:157`, set at `:364`, read at `ui.rs:106`). | ≈ −7 | — | — | ✅ `f70374f` |
+| R26 | `phase_detail(cursor_node)` is derived twice per frame — once per row (`app/screen.rs:447`) and again for the footer (`:354` → `:786`), each reading `node.since.elapsed()` separately, so a boundary crossing could paint two ages in one frame. The footer should read the row it already built. | ≈ −2 | One frame paints two ages for one phase. | `details_age_with_the_phase` (`app/screen.rs:1074`) pins each spelling; a frame test that the row's and the footer's activity agree is the missing one. | ⬜ |
+| R27 | The worktree path string is assembled in the UI although `worktree_path`'s doc claims core owns it: `format!("{}/{}", git::WORKTREE_DIR, node.id)` at `app/screen.rs:882`, again in `crates/mush-core/src/git.rs:161`, and in the test at `app/screen.rs:1137`. One `git::worktree_rel(id)`, used by `worktree_path` and the row. | ≈ −1 | Core changes `.mush/wt/{id}` and the row names a directory that is not there. | `an_unmerged_agent_names_its_worktree_and_the_git_command_to_read_it` (`app/screen.rs:1129`), re-aimed at `worktree_path`. | ⬜ |
+| R28 | Test-only: `selected_rows` (`app/mod.rs:3349`) re-implements `shot` (`:3286`) — the same `set_term_size` + `screen()` + `Terminal::new` + `draw` + buffer read. One `fn painted(app, w, h) -> (Screen, Buffer)`. | ≈ −8 (tests) | The two harnesses drift — already: `selected_rows` carries its own copy of `bar_rows` (`D10`). | the tree's highlight tests that read `selected_rows` (`page_keys_move_the_tree_cursor_a_page_and_clamp_at_both_ends`, `app/mod.rs:6354`). | ⬜ |
+| R29 | `busy_children(id)` (`app/tree.rs:1171`) is an O(n) scan called per node in `roster()` (through `napping`, `tree.rs:1145`), per row in `agent_row` (`app/screen.rs:442`) and once in `tree_line` (`app/mod.rs:1283`) — the same fact walked ~2n+1 times per frame — and `App::live_jobs`, the documented one door, is bypassed by `in_flight` (`app/mod.rs:1098`). One per-frame `HashMap<AgentId, usize>`. | ≈ −3 | A per-frame O(n²) walk on a deep tree, and three walks over the same fact that can disagree. | `the_bar_and_the_title_agree_on_who_the_root_waits_for` (`app/mod.rs:8136`) and `the_title_counts_working_and_waiting_agents_separately` (`:6638`). | ⬜ |
 
 ### The first review (after the `mush/39` integration, `0bd7e8a`)
 
+Measured at `0bd7e8a`: 32 150 lines total, ~19 250 of them tests (`app/mod.rs`
+6 224 / 3 966 test, `agent.rs` 6 872 / 4 104, `app/chat.rs` 2 524, `jobs.rs` 1 358,
+`ui.rs` 1 024). It found `D1`–`D8`, the `ChatRequest` copy (`D8`) carrying the
+compaction bug with it.
 
 **Genuinely not duplicated (checked, do not re-litigate):** `ConfigCell`'s two
 faces over one `believable()`; `keys::KEYS`/`commands::COMMANDS` each rendered
@@ -595,28 +644,12 @@ from one row list; `ToolName`; the worktree verbs' one-row-earlier shape;
 `Outcome::line` writing and `chat::report` parsing (a persistence boundary: the
 reader must not trust the writer); `git::run`'s two contracts; `Phase` ↔
 `StoredStatus` as a tested inverse pair; `Roster`/`busy_children`; `agent.rs`'s
-layered test fixtures; the sanitize-at-the-door arrangement (different surfaces,
+layered test fixtures; the sanitize-at-the-door arrangement.
 
 ### The second review (after the `mush/38`+`mush/41` integration, `fb7265d`)
 
 Measured there: 33 504 lines in `crates` (`agent.rs` 7 681 with 4 689 test,
-`app/mod.rs` 6 428 / 4 126). Items `R1`–`R10`; the `D` numbering continues
-from the first table.
-
-| # | What | Net | Status |
-|---|---|---|---|
-| # | What | Net | Status |
-|---|---|---|---|
-| R1 | `absorb`'s `Run` arm carries the same "Adoption may only *add* marks …" paragraph twice (`agent.rs:1058` and `:1064`, one per author). Merge into one paragraph above the single `state.delivered.entry(id).or_insert(run)`. | ≈ −2 | ⬜ |
-| R2 | `AgentTree::compacted` and `AgentTree::compacting_ended` are the same body twice, differing only in the at-rest phase (`Phase::Done` vs `Phase::Idle`). One private `fold_over(id, in_run, at_rest)`. | ≈ −5 | ⬜ |
-| R3 | The "deliver a completion once" rule is open-coded seven times (both `absorb` arms, `drain_mailbox`, `fold_completions`' two loops, both wait tools). Two `ActorState` methods (`record_child(id, run, outcome) -> (String, bool)`, `record_job(...)`) and each caller keeps only its own decision. **This is the B24 path: exactly one delivery per run must survive.** | ≈ −15 | ⬜ |
-| R4 | The "at rest with children working" predicate is derived twice and the two disagree — the real defect below (`U12`). One `AgentTree::napping(id)`, read by `roster`, `tree_line` and the `⏸N` mark. | ≈ −4 + fix | ⬜ |
-| R5 | The fold's "came to nothing" ending is emitted by each caller for the same `Ok(false)` (`agent.rs:1232` and `:1863`); `compact_history` already knows `in_run`, so it should emit `CompactingEnded` on its three `Ok(false)` returns. | ≈ −5 | ⬜ |
-| R6 | Run identity is four homes plus the adoption scan. Folding `completed`+`delivered` into one `Completion { run, outcome, read }` (and `done_jobs`+`delivered_jobs` likewise) is **not** clearly better: `completed` says what the child last reported, `delivered` what the model has read, and the merged shape would clobber the newer record on an out-of-order arrival. Prefer R3's helpers. | ≈ −8 | ⬜ (judged) |
-| R7 | Overlaps R3 (the two `absorb` arms are one shape); pick one home, not both. | — | ⬜ |
-| R8 | The fold's *verb* is spelled again in the bar (`app/mod.rs:1075`) and in the acknowledgement (`:1757`) while `Compacting::words()` owns the row's words — so the bar says "compacting" for a fold its own row calls "folding at the next step". Derive the verb from `Compacting`. | ≈ 0 | ⬜ |
-| R9 | `draw_chat` looks the focused node up twice (`ui.rs:584`, `:590`) where one binding has two projections. | ≈ −3 | ⬜ |
-| R10 | Stale words left behind by the integration: `tree.rs:64` still offers `summarizing…` as an `Activity` example; `ui.rs:311` says `M waiting` are "the `⏸` rows" (a *working* agent wears `⏸N` since U1); `app/mod.rs:964` says `say`/`fail` own every string the bar's line can be (the fold sentence in `tree_line` is a third). | ≈ −4 | ⬜ |
+`app/mod.rs` 6 428 / 4 126). It found `R1`–`R10`.
 
 **Confirmed not duplicated by the second review:** the fold's state (all five
 surfaces read the one node phase — no surface re-derives it); the run identity's
@@ -626,157 +659,89 @@ re-inlined); the sanitize doors and `truncate`/`fit_row` (no new copy);
 `Compacting`'s three variants (constructed only where the *why* is known);
 `Phase::Compacting` → `StoredStatus::Idle` on save (a persistence decision).
 
----
-
 ### The third review (after the `mush/46` integration, `c4aa2e3`)
 
-
-Confirmed: the doubled `absorb` paragraph (R1) is still there; `diff_rows`'
-preamble/hunk knowledge has exactly one home and `git.rs` is not it (presentation,
-not a parser); `subject_brief`/`parse_commit_subject` are a tested writer/reader pair
-across a persistence boundary (keep); `Focus` has three writers, each a different
-move, and two readers — no drift. What it added:
-
-| # | What | Net | Status |
-|---|---|---|---|
-| R11 | "The brief's first line, whitespace collapsed" is written four times: the real `first_line` (`agent.rs`), `job_title`'s body and `subject_brief` (`app/mod.rs`, the copy this integration added) and `AgentNode::title` (`app/tree.rs`). One home in `mush_core::text`, where the string arithmetic already lives (B9). | ≈ −8 | ⬜ |
-| R12 | `Landed`'s "merged"/"discarded" word is matched in two places in `app/mod.rs` (`worktree_gone`, `worktree_command`). One `Landed::past()`, next to the `Waiting::noun` precedent. | ≈ −6 | ⬜ |
-| R13 | The UI's `worktree_gone` and the actor's `worktree_gone` are deliberately two-sided (the UI can keep the words in the box and out of the transcript; the actor is the backstop for a sender the UI never sees) — **keep both** — but their *predicates* are derived from different inputs and after a restore they disagree: `restore_agents` passes the stored `branch` unfiltered while `revive` filters it on `worktree_path(root, id).exists()`, so a restored agent whose worktree is gone keeps a branch its actor does not have. One decision at restore (`U13`). | +2 | ⬜ |
-
----
+It found `R11`–`R13`. Confirmed: `diff_rows`' preamble/hunk knowledge has exactly
+one home, and `git.rs` is not it (presentation, not a parser);
+`subject_brief`/`parse_commit_subject` are a tested writer/reader pair across a
+persistence boundary (keep); `Focus` has three writers, each a different move,
+and two readers — no drift.
 
 ### The fourth review (after the `mush/47` integration, `e747bc3`)
 
-Confirmed: the doubled `absorb` paragraph (R1) is still there, now adjacent
-above the one loop; `Session::load_from` delegates to `read_from` (one parse,
-one absent/unreadable decision) and the `.bak` name has one home (`first_backup`,
-whose path is returned rather than re-derived); no notice string is spelled
-twice (`NOTHING_TO_COMPACT` is one const at both sites, the isolation `reason`
-is one `Option<String>` rendered for two readers, the session line is built once
-in `main`); the three notices take two doors on purpose (`AgentEvent::Notice` →
-`chat.note_for`, Info; `App::session_unreadable`, Alert and durable) and the
-kind/rank is the constructor's, never re-derived; `Launch::started`/`held` is a
-seam rather than a second lifecycle (one `Live`, one admission/lock/mailbox
-path, one process group), and `JobOutcome`'s TimedOut/Cancelled → `Stopped` is a
-job-reader's choice, not a re-derivation. What it added (line numbers are its
-own, on `e747bc3`):
-
-| # | What | Net | Status |
-|---|---|---|---|
-| R14 | The registry's one reach is walked three times: `kill_owned` (`jobs.rs:865`), `kill_all` (`:885`) and `Registry::drop` (`:1015`) each walk `foregrounds`+`jobs` — except `Drop`, which walks only `jobs` while its own doc (`:1011`) claims the backstop. One `fn kill(&self, owner: Option<u64>)` (`drop` → `kill(None)`), which is also the cheapest way to close R14's own defect below. | ≈ −8 | ⬜ |
-| R15 | `Ended`'s three "mush stopped it" variants are `jobs::Stopped` copied: `wait_bounded` translates 1:1 (`agent.rs:3053–3057`) and `watch` translates the same three into `JobOutcome` (`jobs.rs:1090–1099`). `Ended::Stopped(jobs::Stopped)` built by `jobs::stopping`. The unreachable `Ended::Detached` report arm (`:2983`) rides along and prints a *timeout* sentence it cannot be — fix the arm while you are there. | ≈ −8 | ⬜ |
-| R16 | The `/compact` refusal is emitted from two sites (`agent.rs:1751–1758` and `:1764–1771`): the guard, the `emit` and the `Ok(false)` written twice — the second copy was added by the `mush/47` merge. One `fn nothing_to_compact(actor)`. | ≈ −4 | ⬜ |
-| R17 | `main::shown_under` re-states `Workspace::rel` (`main.rs:303` vs `workspace.rs:79`): the same strip-prefix/unwrap-or/display dance, except `rel` also folds `\` to `/`. Pass the `&Workspace` the caller already has and delete `shown_under` (its test moves to `workspace.rs`). | ≈ −6 | ⬜ |
-| R18 | `keep_unreadable`'s two `Err` branches repeat the name formatting and the sentence shape (`session.rs:219–224` and `:226–229`) — one `cannot_keep(from, why)`. This is also the only untested path in the new session code: no test covers an `Err`. | ≈ −4 | ⬜ |
-| R19 | `App::session_unreadable` is the second spelling of "a failure takes the notice, the bar and the dirty mark" (`app/mod.rs:1026–1031` against the `AgentEvent::Error` arm at `:823–843`); D4's `set_status`/`say_for` should swallow it or the two will drift. | ≈ −4 | ⬜ |
-| R20 | `Launch::held` states the owner `Registry::hold` already recorded (`jobs.rs:501–506` vs `:628`) — one owner per fact, so `Foreground` should carry it; and the same edict builds `Live` by hand twice (`:524–527`, `:629–632`) → `Live::new(job)`. | ≈ −2 | ⬜ |
+It found `R14`–`R20`. Confirmed: the doubled `absorb` paragraph (`R1`) was still
+there then, adjacent above the one loop; `Session::load_from` delegates to
+`read_from` (one parse, one absent/unreadable decision) and the `.bak` name has
+one home (`first_backup`, whose path is returned rather than re-derived); no
+notice string is spelled twice (`NOTHING_TO_COMPACT` is one const at both sites,
+the isolation `reason` is one `Option<String>` rendered for two readers, the
+session line is built once in `main`); the three notices take two doors on
+purpose (`AgentEvent::Notice` → `chat.note_for`, Info; `App::session_unreadable`,
+Alert and durable) and the kind/rank is the constructor's, never re-derived;
+`Launch::started`/`held` is a seam rather than a second lifecycle (one `Live`, one
+admission/lock/mailbox path, one process group), and `JobOutcome`'s
+TimedOut/Cancelled → `Stopped` is a job-reader's choice, not a re-derivation.
 
 **Three things it found that are not duplication:**
 
-1. `Launch`'s doc promises the group "is in the registry's reach every moment
-   of its life" (`jobs.rs:459–463`), but `Source::into_live` frees the foreground
-   slot (`:528` → `:649`) *before* `launch` takes the registry lock (`:758`), so a
-   `kill_all` in that gap misses the command. R14's edit — hold the slot until
-   the record exists — closes it. No test can pin the window; the prose is what
-   is wrong today.
+1. `Launch`'s doc promised the group "is in the registry's reach every moment of
+   its life" (in `e747bc3`'s lines, `jobs.rs:459–463`), but `Source::into_live`
+   freed the foreground slot (`:528` → `:649`) before `launch` took the registry
+   lock (`:758`), so a `kill_all` in that gap missed the command. `R14`'s edit —
+   hold the slot until the record exists — closed it. No test can pin the
+   window; the prose was what was wrong.
 2. `c450e78`'s message says the unreadable session is "copied byte-identically"
-   while `keep_unreadable` (`session.rs:219`) renames it: the original path is
-   gone, not duplicated. One word.
+   while `keep_unreadable` renames it: the original path is gone, not duplicated.
+   One word.
 3. The `S3`/`S4`/`S6`/`S7` rows of `docs/findings.md` had lost their `ID` and
    `What` cells — a `✅` edit left two-cell rows in a four-column table — so the
    queue of record no longer said what any of the four was. Repaired in the same
-   commit as this table.
-
----
+   commit as this review.
 
 ### The fifth review (after the M3 attach wave, `f29b352`)
 
-Confirmed sound, do not re-litigate: one wire type (`Request`/`Op` have one
-`encode` and one parser, and the CLI builds the same type, so a client cannot
-spell a field the parser reads differently); `App` stays the only effector (the
-socket thread only sends `Msg::Attach` with a one-shot `bounded(1)`); a bad line
-is answered from the socket thread and the connection survives; `id` is echoed on
-every reply and is `null` only when the line could not be parsed; `advance`
-(`(prior+1).max(lines)`) is the right shape for a stored counter; a stale socket
-file is cleared and rebound while a live one is refused and left in place;
-`Guard::drop` removes the file; `focus` reuses `focus_cursor_row`, the same path
-Enter takes; an `edit` conflicts rather than guessing for a stale base *within* a
-conversation; `edit send` restores `tree.focused`; quitting with a client
-connected exits 0 and removes the socket; `Msg::Attach` is drained inside one
-30 ms tick. Its four the attach wave owed are in `docs/findings.md` §6 (`A1`–`A8`);
-the structural ones:
+It found `R21`–`R24`. Confirmed sound, do not re-litigate: one wire type
+(`Request`/`Op` have one `encode` and one parser, and the CLI builds the same
+type, so a client cannot spell a field the parser reads differently); `App` stays
+the only effector (the socket thread only sends `Msg::Attach` with a one-shot
+`bounded(1)`); a bad line is answered from the socket thread and the connection
+survives; `id` is echoed on every reply and is `null` only when the line could
+not be parsed; `advance` (`(prior+1).max(lines)`) is the right shape for a stored
+counter; a stale socket file is cleared and rebound while a live one is refused
+and left in place; `Guard::drop` removes the file; `focus` reuses
+`focus_cursor_row`, the same path Enter takes; an `edit` conflicts rather than
+guessing for a stale base *within* a conversation; `edit send` restores
+`tree.focused`; quitting with a client connected exits 0 and removes the socket;
+`Msg::Attach` is drained inside one 30 ms tick. The attach review's finding rows
+are `findings.md` §6 `A1`–`A8` (a different A-series from the §6 checklist
+above; closed by `9b02a3b`), and its structural rows are `R21`–`R24`.
 
-| # | What | Net | Status |
-|---|---|---|---|
-| R21 | **`attach_agents` is a second derivation of the row the painter already derives.** `app/mod.rs`'s roster re-computes `focused`, `children_working`, `title`, `branch` and the phase words with the same expressions `screen::agent_row` uses (`AgentRow`), while the roster's own doc claims it *is* "the roster the tree pane paints" — so H2a/H2b/H4's `unread`/`unread_children` must be added in both places or the claim becomes false. One home: serialize `screen::AgentRow` plus its wire-only extras (`worktree`, `summary`, `leftover`, `revision`). | ≈ −20 | ⬜ |
-| R22 | **"What a phase is called" is spelled three times in two modules, and both doc comments still point at `ui.rs`, which no longer derives anything.** M3 added `Phase::label`/`Phase::detail` (read only by the roster), H9 added `Phase::doing` (read only by the quit line) — which overlaps `label()` on *thinking/compacting/cancelling* and collapses `Stopped|Done|Failed` to `"idle"`, so the quit line can read `#0 idle + 1 job` — and the painter's words are `screen.rs`'s `phase_glyph`/`phase_detail`. Owner: `screen.rs` owns painted prose, `Phase` owns the machine name. `doing()` derives from `label()`/`detail()`; `phase_detail` composes from them instead of re-spelling the stems; fix the two stale `ui.rs` pointers. | ≈ −15 | ⬜ |
-| R23 | **The response body is an untyped `Value` whose keys are spelled in producer and consumer, and the consumer silently defaults a missing key** (`main.rs`'s `field()` returns `""`/`0`), so a rename is a silent blank rather than an error. (The writer/reader boundary is not duplication per §11; the silent default is the seam.) Return a `String` from `print_lines`/`print_agents` and test them against a real `handle_attach` body — which also closes `A3` and pins an untested function. | ±0 | ⬜ |
-| R24 | `attach_focus` asks "is #N in the tree?" twice: `tree.has(id)` then `point_cursor_at`'s ignored return value. They agree only because `rows()` paints every node; use the one return value. | ≈ −3 | ⬜ |
-
-A new `Phase::CutOff` breaks every exhaustive match on `Phase` — `label`, `detail`,
-`doing`, `phase_glyph`, `phase_detail`, `is_busy`, `waiting`, `compacting` and the
-`Phase ↔ StoredStatus` pair. That is the compiler doing its job, and it is one
-more reason R22 should land before the H2/H4 wave that adds the variant.
-
----
+A new `Phase::CutOff` broke every exhaustive match on `Phase` — `label`, `doing`,
+`phase_glyph`, `phase_detail`, `is_busy`, `waiting`, `compacting` and the
+`Phase ↔ StoredStatus` pair — when the H2/H4 wave added it (`eab825e`). That is
+the compiler doing its job, and it is why the name should have one home (`R22`)
+before the next phase arrives.
 
 ### The sixth review (after the `Screen` wave, `7e123e1`)
 
 Read against the replaced `ui.rs` function by function, plus a string-literal and
-a constant census, plus eight injected bugs. The two deliberate semantic changes
-(the build/elide split in `agents_title`, and `bar_line` → `screen::bar_word`
-returning `(Rank, String)` with colour left to `ui::rank_style`) were verified
-byte-identical in output, so `D9`'s and `R9`'s risks are lower than priced and
-their line counts move. Re-priced here, with `D9`/`D10`'s deferral over because
-`7e123e1` landed:
+a constant census, plus eight injected bugs. It found `D9`, `D10`, `R9`, `R10`
+and `R25`–`R29`. The two deliberate semantic changes —
+the build/elide split in `agents_title`, and `bar_line` → `screen::bar_word`
+returning `(Rank, String)` with colour left to `ui::rank_style` — were verified
+byte-identical in output.
 
-| # | What | Net | Status |
-|---|---|---|---|
-| D9 (re-priced) | The two "drop cells from the right until they fit" loops are now **cross-module** (`ui::agents_title` joins with ` · `, `screen::facts_line` with ` │ `) and their floors differ (the title falls back to `" agents "`, the facts line never drops its first cell). Better than one shared helper: pre-elide in `agents_pane`, so `title_cells` becomes a `String` and the painter's rule disappears. | ≈ −5 (was −8) | ⬜ |
-| D10 (re-priced) | Confirmed: the `bar_rows` rule is in the prover and in the test helper; now a pure function of height. | ≈ −2 | ⬜ (`screen::bar_rows`) |
-| R9 (relocated) | `node(focused)` looked up twice for two projections, now at `screen.rs:456–461`. One binding. | ≈ −3 | ⬜ |
-| R10 (relocated, all three still there) | `tree.rs:64` still offers `summarizing…` (no `AgentEvent::Status` sends it); `screen.rs:668`'s "`M waiting` … (the `⏸` rows)" is false since U1 (`AgentRow.waiting = busy_children` marks a *working* parent too, while `roster.waiting` counts only Idle/Done — the two docs in the tree contradict each other); `app/mod.rs:983`'s "every string the bar can show is created by `say`/`fail`" is a third, `tree_line`, bypassing `set_status`'s sanitize door (`findings.md` `V6`). **Plus one new stale comment this integration added**: `mod.rs:6869` says `roomy` is asserted "at every size at least 80×24" while `:7401` checks two exact sizes (`V5`). | ≈ −4 | ⬜ |
-| R25 | **The tree pane's window geometry is derived twice** — `inner`/`footer_rows`/`list_area` in `screen.rs:331–355` (to derive `▲/▼`) and again in `ui.rs:82–112` (to place the `List`); only the painter's copy is real, so the counts are a model of the scroll. Deleting the painter's separator row fails only one incidental highlight test at 80×24 (`findings.md` `V1`, injection H). One `AgentsPane::list_area: Rect`, set where the pane is laid out, read by both. | ≈ −7 | ⬜ |
-| R26 | `phase_detail(cursor_node)` is derived **twice per frame** — once per row (`screen.rs:422`) and again for the footer (`:342` → `:741`), each reading `node.since.elapsed()` separately, so a boundary crossing could paint two ages in one frame. The footer should read the row it already built. | ≈ −2 | ⬜ |
-| R27 | The worktree path **string** is assembled in the UI although its doc claims core owns it: `format!("{}/{}", git::WORKTREE_DIR, node.id)` (`.mush/wt/{id}`) is spelled at `screen.rs:784`, `crates/mush-core/src/git.rs:161`, and in a test at `screen.rs:1011`. One `git::worktree_rel(id)`, used by `worktree_path` and the row. | ≈ −1 | ⬜ |
-| R28 | Test-only: `selected_rows` re-implements `shot` (same `set_term_size` + `screen()` + `Terminal::new` + `draw` + buffer read) at two call sites. One `fn painted(app, w, h) -> (Screen, Buffer)`. | ≈ −8 (tests) | ⬜ |
-| R29 | `busy_children(id)` is an O(n) scan called per node in `roster()`, per row in `agent_row` and once in `tree_line` — the same fact walked ~2n+1 times per frame — and `App::live_jobs`, the documented one door, is bypassed by `in_flight`. One per-frame `HashMap<AgentId, usize>`. | ≈ −3 | ⬜ |
-
-Confirmed **not** duplicated (do not re-litigate): `Screen` caches nothing and
+**Confirmed not duplicated (do not re-litigate):** `Screen` caches nothing and
 `App` holds no frame; `picker_width`/`picker_text_width`, `agents_columns`,
-`floor_notice`/`is_below_floor`, `phase_glyph`/`phase_detail`, `agent_detail`/
-`agent_footer`/`compact_footer`, `facts_line`/`git_cell`, `HINT`, `border(focused)`
-each have one home; `trim_trailing_blanks` and `FOOT_ROWS` have one owner
-(`Chat::painted`/`Chat::foot`); `job_lines` *is* `live_jobs().map`, not a second
-derivation; `git_cell` and the row's `place` answer different questions;
+`floor_notice`/`is_below_floor`, `phase_glyph`/`phase_detail`,
+`agent_detail`/`agent_footer`/`compact_footer`, `facts_line`/`git_cell`, `HINT`,
+`border(focused)` each have one home; `trim_trailing_blanks` and `FOOT_ROWS` have
+one owner (`Chat::painted`/`Chat::foot`); `job_lines` *is* `live_jobs().map`, not
+a second derivation; `git_cell` and the row's `place` answer different questions;
 `mush_core::text::{sanitize, truncate, fit_row}` are the only sanitary doors, and
 the sweep reads painted cells rather than source text.
 
----
-
-### Where the queues stand
-
-`D1`–`D8` landed in `58a309c`, and the measured deltas are in their status
-column (the estimates were off for `D3`, `D7` and `D8`; the fix wave's commit
-messages say by how much). `D9`, `D10`, `R9` and `R10` all live in the
-`ui.rs`/`app/screen.rs` pair; the `Screen` wave landed at `7e123e1`, so all four
-are now actionable and belong to the fix wave that follows, as do the
-rest of `R1`–`R8` and `R11`–`R20` — `R3`/`R7` are one
-item, and `R6` is judged and deliberately left. Line numbers in a table are
-those of the tree its section header names.
-
-**The integration that followed (`eab825e`..`f70374f`, see `findings.md` §8):**
-`R3`/`R7` landed by folding in `mush/91` (`ActorState::record_child` /
-`record_job`, the one home of once-only delivery), as did `R5` (a fold that
-came to nothing ends its own phase) and the one `Registry::kill` walk. From
-this queue's own rows: **`R25` landed** (`AgentsPane::list_area` is derived
-once, where the `▲/▼` counts are, and the painter reads it — `V1`'s test reads
-both back), as did `R10`'s third item (`tree_line` now goes through
-`sanitize`, `V6`) and the `roomy` doc contradiction (`V5`). The sixth review's
-`D9`, `D10`, `R9`, and `R10`'s first two stale comments, plus `R26`–`R29`,
-are still open and unchanged from the prices in that section.
-
-The class the next blind audit should hunt — one fact with several spellings,
-and a poll with a side effect — is named in `findings.md` §8, with the recipe
-that found this wave's rows. The census it asks for is `scripts/census.py`
+The class the next blind audit should hunt — one fact with several spellings, and
+a poll with a side effect — is named in `findings.md` §8, with the recipe that
+found this wave's rows; the census it asks for is `scripts/census.py`
 (`findings.md` §8.5).
