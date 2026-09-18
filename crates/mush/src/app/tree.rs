@@ -207,8 +207,22 @@ pub enum Compacting {
 }
 
 impl Compacting {
-    /// What the row and the transcript's foot say. One spelling, so the two
-    /// cannot describe the same fold differently.
+    /// The verb for what is happening: a parked fold *folds* (it has not
+    /// started yet), an in-flight one *compacts*. The word every surface that
+    /// names the fold out loud reads — the status bar and `/compact`'s own
+    /// acknowledgement — so none of them can call a fold the row calls
+    /// `folding at the next step…` "compacting" (refactor R8).
+    pub fn verb(self) -> &'static str {
+        match self {
+            Compacting::Parked => "folding",
+            Compacting::Requested | Compacting::NearlyFull => "compacting",
+        }
+    }
+
+    /// What the row and the transcript's foot say: the verb above, spelled out
+    /// with what makes this fold the one it is. One spelling, so the two cannot
+    /// describe the same fold differently, and one that contains its own verb,
+    /// which the fold's unit test reads.
     pub fn words(self) -> &'static str {
         match self {
             Compacting::Parked => "folding at the next step…",
@@ -1402,6 +1416,10 @@ mod tests {
         for (kind, words) in kinds {
             assert_eq!(Phase::Compacting(kind).compacting(), Some(kind));
             assert_eq!(kind.words(), words);
+            assert!(
+                words.contains(kind.verb()),
+                "{kind:?}'s sentence has to say what it is doing: {words:?}"
+            );
             assert!(
                 Phase::Compacting(kind).is_busy(),
                 "a fold is work in flight, not a nap: {kind:?}"

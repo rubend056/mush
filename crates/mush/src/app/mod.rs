@@ -1249,9 +1249,11 @@ impl App {
     /// A fold the human is waiting for comes first, because it is the one
     /// derived state that answers a question they are holding in their head:
     /// the fold is running, and the words they are about to type are not lost.
-    /// The row says which kind of fold it is (`compacting…`, `folding at the
-    /// next step…`) with its age; this is the sentence that lets them keep
-    /// typing (finding U11).
+    /// The verb is [`Compacting::verb`] — the row says which kind of fold it is
+    /// (`compacting…`, `folding at the next step…`) with its age, and the bar
+    /// says the same word, so the two cannot describe one fold two ways
+    /// (finding U11, refactor R8). This is the sentence that lets them keep
+    /// typing.
     ///
     /// The count is the root's *own* busy children — [`AgentTree::busy_children`] —
     /// the same derivation the row's `⏸N` mark and the title's `M waiting`
@@ -1268,13 +1270,14 @@ impl App {
     /// derivations (finding U12).
     pub fn tree_line(&self) -> Option<String> {
         let focused = self.tree.focused;
-        if self
+        if let Some(kind) = self
             .tree
             .node(focused)
-            .is_some_and(|node| node.phase.compacting().is_some())
+            .and_then(|node| node.phase.compacting())
         {
             return Some(format!(
-                "compacting #{focused} · keep typing — your message is answered after the fold"
+                "{} #{focused} · keep typing — your message is answered after the fold",
+                kind.verb()
             ));
         }
         if !self.tree.napping(AgentId::ROOT) {
@@ -2023,7 +2026,12 @@ impl App {
         };
         match self.tree.agent_tx.get(&target) {
             Some(tx) if tx.send(AgentMsg::Compact(messages)).is_ok() => {
-                self.say(format!("compacting #{target}…"));
+                // The word comes from the fold the human just asked for, so the
+                // acknowledgement and the row it is answered by read the same
+                // verb (refactor R8): a run in flight turns this request into a
+                // `Parked` fold a moment later, whose row says `folding at the
+                // next step…`.
+                self.say(format!("{} #{target}…", Compacting::Requested.verb()));
             }
             _ => self.fail(format!("agent #{target} is gone")),
         }
@@ -6090,41 +6098,69 @@ mod tests {
 
     /// A fold the human asked for is on the screen while it runs, at both sizes
     /// the audit photographs: the row wears its own glyph and words, the bar
-    /// says what happens to the words they are about to type, and the
-    /// transcript's foot repeats the fold rather than `working…` (finding U11).
+    /// says what happens to the words they are about to type — in the same verb
+    /// the row uses, whatever kind of fold it is — and the transcript's foot
+    /// repeats the fold rather than `working…` (finding U11, refactor R8).
     #[test]
     fn a_fold_in_flight_is_painted_on_every_surface() {
         let (mut app, _rx) = test_app("compact-painted");
         app.chat
             .push_message(AgentId::ROOT, Message::user("fold this".to_string()));
         let flag = Arc::new(AtomicBool::new(false));
-        app.on_agent(
-            AgentId::ROOT,
-            AgentEvent::Compacting {
-                why: Compacting::Requested,
-                cancel: Some(flag.clone()),
-            },
-        );
 
-        for (width, height) in [(80u16, 24u16), (40, 10)] {
-            let rows = screen(&mut app, width, height);
-            let painted = rows.join("\n");
-            assert!(
-                painted.contains("≡ #0"),
-                "the row says a fold, not a run, at {width}×{height}: {rows:?}"
+        for kind in [
+            Compacting::Requested,
+            Compacting::Parked,
+            Compacting::NearlyFull,
+        ] {
+            app.on_agent(
+                AgentId::ROOT,
+                AgentEvent::Compacting {
+                    why: kind,
+                    cancel: Some(flag.clone()),
+                },
             );
-            assert!(
-                painted.contains("compacting 0s") || painted.contains("compacting 1s"),
-                "with the fold's own words at {width}×{height}: {rows:?}"
+
+            assert_eq!(
+                app.tree_line().as_deref(),
+                Some(
+                    format!(
+                        "{} #0 · keep typing — your message is answered after the fold",
+                        kind.verb()
+                    )
+                    .as_str()
+                ),
+                "the bar names the fold with the row's own verb: {kind:?}"
             );
+
+            // The row's words, where there are columns for them: at 40 a tail
+            // cell that does not fit is dropped whole, not cut.
+            let wide = screen(&mut app, 80, 24).join("\n");
             assert!(
-                painted.contains("keep typing"),
-                "and the human's question answered at {width}×{height}: {rows:?}"
+                wide.contains(kind.words().trim_end_matches('…')),
+                "the row says {kind:?} in its own words: {wide}"
             );
-            assert!(
-                !painted.contains("working…"),
-                "a fold is not the run's own model call at {width}×{height}: {rows:?}"
-            );
+
+            for (width, height) in [(80u16, 24u16), (40, 10)] {
+                let rows = screen(&mut app, width, height);
+                let painted = rows.join("\n");
+                assert!(
+                    painted.contains("≡ #0"),
+                    "the row says a fold, not a run, at {width}×{height}: {rows:?}"
+                );
+                assert!(
+                    painted.contains(kind.verb()),
+                    "and the bar's line carries the same verb at {width}×{height}: {rows:?}"
+                );
+                assert!(
+                    painted.contains("keep typing"),
+                    "and the human's question answered at {width}×{height}: {rows:?}"
+                );
+                assert!(
+                    !painted.contains("working…"),
+                    "a fold is not the run's own model call at {width}×{height}: {rows:?}"
+                );
+            }
         }
 
         // The box still takes a line while the fold runs: mush never blocks
@@ -6197,8 +6233,9 @@ mod tests {
     }
 
     /// The bar's derived sentence answers "may I keep typing?" while the fold
-    /// runs, and it is the *same* fact the row draws — one derivation, so the
-    /// two cannot disagree about whether anything is folding (finding U11).
+    /// runs, and it is the *same* fact and the same verb the row draws — one
+    /// derivation, so the two cannot disagree about whether anything is folding
+    /// or about what to call it (finding U11, refactor R8).
     #[test]
     fn the_bar_answers_may_i_keep_typing_while_a_fold_runs() {
         let (mut app, _rx) = test_app("compact-bar");
@@ -6207,8 +6244,8 @@ mod tests {
         app.tree.compacting(AgentId::ROOT, Compacting::Parked, None);
         assert_eq!(
             app.tree_line().as_deref(),
-            Some("compacting #0 · keep typing — your message is answered after the fold"),
-            "a parked fold is what the human is waiting for"
+            Some("folding #0 · keep typing — your message is answered after the fold"),
+            "a parked fold is what the human is waiting for, and it is folding"
         );
         let rows = screen(&mut app, 80, 24).join("\n");
         assert!(rows.contains("keep typing"), "{rows}");
