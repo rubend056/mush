@@ -151,7 +151,7 @@ pub const KEYS: &[Binding] = &[
     Binding {
         context: Context::Agents,
         keys: "Enter",
-        help: "focus the selected agent",
+        help: "show the selected agent's transcript",
     },
     Binding {
         context: Context::Agents,

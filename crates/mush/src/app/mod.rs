@@ -2587,16 +2587,12 @@ impl App {
     /// shows: `Enter` in the agent pane is a move of the *view*, so the brief
     /// goes to the bar where a human can read it before typing.
     ///
-    /// The keyboard moves with the view. `Enter` used to show the agent's
-    /// transcript but leave the tree holding the keys, so the next thing the
-    /// human typed went to the tree — `g`/`G` jumped the cursor, a `c` in the
-    /// message cancelled the agent, and the pane snapped back to the root with
-    /// the words nowhere (finding S2). Focus is one value, so moving it moves
-    /// the bar's `chat`/`agents` badge, the pane borders and the key table
-    /// together.
+    /// The pane follows the row; the keyboard stays in the tree, because the
+    /// human is walking the rows and the next `j` must still be a row move —
+    /// `Tab` is what puts the keys in the box. The bar's `agents` badge says
+    /// where they are, so the split is not a silent one.
     fn focus_cursor_row(&mut self) {
         if let Some(id) = self.tree.focus_cursor() {
-            self.focus = Focus::Chat;
             let brief = self
                 .tree
                 .node(id)
@@ -5871,7 +5867,7 @@ mod tests {
     /// (finding S2): typing then reaches the agent, the letters are a message
     /// and not tree bindings, and the bar's badge moves with the keyboard.
     #[test]
-    fn enter_on_a_row_moves_the_keyboard_with_the_focus() {
+    fn enter_on_a_row_shows_its_transcript_and_leaves_the_keys_in_the_tree() {
         let (mut app, _rx) = test_app("enter-focus");
         app.focus = Focus::Agents;
         // Two rows, so a leaked `g`/`G` would move the cursor somewhere the
@@ -5900,35 +5896,25 @@ mod tests {
         app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
 
         assert_eq!(app.tree.focused, AgentId(1), "the pane shows #1");
-        assert_eq!(app.focus, Focus::Chat, "and the keyboard went with it");
+        assert_eq!(app.focus, Focus::Agents, "and the tree kept the keyboard");
         let cursor = app.tree.cursor();
         assert!(
             screen(&mut app, 80, 24)
                 .iter()
-                .any(|row| row.contains(" chat ")),
+                .any(|row| row.contains(" agents ")),
             "the bar's badge agrees with the key table"
         );
 
-        // `g`, the space and `c` are ordinary letters now.
-        for ch in "go c".chars() {
-            app.on_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE));
-        }
-        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        // The letters are the tree's: `g` moves the cursor, and nothing is
+        // typed at the agent.
+        app.on_key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
 
-        match mailbox.recv_timeout(Duration::from_secs(5)) {
-            Ok(AgentMsg::Nudge(text)) => assert_eq!(text, "go c"),
-            other => panic!("the words must reach #1, not the tree: {:?}", other.is_ok()),
-        }
-        assert_eq!(
-            app.tree.cursor(),
-            cursor,
-            "a `g` in the message must not jump the cursor"
+        assert_ne!(app.tree.cursor(), cursor, "`g` is still the first-row key");
+        assert!(
+            app.chat.input().text().is_empty(),
+            "nothing went into a box"
         );
-        assert_eq!(
-            app.tree.node(AgentId(1)).unwrap().phase,
-            Phase::Thinking,
-            "a `c` in the message must not cancel the agent"
-        );
+        assert!(mailbox.try_recv().is_err(), "so nothing reached #1");
     }
 
     /// The other half of the same rule: while the chat owns the keyboard, `c`
@@ -6237,7 +6223,7 @@ mod tests {
             .join("\n");
         for want in [
             "j / k, ↑ / ↓",
-            "focus the selected agent",
+            "show the selected agent's transcript",
             "cancel the selected agent",
             "back to the root agent",
             "←",
@@ -8684,7 +8670,7 @@ mod tests {
     /// `focus` moves the pane, the keyboard and the tree cursor exactly as
     /// `Enter` on the row does — the same `focus_cursor_row` path.
     #[test]
-    fn attach_focus_moves_the_focus_like_enter() {
+    fn attach_focus_behaves_like_enter_on_the_row() {
         let (mut app, _rx) = test_app("attach-focus");
         app.tree.insert(Spawn {
             id: AgentId(1),
@@ -8703,7 +8689,7 @@ mod tests {
         ));
         assert_eq!(body, serde_json::json!({}));
         assert_eq!(app.tree.focused, AgentId(1), "the pane shows #1");
-        assert_eq!(app.focus, Focus::Chat, "and the keyboard went with it");
+        assert_eq!(app.focus, Focus::Agents, "and the tree kept the keyboard");
         assert_eq!(
             app.tree.cursor_id(),
             Some(AgentId(1)),
