@@ -442,10 +442,11 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     install_panic_hook();
     let mut guard = TerminalGuard::enter()?;
-    // The terminal's width is only known here; `/notes` wraps its popup to it,
-    // so record it before the first key can be read. A resize reports its own.
+    // The terminal's size is only known here; `/notes` wraps its popup to it
+    // and the floor is decided from it, so record both before the first key can
+    // be read. A resize reports its own.
     if let Ok(size) = guard.terminal.size() {
-        app.set_term_width(size.width);
+        app.set_term_size(size.width, size.height);
     }
     let result = event_loop(&mut guard.terminal, &mut app, &rx);
     drop(guard);
@@ -485,9 +486,10 @@ fn event_loop(
                 // The terminal changed size: schedule a redraw. ratatui's
                 // `terminal.draw` re-queries the size first, so the next
                 // frame already paints at the new dimensions — and the app is
-                // told the new width so a `/notes` report wraps to it too.
-                Event::Resize(width, _) => {
-                    app.set_term_width(width);
+                // told the new size so a `/notes` report wraps to it and the
+                // floor notice is raised or lowered (finding P11).
+                Event::Resize(width, height) => {
+                    app.set_term_size(width, height);
                     app.dirty_screen = true;
                 }
                 _ => {}

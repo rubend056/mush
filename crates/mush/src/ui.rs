@@ -13,7 +13,8 @@ use mush_core::git;
 use mush_core::text::{fit_row, truncate};
 
 use crate::app::{
-    short_age, AgentId, AgentNode, App, Focus, Landed, Pane, Phase, PickerKind, Rank, StatusKind,
+    is_below_floor, short_age, AgentId, AgentNode, App, Focus, Landed, Pane, Phase, PickerKind,
+    Rank, StatusKind, MIN_HEIGHT, MIN_WIDTH,
 };
 
 /// The idle bar hint, when there is nothing to report. The commands it names
@@ -44,9 +45,6 @@ const CHAT_MIN_COLUMNS: u16 = 40;
 /// untouched screen is showing a read no event has refreshed, and a cached fact
 /// must not read as a live one (finding P8).
 const GIT_STALE: Duration = Duration::from_secs(10);
-/// Below this mush has no room to be honest: say so instead of painting shreds.
-const MIN_WIDTH: u16 = 40;
-const MIN_HEIGHT: u16 = 10;
 
 /// The popup the pickers paint in: a share of the terminal, floored so a model
 /// list is readable and capped so it does not sprawl on a wide one. One formula,
@@ -81,12 +79,22 @@ pub(crate) fn picker_text_width(terminal_width: u16) -> usize {
 
 pub fn draw(frame: &mut Frame, app: &mut App) {
     let area = frame.area();
-    if area.width < MIN_WIDTH || area.height < MIN_HEIGHT {
+    // The floor is a predicate `App` also reads to refuse input: the frame's
+    // size is what this paints, and it is the same one `main` reported to the
+    // app, so the notice and the keys agree (finding P11 / refactor B3).
+    if is_below_floor(area.width, area.height) {
+        // One notice, centred on both axes. `Paragraph::centered` is
+        // horizontal only, and R3's "centred" means the middle of the screen,
+        // not the top row — the notice used to sit on row one (finding P11).
         let line = Line::from(Span::styled(
-            format!("mush needs at least {MIN_WIDTH}×{MIN_HEIGHT}"),
+            floor_notice(area.width),
             Style::default().fg(Color::Yellow),
         ));
-        frame.render_widget(Paragraph::new(line).centered(), area);
+        let y = area.y + area.height.saturating_sub(1) / 2;
+        frame.render_widget(
+            Paragraph::new(line).centered(),
+            Rect::new(area.x, y, area.width, 1),
+        );
         return;
     }
 
@@ -139,6 +147,28 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
         draw_status(frame, app, rows[1]);
     }
     draw_picker(frame, app);
+}
+
+/// The longest honest spelling of the floor that fits `width` columns.
+///
+/// The notice was one fixed 25-column string, so a 24-column terminal painted
+/// `mush needs at least 40×1` — a truncation that names a size the program does
+/// not need, which is a lie the audit caught (finding P11). The spellings are
+/// ranked, longest first, and the first that fits is the one painted; only a
+/// terminal narrower than `40×10` itself gets a shorter form still.
+fn floor_notice(width: u16) -> String {
+    let size = format!("{MIN_WIDTH}×{MIN_HEIGHT}");
+    let candidates = [
+        format!("mush needs at least {size}"),
+        format!("needs at least {size}"),
+        format!("{size} minimum"),
+        format!("needs {size}"),
+        size,
+    ];
+    candidates
+        .into_iter()
+        .find(|text| UnicodeWidthStr::width(text.as_str()) <= width as usize)
+        .unwrap_or_else(|| format!("{MIN_WIDTH}×{MIN_HEIGHT}"))
 }
 
 pub(crate) fn dim() -> Style {

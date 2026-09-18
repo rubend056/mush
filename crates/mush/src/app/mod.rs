@@ -181,6 +181,21 @@ pub fn short_age(elapsed: Duration) -> String {
     }
 }
 
+/// Below this the screen has no room to be honest: the painter shows a single
+/// notice instead of shreds, and [`App::below_floor`] stops keys that would act
+/// without anything visible to show for it. One pair of numbers, owned here
+/// rather than by the painter, so the notice, the input gate and the tests
+/// cannot disagree about where the floor is (finding P11 / refactor B3).
+pub const MIN_WIDTH: u16 = 40;
+pub const MIN_HEIGHT: u16 = 10;
+
+/// Whether a terminal of this size is below the floor. The predicate is one
+/// function so the painter — which passes the frame's own size — and the input
+/// gate — which passes the size `main` reported — cannot disagree.
+pub const fn is_below_floor(width: u16, height: u16) -> bool {
+    width < MIN_WIDTH || height < MIN_HEIGHT
+}
+
 /// A transient line for the workspace bar. Nothing here describes work in
 /// progress — that is derived from the agents' phases — so it cannot go stale.
 /// `Info` fades; `Error` stays until something replaces it.
@@ -272,11 +287,13 @@ pub struct App {
     pub status: Option<Status>,
     pub should_quit: bool,
     pub dirty_screen: bool,
-    /// The terminal's width, as of the last size `main` reported. `/notes`
-    /// wraps its lines to the popup this size paints them in, so the report has
-    /// to know it — `ui.rs` is not asked to wrap, and the screen keeps one
-    /// owner of the popup's geometry.
+    /// The terminal's size, as of the last size `main` reported. `/notes` wraps
+    /// its lines to the popup this size paints them in, and [`App::below_floor`]
+    /// reads it to refuse input the screen cannot show the effect of — so the
+    /// floor is a state `App` knows rather than only the painter's early return
+    /// (finding P11 / refactor B3).
     term_width: u16,
+    term_height: u16,
     pub spin: u64,
 }
 
@@ -286,11 +303,21 @@ impl App {
         self.cell.ui()
     }
 
-    /// Record the terminal width `main` read, so a `/notes` report can be
-    /// wrapped to the popup that size paints. One setter, called at startup and
-    /// from the resize event — the only two places the terminal's size changes.
-    pub fn set_term_width(&mut self, width: u16) {
+    /// Record the terminal size `main` read, so a `/notes` report can be
+    /// wrapped to the popup that size paints and so the floor is known. One
+    /// setter, called at startup and from the resize event — the only two
+    /// places the terminal's size changes.
+    pub fn set_term_size(&mut self, width: u16, height: u16) {
         self.term_width = width;
+        self.term_height = height;
+    }
+
+    /// Whether the terminal is too small for anything but the floor notice.
+    /// `ui.rs` paints the notice; this is what stops a key from acting with no
+    /// visible result — the destructive `Ctrl-N` on a screen showing only
+    /// `mush needs at least 40×10` was the bug this exists for (finding P11).
+    pub fn below_floor(&self) -> bool {
+        is_below_floor(self.term_width, self.term_height)
     }
 
     pub fn new(
@@ -327,7 +354,10 @@ impl App {
             status: None,
             should_quit: false,
             dirty_screen: true,
+            // The ubiquitous terminal, and above the floor: `main` reports the
+            // real size before the first key can be read.
             term_width: 80,
+            term_height: 24,
             spin: 0,
         };
         // The failures come back before the agents do, because the agent that
@@ -619,8 +649,10 @@ impl App {
             Msg::Paste(text) => {
                 // A paste is something the human wants to say, so it lands in
                 // the message box whichever pane has focus. An open picker is
-                // the one place a paste has no meaning.
-                if self.picker.is_none() {
+                // the one place a paste has no meaning; below the floor there
+                // is no box on screen for it to land in, so it is refused the
+                // way a key is (finding P11).
+                if self.picker.is_none() && !self.below_floor() {
                     // Terminals disagree about line endings in a paste.
                     let text = text.replace("\r\n", "\n").replace('\r', "\n");
                     self.chat.insert(&text);
@@ -1748,7 +1780,16 @@ impl App {
     /// binding is testable without an `App` — which the old shape, where an arm
     /// both matched a key and did its work, made impossible (finding B2).
     fn on_key(&mut self, key: KeyEvent) {
-        self.apply_intent(keys::key(self.focus, self.picker.is_some(), key));
+        let intent = keys::key(self.focus, self.picker.is_some(), key);
+        // Below the floor the screen is a single notice: a key whose effect the
+        // human cannot see — `Ctrl-N` wipes the conversation and starts a new
+        // one — must not act. `Ctrl-Q` is the exception: a terminal too small
+        // to read is still a way out. The floor is `App`'s state, not the
+        // painter's early return (finding P11 / refactor B3).
+        if self.below_floor() && intent != Intent::Quit {
+            return;
+        }
+        self.apply_intent(intent);
     }
 
     /// Do what an intent says. One arm per intent, every side effect of the
@@ -2164,7 +2205,7 @@ mod tests {
     fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
         // Exactly what `main` does at startup and on resize: the width the
         // next frame (and any `/notes` opened between frames) sees.
-        app.set_term_width(width);
+        app.set_term_size(width, height);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer();
