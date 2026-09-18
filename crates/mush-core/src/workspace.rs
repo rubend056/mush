@@ -4,6 +4,7 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Component, Path, PathBuf};
 
+use crate::text;
 use tempfile::NamedTempFile;
 
 /// A single workspace root. All agent file access goes through here, which is
@@ -104,22 +105,13 @@ pub fn truncate_for_model(mut text: String, cap: usize) -> String {
     if text.len() <= cap {
         return text;
     }
-    let cut = head_cut(&text, cap);
+    let cut = text::boundary_at_or_before(&text, cap);
     text.truncate(cut);
     text.push_str(&format!(
         "\n\n[mush: output truncated at {cap} bytes — rerun it narrower (rg, head, a smaller \
          path) to see the rest]"
     ));
     text
-}
-
-/// Where a head cut lands, on a char boundary.
-pub fn head_cut(text: &str, cap: usize) -> usize {
-    let mut cut = cap.min(text.len());
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
-    cut
 }
 
 /// Cap text handed to a model from the *end*, marking the cut at the front.
@@ -135,10 +127,7 @@ pub fn tail_for_model(text: &str, cap: usize) -> String {
     if text.len() <= cap {
         return text.to_string();
     }
-    let mut cut = text.len() - cap;
-    while cut < text.len() && !text.is_char_boundary(cut) {
-        cut += 1;
-    }
+    let cut = text::boundary_at_or_after(text, text.len() - cap);
     format!(
         "[mush: output truncated at {cap} bytes (the end is shown) — rerun it narrower to see \
          the rest]\n\n{}",
