@@ -223,6 +223,20 @@ fn first_backup(root: &Path) -> PathBuf {
     mushroom_dir(root).join(format!("{SESSION_FILE}.bak"))
 }
 
+/// The sentence a session mush could not set aside is told: the file the human
+/// has to go and find, then why it could not be moved.
+///
+/// One shape for every failure of that move, so a third reason cannot be told
+/// without naming the file (refactor R18): the name is the whole point of the
+/// line — the human reads it to find the copy — and the reason is what lets
+/// them fix it.
+fn cannot_keep(from: &Path, why: impl std::fmt::Display) -> String {
+    format!(
+        "cannot keep {} — {why}",
+        from.file_name().unwrap_or_default().to_string_lossy()
+    )
+}
+
 /// Move a session file mush cannot read beside itself, so the save that
 /// follows cannot destroy the only copy of the human's conversation.
 ///
@@ -246,17 +260,11 @@ pub fn keep_unreadable(root: &Path) -> Result<PathBuf, String> {
         if to.exists() {
             continue;
         }
-        return fs::rename(&from, &to).map(|()| to).map_err(|error| {
-            format!(
-                "cannot keep {} — {error}",
-                from.file_name().unwrap_or_default().to_string_lossy()
-            )
-        });
+        return fs::rename(&from, &to)
+            .map(|()| to)
+            .map_err(|error| cannot_keep(&from, error));
     }
-    Err(format!(
-        "cannot keep {} — every backup name beside it is taken",
-        from.file_name().unwrap_or_default().to_string_lossy()
-    ))
+    Err(cannot_keep(&from, "every backup name beside it is taken"))
 }
 
 impl Session {
@@ -397,6 +405,46 @@ mod tests {
         assert_eq!(fs::read_to_string(&first).unwrap(), "first");
         assert_eq!(fs::read_to_string(&second).unwrap(), "second");
         assert_eq!(second, root.join(".mush/session.json.bak.2"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// Both ways the copy can fail to be set aside are told the same way: the
+    /// file the human must go and find, then why. Nothing covered an `Err` at
+    /// all before this — the fixing wave's test only ever read the successful
+    /// rename (refactor R18).
+    #[test]
+    fn a_session_that_cannot_be_kept_still_names_the_file() {
+        let root = std::env::temp_dir().join(format!("mush-session6-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        ensure_mush_dir(&root).unwrap();
+
+        // Nothing to move: the rename fails, and the sentence still names the
+        // file rather than the OS's error alone.
+        let error = keep_unreadable(&root).unwrap_err();
+        assert!(error.starts_with("cannot keep session.json — "), "{error}");
+
+        // Every name beside it taken — the other `Err`, and the one a workspace
+        // that has been hand-broken a hundred times reaches.
+        fs::write(session_path(&root), "{}").unwrap();
+        for step in 1..=BACKUP_TRIES {
+            let name = if step == 1 {
+                format!("{SESSION_FILE}.bak")
+            } else {
+                format!("{SESSION_FILE}.bak.{step}")
+            };
+            fs::write(mushroom_dir(&root).join(name), "kept").unwrap();
+        }
+        let error = keep_unreadable(&root).unwrap_err();
+        assert!(error.starts_with("cannot keep session.json — "), "{error}");
+        assert!(
+            error.contains("every backup name beside it is taken"),
+            "and it says why: {error}"
+        );
+        assert!(
+            session_path(&root).exists(),
+            "nothing was moved, so nothing may claim it was"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
