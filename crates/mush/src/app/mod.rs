@@ -576,6 +576,40 @@ impl App {
         self.tree.repair_focus();
     }
 
+    /// What `/worktrees` says: the truth about `.mush/wt` on disk *and* what
+    /// this session has adopted. The old line counted only the leftovers the
+    /// tree already knew, so a worktree `git worktree list` named — its branch
+    /// not `mush/<id>`, so `discover_worktrees` skipped it — was invisible and
+    /// the message claimed there were none while the directory sat there
+    /// (finding P10). The disk is the fact; the adopted set is what the
+    /// commands can act on; the sentence has to say both to be true.
+    fn worktree_report(&self) -> String {
+        let root = self.ws.root();
+        // `None` is git not answering; say so rather than claim a count.
+        let Some(worktrees) = git::worktrees(root) else {
+            return "cannot list worktrees — git did not answer".to_string();
+        };
+        let dir = root.join(git::WORKTREE_DIR);
+        let on_disk = worktrees
+            .iter()
+            .filter(|worktree| worktree.path.starts_with(&dir))
+            .count();
+        let registered = self.tree.agents.iter().filter(|node| node.leftover).count();
+        if on_disk == 0 {
+            return "no worktrees under .mush/wt on disk".to_string();
+        }
+        let mut line = format!("{on_disk} worktree(s) under .mush/wt on disk");
+        if registered == on_disk {
+            line.push_str(" · all registered — /diff, /merge, /discard work on them");
+        } else {
+            // The difference is a worktree mush cannot name (`mush/<id>`
+            // branch missing, or the id already taken) — name the count, not a
+            // guess at the cause.
+            line.push_str(&format!(" · {registered} registered as leftovers"));
+        }
+        line
+    }
+
     // ---------------------------------------------------------------- updates
 
     pub fn update(&mut self, msg: Msg) {
@@ -1115,12 +1149,7 @@ impl App {
             Command::Worktrees => {
                 self.discover_worktrees();
                 self.refresh_git();
-                let count = self.tree.agents.iter().filter(|n| n.leftover).count();
-                self.say(if count > 0 {
-                    format!("{count} leftover worktree(s) registered — /diff, /merge, /discard work on them")
-                } else {
-                    "no leftover worktrees".to_string()
-                });
+                self.say(self.worktree_report());
             }
             Command::Provider(None) => self.open_provider_picker(),
             Command::Provider(Some(name)) => self.apply_provider(&name),
