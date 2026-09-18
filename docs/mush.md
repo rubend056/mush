@@ -369,15 +369,15 @@ are computed in `App`.
   actually failed (`!`).
 
 ```
-┌ agents · 2 working · 1 waiting · Σ +324 −40 ───────────────────┐
-│   ◐ #0 you        edit src/lib.rs                              │
-│   ◐ #1 ⏸2 lexer   wait                                         │
-│     ◐ #2 tests    edit tests/lex.rs                            │
-│   ✓ #3 docs       wrote README.md                              │
-├────────────────────────────────────────────────────────────────┤
-│ #2 edit tests/lex.rs                                           │
-│ edit tests/lex.rs 3s · .mush/wt/2 · git diff HEAD...mush/2     │
-└────────────────────────────────────────────────────────────────┘
+┌ agents · 2 working · 1 waiting · Σ +324 −40 ─────────────────────┐
+│▶· #0 ⏸1 root                                                     │
+│   ◐ #1 ⏸1 lexer   waiting on results 3s                          │
+│     ◐ #2 tests  mush/2 +324−40  edit_file tests/lex.rs 3s        │
+│   ✓ #3 docs       wrote README.md                                │
+├──────────────────────────────────────────────────────────────────┤
+│ #2 write tests for the lexer                                     │
+│ edit_file tests/lex.rs 3s · .mush/wt/2 · git diff HEAD...mush/2  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 The cursor row is the one wearing the pane's selection colour; there is no
