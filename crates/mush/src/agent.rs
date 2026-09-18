@@ -2540,6 +2540,13 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         Some(reason) => format!(" (isolated unavailable: {reason}; running in place)"),
         None => String::new(),
     };
+    // The branch the parent will need to land the work, said where it is born:
+    // the parent chose the worktree, and a child whose branch it never learned
+    // is a child it cannot diff or merge by hand (finding H1).
+    let on = branch
+        .as_deref()
+        .map(|branch| format!(" on {branch}"))
+        .unwrap_or_default();
 
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AgentMsg>();
     // The UI hears about the child before any of its events can arrive, so
@@ -2607,7 +2614,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // guard far past any real task, so this is not a budget to size a brief
     // against any more.
     Ok(format!(
-        "spawned agent #{id} · runs until it stops calling tools · wait_agents returns its summary"
+        "spawned agent #{id}{on} · runs until it stops calling tools · wait_agents returns its summary"
     ))
 }
 
@@ -3081,6 +3088,55 @@ fn direct_tool(
     }
 }
 
+/// How long a sibling's command queues for a machine lock held by another
+/// agent before the refusal stands. Long enough to ride out a short timing
+/// run, short enough that a wave is not silently parked behind a ten-minute
+/// one; the wait runs on the actor's clock, so it is cancel-aware and a test
+/// reaches the bound without waiting (finding H13).
+const LOCK_QUEUE: Duration = Duration::from_secs(30);
+/// The queue's polling slice.
+const LOCK_POLL: Duration = Duration::from_millis(200);
+
+/// Wait, bounded and cancel-aware, for a machine lock held by another agent.
+///
+/// A refusal is honest but it is not a wait: "do not retry this call" leaves
+/// the model with nothing to do, and a model that retries it anyway is doing
+/// exactly what the loop guard counts (finding H13). So a sibling queues for
+/// [`LOCK_QUEUE`] first and is refused only when the lock outlasts that. The
+/// holder is re-read every slice, so a refusal names whoever holds it at the
+/// end, not whoever held it at the start.
+fn wait_for_machine(actor: &Actor, cancel: &AtomicBool) -> Result<(), jobs::Held> {
+    let deadline = actor.ctx.clock.now() + LOCK_QUEUE;
+    loop {
+        match actor.ctx.registry.machine_free_for(actor.id) {
+            Ok(()) => return Ok(()),
+            Err(held) => {
+                if cancel.load(Ordering::SeqCst) || actor.ctx.clock.now() >= deadline {
+                    return Err(held);
+                }
+            }
+        }
+        actor.ctx.clock.sleep(LOCK_POLL);
+    }
+}
+
+/// Append the fact that a command ran beside a sibling's exclusive run.
+///
+/// The root is exempt from the lock (finding H13), and an exemption that is not
+/// said is exactly the kind of silent state this tree keeps finding: the model
+/// can decide to distrust a timing-sensitive result, or wait next time.
+fn beside_note(text: String, held: Option<&jobs::Held>) -> String {
+    match held {
+        None => text,
+        Some(held) => format!(
+            "{text}\n(ran while #{} held the machine for an exclusive command ({}) — \
+             timing-sensitive results from its run may be perturbed)",
+            held.agent,
+            truncate(&held.command, 40)
+        ),
+    }
+}
+
 fn run_command(
     actor: &Actor,
     state: &mut ActorState,
@@ -3102,8 +3158,23 @@ fn run_command(
     // somewhere to go (the budget). A command that cannot be watched or may not
     // run must never be started. Neither is a failure of the work, so both are
     // `Refused` — the model is not looping when it asks again later (H13).
+    // The lock coordinates *siblings*: the root is the human's own hands — a
+    // human may run any command in another terminal while mush works — so the
+    // root commands beside a held lock and is *told*, not refused. Being blind
+    // for the duration of a sibling's benchmark cost the orchestrator its only
+    // lever (finding H13). A root *exclusive* command is refused like anyone's:
+    // two claims to own the machine is the one thing the lock exists to
+    // prevent. A sibling queues, bounded, instead of refusing on sight.
+    let mut beside: Option<jobs::Held> = None;
     if let Err(held) = registry.machine_free_for(actor.id) {
-        return Err(ToolError::Refused(Refused::Machine(held).message(actor.id)));
+        if actor.id == AgentId::ROOT.0 {
+            if exclusive {
+                return Err(ToolError::Refused(Refused::Machine(held).message(actor.id)));
+            }
+            beside = Some(held);
+        } else if let Err(held) = wait_for_machine(actor, cancel) {
+            return Err(ToolError::Refused(Refused::Machine(held).message(actor.id)));
+        }
     }
     if detach && !registry.has_room() {
         return Err(ToolError::Refused(Refused::Budget.message(actor.id)));
@@ -3143,7 +3214,7 @@ fn run_command(
             ),
         )?;
         state.running_jobs.insert(id);
-        return Ok(detached_line(id));
+        return Ok(beside_note(detached_line(id), beside.as_ref()));
     }
     // A foreground command that outlives `CMD_DETACH_AFTER` becomes a job too —
     // unless there is no room for one, in which case the 120 s timeout and the
@@ -3172,7 +3243,7 @@ fn run_command(
     if exclusive {
         registry.release_machine(actor.id);
     }
-    report
+    report.map(|text| beside_note(text, beside.as_ref()))
 }
 
 /// Whether a foreground command may become a job when it outlives
@@ -6471,6 +6542,150 @@ mod tests {
         assert!(
             actor.ctx.registry.machine_free_for(9).is_ok(),
             "and a sibling may start"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A clock that lets go of the machine on its first slice: the wait's own
+    /// movement ends the wait, so the queue is proved with no thread and no
+    /// real time. The registry is installed after the actor is built (the
+    /// actor makes it), which is why this is a cell.
+    struct ReleasesOnSleep {
+        inner: Advanceable,
+        release: std::sync::Mutex<Option<(Arc<jobs::Registry>, u64)>>,
+    }
+
+    impl ReleasesOnSleep {
+        fn new() -> Self {
+            Self {
+                inner: Advanceable::new(),
+                release: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn release_after(&self, registry: Arc<jobs::Registry>, holder: u64) {
+            *self.release.lock().unwrap() = Some((registry, holder));
+        }
+    }
+
+    impl clock::Clock for ReleasesOnSleep {
+        fn now(&self) -> Instant {
+            self.inner.now()
+        }
+
+        fn sleep(&self, d: Duration) {
+            if let Some((registry, holder)) = self.release.lock().unwrap().clone() {
+                registry.release_machine(holder);
+            }
+            self.inner.sleep(d);
+        }
+    }
+
+    /// A sibling queues for the machine instead of refusing on sight: the wait
+    /// is the thing the refusal left out, and a model that retries the refusal
+    /// is doing exactly what the loop guard counts (finding H13). Here the
+    /// holder lets go on the first slice, so the command runs.
+    #[test]
+    fn a_sibling_command_queues_for_the_machine_and_then_runs() {
+        let machine =
+            Arc::new(ScriptedMachine::new().runs(Script::exits(0).says("ran beside the bench")));
+        let clock = Arc::new(ReleasesOnSleep::new());
+        let (actor, _mailbox) = scripted_tools_actor("machine-queue", machine, clock.clone());
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        actor.ctx.registry.take_machine(2, "cargo bench").unwrap();
+        clock.release_after(actor.ctx.registry.clone(), 2);
+
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "cargo test" }),
+            &cancel,
+        )
+        .unwrap();
+
+        assert!(report.contains("ran beside the bench"), "{report}");
+        assert!(
+            actor.ctx.registry.machine_free_for(9).is_ok(),
+            "and the queue holds nothing afterwards"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// And the wait is bounded: a lock that outlasts it refuses, naming the
+    /// holder. The clock, not a real timeout, is what ends it.
+    #[test]
+    fn a_command_locked_out_for_too_long_is_refused_with_the_holder_named() {
+        // No script on the machine: a command that runs at all has spent its
+        // wait on nothing.
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor(
+            "machine-timeout",
+            Arc::new(ScriptedMachine::new()),
+            clock.clone(),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        actor.ctx.registry.take_machine(2, "cargo bench").unwrap();
+
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "cargo test" }),
+            &cancel,
+        )
+        .unwrap_err();
+        let ToolError::Refused(why) = refused else {
+            panic!("a lock that outlasts the queue is refused");
+        };
+        assert!(why.starts_with("#2 holds the machine"), "{why}");
+        assert!(why.contains("do not retry this call"), "{why}");
+        assert!(
+            clock.elapsed() >= LOCK_QUEUE,
+            "the queue waited its whole bound: {:?}",
+            clock.elapsed()
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The root is not a sibling: it commands beside a held lock rather than
+    /// being refused, and the result says so out loud. The live cost was an
+    /// orchestrator that could not work while a child benchmarked (finding
+    /// H13).
+    #[test]
+    fn the_root_commands_beside_a_held_lock_and_is_told() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::exits(0).says("diffed anyway")));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("root-beside", machine, clock);
+        // The helper builds agent 7; only the root wears id 0, and the
+        // exemption is about that id.
+        let actor = Actor {
+            id: AgentId::ROOT.0,
+            ..actor
+        };
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        actor.ctx.registry.take_machine(2, "cargo bench").unwrap();
+
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "git diff" }),
+            &cancel,
+        )
+        .unwrap();
+
+        assert!(report.contains("diffed anyway"), "{report}");
+        assert!(
+            report.contains("#2 held the machine"),
+            "the exemption is said out loud: {report}"
+        );
+        assert!(
+            actor.ctx.registry.machine_free_for(9).is_err(),
+            "the root ran beside the lock; it did not take or break it"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
