@@ -38,6 +38,7 @@ use mush_core::{
 };
 
 use crate::agent::{self, spawn, AgentEvent, AgentMsg, RootHandle};
+use crate::attach;
 use crate::http;
 use crate::session_save::SessionSave;
 
@@ -69,6 +70,15 @@ pub enum Msg {
         conversation: ConversationId,
         id: AgentId,
         event: AgentEvent,
+    },
+    /// A request from the attach socket (M3). The socket thread owns the
+    /// connection and blocks on `reply` for the answer, so the socket never
+    /// touches `App`'s state: it is parsed off the connection and answered in
+    /// the one message loop, which is what keeps `App` the only effector.
+    Attach {
+        from: String,
+        request: attach::Request,
+        reply: Sender<attach::Response>,
     },
 }
 
@@ -684,6 +694,16 @@ impl App {
                     let _ = cmd.send(AgentMsg::Shutdown);
                 }
             }
+            Msg::Attach {
+                from,
+                request,
+                reply,
+            } => {
+                let response = self.handle_attach(&from, &request);
+                // A client that hung up while the answer was being built leaves
+                // no receiver; that is not an error here.
+                let _ = reply.send(response);
+            }
         }
         self.dirty_screen = true;
     }
@@ -1298,6 +1318,165 @@ impl App {
                 }
             }
         }
+    }
+
+    // -------------------------------------------------------------- attach (M3)
+
+    /// Answer one request from the attach socket. The socket thread hands the
+    /// request over and waits; this is the only place an external agent moves
+    /// mush, and every op runs the same code a keystroke would — `focus` is
+    /// `Enter` on a row, `edit` is the message box and the send — so the
+    /// socket cannot reach a state the human could not.
+    pub fn handle_attach(&mut self, from: &str, request: &attach::Request) -> attach::Response {
+        let reply = match &request.op {
+            attach::Op::Read { agent, since } => self.attach_read(*agent, *since),
+            attach::Op::Agents => self.attach_agents(),
+            attach::Op::Focus { agent } => self.attach_focus(*agent),
+            attach::Op::Edit {
+                agent,
+                base,
+                text,
+                send,
+            } => self.attach_edit(from, *agent, *base, text, *send),
+        };
+        attach::Response {
+            id: request.id.clone(),
+            reply,
+        }
+    }
+
+    /// The transcript lines of `agent` from `since` (0-based, inclusive), with
+    /// the revision a later `edit` must carry.
+    fn attach_read(&self, agent: u64, since: usize) -> attach::Reply {
+        let id = AgentId(agent);
+        if !self.tree.has(id) {
+            return attach::Reply::Err(attach::ReplyError::bad_request(format!("no agent #{id}")));
+        }
+        let lines: Vec<serde_json::Value> = self
+            .chat
+            .transcript(id)
+            .iter()
+            .enumerate()
+            .skip(since)
+            .map(|(line, message)| {
+                serde_json::json!({
+                    "line": line,
+                    "role": message.role,
+                    "text": message.text(),
+                })
+            })
+            .collect();
+        attach::Reply::Ok(serde_json::json!({
+            "agent": agent,
+            "revision": self.chat.revision(id),
+            "lines": lines,
+        }))
+    }
+
+    /// The roster the tree pane paints, read from the tree and never from the
+    /// session file, so a client can see the whole tree — phases, parents,
+    /// working children — without a copy that lags it (M3 / H1).
+    fn attach_agents(&self) -> attach::Reply {
+        let agents: Vec<serde_json::Value> = self
+            .tree
+            .rows()
+            .iter()
+            .map(|node| {
+                serde_json::json!({
+                    "id": node.id.0,
+                    "parent": node.parent.map(|parent| parent.0),
+                    "depth": node.depth,
+                    "phase": node.phase.label(),
+                    "activity": node.phase.detail(),
+                    "title": node.title(),
+                    "branch": node.branch.clone(),
+                    "worktree": self.attach_worktree(node.id),
+                    "focused": self.tree.focused == node.id,
+                    "children_working": self.tree.busy_children(node.id),
+                    "leftover": node.leftover,
+                    "summary": node.summary.clone(),
+                    "revision": self.chat.revision(node.id),
+                })
+            })
+            .collect();
+        attach::Reply::Ok(serde_json::json!({
+            // The root's transcript is the conversation; its revision is the
+            // one token that covers the chat a client is most likely to edit.
+            "revision": self.chat.revision(AgentId::ROOT),
+            "agents": agents,
+        }))
+    }
+
+    /// Where an agent works: its worktree when it has a branch, else the main
+    /// checkout. Derived from the branch, the same way the row's location is.
+    fn attach_worktree(&self, id: AgentId) -> String {
+        match self.tree.node(id).and_then(|node| node.branch.as_ref()) {
+            Some(_) => git::worktree_path(self.ws.root(), id.0)
+                .display()
+                .to_string(),
+            None => self.ws.root().display().to_string(),
+        }
+    }
+
+    /// Focus `agent` exactly as `Enter` on its row does: point the tree cursor
+    /// at it and run the same path the key does, so the pane, the bar and the
+    /// keyboard all move together.
+    fn attach_focus(&mut self, agent: u64) -> attach::Reply {
+        let id = AgentId(agent);
+        if !self.tree.has(id) {
+            return attach::Reply::Err(attach::ReplyError::bad_request(format!("no agent #{id}")));
+        }
+        self.tree.point_cursor_at(id);
+        self.focus_cursor_row();
+        attach::Reply::Ok(serde_json::json!({}))
+    }
+
+    /// An external agent's edit: set the message box's draft for `agent`, or
+    /// deliver `text` as the human's message, but only when that agent's
+    /// transcript still stands at `base`. Otherwise it is a `conflict` with the
+    /// revision that moved — never a guess at what the client meant.
+    fn attach_edit(
+        &mut self,
+        from: &str,
+        agent: u64,
+        base: u64,
+        text: &str,
+        send: bool,
+    ) -> attach::Reply {
+        let id = AgentId(agent);
+        if !self.tree.has(id) {
+            return attach::Reply::Err(attach::ReplyError::bad_request(format!("no agent #{id}")));
+        }
+        let revision = self.chat.revision(id);
+        if revision != base {
+            return attach::Reply::Err(attach::ReplyError::conflict(revision));
+        }
+        if send {
+            // The two refusals a typed message has, said back to the client
+            // rather than into the human's box: the words are the client's,
+            // and a request that could not run must not land as a draft.
+            if self.cfg().model.is_empty() {
+                return attach::Reply::Err(attach::ReplyError::bad_request(
+                    "no model yet — the message was not sent",
+                ));
+            }
+            if let Some(line) = self.worktree_gone(id) {
+                return attach::Reply::Err(attach::ReplyError::bad_request(line));
+            }
+            // The same path a typed message takes: `deliver` sends to the
+            // focused agent, so aim it there for the turn. The keyboard focus
+            // is put back, because an external client steering an agent must
+            // not move the human's pane.
+            let previous = self.tree.focused;
+            self.tree.focused = id;
+            self.chat.expect_human(text);
+            self.deliver(text.to_string());
+            self.tree.focused = previous;
+        } else {
+            self.chat.set_draft(id, text);
+            self.say(format!("{from}: set the draft for #{id}"));
+        }
+        attach::Reply::Ok(serde_json::json!({ "revision": self.chat.revision(id) }))
     }
 
     /// Run one parsed command.

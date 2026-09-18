@@ -334,6 +334,15 @@ pub struct Chat {
     /// provenance, and the pane then reads what it can from the lines themselves
     /// ([`unrecorded`]).
     spoken: HashMap<AgentId, HashMap<usize, Voice>>,
+    /// Each agent's transcript revision: a monotone counter of the changes the
+    /// UI's copy of that agent has taken — one per appended line, one per
+    /// wholesale replacement, and one per draft an attach client set. `read`
+    /// returns it and `edit` compares it, so an edit written against a
+    /// transcript (or draft) that has moved on is refused, not guessed at
+    /// (M3). It is not the line count: a fold replaces a long transcript with
+    /// a short one, and a revision that stepped back would let a stale edit
+    /// land.
+    revisions: HashMap<AgentId, u64>,
     /// The words the human just sent, waiting for their echo.
     ///
     /// The box is the human's voice and `take_input` is the send; `app::mod`
@@ -355,8 +364,27 @@ impl Chat {
             input: Input::default(),
             reading: HashMap::new(),
             spoken: HashMap::new(),
+            revisions: HashMap::new(),
             pending: None,
         }
+    }
+
+    /// The revision of the UI's copy of `agent`'s transcript. A conversation
+    /// nobody has changed reads as its own line count, so the first `read` of
+    /// a restored one still hands back a token that means something.
+    pub fn revision(&self, agent: AgentId) -> u64 {
+        self.revisions
+            .get(&agent)
+            .copied()
+            .unwrap_or_else(|| self.transcript(agent).len() as u64)
+    }
+
+    /// Advance a revision past `prior`, and never below the number of lines the
+    /// copy now holds: monotone across a fold that shrinks the transcript, and
+    /// clear about having moved even when the count did not (M3).
+    fn advance(&mut self, agent: AgentId, prior: u64) {
+        let lines = self.transcript(agent).len() as u64;
+        self.revisions.insert(agent, (prior + 1).max(lines));
     }
 
     /// An empty chat, for this module's own tests.
@@ -402,6 +430,7 @@ impl Chat {
     /// and every other user line was written by another agent or by mush (see
     /// [`unrecorded`]).
     pub fn push_message(&mut self, agent: AgentId, message: Message) {
+        let prior = self.revision(agent);
         if message.role == "user" {
             let index = self.transcript(agent).len();
             let voice = match self.pending.take() {
@@ -417,6 +446,7 @@ impl Chat {
         } else {
             self.agents.entry(agent).or_default().push(message);
         }
+        self.advance(agent, prior);
     }
 
     /// Replace an agent's transcript: the root's is compacted to
@@ -427,6 +457,7 @@ impl Chat {
     /// somebody else's line in the wrong voice. What a restored transcript still
     /// says for itself is read back at paint time.
     pub fn replace_transcript(&mut self, agent: AgentId, messages: Vec<Message>) {
+        let prior = self.revision(agent);
         self.spoken.remove(&agent);
         self.pending = None;
         if agent == AgentId::ROOT {
@@ -434,6 +465,7 @@ impl Chat {
         } else {
             self.agents.insert(agent, messages);
         }
+        self.advance(agent, prior);
     }
 
     /// Who said the line at `index` of `agent`'s transcript, if a speaker is what
@@ -462,6 +494,7 @@ impl Chat {
         self.notices.retain(|notice| notice.agent != agent);
         self.reading.remove(&agent);
         self.spoken.remove(&agent);
+        self.revisions.remove(&agent);
     }
 
     /// How big one conversation is, in tokens, roughly — the same
@@ -492,6 +525,7 @@ impl Chat {
         self.notices.clear();
         self.reading.clear();
         self.spoken.clear();
+        self.revisions.clear();
         self.pending = None;
     }
 
@@ -1051,11 +1085,30 @@ impl Chat {
     /// ([`Self::push_message`]).
     pub fn take_input(&mut self) -> String {
         let text = self.input.take();
+        self.expect_human(&text);
+        text
+    }
+
+    /// Queue the words the human just sent, so the line that echoes them is
+    /// painted as theirs — the mark a typed message gets. `take_input` does this
+    /// on the typing path; an attach client's `edit send` has no box to take, so
+    /// it states the words here through the same one place.
+    pub fn expect_human(&mut self, text: &str) {
         let words = text.trim();
         if !words.is_empty() {
             self.pending = Some(words.to_string());
         }
-        text
+    }
+
+    /// Replace the message box with an attach client's draft for `agent`. The
+    /// box holds one draft at a time — it is the human's box — and the agent's
+    /// revision moves, so a second client that edits from a stale base is
+    /// refused rather than silently overwriting what is there (M3).
+    pub fn set_draft(&mut self, agent: AgentId, text: &str) {
+        self.input.clear();
+        self.input.insert(text);
+        let prior = self.revision(agent);
+        self.advance(agent, prior);
     }
 
     /// Do one key the keymap handed to the chat: editing the message box, or

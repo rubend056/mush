@@ -6,6 +6,7 @@
 
 mod agent;
 mod app;
+mod attach;
 mod clock;
 mod events;
 mod http;
@@ -464,7 +465,19 @@ fn run() -> Result<(), Box<dyn Error>> {
     // snapshot over and keeps painting (see `session_save`). `App`'s drop is the
     // exit flush.
     let save = Arc::new(session_save::Writer::new(workspace.root().to_path_buf()));
+    let attach_root = workspace.root().to_path_buf();
     let mut app = App::new(workspace, cell, stored, root, tx.clone(), save);
+    // The attach socket comes up before the first frame, so a client can
+    // connect the moment mush is running. A bind that fails is said on stderr
+    // and mush runs without it — never a reason to die (M3); the guard removes
+    // the socket file on the way out.
+    let _attach = match attach::serve(&attach_root, tx.clone()) {
+        Ok(guard) => Some(guard),
+        Err(error) => {
+            eprintln!("mush: attach disabled — {error}");
+            None
+        }
+    };
 
     if let Some(cfg) = discovery {
         let tx = tx.clone();
