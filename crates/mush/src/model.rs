@@ -147,10 +147,14 @@ impl ModelClient for HttpModel {
 /// been, a connect or a read that timed out.
 ///
 /// What is *not* here is as deliberate: `InvalidData` is a refusal `http.rs`
-/// already classified, `Interrupted` is how the cancel flag is reported (and a
-/// cancellation is never retried), and `NotFound`/`InvalidInput`/`Other` are a
-/// name that does not resolve, a URL that cannot be parsed and a TLS handshake
-/// that failed — misconfiguration, where a retry only repeats the mistake.
+/// already classified, and `Interrupted` is how the cancel flag is reported. A
+/// signal that interrupted a read or a write — the human resizing the terminal
+/// — was already made again inside `http.rs`, so the interrupt itself never
+/// reaches this classifier (finding B25); the only `Interrupted` that arrives
+/// here is a decision, and a cancellation is never retried.
+/// `NotFound`/`InvalidInput`/`Other` are a name that does not resolve, a URL
+/// that cannot be parsed and a TLS handshake that failed — misconfiguration,
+/// where a retry only repeats the mistake.
 fn transport(error: &io::Error) -> bool {
     matches!(
         error.kind(),

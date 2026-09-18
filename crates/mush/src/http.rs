@@ -275,7 +275,10 @@ fn request(ask: &Ask<'_>, clock: &dyn Clock, pool: &Pool, open: Open<'_>) -> io:
             // never answered and sending it again cannot duplicate anything.
             // One retry, only for a connection that was reused, and never for a
             // cancellation or a deadline: those are decisions, not a dead
-            // socket, and must be reported as themselves.
+            // socket, and must be reported as themselves. `Interrupted` is in
+            // this list because the only one that reaches here is the watch's
+            // own cancellation — a signal that interrupted the socket was
+            // retried inside the read or the write that met it.
             let dead_kept = reused
                 && !heard
                 && !watch.cancelled()
@@ -317,7 +320,7 @@ fn exchange(
     watch: &Watch,
 ) -> Result<(Response, Socket, bool), (io::Error, bool)> {
     let mut heard = false;
-    if let Err(error) = write_request(&mut stream, ask, host, port, path) {
+    if let Err(error) = write_request(&mut stream, ask, host, port, path, watch) {
         return Err((error, heard));
     }
 
@@ -425,6 +428,7 @@ fn write_request(
     host: &str,
     port: u16,
     path: &str,
+    watch: &Watch,
 ) -> io::Result<()> {
     let mut head = format!(
         "{} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: keep-alive\r\nAccept: application/json\r\n",
@@ -441,12 +445,15 @@ fn write_request(
     }
     head.push_str("\r\n");
 
+    // The head, the body and the flush are the same request: a signal landing
+    // on any of them is a call to make again, not a request to report — and
+    // asking the watch first means a Stop still wins over the retry.
     let out = stream.get_mut();
-    out.write_all(head.as_bytes())?;
+    retrying_interrupted(Some(watch), || out.write_all(head.as_bytes()))?;
     if let Some(body) = ask.body {
-        out.write_all(body.as_bytes())?;
+        retrying_interrupted(Some(watch), || out.write_all(body.as_bytes()))?;
     }
-    out.flush()
+    retrying_interrupted(Some(watch), || out.flush())
 }
 
 /// A cancellation flag and a deadline, threaded through one request's reads.
@@ -507,6 +514,41 @@ fn is_timeout(error: &io::Error) -> bool {
     )
 }
 
+/// Make one IO call, and make it again when a signal interrupted it.
+///
+/// `SIGWINCH` — the human resizing the terminal — is the everyday one: it can
+/// land while mush is mid-read or mid-write, and the kernel then fails the
+/// syscall with `EINTR` (`ErrorKind::Interrupted`) *before* it moved a byte.
+/// Nothing about the endpoint changed: it never refused the request, and the
+/// signal was addressed to mush, not to the socket. Retrying is the only honest
+/// answer (finding B25); reporting the interrupt instead tells the human their
+/// endpoint is broken when it was their window manager.
+///
+/// The one `Interrupted` that is not `EINTR` is the cancel flag's, as
+/// [`Watch::check`] reports it, and that one must *not* be retried: the two are
+/// told apart by asking the watch, never by looking at the error. `check` runs
+/// on every interrupt, and its verdict — the human's Stop, or a deadline that
+/// has passed — is returned as itself, so a cancelled request is still answered
+/// in a moment instead of being retried around the signal.
+///
+/// `watch` is the request behind the call. It is `None` for a call that has no
+/// request yet — the connect, which carries its own timeout and no cancel flag.
+fn retrying_interrupted<T>(
+    watch: Option<&Watch>,
+    mut operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    loop {
+        match operation() {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => {
+                if let Some(watch) = watch {
+                    watch.check()?;
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
 /// One bufferful from the socket, retrying the read slices. `Ok(None)` is EOF.
 ///
 /// Everything below reads through `fill_buf`/`consume` rather than
@@ -519,11 +561,18 @@ fn is_timeout(error: &io::Error) -> bool {
 /// cancellation or the deadline through.
 fn fill<'b, R: BufRead>(reader: &'b mut R, watch: &Watch) -> io::Result<Option<&'b [u8]>> {
     loop {
-        match reader.fill_buf() {
-            Ok([]) => return Ok(None),
-            Ok(buffer) => {
+        // `fill_buf` hands back a borrow of the reader's own buffer, and a
+        // borrow cannot travel into a `FnMut` — it is the reader that lives
+        // across the retry, not the reader's bytes. The helper is therefore
+        // asked only *how much* is there, a `usize`, and the buffer itself is
+        // taken from the reader right after: on a full buffer that second
+        // `fill_buf` is a slice of memory the read above already filled, not
+        // another read, so nothing can happen in between it and the count.
+        match retrying_interrupted(Some(watch), || reader.fill_buf().map(<[u8]>::len)) {
+            Ok(0) => return Ok(None),
+            Ok(_) => {
                 watch.check()?;
-                return Ok(Some(buffer));
+                return Ok(Some(reader.fill_buf()?));
             }
             Err(error) if is_timeout(&error) => watch.check()?,
             Err(error) => return Err(error),
@@ -614,8 +663,13 @@ fn connect(
     read_timeout: Duration,
 ) -> io::Result<Box<dyn ReadWrite>> {
     let mut last_error = None;
-    for address in (host, port).to_socket_addrs()? {
-        let stream = match TcpStream::connect_timeout(&address, CONNECT_TIMEOUT) {
+    // Opening a connection happens before there is a request to cancel, so the
+    // calls below have no watch: they retry the signal and are bounded by
+    // their own timeouts.
+    for address in retrying_interrupted(None, || (host, port).to_socket_addrs())? {
+        let stream = match retrying_interrupted(None, || {
+            TcpStream::connect_timeout(&address, CONNECT_TIMEOUT)
+        }) {
             Ok(stream) => stream,
             Err(error) => {
                 last_error = Some(error);
@@ -663,7 +717,11 @@ fn tls_connect(
     let connection = rustls::ClientConnection::new(Arc::new(config), server_name)
         .map_err(|error| io::Error::other(format!("TLS setup failed: {error}")))?;
     let mut stream = rustls::StreamOwned::new(connection, tcp);
-    stream.flush()?; // completes the handshake
+    // This drives the handshake, both directions of it. A signal landing in the
+    // middle of one leaves rustls exactly where it was, so the way to finish it
+    // is to ask again — and the way to lose a healthy endpoint is to report
+    // `EINTR` as a bad TLS host instead.
+    retrying_interrupted(None, || stream.flush())?; // completes the handshake
     Ok(stream)
 }
 
@@ -1210,6 +1268,193 @@ mod tests {
             "the request was answered on a fresh connection"
         );
         assert_eq!(opened.load(Ordering::SeqCst), 2, "one retry, no more");
+    }
+
+    /// A connection whose reads a signal interrupts a few times before it
+    /// answers — the shape of a `SIGWINCH` (the human resizing the terminal)
+    /// landing on a read that is in flight. `stop` is a cancel flag the read
+    /// sets as the signal lands, for the tests where the human's Ctrl-C has to
+    /// be the winner.
+    struct Interrupted {
+        inner: Wire,
+        interrupts: usize,
+        reads: Arc<AtomicUsize>,
+        stop: Option<Arc<AtomicBool>>,
+    }
+
+    impl Read for Interrupted {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            self.reads.fetch_add(1, Ordering::SeqCst);
+            if self.interrupts > 0 {
+                self.interrupts -= 1;
+                if let Some(stop) = &self.stop {
+                    stop.store(true, Ordering::SeqCst);
+                }
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Interrupted system call",
+                ));
+            }
+            self.inner.read(buf)
+        }
+    }
+
+    impl Write for Interrupted {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
+    }
+
+    /// A signal landing on a read in flight is not the endpoint refusing the
+    /// request: the read is made again and the reply arrives. Before the fix
+    /// this failed with `Interrupted system call`, which the model layer
+    /// reported as `cannot reach http://…` — a human resizing the window lost
+    /// the turn, and the message blamed their endpoint (finding B25).
+    #[test]
+    fn a_signal_that_interrupts_a_read_is_retried() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = reads.clone();
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+            Ok(Box::new(Interrupted {
+                inner: wire(&written, &[&ok("{\"answer\":1}")]),
+                interrupts: 3,
+                reads: counted.clone(),
+                stop: None,
+            }) as Box<dyn ReadWrite>)
+        };
+        let pool = Pool::new();
+        let url = "http://models.test:8078/v1/chat/completions";
+
+        let response = send(&pool, &mut opener, url, "{}").unwrap();
+        assert_eq!(response.body, "{\"answer\":1}");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            4,
+            "three interrupts made again, then the reply"
+        );
+    }
+
+    /// The cancel flag still wins over the retry: a read a signal interrupted is
+    /// *not* made again once the human has asked the request to stop. The watch
+    /// reports a cancellation as an `Interrupted` of its own, so the helper has
+    /// to ask the watch rather than treat every `Interrupted` as one more
+    /// `EINTR` — treating them alike would swallow a Ctrl-C that arrived with a
+    /// resize and leave the request waiting for an answer nobody wants.
+    #[test]
+    fn a_cancelled_request_is_not_retried_around_an_interrupt() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let reads = Arc::new(AtomicUsize::new(0));
+        let counted = reads.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = cancel.clone();
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+            Ok(Box::new(Interrupted {
+                inner: wire(&written, &[&ok("{\"never\":1}")]),
+                interrupts: 1,
+                reads: counted.clone(),
+                stop: Some(stop.clone()),
+            }) as Box<dyn ReadWrite>)
+        };
+        let ask = Ask {
+            method: "POST",
+            url: "http://models.test:8078/v1/chat/completions",
+            body: Some("{}"),
+            api_key: None,
+            read_timeout: Duration::from_secs(5),
+            cancel: Some(&cancel),
+        };
+        let pool = Pool::new();
+
+        let error = request(&ask, clock::system(), &pool, &mut opener).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert_eq!(error.to_string(), "request cancelled", "the Stop's answer");
+        assert_eq!(
+            reads.load(Ordering::SeqCst),
+            1,
+            "the interrupted read was not made again"
+        );
+    }
+
+    /// The retry helper on its own, with no socket: an interrupted call is made
+    /// again, and every other answer — a real failure, a Stop, a deadline that
+    /// has passed — is returned as itself without another attempt.
+    #[test]
+    fn retrying_interrupted_retries_only_an_interrupt() {
+        let clock = Advanceable::new();
+        let cancel = AtomicBool::new(false);
+        let watch = Watch::new(Some(&cancel), Duration::from_secs(300), &clock);
+
+        // Three signals in a row, then the answer: the caller sees the answer,
+        // never the interrupts.
+        let attempts = std::cell::Cell::new(0);
+        let answer = retrying_interrupted(Some(&watch), || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 3 {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "Interrupted system call",
+                ))
+            } else {
+                Ok(42)
+            }
+        })
+        .unwrap();
+        assert_eq!(answer, 42);
+        assert_eq!(attempts.get(), 3);
+
+        // A real failure is not a signal, and is not asked again.
+        let attempts = std::cell::Cell::new(0);
+        let error = retrying_interrupted(Some(&watch), || {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(io::Error::new(io::ErrorKind::ConnectionReset, "reset"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::ConnectionReset, "{error}");
+        assert_eq!(attempts.get(), 1);
+
+        // A Stop outranks a signal: the watch is asked on every interrupt, and
+        // its verdict is what the caller is handed.
+        cancel.store(true, Ordering::SeqCst);
+        let attempts = std::cell::Cell::new(0);
+        let error = retrying_interrupted(Some(&watch), || {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(io::Error::new(io::ErrorKind::Interrupted, "EINTR"))
+        })
+        .unwrap_err();
+        assert_eq!(error.to_string(), "request cancelled", "{error}");
+        assert_eq!(attempts.get(), 1, "the call was not made again");
+
+        // And so does the deadline, which needs no signal to have arrived.
+        cancel.store(false, Ordering::SeqCst);
+        clock.advance(Duration::from_secs(300));
+        let attempts = std::cell::Cell::new(0);
+        let error = retrying_interrupted(Some(&watch), || {
+            attempts.set(attempts.get() + 1);
+            Err::<(), _>(io::Error::new(io::ErrorKind::Interrupted, "EINTR"))
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::TimedOut, "{error}");
+        assert_eq!(attempts.get(), 1);
+
+        // A call with no request behind it — the connect — carries no watch and
+        // still makes an interrupted call again.
+        let attempts = std::cell::Cell::new(0);
+        let connected = retrying_interrupted(None, || {
+            attempts.set(attempts.get() + 1);
+            if attempts.get() < 2 {
+                Err(io::Error::new(io::ErrorKind::Interrupted, "EINTR"))
+            } else {
+                Ok("connected")
+            }
+        })
+        .unwrap();
+        assert_eq!(connected, "connected");
+        assert_eq!(attempts.get(), 2);
     }
 
     /// A reply that ends the connection — `Connection: close`, or a body framed
