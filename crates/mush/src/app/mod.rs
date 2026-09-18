@@ -1507,7 +1507,7 @@ impl App {
                     Ok(())
                 }
                 _ => {
-                    let line = format!("agent #{target} is gone");
+                    let line = agent::gone(target);
                     self.tree.nudge_failed(target, previous);
                     self.fail(&line);
                     Err(line)
@@ -2090,7 +2090,7 @@ impl App {
                 // next step…`.
                 self.say(format!("{} #{target}…", Compacting::Requested.verb()));
             }
-            _ => self.fail(format!("agent #{target} is gone")),
+            _ => self.fail(agent::gone(target)),
         }
     }
 
@@ -9065,7 +9065,7 @@ mod tests {
             ),
         ));
         assert_eq!(error.kind, "bad_request", "the sender is told: {error:?}");
-        assert_eq!(error.message.as_deref(), Some("agent #1 is gone"));
+        assert_eq!(error.message, Some(agent::gone(1)));
 
         assert_eq!(
             text_of(&app),

@@ -3067,6 +3067,12 @@ fn parse_target(raw: &str) -> Result<Target, String> {
     })
 }
 
+/// The actor a message was aimed at no longer answers: the mailboxes, the UI
+/// and a nudge all reach the same dead end and the same words.
+pub(crate) fn gone(id: impl std::fmt::Display) -> String {
+    format!("agent #{id} is gone")
+}
+
 /// Stop a child this agent owns. Stopping is not finishing: the child keeps its
 /// context and work, and a later `control message` resumes it.
 fn stop_agent(state: &mut ActorState, id: u64) -> Result<String, String> {
@@ -3077,7 +3083,7 @@ fn stop_agent(state: &mut ActorState, id: u64) -> Result<String, String> {
     // have the model wait on a result that can never arrive.
     cmd.send(AgentMsg::Stop)
         .map(|_| format!("stopping agent #{id}"))
-        .map_err(|_| format!("agent #{id} is gone"))
+        .map_err(|_| gone(id))
 }
 
 /// Message a child this agent owns. The words resume an idle child, so the
@@ -3107,7 +3113,7 @@ fn message_agent(state: &mut ActorState, args: &Value, id: u64) -> Result<String
         Ok(()) => Ok(format!(
             "messaged agent #{id} — it is mid-run, so it reads this at its next step"
         )),
-        Err(_) => Err(format!("agent #{id} is gone")),
+        Err(_) => Err(gone(id)),
     }
 }
 
