@@ -106,22 +106,20 @@ impl Phase {
 
     /// What this phase is parked on, if it is parked at all.
     ///
-    /// A run can be in flight with no model call behind it: `wait_agents` and
-    /// `wait_commands` block for minutes on somebody else's result, and an
-    /// hourglass is not the same thing as a spinner. The word "working" for
-    /// both is how a napping orchestrator came to look like a busy model
-    /// (finding U7) — this is the derivation that tells them apart, made once
-    /// from the label the actor wrote (which is the tool's own name, from
-    /// `ToolName`), so the row, the footer and the transcript foot all read the
-    /// same answer. The distinction itself is [`jobs::Waited`], the enum the
-    /// wait tools answer with.
+    /// A run can be in flight with no model call behind it: `wait` blocks for
+    /// minutes on children and jobs together, and an hourglass is not the same
+    /// thing as a spinner. The word "working" for both is how a napping
+    /// orchestrator came to look like a busy model (finding U7) — this is the
+    /// derivation that tells them apart, made once from the label the actor
+    /// wrote (which is the tool's own name, from `ToolName`), so the row, the
+    /// footer and the transcript foot all read the same answer. The distinction
+    /// itself is [`jobs::Waited`], the value the wait tool answers with.
     pub fn waiting(&self) -> Option<jobs::Waited> {
         let Phase::Activity(label) = self else {
             return None;
         };
         match ToolName::parse(label.split_whitespace().next()?) {
-            Some(ToolName::WaitAgents) => Some(jobs::Waited::Agents),
-            Some(ToolName::WaitCommands) => Some(jobs::Waited::Jobs),
+            Some(ToolName::Wait) => Some(jobs::Waited),
             _ => None,
         }
     }
@@ -922,7 +920,7 @@ impl AgentTree {
 
     /// The parent has read this agent's result: the line is in its transcript
     /// now, wherever it came from — a fold at the next message boundary, the
-    /// wake-up a napping parent got, or a `wait_agents` that asked for it.
+    /// wake-up a napping parent got, or a `wait` that asked for it.
     ///
     /// Only its own actor can say this (it owns the `delivered` set), so this is
     /// only ever called from the event that actor emits, and never as a guess
@@ -1426,12 +1424,8 @@ mod tests {
         // The actor's label is the tool name plus its summarized arguments,
         // which are empty for a wait with none — hence the trailing space.
         assert_eq!(
-            Phase::Activity("wait_agents ".to_string()).waiting(),
-            Some(jobs::Waited::Agents)
-        );
-        assert_eq!(
-            Phase::Activity("wait_commands #c2 #c3".to_string()).waiting(),
-            Some(jobs::Waited::Jobs)
+            Phase::Activity("wait ".to_string()).waiting(),
+            Some(jobs::Waited)
         );
     }
 

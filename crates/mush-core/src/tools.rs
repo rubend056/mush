@@ -1,80 +1,63 @@
-//! The text-only half of the agent's tools.
+//! The tool vocabulary the model and the dispatcher share.
 //!
-//! Every tool result is produced here, so the executor and the schemas cannot
-//! drift apart. The bytes always come from disk: mush holds no open file, so
-//! there is no second copy for a tool result to disagree with.
+//! [`ToolName`] is the one list of what exists. The text half of an edit
+//! (`edit_text`, `edit_text_many`) lives here too: every edit result is produced
+//! by the same code the executor calls, so a schema and its behaviour cannot
+//! drift apart.
 
 use std::fmt;
 
 use serde_json::Value;
 
-use crate::workspace::Workspace;
-
 /// Every tool the model may call.
+///
+/// Six, deliberately. The shell lists, reads and writes a workspace better than
+/// a bespoke tool could — `rg`, `sed -n '1,200p'`, `ls -la`, `mkdir -p && cat >
+/// f` — so mush keeps only `edit_file`, whose exact-and-unique replacement is a
+/// safety property `sed -i` does not have, and `run_command`, the one controlled
+/// surface for everything else. `spawn_agent` is its own intent; `status`,
+/// `control` and `wait` manage what an agent started.
 ///
 /// The schemas, the dispatcher and the prompt all name tools through this enum,
 /// so adding a tool is a compile error in every place that has to know about it
 /// instead of a string that silently never matches.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolName {
-    ListFiles,
-    ReadFile,
-    WriteFile,
     EditFile,
     RunCommand,
     SpawnAgent,
-    WaitAgents,
-    AgentStatus,
-    AgentControl,
-    CommandStatus,
-    CommandControl,
-    WaitCommands,
+    Status,
+    Control,
+    Wait,
 }
 
 impl ToolName {
     /// Every tool, in schema order. `prompt::tool_schemas` is tested against
     /// this list, so a schema and its executor cannot drift.
-    pub const ALL: [ToolName; 12] = [
-        ToolName::ListFiles,
-        ToolName::ReadFile,
-        ToolName::WriteFile,
+    pub const ALL: [ToolName; 6] = [
         ToolName::EditFile,
         ToolName::RunCommand,
         ToolName::SpawnAgent,
-        ToolName::WaitAgents,
-        ToolName::AgentStatus,
-        ToolName::AgentControl,
-        ToolName::CommandStatus,
-        ToolName::CommandControl,
-        ToolName::WaitCommands,
+        ToolName::Status,
+        ToolName::Control,
+        ToolName::Wait,
     ];
 
     /// The tools that exist for delegation only. A leaf agent (at `MAX_DEPTH`)
-    /// does not receive them, which is what bounds the tree. A *job's* tools are
-    /// workspace tools: an agent with no children can still start one, so they
-    /// are not in this list.
-    pub const ORCHESTRATION: [ToolName; 4] = [
-        ToolName::SpawnAgent,
-        ToolName::WaitAgents,
-        ToolName::AgentStatus,
-        ToolName::AgentControl,
-    ];
+    /// does not receive them, which is what bounds the tree. `status`, `control`
+    /// and `wait` are *job* tools too — an agent with no children can still
+    /// start a command and manage it — so they stay in a leaf's set.
+    pub const ORCHESTRATION: [ToolName; 1] = [ToolName::SpawnAgent];
 
     /// The name the model calls this tool by.
     pub const fn as_str(self) -> &'static str {
         match self {
-            ToolName::ListFiles => "list_files",
-            ToolName::ReadFile => "read_file",
-            ToolName::WriteFile => "write_file",
             ToolName::EditFile => "edit_file",
             ToolName::RunCommand => "run_command",
             ToolName::SpawnAgent => "spawn_agent",
-            ToolName::WaitAgents => "wait_agents",
-            ToolName::AgentStatus => "agent_status",
-            ToolName::AgentControl => "agent_control",
-            ToolName::CommandStatus => "command_status",
-            ToolName::CommandControl => "command_control",
-            ToolName::WaitCommands => "wait_commands",
+            ToolName::Status => "status",
+            ToolName::Control => "control",
+            ToolName::Wait => "wait",
         }
     }
 
@@ -108,10 +91,10 @@ const fn names<const N: usize>(tools: [ToolName; N]) -> [&'static str; N] {
 
 /// Every tool name, in schema order. Derived from [`ToolName::ALL`], so the two
 /// cannot disagree.
-pub const TOOL_NAMES: [&str; 12] = names(ToolName::ALL);
+pub const TOOL_NAMES: [&str; 6] = names(ToolName::ALL);
 
 /// The names of the delegation-only tools.
-pub const ORCHESTRATION_TOOLS: [&str; 4] = names(ToolName::ORCHESTRATION);
+pub const ORCHESTRATION_TOOLS: [&str; 1] = names(ToolName::ORCHESTRATION);
 
 /// A required string argument.
 pub fn arg_string(args: &Value, key: &str) -> Result<String, String> {
@@ -119,43 +102,6 @@ pub fn arg_string(args: &Value, key: &str) -> Result<String, String> {
         .and_then(Value::as_str)
         .map(str::to_string)
         .ok_or_else(|| format!("missing `{key}`"))
-}
-
-/// The directory an optional `path` argument names, as a listing prefix.
-pub fn arg_prefix(args: &Value) -> &str {
-    args.get("path")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim()
-        .trim_start_matches("./")
-        .trim_end_matches('/')
-}
-
-/// The result text of `list_files`: one path per line, or an empty answer the
-/// model can act on. A walk that stopped at the limit says so — a listing that
-/// just ends reads as "there is no more" (audit row 8).
-pub fn list_result(ws: &Workspace, args: &Value, limit: usize) -> Result<String, String> {
-    let prefix = arg_prefix(args);
-    let (files, truncated) = ws.list_files(limit);
-    let files: Vec<String> = files
-        .into_iter()
-        .filter(|file| {
-            prefix.is_empty() || prefix == "." || file.starts_with(&format!("{prefix}/"))
-        })
-        .collect();
-    let more = if truncated {
-        format!("\n… more files exist than the {limit} shown — narrow the path to see them")
-    } else {
-        String::new()
-    };
-    if files.is_empty() {
-        Ok(format!(
-            "no files under `{}`{more}",
-            if prefix.is_empty() { "." } else { prefix }
-        ))
-    } else {
-        Ok(format!("{}{more}", files.join("\n")))
-    }
 }
 
 /// One replacement in a batch. `replace_all` is what a rename needs: the same
@@ -230,14 +176,6 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn temp_workspace(name: &str) -> Workspace {
-        use std::fs;
-        let dir = std::env::temp_dir().join(format!("mush-tools-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        Workspace::new(&dir).unwrap()
-    }
-
     #[test]
     fn arg_string_demands_a_string() {
         assert_eq!(
@@ -246,28 +184,6 @@ mod tests {
         );
         assert!(arg_string(&json!({"path": 7}), "path").is_err());
         assert!(arg_string(&json!({}), "path").is_err());
-    }
-
-    #[test]
-    fn list_result_filters_by_prefix() {
-        use std::fs;
-        let ws = temp_workspace("list");
-        fs::create_dir_all(ws.root().join("src")).unwrap();
-        fs::write(ws.root().join("top.rs"), "x").unwrap();
-        fs::write(ws.root().join("src/deep.rs"), "x").unwrap();
-
-        let all = list_result(&ws, &json!({}), 100).unwrap();
-        assert!(
-            all.contains("top.rs") && all.contains("src/deep.rs"),
-            "{all}"
-        );
-
-        let src = list_result(&ws, &json!({"path": "./src/"}), 100).unwrap();
-        assert_eq!(src, "src/deep.rs");
-
-        let none = list_result(&ws, &json!({"path": "missing"}), 100).unwrap();
-        assert!(none.starts_with("no files under"), "{none}");
-        let _ = fs::remove_dir_all(ws.root());
     }
 
     fn edit(old: &str, new: &str) -> Edit {
@@ -329,30 +245,41 @@ mod tests {
     }
 
     /// One name per variant, and parsing it back gives the same tool: the
-    /// schema table and the dispatcher are two views of one list.
+    /// schema table and the dispatcher are two views of one list. Six names,
+    /// and the deleted ones no longer parse.
     #[test]
     fn every_tool_name_round_trips() {
         for tool in ToolName::ALL {
             assert_eq!(ToolName::parse(tool.as_str()), Some(tool));
             assert_eq!(tool.to_string(), tool.as_str());
         }
-        assert_eq!(ToolName::parse("list_files"), Some(ToolName::ListFiles));
+        assert_eq!(ToolName::parse("edit_file"), Some(ToolName::EditFile));
+        assert_eq!(ToolName::parse("wait"), Some(ToolName::Wait));
         assert_eq!(ToolName::parse("nonsense"), None);
+        assert_eq!(ToolName::parse("list_files"), None);
+        assert_eq!(ToolName::parse("read_file"), None);
+        assert_eq!(ToolName::parse("write_file"), None);
+        assert_eq!(ToolName::parse("wait_agents"), None);
+        assert_eq!(ToolName::parse("agent_status"), None);
+        assert_eq!(ToolName::parse("agent_control"), None);
+        assert_eq!(ToolName::parse("command_status"), None);
+        assert_eq!(ToolName::parse("command_control"), None);
+        assert_eq!(ToolName::parse("wait_commands"), None);
 
         // The names derive from the enum, in the same order.
         let all: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
         assert_eq!(all, TOOL_NAMES.to_vec());
+        assert_eq!(TOOL_NAMES.len(), 6);
         let orchestration: Vec<&str> = ToolName::ORCHESTRATION.iter().map(|t| t.as_str()).collect();
         assert_eq!(orchestration, ORCHESTRATION_TOOLS.to_vec());
-        // Only delegation bounds a tree. A job is workspace work: an agent with
-        // no children can still start one and manage it, so the job tools are
-        // *not* orchestration and a leaf receives them (the subagent prompt
-        // names them).
+        // Only delegation bounds a tree. `status`, `control` and `wait` are how
+        // an agent manages the *jobs* it started too, so they are not
+        // orchestration and a leaf receives them (the subagent prompt names
+        // them).
         assert!(ToolName::SpawnAgent.is_orchestration());
-        assert!(ToolName::WaitAgents.is_orchestration());
-        assert!(!ToolName::CommandStatus.is_orchestration());
-        assert!(!ToolName::CommandControl.is_orchestration());
-        assert!(!ToolName::WaitCommands.is_orchestration());
+        assert!(!ToolName::Status.is_orchestration());
+        assert!(!ToolName::Control.is_orchestration());
+        assert!(!ToolName::Wait.is_orchestration());
     }
 
     #[test]

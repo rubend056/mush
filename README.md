@@ -27,9 +27,12 @@ cargo build --release
 ```
 
 `Tab` moves between the **agents** tree and the **chat**. Type in the message
-box and press `Enter`. The agent reads and edits the workspace through five file
-tools, four delegation tools, and three job tools (`command_status`,
-`command_control`, `wait_commands`) — see *Subagents* below.
+box and press `Enter`. The agent works the workspace through six tools —
+`edit_file`, `run_command`, `spawn_agent`, `status`, `control`, `wait`: the
+shell does the listing, reading and writing (`rg`, `sed -n '1,200p' file`,
+`ls -la`, `mkdir -p dir && cat > file <<'EOF'`), `edit_file` replaces exact text
+because an exact-and-unique match is a safety property `sed -i` does not have,
+and the last four manage the agents and jobs it starts — see *Subagents* below.
 
 It talks to any OpenAI-compatible endpoint with function calling:
 
@@ -84,16 +87,22 @@ The root agent can delegate: `spawn_agent(brief, title, base?)` starts a
 subagent that has no memory of your conversation — the brief *is* the context.
 `title` (three words) names its row in the tree; `base`, a branch, tag or
 commit, is what gives the child a tree of its own (*Isolated agents* below).
-`wait_agents` blocks until a child finishes, `agent_status` lists them,
-`agent_control` stops or messages (nudges) a running child. Subagents can spawn
-their own, four levels deep (`MAX_DEPTH` 3, the root included); the four
-delegation tools vanish from a leaf's toolset, and a live-agent budget
-(`MAX_AGENTS` 16) caps total fan-out.
+`status` lists everything the agent owns — each child's state and title or
+branch, each job's state, age and command — and it is a listing, not a
+delivery; `wait` takes no arguments and blocks until every child and every job
+has finished, then hands over one digest (a result not yet read in full, one
+already read as a line); `control {id, action, text?}` stops or messages one,
+naming it as `status` prints it (`2` for a child, `c2` for a job: a job can
+only be stopped, and a child that is stopped is not finished — it keeps its
+context and its work). Subagents can spawn their own, four levels deep
+(`MAX_DEPTH` 3, the root included); `spawn_agent` vanishes from a leaf's
+toolset, so a leaf keeps five, and a live-agent budget (`MAX_AGENTS` 16) caps
+total fan-out.
 
 The orchestrator may end its turn while children still run: mush shows
 `waiting on 1 subagent — the root resumes as they finish`, and the root is
 **woken with each child's `#N done: summary`** as they finish — early End is not
-a lost result, it's a nap.
+a lost result, it's a nap. `wait` is for when you want the results now.
 
 Deep chains are tested deterministically (root → child → grandchild, nested
 worktrees) but they need a model that actually delegates: small local models
@@ -240,10 +249,10 @@ overshooting the window it is sent to. The cap is what mush sends as `max_tokens
 (or `max_completion_tokens`, see `/help`), and `mush --print-config` prints the
 number it resolved to.
 
-The tool caps (a read, command output, a listing) scale with the window, so one
-`read_file` can never fill an 8k transcript. If a server rejects a request over
-its context length, mush reads the number out of the complaint, tells the UI,
-and retries once.
+The command cap (`CMD_CAP`, scaled to the window by `Config::cmd_cap`) follows
+the window, so one command's output can never fill an 8k transcript. If a server
+rejects a request over its context length, mush reads the number out of the
+complaint, tells the UI, and retries once.
 
 ## What it writes
 

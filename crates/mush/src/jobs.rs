@@ -19,7 +19,7 @@
 //! Three rules live here:
 //!
 //! 1. **A kept output window is a tail.** §11.9 asked; the answer is the tail,
-//!    consistently, in the completion line and in `command_status` alike. A job
+//!    consistently, in the completion line and in `status` alike. A job
 //!    is read when it *ends*, and what ended it is at the bottom of the log:
 //!    `test result: FAILED`, `error: could not compile`, the panic. The head is
 //!    what a foreground command's result keeps, because the model reads it
@@ -52,7 +52,6 @@ use crossbeam_channel::Sender;
 
 use mush_core::text::truncate;
 use mush_core::workspace::tail_for_model;
-use mush_core::CMD_CAP;
 
 use crate::agent::{AgentEvent, AgentMsg};
 use crate::app::{short_age, AgentId};
@@ -83,13 +82,18 @@ const JOB_LINE_TAIL: usize = 400;
 /// anyone asks about.
 const JOB_HISTORY: usize = 8;
 
-/// How much of the jobs' own windows one `command_status` result carries, in
-/// total: every job's headline plus this much output, however many jobs there
-/// are. `CMD_CAP` is the per-result cap the other tools keep (`READ_CAP`,
-/// `LIST_LIMIT` are their own), and this is the same bound on the same kind of
-/// tool result — spent on the windows rather than on the list, so no job is
-/// ever dropped from a status for being old.
-pub const STATUS_WINDOW: usize = CMD_CAP;
+/// How much of the jobs' own windows one `status` result carries, in total:
+/// every job's headline plus this much output, however many jobs there are.
+///
+/// A status is a list to choose from, not a log to read, so it is bounded on
+/// its own terms: `CMD_CAP` bounds what one *command* may write back, and a
+/// listing that grew with it would spend a bigger and bigger answer on windows
+/// nobody asked to read. Sixteen jobs — `MAX_JOBS` running plus `JOB_HISTORY`
+/// finished — at a full `JOB_TAIL` each would be 32 KB in one answer.
+///
+/// Spent on the windows rather than on the list, so no job is ever dropped from
+/// a status for being old.
+pub const STATUS_WINDOW: usize = 6_000;
 
 /// How often a running command is polled. Ten milliseconds is the latency
 /// between a `Stop` and a process group dying, and costs nothing while idle.
@@ -116,46 +120,24 @@ pub fn label(id: u64) -> String {
     format!("#c{id}")
 }
 
-/// Which of the two waits a call is: `wait_agents` or `wait_commands`.
+/// What a run is parked on: the one `wait` tool.
 ///
-/// One enum rather than three parallel strings (a noun, a tool name and a label
-/// builder), because they have to agree: a message that says "your agents are
-/// still running" in a job's wait is worse than no message. It is also what a
-/// run in flight is parked on with no model call behind it — [`Phase::waiting`]
-/// derives it from the actor's label, so the row, the footer and the transcript
-/// foot all read the one answer, and an hourglass is never painted as a
-/// spinner (finding U7).
+/// It used to be two tools, `wait_agents` and `wait_commands`, one noun each.
+/// `wait` covers both — every child and every job its owner started — so the
+/// noun is generic and the row says `waiting on results` rather than guessing
+/// which half is slow. It is also what a run in flight is parked on with no
+/// model call behind it — [`Phase::waiting`] derives it from the actor's label,
+/// so the row, the footer and the transcript foot all read the one answer, and
+/// an hourglass is never painted as a spinner (finding U7).
 ///
 /// [`Phase::waiting`]: crate::app::tree::Phase::waiting
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Waited {
-    Agents,
-    Jobs,
-}
+pub struct Waited;
 
 impl Waited {
     /// What the wait is waiting for, in a sentence.
     pub fn noun(self) -> &'static str {
-        match self {
-            Waited::Agents => "agents",
-            Waited::Jobs => "jobs",
-        }
-    }
-
-    /// The tool that runs this wait.
-    pub fn tool(self) -> &'static str {
-        match self {
-            Waited::Agents => "wait_agents",
-            Waited::Jobs => "wait_commands",
-        }
-    }
-
-    /// One thing being waited for, as the model names it (`#2`, `#c2`).
-    pub fn label(self, id: u64) -> String {
-        match self {
-            Waited::Agents => format!("#{id}"),
-            Waited::Jobs => label(id),
-        }
+        "results"
     }
 }
 
@@ -194,7 +176,7 @@ pub fn stopping(
 pub enum JobOutcome {
     /// It ended by itself, with this exit code (`-1` when a signal ended it).
     Exited(i32),
-    /// mush stopped it: a `Stop` aimed at its owner, `command_control stop`,
+    /// mush stopped it: a `Stop` aimed at its owner, `control stop`,
     /// Ctrl-N, or quitting.
     Stopped,
     /// It passed the output limit, so mush killed it rather than let it fill the
@@ -212,7 +194,7 @@ impl JobOutcome {
 
     /// The one line a job is reported in: `#c2 done: exit 0 · 3m12s · cargo
     /// test — test result: ok.`. Kept here so the transcript line, the bar and
-    /// `command_status` say the same thing about the same job.
+    /// `status` say the same thing about the same job.
     pub fn line(&self, id: u64, command: &str, age: Duration, tail: &str) -> String {
         let head = match self {
             JobOutcome::Exited(code) => {
@@ -236,7 +218,7 @@ impl JobOutcome {
 
 /// What a job's kept window looks like inside one line: the very end of it, on
 /// one line, with an ellipsis where the rest was. `·` joins its lines because
-/// this is a summary of the end; the window itself is in `command_status`.
+/// this is a summary of the end; the window itself is in `status`.
 pub fn preview_tail(tail: &str) -> String {
     let lines: Vec<&str> = tail
         .lines()
@@ -336,7 +318,7 @@ impl Live {
     }
 
     /// The end of what it has written so far, at most `cap` bytes of it: the
-    /// window a completion keeps is `JOB_TAIL`, and a `command_status` that
+    /// window a completion keeps is `JOB_TAIL`, and a `status` that
     /// lists several jobs reads a smaller one for each (see `status_for`).
     fn tail(&self, cap: usize) -> String {
         let Ok(job) = self.job.lock() else {
@@ -454,7 +436,7 @@ impl Refused {
         match self {
             Refused::Machine(held) if held.agent == asker => format!(
                 "you hold the machine with an exclusive command ({}); wait for it \
-                 (wait_commands) or stop it (command_control stop) before starting another",
+                 (wait) or stop it (control stop) before starting another",
                 held.command
             ),
             // A sibling's lock. The one thing this must not read as is "try
@@ -462,7 +444,7 @@ impl Refused {
             // guard counts, and it killed two agents that only met a locked
             // machine (finding H13). Who holds it, what they are running, and
             // what to do instead — and no tool can wait on another agent's job,
-            // so `wait_commands` must not be offered (audit row 5).
+            // so `wait` must not be offered (audit row 5).
             Refused::Machine(held) => format!(
                 "#{} holds the machine with an exclusive command ({}); this call queued and the lock \
                  was still held — do not retry in a loop; do other work and try once after it finishes \
@@ -472,7 +454,7 @@ impl Refused {
             ),
             Refused::Budget => format!(
                 "cannot detach: {MAX_JOBS} commands are already running as jobs (the limit). \
-                 Stop one with command_control, or wait for one with wait_commands."
+                 Stop one with control, or wait for one with wait."
             ),
             Refused::Thread(error) => format!("could not start the job: {error}"),
         }
@@ -892,10 +874,7 @@ impl Registry {
     pub fn stop(&self, owner: u64, id: u64) -> Result<String, String> {
         let record = self.jobs().into_iter().find(|record| record.id == id);
         match record {
-            None => Err(format!(
-                "no such job {} — command_status lists yours",
-                label(id)
-            )),
+            None => Err(format!("no such job {} — status lists yours", label(id))),
             Some(record) if record.owner != owner => Err(format!(
                 "job {} belongs to agent #{}",
                 label(id),
@@ -954,7 +933,7 @@ impl Registry {
 
     /// The jobs `owner` should know about: what is running, and what recently
     /// ended. One line each with the window under it — read live from the
-    /// command while it runs, so `command_status` is never a stale copy.
+    /// command while it runs, so `status` is never a stale copy.
     pub fn status_for(&self, owner: u64) -> String {
         let now = self.clock.now();
         let held = self.held();
@@ -1217,6 +1196,7 @@ mod tests {
     use crate::events::fake::Recorder;
     use crate::machine::fake::{Script, Scripted as ScriptedMachine};
     use crate::machine::{Machine, ShellCommand};
+    use mush_core::CMD_CAP;
 
     /// A registry over a scripted machine and an advanceable clock, so a job's
     /// whole life is asserted without a subprocess and without waiting.
@@ -1379,7 +1359,7 @@ mod tests {
             registry.status_for(7)
         );
 
-        // `command_control stop` is the same act, with an answer for the model:
+        // `control stop` is the same act, with an answer for the model:
         // it names the job, and a job that already ended is an answer rather
         // than an error.
         assert_eq!(registry.stop(7, first).unwrap(), "stopping job #c1");
@@ -1454,7 +1434,7 @@ mod tests {
         registry.kill_all();
     }
 
-    /// `command_status` is one bounded tool result, however many jobs there
+    /// `status` is one bounded tool result, however many jobs there
     /// are. It used to carry the full `JOB_TAIL` window of every job: sixteen
     /// jobs — `MAX_JOBS` running plus `JOB_HISTORY` finished — were 32 KB in
     /// one answer, while every other tool in the tree stops at `CMD_CAP`.
@@ -1663,7 +1643,7 @@ mod tests {
         );
         assert_eq!(registry.running(), MAX_JOBS, "and it took no slot");
         assert!(
-            Refused::Budget.message(8).contains("command_control"),
+            Refused::Budget.message(8).contains("control"),
             "the refusal tells the model how to make room"
         );
         registry.kill_all();

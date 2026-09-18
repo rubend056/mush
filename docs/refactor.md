@@ -28,8 +28,9 @@ At the time of writing the working tree had changed shape mid-pass: `Focus` is
 That was the intended shape, and the editor-facing rows were dropped with it:
 there is no `Buffer` extraction, no `app/editor.rs`, and no `ToolHost` — a
 mush that does not open files has nothing for the live-buffer rule to own, and
-the tool dispatch is one function per side (`agent::exec_tool` for orchestration
-and shell, `agent::direct_tool` for the file tools).
+the tool dispatch is one function (`agent::exec_tool`, which owns every tool —
+the twelve-to-six cut of §3.4 left no file-tool side for a second dispatcher to
+hold).
 
 ---
 
@@ -216,10 +217,13 @@ impl ToolHost for App {
 plus the `Msg::Tool` reply plumbing. This was written when the logic was
 triplicated between `agent::exec_tool`, `agent::direct_tool` and
 `app::exec_tool`. The editor was then dropped, so `app::exec_tool` went with it
-and there is no live-buffer rule left to own: there is now **one dispatcher per
-side** (`agent::exec_tool` for orchestration and shell, `agent::direct_tool` for
-the four file tools) and no `ToolHost` trait. M3's socket server, if it lands,
-calls those two directly rather than a buffer host.
+and there is no live-buffer rule left to own: there is now **one dispatcher**
+(`agent::exec_tool`, which owns every tool) and no `ToolHost` trait. M3's socket
+server, if it lands, calls it directly rather than a buffer host. The
+twelve-to-six tool cut went further than the editor's departure: `list_files`,
+`read_file` and `write_file` are gone, because the shell lists, reads and writes
+better than a bespoke tool could — so `edit_file` is the only file tool left and
+the signature above is history twice over.
 
 ### 3.5 `Intent` keys and parsed commands — `app/keys.rs`, `app/commands.rs`
 
@@ -264,9 +268,10 @@ table above, so Stage 1 starts from what is really there:
   built in `agent.rs` (`commit_subject`), because that is where the id, brief and
   outcome are.
 - `app.rs` has no `exec_tool` and no editor pane, so 3.4's "triplicated" is now
-  two dispatchers (`agent::exec_tool` for orchestration + shell,
-  `agent::direct_tool` for the four file tools) — and with `ToolHost` dropped
-  those two are the whole story, one dispatcher per side.
+  one dispatcher (`agent::exec_tool`, which owns every tool) — and with
+  `ToolHost` dropped that one is the whole story. The twelve-to-six tool cut
+  folded the file-tool dispatcher into it too, by removing three of the four
+  file tools.
 
 ---
 
@@ -341,7 +346,7 @@ because a tree's actors ask concurrently, and may be held open until the test
 releases it — which is what makes "the nudge arrived while the reply was in
 flight" and "the parent's turn ended before its child finished" facts rather
 than races. The work stayed real: git worktrees, files, the commit, the merge
-and the discard the UI advertises, and one `write_file` per turn in the
+and the discard the UI advertises, and one file write per turn in the
 turn-limit scenario. The tests now wait on the `Done`/`Compact`/`Message` events
 they assert on instead of polling for a file, and each one asserts what it
 pinned before — the child's work on `mush/1` in `.mush/wt/1`, `mush/2` based on
@@ -368,7 +373,7 @@ in flight is marked `⊘ cancelling…` (an idle, done or failed agent keeps its
 phase and its `busy` flag stays down), and a `Stop` that arrives behind the
 `Run` it was aimed at is no longer folded away by the wait that follows the
 `Run`. Four of the five shell tests are now driven by the fake machine and
-clock, and so are `wait_agents`' timeout and `Watch`'s deadline; the background
+clock, and so are `wait`'s timeout and `Watch`'s deadline; the background
 job, the real output cap and the real `git` stay, each with the reason in
 place. Still on the wall clock: `INFO_TTL`/status ageing in `app/mod.rs` (whose
 commit is another agent's) and `AgentTree`'s stale-cancel window, which already
@@ -410,7 +415,7 @@ starting audit's, not `findings.md` §6's attach rows of the same letters.
 | A1 | cancel/deadline only consulted on read timeout | http `Watch` (regression test) |
 | A2 | `tokens * 3` overflow | `config::clamp_context` |
 | A3 | `parse_context_hint` misfires / misses | `config` (markers + range) |
-| A4 | caps as floors; reserve > window | `config::{read_cap, cmd_cap, list_limit, history_budget}` |
+| A4 | caps as floors; reserve > window | `config::{cmd_cap, history_budget}` (the read and listing caps went with the file tools) |
 | A5 | window derived once; runtime switches never re-derive | `git::rederive_context` on every runtime switch (`/url`, `/provider`, `set_model`, `set_base_url`), pinned in `config.rs` |
 | A6 | CLI provider never selects its endpoint | `config::resolve_with` test |
 | A7 | no cap on response body | `http` `MAX_BODY_BYTES` |
@@ -458,7 +463,7 @@ starting audit's, not `findings.md` §6's attach rows of the same letters.
 | U4 | a grandchild drawn after everything spawned before it | `AgentTree::rows` walks pre-order over the parent links |
 | U5 | the newest activity on screen three times | `App::tree_line` no longer repeats the activity; the bar says the napping root instead |
 | U6 | an agent is a bare number | `AgentNode::title` derives a handle from the brief (a path first, else the first non-filler word) |
-| U7 | a waiting agent still says `working…` | `Phase::waiting` (`app/tree.rs`) tells a model call from `wait_agents`/`wait_commands`, and the row/foot say which |
+| U7 | a waiting agent still says `working…` | `Phase::waiting` (`app/tree.rs`) tells a model call from `wait`, and the row/foot say which |
 | U8 | a transient notice never leaves | `Chat`'s chatter lifetime (`clear_notes_for`, `dismiss_said`, `SAID_TTL`) + repeat collapse (`Notice.count`) |
 | U9 | the shipped DeepSeek window/reply cap is too small | `provider::PROVIDERS` fallback 120 000 + `Config::reply_cap` (a quarter of the window, floored at 1 024 and capped at 120 000) |
 | U10 | walking back up a deep tree costs a keypress per ancestor | `Intent::TreeWalk` on `←`/`→` (`app/keys.rs`) + `PickerMove(±PAGE)` |

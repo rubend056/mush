@@ -5209,15 +5209,15 @@ mod tests {
     }
 
     /// A run parked in a wait is not a model call. The transcript foot's
-    /// spinner may only claim work in flight, so `wait_agents` must not paint
+    /// spinner may only claim work in flight, so `wait` must not paint
     /// `working…` over an agent that is waiting for a child's result — and the
     /// row says what it is waiting for instead (finding U7).
     #[test]
     fn a_waiting_agent_is_not_drawn_working() {
         let (mut app, _rx) = test_app("waiting-foot");
         app.tree.begin(AgentId::ROOT, None);
-        // The label the actor emits for `wait_agents` with no arguments.
-        app.tree.activity(AgentId::ROOT, "wait_agents ");
+        // The label the actor emits for `wait` with no arguments.
+        app.tree.activity(AgentId::ROOT, "wait ");
         app.tree.age(AgentId::ROOT, Duration::from_secs(5));
 
         let rows = screen(&mut app, 120, 32);
@@ -5226,12 +5226,8 @@ mod tests {
             "nothing is being computed, so nothing spins: {rows:?}"
         );
         assert!(
-            rows.iter().any(|row| row.contains("waiting on agents 5s")),
+            rows.iter().any(|row| row.contains("waiting on results 5s")),
             "the row says what it is waiting for: {rows:?}"
-        );
-        assert!(
-            !rows.join("\n").contains("wait_agents"),
-            "and not the tool's name, which reads like work: {rows:?}"
         );
 
         // A model that really has not answered still says so: the point is the

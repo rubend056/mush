@@ -11,7 +11,7 @@
 use crate::provider;
 use crate::session::Session;
 use crate::userconfig::UserConfig;
-use crate::{CMD_CAP, LIST_LIMIT, READ_CAP};
+use crate::CMD_CAP;
 
 /// Re-exported so a caller reads the whole provider vocabulary from one crate
 /// path. Every vendor fact behind it lives in [`crate::provider`], the only
@@ -290,20 +290,19 @@ fn normalize_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
-/// Tokens every request reserves for the tool schemas. The root's nine
-/// schemas measure ~3.4 KB (~1.1 K tokens at the 3 bytes/token heuristic),
-/// so the reserve rounds up; `prompt` tests that they keep fitting.
+/// Tokens every request reserves for the tool schemas. Six schemas measure
+/// ~3.5 KB (~1.2 K tokens at the 3 bytes/token heuristic), so the reserve
+/// rounds up; `prompt` tests that they keep fitting.
 ///
 /// The schemas are context paid on *every* request, so this is a real cost.
 /// Ownership keeps it down: the prompts carry how to work (the rules, the
 /// delegation policy, what the machine is like), and a schema carries only its
-/// own call — arguments, defaults, and what comes back. The payload grew from
-/// ~3.1 KB at the first contract to ~5.1 KB when the replay findings made the
-/// waits say what they hand over (H15); the dedup pass that split prompt policy
-/// from schema shape took it back to ~4.9 KB. The
-/// `schemas_fit_the_budget_reserve` test is what makes growth a decision rather
-/// than a silent drift.
-pub const SCHEMA_TOKENS: usize = 1_700;
+/// own call — arguments, defaults, and what comes back. The cut to six tools
+/// (the shell reads and writes better than a bespoke tool) took the payload
+/// from ~5.1 KB to ~3.5 KB; `edit_file`'s nested `edits` and `control`'s two
+/// verbs are most of what is left. The `schemas_fit_the_budget_reserve` test is
+/// what makes growth a decision rather than a silent drift.
+pub const SCHEMA_TOKENS: usize = 1_200;
 
 impl Config {
     /// Built-in defaults with the `MUSH_*` environment applied.
@@ -378,29 +377,18 @@ impl Config {
         self.context_explicit = true;
     }
 
-    /// Caps that derive from the window, so a small model is not handed a tool
-    /// result larger than its whole transcript: one read may take a quarter of
-    /// the budget, one command an eighth, one listing a sixty-fourth. They are
-    /// ceilings and floors at once — the floor is also capped by the budget, so
-    /// a small window never gets a tool result it cannot hold.
-    pub fn read_cap(&self) -> usize {
-        READ_CAP
-            .min(self.history_budget() / 4)
-            .max(512)
-            .min(self.history_budget())
-    }
-
+    /// The one cap on the text a tool result may carry. The command's result is
+    /// now the only road by which big text reaches the model — the deleted file
+    /// tools' caps are gone with them — so it scales with the window like a read
+    /// did: a quarter of [`Self::history_budget`], floored at 512 bytes so a
+    /// tiny window still gets an answer, and capped by [`CMD_CAP`] so a huge one
+    /// does not hand the model a transcript's worth in a single turn. A result
+    /// that hits the cap says so (see `truncate_for_model`), so a model never
+    /// mistakes a cut result for a complete one.
     pub fn cmd_cap(&self) -> usize {
         CMD_CAP
-            .min(self.history_budget() / 8)
+            .min(self.history_budget() / 4)
             .max(512)
-            .min(self.history_budget())
-    }
-
-    pub fn list_limit(&self) -> usize {
-        LIST_LIMIT
-            .min(self.history_budget() / 64)
-            .max(50)
             .min(self.history_budget())
     }
 
@@ -1318,15 +1306,16 @@ mod tests {
 
     #[test]
     fn history_budget_fits_the_context_window() {
-        // 8192 tokens: the full reserve (1700 schemas + 2048 reply — a quarter
-        // of the window — + 200 margin) leaves 12_732 bytes of history. The
+        // 8192 tokens: the full reserve (1200 schemas + 2048 reply — a quarter
+        // of the window — + 200 margin) leaves 14_232 bytes of history. The
         // reserve has moved with every contract change, test and comment
         // together: 1100 (delegation), 1220 (`cd`), 1700 (the machine's three
-        // tools), 1750 (what the waits hand over, H15), and back to 1700 when
-        // the dedup pass fit the same rules in fewer bytes. See SCHEMA_TOKENS.
+        // tools), 1750 (what the waits hand over, H15), 1700 when the dedup
+        // pass fit the same rules in fewer bytes, and 1200 after the cut to six
+        // tools took the shell's work off the schema list. See SCHEMA_TOKENS.
         let small = Config::new("http://x:1", "m", None);
         assert_eq!(small.context_tokens, DEFAULT_CONTEXT_TOKENS);
-        assert_eq!(small.history_budget(), 12_732);
+        assert_eq!(small.history_budget(), 14_232);
 
         // A big window leaves a much larger budget, and the reply's share of it
         // grows with the window: 128k reserves 32k for one reply.
@@ -1336,19 +1325,17 @@ mod tests {
             max_completion_tokens: false,
             ..small.clone()
         };
-        assert_eq!(big.history_budget(), 282_300);
+        assert_eq!(big.history_budget(), 283_800);
 
         // A tiny window shrinks the reserve to half the window instead of
-        // ignoring it: history still gets 1536 bytes, and no cap — which has
-        // a floor of its own — is larger than the budget that holds it.
+        // ignoring it: history still gets 1536 bytes, and the cap — which has
+        // a floor of its own — is not larger than the budget that holds it.
         let tiny = Config {
             context_tokens: 1024,
             ..small
         };
         assert_eq!(tiny.history_budget(), 1_536);
-        assert!(tiny.read_cap() <= tiny.history_budget());
         assert!(tiny.cmd_cap() <= tiny.history_budget());
-        assert!(tiny.list_limit() <= tiny.history_budget());
     }
 
     /// The reserve keeps the request inside the window: history, schemas, the
@@ -1460,8 +1447,8 @@ mod tests {
     }
 
     /// The window comes from the model when nobody said otherwise, and the
-    /// caps follow it: one tool result must never be larger than the transcript
-    /// that has to hold it.
+    /// command result cap follows it: the one road a big text result travels
+    /// must never be larger than the transcript that has to hold it.
     #[test]
     fn the_window_and_the_caps_scale_together() {
         let mut cfg = Config::new("http://x:1", "deepseek-v4-pro", None);
@@ -1469,33 +1456,27 @@ mod tests {
         // `Config::new` does not resolve; the fallback is what the resolver uses.
         assert_eq!(cfg.fallback_context(), 500_000);
         cfg.context_tokens = cfg.fallback_context();
-        assert_eq!(cfg.read_cap(), READ_CAP, "a huge window keeps the ceiling");
-        assert_eq!(cfg.cmd_cap(), CMD_CAP);
-        assert_eq!(cfg.list_limit(), LIST_LIMIT);
+        assert_eq!(cfg.cmd_cap(), CMD_CAP, "a huge window keeps the ceiling");
 
-        // An 8k local window: a single read may take a quarter of the budget.
+        // An 8k local window: a single command result may take a quarter of the
+        // budget, well under the ceiling.
         let small = Config::new("http://x:1", "m", None);
-        assert_eq!(small.read_cap(), small.history_budget() / 4);
+        assert_eq!(small.cmd_cap(), small.history_budget() / 4);
         assert!(
-            small.read_cap() < 4_000,
-            "a read must fit in an 8k transcript: {}",
-            small.read_cap()
+            small.cmd_cap() < CMD_CAP,
+            "an 8k transcript cannot hold the ceiling: {}",
+            small.cmd_cap()
         );
-        assert!(small.cmd_cap() < small.read_cap());
-        assert!(small.list_limit() < small.cmd_cap());
 
-        // Under a window smaller than the caps' own floors, the budget wins:
-        // a 1k window is never handed a 512-byte read it cannot hold.
+        // Under a window smaller than the cap's own floor, the budget wins:
+        // a 1k window is never handed a 512-byte result it cannot hold.
         let tiny = Config {
             context_tokens: 1_024,
             ..Config::new("http://x:1", "m", None)
         };
         assert_eq!(tiny.history_budget(), 1_536);
-        assert_eq!(tiny.read_cap(), 512);
-        assert!(tiny.read_cap() <= tiny.history_budget());
+        assert_eq!(tiny.cmd_cap(), 512);
         assert!(tiny.cmd_cap() <= tiny.history_budget());
-        assert!(tiny.list_limit() <= tiny.history_budget());
-        assert!(tiny.list_limit() >= 50, "the floor still applies within it");
 
         // An explicit window is never overruled by discovery.
         let mut cfg = Config::new("http://x:1", "m", None);
