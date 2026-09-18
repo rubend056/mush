@@ -500,7 +500,10 @@ directly through mailboxes (`spawn_agent`, `wait_agents`, `agent_status`,
 `agent_control`), while the UI observes via id-tagged events. Depth and live
 count are hard budgets; the delegation tools are simply omitted from a leaf's
 schema. Every agent does its own file I/O on its own thread, an `isolated` one
-inside its own git worktree. Human-in-the-loop is the merge story: a run's work
+inside its own git worktree — and where that is impossible (a workspace that is
+not a git repository) mush says so in the parent's pane (`isolated unavailable:
+not a git repository — it shares this workspace`) rather than letting two
+"isolated" siblings collide in silence. Human-in-the-loop is the merge story: a run's work
 is committed to its branch when the run ends, `/diff` runs the diff of that work
 against HEAD (a one-line stat, then the hunks capped, or `nothing changed`), and
 `/merge` and `/discard` run the git that lands or throws it away — mush never

@@ -127,7 +127,8 @@ stops a model that has not answered instead of waiting for its reply.
 
 `isolated: true` gives a child its own git worktree
 (`.mush/wt/<id>` on branch `mush/<id>`), so parallel agents edit real files
-without colliding. A run's work is **committed** to that branch when the run
+without colliding. Where that is impossible (a workspace that is not a git
+repository) the child shares the checkout and the parent's pane says so. A run's work is **committed** to that branch when the run
 ends (`mush #3: <brief>`), so the branch really carries it. **mush never
 auto-merges** — the tree shows the branch, and these run the git that reads and
 lands it:
