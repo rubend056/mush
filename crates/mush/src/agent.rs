@@ -1838,6 +1838,10 @@ fn run_loop(
             messages.push(Message::user(TRUNCATION_INSTRUCTION));
             continue;
         }
+        // A reply that was not cut off ends the run of them: the guard counts
+        // *consecutive* truncations, and four scattered over a long run are not
+        // "in a row" (audit row 16).
+        cut_offs = 0;
 
         if let Some(reason) = refused {
             // A refused reply may still carry tool calls (a filtering endpoint
@@ -6479,6 +6483,37 @@ mod tests {
         assert!(error.contains("cut off"), "{error}");
         assert!(error.contains("in a row"), "{error}");
         assert_eq!(scripted.asked().len(), TRUNCATION_ROUNDS + 1);
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The cut-off counter counts *consecutive* replies: two truncations, a
+    /// turn that lands, then two more must not end the run as "four in a row"
+    /// (audit row 16).
+    #[test]
+    fn a_good_turn_resets_the_cut_off_count() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .cut_off("one")
+                .cut_off("two")
+                .calls(vec![tool_call(
+                    "w",
+                    "write_file",
+                    json!({ "path": "piece.txt", "content": "a small piece" }),
+                )])
+                .cut_off("three")
+                .cut_off("four")
+                .says("done"),
+        );
+        let (actor, _rx, _mailbox) = scripted_actor("cut-reset", &scripted);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![Message::user("write everything")];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel);
+        assert!(
+            result.is_ok(),
+            "scattered cut-offs are not a row: {result:?}"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
