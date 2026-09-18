@@ -815,22 +815,46 @@ mod tests {
     /// stolen — the bind fails and the caller runs without attach.
     #[test]
     fn a_stale_socket_is_cleared_and_a_live_one_is_not_stolen() {
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+
+        // A file a live listener holds is another mush: the bind refuses it
+        // rather than stealing its socket, and leaves the file where it was.
+        let live_root =
+            std::env::temp_dir().join(format!("mush-attach-live-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&live_root);
+        std::fs::create_dir_all(live_root.join(mush_core::session::MUSH_DIR)).unwrap();
+        let live_path = socket_path(&live_root);
+        let live = UnixListener::bind(&live_path).unwrap();
+        assert!(
+            serve(&live_root, tx.clone()).is_err(),
+            "a live socket is refused, not stolen"
+        );
+        assert!(live_path.exists(), "and it is left where it was");
+        drop(live);
+        let _ = std::fs::remove_dir_all(&live_root);
+
+        // A stale file — nothing listening behind it, the shape a crash leaves
+        // — is cleared and replaced. A root of its own, so the live phase's
+        // probe (which leaves an unaccepted connection in that listener's
+        // backlog) cannot outlive the listener it belongs to (finding A9).
         let root = std::env::temp_dir().join(format!("mush-attach-stale-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
         let path = socket_path(&root);
+        let stale = UnixListener::bind(&path).unwrap();
+        drop(stale);
 
-        let live = UnixListener::bind(&path).unwrap();
-        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
-        assert!(
-            serve(&root, tx.clone()).is_err(),
-            "a live socket is refused, not stolen"
-        );
-        assert!(path.exists(), "and it is left where it was");
-        // Closing the listener leaves the file with nothing behind it — the
-        // shape a crash leaves.
-        drop(live);
-        assert!(UnixStream::connect(&path).is_err());
+        // Even so, a just-closed listener can answer for a moment while the
+        // kernel tears the socket down, and `serve`'s liveness probe would
+        // read the stale file as live and refuse to clear it. Wait, bounded,
+        // for it to actually refuse before asking `serve` to clear it
+        // (finding A9).
+        let mut waits = 0;
+        while UnixStream::connect(&path).is_ok() {
+            waits += 1;
+            assert!(waits < 200, "a closed listener kept answering {path:?}");
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
 
         let guard = serve(&root, tx).unwrap();
         assert!(UnixStream::connect(&path).is_ok(), "the new socket is live");

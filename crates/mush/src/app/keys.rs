@@ -86,7 +86,7 @@ pub const KEYS: &[Binding] = &[
     Binding {
         context: Context::Anywhere,
         keys: "Ctrl-Q",
-        help: "quit",
+        help: "quit (a second press confirms while work is running)",
     },
     Binding {
         context: Context::Anywhere,

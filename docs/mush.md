@@ -46,9 +46,9 @@ edit the files.
   delta, updated while agents work.
 - **Endpoint-neutral**: anything speaking the OpenAI chat-completions API with
   function calling works (llama.cpp, Ollama, vLLM, LM Studio, hosted APIs).
-- **Small on purpose.** Two crates and about 41 000 lines including tests;
-  `scripts/census.py` prints the split (production, tests, comments), so the
-  number is checked rather than remembered.
+- **Small on purpose.** Two crates; `scripts/census.py` prints the split
+  (production, tests, comments) and the total, so the size is checked rather
+  than remembered.
 
 ### Is not
 
@@ -253,9 +253,9 @@ elided, and the cursor is always on screen.
 
 | Context | Keys |
 |---|---|
-| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit · `Ctrl-N` new chat (stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker |
+| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker |
 | picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End`, `PgUp`/`PgDn` move the list, `Enter` take the row, `Esc` close |
-| agents | `j`/`k`, arrows, `g`/`G`, `PgUp`/`PgDn` move the rows, `←` the row's parent, `→` its first child, `Enter` show its transcript, `c` cancel that agent, `Esc` back to the root |
+| agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them, `←` the row's parent, `→` its first child, `Enter` show its transcript, `c` cancel that agent, `Esc` back to the root |
 | chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete`, `↑`/`↓`/`PgUp`/`PgDn` scroll, `Esc` clear · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/compact` `/notes` `/help` `/quit` |
 
 `Enter` in the agents pane moves the *view*, not the keyboard: the row's
@@ -369,15 +369,15 @@ are computed in `App`.
   actually failed (`!`).
 
 ```
-┌ agents · 2 working · 1 waiting · Σ +324 −40 ───────────────────┐
-│   ◐ #0 you        edit src/lib.rs                              │
-│   ◐ #1 ⏸2 lexer   wait                                         │
-│     ◐ #2 tests    edit tests/lex.rs                            │
-│   ✓ #3 docs       wrote README.md                              │
-├────────────────────────────────────────────────────────────────┤
-│ #2 edit tests/lex.rs                                           │
-│ edit tests/lex.rs 3s · .mush/wt/2 · git diff HEAD...mush/2     │
-└────────────────────────────────────────────────────────────────┘
+┌ agents · 2 working · 1 waiting · Σ +324 −40 ─────────────────────┐
+│▶· #0 ⏸1 root                                                     │
+│   ◐ #1 ⏸1 lexer   waiting on results 3s                          │
+│     ◐ #2 tests  mush/2 +324−40  edit_file tests/lex.rs 3s        │
+│   ✓ #3 docs       wrote README.md                                │
+├──────────────────────────────────────────────────────────────────┤
+│ #2 write tests for the lexer                                     │
+│ edit_file tests/lex.rs 3s · .mush/wt/2 · git diff HEAD...mush/2  │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 The cursor row is the one wearing the pane's selection colour; there is no
@@ -819,8 +819,9 @@ a live one. Release profile uses `lto = "thin"`, `codegen-units = 1`,
   every fact has one owner, and the four test seams (`ModelClient`, `Machine`,
   `Clock`, `Events`) so the gate needs no model server, no free port, and no
   wall-clock wait. Stage
-  3.5's `Intent` keymap and parsed commands landed with it; the `Screen` view half
-  of Stage 3 is not built.
+  3.5's `Intent` keymap and parsed commands landed with it, and so did Stage 3's
+  other half — the `Screen` value and the draw sweep that asserts painted text
+  (`app/screen.rs` + `ui.rs`, `7e123e1`).
 - **M2.8 — Concurrent work (jobs + one lock).** `[DONE]` A command that outlives
   `CMD_DETACH_AFTER` (60 s), or that asked with `detach: true`, becomes a **job**:
   ids drawn from the tree's one counter (`#c2`), a machine-wide registry

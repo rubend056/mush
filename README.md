@@ -8,14 +8,14 @@ mush does not edit files itself. The agents do, and mush is how you steer them
 and see what changed.
 
 ```
-┌ agents · 1 working · Σ +12 −3 ───┬ mush ──────────────────────────────┐
-│ ▶ · #0   you (root agent)        │ you › rename the lexer module       │
-│   ◐ #1   lexer    edit lex.rs 4s │ mush › Starting with the rename.    │
-│   ✓ #2   docs     wrote README   │       ⚙ edit_file src/lex.rs        │
+┌ agents · 2 working · Σ +12 −3 ───┬ mush ───────────────────────────────┐
+│▶◐ #0 ⏸1 root  thinking 4s        │you › rename the lexer module        │
+│   ◐ #1 lexer  mush/1 +12−3       │mush › Starting with the rename.     │
+│   ✓ #2 docs  wrote README        │      ⚙ edit_file src/lex.rs         │
 │                                  ├─────────────────────────────────────┤
 │                                  │ › _                                 │
 └──────────────────────────────────┴─────────────────────────────────────┘
- chat  Tab cycles panes · /help lists commands
+ chat  Tab cycles panes · /help lists commands · Ctrl-P picks a model
  ⌂ ~/p/demo │ master ±3 +12−3 │ deepseek-flash @ deepseek.com · ctx 12k/~500k
 ```
 
@@ -25,6 +25,8 @@ and see what changed.
 cargo build --release
 ./target/release/mush /path/to/project    # or just: mush
 ```
+
+`mush --version` (or `-V`) prints the version and exits.
 
 `Tab` moves between the **agents** tree and the **chat**. Type in the message
 box and press `Enter`. The agent works the workspace through six tools —
