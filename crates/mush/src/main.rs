@@ -559,7 +559,13 @@ fn event_loop(
 
         app.tick();
         if app.dirty_screen {
-            terminal.draw(|frame| ui::draw(frame, app))?;
+            // One value, painted: `App` derives every word of the frame (the
+            // layout tiers included), and `ui::draw` only paints it, so what is
+            // on screen cannot be a second derivation of the state it draws.
+            terminal.draw(|frame| {
+                let screen = app.screen(frame.area());
+                ui::draw(frame, &screen)
+            })?;
             app.dirty_screen = false;
         }
     }
