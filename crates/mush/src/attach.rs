@@ -62,6 +62,25 @@ impl Drop for Guard {
 /// another mush, and the bind refuses the name rather than stealing its
 /// socket.
 pub fn serve(root: &Path, ui_tx: Sender<Msg>) -> Result<Guard, String> {
+    serve_with(root, ui_tx, |listener, ui_tx| {
+        thread::Builder::new()
+            .name("mush-attach".to_string())
+            .spawn(move || accept_loop(listener, ui_tx))
+            .map(|_| ())
+            .map_err(|error| format!("could not start the attach thread: {error}"))
+    })
+}
+
+/// [`serve`] with the one step no test can make fail injected: starting the
+/// thread that runs the accept loop. A spawn the OS refuses is exactly what
+/// finding A7 is about — the socket file must go with the failed serve — and a
+/// thread the OS will not give cannot be asked for on purpose, so the failing
+/// start is the test's own.
+fn serve_with(
+    root: &Path,
+    ui_tx: Sender<Msg>,
+    start: impl FnOnce(UnixListener, Sender<Msg>) -> Result<(), String>,
+) -> Result<Guard, String> {
     let path = socket_path(root);
     if path.exists() && UnixStream::connect(&path).is_err() {
         let _ = std::fs::remove_file(&path);
@@ -72,10 +91,7 @@ pub fn serve(root: &Path, ui_tx: Sender<Msg>) -> Result<Guard, String> {
     // The guard is built before the thread so the file is never left behind if
     // the spawn fails: returning here drops it, and its `Drop` removes the
     // socket (finding A7).
-    thread::Builder::new()
-        .name("mush-attach".to_string())
-        .spawn(move || accept_loop(listener, ui_tx))
-        .map_err(|error| format!("could not start the attach thread: {error}"))?;
+    start(listener, ui_tx)?;
     Ok(guard)
 }
 
@@ -820,6 +836,31 @@ mod tests {
         assert!(UnixStream::connect(&path).is_ok(), "the new socket is live");
         drop(guard);
         assert!(!path.exists());
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A thread that will not start must not leave the socket file behind. The
+    /// guard is built before the start, so the failed serve returns through its
+    /// `Drop` and the file goes with it (finding A7).
+    #[test]
+    fn a_thread_that_will_not_start_takes_the_socket_with_it() {
+        let root = std::env::temp_dir().join(format!("mush-attach-spawn-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+
+        let error = match serve_with(&root, tx, |_, _| Err("no threads today".to_string())) {
+            Ok(_) => panic!("a start that fails fails the serve"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error, "no threads today",
+            "the start's own words reach the caller"
+        );
+        assert!(
+            !socket_path(&root).exists(),
+            "the bound socket went with the failed serve"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 }
