@@ -400,12 +400,19 @@ impl Outcome {
     /// and mark it read. `agent_status` used to print every child's entire
     /// final message on every call, so a parent that polled it re-read every
     /// child's report again and again (the replay this digest closes).
+    ///
+    /// This is also the *one* sentence per ending: a listing and a wait both
+    /// read it and only add their own marks around it, because two surfaces
+    /// that each spell an ending are two chances to disagree about what a stop
+    /// means.
     fn digest(&self, id: u64) -> String {
         let (mark, body) = match self {
             Outcome::Finished(summary) => ("✓", summary.as_str()),
             Outcome::Failed(error) => ("✗", error.as_str()),
             Outcome::Stopped => {
-                return format!("#{id} ⊘ stopped — idle and resumable");
+                return format!(
+                    "#{id} ⊘ stopped — idle and resumable (control message resumes it)"
+                );
             }
             Outcome::CutOff => {
                 return format!("#{id} ⚠ cut off — the run never ended; nothing was committed");
@@ -2999,21 +3006,13 @@ fn child_listing(state: &ActorState) -> String {
         // run, so an older branch never reads as the newer run's work.
         let work = state.work_for(id).map(Work::digest).unwrap_or_default();
         match state.outcome(id) {
-            // Each state gets its own mark: a stopped child was neither
-            // finished (✓) nor failed (✗), and a parent that cannot tell them
-            // apart treats a stop as a result.
-            Some(outcome @ (Outcome::Finished(_) | Outcome::Failed(_))) => {
-                lines.push(format!("{unread}{}{work}", outcome.digest(id)));
-            }
-            Some(Outcome::Stopped) => lines.push(format!(
-                "{unread}#{id} ⊘ stopped — idle and resumable (control message resumes it){work}"
-            )),
-            // A run that never ended. Its own line, because the parent's next
-            // move depends on it: there is no result coming and the work may be
-            // sitting uncommitted (finding H2).
-            Some(Outcome::CutOff) => lines.push(format!(
-                "{unread}#{id} ⚠ cut off — the run never ended; nothing was committed"
-            )),
+            // One sentence per ending, and the ending owns it: the listing
+            // composes only its marks around what `digest` says — the `✉` of a
+            // result nobody has read, and the work fact — for every variant.
+            // Each state kept its own sentence here once, which is how a
+            // stopped child came to read one way to a listing and another to a
+            // `wait` (finding H2).
+            Some(outcome) => lines.push(format!("{unread}{}{work}", outcome.digest(id))),
             None => lines.push(format!("#{id} ◐ running")),
         }
     }
@@ -3808,26 +3807,90 @@ mod tests {
     /// Stopped, finished and failed are three different things, and a parent
     /// that cannot tell them apart treats a stop as a result. Each gets its own
     /// mark: `✓` only ever means a run produced something.
+    ///
+    /// The sentence is written **once**, for all four endings: the listing is
+    /// that sentence plus the marks it composes around it (`✉`, and the work
+    /// fact when the run left one), and the wait's digest is the same sentence
+    /// again — a reader that re-spelled an ending could say something about a
+    /// stop that no other surface said.
     #[test]
     fn status_distinguishes_stopped_from_done_and_failed() {
         let (actor, _mailbox) = test_actor("status-marks");
         let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
         let mut state = ActorState::default();
-        state.children.insert(1, tx.clone());
-        note_completion(&mut state, 1, 1, Outcome::Stopped);
-        state.children.insert(2, tx.clone());
-        note_completion(&mut state, 2, 1, Outcome::Finished("did the thing".into()));
-        state.children.insert(3, tx);
-        note_completion(&mut state, 3, 1, Outcome::Failed("no route".into()));
+        let outcomes = [
+            Outcome::Stopped,
+            Outcome::CutOff,
+            Outcome::Finished("did the thing".into()),
+            Outcome::Failed("no route".into()),
+        ];
+        for (index, outcome) in outcomes.iter().enumerate() {
+            let id = index as u64 + 1;
+            state.children.insert(id, tx.clone());
+            note_completion(&mut state, id, 1, outcome.clone());
+        }
 
+        // Nothing has been read, so every line carries the `✉` and no work
+        // fact has been sent: the line *is* the outcome's sentence plus that
+        // one mark.
+        let listing = child_listing(&state);
+        let lines: Vec<&str> = listing.lines().collect();
+        for (index, outcome) in outcomes.iter().enumerate() {
+            let id = index as u64 + 1;
+            assert_eq!(
+                lines[index],
+                format!("✉ {}", outcome.digest(id)),
+                "the listing is the outcome's sentence, marked"
+            );
+        }
         let lines = status_tool(&actor, &state).unwrap();
         assert!(lines.contains("#1 ⊘ stopped"), "a stop is not a ✓: {lines}");
-        assert!(lines.contains("#2 ✓ did the thing"), "{lines}");
-        assert!(lines.contains("#3 ✗ no route"), "{lines}");
+        assert!(lines.contains("#2 ⚠ cut off"), "{lines}");
+        assert!(lines.contains("#3 ✓ did the thing"), "{lines}");
+        assert!(lines.contains("#4 ✗ no route"), "{lines}");
         // The old shape — a sentinel string leaking into the parent's view —
         // reported a stopped child as a *finished* one.
         assert!(!lines.contains("#1 ✓"), "{lines}");
         assert!(!lines.contains("cancelled"), "{lines}");
+
+        // The work fact is the other mark, hung on the same sentence.
+        note_work(
+            &mut state,
+            1,
+            1,
+            Work::Clean {
+                branch: "mush/1".into(),
+            },
+        );
+        let listing = child_listing(&state);
+        let first = listing.lines().next().unwrap();
+        assert_eq!(
+            first,
+            format!(
+                "✉ {}{}",
+                Outcome::Stopped.digest(1),
+                Work::Clean {
+                    branch: "mush/1".into()
+                }
+                .digest()
+            ),
+            "the listing adds the work fact to the same sentence"
+        );
+
+        // And the other reader: `wait` answers an already-read result with the
+        // same digest, so both roads say one thing about one ending.
+        for id in 1..=outcomes.len() as u64 {
+            state.delivered.insert(id, 1);
+        }
+        let answers = wait_digest(&actor, &mut state, false);
+        for (index, outcome) in outcomes.iter().enumerate() {
+            let id = index as u64 + 1;
+            assert_eq!(
+                answers[index],
+                format!("{} (already read — no new run since)", outcome.digest(id)),
+                "the wait's digest is the same sentence"
+            );
+        }
     }
 
     /// A finished isolated child's listing says where its work is and whether
