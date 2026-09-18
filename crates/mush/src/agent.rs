@@ -493,11 +493,14 @@ pub enum AgentMsg {
     /// Not a result and not a delivery: a listing fact (`status`), so it
     /// starts no run and marks nothing read (finding H1).
     Work { id: u64, run: u64, work: Work },
-    /// A child that was at rest began a run the parent did not start: the human
-    /// nudged it, or a client did. The UI is the only hand that sees that, and
-    /// the parent's books need it — a wait would otherwise answer a stale
-    /// result, and the shared-workspace guard would miss a sibling that is
-    /// working (audit of the prompt vs behaviour, row 1).
+    /// A child that began a run the parent did not start: the human nudged it,
+    /// a client did, or the parent's own `control message` started it. The
+    /// witnesses are the hand that saw it — the UI, which is the human's — and
+    /// the child's own actor, which is the only one that knows a `Steer`
+    /// *resumed* it instead of being read mid-run. The parent's books need it
+    /// either way: a wait would otherwise answer a stale result, and the
+    /// shared-workspace guard would miss a sibling that is working (audit of the
+    /// prompt vs behaviour, row 1).
     ChildRunning { id: u64 },
     /// A job this agent started ended. `line` is the report its owner reads,
     /// rendered once by the registry; `news` says whether it is worth waking a
@@ -1101,6 +1104,20 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
                 cancel: cancel.clone(),
             },
         );
+        // Say it to the parent too, and *before* the run does anything: a run
+        // starting is the child's own news, and a parent that infers it from
+        // its own books can be wrong. Its own `control message` is the case: a
+        // `Steer` the parent read as "mid-run" may have arrived after the run
+        // ended, so it *starts* one — and the completion of the run before it
+        // is still travelling to the parent, which would then record it and
+        // leave a working child marked at rest (a `status` line, the
+        // one-shared-child guard, and the next `wait` all read that). The
+        // message order closes it: the parent drains the completion first, then
+        // this, and the books end where the child really is. The root's parent
+        // receiver is dead, so its send is dropped.
+        let _ = actor
+            .parent_tx
+            .send(AgentMsg::ChildRunning { id: actor.id });
         actor.ctx.live.fetch_add(1, Ordering::SeqCst);
         let result = run_loop(&actor, &mut state, &mut transcript, &cancel);
         actor.ctx.live.fetch_sub(1, Ordering::SeqCst);
@@ -9534,6 +9551,76 @@ mod tests {
     /// How long a scenario waits for something the run is *supposed* to do.
     /// Only ever spent waiting for an event, never asserting on it.
     const WAIT: Duration = Duration::from_secs(5);
+
+    /// A run starting is told to the parent by the actor that starts it.
+    ///
+    /// The parent's own books are a guess otherwise: `control message` decides
+    /// whether it is resuming a child or interrupting one from the mark it
+    /// holds, and the mark can be one completion behind — a `Steer` that reads
+    /// as "mid-run" can be the thing that starts the run. The child is the only
+    /// witness, so it says so as the run begins, and the completion of the run
+    /// before it (drained first, same channel) cannot leave a working child
+    /// marked at rest.
+    #[test]
+    fn a_starting_run_tells_its_parent() {
+        let model = Arc::new(Scripted::new().says("done"));
+        let (actor, _events, _mailbox) = scripted_actor("child-running", &model);
+        let (parent_tx, parent_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let child = Actor { parent_tx, ..actor };
+        start(child, vec![Message::user("do the thing")], true);
+
+        // The run's start, before the run's report — which is the order that
+        // makes the parent's mark exact rather than a guess.
+        let first = parent_rx
+            .recv_timeout(WAIT)
+            .expect("the parent is told the run started");
+        assert!(
+            matches!(first, AgentMsg::ChildRunning { id: 7 }),
+            "the mark, not the report"
+        );
+        let second = parent_rx.recv_timeout(WAIT).expect("then the run reports");
+        assert!(
+            matches!(second, AgentMsg::ChildDone { id: 7, run: 1, .. }),
+            "and the report follows"
+        );
+
+        // The other end of that order, on the parent's own books: the
+        // completion of the run *before* the one just started, folded first,
+        // leaves the child marked at rest for exactly one message — and the
+        // start that follows puts the mark back, because the child really is
+        // running.
+        let (actor, _mailbox) = test_actor("stale-then-running");
+        let mut state = ActorState::default();
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+        state.running.insert(1);
+        note_completion(&mut state, 1, 1, Outcome::Stopped);
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ChildDone {
+                id: 1,
+                run: 2,
+                outcome: Outcome::Stopped,
+            },
+        );
+        assert!(
+            !state.running.contains(&1),
+            "the run that ended is booked as ended"
+        );
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ChildRunning { id: 1 },
+        );
+        assert!(
+            state.running.contains(&1),
+            "and the run that started is booked as started"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
 
     /// What the actors told the UI, as a test watches a run.
     ///
