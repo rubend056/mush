@@ -918,17 +918,10 @@ impl Registry {
         }
     }
 
-    /// Bounded on its own terms, windows first: they share [`STATUS_WINDOW`],
-    /// so a status spends the same budget on one job or on sixteen, and no job
-    /// is ever dropped from the list for being old. What rides on top is one
-    /// headline per job.
-    ///
-    /// The headline is the one line that is not cut. It names the command the
-    /// model chose, and half a command is a job that cannot be told from the
-    /// next one in the list it is choosing between; a command that is a
-    /// paragraph costs the status one longer line, where a cut window would
-    /// cost it what the job died of. The windows — the text nobody chose — are
-    /// what the budget is spent on.
+    /// Bounded on its own terms, windows first: they share [`STATUS_WINDOW`], so
+    /// a status spends the same budget on one job or on sixteen. Each job's
+    /// headline is the one line that is not cut — half a command is a job that
+    /// cannot be told from the next one in the list it is choosing between.
     ///
     /// The jobs `owner` should know about: what is running, and what recently
     /// ended. One line each with the window under it — read live from the

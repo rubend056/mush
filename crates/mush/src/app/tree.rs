@@ -158,22 +158,9 @@ impl Phase {
     }
 
     /// What this phase is, in the fewest words, for the one line that has to
-    /// name every live agent at once (finding H9).
-    ///
-    /// Every phase but one answers with its machine name ([`Phase::label`]), so
-    /// the quit line and a client reading the attach roster cannot call the same
-    /// phase two things. This used to spell the stems again and collapse
-    /// `Stopped`, `Done` and `Failed` to `idle`, which made a stopped agent that
-    /// still owned a running job read `#0 idle + 1 job` — the agent was not
-    /// idle, and the job was the whole reason the line existed (findings §6,
-    /// refactor R22).
-    ///
-    /// [`Phase::Activity`] is the exception: `working` is the right word for a
-    /// roster cell but says nothing on the bar, where the tool's own name fits —
-    /// `edit_file` says what the agent is at without spending the row on the
-    /// path it is editing. The painter's prose for the one row the human is
-    /// looking at (`app::screen::phase_detail`) spells the same phase out with
-    /// its age, which is the painter's to say.
+    /// name every live agent at once; every phase answers with [`Phase::label`]
+    /// but [`Phase::Activity`], where the bar fits the tool's own name instead
+    /// of the roster's `working` (finding H9, refactor R22).
     pub fn doing(&self) -> &str {
         match self {
             Phase::Activity(what) => what.split_whitespace().next().unwrap_or("working"),

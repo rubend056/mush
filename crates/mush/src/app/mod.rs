@@ -1541,19 +1541,10 @@ impl App {
     /// `Enter` on a row, `edit` is the message box and the send — so the
     /// socket cannot reach a state the human could not.
     pub fn handle_attach(&mut self, from: &str, request: &attach::Request) -> attach::Response {
-        // A client's op is not the human's own key. A key means the human
-        // changed their mind, and every door a key takes a quit's warning back
-        // through is a deliberate [`Self::disarm_quit`]; a client's `focus`,
-        // draft or send must not end a confirmation the human is in the middle
-        // of. The warning *is* the arm (finding H9), so an op that says its own
-        // line would cancel the press they are holding — so the warning is put
-        // back exactly as it stood, same `set_at`, so it still fades when it
-        // would have. The client's answer travels on the socket it asked from.
-        //
-        // A *failure* the op caused is not put back under: it is the thing the
-        // human has to read (`chat::Rank::Alert`, the rank the warning holds
-        // too), and the bar has one row for the two — overwriting it would lose
-        // the op's own failure entirely (findings §6, H9).
+        // A client's op must not end the quit a key armed
+        // ([`Self::disarm_quit`]), so the warning is put back exactly as it
+        // stood — but not over a failure the op itself caused, a line the
+        // human has to read (finding H9).
         let armed_quit = self.status.clone().filter(|_| self.quit_armed());
         let reply = match &request.op {
             attach::Op::Read { agent, since } => self.attach_read(*agent, *since),
@@ -3366,7 +3357,6 @@ mod tests {
         (screen, terminal.backend().buffer().clone())
     }
 
-    /// One painted frame as a [`Shot`]: the `Screen` and its cells.
     fn shot(app: &mut App, width: u16, height: u16) -> Shot {
         let (screen, buffer) = painted(app, width, height);
         let cells = (0..height)

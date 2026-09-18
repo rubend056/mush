@@ -708,8 +708,7 @@ fn facts_line(app: &App, width: usize) -> String {
 
 /// Drop cells from the right until the line fits: one rule for the two lines
 /// that are built this way — the pane's title and the facts under it — and the
-/// one home of it (finding D9; the loop left the painter, and what stayed
-/// behind was a copy per caller).
+/// one home of it (finding D9).
 ///
 /// A cell goes whole, because a clause cut mid-number (`Σ +324 −`, `2 waitin`)
 /// is a count that is not the count. The first `min_kept` cells are never given
