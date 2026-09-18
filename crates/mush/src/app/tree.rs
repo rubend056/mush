@@ -18,6 +18,7 @@ use crossbeam_channel::Sender;
 
 use mush_core::git;
 use mush_core::message::Message;
+use mush_core::prompt;
 use mush_core::text::truncate;
 use mush_core::tools::ToolName;
 
@@ -667,7 +668,7 @@ impl AgentTree {
     /// the conversation, not to the tree.
     pub fn insert(&mut self, spawn: Spawn) -> Opened {
         let opening = if spawn.brief.trim().is_empty() {
-            "Begin the task now.".to_string()
+            prompt::BEGIN_TASK.to_string()
         } else {
             spawn.brief.clone()
         };

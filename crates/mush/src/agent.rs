@@ -2748,10 +2748,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         depth + 1 < MAX_DEPTH,
     );
     let initial = if brief.trim().is_empty() {
-        vec![
-            Message::system(whoami),
-            Message::user("Begin the task now."),
-        ]
+        vec![Message::system(whoami), Message::user(prompt::BEGIN_TASK)]
     } else {
         vec![Message::system(whoami), Message::user(brief.clone())]
     };
