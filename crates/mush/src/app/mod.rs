@@ -225,6 +225,17 @@ pub const fn is_below_floor(width: u16, height: u16) -> bool {
 pub enum StatusKind {
     Info,
     Error,
+    /// The warning a quit waits on: `Ctrl-Q` again and mush goes, killing what
+    /// the line names (finding H9).
+    ///
+    /// A kind of its own because it needs two rules nothing else does. It is
+    /// ranked an alert, like a failure: the human who pressed `Ctrl-Q` must
+    /// never see the derived activity line instead — `waiting on 2 subagent(s)`
+    /// is exactly the state they are quitting *from*, and a warning hidden
+    /// behind it is how a second press becomes a silent kill. And it fades like
+    /// `Info`: an arm nobody can see any more is not an arm, so the warning and
+    /// the arming it stands for end together.
+    Quit,
 }
 
 /// How long an `Info` line is worth showing. Long enough to read after a
@@ -264,6 +275,61 @@ fn job_title(command: &str) -> String {
         .join(" ");
     let clause = first.rsplit("&&").next().unwrap_or(&first).trim();
     mush_core::text::truncate(clause, JOB_TITLE_COLUMNS)
+}
+
+/// How much of one bar row the quit warning may spend.
+///
+/// One row at the ubiquitous 80×24 is 73 columns — the ` chat ` badge and the
+/// space after it take seven of the eighty — and a column is left spare. The
+/// bar paints its line whole and does no width arithmetic of its own, so a
+/// warning longer than this would have its tail clipped: the last names, and
+/// the count of what could not be named, would be the parts silently lost
+/// (finding H9).
+const QUIT_LINE_COLUMNS: usize = 72;
+
+/// The line a quit over live work paints: `Ctrl-Q again quits · kills #0
+/// thinking, #3 wait_commands + 1 job`.
+///
+/// The first clause is the decision the human is making twice; everything after
+/// it is [`App::what_a_quit_kills`], one item per thing, joined until the row
+/// is spent. What does not fit is *counted*, never dropped: a tree with more
+/// live agents than a row can name says `+2 more`, which is honest, where a
+/// clipped list reads as a short one. The first item is taken whatever it
+/// costs — an item is an id, a word and a count, so it always fits — because a
+/// warning that named nothing would be the silence this line exists to end.
+fn quit_warning(items: &[String], columns: usize) -> String {
+    const OPENING: &str = "Ctrl-Q again quits · kills ";
+    /// What the line ends with when `left` things go unnamed.
+    fn more(left: usize) -> String {
+        format!(", +{left} more")
+    }
+    let mut text = OPENING.to_string();
+    let mut width = OPENING.chars().count();
+    let mut named = 0;
+    for (index, item) in items.iter().enumerate() {
+        let separator = if index == 0 { 0 } else { 2 }; // ", "
+                                                        // Stopping after this item means ending with the count of the rest, so
+                                                        // the room that tail needs is reserved now — a line that fit its names
+                                                        // and not its count would drop exactly the word that keeps it honest.
+        let tail = if index + 1 < items.len() {
+            more(items.len() - index - 1).chars().count()
+        } else {
+            0
+        };
+        if index > 0 && width + separator + item.chars().count() + tail > columns {
+            break;
+        }
+        width += separator + item.chars().count();
+        if index > 0 {
+            text.push_str(", ");
+        }
+        text.push_str(item);
+        named += 1;
+    }
+    if named < items.len() {
+        text.push_str(&more(items.len() - named));
+    }
+    text
 }
 
 #[derive(Clone, Debug)]
@@ -728,11 +794,18 @@ impl App {
             }
         }
         if let Some(status) = &self.status {
-            if status.kind == StatusKind::Info && status.set_at.elapsed() >= INFO_TTL {
+            // A failure stays until something replaces it; everything else —
+            // the quit warning included, whose arm ends when its line does —
+            // fades.
+            if status.kind != StatusKind::Error && status.set_at.elapsed() >= INFO_TTL {
                 self.status = None;
                 self.dirty_screen = true;
             }
         }
+        // While a quit waits for its second key, its warning is rewritten from
+        // the tree it is about: the line names what is running now, not what
+        // was running when the key was pressed (finding H9).
+        self.refresh_quit_warning();
         // The same expiry for the pane's own transient lines, on the same tick:
         // a command's answer or a hint that nobody ended by acting must not sit
         // in the foot for the life of the session (finding U8). Failures are not
@@ -981,7 +1054,8 @@ impl App {
     /// [`mush_core::text::sanitize`]d here, because the bar paints it whole —
     /// it does no width arithmetic, so the `truncate`/`fit_row` rule cannot
     /// reach it. Private, so every string the bar can show is created by
-    /// [`Self::say`] or [`Self::fail`], which differ only in the kind.
+    /// [`Self::say`], [`Self::fail`] or a quit's own warning ([`StatusKind::Quit`]),
+    /// which differ only in the kind.
     fn set_status(&mut self, kind: StatusKind, text: impl Into<String>) {
         let text = text.into();
         self.status = Some(Status {
@@ -1488,9 +1562,16 @@ impl App {
     /// silent fall-through, and it is what lets the help text, the parser and
     /// these arms all read the same table (`app::commands`).
     fn apply_command(&mut self, command: Command) {
+        // A command that is not `/quit` is the human choosing something else,
+        // and it takes an armed quit back the way any other key does
+        // ([`Self::disarm_quit`]). `/quit` itself is left alone: it is the
+        // second step of the two-step quit, typed.
+        if !matches!(command, Command::Quit) {
+            self.disarm_quit();
+        }
         match command {
             Command::New => self.new_chat(),
-            Command::Quit => self.should_quit = true,
+            Command::Quit => self.request_quit(),
             Command::Help => self.chat.note(help_notice()),
             Command::Notes => self.open_notes_picker(),
             Command::Context(None) => self.say(format!(
@@ -2222,6 +2303,15 @@ impl App {
     /// keyboard in one readable list: which pane moves, what is sent, what is
     /// picked, and which config change is remembered.
     fn apply_intent(&mut self, intent: Intent) {
+        // Any key but `Ctrl-Q` takes an armed quit back — `Ctrl-C` above all,
+        // because "stop this agent" is the opposite of "quit" — and the keys
+        // the human is *typing* are the exception: `/quit` is spelled out key
+        // by key, and a warning that disarmed itself on the way in could never
+        // run it. What the human sends from the box is judged where it lands,
+        // in `apply_command`.
+        if intent != Intent::Quit && !matches!(intent, Intent::Chat(_) | Intent::Send) {
+            self.disarm_quit();
+        }
         match intent {
             Intent::Ignore => {}
             Intent::Quit => self.request_quit(),
@@ -2249,8 +2339,135 @@ impl App {
         }
     }
 
+    /// `Ctrl-Q` (and `/quit`): leave — but never silently over live work.
+    ///
+    /// The exit kills the agents' process groups (finding H9): a model call in
+    /// flight, the command an agent is parked on, every detached job. The human
+    /// who quits is owed the names of what that costs, so the first press
+    /// *arms* — the bar's line says what will die — and the next one does it.
+    /// The second press is read off the line itself ([`Self::quit_armed`]), so
+    /// an arm cannot outlive the warning that explains it. With nothing live
+    /// there is nothing to warn about, and the ordinary quit stays one
+    /// keystroke.
     fn request_quit(&mut self) {
-        self.should_quit = true;
+        let kills = self.what_a_quit_kills();
+        if kills.is_empty() || self.quit_armed() {
+            self.should_quit = true;
+            return;
+        }
+        self.arm_quit(&kills);
+    }
+
+    /// Whether a quit is waiting for its second key: the warning is the line
+    /// the bar is showing, inside that line's own life ([`INFO_TTL`]).
+    ///
+    /// Derived from the line and not stored beside it, so nothing can leave an
+    /// arm standing with no notice to show for it: whatever replaces the line —
+    /// a job's report, an agent's failure, [`Self::disarm_quit`] — has
+    /// disarmed the quit by being written, and a warning nobody can see any
+    /// more is not a warning.
+    fn quit_armed(&self) -> bool {
+        matches!(self.status_line(), Some((_, StatusKind::Quit)))
+    }
+
+    /// Take an armed quit back: the human did something other than quit, and
+    /// the warning belongs to the moment it was said, so it goes with it.
+    fn disarm_quit(&mut self) {
+        if self.quit_armed() {
+            self.status = None;
+        }
+    }
+
+    /// What a quit would kill, one item per thing that dies: `#0 thinking`,
+    /// `#3 run_command + 1 job`.
+    ///
+    /// The set is [`Self::working_agents`] — the predicate `Ctrl-C` and the
+    /// tree's `c` already ask, so the line cannot name an agent that has
+    /// stopped or miss one that is running — plus, per agent, how many jobs go
+    /// with it. The jobs' *commands* are deliberately not spelled out here: the
+    /// agent's row and its cursor row's footer already name each one
+    /// (`cargo build 1m20s`, finding U5), and the bar has a single row for the
+    /// whole tree. The registry's own count closes the one gap the rows have: a
+    /// job whose agent was forgotten with `/forget` runs on, is killed by the
+    /// quit like any other, and is owned by a node that is gone.
+    fn what_a_quit_kills(&self) -> Vec<String> {
+        let mut items = Vec::new();
+        let mut named_jobs = 0;
+        for id in self.working_agents() {
+            let Some(node) = self.tree.node(id) else {
+                continue;
+            };
+            let jobs = self.tree.live_jobs(id).len();
+            named_jobs += jobs;
+            let jobs = match jobs {
+                0 => String::new(),
+                1 => " + 1 job".to_string(),
+                count => format!(" + {count} jobs"),
+            };
+            items.push(format!("#{id} {}{jobs}", node.phase.doing()));
+        }
+        let stray = self
+            .tree
+            .handles()
+            .jobs
+            .running()
+            .saturating_sub(named_jobs);
+        if stray > 0 {
+            items.push(match stray {
+                1 => "a job whose agent is gone".to_string(),
+                count => format!("{count} jobs whose agents are gone"),
+            });
+        }
+        items
+    }
+
+    /// Arm the quit: the bar's line becomes the warning for `kills`.
+    ///
+    /// A warning that is *still standing* keeps its clock, so recomposing it on
+    /// a tick cannot extend the arming — and one whose five seconds are up does
+    /// not: arming again shows a warning with a life of its own, rather than one
+    /// that expires as it appears.
+    fn arm_quit(&mut self, kills: &[String]) {
+        let set_at = if self.quit_armed() {
+            self.status.as_ref().map(|status| status.set_at)
+        } else {
+            None
+        };
+        // The one door a bar line goes through, so the text is sanitized once
+        // by one rule.
+        self.set_status(StatusKind::Quit, quit_warning(kills, QUIT_LINE_COLUMNS));
+        if let (Some(at), Some(status)) = (set_at, self.status.as_mut()) {
+            status.set_at = at;
+        }
+    }
+
+    /// Keep an armed quit's warning true to the tree.
+    ///
+    /// The line is composed from the phases and the registry, so a tick
+    /// re-composes it: work that ends while the human is deciding leaves the
+    /// line, and a quit with nothing left to warn about stops being armed — the
+    /// next `Ctrl-Q` is then an ordinary one, which is the truth, because there
+    /// is nothing left to kill. The clock is *not* restarted, so the warning
+    /// still fades with the moment the first key made it.
+    fn refresh_quit_warning(&mut self) {
+        if !self.quit_armed() {
+            return;
+        }
+        let kills = self.what_a_quit_kills();
+        if kills.is_empty() {
+            self.status = None;
+            self.dirty_screen = true;
+            return;
+        }
+        let text = quit_warning(&kills, QUIT_LINE_COLUMNS);
+        if self
+            .status
+            .as_ref()
+            .is_some_and(|status| status.text != text)
+        {
+            self.arm_quit(&kills);
+            self.dirty_screen = true;
+        }
     }
 
     /// Ask one agent's current run to stop: flip the flag its in-flight model
@@ -2676,6 +2893,15 @@ mod tests {
         if let Some(status) = app.status.as_mut() {
             status.set_at = Instant::now() - Duration::from_secs(seconds);
         }
+    }
+
+    /// A `Ctrl-` key as the terminal delivers it: one press, through the key
+    /// table and the arms, exactly as `main` routes it.
+    fn ctrl(app: &mut App, key: char) {
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char(key),
+            KeyModifiers::CONTROL,
+        )));
     }
 
     /// A real `App` on a scratch directory, with a real (idle) root actor. The
@@ -4270,6 +4496,288 @@ mod tests {
         );
         drop(app);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A quit kills the agents' process groups (finding H9), so the human who
+    /// quits is told what that costs before it happens: two runs were lost to a
+    /// `Ctrl-Q` that said nothing. The first press arms and names them; the
+    /// second, while the line is still there, is the quit.
+    #[test]
+    fn a_live_run_arms_the_quit_and_names_what_dies() {
+        let (mut app, _rx) = test_app("quit-armed");
+        app.chat.insert("do the thing");
+        app.send_message();
+        assert_eq!(app.tree.agents[0].phase, Phase::Thinking, "the root runs");
+
+        ctrl(&mut app, 'q');
+
+        assert!(!app.should_quit, "the first Ctrl-Q warns, it does not quit");
+        assert_eq!(
+            text_of(&app),
+            "Ctrl-Q again quits · kills #0 thinking",
+            "the line names the agent and what it is doing"
+        );
+
+        ctrl(&mut app, 'q');
+
+        assert!(app.should_quit, "the second one is the quit");
+    }
+
+    /// A detached job is work in flight too, and it is a process group the old
+    /// silent quit left running (finding S4/H9): the line counts it beside the
+    /// agent whose jobs they are — an agent at rest whose `cargo build` is not.
+    #[test]
+    fn a_detached_job_is_counted_in_the_quit_warning() {
+        use crate::jobs::Launch;
+        use crate::machine::fake::{Script, Scripted as ScriptedMachine};
+        use crate::machine::{Machine, ShellCommand};
+
+        let (mut app, _rx) = test_app("quit-job");
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let job = machine
+            .spawn(&ShellCommand {
+                command: "cargo build",
+                root: std::path::Path::new("/tmp"),
+            })
+            .unwrap();
+        let (tx, job_rx) = crossbeam_channel::unbounded();
+        app.tree
+            .handles()
+            .jobs
+            .launch(Launch::started(
+                0,
+                "cargo build".to_string(),
+                false,
+                tx,
+                job,
+            ))
+            .unwrap();
+        assert!(app.busy(), "a job is work in flight");
+
+        ctrl(&mut app, 'q');
+
+        assert!(
+            !app.should_quit,
+            "a running job is not nothing to warn about"
+        );
+        assert_eq!(
+            text_of(&app),
+            "Ctrl-Q again quits · kills #0 idle + 1 job",
+            "the agent is at rest, its job is not"
+        );
+
+        ctrl(&mut app, 'q');
+        assert!(app.should_quit, "and the second press still quits");
+
+        // The quit is the one that kills, as it always was: `Drop` is the only
+        // killer and the job's own thread reports the stop.
+        drop(app);
+        assert!(matches!(
+            job_rx.recv_timeout(Duration::from_secs(5)),
+            Ok(AgentMsg::CommandDone { .. })
+        ));
+    }
+
+    /// The common quit kills nothing, so it stays one keystroke and stays
+    /// silent: a warning every quit must read is a warning nobody reads.
+    #[test]
+    fn a_quit_with_nothing_live_is_still_one_key() {
+        let (mut app, _rx) = test_app("quit-idle");
+        assert!(!app.busy());
+
+        ctrl(&mut app, 'q');
+
+        assert!(app.should_quit, "one key, no confirmation step");
+        assert_eq!(text_of(&app), "", "and nothing said about it");
+        assert!(!app.quit_armed());
+    }
+
+    /// `/quit` is the same two-step quit in words. The letters that spell it
+    /// are typing, not a change of mind, so they do not disarm what they are on
+    /// their way to run — a command that armed itself off on the way in could
+    /// never quit. `Ctrl-C` and the tree's own keys do disarm it.
+    #[test]
+    fn slash_quit_is_the_same_two_step_quit() {
+        let (mut app, _rx) = test_app("quit-said");
+        app.chat.insert("do the thing");
+        app.send_message();
+        assert!(app.busy());
+
+        let typed = |app: &mut App, line: &str| {
+            for letter in line.chars() {
+                app.on_key(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::NONE));
+            }
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        };
+
+        typed(&mut app, "/quit");
+        assert!(!app.should_quit, "the typed quit warns first");
+        assert!(app.quit_armed());
+
+        typed(&mut app, "/quit");
+        assert!(app.should_quit, "the second /quit is the quit");
+    }
+
+    /// `Ctrl-C` is the opposite of quitting, so it takes the arming back — and
+    /// mush is not wedged by having been warned at: the stop lands, the next
+    /// message reaches the agent, and the exit still flushes what the debounce
+    /// had not.
+    #[test]
+    fn ctrl_c_disarms_the_quit_and_the_app_keeps_working() {
+        let root = dir("quit-disarmed");
+        let (mut app, _writer) = app_writing(&root);
+        app.chat.insert("do the thing");
+        app.send_message();
+        assert_eq!(app.tree.agents[0].phase, Phase::Thinking);
+
+        ctrl(&mut app, 'q');
+        assert!(!app.should_quit);
+        assert!(app.quit_armed());
+
+        ctrl(&mut app, 'c');
+
+        assert!(!app.should_quit, "Ctrl-C is not a quit");
+        assert!(!app.quit_armed(), "and it takes the warning back");
+        assert_eq!(text_of(&app), "", "the line goes with the arming");
+
+        // The stop lands, and the next message starts a run the row shows.
+        let conversation = app.tree.conversation();
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Stopped,
+        });
+        app.chat.insert("still here");
+        app.send_message();
+        assert_eq!(
+            app.tree.agents[0].phase,
+            Phase::Thinking,
+            "the message reached the agent"
+        );
+
+        drop(app);
+
+        let stored = Session::load(&root).expect("the exit flush wrote it");
+        assert_eq!(
+            stored.messages.last().map(|message| message.text()),
+            Some("still here")
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A line that cannot name everything *counts* what is left, and it fits one
+    /// bar row at 80×24. A clipped list would read as a short one, and the human
+    /// would quit believing they knew what it cost (finding H9).
+    #[test]
+    fn the_quit_warning_fits_the_bar_and_counts_the_rest() {
+        let (mut app, _rx) = test_app("quit-many");
+        let mut _mailboxes = Vec::new();
+        for id in 1..=5u64 {
+            let (cmd, rx) = crossbeam_channel::unbounded();
+            _mailboxes.push(rx);
+            app.tree.insert(Spawn {
+                id: AgentId(id),
+                parent: AgentId::ROOT,
+                brief: format!("child {id}"),
+                depth: 1,
+                branch: None,
+                cmd,
+            });
+        }
+
+        ctrl(&mut app, 'q');
+
+        let warning = text_of(&app).to_string();
+        assert!(
+            warning.starts_with("Ctrl-Q again quits · kills #1 thinking, #2 thinking"),
+            "{warning}"
+        );
+        assert!(
+            warning.ends_with("+3 more"),
+            "the rest are counted: {warning}"
+        );
+        assert!(warning.chars().count() <= 73, "one bar row: {warning}");
+
+        // And the frame paints it whole, on the bar's own row: the row is 80
+        // columns wide and the badge takes seven of them. Read through the
+        // `Shot` harness, so the assertion is about a frame the app derived and
+        // the frame's own shape is checked with it (refactor B17).
+        let frame = shot(&mut app, 80, 24);
+        frame.assert_shape("the quit warning", 80, 24);
+        assert!(frame.line(22).contains(&warning), "{:?}", frame.line(22));
+
+        ctrl(&mut app, 'q');
+        assert!(app.should_quit, "the second press quits");
+    }
+
+    /// The warning is composed from the tree, not remembered, so it follows it:
+    /// work that ends while the human is deciding leaves the line, and a quit
+    /// with nothing left to warn about stops being armed.
+    #[test]
+    fn the_armed_warning_follows_the_tree() {
+        let (mut app, _rx) = test_app("quit-follows");
+        let (cmd, _child_rx) = crossbeam_channel::unbounded();
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "lexer".to_string(),
+            depth: 1,
+            branch: None,
+            cmd,
+        });
+        app.chat.insert("do the thing");
+        app.send_message();
+        assert_eq!(app.working_agents().len(), 2, "the root and its child");
+
+        ctrl(&mut app, 'q');
+        assert_eq!(
+            text_of(&app),
+            "Ctrl-Q again quits · kills #0 thinking, #1 thinking"
+        );
+
+        // The child finishes while the human is deciding: the line names what
+        // is running now, not what was.
+        app.tree
+            .finish(AgentId(1), Some("did the work".to_string()));
+        app.tick();
+        assert_eq!(text_of(&app), "Ctrl-Q again quits · kills #0 thinking");
+
+        // Nothing is live any more, so there is nothing to warn about: the
+        // warning goes, the arming goes, and one key quits again.
+        app.tree.finish(AgentId::ROOT, Some("done".to_string()));
+        app.tick();
+        assert_eq!(text_of(&app), "", "the line went with the work");
+        assert!(!app.quit_armed());
+
+        ctrl(&mut app, 'q');
+        assert!(app.should_quit);
+    }
+
+    /// A warning whose five seconds are up is gone, and with it the arming: the
+    /// next `Ctrl-Q` is a fresh question (with a fresh warning), not the second
+    /// half of a pair the human made six seconds ago.
+    #[test]
+    fn a_faded_warning_arms_again_rather_than_quitting() {
+        let (mut app, _rx) = test_app("quit-faded");
+        app.chat.insert("do the thing");
+        app.send_message();
+        assert!(app.busy());
+
+        ctrl(&mut app, 'q');
+        assert!(app.quit_armed());
+
+        // Five seconds on: the line fades, and the arming fades with it.
+        age_status(&mut app, 6);
+        app.tick();
+        assert_eq!(text_of(&app), "", "the warning is gone");
+        assert!(!app.quit_armed());
+
+        ctrl(&mut app, 'q');
+        assert!(!app.should_quit, "a fresh warning, not a silent quit");
+        assert!(app.quit_armed(), "with five seconds of its own");
+
+        ctrl(&mut app, 'q');
+        assert!(app.should_quit, "and the second press still quits");
     }
 
     /// Quitting writes what the debounce had not: the exit flush is what makes

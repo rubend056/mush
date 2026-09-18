@@ -127,7 +127,17 @@ class Tui:
         return text
 
     def close(self) -> int:
-        self.send("\x11", 0.5)  # Ctrl-Q quits; there is nothing to save
+        # `Ctrl-Q` twice. Quitting over live work says what it would kill first
+        # and quits on the second press (finding H9), and a scenario can end
+        # while an agent is still running — the agent scenario does, by
+        # construction, since it stops the moment the file appears. With
+        # nothing live the first press is the quit and the second is written to
+        # a pty nobody is reading, which is ignored.
+        for _ in range(2):
+            try:
+                self.send("\x11", 0.5)
+            except OSError:
+                break
         self.pump(1.0)
         try:
             self.proc.wait(timeout=5)
