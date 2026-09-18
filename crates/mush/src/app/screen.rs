@@ -793,8 +793,14 @@ fn agent_detail(node: &AgentNode) -> Vec<String> {
 /// The glyph is derived from the agent's own phase, never stored and never
 /// borrowed from the tree: `·` until it does something, `◐` while its own run is
 /// in flight, `⊘` while a cancel is in flight and after it lands, `✓` only when
-/// a run finished, `✗` when it failed, `≡` while its conversation is being
-/// folded.
+/// a run finished, `✗` when it failed, `⚠` when the run never ended at all,
+/// `≡` while its conversation is being folded.
+///
+/// A cut-off run cannot borrow `⊘`: a stop is the human's doing and the actor is
+/// alive to be nudged again, while a cut-off agent's run died where it stood and
+/// left nothing committed (finding H2). It cannot borrow `✗` either — nothing
+/// the model or the endpoint did failed, and the agent's work is still on disk,
+/// untouched and unlanded.
 ///
 /// Waiting on children is a *different fact* from working and is drawn as a
 /// different mark (`agent_line`'s `⏸N`), because a parent that is mid-turn with
@@ -808,6 +814,7 @@ fn phase_glyph(phase: &Phase) -> &'static str {
         // `⊘` while a cancel is in flight and after it lands: a stopped agent
         // is not a finished one, and must not borrow `✓`.
         Phase::Cancelling | Phase::Stopped => "⊘",
+        Phase::CutOff => "⚠",
         Phase::Idle => "·",
         Phase::Done => "✓",
         Phase::Compacting(_) => "≡",
@@ -844,6 +851,11 @@ fn phase_detail(node: &AgentNode) -> String {
         // run that was interrupted, so showing it would claim work that was
         // never delivered. `node.summary` is deliberately not consulted.
         Phase::Stopped => "stopped · re-send to resume".to_string(),
+        // No age, deliberately: the moment the run died is the moment mush
+        // went away with it, and the only clock left to age it is the next
+        // launch's — which would count from the restart, not from the cut-off
+        // (finding H2).
+        Phase::CutOff => "cut off · nothing committed".to_string(),
         Phase::Failed(error) => error.clone(),
         Phase::Idle | Phase::Done => node.summary.clone().unwrap_or_default(),
     }

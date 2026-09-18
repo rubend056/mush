@@ -157,11 +157,15 @@ const CANCELLED: &str = "cancelled";
 
 /// How a run ended, as the actor reports it to its parent and to its own row.
 ///
-/// Three outcomes, because they mean three different things: a finished run
-/// produced a result, a failed run produced an error, and a *stopped* run
-/// produced neither — the actor is still alive and a nudge resumes it. A bare
-/// summary string could not tell them apart, so a stopped child was reported
-/// through the same path as a finished one and read as `done`.
+/// Four outcomes, because they mean four different things: a finished run
+/// produced a result, a failed run produced an error, a *stopped* run produced
+/// neither — the actor is still alive and a nudge resumes it — and a run that
+/// was **cut off** never ended at all: the process went away with it in flight,
+/// or the actor's thread did, and nothing was committed by it. A bare summary
+/// string could not tell them apart, so a stopped child was reported through the
+/// same path as a finished one and read as `done`; and the fourth had no name at
+/// all, which is how a killed run came back looking idle (`docs/findings.md`
+/// H2).
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Outcome {
     /// The run finished; the string is its summary.
@@ -169,6 +173,14 @@ pub enum Outcome {
     /// The run was stopped (Ctrl-C, `agent_control stop`, `/new`). Not a
     /// result and not a failure: the actor is idle and resumable.
     Stopped,
+    /// The run never ended: mush went away with it in flight, and nothing was
+    /// committed by it. Not `Stopped` — there is no actor left to resume — and
+    /// not `Failed` — nothing the model or the endpoint did broke.
+    ///
+    /// It is news, unlike a stop: the parent has to know that the work it was
+    /// waiting for is not on its way and may be sitting uncommitted in a
+    /// worktree.
+    CutOff,
     /// The run failed; the string is the error.
     Failed(String),
 }
@@ -183,6 +195,9 @@ pub enum Outcome {
 pub enum Committed {
     Finished,
     Stopped,
+    /// A run that never ended: an interrupted run's work, committed anyway.
+    /// Its own shape so the branch cannot read as a stop the human asked for.
+    CutOff,
     Failed(String),
 }
 
@@ -191,6 +206,7 @@ impl From<&Outcome> for Committed {
         match outcome {
             Outcome::Finished(_) => Committed::Finished,
             Outcome::Stopped => Committed::Stopped,
+            Outcome::CutOff => Committed::CutOff,
             Outcome::Failed(error) => Committed::Failed(error.clone()),
         }
     }
@@ -245,6 +261,12 @@ pub fn commit_subject(id: u64, brief: &str, outcome: &Outcome) -> String {
     match Committed::from(outcome) {
         Committed::Finished => format!("mush #{id}: {brief}"),
         Committed::Stopped => format!("mush #{id} (stopped, work in progress): {brief}"),
+        // A run that was cut off commits its work in progress too — this is the
+        // subject of a commit that *exists*, so it says "work in progress", not
+        // "nothing committed": that phrase describes the state the cut-off run
+        // itself left behind, and a commit is the state after someone picked the
+        // work up.
+        Committed::CutOff => format!("mush #{id} (cut off, work in progress): {brief}"),
         Committed::Failed(error) => {
             format!("mush #{id} (failed: {}): {brief}", truncate(&error, 40))
         }
@@ -272,6 +294,8 @@ pub fn parse_commit_subject(subject: &str) -> Option<(Committed, String)> {
     let (head, brief) = rest.split_once("): ")?;
     let ended = if head == "stopped, work in progress" {
         Committed::Stopped
+    } else if head == "cut off, work in progress" {
+        Committed::CutOff
     } else {
         // Any other shape must name a failure; if it does not, this subject is
         // not one mush wrote.
@@ -282,13 +306,22 @@ pub fn parse_commit_subject(subject: &str) -> Option<(Committed, String)> {
 
 impl Outcome {
     /// The line a parent reads. Each outcome names itself, so a stop can never
-    /// be mistaken for a result.
-    fn line(&self, id: u64) -> String {
+    /// be mistaken for a result — and a run that never ended can never be
+    /// mistaken for either.
+    ///
+    /// `pub(crate)` because a cut-off run has no actor left to write this line:
+    /// the UI, which is the only observer that can tell an actor vanished, files
+    /// it through the very same sentence (`App::report_cut_off`).
+    pub(crate) fn line(&self, id: u64) -> String {
         match self {
             Outcome::Finished(summary) => format!("#{id} done: {summary}"),
             Outcome::Stopped => format!(
                 "#{id} stopped: the run ended before it finished — this agent is idle, \
                  not done; agent_control message resumes it"
+            ),
+            Outcome::CutOff => format!(
+                "#{id} cut off: the run never ended — nothing was committed; \
+                 its work is where it left it"
             ),
             Outcome::Failed(error) => format!("#{id} failed: {error}"),
         }
@@ -296,7 +329,9 @@ impl Outcome {
 
     /// Whether this is news worth waking a napping parent for. A stop is the
     /// human's doing, not news, so it waits in the transcript instead of
-    /// paying for a fresh run.
+    /// paying for a fresh run. A cut-off *is* news: the parent is waiting for a
+    /// result that will never come, and the work it was waiting on may be
+    /// sitting uncommitted, so it has to be told rather than left to assume.
     fn is_news(&self) -> bool {
         !matches!(self, Outcome::Stopped)
     }
@@ -902,6 +937,13 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
             Outcome::Failed(error) => actor.ctx.emit(actor.id, AgentEvent::Error(error)),
             Outcome::Stopped => actor.ctx.emit(actor.id, AgentEvent::Stopped),
             Outcome::Finished(_) => actor.ctx.emit(actor.id, AgentEvent::Done),
+            // Unreachable from here, and deliberately listed rather than
+            // swallowed by a wildcard: a cut-off run is one whose actor is
+            // *gone*, so the only hand that can report it is the UI's
+            // (`App::report_cut_off`), which files both the row's mark and the
+            // parent's line. Nothing is emitted, because nothing here is alive
+            // to have run.
+            Outcome::CutOff => {}
         }
         // A Shutdown arrived while this run was winding down: it is over, and
         // so is this actor.
@@ -1073,8 +1115,9 @@ fn absorb(
             // Which run each line is asked about is the completion's own run:
             // a transcript that carries the line for the *current* record has
             // read that record, and one that carries an older line has not. The
-            // line comes from `Outcome::line`, the one place that says all three
-            // shapes, so a replayed `#N failed: …` (or a `#N stopped: …`) is
+            // line comes from `Outcome::line`, the one place that says all four
+            // shapes, so a replayed `#N failed: …` (or a `#N stopped: …`, or a
+            // `#N cut off: …`) is
             // recognised exactly like a `#N done: …` — the old scan knew only
             // the `done:` shape, so a failure read in the transcript looked
             // unread and was folded again (`docs/findings.md` B24).
@@ -2565,6 +2608,12 @@ fn status_tool(state: &ActorState) -> Result<String, String> {
             Some(Outcome::Stopped) => lines.push(format!(
                 "#{id} ⊘ stopped — idle and resumable (agent_control message resumes it)"
             )),
+            // A run that never ended. Its own line, because the parent's next
+            // move depends on it: there is no result coming and the work may be
+            // sitting uncommitted (finding H2).
+            Some(Outcome::CutOff) => lines.push(format!(
+                "#{id} ⚠ cut off — the run never ended; nothing was committed"
+            )),
             None => lines.push(format!("#{id} ◐ running")),
         }
     }
@@ -3390,6 +3439,7 @@ mod tests {
         let cases = [
             (Outcome::Finished("done".into()), Committed::Finished),
             (Outcome::Stopped, Committed::Stopped),
+            (Outcome::CutOff, Committed::CutOff),
             (
                 Outcome::Failed("no route".into()),
                 Committed::Failed("no route".into()),
@@ -3990,7 +4040,7 @@ mod tests {
     }
 
     /// Adoption asks "has this transcript already read this child?", and the
-    /// answer has to be yes for all three shapes `Outcome::line` writes. The
+    /// answer has to be yes for all four shapes `Outcome::line` writes. The
     /// scan knew only `#N done:`, so a replayed failure — or a stop — read as
     /// unread and was folded in again (`docs/findings.md` B24).
     #[test]
@@ -3999,12 +4049,14 @@ mod tests {
         let mut state = ActorState::default();
         note_completion(&mut state, 2, 1, Outcome::Failed("no route".into()));
         note_completion(&mut state, 3, 1, Outcome::Stopped);
+        note_completion(&mut state, 4, 1, Outcome::CutOff);
         let mut messages = Vec::new();
         let fresh = vec![
             Message::system("you are mush"),
             Message::user("task"),
             Message::tool("a", "#2 failed: no route"),
             Message::tool("b", Outcome::Stopped.line(3)),
+            Message::tool("c", Outcome::CutOff.line(4)),
         ];
         assert!(matches!(
             absorb(&actor, &mut state, &mut messages, AgentMsg::Run(fresh)),
@@ -4016,6 +4068,11 @@ mod tests {
             "a failed line is a completion the model has read"
         );
         assert_eq!(state.delivered.get(&3), Some(&1), "and so is a stopped one");
+        assert_eq!(
+            state.delivered.get(&4),
+            Some(&1),
+            "and a cut-off line, which is the fourth shape `Outcome::line` writes"
+        );
         assert!(
             !fold_completions(&actor, &mut state, &mut messages),
             "so neither is folded in a second time"

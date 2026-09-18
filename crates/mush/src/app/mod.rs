@@ -174,6 +174,19 @@ fn ended_on_an_answer(messages: &[Message]) -> bool {
     )
 }
 
+/// What a cut-off agent's own pane says under its `⚠` row.
+///
+/// The row is the mark; this is the sentence a human needs to act on it — that
+/// the run did not produce a result, and that whatever it wrote is *uncommitted*,
+/// which is what makes the difference between "recoverable" and "lost"
+/// (finding H2). One wording, shared by the two paths that can prove a run was
+/// cut off: a restored status that still said `running`, and an actor whose
+/// mailbox is dead with work in flight.
+fn cut_off_notice() -> String {
+    "cut off — its run never ended, so nothing was committed; its work is where it left it"
+        .to_string()
+}
+
 /// `/help`: the key table, then the command table.
 ///
 /// Both tables are the same one source their CLI counterparts print —
@@ -406,6 +419,10 @@ impl App {
         let conversation = self.tree.conversation().0;
         let handles = self.tree.handles();
         let root = self.ws.root().to_path_buf();
+        // The agents whose last run never ended, and who they report to. The
+        // parent cannot be told while this loop runs (a child may be restored
+        // before its parent is a node), so it is told after it.
+        let mut cut_off: Vec<(AgentId, Option<AgentId>)> = Vec::new();
         for agent in stored {
             // Keep the counter above every restored id, or the next spawn hands
             // a live child an id a restored agent already holds (finding B1).
@@ -428,7 +445,23 @@ impl App {
                 session::StoredStatus::Failed(error) => {
                     (Phase::Failed(error.clone()), agent.summary.clone())
                 }
-                // A run that was still in flight at shutdown is not a result.
+                // A run that was still in flight when the file was last written
+                // never ended: the process — or the harness around it — went
+                // away first. Three endings used to be flattened into `Idle`
+                // here, and the one that cost real work was this one: on screen
+                // and in the file a killed agent looked exactly like an agent
+                // nobody had ever asked to do anything, and its work sat
+                // uncommitted until a human went looking (finding H2).
+                //
+                // It is not `Stopped` either: a stop is the human's Ctrl-C and
+                // the actor is alive to be nudged again, while this run died
+                // where it stood. `Running` and `CutOff` are the same fact a
+                // restart apart — the file's last word was that a run was in
+                // flight, or that one never ended — and they come back the
+                // same way.
+                session::StoredStatus::Running | session::StoredStatus::CutOff => {
+                    (Phase::CutOff, agent.summary.clone())
+                }
                 session::StoredStatus::Idle => (Phase::Idle, agent.summary.clone()),
             };
             // The row is derived and cannot lie, so the line that disagrees with
@@ -442,6 +475,15 @@ impl App {
                 session::StoredLanded::Merged => Landed::Merged,
                 session::StoredLanded::Discarded => Landed::Discarded,
             });
+            let parent = agent.parent.map(AgentId);
+            // The row is derived and cannot lie; a `⚠` row with nothing under it
+            // would say *that* a run never ended without saying what follows
+            // from it, which is the whole of what the human needs (finding H2).
+            if phase == Phase::CutOff {
+                self.chat
+                    .note_cut_off_for(AgentId(agent.id), cut_off_notice());
+                cut_off.push((AgentId(agent.id), parent));
+            }
             let tx = agent::revive(
                 handles.clone(),
                 cfg.clone(),
@@ -458,7 +500,7 @@ impl App {
             );
             self.tree.register(Existing {
                 id: AgentId(agent.id),
-                parent: agent.parent.map(AgentId),
+                parent,
                 depth: agent.depth.max(1),
                 brief: agent.brief,
                 phase,
@@ -471,6 +513,19 @@ impl App {
             // What it said in the previous conversation is where it resumes.
             self.chat
                 .replace_transcript(AgentId(agent.id), agent.messages);
+        }
+        // The parent's own transcript is where a completion lands while mush is
+        // running, so it is where a completion that never happened has to land
+        // too — the model reads it on its next turn, which is the only way it
+        // can know that a child's work is uncommitted rather than finished
+        // (finding H2). Only a parent that is really in the tree: a transcript
+        // for an agent that does not exist is a pane nobody can open.
+        for (id, parent) in cut_off {
+            let Some(parent) = parent.filter(|parent| self.tree.has(*parent)) else {
+                continue;
+            };
+            let line = agent::Outcome::CutOff.line(id.0);
+            self.chat.push_message(parent, Message::user(line));
         }
         self.tree.repair_focus();
     }
@@ -602,6 +657,9 @@ impl App {
                     }
                     Some((agent::Committed::Stopped, brief)) => {
                         (brief, Phase::Stopped, "last run was stopped")
+                    }
+                    Some((agent::Committed::CutOff, brief)) => {
+                        (brief, Phase::CutOff, "last run was cut off")
                     }
                     Some((agent::Committed::Failed(error), brief)) => {
                         (brief, Phase::Failed(error), "last run failed")
@@ -2158,9 +2216,28 @@ impl App {
                     Phase::Done => session::StoredStatus::Done,
                     Phase::Stopped => session::StoredStatus::Stopped,
                     Phase::Failed(error) => session::StoredStatus::Failed(error.clone()),
-                    // Mid-run at shutdown is not a result; it comes back idle,
-                    // which is what it will actually be.
-                    _ => session::StoredStatus::Idle,
+                    // A run that never ended is stored as exactly that, and it
+                    // stays stored that way until a new run replaces it: the
+                    // fact must not decay into `Idle` on a second restart, or a
+                    // `⚠` would be a mark that lasts one launch (finding H2).
+                    Phase::CutOff => session::StoredStatus::CutOff,
+                    // At rest is not in flight. `Idle` has to be named here
+                    // because the wildcard below is the *phases of a run in
+                    // flight*, and an agent nobody has asked to do anything is
+                    // not one of them: storing it as `running` would bring it
+                    // back `⚠ cut off` on the next launch, which is the same
+                    // flattened lie — one run's state written for an agent that
+                    // had no run — in the other direction (finding H2).
+                    Phase::Idle => session::StoredStatus::Idle,
+                    // A run *in flight* is stored as `running` — not as `Idle`,
+                    // which is the one thing it is not. That value is never an
+                    // ending, so a file that still carries it is the record of a
+                    // run nobody finished: the harness was SIGTERM'd, the
+                    // terminal closed, the process crashed. This is what turns a
+                    // killed agent into a `⚠` on the next launch instead of a
+                    // row that looks like it was never asked to do anything
+                    // (finding H2).
+                    _ => session::StoredStatus::Running,
                 },
                 landed: node.landed.map(|landed| match landed {
                     Landed::Merged => session::StoredLanded::Merged,
@@ -4080,6 +4157,190 @@ mod tests {
             app.tree.node(AgentId(2)).map(|node| node.phase.clone()),
             Some(Phase::Failed("the endpoint stopped responding".into())),
             "an unfinished transcript keeps its failure"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A stored session file with one child of the root, written the way a
+    /// human would hand-edit it: only the fields this test is about.
+    fn stored_agent_file(root: &std::path::Path, status: &str) -> String {
+        format!(
+            r#"{{
+              "root": "{}",
+              "model": "test-model",
+              "provider": "custom",
+              "base_url": "http://127.0.0.1:1",
+              "updated": 0,
+              "messages": [{{"role": "user", "content": "the root task"}}],
+              "agents": [
+                {{
+                  "id": 2,
+                  "parent": 0,
+                  "depth": 1,
+                  "brief": "port the parser",
+                  "status": "{status}",
+                  "messages": []
+                }}
+              ]
+            }}
+"#,
+            root.display()
+        )
+    }
+
+    /// The clearest cut-off a restart can prove: the file's own status still
+    /// said `running`, which no run ever writes as its own ending — so the run
+    /// was in flight when the harness (or the terminal, or the process) went
+    /// away, and nothing was committed by it.
+    ///
+    /// It came back `Idle`, which on screen and in the file is exactly what an
+    /// agent nobody had asked to do anything looks like, and its work sat
+    /// uncommitted until a human went looking (finding H2).
+    #[test]
+    fn a_restored_run_that_never_ended_comes_back_cut_off() {
+        let root = dir("restore-cut-off");
+        session::ensure_mush_dir(&root).unwrap();
+        std::fs::write(
+            session::session_path(&root),
+            stored_agent_file(&root, "running"),
+        )
+        .unwrap();
+
+        let mut app = reopened(&root);
+
+        assert!(
+            app.tree.has(AgentId(2)),
+            "a status the file carries must not lose the agent"
+        );
+        let rows = screen(&mut app, 120, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("⚠ #2")),
+            "the row says the run never ended, and never says ✓: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("✓ #2")),
+            "a run nobody finished is not a finished one: {rows:?}"
+        );
+        // The row is the mark; the pane says what follows from it, because
+        // "recoverable or lost" is the question the human has.
+        let notice = app
+            .chat
+            .notices_for(AgentId(2))
+            .map(|notice| notice.text.clone())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        assert!(notice.contains("nothing was committed"), "{notice}");
+        // And the parent is told in the words a completion would have used:
+        // the model reads this on its next turn, which is the only way it can
+        // know a child's work is uncommitted rather than finished.
+        let root_text = app
+            .chat
+            .transcript(AgentId::ROOT)
+            .iter()
+            .map(|message| message.text())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(root_text.contains("#2 cut off"), "{root_text}");
+        assert!(root_text.contains("nothing was committed"), "{root_text}");
+        assert!(
+            !root_text.contains("#2 done:"),
+            "a cut-off run must never read as a result: {root_text}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half of the same fact: a cut-off run stays cut off. The status
+    /// is written back on every save, so a `⚠` is not a mark that lasts one
+    /// launch — and a second quit without touching the agent does not quietly
+    /// turn it into `idle`.
+    #[test]
+    fn a_cut_off_run_stays_cut_off_across_a_second_launch() {
+        let root = dir("cut-off-twice");
+        session::ensure_mush_dir(&root).unwrap();
+        std::fs::write(
+            session::session_path(&root),
+            stored_agent_file(&root, "running"),
+        )
+        .unwrap();
+
+        let first = reopened(&root);
+        let after = serde_json::to_string(&first.session_snapshot()).unwrap();
+        assert!(
+            after.contains(r#""status":"cut_off""#),
+            "the file says what the row says: {after}"
+        );
+        std::fs::write(session::session_path(&root), after).unwrap();
+
+        let mut second = reopened(&root);
+        let rows = screen(&mut second, 120, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("⚠ #2")),
+            "a launch that changes nothing keeps the fact: {rows:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// What the file says about a run *in flight*. `Idle` was the old answer,
+    /// and it is the one thing a busy agent is not: it made a killed run — the
+    /// harness SIGTERM'd, the terminal closed — indistinguishable from an agent
+    /// nobody had ever asked to do anything (finding H2).
+    #[test]
+    fn the_session_records_a_run_in_flight_as_running() {
+        let root = dir("stored-running");
+        let mut app = app_at(root.clone());
+        crowd(&mut app, 1);
+        assert_eq!(
+            app.tree.node(AgentId(1)).map(|node| node.phase.clone()),
+            Some(Phase::Thinking),
+            "the child is mid-run"
+        );
+
+        let busy = serde_json::to_string(&app.session_snapshot()).unwrap();
+        assert!(busy.contains(r#""status":"running""#), "{busy}");
+
+        // A run that *ended* still stores its own ending: `running` is a state,
+        // never a result.
+        app.tree.finish(AgentId(1), Some("all done".to_string()));
+        let done = serde_json::to_string(&app.session_snapshot()).unwrap();
+        assert!(done.contains(r#""status":"done""#), "{done}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other half of the same writer: a run that never happened is not a
+    /// run in flight. The wildcard that stores a busy phase is the *phases of a
+    /// run in flight*, and an agent nobody has asked to do anything is not one
+    /// of them — writing it as `running` brings it back `⚠ cut off` on the next
+    /// launch, which is the flattened lie this change exists to stop, in the
+    /// other direction (finding H2).
+    #[test]
+    fn an_agent_at_rest_is_stored_at_rest() {
+        let root = dir("stored-idle");
+        session::ensure_mush_dir(&root).unwrap();
+        std::fs::write(
+            session::session_path(&root),
+            stored_agent_file(&root, "idle"),
+        )
+        .unwrap();
+
+        let mut app = reopened(&root);
+        assert_eq!(
+            app.tree.node(AgentId(2)).map(|node| node.phase.clone()),
+            Some(Phase::Idle),
+            "an agent whose run never started comes back idle"
+        );
+        let stored = serde_json::to_string(&app.session_snapshot()).unwrap();
+        assert!(stored.contains(r#""status":"idle""#), "{stored}");
+
+        // And the row a restart paints is the same one: a `⚠` here would
+        // claim a run was cut off that nobody had ever started.
+        let rows = screen(&mut app, 120, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("· #2")),
+            "an agent at rest wears `·`: {rows:?}"
+        );
+        assert!(
+            !rows.iter().any(|row| row.contains("⚠ #2")),
+            "and never the mark of a run that never ended: {rows:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

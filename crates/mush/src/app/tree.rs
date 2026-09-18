@@ -74,6 +74,14 @@ pub enum Phase {
     /// are three different things and blanking a stop to `Idle` lost the one
     /// fact the human needed: that work was interrupted mid-flight.
     Stopped,
+    /// The run never ended: the process went away with it in flight, or the
+    /// actor's mailbox is dead and no reply can ever come. Not `Stopped` — a
+    /// stop is the human's doing and the actor is alive to be nudged again;
+    /// a run that was cut off is not resumable and **nothing was committed by
+    /// it**, which is the fact a human needs before trusting its worktree
+    /// (`docs/findings.md` H2). A restored session whose stored status was
+    /// `Running` is the clearest case, and it is the one a restart proves.
+    CutOff,
     /// The run finished; `summary` holds what it produced.
     Done,
     /// The run failed; the payload is what the human needs to read.
@@ -143,6 +151,7 @@ impl Phase {
             Phase::Compacting(_) => "compacting",
             Phase::Cancelling => "cancelling",
             Phase::Stopped => "stopped",
+            Phase::CutOff => "cut off",
             Phase::Done => "done",
             Phase::Failed(_) => "failed",
         }
