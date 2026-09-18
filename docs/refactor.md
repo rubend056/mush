@@ -1,11 +1,15 @@
 # mush — refactor plan: seams and owners
 
-> Status: **Stages 0, 1.1, 1.2 and 2 complete; Stage 1.3 in flight.** On master:
-> Stage 0 (all four moves), `AgentTree` (`app/tree.rs`), `Chat` (`app/chat.rs`),
-> the `ModelClient` seam, the other three seams (`Machine`, `Clock`, `Events`),
-> and the `#[ignore]`d actor tests rewritten in process. What is left of Stage 1
-> is `ConfigCell` (§3.3) and its row B7; Stage 3 (`Screen` + `Intent`) is
-> untouched. The delegation-honesty family (N1, N3–N6) is closed.
+> Status: **Stages 0, 1, 2 and 3.5 complete.** On master: Stage 0 (all four
+> moves), `AgentTree` (`app/tree.rs`), `Chat` (`app/chat.rs`), `ConfigCell`
+> (`app/settings.rs`), the four seams (`ModelClient`, `Machine`, `Clock`,
+> `Events`), the `#[ignore]`d actor tests rewritten in process, and Stage 3.5
+> (`Intent` + parsed commands, `app/keys.rs` + `app/commands.rs`). Stage 3.4
+> (`ToolHost`) was dropped with the editor: there is one dispatcher per side, not
+> three. What is left of Stage 3 is the other half — the `Screen` value and the
+> draw sweep that asserts painted text (B17). The delegation-honesty family (N1,
+> N3–N6) is closed, and so is the wave this plan's checklist now also tracks
+> (`findings.md` U1–U10, B20–B23).
 >
 > Written 2026-09-17 against `d4f80ae` plus the
 > in-flight findings pass (`input.rs`, `config.rs`, `git.rs`, `http.rs`,
@@ -19,11 +23,13 @@
 > it stop recurring. It is not a rewrite proposal. Nothing in the design doc's
 > §6 architecture (single owner, no async, two crates) changes.
 
-At the time of writing the working tree has changed shape mid-pass: `Focus` is
+At the time of writing the working tree had changed shape mid-pass: `Focus` is
 `{Agents, Chat}`, and there is no editor pane or `Buffer` in `ui.rs`/`app.rs`.
-If that is the intended shape, delete the editor-facing rows below (Buffer,
-M6 undo); if it is transient, put them back before Stage 0, because the Buffer
-extraction in Stage 0 assumes §4 of the design doc is still the target.
+That was the intended shape, and the editor-facing rows were dropped with it:
+there is no `Buffer` extraction, no `app/editor.rs`, and no `ToolHost` — a
+mush that does not open files has nothing for the live-buffer rule to own, and
+the tool dispatch is one function per side (`agent::exec_tool` for orchestration
+and shell, `agent::direct_tool` for the file tools).
 
 ---
 
@@ -37,12 +43,13 @@ dependencies:
 | 1 | `AgentTree` (ids, focus, phases, per-id maps, derived `busy`) | `app.rs` | B1, B5, B6, B10, B11, B14 |
 | 2 | `Chat` (root + per-agent transcripts, notices, input, context meter) | `app.rs` | B4, B8, B12, B19, N2 |
 | 3 | `ConfigCell` (one owner of endpoint/model/key/window) | `app.rs` + `agent.rs` | B7, A5 |
-| 4 | `ToolHost` (the live-buffer rule in one place) | `app.rs` | three dispatchers → one; M3 reuse |
+| 4 | ~~`ToolHost`~~ (dropped with the editor) | `app.rs` | — |
 | 5 | `Intent` keymap + parsed slash commands | `app.rs` | B2; help/status drift |
 | 6 | core `transcript.rs`, `text.rs`, `ToolName`, git verbs | `agent.rs`, `ui.rs`, `app.rs` | B9, B13, name/path/cap drift |
 
 Four traits, each with one real and one fake impl: `ModelClient`, `Machine`,
-`Clock`, `Events` (+ `ToolHost`).
+`Clock`, `Events`. (`ToolHost` would have been a fifth, but the editor it existed
+for is gone.)
 
 Acceptance test for the whole program: **the default `cargo test` needs no
 socket, no subprocess, and no sleep longer than 50 ms; `--ignored` is only for
@@ -79,10 +86,11 @@ Five causes, each with the evidence in the tree:
    five, truncation with three different meanings, the token heuristic in three.
    M4 (merge) and M6 (undo) have no clean place to land.
 
-The design doc is also stale on this: §1 claims "roughly 5,000 lines… across two
-crates"; the real source (excluding `.mush/wt/`) is ~8,900 lines, with
-`agent.rs` ~2,500 and `app.rs` ~2,300. §7's "seven crates" predates the
-dependency pass.
+The design doc was also stale on this: §1 claimed "roughly 5,000 lines… across
+two crates"; the real source at the time (excluding `.mush/wt/`) was ~8,900
+lines, with `agent.rs` ~2,500 and `app.rs` ~2,300. (The tree is ~32,000 lines
+now, and `app.rs` is `app/mod.rs` plus its modules.) §7's "seven crates"
+predates the dependency pass.
 
 ---
 
@@ -109,6 +117,15 @@ crates/mush-core/src/            crates/mush/src/
                                    http.rs                 transport only
                                    ui/mod.rs + view.rs     draw(frame, &Screen)
 ```
+
+What is actually there, and what is not. All of `mush-core`'s list landed, plus
+`transcript.rs` and `text.rs`; on the binary side `app/{mod,tree,chat,settings,
+keys,commands}.rs`, `model.rs`, `machine.rs`, `clock.rs`, `events.rs`,
+`session_save.rs` and `jobs.rs` all exist. What did **not** land, and is now
+ruled out rather than pending: `app/editor.rs` and `app/host.rs` (the editor was
+dropped, so there is no `Buffer` and no `ToolHost` — dispatch is one function per
+side), the `agent/` split (`agent.rs` is still one file), `tui.rs` (`main.rs`
+holds the event loop), and `ui/mod.rs + view.rs` (Stage 3's `Screen` value).
 
 Rules that keep it from becoming a framework:
 
@@ -165,7 +182,10 @@ every push site.
 
 ### 3.3 `ConfigCell` — `app/settings.rs`
 
-One owner for provider/model/url/key/window, shared with the actors:
+**Landed (Stage 1.3).** `ConfigCell` holds the UI copy and an `Arc<Mutex<Config>>`
+shared with every actor in the tree, so the two sides cannot disagree; the file
+is `crates/mush/src/app/settings.rs` and one `ConfigHandle` travels to the
+agents. One owner for provider/model/url/key/window, shared with the actors:
 
 ```rust
 pub struct ConfigCell { ui: Config, shared: Arc<Mutex<Config>> }
@@ -180,7 +200,7 @@ B7 is "the UI and the actor each have a `Config` and only one of them learns".
 With a cell, `learn_context` is the only mutator and it goes through one path;
 "the UI shows a window the actor does not have" stops being representable.
 
-### 3.4 `ToolHost` — `app/host.rs`
+### 3.4 `ToolHost` — `app/host.rs` — **dropped**
 
 The live-buffer rule (design doc §2) as one function:
 
@@ -191,20 +211,26 @@ impl ToolHost for App {
 ```
 
 `list_files` / `read_file` / `write_file` / `edit_file` over buffers + workspace,
-plus the `Msg::Tool` reply plumbing. Today this logic is triplicated between
-`agent::exec_tool`, `agent::direct_tool` and `app::exec_tool`; after the move
-there is one dispatcher per *side* (UI vs worktree) and one tool-name table. The
-same trait is what M3's socket server should call, so an external agent and a
-built-in one cannot get different semantics.
+plus the `Msg::Tool` reply plumbing. This was written when the logic was
+triplicated between `agent::exec_tool`, `agent::direct_tool` and
+`app::exec_tool`. The editor was then dropped, so `app::exec_tool` went with it
+and there is no live-buffer rule left to own: there is now **one dispatcher per
+side** (`agent::exec_tool` for orchestration and shell, `agent::direct_tool` for
+the four file tools) and no `ToolHost` trait. M3's socket server, if it lands,
+calls those two directly rather than a buffer host.
 
 ### 3.5 `Intent` keys and parsed commands — `app/keys.rs`, `app/commands.rs`
 
-- `fn key(focus, mode, picker_open, key) -> Intent` is pure; `App::update`
-  applies intents. No more side effects hidden in match arms (the `mask_key`
-  class, B2), and key handling is testable without an `App`.
-- `fn parse_command(&str) -> Command` is pure and exhaustive; the help text and
-  the status hint render from the same table, so `main.rs`'s help cannot drift
-  from `run_command`'s arms.
+**Landed.** `keys::key(focus, picker_open, key) -> Intent` is pure and calls no
+side effect of its own; `App::apply_intent` is the only thing that carries an
+intent out, and nothing below `App::on_key` reads a `KeyCode`, so a binding is
+testable without an `App` (the `mask_key` class, B2). The sketch's `mode`
+argument is not there: the only modal state the keyboard has is the picker, held
+as a bool, and the editor that had insert and normal modes is gone.
+`commands::parse_command(&str) -> Result<Command, CommandError>` is pure, and
+both help surfaces — `mush --help`'s KEYS/COMMANDS blocks and the in-app
+`/help` notice — render from `keys::KEYS` and `commands::COMMANDS`, so neither
+can drift from what the parser accepts.
 
 ### 3.6 Core modules — `transcript.rs`, `text.rs`, `ToolName`, git verbs
 
@@ -215,9 +241,9 @@ built-in one cannot get different semantics.
 | `enum ToolName { ListFiles, ReadFile, WriteFile, EditFile, RunCommand, SpawnAgent, WaitAgents, AgentStatus, AgentControl }` with `as_str`/`parse`; `TOOL_NAMES` derived; schemas keyed by it; dispatch matches on it | `tools.rs`, `prompt.rs`, `agent.rs`, `app.rs` | adding a tool becomes a compile error in every place that must know |
 | one `Git` value with `run`/`status`/`branch_stat` + `worktree_add/list/remove/commit` | `git.rs`, `agent.rs` (`create_worktree`, `commit_worktree`, `git_output`), `app.rs` (`discover_worktrees`) | one invocation style instead of three; `.mush/wt/{id}` and `mush/{id}` formatted in one place |
 
-`Buffer` itself goes to `app/editor.rs` rather than core: core is about files and
-messages, the binary is about this session's UI. (If the editor does not come
-back, skip it.)
+`Buffer` itself would have gone to `app/editor.rs` rather than core: core is about
+files and messages, the binary is about this session's UI. The editor did not
+come back, so there is no `Buffer` and no `app/editor.rs` — skip it.
 
 **Landed (Stage 0).** Three notes where the tree ended up differing from the
 table above, so Stage 1 starts from what is really there:
@@ -237,8 +263,8 @@ table above, so Stage 1 starts from what is really there:
   outcome are.
 - `app.rs` has no `exec_tool` and no editor pane, so 3.4's "triplicated" is now
   two dispatchers (`agent::exec_tool` for orchestration + shell,
-  `agent::direct_tool` for the four file tools); `ToolHost` in Stage 1 is a move
-  of the second one, not a merge of three.
+  `agent::direct_tool` for the four file tools) — and with `ToolHost` dropped
+  those two are the whole story, one dispatcher per side.
 
 ---
 
@@ -278,20 +304,21 @@ when* the new modules' tests are the old tests and the gate is green with no
 assertion edits — both held (the two later commits added tests; no existing
 assertion was edited).
 
-**Stage 1 — one owner per fact.** 1.1 ✅ `AgentTree`, 1.2 ✅ `Chat`, 1.3 ⬜
-`ConfigCell`. *Done when* nothing outside `tree.rs` writes
+**Stage 1 — one owner per fact.** ✅ 1.1 `AgentTree`, 1.2 `Chat`, 1.3
+`ConfigCell` (`app/settings.rs`). *Done when* nothing outside `tree.rs` writes
 `node.phase`, `node.summary`, `focused` or `agent_cursor`, `busy` is a method,
-and the context meter is a method — all three hold; §3.3's cell is what is left,
-and its finding is B7 (A5 turned out to be closed already: `rederive_context`
+and the context meter is a method — all three hold, and §3.3's cell landed with
+them (its finding was B7; A5 turned out to be closed already: `rederive_context`
 runs on every runtime switch).
 
 **Stage 2 — the seams.** ✅ Rewrite the `#[ignore]`d actor tests in-process and
 delete `scripts/mock_llm.py` from the test path (keep it for the pty smoke
 scenarios if they still want a scripted model). *Done when* the default suite
 needs no socket, no subprocess and no sleep over 50 ms, and `--ignored` contains
-only live-endpoint tests — held: the five actor scenarios it used to hold (five,
-not the four this line claimed) run in the default suite, and `--ignored` is now
-exactly the two live-endpoint tests in `http.rs`.
+only live-endpoint tests — held: the actor scenarios it used to hold (five, not
+the four this line first claimed; more have grown beside them since) run in the
+default suite, and `--ignored` is now exactly the three live-endpoint tests in
+`http.rs` (the model list, the reply cap, and the TLS handshake).
 
 **Stage 2.1 — `ModelClient`.** ✅ `crates/mush/src/model.rs` holds one trait
 (`chat(&ChatRequest, &AtomicBool) -> Result<ChatResponse, ModelError>`), the
@@ -346,15 +373,19 @@ commit is another agent's) and `AgentTree`'s stale-cancel window, which already
 has `age` for tests. The default suite still opens local mock sockets in
 `http.rs`.
 
-**Stage 3 — `Screen` view and intents.** `ui::draw(frame, &Screen)` where
-`Screen` is built by `App::screen()`; panes become pure functions of a value, so
-the draw sweep can assert painted text at every size instead of only "does not
-panic" (B17), and keys go through `Intent`. *Done when* no render function takes
-`&App`.
+**Stage 3 — `Screen` view and intents.** Stage 3.5 ✅ — keys go through `Intent`
+(`app/keys.rs`), and slash commands are parsed values (`app/commands.rs`), with
+both help surfaces rendered from the one table (§3.5). The `Screen` half is **not
+built**: `ui::draw(frame, &Screen)` where `Screen` is built by `App::screen()`,
+so panes become pure functions of a value and the draw sweep can assert painted
+text at every size instead of only "does not panic" (B17). *Done when* no render
+function takes `&App`.
 
 **Stage 4 — roadmap.** M2.8 = a job registry + `Machine`; M3 = the socket server
-over `ToolHost`; M4 = a base revision on `Buffer` + merge in core `text.rs`; M6 =
-undo inside `Buffer`. None of them should need to touch `app.rs`'s routing.
+over the two dispatchers; M4 = a base revision on `Buffer` + merge in core
+`text.rs`; M6 = undo inside `Buffer`. None of them should need to touch `app.rs`'s
+routing. (M2.8 landed: `jobs.rs` sits on the `Machine` seam, and M4/M6's `Buffer`
+is gone with the editor.)
 
 Sequencing with the concurrent findings pass: Stage 0.1 (`transcript.rs`)
 touches only `agent.rs` + `mush-core`, so it can start immediately. The stages
