@@ -2452,10 +2452,19 @@ fn drain_mailbox(
 /// model read, and hearing the same report again cannot make it unread
 /// (`docs/findings.md` B24: the defect was the unconditional
 /// `state.delivered.remove(&id)` that used to end this function).
+///
+/// The *running* mark is the same kind of fact and is cleared under the same
+/// rule: only a run ending — a run the books have not heard of — is a child
+/// coming to rest. A result recorded again is not. It used to clear the mark
+/// unconditionally, so the timeout's fresh path (`wait_digest(fresh_only)`,
+/// which re-records what it hands over) took the running mark off a child the
+/// human had nudged: `status` reported an idle child, the one-shared-child guard
+/// saw the workspace free, and the next `wait` answered a result the child was
+/// busy pasting over (audit row 1).
 fn note_completion(state: &mut ActorState, id: u64, run: u64, outcome: Outcome) -> String {
-    state.running.remove(&id);
     let line = outcome.line(id);
     if state.completed.get(&id).map(|completion| completion.run) != Some(run) {
+        state.running.remove(&id);
         state.completed.insert(id, Completion { run, outcome });
     }
     line
@@ -9704,6 +9713,11 @@ mod tests {
     /// A child the human resumed is *running*, whatever its last report said:
     /// the listing says so, and a wait does not answer the stale result as if
     /// it had just finished (audit row 1 and 3).
+    ///
+    /// Both shapes of that report: one the model has read, and one nobody has —
+    /// the second is the one the timeout's fresh path walks, recording the same
+    /// result again, and a result recorded again is not the child coming to
+    /// rest.
     #[test]
     fn a_resumed_child_reads_as_running_and_a_wait_holds() {
         let clock = Arc::new(Advanceable::new());
@@ -9739,6 +9753,50 @@ mod tests {
             "the deadline is what ended it: {:?}",
             clock.elapsed()
         );
+
+        // The same with a result nobody has read: the timeout hands it over (it
+        // is the one road a fresh result travels) while the child runs on. The
+        // completion the fresh path records is the one the nudge resumed *past*,
+        // so the running mark stays — otherwise the parent's books say a running
+        // child is at rest, and `status`, the one-shared-child guard and the
+        // next `wait` all read that.
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor(
+            "resumed-unread",
+            Arc::new(ScriptedMachine::new()),
+            clock.clone(),
+        );
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+        note_completion(
+            &mut state,
+            1,
+            1,
+            Outcome::Finished("run one's result".into()),
+        );
+        assert!(state.unread(1), "nobody has read the result yet");
+
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ChildRunning { id: 1 },
+        );
+
+        let report = wait_tool(&actor, &mut state, &cancel).unwrap();
+        assert!(
+            report.contains("wait timed out") && report.contains("run one's result"),
+            "the timeout hands over the unread result and names what still runs: {report}"
+        );
+        assert!(
+            state.running.contains(&1),
+            "recording a result again is not the child coming to rest: {:?}",
+            state.running
+        );
+        let lines = status_tool(&actor, &state).unwrap();
+        assert!(lines.contains("#1 ◐ running"), "{lines}");
     }
 
     /// A result the model has already read is not what a wait returns while a
