@@ -2695,6 +2695,7 @@ mod tests {
 
     use crossbeam_channel::Receiver;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::layout::Rect;
     use ratatui::widgets::{Block, Borders};
@@ -3278,15 +3279,22 @@ mod tests {
     /// Paint one frame at a real terminal size, the way `main` does: the size
     /// the next frame (and any `/notes` opened between frames) sees, one
     /// `Screen` derived for the frame's own area, and it painted into a
-    /// `TestBackend`.
-    fn shot(app: &mut App, width: u16, height: u16) -> Shot {
+    /// `TestBackend`. The `Screen` and the painted buffer are handed back
+    /// together, because the tests read both: the derived words and the cells
+    /// they reached — including the ones `screen` trims away (finding R28).
+    fn painted(app: &mut App, width: u16, height: u16) -> (Screen, Buffer) {
         app.set_term_size(width, height);
         let screen = app.screen(Rect::new(0, 0, width, height));
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| crate::ui::draw(frame, &screen))
             .unwrap();
-        let buffer = terminal.backend().buffer();
+        (screen, terminal.backend().buffer().clone())
+    }
+
+    /// One painted frame as a [`Shot`]: the `Screen` and its cells.
+    fn shot(app: &mut App, width: u16, height: u16) -> Shot {
+        let (screen, buffer) = painted(app, width, height);
         let cells = (0..height)
             .map(|y| {
                 (0..width)
@@ -3343,14 +3351,8 @@ mod tests {
     /// how a test still reads which row the pane paints as selected. The bar is
     /// excluded because its focus badge wears the same cyan and is not a row.
     fn selected_rows(app: &mut App, width: u16, height: u16) -> Vec<usize> {
-        app.set_term_size(width, height);
-        let screen = app.screen(Rect::new(0, 0, width, height));
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| crate::ui::draw(frame, &screen))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let bar_rows = if height >= 24 { 2 } else { 1 };
+        let (_, buffer) = painted(app, width, height);
+        let bar_rows = super::screen::bar_rows(height);
         (0..(height - bar_rows) as usize)
             .filter(|&y| {
                 (0..width as usize)
@@ -4659,10 +4661,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// How long one frame costs on a session the size of a real one. A frame
-    /// that does not fit in a 60 fps budget is felt as lag, so this is a
-    /// regression guard as much as a measurement.
+    /// How long one frame costs on a session the size of a real one.
+    ///
+    /// `#[ignore]`d on purpose: the 16 ms budget is a property of an *idle* box,
+    /// and this suite runs while sibling agents build on the same machine, so a
+    /// bar this tight flakes and a gate that is green "usually" is not a gate
+    /// (finding H6). Run it deliberately, alone, with
+    /// `cargo test -- --ignored a_frame_fits`.
+    ///
+    /// When it is run, a frame that does not fit a 60 fps budget is felt as lag,
+    /// so it is a regression guard as much as a measurement.
     #[test]
+    #[ignore = "the 16 ms budget needs an idle box; run it alone with --ignored"]
     fn a_frame_fits_in_a_60fps_budget_on_a_long_transcript() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
@@ -5294,24 +5304,39 @@ mod tests {
             (agents, chat)
         };
 
+        // The width boundary: 79 columns stacks the tree over the chat, and 80
+        // is the first width that holds both side by side.
         let (agents, chat) = title_rows(&mut app, 79, 24);
         assert!(
             agents.is_some() && chat.is_some() && agents != chat,
             "79 columns stacks the tree over the chat: {agents:?} vs {chat:?}"
         );
-        let (agents, chat) = title_rows(&mut app, 60, 19);
+        let (agents, chat) = title_rows(&mut app, 80, 24);
+        assert_eq!(
+            agents, chat,
+            "80×24 is the first width with room for both panes side by side"
+        );
+        // The height boundary, at a width wide enough to hold both: 19 rows
+        // stacks, 20 is the first side-by-side height.
+        let (agents, chat) = title_rows(&mut app, 80, 19);
         assert!(
             agents != chat,
             "19 rows stacks them: {agents:?} vs {chat:?}"
         );
-        // The corner itself: side by side.
         let (agents, chat) = title_rows(&mut app, 80, 20);
         assert_eq!(
             agents, chat,
-            "80×20 is the first size with room for both panes side by side"
+            "80×20 is the first height with room for both panes side by side"
         );
-        let (agents, chat) = title_rows(&mut app, 80, 24);
-        assert_eq!(agents, chat, "and taller keeps them side by side");
+        // A narrow terminal stays stacked however tall it grows — the width
+        // edge dominates, so 60×20 must not flip on height alone.
+        let (agents, chat) = title_rows(&mut app, 60, 19);
+        assert!(agents != chat, "60×19 stacks them: {agents:?} vs {chat:?}");
+        let (agents, chat) = title_rows(&mut app, 60, 20);
+        assert!(
+            agents != chat,
+            "a narrow terminal stacks them at any height: {agents:?} vs {chat:?}"
+        );
         let (agents, chat) = title_rows(&mut app, 100, 30);
         assert_eq!(agents, chat, "and wider too");
     }
@@ -6613,6 +6638,22 @@ mod tests {
         assert!(!rows.contains("thinking"), "no `thinking` survives: {rows}");
     }
 
+    /// The cursor row's age is derived once per frame: the footer reads the
+    /// activity off the row already built for the list, not the clock again, so
+    /// the two surfaces cannot paint two ages for one frame (finding R26).
+    #[test]
+    fn the_row_and_the_footer_paint_one_age_for_the_cursor() {
+        let (mut app, _rx) = test_app("one-age");
+        app.tree.begin(AgentId::ROOT, None);
+        app.tree.age(AgentId::ROOT, Duration::from_secs(70));
+        let frame = screen(&mut app, 120, 32).join("\n");
+        assert_eq!(
+            frame.matches("thinking 1m10s").count(),
+            2,
+            "the row and the footer both name the same age: {frame}"
+        );
+    }
+
     /// The pane title counts the phases it names, and no agent is in two of its
     /// counts (finding U2).
     ///
@@ -7074,11 +7115,17 @@ mod tests {
     /// item wrapping is derived from the terminal's width *when they open*
     /// (`/notes`): the sweep opens them again for each size, which is what a
     /// human resizing the terminal with the popup up would get.
+    ///
+    /// `absent` is the other half of `words`: facts the frame must *not* carry
+    /// at any size with a floor to paint in, for a state whose point is an
+    /// absence — a pane with no foot row must not claim hidden lines (finding
+    /// V7).
     struct Sweep {
         name: &'static str,
         app: App,
         words: Vec<&'static str>,
         roomy: Vec<&'static str>,
+        absent: Vec<&'static str>,
         reopen: Option<fn(&mut App)>,
     }
 
@@ -7218,6 +7265,7 @@ mod tests {
             app: fresh,
             words: vec!["· #0", " agents ", " chat ", "Tab cycles panes"],
             roomy: vec!["you", " message ", "Ask for a change"],
+            absent: Vec::new(),
             reopen: None,
         });
         keep.push(rx);
@@ -7234,6 +7282,7 @@ mod tests {
             app: run,
             words: vec!["◐ #0", "edit_file src/lib.rs", "working…", " chat "],
             roomy: vec![" agents · 1 working"],
+            absent: Vec::new(),
             reopen: None,
         });
         keep.push(rx);
@@ -7257,6 +7306,7 @@ mod tests {
             app: parked,
             words: vec!["⏸1", "2 working", "waiting on 1 subagent"],
             roomy: vec!["◐ #1", "◐ #2", "lexer", " agents · 2 working · 1 waiting"],
+            absent: Vec::new(),
             reopen: None,
         });
         keep.push(rx);
@@ -7286,6 +7336,7 @@ mod tests {
                 app: fold,
                 words: vec!["≡ #0", words, "keep typing"],
                 roomy: vec!["your message is answered after the fold"],
+                absent: Vec::new(),
                 reopen: None,
             });
             keep.push(rx);
@@ -7301,6 +7352,7 @@ mod tests {
             app: failed,
             words: vec!["✗ #0", "no route to host", "agent #0 failed"],
             roomy: vec!["! no route to host"],
+            absent: Vec::new(),
             reopen: None,
         });
         keep.push(rx);
@@ -7314,6 +7366,7 @@ mod tests {
             app: stopped,
             words: vec!["⊘ #0", "stopped"],
             roomy: vec!["re-send to resume"],
+            absent: Vec::new(),
             reopen: None,
         });
         keep.push(rx);
@@ -7325,6 +7378,7 @@ mod tests {
             app: restored_session("sweep-restored"),
             words: vec!["· #0", " agents ", " chat ", "mush › "],
             roomy: vec!["✗ #1", "mush/1", "! the endpoint returned 503"],
+            absent: Vec::new(),
             reopen: None,
         });
 
@@ -7344,6 +7398,7 @@ mod tests {
             app: scrolled,
             words: vec!["scrolled ↑5 rows", "PgDn"],
             roomy: vec![],
+            absent: Vec::new(),
             reopen: None,
         });
         keep.push(rx);
@@ -7361,6 +7416,7 @@ mod tests {
             app: noted,
             words: vec!["more lines", "/notes"],
             roomy: vec!["note 7", "note 6", "+5 more lines"],
+            absent: Vec::new(),
             reopen: None,
         });
         keep.push(rx);
@@ -7381,12 +7437,18 @@ mod tests {
             app: jobbed,
             words: vec!["⚙1", "#c1"],
             roomy: vec![" 1 jobs · #c1"],
+            absent: Vec::new(),
             reopen: None,
         });
         keep.push(rx);
 
-        // Twenty agents, three levels deep, with a dirty repository.
-        let (twenty, twenty_rx) = a_twenty_agent_tree("sweep-twenty");
+        // Twenty agents, three levels deep, with a dirty repository. The
+        // cursor sits mid-tree so the window has rows hidden on *both* sides:
+        // the sweep reads the `▲`/`▼` split back against the rows painted
+        // between them, where a top cursor would only ever exercise `▼`
+        // (finding V7).
+        let (mut twenty, twenty_rx) = a_twenty_agent_tree("sweep-twenty");
+        twenty.tree.move_cursor(5);
         states.push(Sweep {
             name: "twenty agents",
             app: twenty,
@@ -7398,6 +7460,7 @@ mod tests {
                 "mush/3",
                 "main ±3 +9−2",
             ],
+            absent: Vec::new(),
             reopen: None,
         });
         keep.push(twenty_rx);
@@ -7431,6 +7494,7 @@ mod tests {
                 "j/k or PgUp/PgDn",
             ],
             roomy: vec!["deepseek-chat · 128k"],
+            absent: Vec::new(),
             reopen: None,
         });
         keep.push(rx);
@@ -7452,6 +7516,26 @@ mod tests {
                 "j/k or PgUp/PgDn",
             ],
             roomy: vec![],
+            absent: Vec::new(),
+            reopen: None,
+        });
+        keep.push(rx);
+
+        // A busy root whose one message the pane protects at the smallest
+        // sizes: the foot has no row there, so the frame must not claim hidden
+        // lines anywhere — a derived spinner is not a line `/notes` can answer
+        // (finding V7).
+        let (mut spinner, rx) = test_app("sweep-spinner");
+        spinner
+            .chat
+            .push_message(AgentId::ROOT, Message::user("what is happening"));
+        begin_run(&mut spinner, AgentId::ROOT);
+        states.push(Sweep {
+            name: "a spinner with no foot row",
+            app: spinner,
+            words: vec!["◐ #0"],
+            roomy: vec!["working…"],
+            absent: vec!["more lines"],
             reopen: None,
         });
         keep.push(rx);
@@ -7475,6 +7559,7 @@ mod tests {
             app: hostile,
             words: vec!["escaped", "␍", " chat "],
             roomy: vec!["escaped", "␍"],
+            absent: Vec::new(),
             reopen: None,
         });
         keep.push(rx);
@@ -7553,6 +7638,7 @@ mod tests {
                 app,
                 words,
                 roomy,
+                absent,
                 reopen,
             } = state;
             for &(width, height) in SWEEP_SIZES {
@@ -7602,6 +7688,20 @@ mod tests {
                 let text = shot.text();
                 for word in words.iter() {
                     assert!(text.contains(word), "{at}: must paint `{word}`:\n{text}");
+                }
+                for word in absent.iter() {
+                    assert!(
+                        !text.contains(word),
+                        "{at}: must not paint `{word}`:\n{text}"
+                    );
+                }
+                // The title's `▲`/`▼` must be the window the painter really
+                // left, and the window must hold the rows it claims — read back
+                // from the cells, not trusted from the derivation. A popup is
+                // skipped: its `Clear` erases the list cells this counts
+                // (findings V1/V7).
+                if matches!(&shot.screen, Screen::Panes(panes) if panes.picker.is_none()) {
+                    assert_window_counts(&at, &shot);
                 }
                 // The audit's two presentation sizes: the widest terminal mush
                 // is photographed on and the one a working session sits at.
@@ -7706,52 +7806,79 @@ mod tests {
         assert!(!text.contains('▲') && !text.contains('▼'), "{text}");
     }
 
+    /// The title's `▲`/`▼` counts name exactly the rows the pane's window
+    /// leaves off screen, and the rows the window paints are the rows between
+    /// them. The counts are arithmetic over `AgentsPane::list_area`, and this
+    /// reads them back against the painted cells instead of trusting the
+    /// derivation — the one way the count, the scroll offset and the window can
+    /// be caught drifting apart (findings V1/V7).
+    fn assert_window_counts(at: &str, shot: &Shot) {
+        let Screen::Panes(panes) = &shot.screen else {
+            return;
+        };
+        let pane = &panes.agents;
+        let window = pane.list_area.height as usize;
+        let rows = pane.rows.len();
+        let mut above = 0usize;
+        let mut below = 0usize;
+        for cell in pane.title.split(" · ") {
+            if let Some(count) = cell
+                .strip_prefix('▲')
+                .and_then(|digits| digits.parse().ok())
+            {
+                above = count;
+            }
+            if let Some(count) = cell
+                .strip_prefix('▼')
+                .and_then(|digits| digits.parse().ok())
+            {
+                below = count;
+            }
+        }
+        assert_eq!(
+            above + below,
+            rows.saturating_sub(window),
+            "{at}: ▲/▼ must name exactly what the window hides"
+        );
+        // The ids painted inside the window, in order: the counts must be of
+        // the rows really between them, not of an offset the painter ignored.
+        let painted: Vec<u64> = (pane.list_area.y..pane.list_area.bottom())
+            .filter_map(|y| {
+                let line: String = (pane.list_area.x..pane.list_area.right())
+                    .map(|x| shot.cells[y as usize][x as usize].clone())
+                    .collect();
+                line.split_once('#')?
+                    .1
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .ok()
+            })
+            .collect();
+        let expected: Vec<u64> = pane
+            .rows
+            .iter()
+            .skip(above)
+            .take(window)
+            .map(|row| row.id.0)
+            .collect();
+        assert_eq!(
+            painted, expected,
+            "{at}: the window must paint the {window} rows the counts leave in it"
+        );
+    }
+
     /// V1: the window the counts name is the window the painter paints. The
     /// counts are arithmetic over `AgentsPane::list_area`, and the painter now
     /// reads that same value instead of deriving the geometry again — so this
-    /// reads both back: `▲N`/`▼M` must be exactly the rows the window does not
-    /// hold, and the agent rows painted inside the window must be the window's.
+    /// reads both back at the sizes the tree outgrows its pane.
     #[test]
     fn the_window_the_counts_name_is_the_window_the_painter_paints() {
         let (mut app, _rx) = a_twenty_agent_tree("sweep-window");
         for &(width, height) in &[(40u16, 10u16), (80u16, 24u16), (120u16, 32u16)] {
-            app.set_term_size(width, height);
-            let screen_value = app.screen(Rect::new(0, 0, width, height));
-            let Screen::Panes(panes) = &screen_value else {
-                continue;
-            };
-            let pane = &panes.agents;
-            let window = pane.list_area.height as usize;
-            let rows = pane.rows.len();
-
-            let hidden: usize = pane
-                .title_cells
-                .iter()
-                .filter_map(|cell| {
-                    let digits = cell.strip_prefix('▲').or_else(|| cell.strip_prefix('▼'))?;
-                    digits.parse::<usize>().ok()
-                })
-                .sum();
-            assert_eq!(
-                hidden,
-                rows.saturating_sub(window),
-                "{width}×{height}: ▲/▼ must name exactly what the window hides"
-            );
-
-            let frame = shot(&mut app, width, height);
-            let painted = (pane.list_area.y..pane.list_area.bottom())
-                .filter(|&y| {
-                    let line: String = (pane.list_area.x..pane.list_area.right())
-                        .map(|x| frame.cells[y as usize][x as usize].clone())
-                        .collect();
-                    line.contains('#')
-                })
-                .count();
-            assert_eq!(
-                painted,
-                window.min(rows),
-                "{width}×{height}: the window holds {window} rows but {painted} were painted"
-            );
+            let shot = shot(&mut app, width, height);
+            assert_window_counts(&format!("{width}×{height}"), &shot);
         }
     }
 

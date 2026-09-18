@@ -156,9 +156,17 @@ pub fn branch_stat(dir: &Path, base: &str, branch: &str) -> Option<Stat> {
 /// can reclaim (docs/refactor.md §3.6).
 pub const WORKTREE_DIR: &str = ".mush/wt";
 
+/// The worktree of agent `id`, relative to the repository root:
+/// `<WORKTREE_DIR>/<id>`. One spelling, shared by the path a worktree is
+/// created at, the path a row prints, and the path `/discard` removes — three
+/// `format!`s used to drift (docs/refactor.md §3.6, R27).
+pub fn worktree_rel(id: u64) -> String {
+    format!("{WORKTREE_DIR}/{id}")
+}
+
 /// The worktree of agent `id`: `<root>/.mush/wt/<id>`.
 pub fn worktree_path(root: &Path, id: u64) -> PathBuf {
-    root.join(format!("{WORKTREE_DIR}/{id}"))
+    root.join(worktree_rel(id))
 }
 
 /// The branch an isolated agent's worktree is checked out on: `mush/<id>`.
@@ -545,6 +553,7 @@ mod tests {
     #[test]
     fn the_path_and_branch_are_one_rule() {
         let root = Path::new("/repo");
+        assert_eq!(worktree_rel(12), ".mush/wt/12");
         assert_eq!(worktree_path(root, 12), PathBuf::from("/repo/.mush/wt/12"));
         assert_eq!(branch_name(12), "mush/12");
         assert_eq!(worktree_id(&branch_name(12)), Some(12));

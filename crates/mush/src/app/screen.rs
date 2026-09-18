@@ -94,6 +94,23 @@ fn inner(area: Rect) -> Rect {
     Block::default().borders(Borders::ALL).inner(area)
 }
 
+/// The bar's rows: two from 24 up, so the facts line — the branch, the dirty
+/// count and the line delta — is on screen at the ubiquitous 80×24, where it
+/// used to need 26 and was simply absent (finding P12). Below 24 the extra row
+/// is worth more to the transcript, and the compact footer carries the selected
+/// agent's own branch and worktree instead.
+///
+/// One predicate, because the prover's layout and the test helper that reads
+/// back the rows the bar does not cover must agree on where the bar starts
+/// (finding D10).
+pub(super) fn bar_rows(height: u16) -> u16 {
+    if height >= 24 {
+        2
+    } else {
+        1
+    }
+}
+
 /// The longest honest spelling of the floor that fits `width` columns.
 ///
 /// The notice was one fixed 25-column string, so a 24-column terminal painted
@@ -156,13 +173,14 @@ pub struct AgentsPane {
     /// counts of the rows that are really on screen (finding V1).
     pub list_area: Rect,
     pub focused: bool,
-    /// The title's clauses, ranked so that the ones that exist *only* here come
-    /// first: the hidden-row counts (`▲3`, `▼17`), then what the whole tree is
-    /// doing (`2 working`, `1 waiting`), then the branches' totals (`Σ +324
-    /// −40`). The painter keeps the longest prefix of them that fits the pane,
-    /// dropping whole clauses — a clause cut mid-number is a count that is not
-    /// the count.
-    pub title_cells: Vec<String>,
+    /// The pane's title, already elided to the columns this pane has: the
+    /// clauses, ranked so that the ones that exist *only* here come first (the
+    /// hidden-row counts `▲3`, `▼17`, then what the whole tree is doing, then
+    /// the branches' totals), with the ones that do not fit dropped whole from
+    /// the right. Whole, because a clause cut mid-number is a count that is not
+    /// the count; and elided here rather than in the painter, so the `Screen`
+    /// owns every word a frame paints (finding D9).
+    pub title: String,
     pub rows: Vec<AgentRow>,
     /// The row the cursor is on: an index into `rows`.
     pub cursor: usize,
@@ -275,12 +293,7 @@ impl App {
         // Size tiers (docs/mush.md §4.5 R3). Narrow or short terminals stack the
         // agent strip above the chat, because two columns starve both panes.
         let compact = area.width < 80 || area.height < 20;
-        // Two rows from 24 up, so the facts line — the branch, the dirty count
-        // and the line delta — is on screen at the ubiquitous 80×24, where it
-        // used to need 26 and was simply absent (finding P12). Below 24 the
-        // extra row is worth more to the transcript, and the compact footer
-        // carries the selected agent's own branch and worktree instead.
-        let bar_rows = if area.height >= 24 { 2 } else { 1 };
+        let bar_rows = bar_rows(area.height);
 
         let (agents_area, chat_area, bar_area) = if compact {
             // Every pane's height is a `Length`, so the three add up to the
@@ -339,6 +352,21 @@ impl App {
         let inner = inner(area);
         let nodes = self.tree.rows();
         let cursor = self.tree.cursor();
+        // One walk over the tree for every count this pane paints: `busy_children`
+        // scans per call, and asking it once per row was quadratic in the tree
+        // (finding R29). The title's buckets are one more walk of their own,
+        // inside `roster`.
+        let busy = self.tree.busy_counts();
+
+        // The rows are built before the footer, because the footer reads the
+        // cursor row's activity off the row already built for it. Deriving
+        // `phase_detail` a second time here would call `node.since.elapsed()`
+        // again, and a clock tick between the two calls would paint two ages
+        // for one frame (finding R26).
+        let rows: Vec<AgentRow> = nodes
+            .iter()
+            .map(|node| self.row(node, busy.get(&node.id).copied().unwrap_or(0)))
+            .collect();
 
         // The cursor row's facts live in a footer under the list, so the list
         // may degrade to `◐ #2` on a narrow pane without losing anything: facts
@@ -351,7 +379,7 @@ impl App {
         } else {
             let budget = if inner.height >= 8 { 3 } else { 1 };
             compact_footer(
-                agent_footer(self, nodes[cursor], inner.width as usize),
+                agent_footer(self, nodes[cursor], &rows[cursor], inner.width as usize),
                 budget,
             )
         };
@@ -390,8 +418,8 @@ impl App {
             area,
             list_area,
             focused,
-            title_cells: agents_title(self, above, below),
-            rows: nodes.iter().map(|node| self.agent_row(node)).collect(),
+            title: elide_title(&title_cells(self, above, below), inner.width as usize),
+            rows,
             cursor,
             footer,
         }
@@ -401,6 +429,13 @@ impl App {
     /// so the attach roster can serialize the very row the pane paints instead
     /// of deriving it a second time (finding R21).
     pub(super) fn agent_row(&self, node: &AgentNode) -> AgentRow {
+        self.row(node, self.tree.busy_children(node.id))
+    }
+
+    /// The same row with the parent's busy-child count supplied: the pane has
+    /// already built them all in one [`super::tree::AgentTree::busy_counts`]
+    /// walk, so it does not ask the tree once per row (finding R29).
+    fn row(&self, node: &AgentNode, waiting: usize) -> AgentRow {
         // Two facts, two marks: `glyph · id` is this agent's own phase, and
         // `⏸N` counts the children that are working. The old row derived the
         // glyph from "has live children", so a busy agent wore `⏸` and its own
@@ -439,7 +474,7 @@ impl App {
             depth: node.depth,
             glyph: phase_glyph(&node.phase),
             focused: self.tree.focused == node.id,
-            waiting: self.tree.busy_children(node.id),
+            waiting,
             result_unread: node.result_unread,
             unread_children: self.tree.unread_children(node.id).len(),
             title: node.title(),
@@ -462,6 +497,11 @@ impl App {
 
         let label = self.cfg().label();
         let room = inner(transcript_area);
+        // One lookup of the focused node for the two facts the pane's activity
+        // line is built from: `busy` and `compacting` are projections of the
+        // same node, and asking the tree twice is one thing more to keep in
+        // step (finding R9).
+        let node = self.tree.node(self.tree.focused);
         let transcript = (room.height > 0 && room.width > 0).then(|| {
             // A 200-column transcript is not read, it is skimmed. Cap the
             // measure and leave the rest as margin.
@@ -477,15 +517,10 @@ impl App {
                 // agent is waiting for somebody else's result, and the row says
                 // so (`waiting on agents 3s`). Painting the spinner over that
                 // was exactly the lie finding U7 named.
-                busy: self
-                    .tree
-                    .node(self.tree.focused)
+                busy: node
                     .map(|node| node.phase.is_busy() && node.phase.waiting().is_none())
                     .unwrap_or(false),
-                compacting: self
-                    .tree
-                    .node(self.tree.focused)
-                    .and_then(|node| node.phase.compacting()),
+                compacting: node.and_then(|node| node.phase.compacting()),
                 spin: self.spin,
                 label: &label,
             };
@@ -670,6 +705,27 @@ fn facts_line(app: &App, width: usize) -> String {
 /// uncommitted delta — and, once the read has aged past [`GIT_STALE`], how old
 /// it is. A cached read must not read as a live one, so the age rides with the
 /// fact it qualifies and is elided with it, never after it (finding P8).
+/// The pane's title: ` agents · 3 working · 2 jobs · 2 waiting · Σ +324 −40`,
+/// with the clauses that do not fit dropped whole from the right.
+///
+/// Whole, because this pane is 32 columns wide at its widest and a clause cut
+/// mid-number (`Σ +324 −`, `2 waitin`) is a count that is not the count. The
+/// pane keeps its own name when none of them fit. The loop lives here, beside
+/// the cells it elides, so the painter only paints (finding D9).
+fn elide_title(cells: &[String], width: usize) -> String {
+    for kept in (0..=cells.len()).rev() {
+        let title = if kept == 0 {
+            " agents ".to_string()
+        } else {
+            format!(" agents · {}", cells[..kept].join(" · "))
+        };
+        if UnicodeWidthStr::width(title.as_str()) <= width {
+            return title;
+        }
+    }
+    " agents ".to_string()
+}
+
 fn git_cell(git: &git::RepoStatus, age: Option<Duration>) -> String {
     let mut cell = if git.branch.is_empty() {
         "detached".to_string()
@@ -693,10 +749,11 @@ fn git_cell(git: &git::RepoStatus, age: Option<Duration>) -> String {
 ///
 /// Every clause is a count of the phases, named for what it counts, and no
 /// agent is in two of them: `N working` is the agents whose own run is in
-/// flight, `M waiting` the ones at rest with children working (the `⏸` rows),
-/// and the totals are the branches'. It used to say `N running` over a number
-/// that included the napping ones, which is how the title came to contradict
-/// the rows under it (finding U2).
+/// flight, `M waiting` the ones at rest with children working — a subset of the
+/// rows wearing `⏸N`, which a working parent wears too (finding R10) — and the
+/// totals are the branches'. It used to say `N running` over a number that
+/// included the napping ones, which is how the title came to contradict the
+/// rows under it (finding U2).
 ///
 /// The hidden-row counts are first because they exist *only* here: a 4-row pane
 /// over nineteen agents used to hide fifteen with nothing on screen saying so
@@ -706,10 +763,9 @@ fn git_cell(git: &git::RepoStatus, age: Option<Duration>) -> String {
 /// `+add −del` is on its row and in the selected row's footer, while who is
 /// working exists only here. The machine's job count rides between the two
 /// counts it is read beside: it is the box's load, the one fact that says why a
-/// dozen isolated children feel slow (finding H8). The painter drops clauses
-/// from the right until the title fits — it knows the columns, this knows the
-/// numbers.
-fn agents_title(app: &App, above: usize, below: usize) -> Vec<String> {
+/// dozen isolated children feel slow (finding H8). This knows the numbers;
+/// [`elide_title`] spends the columns on them.
+fn title_cells(app: &App, above: usize, below: usize) -> Vec<String> {
     let roster = app.tree.roster();
     let mut cells = Vec::new();
     if above > 0 {
@@ -766,8 +822,10 @@ fn compact_footer(mut full: Vec<Line<'static>>, budget: usize) -> Vec<Line<'stat
 }
 
 /// The footer under the tree: the cursor row's full facts, so a narrow pane
-/// still tells the whole story.
-fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>> {
+/// still tells the whole story. The row is the one already built for the
+/// cursor: its `activity` is the age the list is painting, so the footer and
+/// the row cannot show two ages for one frame (finding R26).
+fn agent_footer(app: &App, node: &AgentNode, row: &AgentRow, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
         Span::styled(format!(" #{} ", node.id), Style::default().fg(Color::Cyan)),
@@ -783,7 +841,7 @@ fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>>
     // stopped agent, so the one row the human is reading was the one whose
     // activity could vanish from the screen entirely (finding P4).
     let mut detail = agent_detail(node);
-    let activity = phase_detail(node);
+    let activity = row.activity.clone();
     if !activity.is_empty() {
         detail.insert(0, activity);
     }
@@ -879,7 +937,7 @@ fn agent_detail(node: &AgentNode) -> Vec<String> {
             Some(branch) => vec![
                 // The worktree path comes from core like every other one: the
                 // row must name the directory a `git worktree remove` takes.
-                format!("{}/{}", git::WORKTREE_DIR, node.id),
+                git::worktree_rel(node.id.0),
                 format!("git diff HEAD...{branch}"),
             ],
             None => Vec::new(),
@@ -1134,7 +1192,7 @@ mod tests {
         // match the number in the branch name.
         assert_eq!(
             text,
-            format!(".mush/wt/{} · git diff HEAD...mush/9", open.id)
+            format!("{} · git diff HEAD...mush/9", git::worktree_rel(open.id.0))
         );
     }
 
