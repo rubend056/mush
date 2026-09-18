@@ -562,6 +562,33 @@ impl ActorState {
             .get(&id)
             .map(|completion| &completion.outcome)
     }
+
+    /// Record a child's completion and say whether its line is *fresh* — one
+    /// the model has not read yet: `(line, fresh)`. The record is kept either
+    /// way (it is what makes a *later* run newsworthy), and a fresh line is
+    /// marked read as it is handed back. The seven callers of "record and push
+    /// a completion once" — the two in [`absorb`], `drain_mailbox`'s, both of
+    /// [`fold_completions`]'s, and the two wait tools — differ only in what
+    /// they do with the answer (`Fold::Run` or `Fold::Idle`, or return the
+    /// line). Reading the same run again is not fresh: folding it would hand
+    /// the model a line it has answered (`docs/findings.md` B24).
+    fn record_child(&mut self, id: u64, run: u64, outcome: Outcome) -> (String, bool) {
+        let line = note_completion(self, id, run, outcome);
+        if self.delivered.get(&id) == Some(&run) {
+            return (line, false);
+        }
+        self.delivered.insert(id, run);
+        (line, true)
+    }
+
+    /// The same once-only delivery for a job: record the report and return its
+    /// line when the model has not read it, or `None` when it has — a report
+    /// recorded again is the *same* report, and folding it again would repeat a
+    /// line the model has answered (`docs/findings.md` B24).
+    fn record_job(&mut self, id: u64, line: String, news: bool) -> Option<String> {
+        let line = note_job(self, id, line, news);
+        self.delivered_jobs.insert(id).then_some(line)
+    }
 }
 
 /// A job's completion, as its owner keeps it: the line the model reads, and
@@ -1158,17 +1185,16 @@ fn absorb(
             // completion counts as delivered because the model is about to
             // read it in this very run.
             let news = outcome.is_news();
-            let line = note_completion(state, id, run, outcome);
+            let (line, fresh) = state.record_child(id, run, outcome);
             // A run the model has already read is not news however often it is
             // reported: folding it here would hand the model a line it has
             // answered, and a result would even pay for a turn to repeat it
             // (`docs/findings.md` B24). The record itself is kept — it is what
             // makes a *later* run newsworthy.
-            if state.delivered.get(&id) == Some(&run) {
+            if !fresh {
                 return Fold::Idle;
             }
             push_line(actor, transcript, line);
-            state.delivered.insert(id, run);
             // A stopped child is the human's doing, not news that warrants
             // waking a napping parent into a fresh (paid) run: the line is in
             // the transcript for whenever the parent runs next.
@@ -1184,16 +1210,16 @@ fn absorb(
             // same silence when the report has already been read, so a report
             // recorded again cannot repeat a line the model has answered
             // (`docs/findings.md` B24).
-            let line = note_job(state, id, line, news);
-            if state.delivered_jobs.contains(&id) {
-                return Fold::Idle;
-            }
-            push_line(actor, transcript, line);
-            state.delivered_jobs.insert(id);
-            if news {
-                Fold::Run
-            } else {
-                Fold::Idle
+            match state.record_job(id, line, news) {
+                None => Fold::Idle,
+                Some(line) => {
+                    push_line(actor, transcript, line);
+                    if news {
+                        Fold::Run
+                    } else {
+                        Fold::Idle
+                    }
+                }
             }
         }
     }
@@ -2082,10 +2108,8 @@ fn drain_mailbox(
             // often it is recorded (`docs/findings.md` B24), which is what makes
             // a replayed record cost nothing.
             AgentMsg::CommandDone { id, line, news } => {
-                let line = note_job(state, id, line, news);
-                if !state.delivered_jobs.contains(&id) {
+                if let Some(line) = state.record_job(id, line, news) {
                     push_line(actor, messages, line);
-                    state.delivered_jobs.insert(id);
                 }
             }
             // The UI sends a whole transcript when it believes we are idle.
@@ -2181,8 +2205,9 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
         .collect();
     let mut news = false;
     for (job, line, job_news) in jobs {
-        push_line(actor, messages, note_job(state, job, line, job_news));
-        state.delivered_jobs.insert(job);
+        if let Some(line) = state.record_job(job, line, job_news) {
+            push_line(actor, messages, line);
+        }
         news |= job_news;
     }
     // A child's completion is always worth a turn: the model has to read a
@@ -2196,9 +2221,7 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
         .map(|(child, completion)| (*child, completion.run, completion.outcome.clone()))
         .collect();
     for (child, run, outcome) in children {
-        let line = note_completion(state, child, run, outcome);
-        push_line(actor, messages, line);
-        state.delivered.insert(child, run);
+        push_line(actor, messages, state.record_child(child, run, outcome).0);
         news = true;
     }
     news
@@ -2454,8 +2477,7 @@ fn wait_tool(
             // says "cancelled". The mark names the run this answer came from: a
             // run recorded *after* it is still unread, and folds then.
             let completion = state.completed.get(&id)?.clone();
-            state.delivered.insert(id, completion.run);
-            Some(completion.outcome.line(id))
+            Some(state.record_child(id, completion.run, completion.outcome).0)
         },
     )
 }
@@ -2672,9 +2694,12 @@ fn wait_commands_tool(
             // Asking a second time answers with the job's line again — a wait
             // is "tell me what happened", and the model that asks twice gets an
             // answer twice rather than a silence it has to interpret.
-            let report = state.done_jobs.get(&id)?.line.clone();
-            state.delivered_jobs.insert(id);
-            Some(report)
+            let report = state.done_jobs.get(&id)?.clone();
+            Some(
+                state
+                    .record_job(id, report.line.clone(), report.news)
+                    .unwrap_or(report.line),
+            )
         },
     )
 }
