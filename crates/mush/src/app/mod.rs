@@ -99,7 +99,15 @@ impl Picker {
         match self.kind {
             PickerKind::Model => " models · Enter picks ".to_string(),
             PickerKind::Provider => " provider · Enter picks ".to_string(),
-            PickerKind::Notes => " notes · newest last ".to_string(),
+            PickerKind::Notes => format!(
+                // The position is part of the title because the list opens in
+                // the middle of a long note (see `open_notes_picker`): without
+                // it, a popup whose head is above the fold looks like the whole
+                // note, and nothing says a keypress reads the rest.
+                " notes · newest last · line {}/{} ",
+                self.cursor + 1,
+                self.items.len()
+            ),
         }
     }
 
@@ -1255,8 +1263,11 @@ impl App {
     /// The foot shows at most two of them, so this is the other half of that
     /// cap: a list where a long line is wrapped rather than clipped, which is
     /// what `/help` and a multi-line failure need. Newest last, the same order
-    /// the pane reads in, with the cursor on it — the newest is what the human
-    /// came back for.
+    /// the pane reads in, and the cursor opens on the *head of the newest* note
+    /// rather than on the list's last row: a note longer than the popup wraps
+    /// into many rows, and its last row is the middle of a sentence with the
+    /// stamp that says when it happened above the fold (finding T7). One
+    /// keypress down from there reads the rest of it.
     fn open_notes_picker(&mut self) {
         let agent = self.tree.focused;
         // Wrapped for the popup this terminal actually paints: the width comes
@@ -1264,16 +1275,15 @@ impl App {
         // the list instead of being clipped by it (`picker_text_width` says
         // what).
         let width = crate::ui::picker_text_width(self.term_width);
-        let items = self.chat.notes_report(agent, session::now_secs(), width);
-        if items.is_empty() {
+        let notes = self.chat.notes_report(agent, session::now_secs(), width);
+        if notes.rows.is_empty() {
             self.say(format!("nothing written about #{agent} yet"));
             return;
         }
-        let cursor = items.len() - 1;
         self.picker = Some(Picker {
             kind: PickerKind::Notes,
-            items,
-            cursor,
+            items: notes.rows,
+            cursor: notes.newest,
         });
     }
 
@@ -3469,6 +3479,7 @@ mod tests {
         assert!(
             app.chat
                 .notes_report(AgentId::ROOT, session::now_secs(), 74)
+                .rows
                 .is_empty(),
             "nothing has been written about a fresh conversation"
         );
@@ -3498,6 +3509,59 @@ mod tests {
             "oldest first, like the pane"
         );
         assert_eq!(picker.cursor, 4, "the cursor opens on the newest");
+    }
+
+    /// A note longer than the popup must not drop the human mid-sentence: the
+    /// list opens on the head of the newest note — the row that carries when it
+    /// happened and how it started — not on its last row (finding T7).
+    #[test]
+    fn the_notes_popup_opens_on_the_head_of_the_newest_note() {
+        let (mut app, _rx) = test_app("notes-head");
+        // Old enough to have a stamp, short enough to be one row.
+        app.chat.note_for(AgentId::ROOT, "opened notes.txt");
+        // The newest note, long enough to wrap into several rows at the width
+        // the popup is painted at.
+        app.chat.note_for(
+            AgentId::ROOT,
+            "the run failed while folding the transcript: the endpoint returned 503 \
+             for the third summarisation attempt, and the fold was abandoned with the \
+             conversation left half-written, so read the tail of the transcript before \
+             trusting anything above it",
+        );
+
+        let _ = screen(&mut app, 80, 24);
+        run(&mut app, "/notes");
+        let picker = app.picker.as_ref().expect("the lines mush wrote");
+        assert!(
+            picker.items.len() > 3,
+            "the newest note wraps, which is the case this is about: {:?}",
+            picker.items
+        );
+        assert!(
+            picker.cursor < picker.items.len() - 1,
+            "the cursor is not on the last row, which is mid-sentence: {:?}",
+            picker.items
+        );
+        assert_eq!(
+            picker.items[picker.cursor], "0s · the run failed while folding the",
+            "it opens on the head of the newest note, stamp included"
+        );
+        assert!(
+            picker.items[..picker.cursor]
+                .iter()
+                .any(|row| row.contains("opened notes.txt")),
+            "and the older note is above it, not scrolled away: {:?}",
+            picker.items
+        );
+        let title = picker.title();
+        assert!(
+            title.contains(&format!(
+                "line {}/{}",
+                picker.cursor + 1,
+                picker.items.len()
+            )),
+            "the title says where in the list the cursor is: {title}"
+        );
     }
 
     /// `/notes` is the escape hatch for the lines the foot ceded, so it has to

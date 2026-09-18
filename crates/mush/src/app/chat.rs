@@ -200,6 +200,21 @@ pub struct Painted {
     pub title: String,
 }
 
+/// The lines mush wrote about one agent, as `/notes` reads them: the rows of
+/// the list, oldest first, and the row the newest note starts at.
+///
+/// The second half is the answer to finding T7: the report used to be a bare
+/// list of rows, so the popup could only open on the last one — and a long note
+/// wraps into many rows, so the row it opened on was the middle of a sentence,
+/// with the stamp and the start of the note above the fold. Where a note begins
+/// is a fact about the notes, so it is derived here rather than guessed from the
+/// rows by whoever opens the list.
+pub struct Notes {
+    pub rows: Vec<String>,
+    /// The index of the newest note's first row. `0` for an empty list.
+    pub newest: usize,
+}
+
 /// The foot of one transcript pane: the rows a pane paints under the
 /// conversation, how many of the foot's lines it has no room for, and whether
 /// the row that says so is one of them.
@@ -551,9 +566,20 @@ impl Chat {
     /// happened, what it said, and — because the foot can only ever show two of
     /// its lines — the rest of it, wrapped here rather than clipped, since a
     /// list row cannot wrap itself.
-    pub fn notes_report(&self, agent: AgentId, now: u64, width: usize) -> Vec<String> {
+    ///
+    /// The list also carries where the newest note *begins*, because a long
+    /// note wraps into many rows and the row that says when it happened and how
+    /// it started is the head: a reader dropped at the bottom lands mid-sentence
+    /// with the age above the fold (finding T7). See [`Notes::newest`].
+    pub fn notes_report(&self, agent: AgentId, now: u64, width: usize) -> Notes {
         let mut rows = Vec::new();
+        let mut newest = 0;
         for notice in self.notices_for(agent) {
+            // The head of the newest note is the last one this loop starts: a
+            // later notice, if there is one, moves it down. A note that wraps
+            // to no rows at all (an empty text another version stored) leaves
+            // the head where it was rather than pointing past the list.
+            let head = rows.len();
             let marker = match notice.kind {
                 NoticeKind::Info => "·",
                 NoticeKind::Stopped => "⊘",
@@ -576,8 +602,11 @@ impl Chat {
                     rows.push(format!("{}{line}", " ".repeat(lead.len())));
                 }
             }
+            if rows.len() > head {
+                newest = head;
+            }
         }
-        rows
+        Notes { rows, newest }
     }
 
     fn push_notice(&mut self, agent: AgentId, kind: NoticeKind, text: impl Into<String>) {
@@ -2048,7 +2077,7 @@ mod tests {
         assert_eq!(shown(&painted.lines), vec!["mush › the newest reply"]);
         assert_eq!(painted.title, " mush ", "{:?}", painted.title);
         assert!(
-            chat.notes_report(AgentId::ROOT, 0, 34).is_empty(),
+            chat.notes_report(AgentId::ROOT, 0, 34).rows.is_empty(),
             "and there is in fact nothing to read"
         );
 
@@ -2070,7 +2099,7 @@ mod tests {
         let at = chat.notices_for(AgentId(1)).next().expect("the hint").at;
 
         // Narrow enough to wrap the hint into several list rows.
-        let rows = chat.notes_report(AgentId(1), at, 20);
+        let rows = chat.notes_report(AgentId(1), at, 20).rows;
         assert!(rows.len() > 2, "the long line wraps: {rows:?}");
         assert!(rows[0].starts_with("0s · could not"), "{:?}", rows[0]);
         assert!(
@@ -2087,7 +2116,7 @@ mod tests {
             "and wrapped whole instead of being clipped: {rows:?}"
         );
         assert!(
-            chat.notes_report(AgentId(2), at, 20).is_empty(),
+            chat.notes_report(AgentId(2), at, 20).rows.is_empty(),
             "and it is one agent's list, not every agent's (finding B19)"
         );
     }
@@ -2113,7 +2142,7 @@ mod tests {
         // `ui::picker_text_width` (a 40-column terminal and an 80-column one),
         // which is what makes this the real painted width and not a stand-in.
         for width in [34usize, 46, 74] {
-            let rows = chat.notes_report(AgentId(1), at, width);
+            let rows = chat.notes_report(AgentId(1), at, width).rows;
             assert!(
                 rows.iter().any(|row| row.contains("tango")),
                 "the tail of the note survives at {width}: {rows:?}"
