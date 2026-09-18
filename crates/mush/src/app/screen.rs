@@ -94,6 +94,23 @@ fn inner(area: Rect) -> Rect {
     Block::default().borders(Borders::ALL).inner(area)
 }
 
+/// The bar's rows: two from 24 up, so the facts line — the branch, the dirty
+/// count and the line delta — is on screen at the ubiquitous 80×24, where it
+/// used to need 26 and was simply absent (finding P12). Below 24 the extra row
+/// is worth more to the transcript, and the compact footer carries the selected
+/// agent's own branch and worktree instead.
+///
+/// One predicate, because the prover's layout and the test helper that reads
+/// back the rows the bar does not cover must agree on where the bar starts
+/// (finding D10).
+pub(super) fn bar_rows(height: u16) -> u16 {
+    if height >= 24 {
+        2
+    } else {
+        1
+    }
+}
+
 /// The longest honest spelling of the floor that fits `width` columns.
 ///
 /// The notice was one fixed 25-column string, so a 24-column terminal painted
@@ -276,12 +293,7 @@ impl App {
         // Size tiers (docs/mush.md §4.5 R3). Narrow or short terminals stack the
         // agent strip above the chat, because two columns starve both panes.
         let compact = area.width < 80 || area.height < 20;
-        // Two rows from 24 up, so the facts line — the branch, the dirty count
-        // and the line delta — is on screen at the ubiquitous 80×24, where it
-        // used to need 26 and was simply absent (finding P12). Below 24 the
-        // extra row is worth more to the transcript, and the compact footer
-        // carries the selected agent's own branch and worktree instead.
-        let bar_rows = if area.height >= 24 { 2 } else { 1 };
+        let bar_rows = bar_rows(area.height);
 
         let (agents_area, chat_area, bar_area) = if compact {
             // Every pane's height is a `Length`, so the three add up to the

@@ -2695,6 +2695,7 @@ mod tests {
 
     use crossbeam_channel::Receiver;
     use ratatui::backend::TestBackend;
+    use ratatui::buffer::Buffer;
     use ratatui::crossterm::event::{KeyCode, KeyModifiers};
     use ratatui::layout::Rect;
     use ratatui::widgets::{Block, Borders};
@@ -3278,15 +3279,22 @@ mod tests {
     /// Paint one frame at a real terminal size, the way `main` does: the size
     /// the next frame (and any `/notes` opened between frames) sees, one
     /// `Screen` derived for the frame's own area, and it painted into a
-    /// `TestBackend`.
-    fn shot(app: &mut App, width: u16, height: u16) -> Shot {
+    /// `TestBackend`. The `Screen` and the painted buffer are handed back
+    /// together, because the tests read both: the derived words and the cells
+    /// they reached — including the ones `screen` trims away (finding R28).
+    fn painted(app: &mut App, width: u16, height: u16) -> (Screen, Buffer) {
         app.set_term_size(width, height);
         let screen = app.screen(Rect::new(0, 0, width, height));
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
             .draw(|frame| crate::ui::draw(frame, &screen))
             .unwrap();
-        let buffer = terminal.backend().buffer();
+        (screen, terminal.backend().buffer().clone())
+    }
+
+    /// One painted frame as a [`Shot`]: the `Screen` and its cells.
+    fn shot(app: &mut App, width: u16, height: u16) -> Shot {
+        let (screen, buffer) = painted(app, width, height);
         let cells = (0..height)
             .map(|y| {
                 (0..width)
@@ -3343,14 +3351,8 @@ mod tests {
     /// how a test still reads which row the pane paints as selected. The bar is
     /// excluded because its focus badge wears the same cyan and is not a row.
     fn selected_rows(app: &mut App, width: u16, height: u16) -> Vec<usize> {
-        app.set_term_size(width, height);
-        let screen = app.screen(Rect::new(0, 0, width, height));
-        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
-        terminal
-            .draw(|frame| crate::ui::draw(frame, &screen))
-            .unwrap();
-        let buffer = terminal.backend().buffer();
-        let bar_rows = if height >= 24 { 2 } else { 1 };
+        let (_, buffer) = painted(app, width, height);
+        let bar_rows = super::screen::bar_rows(height);
         (0..(height - bar_rows) as usize)
             .filter(|&y| {
                 (0..width as usize)
