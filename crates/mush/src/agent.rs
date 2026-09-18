@@ -2888,6 +2888,11 @@ fn control_tool(state: &mut ActorState, args: &Value) -> Result<String, String> 
     let Some(cmd) = state.children.get(&id) else {
         return Err(format!("no such child agent #{id}"));
     };
+    // Whether the words are read *now* or at the child's next message boundary
+    // is the parent's own book (`running`), and the reply says which: "messaged
+    // agent #N" claimed delivery with no way to tell a child that resumes from
+    // one that is mid-run (finding H5).
+    let at_rest = !state.running.contains(&id);
     // A dead mailbox means the child is gone; saying "stopping" anyway would
     // have the model wait on a result that can never arrive.
     let sent = match action.as_str() {
@@ -2900,7 +2905,12 @@ fn control_tool(state: &mut ActorState, args: &Value) -> Result<String, String> 
     };
     match sent {
         Ok(()) if action == "stop" => Ok(format!("stopping agent #{id}")),
-        Ok(()) => Ok(format!("messaged agent #{id}")),
+        Ok(()) if at_rest => Ok(format!(
+            "messaged agent #{id} — it was at rest, so this resumes it"
+        )),
+        Ok(()) => Ok(format!(
+            "messaged agent #{id} — it is mid-run, so it reads this at its next step"
+        )),
         Err((id, _)) => Err(format!("agent #{id} is gone")),
     }
 }
@@ -3890,11 +3900,30 @@ mod tests {
             &AtomicBool::new(false),
         )
         .unwrap();
-        assert_eq!(sent, "messaged agent #1");
+        assert_eq!(
+            sent,
+            "messaged agent #1 — it was at rest, so this resumes it"
+        );
         match child_rx.try_recv() {
             Ok(AgentMsg::Steer(words)) => assert_eq!(words, text),
             _ => panic!("steering must travel as steering, not as the human's own words"),
         }
+        // The reply names the other road too: a child that is mid-run reads the
+        // words at its next message boundary, not now (finding H5).
+        state.running.insert(1);
+        let sent = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::AgentControl,
+            &json!({ "id": 1, "action": "message", "text": "keep going" }),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(sent.contains("mid-run"), "{sent}");
+        assert!(
+            matches!(child_rx.try_recv(), Ok(AgentMsg::Steer(words)) if words == "keep going"),
+            "the words are queued either way"
+        );
 
         // Folding it in: the model reads the line, and the UI was told to put it
         // in the same transcript.
