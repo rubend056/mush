@@ -542,6 +542,13 @@ impl App {
                 session::StoredLanded::Merged => Landed::Merged,
                 session::StoredLanded::Discarded => Landed::Discarded,
             });
+            // One decision, two readers: a stored branch whose worktree is gone
+            // is not this agent's any more. `revive` runs such an agent in the
+            // main checkout, and a node that kept the branch would offer
+            // `/diff` and `/merge` for a reclaimed directory, paint a dead path
+            // in the footer, and refuse a nudge the actor would have run
+            // (finding U13). Computed once, handed to both.
+            let branch = agent::live_branch(&root, agent.id, agent.branch.clone());
             let parent = agent.parent.map(AgentId);
             // The row is derived and cannot lie; a `⚠` row with nothing under it
             // would say *that* a run never ended without saying what follows
@@ -561,7 +568,7 @@ impl App {
                     id: agent.id,
                     depth: agent.depth.max(1),
                     brief: agent.brief.clone(),
-                    branch: agent.branch.clone(),
+                    branch: branch.clone(),
                     messages: agent.messages.clone(),
                 },
             );
@@ -571,7 +578,7 @@ impl App {
                 depth: agent.depth.max(1),
                 brief: agent.brief,
                 phase,
-                branch: agent.branch,
+                branch,
                 summary,
                 leftover: agent.leftover,
                 landed,
@@ -1254,6 +1261,12 @@ impl App {
     /// grandchild working under a child that is itself parked promised a resume
     /// the grandchild's finish does not cause, and it contradicted the title of
     /// the very frame it was painted in (a second owner of the fact U2 named).
+    ///
+    /// Whether the root is the one napping is [`AgentTree::napping`] too — the
+    /// predicate the title's bucket reads. A stopped or failed root over a
+    /// working child does resume (the completion folds in and starts a run), so
+    /// the bar promising it while the title said `0 waiting` was one fact, two
+    /// derivations (finding U12).
     pub fn tree_line(&self) -> Option<String> {
         let focused = self.tree.focused;
         if self
@@ -1265,14 +1278,10 @@ impl App {
                 "compacting #{focused} · keep typing — your message is answered after the fold"
             ));
         }
-        let waiting = self.tree.busy_children(AgentId::ROOT);
-        let root_is_working = self
-            .tree
-            .node(AgentId::ROOT)
-            .is_some_and(|root| root.phase.is_busy());
-        if waiting == 0 || root_is_working {
+        if !self.tree.napping(AgentId::ROOT) {
             return None;
         }
+        let waiting = self.tree.busy_children(AgentId::ROOT);
         Some(format!(
             "waiting on {waiting} subagent(s) — the root resumes as they finish"
         ))
@@ -4313,6 +4322,52 @@ mod tests {
             }],
             notices: Vec::new(),
         }
+    }
+
+    /// One decision at restore: a stored branch whose worktree is gone is not
+    /// the agent's any more (finding U13). The row must not offer `/diff` or
+    /// `/merge` for a reclaimed directory, must not paint a dead path in its
+    /// footer, and must not refuse a nudge the actor would happily run in the
+    /// main checkout.
+    #[test]
+    fn a_restored_branch_whose_worktree_is_gone_is_dropped() {
+        let root = dir("restore-dead-branch");
+        let mut stored = stored_with_agent(
+            &root,
+            session::StoredStatus::Idle,
+            vec![Message::user("port the parser")],
+        );
+        stored.agents[0].branch = Some("mush/2".to_string());
+        let (mut app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+        let node = app.tree.node(AgentId(2)).expect("the agent is restored");
+        assert!(
+            node.branch.is_none(),
+            "the branch went with its worktree: {:?}",
+            node.branch
+        );
+        assert!(
+            app.worktree_gone(AgentId(2)).is_none(),
+            "a nudge must not be refused for a branch the agent no longer has"
+        );
+
+        // The words the human reads: `/diff` says there is no branch, instead
+        // of running git against a revision nothing can show.
+        app.apply_command(Command::Worktree {
+            verb: Verb::Diff,
+            id: 2,
+        });
+        let (said, kind) = app.status_line().expect("the refusal is on the bar");
+        assert_eq!(
+            kind,
+            StatusKind::Error,
+            "a refusal is a failure, not chatter"
+        );
+        assert!(
+            said.contains("no worktree branch"),
+            "a dropped branch has no diff to show: {said}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Everything the restore heard from one agent, as text, for a test that
@@ -8104,6 +8159,12 @@ mod tests {
         let root = dir(label);
         let session = root.join(".mush/session.json");
         std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        // The stored worktree is really on disk: a restored isolated agent
+        // keeps its branch, and the sweep photographs a row with one. A branch
+        // whose worktree is gone is the *other* case — it is dropped, and
+        // `a_restored_branch_whose_worktree_is_gone_is_dropped` is where that
+        // is pinned (finding U13).
+        std::fs::create_dir_all(root.join(".mush/wt/1")).unwrap();
         // Written as text, not built from `Session`: a hand-edited file is the
         // input this path has to survive, and a round trip through the writer
         // would test the writer instead.
@@ -8714,6 +8775,25 @@ mod tests {
         assert!(
             !bar.contains("waiting on 2"),
             "the bar disagrees with the title in the same frame: {bar:?}"
+        );
+
+        // The same fact with a *stopped* root (finding U12): a stopped or failed
+        // agent's mailbox is just as alive — the child's completion folds in and
+        // starts a run — so the title must still count it waiting. The title
+        // said `0 waiting` while the bar promised `the root resumes`, which is
+        // one fact derived two ways.
+        app.tree.stopped(AgentId::ROOT);
+        assert!(
+            app.tree.roster().waiting >= 1,
+            "a stopped root over a working child is still waiting on it"
+        );
+        let rows = screen(&mut app, 200, 50);
+        let title = rows.first().expect("the pane title is painted");
+        let bar = &rows[rows.len() - 2];
+        assert!(title.contains("1 waiting"), "{title:?}");
+        assert!(
+            bar.contains("waiting on 1 subagent(s)"),
+            "the bar and the title agree about a stopped root: {bar:?}"
         );
     }
 

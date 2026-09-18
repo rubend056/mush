@@ -1108,18 +1108,30 @@ impl AgentTree {
         for node in &self.agents {
             if node.phase.is_busy() {
                 roster.working += 1;
-            } else if matches!(node.phase, Phase::Idle | Phase::Done)
-                && self.busy_children(node.id) > 0
-            {
+            } else if self.napping(node.id) {
                 // At rest with work out: §5.5's napping orchestrator, which the
                 // row draws as `⏸`. Counted here and *nowhere else* — counting
-                // it as working as well is exactly what the title did wrong.
-                // A failed or stopped agent waits for nothing, so it is in no
-                // bucket: its own `✗`/`⊘` row is where that fact lives.
+                // it as working as well is exactly what the title did wrong
+                // (U2), and a stop or a failure is not a reason to say it waits
+                // for nothing (U12: the mailbox is just as alive).
                 roster.waiting += 1;
             }
         }
         roster
+    }
+
+    /// Whether this agent is at rest with work still out — §5.5's napping
+    /// orchestrator: it ended (or stopped, or failed) its turn while children
+    /// run, and a completion will fold in and start a fresh run.
+    ///
+    /// The one predicate the title's `waiting` bucket and the bar's sentence
+    /// read, because a stopped or failed agent's mailbox is exactly as alive as
+    /// an idle one's: the child's completion folds in and wakes it all the same,
+    /// so the title saying `0 waiting` while the bar promises `the root resumes
+    /// as they finish` was one fact derived two ways (finding U12).
+    pub fn napping(&self, id: AgentId) -> bool {
+        self.node(id)
+            .is_some_and(|node| !node.phase.is_busy() && self.busy_children(id) > 0)
     }
 
     /// The children of `id` whose results it has not read, in tree order.

@@ -864,6 +864,18 @@ pub struct ReviveSpec {
     pub messages: Vec<Message>,
 }
 
+/// The branch an agent can still work on: one whose worktree is on disk.
+///
+/// A merged or discarded branch is not this agent's any more — its work is in
+/// the main checkout, and its actor would commit into the human's own tree if
+/// it kept the name (`revive` sends it to the root, where the work now is).
+/// The node and the actor must read the same answer, or the row offers `/diff`
+/// and `/merge` for a reclaimed directory while the actor runs in the checkout
+/// (finding U13); this one function is where both get it.
+pub fn live_branch(root: &Path, id: u64, branch: Option<String>) -> Option<String> {
+    branch.filter(|_| git::worktree_path(root, id).exists())
+}
+
 /// Bring back an agent whose actor is gone — one restored from a stored session,
 /// or a worktree found on disk — seeded with the transcript it had, and run it.
 ///
@@ -893,7 +905,9 @@ pub fn revive(
     } = spec;
     // Its own worktree if it still exists, else the shared root — an agent whose
     // branch was merged continues in the main checkout, which is where its work
-    // now is.
+    // now is. The same decision the node's branch goes through
+    // ([`live_branch`]), so the two cannot disagree (finding U13).
+    let branch = live_branch(&root, id, branch);
     let isolated = branch
         .as_deref()
         .map(|_| git::worktree_path(&root, id))
@@ -901,10 +915,6 @@ pub fn revive(
     let ws_root = isolated.clone().unwrap_or_else(|| root.clone());
     let ws = Workspace::new(&ws_root).expect("workspace root must exist");
     let ws_root_str = ws.root_str();
-    // A branch with no worktree left must not be carried: the actor commits at
-    // the end of every run, and that commit would land in the human's own
-    // checkout.
-    let branch = if isolated.is_some() { branch } else { None };
     let ctx = Arc::new(AgentCtx {
         cfg: cfg.clone(),
         model: Arc::new(HttpModel::new(cfg)),
