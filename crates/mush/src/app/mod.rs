@@ -1365,13 +1365,10 @@ impl App {
     fn worktree_gone(&self, id: AgentId) -> Option<String> {
         let node = self.tree.node(id)?;
         if let Some(landed) = node.landed {
-            let past = match landed {
-                Landed::Merged => "merged",
-                Landed::Discarded => "discarded",
-            };
             return Some(format!(
-                "agent #{id} was {past} — its worktree is gone; \
-                 spawn a fresh agent or work in the root"
+                "agent #{id} was {} — its worktree is gone; \
+                 spawn a fresh agent or work in the root",
+                landed.past()
             ));
         }
         if node.branch.is_some() && !git::worktree_path(self.ws.root(), id.0).exists() {
@@ -3560,6 +3557,34 @@ mod tests {
             }],
             notices: Vec::new(),
         }
+    }
+
+    /// A landed agent's nudge is refused in the landing's own word: the past
+    /// tense is [`Landed::past`]'s, so the refusal and the row cannot tell the
+    /// same story two ways (refactor R12).
+    #[test]
+    fn a_nudge_to_a_landed_agent_names_how_it_landed() {
+        let root = dir("landed-refusal");
+        let mut stored = stored_with_agent(
+            &root,
+            session::StoredStatus::Done,
+            vec![Message::user("port the parser")],
+        );
+        stored.agents[0].landed = Some(session::StoredLanded::Merged);
+        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+        assert_eq!(
+            app.worktree_gone(AgentId(2)).as_deref(),
+            Some(
+                format!(
+                    "agent #2 was {} — its worktree is gone; \
+                     spawn a fresh agent or work in the root",
+                    Landed::Merged.past()
+                )
+                .as_str()
+            )
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// One decision at restore: a stored branch whose worktree is gone is not

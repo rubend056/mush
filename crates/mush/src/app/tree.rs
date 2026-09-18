@@ -356,6 +356,22 @@ pub enum Landed {
     Discarded,
 }
 
+impl Landed {
+    /// The past tense of what happened, as a word.
+    ///
+    /// The one spelling of it, so the refusal that tells the human why a nudge
+    /// cannot run and the row that says where the work went cannot tell the
+    /// same story in two different words (refactor R12). It is the word and not
+    /// the sentence: each surface paints its own prose around it
+    /// (`app::screen::agent_detail` for the row).
+    pub fn past(self) -> &'static str {
+        match self {
+            Landed::Merged => "merged",
+            Landed::Discarded => "discarded",
+        }
+    }
+}
+
 /// One entry in the agent tree. In [`AgentTree::agents`] the order is *spawn*
 /// order — the order things happened, which is what a stored session keeps;
 /// the order a pane paints is derived from it by [`AgentTree::rows`]. Ids are
@@ -1485,6 +1501,14 @@ mod tests {
         assert_eq!(edit.doing(), "edit_file", "the bar carries the tool's own");
         // A label with no words in it is still a word: nothing may read `#0 `.
         assert_eq!(Phase::Activity(String::new()).doing(), "working");
+    }
+
+    /// A landing's past tense is one word, so the row's prose and the refusal
+    /// that stops a nudge cannot tell the same story two ways (refactor R12).
+    #[test]
+    fn a_landing_has_one_past_tense() {
+        assert_eq!(Landed::Merged.past(), "merged");
+        assert_eq!(Landed::Discarded.past(), "discarded");
     }
 
     /// A fold from rest is visible — the hole `activity` could not fill, because
