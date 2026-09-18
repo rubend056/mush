@@ -685,7 +685,9 @@ impl App {
 
     /// Register git worktrees left over from earlier sessions (`mush/<id>`
     /// branches) as finished tree nodes, so `/diff`, `/merge`, `/discard` keep
-    /// working after a restart.
+    /// working after a restart. A registry entry whose checkout is gone is not
+    /// work on disk and gets no row — `rm -rf .mush` leaves git naming those
+    /// until they are pruned (finding P13).
     pub fn discover_worktrees(&mut self) {
         let root = self.ws.root().to_path_buf();
         // `None` means git could not answer (no binary, not a repository). The
@@ -711,6 +713,11 @@ impl App {
             .collect();
         self.tree.reap(&gone);
         for worktree in worktrees {
+            // A dead registry entry is git's residue, not a worktree: a row for
+            // it would claim a directory that is not there (finding P13).
+            if !worktree.on_disk() {
+                continue;
+            }
             let Some(id) = worktree.id else {
                 continue;
             };
@@ -771,7 +778,12 @@ impl App {
     /// the message claimed there were none while the directory sat there
     /// (finding P10). The disk is the fact; the adopted set is what the
     /// commands can act on; the sentence has to say both to be true.
-    fn worktree_report(&self) -> String {
+    ///
+    /// `cleared` is what this re-scan took out of git's registry: entries for
+    /// checkouts that were already gone. The line says so, and says the
+    /// branches stayed, because that is the part a human has to be able to
+    /// trust (finding P13).
+    fn worktree_report(&self, cleared: usize) -> String {
         let root = self.ws.root();
         // `None` is git not answering; say so rather than claim a count.
         let Some(worktrees) = git::worktrees(root) else {
@@ -780,11 +792,16 @@ impl App {
         let dir = root.join(git::WORKTREE_DIR);
         let on_disk = worktrees
             .iter()
-            .filter(|worktree| worktree.path.starts_with(&dir))
+            .filter(|worktree| worktree.path.starts_with(&dir) && worktree.on_disk())
             .count();
+        let cleared = match cleared {
+            0 => String::new(),
+            1 => " · cleared 1 stale git entry (branches kept)".to_string(),
+            n => format!(" · cleared {n} stale git entries (branches kept)"),
+        };
         let registered = self.tree.agents.iter().filter(|node| node.leftover).count();
         if on_disk == 0 {
-            return "no worktrees under .mush/wt on disk".to_string();
+            return format!("no worktrees under .mush/wt on disk{cleared}");
         }
         let mut line = format!("{on_disk} worktree(s) under .mush/wt on disk");
         if registered == on_disk {
@@ -795,6 +812,7 @@ impl App {
             // guess at the cause.
             line.push_str(&format!(" · {registered} registered as leftovers"));
         }
+        line.push_str(&cleared);
         line
     }
 
@@ -1740,9 +1758,19 @@ impl App {
             Command::Compact => self.compact_focused(),
             Command::Forget(id) => self.forget_agent(AgentId(id)),
             Command::Worktrees => {
-                self.discover_worktrees();
-                self.refresh_git();
-                self.say(self.worktree_report());
+                // The re-scan reconciles git with the disk: entries for
+                // checkouts that are gone are cleared here, so the listing and
+                // the rows cannot keep claiming a directory `rm -rf` took. No
+                // branch, commit, or stored transcript is touched — the work
+                // stays reachable (finding P13).
+                match git::prune_worktrees(self.ws.root()) {
+                    Ok(cleared) => {
+                        self.discover_worktrees();
+                        self.refresh_git();
+                        self.say(self.worktree_report(cleared));
+                    }
+                    Err(error) => self.fail(format!("cannot prune stale worktrees — {error}")),
+                }
             }
             Command::Provider(None) => self.open_provider_picker(),
             Command::Provider(Some(name)) => self.apply_provider(&name),
@@ -3293,6 +3321,46 @@ mod tests {
             "{line}"
         );
         assert!(line.contains("all registered"), "{line}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A registry entry whose checkout was deleted by hand — exactly what
+    /// `rm -rf .mush` leaves behind — is not a worktree: it gets no row, and
+    /// the re-scan clears git's entry while keeping the branch, so the work is
+    /// still there for whoever comes back to it (finding P13).
+    #[test]
+    fn worktrees_clears_dead_git_entries_and_keeps_the_branch() {
+        let root = repo("wt-dead");
+        isolated_work(&root, 7, "keep my work");
+        let worktree = git::worktree_path(&root, 7);
+        std::fs::remove_dir_all(&worktree).unwrap();
+        let mut app = app_at(root.clone());
+
+        assert!(
+            !app.tree.agents.iter().any(|node| node.id == AgentId(7)),
+            "a checkout that is gone is not a leftover row"
+        );
+
+        run(&mut app, "/worktrees");
+        let line = text_of(&app).to_string();
+        assert!(
+            line.contains("no worktrees under .mush/wt on disk"),
+            "{line}"
+        );
+        assert!(
+            line.contains("cleared 1 stale git entry (branches kept)"),
+            "{line}"
+        );
+
+        let listing = git::run(&root, &["worktree", "list", "--porcelain"]).unwrap_or_default();
+        assert!(
+            !listing.contains(worktree.to_str().unwrap()),
+            "git no longer names the dead worktree: {listing:?}"
+        );
+        assert!(
+            git::resolve(&root, "mush/7").is_some(),
+            "the branch survives the prune, so the work is still reachable"
+        );
         let _ = std::fs::remove_dir_all(&root);
     }
 

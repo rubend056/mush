@@ -26,7 +26,7 @@
 //! | `/url <url>` | required | point at another endpoint |
 //! | `/key [SECRET]` | optional | show the key in use, or set one |
 //! | `/models` | ignored | re-read the endpoint's model list |
-//! | `/worktrees` | ignored | re-scan for leftover isolated worktrees |
+//! | `/worktrees` | ignored | re-scan for leftover isolated worktrees; clears dead git entries |
 //! | `/diff <id>` | required, an id | run the diff of its work against HEAD |
 //! | `/merge <id>` | required, an id | merge it into HEAD and reclaim it |
 //! | `/discard <id>` | required, an id | throw it away and reclaim it |
@@ -215,7 +215,7 @@ pub const COMMANDS: &[Spec] = &[
         name: "/worktrees",
         aliases: &[],
         args: "",
-        help: "re-scan for leftover isolated worktrees",
+        help: "re-scan worktrees; clears git entries whose checkout is gone",
     },
     worktree_spec(Verb::Diff),
     worktree_spec(Verb::Merge),
