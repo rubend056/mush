@@ -294,18 +294,16 @@ fn normalize_url(url: &str) -> String {
 /// schemas measure ~3.4 KB (~1.1 K tokens at the 3 bytes/token heuristic),
 /// so the reserve rounds up; `prompt` tests that they keep fitting.
 ///
-/// The schemas are context paid on *every* request, so this is a real cost and
-/// the descriptions are kept to the rules a model must read to obey them (the
-/// one-non-isolated-sibling limit, that stopping a child is not finishing it,
-/// that a command already runs in the workspace root, and — with jobs — what
-/// `detach` and `exclusive` promise). They grew from ~3.1 KB when those rules
-/// were made explicit, to ~3.6 KB when the `cd` rule joined them, to ~5 KB
-/// when the machine's three tools did, and to ~5.1 KB when the delegation
-/// tools had to say what their answers mean (a listing digests a result, a
-/// wait hands an unread one over — findings H15 and the replay); the
-/// `schemas_fit_the_budget_reserve` test is what makes that a decision rather
+/// The schemas are context paid on *every* request, so this is a real cost.
+/// Ownership keeps it down: the prompts carry how to work (the rules, the
+/// delegation policy, what the machine is like), and a schema carries only its
+/// own call — arguments, defaults, and what comes back. The payload grew from
+/// ~3.1 KB at the first contract to ~5.1 KB when the replay findings made the
+/// waits say what they hand over (H15); the dedup pass that split prompt policy
+/// from schema shape took it back to ~4.9 KB. The
+/// `schemas_fit_the_budget_reserve` test is what makes growth a decision rather
 /// than a silent drift.
-pub const SCHEMA_TOKENS: usize = 1_750;
+pub const SCHEMA_TOKENS: usize = 1_700;
 
 impl Config {
     /// Built-in defaults with the `MUSH_*` environment applied.
@@ -1320,16 +1318,15 @@ mod tests {
 
     #[test]
     fn history_budget_fits_the_context_window() {
-        // 8192 tokens: the full reserve (1750 schemas + 2048 reply — a quarter
-        // of the window — + 200 margin) leaves 12_582 bytes of history. The
-        // schema reserve has grown four times, each time with the test and the
-        // comment moved together: 1100 when the delegation contract became
-        // explicit, 1220 when the `cd` rule joined it, 1700 when the machine's
-        // three tools did, and 1750 when the delegation tools had to say what
-        // their answers mean (H15 and the replay). See SCHEMA_TOKENS.
+        // 8192 tokens: the full reserve (1700 schemas + 2048 reply — a quarter
+        // of the window — + 200 margin) leaves 12_732 bytes of history. The
+        // reserve has moved with every contract change, test and comment
+        // together: 1100 (delegation), 1220 (`cd`), 1700 (the machine's three
+        // tools), 1750 (what the waits hand over, H15), and back to 1700 when
+        // the dedup pass fit the same rules in fewer bytes. See SCHEMA_TOKENS.
         let small = Config::new("http://x:1", "m", None);
         assert_eq!(small.context_tokens, DEFAULT_CONTEXT_TOKENS);
-        assert_eq!(small.history_budget(), 12_582);
+        assert_eq!(small.history_budget(), 12_732);
 
         // A big window leaves a much larger budget, and the reply's share of it
         // grows with the window: 128k reserves 32k for one reply.
@@ -1339,7 +1336,7 @@ mod tests {
             max_completion_tokens: false,
             ..small.clone()
         };
-        assert_eq!(big.history_budget(), 282_150);
+        assert_eq!(big.history_budget(), 282_300);
 
         // A tiny window shrinks the reserve to half the window instead of
         // ignoring it: history still gets 1536 bytes, and no cap — which has

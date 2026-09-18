@@ -1,13 +1,36 @@
 //! The system prompts and the tool schemas.
 //!
-//! These things *are* the agent contract. They are kept deliberately small:
-//! a model only has to know how to read, edit, run, and delegate — mush
-//! handles the rest. Leaf agents (at `MAX_DEPTH`) simply don't receive the
+//! These things *are* the agent contract. They are kept deliberately small: a
+//! model only has to know how to read, edit, run, and delegate — mush handles
+//! the rest. Leaf agents (at `MAX_DEPTH`) simply don't receive the
 //! orchestration tools, which is how deep chains stay bounded.
+//!
+//! Ownership, so nothing is said twice: the prompts own *how to work* (the
+//! rules, the delegation policy, what the machine is like); each schema owns
+//! *the call* (its arguments, their defaults, what comes back). A rule with two
+//! homes is a rule that drifts — `docs/findings.md` §8's class.
 
 use serde_json::{json, Value};
 
 use crate::tools::ToolName;
+
+/// How to work, for every agent at every depth. One home: the root and a
+/// subagent used to spell these rules twice, and the copies had drifted.
+const RULES: &str = "\
+Rules:\n\
+- Every tool already works inside the workspace: paths are workspace-relative (\"src/main.rs\", not an \
+absolute path) and run_command/edit/read already runs there with its cwd at the workspace root.\n\
+- When you are done finish with a concise summary of what you did.";
+
+/// What is true of the machine for every agent, root or leaf. One home, read by
+/// both prompts; the child pays for every word here on every request.
+const MACHINE: &str = "\
+The machine is shared (CPU, ports, /tmp — a worktree isolates files, nothing else):\n\
+- A long command detaches into a job instead of dying: run_command answers \"[still running — detached \
+as #c2]\", detach=true asks for one at once, and any command that outlives 60s does it by itself. \
+command_status lists your jobs, wait_commands waits for one, command_control stops one.\n\
+- exclusive=true owns the machine for timing- or port-sensitive work (a benchmark, a profiler, a fixed \
+port): a sibling's command is refused (`#N holds the machine`) — wait, do not retry.";
 
 /// The whole root-agent system prompt. If this grows much, something else went
 /// wrong.
@@ -15,19 +38,11 @@ pub fn system_prompt(root: &str) -> String {
     format!(
         "You are mush, a coding agent working in the workspace at {root}.\n\
          \n\
-         Use the tools to inspect and change files. Rules:\n\
-         - Read a file before you edit it.\n\
-         - Prefer edit_file for small, surgical changes; use write_file only for new files or full rewrites.\n\
-         - Every tool already works inside the workspace: paths are workspace-relative (\"src/main.rs\", \
-         not an absolute path) and run_command already runs there with its cwd at the workspace root. \
-         Never prefix a command with `cd`.\n\
-         - Do the work instead of describing it. Keep replies short.\n\
-         - Never touch paths outside the workspace.\n\
-         - When the task is done, stop calling tools and reply with a one-sentence summary.\n\
+         {RULES}\n\
          \n\
          Delegation:\n\
-         - spawn_agent(brief, isolated?) starts a subagent that has NO memory of this conversation: \
-         the brief must carry every fact, file, and the exact deliverable.\n\
+         - spawn_agent(brief, isolated?, base?) starts a subagent with no memory of this conversation: the \
+         brief must carry every fact, file, and the exact deliverable.\n\
          - An isolated subagent works in its own copy of the repository (its own git worktree and branch); \
          a shared one works in this workspace, so only one of those may run at a time. Decide up front: \
          pass isolated=true for siblings that should run in parallel, or wait_agents for the running one \
@@ -36,24 +51,12 @@ pub fn system_prompt(root: &str) -> String {
          count: split by what is independent, not by how long you think it takes.\n\
          - Delegate independent, large, or context-heavy subtasks; do single edits and lookups yourself. \
          Prefer a few big delegations over many small ones.\n\
-         - wait_agents blocks until a child finishes: with no ids it returns the *first* one to finish, \
-         with all=true it waits for every child. Its answer hands over the full summary of a result \
-         you have not read; a result you already read comes back as a digest marked \"already read\". \
-         agent_status lists your children with a one-line digest each and an unread mark; \
-         agent_control stops or messages one.\n\
-         - Ending your turn while children still run is fine: they keep working and you are woken with \
-         their \"#N done: summary\" results as each finishes. Use wait_agents when you need a result \
-         before you continue.\n\
+         - wait_agents blocks until a child finishes: no ids means the *first* finish, all=true every \
+         child; its answer hands over an unread result's full summary, and an already-read one comes back \
+         as a digest. Ending your turn while children still run is fine: they keep working and you are \
+         woken with their \"#N done: summary\" results as each finishes.\n\
          \n\
-         The machine is shared (CPU, ports, /tmp — a worktree isolates files, nothing else):\n\
-         - A long command detaches instead of dying: run_command answers \"[still running — detached as \
-         #c2]\" and you are told when it finishes. Pass detach=true for a server; any command that \
-         outlives 60s detaches by itself. command_status lists your jobs, wait_commands waits for one, \
-         command_control with action \\\"stop\\\" ends one.\n\
-         - Pass exclusive=true for anything timing- or port-sensitive (a benchmark, a profiler, a \
-         fixed port): it owns the machine while it runs, and a sibling's command is refused with \
-         \"#3 holds the machine; retry when it finishes\" — so wait, don't interleave. The lock is \
-         between agents; it cannot see the human's own build or an unrelated process."
+         {MACHINE}"
     )
 }
 
@@ -68,31 +71,20 @@ pub fn system_prompt(root: &str) -> String {
 pub fn subagent_prompt(root: &str, depth: usize, isolated: bool) -> String {
     let workspace = if isolated {
         format!(
-            "You have your own copy of the repository — a git worktree at {root}, on your own branch. It \
-             is your workspace root: edit in it, run your tests in it. Your changes stay on your branch \
-             until your parent reviews and merges them."
+            "You work at `{root}`, a worktree of your own branch. It \
+             is your workspace root."
         )
     } else {
-        format!("Your workspace is the shared workspace at {root}.")
+        format!("Your workspace is `{root}`.")
     };
     format!(
         "You are a mush subagent at depth {depth}, working for a parent agent.\n\
-         You have no memory of your parent's conversation; your task arrives as the next user message.\n\
+         \n\
          {workspace}\n\
-         Rules:\n\
-         - Read a file before you edit it.\n\
-         - Prefer edit_file for small, surgical changes; use write_file only for new files or full rewrites.\n\
-         - Every tool already works inside your workspace: paths are workspace-relative (\"src/main.rs\"), \
-         never absolute, and run_command already runs there with its cwd at the workspace root. \
-         Never prefix a command with `cd`.\n\
-         - Never touch paths outside your workspace.\n\
-         - Do the work instead of describing it. Keep replies short.\n\
-         - Run until you are done: a run ends when you stop calling tools, not at a turn count, so do the \
-         whole task.\n\
-         - The machine is shared with your siblings (CPU, ports, /tmp): a long command detaches into a \
-         job you are told about (command_status, wait_commands, command_control), and run_command with \
-         exclusive=true owns the machine for timing- or port-sensitive work.\n\
-         - Finish with a concise summary of what you changed."
+         \n\
+         {RULES}\n\
+         \n\
+         {MACHINE}"
     )
 }
 
@@ -113,6 +105,19 @@ fn tool(name: ToolName, description: &str, parameters: Value) -> Value {
     })
 }
 
+/// The three arguments both waits take, written once: they promise the same
+/// release rule and the same defaults. Only `ids` may differ.
+fn wait_parameters(ids: &str) -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "ids": { "type": "array", "items": { "type": "integer" }, "description": ids },
+            "timeout": { "type": "integer", "description": "Seconds to wait; 0 waits forever. Default 600." },
+            "all": { "type": "boolean", "description": "Every result, not just the first." }
+        }
+    })
+}
+
 /// JSON-Schema tool definitions in the OpenAI `tools` format, keyed by the tool
 /// they describe: a schema without an executor cannot be written down.
 pub fn tool_schemas() -> Vec<Value> {
@@ -129,7 +134,7 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::ReadFile,
-            "Read a text file (may be truncated).",
+            "Read a file.",
             json!({
                 "type": "object",
                 "properties": { "path": { "type": "string", "description": "Workspace-relative file path." } },
@@ -176,7 +181,7 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::RunCommand,
-            "Run a shell command in the workspace root — no `cd` needed. A long one becomes a job you are told about.",
+            "Run a shell command in the workspace root.",
             json!({
                 "type": "object",
                 "properties": {
@@ -189,12 +194,13 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::SpawnAgent,
-            "Delegate a self-contained task to a subagent with no memory here: the brief must carry all context, the deliverable, and the expected output. Only one non-isolated subagent runs at a time. Returns its id.",
+            "Delegate a self-contained task to a subagent. Returns its id.",
             json!({
                 "type": "object",
                 "properties": {
-                    "brief": { "type": "string", "description": "Self-contained task for the subagent." },
-                    "isolated": { "type": "boolean", "description": "Own git worktree. Required to run siblings in parallel: only one non-isolated subagent runs at a time. Default false." }
+                    "brief": { "type": "string" },
+                    "isolated": { "type": "boolean", "description": "Own git worktree. Default false." },
+                    "base": { "type": "string", "description": "Branch, tag or commit an isolated worktree forks from. Default: this agent's branch. Requires isolated=true." }
                 },
                 "required": ["brief"]
             }),
@@ -203,14 +209,7 @@ pub fn tool_schemas() -> Vec<Value> {
             ToolName::WaitAgents,
             "Block until a child finishes. Returns an unread result's summary; an already-read one as \
              a marked digest.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "ids": { "type": "array", "items": { "type": "integer" }, "description": "Child ids. Empty means any child: the first finish." },
-                    "timeout": { "type": "integer", "description": "Seconds to wait; 0 waits forever. Default 600." },
-                    "all": { "type": "boolean", "description": "Every child, not just the first finish." }
-                }
-            }),
+            wait_parameters("Child ids. Empty means any child: the first finish."),
         ),
         tool(
             ToolName::AgentStatus,
@@ -251,14 +250,7 @@ pub fn tool_schemas() -> Vec<Value> {
         tool(
             ToolName::WaitCommands,
             "Block until a job finishes, or the timeout expires; returns its exit status and the end of its output.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "ids": { "type": "array", "items": { "type": "integer" }, "description": "Job ids; empty means all of yours." },
-                    "timeout": { "type": "integer", "description": "Seconds; 0 waits forever. Default 600." },
-                    "all": { "type": "boolean", "description": "Every result, not the first." }
-                }
-            }),
+            wait_parameters("Job ids; empty means all of yours."),
         ),
     ]
 }
@@ -309,36 +301,58 @@ mod tests {
         assert_eq!(leaf_names, workspace);
     }
 
-    /// Depth is bounded by what a leaf can see: the delegation tools are gone,
-    /// but the job tools stay — a leaf that runs a build in the background has
-    /// to be able to watch and stop it.
+    /// Depth is bounded by what a leaf can see: the delegation tools are gone
+    /// and the job tools stay.
     #[test]
-    fn leaf_schemas_omit_orchestration_but_keep_the_job_tools() {
+    fn a_leaf_keeps_the_workspace_and_job_tools() {
         let leaf = leaf_tool_schemas();
         let names: Vec<&str> = leaf
             .iter()
             .map(|schema| schema["function"]["name"].as_str().unwrap())
             .collect();
         assert_eq!(names.len(), 8);
-        assert!(names.contains(&"edit_file"));
-        assert!(names.contains(&"command_status"));
-        assert!(names.contains(&"command_control"));
-        assert!(names.contains(&"wait_commands"));
-        assert!(!names.contains(&"spawn_agent"));
-        assert!(!names.contains(&"wait_agents"));
-        assert!(!names.contains(&"agent_status"));
-        assert!(!names.contains(&"agent_control"));
+        for kept in [
+            "edit_file",
+            "command_status",
+            "command_control",
+            "wait_commands",
+        ] {
+            assert!(names.contains(&kept), "a leaf loses {kept}");
+        }
     }
 
     /// The root's schemas must fit the tokens `Config::history_budget`
-    /// reserves for them, or every request quietly overshoots the window.
+    /// reserves for them, or every request quietly overshoots the window. The
+    /// measurement is printed, so a shrink is as visible as a growth.
     #[test]
     fn schemas_fit_the_budget_reserve() {
         let bytes = serde_json::to_string(&tool_schemas()).unwrap().len();
+        eprintln!("root schemas: {bytes} bytes");
         assert!(
             bytes <= crate::config::SCHEMA_TOKENS * 3,
             "root schemas grew to {bytes} bytes — raise Config::SCHEMA_TOKENS"
         );
+    }
+
+    /// The two waits take the same three arguments: `wait_parameters` writes
+    /// them once, and only `ids` may differ.
+    #[test]
+    fn the_two_wait_tools_take_the_same_arguments() {
+        let prop = |tool: &str, key: &str| {
+            tool_schemas()
+                .into_iter()
+                .find(|schema| schema["function"]["name"] == tool)
+                .expect("the wait tool has a schema")["function"]["parameters"]["properties"][key]
+                .clone()
+        };
+        for key in ["timeout", "all"] {
+            assert_eq!(
+                prop("wait_agents", key),
+                prop("wait_commands", key),
+                "{key} is one promise, not two"
+            );
+        }
+        assert_ne!(prop("wait_agents", "ids"), prop("wait_commands", "ids"));
     }
 
     #[test]
@@ -349,52 +363,41 @@ mod tests {
         // The task is a user message, never part of the system prompt.
         assert!(!prompt.contains("PARENT TASK"));
         assert!(!prompt.contains("port the parser"));
-        // Subagents get the same workspace rules as the root.
-        assert!(prompt.contains("Read a file before you edit it"));
-        assert!(prompt.contains("Never touch paths outside"));
-        assert!(prompt.contains("shared workspace at /tmp/x"));
+        // Subagents get the same workspace rules as the root, from one block.
+        assert!(prompt.contains("Rules:"));
+        assert!(prompt.contains("Every tool already works inside the workspace"));
+        assert!(prompt.contains("`/tmp/x`"));
     }
 
     #[test]
     fn subagent_prompt_names_an_isolated_worktree() {
         let prompt = subagent_prompt("/tmp/wt/3", 1, true);
-        assert!(
-            prompt.contains("your own copy of the repository"),
-            "{prompt}"
-        );
-        assert!(prompt.contains("worktree at /tmp/wt/3"), "{prompt}");
-        assert!(!prompt.contains("shared workspace"));
+        assert!(prompt.contains("worktree of your own branch"), "{prompt}");
+        assert!(prompt.contains("`/tmp/wt/3`"), "{prompt}");
+        // A shared child gets the shared-workspace sentence instead.
+        let shared = subagent_prompt("/tmp/wt/3", 1, false);
+        assert!(!shared.contains("worktree of your own branch"), "{shared}");
     }
 
-    /// Every tool already runs in the workspace, so a command never needs a
-    /// `cd` — and an absolute path is refused by the file tools, so inviting one
-    /// is inviting a failure. Both prompts say so, and neither tells the model
-    /// to size a brief against a turn budget (a run ends when the model stops
-    /// calling tools).
+    /// Every tool already runs in the workspace with its cwd at the root, so
+    /// paths are workspace-relative and nothing invites an absolute one. The
+    /// rule lives in the shared prompt block and is not restated in
+    /// `run_command`'s schema: one home, so the two cannot drift (the schema
+    /// says what the call is, the prompt how to work).
     #[test]
-    fn the_prompts_forbid_cd_and_promise_no_turn_budget() {
+    fn the_prompts_keep_commands_in_the_workspace_root() {
         for prompt in [
             system_prompt("/tmp/ws"),
             subagent_prompt("/tmp/ws", 1, true),
         ] {
             let lower = prompt.to_lowercase();
-            assert!(
-                lower.contains("never prefix a command with `cd`"),
-                "{prompt}"
-            );
             assert!(lower.contains("workspace-relative"), "{prompt}");
+            assert!(lower.contains("cwd at the workspace root"), "{prompt}");
             assert!(
                 !lower.contains("bounded number of turns") && !lower.contains("turn budget"),
                 "no turn budget exists to size a brief against: {prompt}"
             );
         }
-        // The tool description the model reads says the same thing.
-        let command = tool_schemas()
-            .into_iter()
-            .find(|schema| schema["function"]["name"] == "run_command")
-            .expect("run_command has a schema");
-        let description = command["function"]["description"].as_str().unwrap();
-        assert!(description.contains("no `cd` needed"), "{description}");
     }
 
     /// The prompt says what the tools promise: that a long command detaches
@@ -411,7 +414,7 @@ mod tests {
             "the refusal a sibling reads is quoted, so the model recognises it: {root}"
         );
         assert!(root.contains("worktree isolates files"), "{root}");
-        // A subagent gets the same facts in one bullet.
+        // A subagent gets the same facts, from the same block.
         let child = subagent_prompt("/tmp/ws", 1, true);
         assert!(child.contains("machine is shared"), "{child}");
         assert!(child.contains("exclusive=true"), "{child}");

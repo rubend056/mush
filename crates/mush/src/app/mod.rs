@@ -7729,6 +7729,10 @@ mod tests {
             !held.join("\n").contains("line 29"),
             "the pane is away from the newest line: {held:?}"
         );
+        // The bar is not the pane: its context meter legitimately follows the
+        // transcript the news just grew, and this test is about the reading
+        // position. At 120×32 the bar is the last two rows.
+        let pane = |rows: &[String]| rows[..rows.len().saturating_sub(2)].to_vec();
 
         // Another agent's news: the root says something of its own.
         app.update(Msg::Agent {
@@ -7737,8 +7741,8 @@ mod tests {
             event: AgentEvent::Message(Message::assistant("the root's line")),
         });
         assert_eq!(
-            chat_rows(&mut app),
-            held,
+            pane(&chat_rows(&mut app)),
+            pane(&held),
             "another agent's line must not move this pane"
         );
 
@@ -7749,7 +7753,11 @@ mod tests {
             id: AgentId(1),
             event: AgentEvent::Message(Message::assistant("its own line")),
         });
-        assert_eq!(chat_rows(&mut app), held, "a held pane is the human's");
+        assert_eq!(
+            pane(&chat_rows(&mut app)),
+            pane(&held),
+            "a held pane is the human's"
+        );
 
         // At the bottom the same news is exactly what the pane shows: that is
         // what following means, and it needs nothing to be told to it.
