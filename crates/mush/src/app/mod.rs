@@ -634,6 +634,13 @@ impl App {
                 self.dirty_screen = true;
             }
         }
+        // The same expiry for the pane's own transient lines, on the same tick:
+        // a command's answer or a hint that nobody ended by acting must not sit
+        // in the foot for the life of the session (finding U8). Failures are not
+        // chatter and are never taken away here.
+        if self.chat.expire_said(session::now_secs()) {
+            self.dirty_screen = true;
+        }
         // A `⊘` whose acknowledgement never arrives leaves a row spinning
         // forever, which is worse than an idle one (finding B6).
         if self.tree.expire_cancels() {
@@ -958,6 +965,18 @@ impl App {
 
     // ------------------------------------------------------------- chat / LLM
 
+    /// The human's next act ends the moment the last chatter line answered
+    /// (finding U8): a `/help`, a diff or a hint was about the thing they typed
+    /// *before* this one, and leaving it in the foot spends rows on a question
+    /// nobody is asking any more. Failures stay — they are the run's record, not
+    /// a moment's — and so does the pane's red line, which is the bar's copy of
+    /// the same fact.
+    fn ends_the_moment(&mut self) {
+        if self.chat.dismiss_said() {
+            self.dirty_screen = true;
+        }
+    }
+
     /// Send what is in the message box: a command to run, or a message for the
     /// focused agent.
     ///
@@ -970,7 +989,15 @@ impl App {
         if text.is_empty() {
             return;
         }
-        match commands::parse_command(&text) {
+        let parsed = commands::parse_command(&text);
+        // `/notes` is the reader of the chatter lines, not the act that
+        // supersedes them: a human asking for the rest of the foot is reading
+        // it, and dismissing what they came to read would make the pane's
+        // `+N more · /notes` point at nothing (see `ends_the_moment`).
+        if !matches!(&parsed, Ok(Command::Notes)) {
+            self.ends_the_moment();
+        }
+        match parsed {
             Ok(command) => self.apply_command(command),
             // No slash: the human is talking to an agent.
             Err(CommandError::NotACommand) => self.deliver(text),
@@ -3610,6 +3637,93 @@ mod tests {
         assert!(
             rows.contains("Tab cycles panes · Enter sends"),
             "and the hints under it still get their rows: {rows}"
+        );
+    }
+
+    /// A send ends the chatter the last command left in the foot: `/help` and a
+    /// diff answer the thing the human typed *before* this message, and leaving
+    /// them there spends the pane's rows on a question nobody is asking any more
+    /// (finding U8). A failure is not a moment and survives the send.
+    #[test]
+    fn sending_the_next_message_ends_the_last_command_answer() {
+        let (mut app, _rx) = test_app("chatter-send");
+        run(&mut app, "/help");
+        app.chat.note_error_for(AgentId::ROOT, "first failure");
+        assert_eq!(
+            app.chat.notices_for(AgentId::ROOT).count(),
+            2,
+            "the bar line and the pane's list both exist"
+        );
+
+        app.chat.insert("carry on");
+        app.send_message();
+
+        let left: Vec<&str> = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .map(|notice| notice.text.as_str())
+            .collect();
+        assert_eq!(
+            left,
+            vec!["first failure"],
+            "the chatter went and the failure stayed: {left:?}"
+        );
+        assert!(
+            app.chat
+                .transcript(AgentId::ROOT)
+                .iter()
+                .any(|message| message.role == "user"),
+            "and the message itself was still sent"
+        );
+    }
+
+    /// `/notes` reads the chatter instead of superseding it: dismissing on the
+    /// way in would make the pane's own `+N more · /notes` point at nothing,
+    /// which is the half of finding U8 the command exists to answer.
+    #[test]
+    fn asking_for_the_notes_does_not_throw_them_away() {
+        let (mut app, _rx) = test_app("chatter-notes");
+        app.chat.note_for(AgentId::ROOT, "opened notes.txt");
+
+        app.chat.insert("/notes");
+        app.send_message();
+
+        assert!(app.picker.is_some(), "the list opened");
+        assert_eq!(
+            app.chat.notices_for(AgentId::ROOT).count(),
+            1,
+            "and it had the line it came to read"
+        );
+    }
+
+    /// The clock, on the tick that already expires the bar's own transient line:
+    /// a hint read once and then left on the screen must not outlive its moment,
+    /// because the agent it answers may never run again (finding U8).
+    #[test]
+    fn a_transient_line_leaves_the_foot_without_a_run() {
+        let (mut app, _rx) = test_app("chatter-clock");
+        app.chat.note_for(AgentId::ROOT, "opened notes.txt");
+        app.chat.note_error_for(AgentId::ROOT, "no route to host");
+
+        app.tick();
+        assert_eq!(
+            app.chat.notices_for(AgentId::ROOT).count(),
+            2,
+            "a line inside its moment is still there"
+        );
+
+        app.chat.age_notices(600);
+        app.tick();
+
+        let left: Vec<&str> = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .map(|notice| notice.text.as_str())
+            .collect();
+        assert_eq!(
+            left,
+            vec!["no route to host"],
+            "the tick took the chatter and left the failure: {left:?}"
         );
     }
 
