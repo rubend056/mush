@@ -207,3 +207,34 @@ are the only reason a UX review could quote painted rows as evidence;
 `docs/refactor.md`'s symbol-level map, which made a 20 000-line tree navigable by
 agents with no memory of each other; and this file's one-line-per-defect shape,
 which is what let five waves hand work to each other without losing an item.
+
+## 6. The attach boundary, reviewed (M3, `f29b352`)
+
+The socket (`attach.rs`, `<root>/.mush/mush.sock`, newline-delimited JSON with
+`read`/`agents`/`focus`/`edit`) was reviewed against the real binary, driving raw
+lines with `python3` at a held socket. It is sound where it matters — one wire
+type, one parser and one `encode`; `App` stays the only effector (the socket
+thread only sends `Msg::Attach`); a malformed line is answered from the socket
+thread and the connection survives; `id` is echoed on every reply including
+errors; `advance` never steps the revision back *within* a conversation. What
+follows is what it does not hold.
+
+| ID | What | Status | Home |
+|---|---|---|---|
+| A1 | **The revision steps backwards across `/new`, so a client silently desyncs and a stale `edit` lands.** `Chat::clear`/`forget` drop the counter, so it restarts at 0 and collides with a revision the client already holds; nothing on the wire carries the conversation's identity, though `ConversationId` exists for exactly that. Raw wire, real binary: after a first message `read` says `revision 1` with `line 0 = "first message"`; after `/new` it says `{"lines":[],"revision":0}`; after a second message `revision 1` again with the new line at `line 0`; a client polling `since=1` never sees it, and its `base=1` edit is **accepted** (`{"id":5,"ok":{"revision":2}}`). | ⬜ | `Chat`'s revision must be process-monotone (`clear`/`forget` must not reset it), and the epoch belongs in the `read`/`agents` payload; test: `revision(ROOT)` never decreases across `new_chat()`, plus a read → `/new` → `edit` that must `conflict` |
+| A2 | **One idle client wedges the whole attach surface.** `accept_loop` is serial and `ask` has no read timeout, so a connection that opens and says nothing blocks every other client: holding one open, `mush agents` did not return in 8 s (`TIMEOUT`); closing it returned immediately. | ⬜ | a thread per connection (or a read timeout / idle cap) plus a read timeout in the CLI; test: hold A open, send on B, assert an answer via `recv_timeout` — it fails today |
+| A3 | **`mush read` cannot frame a multi-line transcript line.** `print_lines` writes the decoded text raw, so a line containing `\n` (the wire is correct: `"text":"first\nsecond"`) prints as two lines under one index and no external parser can tell continuation from a new line. | ⬜ | escape newlines (or offer JSONL / `--json`); test: a `print_lines` unit test over a body with an embedded newline |
+| A4 | **`edit send` does not take the path a typed message takes, though its comment claims it does.** The typed path (`send_message`) trims, refuses an empty box and parses commands; `attach_edit` calls `expect_human(text)` + `deliver(text)` with the raw text. Sending `"text":""` with `send:true` is accepted, adds an empty user line to the transcript and starts a run. | ⬜ | trim and refuse empty; state explicitly whether a client's text is ever a command; test: an empty/whitespace `send` is `bad_request` and changes nothing |
+| A5 | **The `--` escape is claimed but half exists, and a directory named after a subcommand is unopenable.** `Cli::detect`'s doc says "`--` is the escape hatch a human has", but it only escapes as the first argv (`mush -- agents` skips detection — a second arg then errors with "only one directory may be given", proving `agents` was taken as the directory), it is rejected *inside* a subcommand (`mush read --` → ``unknown option `--` for `mush read` ``), and `mush agents` in a directory literally named `agents` runs the attach CLI instead of opening that directory. Nothing in `--help` names either form. | ⬜ | stop `detect` at `--` and document it in the ATTACH block; test: `parse(&["read","--"])`, and that `["--","agents"]` is not a subcommand |
+| A6 | **`bad_request` carries two failures that are not the request's fault:** "mush is shutting down" and "the UI dropped the request", so a client cannot tell a transient shutdown from a malformed request. | ⬜ | an `unavailable`/`shutting_down` reply kind; test: `ReplyError::describe` for each kind |
+| A7 | **A spawn failure leaks the socket file.** `serve` builds the `Guard` before `spawn`, and the `?` on the spawn returns while the listener is dropped, leaving the file with no guard to remove it (cosmetic: the next run clears it). | ⬜ | remove the file (or drop the guard) on that error path |
+| A8 | **`attach_worktree` reports a worktree that is gone** — a path whenever `branch` is `Some`, including a merged/discarded agent, which is the case `worktree_gone` exists to detect; the roster carries no `landed`. | ⬜ | report the path only when the worktree is on disk (or carry `landed`); test: the roster of a discarded agent says it is gone |
+
+Two interactions with H9 (`ae16cb2`) worth stating rather than inheriting: the
+arm *is* the status line (`quit_armed()` reads `status_line()`), so any attach op
+that calls `App::say` — `focus`, and `edit`'s draft arm — **silently disarms a
+quit the human armed**; that should be a decision, not a side effect of `say`.
+And H9's `Phase::doing` is a third phase-word derivation beside M3's
+`Phase::label`/`detail` and `screen.rs`'s `phase_glyph`/`phase_detail`; `doing()`
+collapses `Stopped|Done|Failed` to `"idle"`, so the quit line can read
+`#0 idle + 1 job` for a stopped agent that owns a live job (see refactor §11).
