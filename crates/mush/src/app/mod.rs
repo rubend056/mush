@@ -4978,6 +4978,163 @@ mod tests {
         assert!(help.contains("/compact"), "{help}");
     }
 
+    /// A fold the human asked for is on the screen while it runs, at both sizes
+    /// the audit photographs: the row wears its own glyph and words, the bar
+    /// says what happens to the words they are about to type, and the
+    /// transcript's foot repeats the fold rather than `working…` (finding U11).
+    #[test]
+    fn a_fold_in_flight_is_painted_on_every_surface() {
+        let (mut app, _rx) = test_app("compact-painted");
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("fold this".to_string()));
+        let flag = Arc::new(AtomicBool::new(false));
+        app.on_agent(
+            AgentId::ROOT,
+            AgentEvent::Compacting {
+                why: Compacting::Requested,
+                cancel: Some(flag.clone()),
+            },
+        );
+
+        for (width, height) in [(80u16, 24u16), (40, 10)] {
+            let rows = screen(&mut app, width, height);
+            let painted = rows.join("\n");
+            assert!(
+                painted.contains("≡ #0"),
+                "the row says a fold, not a run, at {width}×{height}: {rows:?}"
+            );
+            assert!(
+                painted.contains("compacting 0s") || painted.contains("compacting 1s"),
+                "with the fold's own words at {width}×{height}: {rows:?}"
+            );
+            assert!(
+                painted.contains("keep typing"),
+                "and the human's question answered at {width}×{height}: {rows:?}"
+            );
+            assert!(
+                !painted.contains("working…"),
+                "a fold is not the run's own model call at {width}×{height}: {rows:?}"
+            );
+        }
+
+        // The box still takes a line while the fold runs: mush never blocks
+        // input, and the sentence the bar prints says what happens to the
+        // words. What proves it is the painted box, not the buffer: a line can
+        // be in the box and nowhere on the screen.
+        app.focus = Focus::Chat;
+        for letter in "noted".chars() {
+            app.on_key(KeyEvent::new(KeyCode::Char(letter), KeyModifiers::NONE));
+        }
+        let rows = screen(&mut app, 40, 10).join("\n");
+        assert!(rows.contains("noted"), "the box took the line: {rows}");
+        assert_eq!(app.chat.input().text(), "noted");
+    }
+
+    /// When the fold lands the state leaves the screen, and the transcript says
+    /// what happened to the conversation instead (finding U11).
+    #[test]
+    fn a_landed_fold_takes_its_state_off_the_screen() {
+        let (mut app, _rx) = test_app("compact-landed");
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("fold this".to_string()));
+        app.on_agent(
+            AgentId::ROOT,
+            AgentEvent::Compacting {
+                why: Compacting::Requested,
+                cancel: None,
+            },
+        );
+        assert!(screen(&mut app, 80, 24).join("\n").contains("compacting"));
+
+        app.on_agent(
+            AgentId::ROOT,
+            AgentEvent::Compact {
+                summary: "the task, and where it got to".to_string(),
+                in_run: false,
+            },
+        );
+        for (width, height) in [(80u16, 24u16), (40, 10)] {
+            let painted = screen(&mut app, width, height).join("\n");
+            assert!(
+                !painted.contains("compacting") && !painted.contains('≡'),
+                "nothing still claims to be folding at {width}×{height}: {painted}"
+            );
+        }
+        assert_eq!(app.tree_line(), None, "and the bar stops saying so");
+        assert_eq!(
+            app.tree.node(AgentId::ROOT).unwrap().phase,
+            Phase::Done,
+            "the fold that landed is a thing that finished"
+        );
+    }
+
+    /// A fold that fails or is stopped takes its state off the row too: the
+    /// notice owns what went wrong, and the `≡` does not outlive the request.
+    #[test]
+    fn a_fold_that_ends_without_landing_leaves_a_quiet_row() {
+        let (mut app, _rx) = test_app("compact-ended");
+        app.on_agent(
+            AgentId::ROOT,
+            AgentEvent::Compacting {
+                why: Compacting::NearlyFull,
+                cancel: None,
+            },
+        );
+        app.on_agent(AgentId::ROOT, AgentEvent::CompactingEnded { in_run: false });
+        let painted = screen(&mut app, 80, 24).join("\n");
+        assert!(!painted.contains("compacting"), "{painted}");
+        assert_eq!(app.tree.node(AgentId::ROOT).unwrap().phase, Phase::Idle);
+    }
+
+    /// The bar's derived sentence answers "may I keep typing?" while the fold
+    /// runs, and it is the *same* fact the row draws — one derivation, so the
+    /// two cannot disagree about whether anything is folding (finding U11).
+    #[test]
+    fn the_bar_answers_may_i_keep_typing_while_a_fold_runs() {
+        let (mut app, _rx) = test_app("compact-bar");
+        assert_eq!(app.tree_line(), None, "nothing to report at rest");
+
+        app.tree.compacting(AgentId::ROOT, Compacting::Parked, None);
+        assert_eq!(
+            app.tree_line().as_deref(),
+            Some("compacting #0 · keep typing — your message is answered after the fold"),
+            "a parked fold is what the human is waiting for"
+        );
+        let rows = screen(&mut app, 80, 24).join("\n");
+        assert!(rows.contains("keep typing"), "{rows}");
+
+        app.tree.compacted(AgentId::ROOT, false);
+        assert_eq!(app.tree_line(), None, "and it goes when the fold does");
+    }
+
+    /// Ctrl-C reaches a fold from rest: the fold's `Compacting` event carries
+    /// the only handle there is to the summarize call, and the UI's Stop looks
+    /// exactly where that handle is put (findings U11 and B6).
+    #[test]
+    fn a_stop_reaches_the_summarize_call_of_a_fold_from_rest() {
+        let (mut app, _rx) = test_app("compact-stop");
+        let flag = Arc::new(AtomicBool::new(false));
+        app.on_agent(
+            AgentId::ROOT,
+            AgentEvent::Compacting {
+                why: Compacting::Requested,
+                cancel: Some(flag.clone()),
+            },
+        );
+
+        app.interrupt_all();
+
+        assert!(
+            flag.load(Ordering::SeqCst),
+            "the Stop the human pressed reached the summarize request"
+        );
+        assert_eq!(
+            app.tree.node(AgentId::ROOT).unwrap().phase,
+            Phase::Cancelling,
+            "and the row says the stop is on its way"
+        );
+    }
+
     /// `/help` renders the same key table `mush --help` does, so a human who
     /// learns the keyboard from the notice can discover every binding instead
     /// of the six the old hand-written line named — and discover the keys that

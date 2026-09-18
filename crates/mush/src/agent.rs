@@ -6619,6 +6619,293 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A fold the human asked for is said out loud, at every step it takes:
+    /// parked while the run it arrived behind is still going, on the wire when
+    /// it fires, and landed when the transcript is replaced. Exactly once — the
+    /// half of the bug where a request was *silent* (finding U11).
+    ///
+    /// The actor reads its mailbox between the things it does, not while a
+    /// request is in flight, so what this pins is the order: the request is
+    /// acknowledged as parked before anything is folded, and the fold is asked
+    /// for once.
+    #[test]
+    fn a_compact_request_mid_run_says_where_it_is_every_step() {
+        let root = scratch_dir("compact-parked-visible");
+        let gate = Arc::new(Gate::new());
+        let summary = "wrote note.txt; nothing else happened";
+        let scripted = Arc::new(
+            Scripted::new()
+                .held(gate.clone())
+                .calls(vec![tool_call(
+                    "c1",
+                    "write_file",
+                    json!({ "path": "note.txt", "content": "worth folding" }),
+                )])
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary)
+                .says("carried on after the fold"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("write the note".to_string()),
+            ]))
+            .unwrap();
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the run never reached the model"
+        );
+
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
+        gate.release();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the run must finish with the fold folded in: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+        assert_eq!(
+            seen.folds,
+            vec![
+                "Parked".to_string(),
+                "Requested".to_string(),
+                "landed".to_string()
+            ],
+            "the whole fold, once, step by step: {seen:?}"
+        );
+        let folds = scripted
+            .asked()
+            .into_iter()
+            .filter(|asked| asked.saw(COMPACT_INSTRUCTION))
+            .count();
+        assert_eq!(folds, 1, "a parked request folds once, not once per turn");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A fold the window triggered — nobody asked, the history is three quarters
+    /// of the budget — reaches the same visible state, and says *why* it is
+    /// happening: the human did not ask for this one. It folds once.
+    #[test]
+    fn a_full_history_folds_once_and_says_the_window_asked() {
+        let root = scratch_dir("compact-auto-visible");
+        let summary = "condensed work so far";
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary)
+                .calls(vec![tool_call(
+                    "c1",
+                    "write_file",
+                    json!({ "path": "after.txt", "content": "written after the fold" }),
+                )])
+                .says("done"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        let budget = scripted_budget();
+        // Past the trigger, and still one the summarize request can carry: the
+        // window the automatic fold fires in.
+        let long = "x".repeat(mush_core::transcript::compaction_trigger(budget) + 1_000);
+        assert!(
+            long.len() <= budget,
+            "the transcript must fit the whole budget"
+        );
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("read this".to_string()),
+                Message::assistant(long),
+            ]))
+            .unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the run must finish: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+        assert_eq!(
+            seen.folds,
+            vec!["NearlyFull".to_string(), "landed".to_string()],
+            "the window's fold is visible too, and it fires once: {seen:?}"
+        );
+        assert_eq!(seen.summaries, vec![summary.to_string()]);
+        let folds = scripted
+            .asked()
+            .into_iter()
+            .filter(|asked| asked.saw(COMPACT_INSTRUCTION))
+            .count();
+        assert_eq!(
+            folds, 1,
+            "the folded transcript is small again, so no turn folds a second time"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `compacting…` cannot outlive the fold that justified it. An endpoint that
+    /// refuses the summarize call, or answers something mush cannot read as a
+    /// summary, is the notice's to report — the row goes quiet either way, and a
+    /// human who asked is told (finding U11).
+    #[test]
+    fn a_fold_that_fails_leaves_no_fold_on_the_row() {
+        let root = scratch_dir("compact-failed");
+        let scripted = Arc::new(
+            Scripted::new()
+                .says("the run's answer")
+                .fails_with(500, "no summarizer today"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("answer me".to_string()),
+            ]))
+            .unwrap();
+        let mut ran = Watched::default();
+        assert!(
+            ran.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the run must finish: {ran:?}"
+        );
+
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen
+                .folds
+                .contains(&"ended".to_string())),
+            "the fold must end, however it ends: {seen:?}"
+        );
+        assert_eq!(
+            seen.folds,
+            vec!["Requested+flag".to_string(), "ended".to_string()],
+            "a fold from rest owns the flag that can stop it: {seen:?}"
+        );
+        assert!(
+            seen.notices
+                .iter()
+                .any(|notice| notice.contains("could not compact")),
+            "a human who asked is told why nothing happened: {:?}",
+            seen.notices
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An idle fold can be stopped, and a stop is a stop: the actor says
+    /// `Stopped`, which is what takes the `⊘` off the row's fold and leaves the
+    /// agent resumable. A cancelled fold is not a failure to report.
+    #[test]
+    fn a_stopped_fold_is_a_stop_and_not_a_failure() {
+        let root = scratch_dir("compact-stopped");
+        let scripted = Arc::new(Scripted::new().says("the run's answer").cancels());
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("answer me".to_string()),
+            ]))
+            .unwrap();
+        let mut ran = Watched::default();
+        assert!(ran.wait(&events, WAIT, |seen| seen.done >= 1), "{ran:?}");
+
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.stopped >= 1),
+            "the actor must say the fold was stopped: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+        assert_eq!(seen.summaries, Vec::<String>::new());
+        assert!(
+            seen.notices.is_empty(),
+            "a stop is the human's doing, not a failure: {:?}",
+            seen.notices
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An actor restored from a session starts with no transcript — the UI
+    /// holds the conversation until the human's next message. A fold is not a
+    /// run, so the request carries it: without that a `/compact` on a restored
+    /// agent folded nothing, and said nothing about it (finding U11).
+    #[test]
+    fn a_compact_request_carries_the_transcript_an_actor_has_none_of() {
+        let root = scratch_dir("compact-adopted");
+        let summary = "the task and where it got to";
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        // No `Run` first: this is the actor a restart leaves behind.
+        root_tx
+            .send(AgentMsg::Compact(vec![
+                Message::system("you are mush"),
+                Message::user("the old task".to_string()),
+                Message::assistant("the old answer"),
+            ]))
+            .unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| !seen.summaries.is_empty()),
+            "a fold with nothing to fold is a command that does nothing: {seen:?}"
+        );
+        assert_eq!(seen.summaries, vec![summary.to_string()]);
+        let asked = scripted.asked();
+        assert_eq!(
+            asked.len(),
+            1,
+            "one summarize call, and the transcript it carried"
+        );
+        assert!(
+            asked[0].saw("the old task"),
+            "the fold is of the conversation the request carried"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The history budget of the config the tests spawn actors with, so a test
+    /// can build a transcript that sits in the compaction window.
+    fn scripted_budget() -> usize {
+        Config::new("http://127.0.0.1:1", "scripted", None).history_budget()
+    }
+
     /// A `/compact` sent while the model is writing the run's *last* reply
     /// arrives at the boundary the run ends on. It must not be dropped with the
     /// run: the actor folds as it goes idle, after the completion — once.
@@ -6897,6 +7184,10 @@ mod tests {
         replies: Vec<String>,
         summaries: Vec<String>,
         stopped: usize,
+        /// Every fold state this actor reported, in order: what the row, the
+        /// bar and the foot were told (finding U11). `Parked`, `Requested`,
+        /// `NearlyFull`, `ended`, `landed`.
+        folds: Vec<String>,
     }
 
     impl Watched {
@@ -6941,7 +7232,15 @@ mod tests {
                 AgentEvent::Error(why) => self.errors.push(why),
                 AgentEvent::Notice(what) => self.notices.push(what),
                 AgentEvent::Stopped => self.stopped += 1,
-                AgentEvent::Compact { summary, .. } => self.summaries.push(summary),
+                AgentEvent::Compact { summary, .. } => {
+                    self.summaries.push(summary);
+                    self.folds.push("landed".to_string());
+                }
+                AgentEvent::Compacting { why, cancel } => self.folds.push(format!(
+                    "{why:?}{}",
+                    if cancel.is_some() { "+flag" } else { "" }
+                )),
+                AgentEvent::CompactingEnded { .. } => self.folds.push("ended".to_string()),
                 AgentEvent::Message(message)
                     if message.role == "assistant" && !message.text().is_empty() =>
                 {
