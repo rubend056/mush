@@ -532,3 +532,31 @@ exactly one worktree (the main checkout).
 3. Should `AgentTree` own `agent_stats` (git facts) too, or does the git snapshot
    stay a separate value refreshed by events? Today the coupling is one-way
    (`refresh_git` reads the tree), so it probably stays separate.
+
+---
+
+## 10. The wave loop (how work lands, and what it owes the tree)
+
+The rule the waves have settled into, so it is not re-derived each time:
+
+1. **One branch per item**, one commit per item, committed as soon as the gate is
+   green (`cargo fmt --all --check`; `cargo clippy --all-targets -- -D warnings`;
+   `cargo test`; both `scripts/smoke.py` pty scenarios). A branch that dies mid-way
+   leaves its work in a commit whose subject is the brief — that commit is rebuilt
+   with a repo-style subject, and the rebuild is proved lossless by
+   `git diff <old-tip> <new-tip>` being empty.
+2. **An integrator merges it onto `master`** (`--no-ff`), resolving for the two
+   intentions rather than for the diff, and records the decisions in the merge
+   body. No merge commit carries a change of its own beyond reconciliation.
+3. **Every integration onto `master` is followed by a review agent whose subject
+   is duplication and missing seams** — the same fact, rule or shape written more
+   than once, and the abstraction that would remove the repetition without moving
+   derivation across a seam (§2's rules). It reports a ranked list with `file:line`
+   evidence, a net line delta, the risk, and the test that would protect the
+   change; the list becomes the next wave's queue. This is how the tree pays for
+   itself as it grows: each wave is allowed to add code, and the review decides
+   what the next wave takes back out.
+4. **A UX/UI review wave closes the loop**: it drives the real binary at §4.5's
+   sizes and reports what the screen says against what is true. Its findings get
+   the same treatment as any other row: a home is named, a fixer is sent, and the
+   row's status is moved in `docs/findings.md`.
