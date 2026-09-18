@@ -52,10 +52,11 @@ pub struct ProviderSpec {
     /// Whether a request asks for the provider's thinking mode when the human
     /// states none.
     pub thinking_by_default: bool,
-    /// The `reasoning_effort` a request sends when the human states none.
+    /// The `reasoning_effort` a request sends when a human states no effort.
     /// `None` is "not stated": no such field is sent at all, because inventing
     /// one for an endpoint whose provider never documented it is how a request
-    /// gets rejected.
+    /// gets rejected — and with no spelling in the vocabulary meaning "send
+    /// nothing", a row like this is the only way the field stays off.
     pub reasoning_effort_by_default: Option<&'static str>,
     /// Whether naming this provider also switches the endpoint to its own. A
     /// hosted API owns its endpoint, so selecting it must reach the right host;

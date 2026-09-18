@@ -167,7 +167,7 @@ fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
                 // endpoint, and dropping it would send the provider's default
                 // instead of the effort the human asked for.
                 let stated = config::ReasoningEffort::parse(&value).map_err(|_| {
-                    format!("--reasoning-effort needs low, medium, high or none, got `{value}`")
+                    format!("--reasoning-effort needs low, high or max, got `{value}`")
                 })?;
                 reasoning_effort = Some(stated);
             }
@@ -470,9 +470,8 @@ fn help_text() -> String {
          \x20                      else what the endpoint advertises, else the model's known window)\n\
          \x20   --temperature F    Sampling temperature, 0.0-2.0 (default: 1.0, the model's own choice)\n\
          \x20   --reasoning-effort LEVEL\n\
-         \x20                      Reasoning effort sent as `reasoning_effort`: low, medium or high,\n\
-         \x20                      or none to send no such field (default: {};\n\
-         \x20                      $MUSH_REASONING_EFFORT)\n\
+         \x20                      Reasoning effort sent as `reasoning_effort`: low, high or max\n\
+         \x20                      (default: {}; $MUSH_REASONING_EFFORT)\n\
          \x20   --thinking MODE    on asks for the provider's thinking mode, off sends no `thinking`\n\
          \x20                      field at all (default: {}; $MUSH_THINKING)\n\
          \x20   --max-completion-tokens\n\
@@ -908,7 +907,7 @@ mod tests {
             context: Some(64_000),
             temperature: Some(0.2),
             max_completion_tokens: Some(true),
-            reasoning_effort: Some(config::ReasoningEffort::Medium),
+            reasoning_effort: Some(config::ReasoningEffort::Max),
             thinking: Some(config::ThinkingMode::Off),
             yes: true,
             print_config: false,
@@ -922,7 +921,7 @@ mod tests {
         assert_eq!(overrides.max_completion_tokens, Some(true));
         assert_eq!(
             overrides.reasoning_effort,
-            Some(config::ReasoningEffort::Medium)
+            Some(config::ReasoningEffort::Max)
         );
         assert_eq!(overrides.thinking, Some(config::ThinkingMode::Off));
         // The key never comes from argv, and `-y` is not a config value: it is
@@ -939,7 +938,7 @@ mod tests {
             "--temperature",
             "0.25",
             "--reasoning-effort",
-            "none",
+            "max",
             "--thinking",
             "off",
             "--max-completion-tokens",
@@ -950,9 +949,9 @@ mod tests {
         assert_eq!(args.dir, PathBuf::from("work"));
         assert_eq!(args.temperature, Some(0.25));
         assert_eq!(args.max_completion_tokens, Some(true));
-        // `none` is a statement, and it survives parsing as one: the config
-        // layer has to be able to tell it from silence.
-        assert_eq!(args.reasoning_effort, Some(config::ReasoningEffort::Off));
+        // A stated value survives parsing as one: the config layer has to be
+        // able to tell it from silence.
+        assert_eq!(args.reasoning_effort, Some(config::ReasoningEffort::Max));
         assert_eq!(args.thinking, Some(config::ThinkingMode::Off));
         assert!(args.yes, "`-y` is remembered, not acted on");
         assert!(args.print_config);
@@ -962,7 +961,7 @@ mod tests {
         assert!(args.yes);
         assert_eq!(args.temperature, None);
         assert_eq!(args.max_completion_tokens, None);
-        assert_eq!(args.reasoning_effort, None, "unstated is not `none`");
+        assert_eq!(args.reasoning_effort, None, "unstated is not a value");
         assert_eq!(args.thinking, None);
         assert!(!args.print_config);
         assert_eq!(args.dir, PathBuf::from("."));
@@ -1075,7 +1074,7 @@ mod tests {
         cfg.set_context(64_000);
         cfg.temperature = 0.0;
         cfg.max_completion_tokens = true;
-        cfg.reasoning_effort = Some(config::ReasoningEffort::Medium);
+        cfg.reasoning_effort = Some(config::ReasoningEffort::Max);
         cfg.thinking = Some(config::ThinkingMode::Off);
 
         let lines = describe(&cfg, true);
@@ -1091,7 +1090,7 @@ mod tests {
         assert_eq!(field("model"), "deepseek-v4-pro");
         assert_eq!(field("window"), "64000 tokens (stated)");
         assert_eq!(field("temperature"), "0.0", "0 is a value, not an absence");
-        assert_eq!(field("reasoning"), "medium (stated)");
+        assert_eq!(field("reasoning"), "max (stated)");
         assert_eq!(field("thinking"), "off (stated)");
         assert_eq!(
             field("reply cap"),

@@ -63,39 +63,38 @@ fn clamp_context(tokens: usize) -> usize {
     tokens.clamp(MIN_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS)
 }
 
-/// The reasoning effort a request asks for. `Off` is a statement rather than a
-/// value: no `reasoning_effort` field is sent at all, which leaves the model's
-/// own default even on an endpoint whose provider default would ask for more.
+/// The reasoning effort a request asks for: exactly the values the DeepSeek
+/// OpenAI format documents, and nothing wider. There is no spelling meaning
+/// "send nothing": stating an effort is what puts the field on the request,
+/// and the only way a request carries none is an endpoint whose provider row
+/// documents no default (the `custom` row).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ReasoningEffort {
-    Off,
     Low,
-    Medium,
     High,
+    Max,
 }
 
 impl ReasoningEffort {
-    /// The value as the endpoint spells it. `Off` has no spelling: it *is* the
-    /// absent field.
-    pub fn as_str(&self) -> Option<&'static str> {
+    /// The value as the endpoint spells it.
+    pub fn as_str(&self) -> &'static str {
         match self {
-            ReasoningEffort::Off => None,
-            ReasoningEffort::Low => Some("low"),
-            ReasoningEffort::Medium => Some("medium"),
-            ReasoningEffort::High => Some("high"),
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::Max => "max",
         }
     }
 
-    /// Parse what a human stated. `off` and `none` are the same statement —
-    /// the field is not sent — and neither is quietly mapped to an effort.
+    /// Parse what a human stated. Every accepted string is an effort the
+    /// request will carry; a spelling mush does not know is named back rather
+    /// than mapped onto one, so a typo can never become a different ask.
     pub fn parse(value: &str) -> Result<Self, String> {
         match value.trim().to_ascii_lowercase().as_str() {
-            "off" | "none" => Ok(ReasoningEffort::Off),
             "low" => Ok(ReasoningEffort::Low),
-            "medium" => Ok(ReasoningEffort::Medium),
             "high" => Ok(ReasoningEffort::High),
+            "max" => Ok(ReasoningEffort::Max),
             _ => Err(format!(
-                "unknown reasoning effort `{value}` (try low, medium, high or none)"
+                "unknown reasoning effort `{value}` (try low, high or max)"
             )),
         }
     }
@@ -150,10 +149,10 @@ pub struct Config {
     pub max_completion_tokens: bool,
     /// The reasoning effort every request asks for. `None` is "not stated":
     /// the provider's own documented default applies, from its row in
-    /// [`crate::provider::PROVIDERS`].
-    /// `Some(ReasoningEffort::Off)` is a statement too — no `reasoning_effort`
-    /// field is sent at all — and a statement is honoured wherever the human
-    /// pointed mush, which is the whole point of stating one.
+    /// [`crate::provider::PROVIDERS`]. A stated effort is always sent, wherever
+    /// the human pointed mush, which is why the vocabulary has no "send
+    /// nothing" spelling: an endpoint gets no `reasoning_effort` field only
+    /// because its row documents none.
     pub reasoning_effort: Option<ReasoningEffort>,
     /// The provider's thinking mode. `None` is "not stated": the provider's own
     /// documented default applies, from its row in
@@ -187,9 +186,8 @@ pub struct Overrides {
     /// (`--max-completion-tokens`). `None` is "not stated", which is what keeps
     /// a deliberate `false` distinguishable from silence.
     pub max_completion_tokens: Option<bool>,
-    /// Reasoning effort (`--reasoning-effort` or `MUSH_REASONING_EFFORT`),
-    /// including the statement that none is sent: `Some(Off)` is as much a
-    /// statement as `Some(High)`, and only `None` means "not stated".
+    /// Reasoning effort (`--reasoning-effort` or `MUSH_REASONING_EFFORT`).
+    /// `None` is "not stated"; every `Some` is an effort a request sends.
     pub reasoning_effort: Option<ReasoningEffort>,
     /// Provider thinking mode (`--thinking` or `MUSH_THINKING`). A stated `off`
     /// is a decision, not silence.
@@ -509,18 +507,17 @@ impl Config {
 
     /// What a request sends as `reasoning_effort`, `None` for no such field at
     /// all. A stated value reaches any endpoint; unstated, the provider's own
-    /// documented default applies, and an endpoint whose provider documents
-    /// none is never given a field it never asked for.
+    /// documented default applies, and the `custom` row documents none — which
+    /// is now the only reason an endpoint is never given the field.
     pub fn reasoning_effort(&self) -> Option<&'static str> {
         match self.reasoning_effort {
-            Some(effort) => effort.as_str(),
+            Some(effort) => Some(effort.as_str()),
             None => self.provider.spec().reasoning_effort_by_default,
         }
     }
 
     /// Whether the human stated the effort rather than the provider's default
-    /// being sent. `Some(ReasoningEffort::Off)` counts: sending no field is
-    /// what a stated `none` asked for.
+    /// being sent.
     pub fn reasoning_effort_stated(&self) -> bool {
         self.reasoning_effort.is_some()
     }
@@ -1085,7 +1082,7 @@ mod tests {
             ..UserConfig::default()
         };
         let env = Overrides {
-            reasoning_effort: Some(ReasoningEffort::Medium),
+            reasoning_effort: Some(ReasoningEffort::Max),
             thinking: Some(ThinkingMode::Off),
             ..Overrides::default()
         };
@@ -1102,7 +1099,7 @@ mod tests {
 
         // Environment: fills what the flag left alone.
         let config = resolve_with(base(), &Overrides::default(), &env, &home, None).unwrap();
-        assert_eq!(config.reasoning_effort(), Some("medium"));
+        assert_eq!(config.reasoning_effort(), Some("max"));
         assert!(!config.thinking_enabled(), "the env said off, the file on");
         assert!(config.reasoning_effort_stated());
 
@@ -1119,8 +1116,10 @@ mod tests {
         assert!(config.thinking_enabled());
         assert!(config.thinking_stated());
 
-        // The home config's `none`/`false` are statements too: on DeepSeek they
-        // overrule the preset, which is exactly why they are worth stating.
+        // The home config's `false` is a statement too: on DeepSeek it
+        // overrules the preset, which is exactly why it is worth stating — and
+        // a stated effort replaces the preset the same way, since a stated
+        // value is what a request carries.
         let config = resolve_with(
             base(),
             &Overrides {
@@ -1129,7 +1128,7 @@ mod tests {
             },
             &Overrides::default(),
             &UserConfig {
-                reasoning_effort: Some("none".into()),
+                reasoning_effort: Some("max".into()),
                 thinking: Some(false),
                 ..UserConfig::default()
             },
@@ -1139,8 +1138,8 @@ mod tests {
         assert_eq!(config.provider, Provider::DeepSeek);
         assert_eq!(
             config.reasoning_effort(),
-            None,
-            "stated none sends no field"
+            Some("max"),
+            "the stated effort, not the preset"
         );
         assert!(!config.thinking_enabled(), "stated off sends no field");
         assert!(config.reasoning_effort_stated());
@@ -1173,13 +1172,13 @@ mod tests {
         assert_eq!(config.reasoning_effort(), Some("low"));
         assert!(config.thinking_enabled());
 
-        // And the reverse: a stated `none`/`off` suppresses the DeepSeek
-        // preset rather than being mistaken for silence.
+        // And the reverse: a stated `off` suppresses the DeepSeek thinking
+        // preset rather than being mistaken for silence, while the effort left
+        // unstated still follows that provider's row.
         let config = resolve_with(
             Config::new("http://base:0", "m", None),
             &Overrides {
                 provider: Some("deepseek".into()),
-                reasoning_effort: Some(ReasoningEffort::Off),
                 thinking: Some(ThinkingMode::Off),
                 ..Overrides::default()
             },
@@ -1189,7 +1188,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(config.provider, Provider::DeepSeek);
-        assert_eq!(config.reasoning_effort(), None);
+        assert_eq!(config.reasoning_effort(), Some("high"));
         assert!(!config.thinking_enabled());
     }
 
@@ -1696,14 +1695,11 @@ mod tests {
     /// The thinking knobs' environment spellings report a typo by name, the way
     /// `MUSH_CONTEXT` does: a value mush cannot use must never travel to an
     /// endpoint, and dropping it would send the provider's default instead of
-    /// the setting the human stated. `off` and `none` are statements, not
-    /// typos: they mean the field is not sent.
+    /// the setting the human stated.
     #[test]
     fn a_bad_effort_or_thinking_environment_value_is_reported() {
         assert_eq!(parse_effort_env("high"), Ok(ReasoningEffort::High));
-        assert_eq!(parse_effort_env(" MEDIUM "), Ok(ReasoningEffort::Medium));
-        assert_eq!(parse_effort_env("off"), Ok(ReasoningEffort::Off));
-        assert_eq!(parse_effort_env("none"), Ok(ReasoningEffort::Off));
+        assert_eq!(parse_effort_env(" MAX "), Ok(ReasoningEffort::Max));
         let error = parse_effort_env("very").unwrap_err();
         assert!(
             error.contains("MUSH_REASONING_EFFORT") && error.contains("very"),
@@ -1717,6 +1713,19 @@ mod tests {
             error.contains("MUSH_THINKING") && error.contains("of"),
             "{error}"
         );
+    }
+
+    /// The vocabulary is exactly the three values DeepSeek documents, so every
+    /// spelling from a wider one — including the deleted `none`/`off` and the
+    /// `medium`, `minimal` and `xhigh` other vendors use — is refused by name
+    /// rather than folded onto an effort the human did not ask for.
+    #[test]
+    fn an_effort_outside_the_vocabulary_is_refused_by_name() {
+        for value in ["none", "off", "medium", "minimal", "xhigh"] {
+            let error = ReasoningEffort::parse(value).unwrap_err();
+            assert!(error.contains(value), "{error}");
+            assert!(error.contains("low, high or max"), "{error}");
+        }
     }
 
     /// The same rule one layer down: a hand-edited effort the human got wrong

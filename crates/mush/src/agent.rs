@@ -6162,7 +6162,7 @@ mod tests {
     fn a_stated_effort_and_thinking_mode_reach_the_request() {
         let scripted = Arc::new(Scripted::new().says("done"));
         let mut local = Config::new("http://localhost:11434", "local-thinker", None);
-        local.reasoning_effort = Some(ReasoningEffort::Medium);
+        local.reasoning_effort = Some(ReasoningEffort::Max);
         local.thinking = Some(ThinkingMode::Off);
         let (actor, _events, _mailbox) =
             build_actor("knobs", scripted.clone(), ConfigHandle::own(local));
@@ -6173,7 +6173,7 @@ mod tests {
         let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
         assert_eq!(result.as_deref(), Some("done"));
         let asked = scripted.asked();
-        assert_eq!(asked[0].reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(asked[0].reasoning_effort.as_deref(), Some("max"));
         assert_eq!(
             asked[0].thinking, None,
             "stating off sends no `thinking` field at all"

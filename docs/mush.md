@@ -470,7 +470,7 @@ window; the built-in default is 120 000 for DeepSeek and 8 192 for a custom
 endpoint, spelled from the provider table), `temperature`, `max_completion_tokens`
 (`true` sends the reply cap — a quarter of the window, floored at 1 024 and
 capped at 120 000 — as `max_completion_tokens`), `reasoning_effort` (`"low"`,
-`"medium"`, `"high"`, or `"none"` for no `reasoning_effort` field at all), and
+`"high"` or `"max"` — exactly the values DeepSeek's OpenAI format documents), and
 `thinking` (`true` asks for the provider's thinking mode, `false` sends no
 `thinking` field and leaves the model's own default) — and the file mush writes
 opens with a `_comment` header naming the precedence and each field, as plain
@@ -498,7 +498,7 @@ name it travels under, and the key masked — and exits 0 without opening the
 terminal or creating `.mush/`.
 It is the honest view of the precedence, and what makes a hand-edited file
 debuggable. The other flags a human would type are `--temperature F`,
-`--reasoning-effort LEVEL` (`low`, `medium`, `high`, or `none`; also
+`--reasoning-effort LEVEL` (`low`, `high` or `max`; also
 `MUSH_REASONING_EFFORT`), `--thinking MODE` (`on` or `off`; also
 `MUSH_THINKING`), `--max-completion-tokens`, and `-y`/`--yes`, which *records*
 that this session's human pre-approved the work: mush has no approval prompt yet

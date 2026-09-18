@@ -57,7 +57,7 @@ fn comment() -> Vec<String> {
         "temperature: 0.0-2.0, sent with every request; 1.0 is the model's own choice, and the default.".to_string(),
         "max_completion_tokens: true sends the reply cap — a quarter of the window, at most — as max_completion_tokens; OpenAI's reasoning models reject max_tokens.".to_string(),
         format!(
-            "reasoning_effort: \"low\", \"medium\" or \"high\", or \"none\" to send no reasoning_effort at all. A value here reaches any endpoint; the provider's own default is {}.",
+            "reasoning_effort: \"low\", \"high\" or \"max\" — exactly what the DeepSeek OpenAI format documents. A value here reaches any endpoint; the provider's own default is {}.",
             crate::provider::effort_default_hint()
         ),
         format!(
@@ -106,10 +106,11 @@ pub struct UserConfig {
     /// which OpenAI's reasoning models require.
     #[serde(default)]
     pub max_completion_tokens: Option<bool>,
-    /// Reasoning effort sent as `reasoning_effort`: "low", "medium" or "high",
-    /// or "none" for no `reasoning_effort` field at all. Stated here it is
-    /// honoured wherever the endpoint is pointed; unstated, the provider's own
-    /// documented default applies (`provider::PROVIDERS`). A value mush does
+    /// Reasoning effort sent as `reasoning_effort`: "low", "high" or "max",
+    /// exactly the values the DeepSeek OpenAI format documents. Stated here it
+    /// is honoured wherever the endpoint is pointed; unstated, the provider's
+    /// own documented default applies (`provider::PROVIDERS`), and a row that
+    /// documents none is the only way the field is left off. A value mush does
     /// not know is reported at startup rather than sent.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
