@@ -11,7 +11,7 @@
 //! One registry per conversation, shared by every agent in the tree through
 //! `AgentCtx` (the same handle `ids` and `live` travel through), because a job
 //! is a fact about the *machine*, not about one actor: the budget is
-//! machine-wide, the lock is machine-wide, and `/new` has to be able to kill
+//! machine-wide, the lock is machine-wide, and Ctrl-N has to be able to kill
 //! everything the old tree left running. Job ids are drawn from the tree's one
 //! id counter, so `#c2` can never collide with agent `#2`, with `#N` in a
 //! message, or with an id recovered from a leftover worktree (finding B1).
@@ -25,7 +25,7 @@
 //!    what a foreground command's result keeps, because the model reads it
 //!    while the command still runs. There is no second window and no second
 //!    source: both readers go through [`preview`].
-//! 2. **A job dies with its owner.** `Stop`, `Shutdown`, `/new` and quitting
+//! 2. **A job dies with its owner.** `Stop`, `Shutdown`, Ctrl-N and quitting
 //!    mush all end up in [`Registry::kill_owned`] or [`Registry::kill_all`], and
 //!    [`Registry`]'s `Drop` is the backstop for a path that forgets. A build an
 //!    agent started must not outlive a clean quit.
@@ -195,7 +195,7 @@ pub enum JobOutcome {
     /// It ended by itself, with this exit code (`-1` when a signal ended it).
     Exited(i32),
     /// mush stopped it: a `Stop` aimed at its owner, `command_control stop`,
-    /// `/new`, or quitting.
+    /// Ctrl-N, or quitting.
     Stopped,
     /// It passed the output limit, so mush killed it rather than let it fill the
     /// disk.
@@ -287,7 +287,7 @@ struct Live {
 
 impl Live {
     /// Stop it and everything it started, now. Killing is idempotent and goes
-    /// through the handle rather than the flag: on `/new` and on quit the
+    /// through the handle rather than the flag: on Ctrl-N and on quit the
     /// process groups must be gone before this returns, not ten milliseconds
     /// later.
     fn kill(&self) {
@@ -298,7 +298,7 @@ impl Live {
     }
 
     /// Whether mush stopped this command from outside its own watcher — a quit
-    /// (`kill_all`), a `/new`, or a `Stop` aimed at the agent that started it.
+    /// (`kill_all`), a Ctrl-N, or a `Stop` aimed at the agent that started it.
     fn stopped(&self) -> bool {
         self.stop.load(Ordering::SeqCst)
     }
@@ -348,7 +348,7 @@ impl Live {
 /// group and did its work after mush was gone — while a *detached* job, the
 /// same process group by another name, died correctly (finding S4). This is the
 /// missing half: the registry holds the command for the life of the call, so
-/// `kill_all` on quit and `kill_owned` on `Stop`/`/new` reach it exactly as they
+/// `kill_all` on quit and `kill_owned` on `Stop`/Ctrl-N reach it exactly as they
 /// reach a job.
 ///
 /// It is not a job. It has no id, no line, no output window and no place in the
@@ -365,7 +365,7 @@ pub struct Foreground {
 
 impl Foreground {
     /// Whether mush stopped this command from outside its own watcher — a quit,
-    /// a `/new`, or a `Stop` aimed at the agent that started it. The answer the
+    /// a Ctrl-N, or a `Stop` aimed at the agent that started it. The answer the
     /// watcher gives the model must not read as the command's own exit code.
     pub fn stopped(&self) -> bool {
         self.live.stopped()
@@ -1061,7 +1061,7 @@ impl Drop for Registry {
     /// outlives it. `App` calls `kill_all` explicitly on the way out; this
     /// catches the paths that do not (a panic inside an actor, a test).
     ///
-    /// It kills through [`Registry::kill`], the same walk `Stop`, `/new` and
+    /// It kills through [`Registry::kill`], the same walk `Stop`, Ctrl-N and
     /// quitting take, so the backstop is the rule and not a second copy of it:
     /// walking the job list alone left the commands a tool call is holding —
     /// the ones finding S4 is about — outside a drop that is meant to be

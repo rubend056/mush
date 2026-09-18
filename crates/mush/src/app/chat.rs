@@ -26,7 +26,7 @@
 //! loop cannot spend the foot row by row. **News** — a failure, a run mush
 //! stopped — belongs to its run: a new one replaces the agent's old one, it is
 //! written to the session so a restart still says what broke, and no clock
-//! takes it away. Before this, every notice ever written stayed until `/new`, a
+//! takes it away. Before this, every notice ever written stayed until Ctrl-N, a
 //! failure from twenty runs ago was painted under the newest message as if it
 //! were the newest thing said, none of it survived a restart, and a line about
 //! one moment spent the foot for the life of the session.
@@ -497,22 +497,6 @@ impl Chat {
         )
     }
 
-    /// Drop an agent's transcript, and the lines mush wrote about it: a
-    /// forgotten agent is not coming back, and notes about a conversation
-    /// nobody can read or steer are text with no owner. Its reading position
-    /// goes with it — there is no pane left to be looking at.
-    pub fn forget(&mut self, agent: AgentId) {
-        self.agents.remove(&agent);
-        self.notices.retain(|notice| notice.agent != agent);
-        self.reading.remove(&agent);
-        self.spoken.remove(&agent);
-        // The transcript is gone; the counter stays, moved forward. A client
-        // that read a revision for this id must never see that number come back
-        // for a *different* transcript and land a stale edit (finding A1).
-        let prior = self.revision(agent);
-        self.advance(agent, prior);
-    }
-
     /// How big one conversation is, in tokens, roughly — the same
     /// three-bytes-per-token heuristic the trimmer uses.
     ///
@@ -534,7 +518,7 @@ impl Chat {
         bytes / 3
     }
 
-    /// `/new`: the conversation is gone, the box and the scrollback with it.
+    /// Ctrl-N: the conversation is gone, the box and the scrollback with it.
     pub fn clear(&mut self) {
         self.root.clear();
         self.agents.clear();
@@ -543,7 +527,7 @@ impl Chat {
         self.spoken.clear();
         self.pending = None;
         // Every counter steps forward rather than resetting to nothing: a
-        // client that read a revision before `/new` must not see the same
+        // client that read a revision before Ctrl-N must not see the same
         // number come back for a different conversation, where its next edit
         // would be accepted as if the transcript had stood still (finding A1).
         // The root is always bumped — its revision is the one a client holds
@@ -651,7 +635,7 @@ impl Chat {
     ///
     /// This is the other half of the lifetime a command's answer has. Its agent
     /// may never run again — a `/help` read once, a diff of work already merged
-    /// by hand — and until this existed the line sat in the foot until `/new`,
+    /// by hand — and until this existed the line sat in the foot until Ctrl-N,
     /// spending the transcript's rows on a moment nobody was in any more
     /// (finding U8). Every agent's chatter goes, not only the focused one's:
     /// the moment ended for the human, and which pane happened to show the line
@@ -2442,12 +2426,12 @@ mod tests {
     }
 
     /// A revision is process-monotone: it is a token a client holds across
-    /// turns, so `/new` and `forget` move it *forward* instead of resetting it.
+    /// turns, so a new chat moves it *forward* instead of resetting it.
     /// Restarting at 0 made a new conversation collide with a transcript the
     /// client had already read, and its next edit landed as if nothing had
     /// happened (finding A1).
     #[test]
-    fn a_revision_never_steps_back_across_new_or_forget() {
+    fn a_revision_never_steps_back_across_new_transcripts() {
         let mut chat = Chat::bare();
         chat.push_message(AgentId::ROOT, Message::user("first"));
         chat.replace_transcript(AgentId(2), vec![Message::user("a child line")]);
@@ -2457,7 +2441,7 @@ mod tests {
         chat.clear();
         assert!(
             chat.revision(AgentId::ROOT) > root_before,
-            "/new steps the root forward: {}",
+            "a new chat steps the root forward: {}",
             chat.revision(AgentId::ROOT)
         );
         assert!(
@@ -2466,7 +2450,7 @@ mod tests {
         );
 
         // A conversation nobody had changed is a token too: an empty transcript
-        // reads as revision 0, and `/new` must not hand that same 0 back for a
+        // reads as revision 0, and Ctrl-N must not hand that same 0 back for a
         // different (also empty) one — the case a client polls into.
         let mut empty = Chat::bare();
         let zero = empty.revision(AgentId::ROOT);
@@ -2475,22 +2459,12 @@ mod tests {
             empty.revision(AgentId::ROOT) > zero,
             "even an empty conversation's token moves on"
         );
-
-        chat.forget(AgentId(2));
-        let after_forget = chat.revision(AgentId(2));
-        assert!(after_forget > child_before, "a forgotten id does not reset");
-        chat.replace_transcript(AgentId(2), vec![Message::user("a different child")]);
-        assert!(
-            chat.revision(AgentId(2)) > after_forget,
-            "a transcript that takes the id over never reuses the token"
-        );
     }
 
     /// Clearing is per agent, because a line about one conversation is not a
-    /// line about another (finding B19), and `/forget` takes an agent's lines
-    /// with it: notes about a conversation nobody can read have no owner.
+    /// line about another (finding B19).
     #[test]
-    fn clearing_and_forgetting_are_one_agent_at_a_time() {
+    fn clearing_notes_is_one_agent_at_a_time() {
         let mut chat = Chat::bare();
         chat.note_error_for(AgentId(1), "boom");
         chat.note_for(AgentId::ROOT, "a hint");
@@ -2504,15 +2478,6 @@ mod tests {
             chat.notices_for(AgentId::ROOT).count(),
             1,
             "the root's hint is not the child's to lose"
-        );
-
-        chat.note_error_for(AgentId(2), "boom");
-        chat.forget(AgentId(2));
-        assert_eq!(chat.notices_for(AgentId(2)).count(), 0);
-        assert_eq!(
-            chat.stored_notices().len(),
-            0,
-            "a forgotten failure is not written to the session either"
         );
     }
 

@@ -44,7 +44,7 @@ impl fmt::Display for AgentId {
     }
 }
 
-/// Which conversation an agent tree belongs to. One per `/new`, so an event
+/// Which conversation an agent tree belongs to. One per Ctrl-N, so an event
 /// from an actor left over from the previous chat can be recognised as stale.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct ConversationId(pub u64);
@@ -365,7 +365,8 @@ pub struct AgentNode {
     /// so matching on its text would stop recognising leftovers the moment they
     /// learned their real names.
     pub leftover: bool,
-    /// Set once `/merge` or `/discard` reclaimed the worktree.
+    /// Set in a stored session whose work was landed by hand; nothing in this
+    /// session sets it.
     pub landed: Option<Landed>,
     /// The agent's last run ended and its parent has not read the result yet.
     ///
@@ -732,11 +733,12 @@ impl AgentTree {
             // the mark that result wore goes with it.
             node.result_unread = false;
             // A landed agent that runs again is not a landed agent: its
-            // worktree is gone (which is why `land` cleared the branch), so the
-            // new run happens in the main checkout, and a footer still saying
-            // `merged into HEAD` would be describing the run before this one
-            // while the row shows work in flight (finding P7). What the merge
-            // did is in the transcript, where history lives.
+            // worktree is gone (which is why the restored node dropped its
+            // branch), so the new run happens in the main checkout, and a
+            // footer still saying `merged into HEAD` would be describing the
+            // run before this one while the row shows work in flight (finding
+            // P7). What the merge did is in the transcript, where history
+            // lives.
             node.landed = None;
         }
     }
@@ -904,21 +906,6 @@ impl AgentTree {
         if let Some(node) = self.node_mut(id) {
             node.phase = Phase::Idle;
             node.since = Instant::now();
-        }
-    }
-
-    /// Record that `/merge` or `/discard` reclaimed this agent's worktree.
-    ///
-    /// The branch goes with it. A landed agent has no worktree, no branch and
-    /// nothing to diff — the row that kept naming `mush/2` after
-    /// `merged mush/2 into HEAD · mush/2 deleted` was pointing at two things
-    /// that no longer existed, and `/diff` would have offered a command that
-    /// cannot run (finding P7). Where the work *went* is what is left, and that
-    /// is what `landed` records.
-    pub fn land(&mut self, id: AgentId, landed: Landed) {
-        if let Some(node) = self.node_mut(id) {
-            node.landed = Some(landed);
-            node.branch = None;
         }
     }
 

@@ -2,7 +2,7 @@
 //!
 //! A typed line becomes a value — [`Command`] with its arguments already read —
 //! and a line that is not a command becomes an error value rather than a string
-//! comparison buried in a `match` arm. Parsing is pure, so `/context 240000`
+//! comparison buried in a `match` arm. Parsing is pure, so `/url http://…`
 //! can be tested without an `App`.
 //!
 //! The invariant this module owns: **there is one table.** The parser's arms,
@@ -22,87 +22,45 @@
 //! |---|---|---|
 //! | `/provider [PROVIDERS]` | optional | switch provider, or open the picker |
 //! | `/model` | ignored | open the model picker |
-//! | `/context [TOKENS]` | optional, a positive count | show or set the window |
 //! | `/url <url>` | required | point at another endpoint |
 //! | `/key [SECRET]` | optional | show the key in use, or set one |
 //! | `/models` | ignored | re-read the endpoint's model list |
-//! | `/worktrees` | ignored | re-scan for leftover isolated worktrees; clears dead git entries |
-//! | `/diff <id>` | required, an id | run the diff of its work against HEAD |
-//! | `/merge <id>` | required, an id | merge it into HEAD and reclaim it |
-//! | `/discard <id>` | required, an id | throw it away and reclaim it |
-//! | `/forget <id>` | required, an id | drop the agent from this session |
 //! | `/compact` | ignored | fold the focused conversation into a summary |
 //! | `/notes` | ignored | read the notes the foot had no room for |
-//! | `/new` [`/clear`] | ignored | start a new chat |
 //! | `/help` [`/?`] | ignored | list the keys and the commands |
 //! | `/quit` [`/q`] | ignored | leave mush |
+//!
+//! Git is not a command surface: the tree names the branch and the worktree,
+//! and `git` itself is the tool for acting on them. The worktree commands mush
+//! used to wrap (`/diff`, `/merge`, `/discard`, `/forget`, `/worktrees`) are
+//! gone, and so is `/context` (the meter is on screen) and `/new` (Ctrl-N).
 //!
 //! Anything else is an error value: an unknown slash, or a real command whose
 //! argument does not read.
 
 use std::fmt;
 
-/// The three things `/diff`, `/merge` and `/discard` can do to one isolated
-/// agent's work.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verb {
-    Diff,
-    Merge,
-    Discard,
-}
-
-impl Verb {
-    /// The spelling a human types. Every message about a verb is built from
-    /// this, so the refusal cannot name a command the parser does not accept.
-    pub const fn name(self) -> &'static str {
-        match self {
-            Verb::Diff => "/diff",
-            Verb::Merge => "/merge",
-            Verb::Discard => "/discard",
-        }
-    }
-
-    /// What it does, in the help table's own words.
-    const fn help(self) -> &'static str {
-        match self {
-            Verb::Diff => "show the diff of its work against HEAD",
-            Verb::Merge => "merge its work into HEAD, and reclaim its worktree",
-            Verb::Discard => "throw its work away, and reclaim its worktree",
-        }
-    }
-}
-
 /// A command, with its arguments read the way the executor will use them.
 ///
-/// Arguments are typed rather than passed as text: `/context abc` is refused
-/// here, where the rule is written, instead of in the arm that would have had
-/// to parse it and report back.
+/// Arguments are typed rather than passed as text: `/url` with no argument is
+/// refused here, where the rule is written, instead of in the arm that would
+/// have had to parse it and report back.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
-    /// `/new`: a fresh chat, and the old conversation is gone.
-    New,
     Quit,
     Help,
     /// `/model`: open the picker.
     Model,
     /// `/provider` with no argument: open the picker.
     Provider(Option<String>),
-    /// `/context` with no argument: report the window in use.
-    Context(Option<usize>),
     Url(String),
     /// `/key` with no argument: report the key in use.
     ApiKey(Option<String>),
     /// `/models`: re-read the endpoint's list.
     Models,
-    Worktrees,
     Compact,
     /// `/notes`: read every note the foot had no room for.
     Notes,
-    Worktree {
-        verb: Verb,
-        id: u64,
-    },
-    Forget(u64),
 }
 
 /// Why a typed line is not a command to run.
@@ -158,15 +116,6 @@ impl Spec {
     }
 }
 
-const fn worktree_spec(verb: Verb) -> Spec {
-    Spec {
-        name: verb.name(),
-        aliases: &[],
-        args: "<id>",
-        help: verb.help(),
-    }
-}
-
 /// Every command, in the order a human should read them.
 ///
 /// A new command is one row here, one arm in [`parse_command`], and one arm in
@@ -188,12 +137,6 @@ pub const COMMANDS: &[Spec] = &[
         help: "pick a model from the endpoint's list",
     },
     Spec {
-        name: "/context",
-        aliases: &[],
-        args: "[TOKENS]",
-        help: "show or set the context window",
-    },
-    Spec {
         name: "/url",
         aliases: &[],
         args: "<url>",
@@ -212,21 +155,6 @@ pub const COMMANDS: &[Spec] = &[
         help: "refresh the model list from the endpoint",
     },
     Spec {
-        name: "/worktrees",
-        aliases: &[],
-        args: "",
-        help: "re-scan worktrees; clears git entries whose checkout is gone",
-    },
-    worktree_spec(Verb::Diff),
-    worktree_spec(Verb::Merge),
-    worktree_spec(Verb::Discard),
-    Spec {
-        name: "/forget",
-        aliases: &[],
-        args: "<id>",
-        help: "drop the agent from this session (its branch stays)",
-    },
-    Spec {
         name: "/compact",
         aliases: &[],
         args: "",
@@ -237,12 +165,6 @@ pub const COMMANDS: &[Spec] = &[
         aliases: &[],
         args: "",
         help: "read the notes the foot had no room for",
-    },
-    Spec {
-        name: "/new",
-        aliases: &["/clear"],
-        args: "",
-        help: "start a new chat",
     },
     Spec {
         name: "/help",
@@ -296,7 +218,7 @@ pub fn parse_command(line: &str) -> Result<Command, CommandError> {
         return Err(CommandError::NotACommand);
     };
     // Only a space separates name from argument, exactly as the arms this
-    // replaced did: `/new\tx` is a command nobody implements, not `/new`.
+    // replaced did: `/help\tx` is a command nobody implements, not `/help`.
     let (name, argument) = match body.split_once(' ') {
         Some((name, rest)) => (name, rest.trim()),
         None => (body, ""),
@@ -311,12 +233,10 @@ pub fn parse_command(line: &str) -> Result<Command, CommandError> {
     };
 
     let command = match spec.name {
-        "/new" => Command::New,
         "/quit" => Command::Quit,
         "/help" => Command::Help,
         "/model" => Command::Model,
         "/models" => Command::Models,
-        "/worktrees" => Command::Worktrees,
         "/compact" => Command::Compact,
         "/notes" => Command::Notes,
         "/provider" => Command::Provider(optional(argument)),
@@ -328,33 +248,6 @@ pub fn parse_command(line: &str) -> Result<Command, CommandError> {
             ))
         }
         "/url" => Command::Url(argument.to_string()),
-        // No argument asks for the window in use; a count that does not read,
-        // or a window of zero, is the same complaint.
-        "/context" if argument.is_empty() => Command::Context(None),
-        "/context" => match argument.parse::<usize>() {
-            Ok(tokens) if tokens > 0 => Command::Context(Some(tokens)),
-            _ => return Err(CommandError::Usage("usage: /context <tokens>".to_string())),
-        },
-        "/diff" | "/merge" | "/discard" => {
-            let verb = match spec.name {
-                "/diff" => Verb::Diff,
-                "/merge" => Verb::Merge,
-                _ => Verb::Discard,
-            };
-            match argument.parse::<u64>() {
-                Ok(id) => Command::Worktree { verb, id },
-                Err(_) => {
-                    return Err(CommandError::Usage(format!(
-                        "usage: {} <agent id>",
-                        verb.name()
-                    )))
-                }
-            }
-        }
-        "/forget" => match argument.parse::<u64>() {
-            Ok(id) => Command::Forget(id),
-            Err(_) => return Err(CommandError::Usage("usage: /forget <agent id>".to_string())),
-        },
         // A row with no arm here: `every_command_in_the_table_parses` fails
         // before this can happen, and the honest answer to a name that somehow
         // got here is still the error the lookup would have given.
@@ -442,7 +335,6 @@ mod tests {
                 );
             }
         }
-        assert_eq!(parse_command("/clear"), Ok(Command::New));
         assert_eq!(parse_command("/q"), Ok(Command::Quit));
         assert_eq!(parse_command("/?"), Ok(Command::Help));
     }
@@ -460,8 +352,8 @@ mod tests {
             Err(CommandError::NotACommand)
         );
         // The terminal's whitespace, not the command's: a box that kept a
-        // trailing newline still sends `/new`.
-        assert_eq!(parse_command("  /new \n"), Ok(Command::New));
+        // trailing newline still sends `/quit`.
+        assert_eq!(parse_command("  /quit \n"), Ok(Command::Quit));
     }
 
     /// An unknown command is an error value carrying what was typed, so the
@@ -490,25 +382,10 @@ mod tests {
         );
     }
 
-    /// Arguments are read here, once, the way the executor uses them: a count
-    /// as a number, an id as an id, and the text of a secret as text.
+    /// Arguments are read here, once, the way the executor uses them: a url as
+    /// a url, and the text of a secret as text.
     #[test]
     fn arguments_parse_the_way_the_executor_uses_them() {
-        assert_eq!(
-            parse_command("/context 240000"),
-            Ok(Command::Context(Some(240_000)))
-        );
-        assert_eq!(parse_command("/context"), Ok(Command::Context(None)));
-        assert_eq!(
-            parse_command("/context seven"),
-            Err(CommandError::Usage("usage: /context <tokens>".into()))
-        );
-        assert_eq!(
-            parse_command("/context 0"),
-            Err(CommandError::Usage("usage: /context <tokens>".into())),
-            "a window of zero is not a window"
-        );
-
         assert_eq!(
             parse_command("/provider ollama"),
             Ok(Command::Provider(Some("ollama".to_string())))
@@ -531,36 +408,12 @@ mod tests {
             Err(CommandError::Usage(line)) if line.starts_with("usage: /url http")
         ));
 
-        for verb in [Verb::Diff, Verb::Merge, Verb::Discard] {
-            assert_eq!(
-                parse_command(&format!("{} 7", verb.name())),
-                Ok(Command::Worktree { verb, id: 7 })
-            );
-            assert_eq!(
-                parse_command(verb.name()),
-                Err(CommandError::Usage(format!(
-                    "usage: {} <agent id>",
-                    verb.name()
-                )))
-            );
-            assert!(matches!(
-                parse_command(&format!("{} seven", verb.name())),
-                Err(CommandError::Usage(_))
-            ));
-        }
-
-        assert_eq!(parse_command("/forget 12"), Ok(Command::Forget(12)));
-        assert_eq!(
-            parse_command("/forget"),
-            Err(CommandError::Usage("usage: /forget <agent id>".into()))
-        );
-
         // The commands that take nothing ignore what follows, as they always
-        // have: `/new now` starts a new chat.
-        assert_eq!(parse_command("/new now"), Ok(Command::New));
+        // have: `/quit now` is still `/quit`.
+        assert_eq!(parse_command("/quit now"), Ok(Command::Quit));
         assert_eq!(parse_command("/models all"), Ok(Command::Models));
         assert_eq!(parse_command("/compact harder"), Ok(Command::Compact));
-        assert_eq!(parse_command("/worktrees again"), Ok(Command::Worktrees));
+        assert_eq!(parse_command("/notes please"), Ok(Command::Notes));
     }
 
     /// The table renders with the provider list filled in, and nothing left

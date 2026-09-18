@@ -45,7 +45,7 @@ use crate::attach;
 use crate::http;
 use crate::session_save::SessionSave;
 
-use commands::{Command, CommandError, Verb};
+use commands::{Command, CommandError};
 use keys::Intent;
 
 pub enum Msg {
@@ -67,7 +67,7 @@ pub enum Msg {
         status: Option<git::RepoStatus>,
     },
     /// An event from an agent actor. `conversation` identifies the tree that
-    /// sent it, so an actor left over from `/new` cannot write into the new
+    /// sent it, so an actor left over from Ctrl-N cannot write into the new
     /// chat: events are tagged and the UI drops the stale ones.
     Agent {
         conversation: ConversationId,
@@ -377,7 +377,7 @@ pub struct App {
     /// `None` means the file is current. `tick` is where it is turned into a
     /// write, so a burst of messages costs one rebuild instead of one each.
     session_dirty_at: Option<Instant>,
-    /// The UI event channel, needed to respawn the root actor on /new.
+    /// The UI event channel, needed to respawn the root actor on Ctrl-N.
     ui_tx: Sender<Msg>,
     /// When the git snapshot was last taken, so a long run refreshes it.
     git_at: Option<Instant>,
@@ -544,8 +544,8 @@ impl App {
             });
             // One decision, two readers: a stored branch whose worktree is gone
             // is not this agent's any more. `revive` runs such an agent in the
-            // main checkout, and a node that kept the branch would offer
-            // `/diff` and `/merge` for a reclaimed directory, paint a dead path
+            // main checkout, and a node that kept the branch would offer a diff
+            // against a reclaimed directory, paint a dead path
             // in the footer, and refuse a nudge the actor would have run
             // (finding U13). Computed once, handed to both.
             let branch = agent::live_branch(&root, agent.id, agent.branch.clone());
@@ -653,8 +653,8 @@ impl App {
 
     /// Adopt a repository read that finished on its own thread.
     fn adopt_git(&mut self, stats: HashMap<AgentId, git::Stat>, status: Option<git::RepoStatus>) {
-        // A reap can land between the read and this adoption (`/forget`, or a
-        // stale leftover going away), and the row title sums every entry: a
+        // A reap can land between the read and this adoption (a leftover whose
+        // checkout went away, say), and the row title sums every entry: a
         // stat for an id with no node would be counted as a ghost. The tree
         // owns which ids exist, so ask it rather than trusting the snapshot.
         let stats = stats
@@ -684,8 +684,8 @@ impl App {
     }
 
     /// Register git worktrees left over from earlier sessions (`mush/<id>`
-    /// branches) as finished tree nodes, so `/diff`, `/merge`, `/discard` keep
-    /// working after a restart. A registry entry whose checkout is gone is not
+    /// branches) as finished tree nodes, so a leftover's branch is on its row
+    /// after a restart. A registry entry whose checkout is gone is not
     /// work on disk and gets no row — `rm -rf .mush` leaves git naming those
     /// until they are pruned (finding P13).
     pub fn discover_worktrees(&mut self) {
@@ -771,51 +771,6 @@ impl App {
         self.tree.repair_focus();
     }
 
-    /// What `/worktrees` says: the truth about `.mush/wt` on disk *and* what
-    /// this session has adopted. The old line counted only the leftovers the
-    /// tree already knew, so a worktree `git worktree list` named — its branch
-    /// not `mush/<id>`, so `discover_worktrees` skipped it — was invisible and
-    /// the message claimed there were none while the directory sat there
-    /// (finding P10). The disk is the fact; the adopted set is what the
-    /// commands can act on; the sentence has to say both to be true.
-    ///
-    /// `cleared` is what this re-scan took out of git's registry: entries for
-    /// checkouts that were already gone. The line says so, and says the
-    /// branches stayed, because that is the part a human has to be able to
-    /// trust (finding P13).
-    fn worktree_report(&self, cleared: usize) -> String {
-        let root = self.ws.root();
-        // `None` is git not answering; say so rather than claim a count.
-        let Some(worktrees) = git::worktrees(root) else {
-            return "cannot list worktrees — git did not answer".to_string();
-        };
-        let dir = root.join(git::WORKTREE_DIR);
-        let on_disk = worktrees
-            .iter()
-            .filter(|worktree| worktree.path.starts_with(&dir) && worktree.on_disk())
-            .count();
-        let cleared = match cleared {
-            0 => String::new(),
-            1 => " · cleared 1 stale git entry (branches kept)".to_string(),
-            n => format!(" · cleared {n} stale git entries (branches kept)"),
-        };
-        let registered = self.tree.agents.iter().filter(|node| node.leftover).count();
-        if on_disk == 0 {
-            return format!("no worktrees under .mush/wt on disk{cleared}");
-        }
-        let mut line = format!("{on_disk} worktree(s) under .mush/wt on disk");
-        if registered == on_disk {
-            line.push_str(" · all registered — /diff, /merge, /discard work on them");
-        } else {
-            // The difference is a worktree mush cannot name (`mush/<id>`
-            // branch missing, or the id already taken) — name the count, not a
-            // guess at the cause.
-            line.push_str(&format!(" · {registered} registered as leftovers"));
-        }
-        line.push_str(&cleared);
-        line
-    }
-
     // ---------------------------------------------------------------- updates
 
     pub fn update(&mut self, msg: Msg) {
@@ -843,7 +798,7 @@ impl App {
                 if conversation == self.tree.conversation() {
                     self.on_agent(id, event);
                 } else if let AgentEvent::Spawned { cmd, .. } = &event {
-                    // A tree `/new` abandoned can still spawn children. They are
+                    // A tree Ctrl-N abandoned can still spawn children. They are
                     // not ours, but they must not run either — and because this
                     // event is dropped, telling the child here is the only
                     // chance it gets to end.
@@ -1069,8 +1024,8 @@ impl App {
             }
             AgentEvent::Context { tokens, source } => {
                 // The actor learned the endpoint's real window from a server
-                // complaint; the UI owns the copy the bar, `/context`, and the
-                // tool caps read, so it has to adopt the same number or the
+                // complaint; the UI owns the copy the bar and the tool caps
+                // read, so it has to adopt the same number or the
                 // next `/model` clobbers it (finding B7). The cell is the one
                 // path: this is the UI adopting on the same terms the actor
                 // did, and it writes the actors' copy with it.
@@ -1386,12 +1341,12 @@ impl App {
 
     /// Why a message to `id` cannot run, if it cannot: its worktree is gone.
     ///
-    /// `/merge` and `/discard` reclaim an isolated agent's worktree and branch
-    /// but leave its actor alive, and that actor's file tools resolve their
-    /// directory from the workspace it was spawned with — so a run would
+    /// A hand-run merge or discard reclaims an isolated agent's worktree and
+    /// branch but leaves its actor alive, and that actor's file tools resolve
+    /// their directory from the workspace it was spawned with — so a run would
     /// recreate the reclaimed path as a plain directory where no surface could
-    /// see the work (finding S1). The row, the footer and `/diff`/`/merge`/
-    /// `/worktrees` already tell the landed story; this is the same story for
+    /// see the work (finding S1). The row and its footer already tell the landed
+    /// story; this is the same story for
     /// typing. A worktree a hand-run `git worktree remove` took reads the same
     /// way: the branch is named, the worktree is not on disk, so a run would
     /// write into a phantom.
@@ -1475,15 +1430,15 @@ impl App {
                     self.tree.begin(AgentId::ROOT, None);
                 }
                 _ => {
-                    self.fail("root agent is gone — /new restarts it");
+                    self.fail("root agent is gone — Ctrl-N restarts it");
                 }
             }
         } else {
             // A landed agent cannot run again: its file tools resolve their
             // directory from the workspace it was spawned with, so a run would
             // recreate the reclaimed path as a plain directory where no surface
-            // — not `git status`, not `/diff`, not `/merge` — could see the work
-            // (finding S1). The words stay in the box and nothing runs.
+            // — not `git status`, not `git diff`, not `git merge` — could see the
+            // work (finding S1). The words stay in the box and nothing runs.
             if let Some(line) = self.worktree_gone(target) {
                 self.chat.insert(&text);
                 self.fail(line);
@@ -1555,7 +1510,7 @@ impl App {
     /// a revision a later `edit` must carry.
     ///
     /// The conversation's id travels with every answer: a revision is only
-    /// meaningful *within* one conversation, and `/new` is where a client that
+    /// meaningful *within* one conversation, and Ctrl-N is where a client that
     /// polls with its own token would otherwise mistake a fresh transcript for
     /// the one it has been reading (finding A1).
     fn attach_read(&self, agent: u64, since: usize) -> attach::Reply {
@@ -1634,8 +1589,9 @@ impl App {
     /// Where an agent works: its worktree when it has one that is still on
     /// disk, else the main checkout.
     ///
-    /// A merged or discarded agent keeps no branch (`live_branch` drops it at
-    /// restore and `/merge` drops it on landing), and a hand-run
+    /// A merged or discarded agent keeps no branch (`live_branch` drops one
+    /// whose worktree is gone at restore; a stored session may carry a landing),
+    /// and a hand-run
     /// `git worktree remove` takes the directory out from under a branch that
     /// still exists — either way, reporting a dead path is a path a client must
     /// not read files or run commands from (finding A8). The same question
@@ -1693,9 +1649,9 @@ impl App {
             if let Some(line) = self.worktree_gone(id) {
                 return attach::Reply::Err(attach::ReplyError::bad_request(line));
             }
-            // A client's words are a *message*, not a command: `/new` typed
+            // A client's words are a *message*, not a command: `/quit` typed
             // here would be text an agent reads, where the same words at the
-            // human's keyboard would restart the tree. Saying that is the
+            // human's keyboard would leave mush. Saying that is the
             // contract; the empty case is the one the typed path refuses
             // (finding A4).
             let text = text.trim();
@@ -1735,43 +1691,10 @@ impl App {
             self.disarm_quit();
         }
         match command {
-            Command::New => self.new_chat(),
             Command::Quit => self.request_quit(),
             Command::Help => self.chat.note(help_notice()),
             Command::Notes => self.open_notes_picker(),
-            Command::Context(None) => self.say(format!(
-                "{} · {} tokens used · set it with /context <tokens>",
-                self.context_label(),
-                tokens_label(self.context_used_tokens())
-            )),
-            Command::Context(Some(tokens)) => {
-                self.cell.edit(|cfg| cfg.set_context(tokens));
-                // A stated window is remembered for this workspace, so it is on
-                // disk before the command returns.
-                self.flush_session();
-                self.say(format!(
-                    "{} — remembered for this workspace",
-                    self.context_label()
-                ));
-            }
-            Command::Worktree { verb, id } => self.worktree_command(verb, AgentId(id)),
             Command::Compact => self.compact_focused(),
-            Command::Forget(id) => self.forget_agent(AgentId(id)),
-            Command::Worktrees => {
-                // The re-scan reconciles git with the disk: entries for
-                // checkouts that are gone are cleared here, so the listing and
-                // the rows cannot keep claiming a directory `rm -rf` took. No
-                // branch, commit, or stored transcript is touched — the work
-                // stays reachable (finding P13).
-                match git::prune_worktrees(self.ws.root()) {
-                    Ok(cleared) => {
-                        self.discover_worktrees();
-                        self.refresh_git();
-                        self.say(self.worktree_report(cleared));
-                    }
-                    Err(error) => self.fail(format!("cannot prune stale worktrees — {error}")),
-                }
-            }
             Command::Provider(None) => self.open_provider_picker(),
             Command::Provider(Some(name)) => self.apply_provider(&name),
             Command::Model => self.open_model_picker(),
@@ -2042,199 +1965,6 @@ impl App {
         }
     }
 
-    /// Print the exact git commands for an isolated agent's branch. The human
-    /// merges in their own IDE — mush never auto-merges.
-    /// `/diff` names the command to read the work; `/merge` and `/discard` run
-    /// it. mush cannot see a git command the human runs in their own shell, so
-    /// the only thing that ever reclaims a worktree and its branch is doing it
-    /// here — which is why the pane stayed cluttered with leftovers.
-    fn worktree_command(&mut self, verb: Verb, id: AgentId) {
-        let (branch, busy, landed) = match self.tree.node(id) {
-            None => {
-                self.fail(format!("no agent #{id}"));
-                return;
-            }
-            Some(node) => (node.branch.clone(), node.phase.is_busy(), node.landed),
-        };
-        // A landed agent has nothing left to look at: `land` took its branch
-        // with the worktree, so what happened must be asked *before* the branch
-        // it no longer has is read — a `let Some(branch)` guard first would
-        // answer a landed agent with "has no worktree branch (not isolated)",
-        // which is false. Where the work went is the answer, not a `git diff`
-        // against a branch that is gone.
-        if let Some(landed) = landed {
-            self.say(format!(
-                "agent #{id} was already {}",
-                match landed {
-                    Landed::Merged => "merged",
-                    Landed::Discarded => "discarded",
-                }
-            ));
-            return;
-        }
-        let Some(branch) = branch else {
-            self.fail(format!("agent #{id} has no worktree branch (not isolated)"));
-            return;
-        };
-        // The read is the one verb that changes nothing, so it goes first: it
-        // is the answer to "what would merging this do".
-        if verb == Verb::Diff {
-            self.paint_diff(id, &branch);
-            return;
-        }
-        if busy {
-            // Merging under a running agent would race the commits it is still
-            // making, so refuse instead of interleaving with it.
-            self.fail(format!(
-                "agent #{id} is still running — Ctrl-C stops it before you {} its work",
-                verb.name()
-            ));
-            return;
-        }
-        let root = self.ws.root().to_path_buf();
-        // The path git removes and the path the note names are one string: the
-        // core formatter, made relative to the root `-C` already resolves it
-        // against, so a discard cannot remove one worktree and report another.
-        let worktree = git::worktree_path(&root, id.0);
-        let worktree = worktree
-            .strip_prefix(&root)
-            .unwrap_or(&worktree)
-            .to_string_lossy()
-            .to_string();
-        match verb {
-            // Returned above: a read has nothing to land and nothing to
-            // reclaim.
-            Verb::Diff => {}
-            Verb::Merge => match git::run(&root, &["merge", branch.as_str()]) {
-                Err(error) => self.fail(format!("merge {branch} failed: {error}")),
-                Ok(_) => {
-                    // The work is in HEAD now, so reclaim the disk and the
-                    // branch. Best-effort: a worktree git refuses to remove is
-                    // worth reporting, but the merge — the part that mattered —
-                    // already happened.
-                    let _ = git::run(&root, &["worktree", "remove", "--force", &worktree]);
-                    let branch_note = match git::run(&root, &["branch", "-d", branch.as_str()]) {
-                        Ok(_) => format!("{branch} deleted"),
-                        Err(error) => format!("branch kept: {error}"),
-                    };
-                    self.tree.land(id, Landed::Merged);
-                    self.chat
-                        .note(format!("merged {branch} into HEAD · {branch_note}"));
-                    self.refresh_git();
-                    self.flush_session();
-                }
-            },
-            Verb::Discard => {
-                let removed = git::run(&root, &["worktree", "remove", "--force", &worktree]);
-                let deleted = git::run(&root, &["branch", "-D", branch.as_str()]);
-                // Say what actually happened: a discard that half-failed must
-                // not read like a clean one.
-                let mut steps = Vec::new();
-                steps.push(match &removed {
-                    Ok(_) => format!("removed {worktree}"),
-                    Err(error) => format!("worktree kept: {error}"),
-                });
-                steps.push(match &deleted {
-                    Ok(_) => format!("deleted {branch}"),
-                    Err(error) => format!("branch kept: {error}"),
-                });
-                let outcome = steps.join(" · ");
-                if removed.is_err() && deleted.is_err() {
-                    self.fail(format!("cannot discard agent #{id}: {outcome}"));
-                } else {
-                    self.tree.land(id, Landed::Discarded);
-                    self.chat.note(format!(
-                        "discarded agent #{id} — its work is gone · {outcome}"
-                    ));
-                    self.refresh_git();
-                    self.flush_session();
-                }
-            }
-        }
-    }
-
-    /// `/diff`: run the diff of an isolated agent's work against HEAD and paint
-    /// it, instead of naming the command and leaving the human to type it. The
-    /// old answer was the command and nothing else — a transcript whose only
-    /// reply to "what did this agent do" was `· git diff HEAD...mush/2`, which
-    /// is an instruction, not an answer (finding T9).
-    ///
-    /// The shapes, because a diff can be enormous:
-    ///
-    /// * The **bar** gets the one-glance line — the stat, or "nothing changed"
-    ///   — because a bar row is one row.
-    /// * The **transcript** gets the diff itself — each hunk named by its file
-    ///   ([`diff_rows`]), capped at `cmd_cap()` bytes of whole lines, head
-    ///   first, with a last row naming the command that reads the rest. That
-    ///   is the cap idiom the tool results already keep (`READ_CAP`, `CMD_CAP`,
-    ///   and the eight rows one result is painted with): git's output is not
-    ///   special, and a branch that touched a lockfile can print more diff than
-    ///   every conversation in the session.
-    /// * The **model** gets nothing. `/diff` is the human's command: its answer
-    ///   goes to `Chat`'s notices, never to the messages that are sent, so no
-    ///   tokens are spent and there is no model-facing shape to pick. A model
-    ///   that wants a diff has `run_command`.
-    ///
-    /// An empty diff says so. `branch` at HEAD is a fact about the work —
-    /// nothing changed — and silence would leave the human unable to tell it
-    /// from a command that did not run.
-    fn paint_diff(&mut self, id: AgentId, branch: &str) {
-        let root = self.ws.root().to_path_buf();
-        let command = format!("git diff HEAD...{branch}");
-        // Both names are resolved to commits before git reads them, through the
-        // one home `git::resolve` keeps for that rule: a branch name is
-        // untrusted input, and one beginning with `-` would be taken by `diff`
-        // as an option.
-        let (Some(base), Some(tip)) = (git::resolve(&root, "HEAD"), git::resolve(&root, branch))
-        else {
-            // The branch a node names can be gone — a hand-run `git branch -d`,
-            // a worktree git pruned — and the honest answer is git's own, not a
-            // diff against a name that does not resolve.
-            self.fail(format!(
-                "cannot diff {branch}: it does not resolve to a commit — {command}"
-            ));
-            return;
-        };
-        let range = format!("{base}...{tip}");
-        let stat = match git::run(&root, &["diff", "--shortstat", &range]) {
-            Ok(text) => git::parse_shortstat(&text).unwrap_or_default(),
-            Err(error) => {
-                self.fail(format!("cannot diff {branch}: {error}"));
-                return;
-            }
-        };
-        let diff = match git::run(&root, &["diff", &range]) {
-            Ok(text) => text,
-            Err(error) => {
-                self.fail(format!("cannot diff {branch}: {error}"));
-                return;
-            }
-        };
-        let summary = format!("#{id} {branch} {}", stat.compact());
-        if diff.is_empty() {
-            self.say(format!("{summary} — nothing changed"));
-            self.chat
-                .note(format!("{command} — nothing changed; {branch} is at HEAD"));
-            return;
-        }
-        // The head of the *change*, not of git's boilerplate: a pane spends
-        // two rows on this answer, and `diff --git`/`index` are not the answer
-        // (finding S8(ii)).
-        let rows = diff_rows(&diff);
-        let (head, elided) = head_lines(&rows, self.cfg().cmd_cap());
-        // The bar already carries the one-glance line, so the transcript is the
-        // diff itself rather than the same summary again; a second copy only
-        // pushed the change one row further out of the pane's two-row foot.
-        let mut note = head;
-        if elided > 0 {
-            note.push_str(&format!(
-                "\n[+{elided} more lines — {command} reads the rest]"
-            ));
-        }
-        self.say(summary);
-        self.chat.note(note);
-    }
-
     /// `/compact`: ask the focused agent to fold its conversation into a
     /// summary now, instead of waiting for the window to fill.
     ///
@@ -2267,48 +1997,12 @@ impl App {
         }
     }
 
-    /// Drop an agent's node and transcript from this session.
-    ///
-    /// This is deliberately *not* `/discard`: the worktree and any unmerged work
-    /// are left alone, so forgetting a live one only means `/worktrees` lists it
-    /// again (which is the honest outcome — forgetting is about the
-    /// conversation, not the disk).
-    fn forget_agent(&mut self, id: AgentId) {
-        if id == AgentId::ROOT {
-            self.fail("the root agent cannot be forgotten — /new restarts it");
-            return;
-        }
-        let Some(node) = self.tree.node(id) else {
-            self.fail(format!("no agent #{id}"));
-            return;
-        };
-        if node.phase.is_busy() {
-            self.fail(format!(
-                "agent #{id} is still running — Ctrl-C stops it first"
-            ));
-            return;
-        }
-        let unmerged = node.branch.clone().filter(|_| node.landed.is_none());
-        self.tree.reap(&[id]);
-        self.chat.forget(id);
-        // Written before this returns: a forgotten agent that came back after a
-        // restart would be the worst kind of surprise, and it is one line to
-        // prevent.
-        self.flush_session();
-        match unmerged {
-            Some(branch) => self.chat.note(format!(
-                "forgot agent #{id} — {branch} is untouched, so /worktrees lists it again"
-            )),
-            None => self.say(format!("forgot agent #{id}")),
-        }
-    }
-
     /// Reset the conversation: stop every actor in the old tree and start a
     /// fresh root, so the new chat has a clean slate and a live mailbox.
     ///
-    /// Both `Ctrl-N` and `/new` land here — a chat that is cleared without
-    /// restarting the root would leave the actor holding the old transcript
-    /// (and a busy flag) while the UI shows an empty one.
+    /// Ctrl-N lands here: a chat that is cleared without restarting the root
+    /// would leave the actor holding the old transcript (and a busy flag) while
+    /// the UI shows an empty one.
     fn new_chat(&mut self) {
         self.stop_all();
         // The respawned root owns its own config cell, conversation tag, and id
@@ -2335,7 +2029,7 @@ impl App {
 
     /// Ask every actor in the tree to shut down. `Shutdown`, not `Stop`: a
     /// cancelled actor goes back to waiting for work (which is what Ctrl-C
-    /// should do), while `/new` needs the threads to be gone — and an actor
+    /// should do), while Ctrl-N needs the threads to be gone — and an actor
     /// holds its own mailbox open, so it never notices that the UI let go.
     fn stop_all(&self) {
         for tx in self.tree.agent_tx.values() {
@@ -2584,8 +2278,8 @@ impl App {
     /// agent's row and its cursor row's footer already name each one
     /// (`cargo build 1m20s`, finding U5), and the bar has a single row for the
     /// whole tree. The registry's own count closes the one gap the rows have: a
-    /// job whose agent was forgotten with `/forget` runs on, is killed by the
-    /// quit like any other, and is owned by a node that is gone.
+    /// job whose agent has no row any more runs on, is killed by the quit like
+    /// any other, and is owned by a node that is gone.
     fn what_a_quit_kills(&self) -> Vec<String> {
         let mut items = Vec::new();
         let mut named_jobs = 0;
@@ -2887,7 +2581,7 @@ impl App {
     ///
     /// Stopping an idle agent is not a no-op to be swallowed — the human asked
     /// for something that cannot happen, and the row's phase is left alone
-    /// because it has no work in flight to cancel. Ending an agent is `/new`'s
+    /// because it has no work in flight to cancel. Ending an agent is Ctrl-N's
     /// job.
     fn cancel_cursor_row(&mut self) {
         // The painted row under the cursor, not the storage vector: they are
@@ -2965,134 +2659,6 @@ impl Drop for App {
     }
 }
 
-/// The head of a long text, in whole lines and at most `max` bytes, with how
-/// many lines were left out.
-///
-/// Whole lines because a diff is read as rows: half a hunk header is not a
-/// shorter diff, it is a broken one. Bytes because that is the cap the other
-/// tool results keep ([`Config::cmd_cap`]), which is what makes `/diff`'s answer
-/// the same size of thing as a `run_command` result instead of a rule of its
-/// own. A single line longer than the whole cap is cut at a char boundary — one
-/// minified file is one line, and it must not be able to fill the transcript
-/// either.
-fn head_lines(text: &str, max: usize) -> (String, usize) {
-    /// The longest prefix that is at most `max` bytes and ends on a char
-    /// boundary: a truncated UTF-8 glyph in a transcript is worse than a
-    /// shorter row.
-    fn char_head(text: &str, max: usize) -> &str {
-        if text.len() <= max {
-            return text;
-        }
-        let mut end = max;
-        while end > 0 && !text.is_char_boundary(end) {
-            end -= 1;
-        }
-        &text[..end]
-    }
-
-    let lines: Vec<&str> = text.lines().collect();
-    let mut kept = String::new();
-    for line in &lines {
-        // The newline between two kept rows is part of the budget: `max` is a
-        // byte count of what is handed on, not of the rows' text alone.
-        let next = line.len() + usize::from(!kept.is_empty());
-        if kept.len() + next > max {
-            break;
-        }
-        if !kept.is_empty() {
-            kept.push('\n');
-        }
-        kept.push_str(line);
-    }
-    if kept.is_empty() && !lines.is_empty() {
-        kept = char_head(lines[0], max).to_string();
-    }
-    let kept_lines = kept.lines().count();
-    (kept, lines.len().saturating_sub(kept_lines))
-}
-
-/// git's diff, with each file's preamble folded into the hunks that belong to
-/// it: `more.txt @@ -0,0 +1,2 @@`.
-///
-/// A pane spends two rows on a `/diff` answer, and git's first two rows are
-/// always the same boilerplate — `diff --git a/x b/x`, then `index …` — so the
-/// change itself was never on screen without `/notes` (finding S8(ii)). The
-/// headline is the answer instead: the file, the hunk's line numbers, then the
-/// lines. A file with no hunk (`Binary files … differ`, a mode-only change)
-/// keeps a line of its own so it is still named.
-fn diff_rows(diff: &str) -> String {
-    /// Whether a line is git's per-file preamble: identity and mode, not a
-    /// change. Only dropped before the file's first `@@`, because a hunk's own
-    /// content can itself be a line beginning `---` (a removed line of `--`) or
-    /// `+++` (an added line of `++`).
-    fn preamble(line: &str) -> bool {
-        [
-            "index ",
-            "new file mode ",
-            "deleted file mode ",
-            "old mode ",
-            "new mode ",
-            "similarity index ",
-            "dissimilarity index ",
-            "rename from ",
-            "rename to ",
-            "copy from ",
-            "copy to ",
-            "--- ",
-            "+++ ",
-        ]
-        .iter()
-        .any(|prefix| line.starts_with(prefix))
-    }
-    /// The b-side path of git's `a/x b/x`, which is the file the hunk is in.
-    fn path_of(after: &str) -> String {
-        match after.rsplit_once(" b/") {
-            Some((_, b)) => b.to_string(),
-            None => after.strip_prefix("b/").unwrap_or(after).to_string(),
-        }
-    }
-
-    let mut rows: Vec<String> = Vec::new();
-    let mut path = String::new();
-    // A file named but not yet spoken for: it is kept by name when nothing else
-    // of it survives (a mode-only change).
-    let mut pending = false;
-    let mut preamble_open = false;
-    for line in diff.lines() {
-        if let Some(after) = line.strip_prefix("diff --git ") {
-            if pending {
-                rows.push(path.clone());
-            }
-            path = path_of(after);
-            pending = true;
-            preamble_open = true;
-            continue;
-        }
-        if line.starts_with("@@") {
-            rows.push(if path.is_empty() {
-                line.to_string()
-            } else {
-                format!("{path} {line}")
-            });
-            pending = false;
-            preamble_open = false;
-            continue;
-        }
-        if preamble_open && preamble(line) {
-            continue;
-        }
-        // Anything outside the preamble is kept as it is: `Binary files …`,
-        // `GIT binary patch`, `\ No newline at end of file`.
-        rows.push(line.to_string());
-        pending = false;
-        preamble_open = false;
-    }
-    if pending {
-        rows.push(path);
-    }
-    rows.join("\n")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3142,8 +2708,8 @@ mod tests {
 
     /// A real `App` on a scratch directory, with a real (idle) root actor. The
     /// returned receiver keeps the UI channel alive for the life of the test.
-    /// A real repository, because `/merge`, `/discard` and worktree discovery
-    /// all shell out to git — a fake would test nothing they actually do.
+    /// A real repository, because worktree discovery shells out to git — a fake
+    /// would test nothing it actually does.
     fn repo(label: &str) -> std::path::PathBuf {
         let dir = std::env::temp_dir().join(format!("mush-land-{label}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
@@ -3246,7 +2812,7 @@ mod tests {
         );
 
         std::fs::write(root.join("b.txt"), "new\n").unwrap();
-        app.apply_command(Command::Context(None));
+        app.apply_command(Command::Help);
         wait_git(&mut app, &rx);
         assert_eq!(
             app.git.as_ref().map(|g| g.dirty),
@@ -3276,92 +2842,6 @@ mod tests {
         let full = app.context_meter();
         assert!(full.ends_with(" full"), "{full}");
         assert!(!full.contains(" over"), "{full}");
-    }
-
-    /// `/worktrees` asks about disk, not only about the leftovers the session
-    /// already knows: a worktree `git worktree list` names but whose branch is
-    /// not `mush/<id>` was invisible to `discover_worktrees`, and the message
-    /// then said there were none while the directory sat there (finding P10).
-    #[test]
-    fn worktrees_reports_what_is_on_disk_even_when_it_cannot_name_it() {
-        let root = repo("wt-truth");
-        git(
-            &root,
-            &["worktree", "add", "-q", "-b", "scratch", ".mush/wt/1"],
-        );
-        let mut app = app_at(root.clone());
-        assert_eq!(
-            app.tree.agents.iter().filter(|n| n.leftover).count(),
-            0,
-            "a hand-named branch is not adopted as a leftover"
-        );
-
-        run(&mut app, "/worktrees");
-        let line = text_of(&app).to_string();
-        assert!(
-            line.contains("1 worktree(s) under .mush/wt on disk"),
-            "{line}"
-        );
-        assert!(line.contains("0 registered as leftovers"), "{line}");
-        assert!(!line.contains("no worktrees"), "{line}");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A worktree mush can name is registered, and `/worktrees` says so both
-    /// ways: what is on disk and what the commands can act on.
-    #[test]
-    fn worktrees_reports_a_registered_leftover() {
-        let root = repo("wt-reg");
-        isolated_work(&root, 3, "port the parser module");
-        let mut app = app_at(root.clone());
-        run(&mut app, "/worktrees");
-        let line = text_of(&app).to_string();
-        assert!(
-            line.contains("1 worktree(s) under .mush/wt on disk"),
-            "{line}"
-        );
-        assert!(line.contains("all registered"), "{line}");
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A registry entry whose checkout was deleted by hand — exactly what
-    /// `rm -rf .mush` leaves behind — is not a worktree: it gets no row, and
-    /// the re-scan clears git's entry while keeping the branch, so the work is
-    /// still there for whoever comes back to it (finding P13).
-    #[test]
-    fn worktrees_clears_dead_git_entries_and_keeps_the_branch() {
-        let root = repo("wt-dead");
-        isolated_work(&root, 7, "keep my work");
-        let worktree = git::worktree_path(&root, 7);
-        std::fs::remove_dir_all(&worktree).unwrap();
-        let mut app = app_at(root.clone());
-
-        assert!(
-            !app.tree.agents.iter().any(|node| node.id == AgentId(7)),
-            "a checkout that is gone is not a leftover row"
-        );
-
-        run(&mut app, "/worktrees");
-        let line = text_of(&app).to_string();
-        assert!(
-            line.contains("no worktrees under .mush/wt on disk"),
-            "{line}"
-        );
-        assert!(
-            line.contains("cleared 1 stale git entry (branches kept)"),
-            "{line}"
-        );
-
-        let listing = git::run(&root, &["worktree", "list", "--porcelain"]).unwrap_or_default();
-        assert!(
-            !listing.contains(worktree.to_str().unwrap()),
-            "git no longer names the dead worktree: {listing:?}"
-        );
-        assert!(
-            git::resolve(&root, "mush/7").is_some(),
-            "the branch survives the prune, so the work is still reachable"
-        );
-        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Below the floor the screen is one notice, so a key whose effect the
@@ -3445,7 +2925,7 @@ mod tests {
     }
 
     /// In compact mode the pane still owes the selected row a footer: the
-    /// worktree and the commands to land it, which its row had to drop. Under
+    /// worktree and the git command to read it, which its row had to drop. Under
     /// six inner rows the footer used to vanish entirely (finding P12).
     #[test]
     fn a_compact_pane_pays_the_selected_row_a_footer() {
@@ -3949,433 +3429,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// `/merge` runs git for real: the work lands in HEAD, and the worktree and
-    /// the branch — the clutter — are reclaimed, which is the whole reason the
-    /// pane kept filling up.
-    #[test]
-    fn merging_an_agent_lands_the_work_and_reclaims_the_worktree() {
-        let root = repo("merge");
-        isolated_work(&root, 1, "add the parser");
-        let mut app = app_at(root.clone());
-
-        run(&mut app, "/merge 1");
-
-        assert!(root.join("work.txt").exists(), "the work is in HEAD now");
-        assert!(
-            !root.join(".mush/wt/1").exists(),
-            "the worktree is reclaimed"
-        );
-        let branches = std::process::Command::new("git")
-            .arg("-C")
-            .arg(&root)
-            .args(["branch", "--list", "mush/1"])
-            .output()
-            .unwrap();
-        assert!(
-            String::from_utf8_lossy(&branches.stdout).trim().is_empty(),
-            "the branch is reclaimed"
-        );
-        let node = app
-            .tree
-            .agents
-            .iter()
-            .find(|node| node.id == AgentId(1))
-            .unwrap();
-        assert_eq!(node.landed, Some(Landed::Merged));
-        assert!(
-            node.branch.is_none(),
-            "the branch git deleted must leave the row with it"
-        );
-        // A second /merge must not re-run git or claim a second merge. It says
-        // what happened — `land` cleared the branch, so a landed agent must be
-        // asked first, or this reports a missing branch that was never missing.
-        run(&mut app, "/merge 1");
-        assert!(
-            text_of(&app).contains("was already merged"),
-            "a second /merge reports the merge, not a branch: {}",
-            text_of(&app)
-        );
-        // `/diff` too: it used to name a branch git had already deleted.
-        run(&mut app, "/diff 1");
-        assert!(
-            text_of(&app).contains("was already merged") && !text_of(&app).contains("git diff"),
-            "/diff must not offer a branch that is gone: {}",
-            text_of(&app)
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// `/discard` throws the work away on purpose and says so.
-    #[test]
-    fn discarding_an_agent_removes_the_worktree_and_the_branch() {
-        let root = repo("discard");
-        isolated_work(&root, 2, "throwaway");
-        let mut app = app_at(root.clone());
-
-        run(&mut app, "/discard 2");
-
-        assert!(!root.join(".mush/wt/2").exists());
-        assert!(!root.join("work.txt").exists(), "the work did not land");
-        let node = app
-            .tree
-            .agents
-            .iter()
-            .find(|node| node.id == AgentId(2))
-            .unwrap();
-        assert_eq!(node.landed, Some(Landed::Discarded));
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A nudge to a landed agent is refused, not run into the reclaimed path
-    /// (finding S1). Landing already took the worktree and the branch, so the
-    /// run would recreate `.mush/wt/N` as a plain directory nothing can show,
-    /// diff or land; the words stay in the box and tell the same story the row,
-    /// the footer and `/diff`/`/merge`/`/worktrees` do.
-    #[test]
-    fn a_nudge_to_a_merged_agent_is_refused_and_writes_nothing() {
-        let root = repo("nudge-merged");
-        isolated_work(&root, 1, "add the parser");
-        let mut app = app_at(root.clone());
-        run(&mut app, "/merge 1");
-
-        app.tree.focus(AgentId(1));
-        app.chat.insert("write extra.txt");
-        app.send_message();
-
-        assert!(
-            text_of(&app).contains("agent #1 was merged — its worktree is gone"),
-            "the refusal says what happened: {}",
-            text_of(&app)
-        );
-        assert_eq!(
-            app.chat.input().text(),
-            "write extra.txt",
-            "the words are still in the box: nothing ran"
-        );
-        assert!(
-            !app.chat
-                .transcript(AgentId(1))
-                .iter()
-                .any(|message| message.text().contains("write extra.txt")),
-            "a refused message is not a message"
-        );
-        assert!(
-            !root.join(".mush/wt/1").exists(),
-            "the reclaimed path was not recreated"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The same for `/discard`: its work is gone on purpose, and typing must
-    /// not bring the path back.
-    #[test]
-    fn a_nudge_to_a_discarded_agent_is_refused_and_writes_nothing() {
-        let root = repo("nudge-discarded");
-        isolated_work(&root, 2, "throwaway");
-        let mut app = app_at(root.clone());
-        run(&mut app, "/discard 2");
-
-        app.tree.focus(AgentId(2));
-        app.chat.insert("write extra.txt");
-        app.send_message();
-
-        assert!(
-            text_of(&app).contains("agent #2 was discarded — its worktree is gone"),
-            "the refusal says what happened: {}",
-            text_of(&app)
-        );
-        assert!(
-            !app.chat
-                .transcript(AgentId(2))
-                .iter()
-                .any(|message| message.text().contains("write extra.txt")),
-            "a refused message is not a message"
-        );
-        assert!(
-            !root.join(".mush/wt/2").exists(),
-            "the reclaimed path was not recreated"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// Landing work under a *running* agent would race the commits it is still
-    /// making, so both commands refuse instead of interleaving with it.
-    #[test]
-    fn a_running_agent_refuses_to_be_merged_or_discarded() {
-        let root = repo("busy");
-        isolated_work(&root, 4, "still working");
-        let mut app = app_at(root.clone());
-        app.tree.begin(AgentId(4), None);
-
-        run(&mut app, "/merge 4");
-        run(&mut app, "/discard 4");
-
-        assert!(root.join(".mush/wt/4").exists(), "nothing was reclaimed");
-        let node = app
-            .tree
-            .agents
-            .iter()
-            .find(|node| node.id == AgentId(4))
-            .unwrap();
-        assert_eq!(node.landed, None);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// `/diff` runs the diff and paints it. The old arm printed the command it
-    /// *would* have run — a transcript whose only answer to "what did this agent
-    /// do" was `· git diff HEAD...mush/1`, which is an instruction, not an
-    /// answer (finding T9).
-    #[test]
-    fn the_diff_command_runs_the_diff_and_paints_it() {
-        let root = repo("diff");
-        isolated_work(&root, 1, "add the parser");
-        let mut app = app_at(root.clone());
-
-        run(&mut app, "/diff 1");
-
-        // The bar got the one-glance line, in the vocabulary the row uses.
-        assert_eq!(text_of(&app), "#1 mush/1 +1−0");
-        let note = app
-            .chat
-            .notices_for(AgentId::ROOT)
-            .next()
-            .map(|notice| notice.text.clone())
-            .expect("the diff is the answer");
-        assert_eq!(
-            note, "work.txt @@ -0,0 +1 @@\n+the work",
-            "the answer is the change itself, named by its file: {note:?}"
-        );
-        // The model pays nothing for a command the human typed: this is a
-        // notice, not a message, and notices are never sent anywhere.
-        assert!(
-            app.chat.transcript(AgentId::ROOT).is_empty(),
-            "the diff is the human's reading, not a turn"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The pane's own rows show the change, not git's file header (finding
-    /// S8(ii)): `/diff` keeps the head, and the head is the first hunks, each
-    /// named by its file — so a `+` line is on screen without `/notes`.
-    #[test]
-    fn the_diff_pane_shows_the_first_hunks_not_gits_preamble() {
-        let root = repo("diff-first-hunk");
-        isolated_work(&root, 1, "add work");
-        let worktree = git::worktree_path(&root, 1);
-        std::fs::write(worktree.join("more.txt"), "alpha\nbravo\n").unwrap();
-        git(&worktree, &["add", "-A"]);
-        git(&worktree, &["commit", "-qm", "more"]);
-        let mut app = app_at(root.clone());
-
-        run(&mut app, "/diff 1");
-
-        let note = app
-            .chat
-            .notices_for(AgentId::ROOT)
-            .next()
-            .map(|notice| notice.text.clone())
-            .expect("the diff is the answer");
-        assert!(
-            !note.contains("diff --git") && !note.contains("index "),
-            "git's preamble is not the answer: {note:?}"
-        );
-        assert!(
-            note.lines().any(|line| line.starts_with("more.txt @@")),
-            "each hunk is named by its file: {note:?}"
-        );
-
-        // What the human actually sees at a normal terminal: the pane's two
-        // note rows are the first hunk and its first changed line.
-        let rows = screen(&mut app, 80, 16);
-        assert!(
-            rows.iter().any(|row| row.contains("more.txt @@")),
-            "the first hunk is painted: {rows:?}"
-        );
-        assert!(
-            rows.iter()
-                .any(|row| row.trim_start().starts_with("+alpha")),
-            "and so is a changed line: {rows:?}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A branch with nothing on it is a fact — the work is at HEAD — and saying
-    /// nothing would be indistinguishable from a command that did not run.
-    #[test]
-    fn a_diff_with_nothing_to_show_says_so() {
-        let root = repo("diff-empty");
-        let worktree = git::worktree_path(&root, 3);
-        std::fs::create_dir_all(root.join(".mush")).unwrap();
-        git(
-            &root,
-            &[
-                "worktree",
-                "add",
-                "-q",
-                worktree.to_str().unwrap(),
-                "-b",
-                &git::branch_name(3),
-            ],
-        );
-        let mut app = app_at(root.clone());
-
-        run(&mut app, "/diff 3");
-
-        assert_eq!(text_of(&app), "#3 mush/3 ±0 — nothing changed");
-        let note = app
-            .chat
-            .notices_for(AgentId::ROOT)
-            .next()
-            .map(|notice| notice.text.clone())
-            .expect("an answer either way");
-        assert!(
-            note.contains("nothing changed") && note.contains("mush/3 is at HEAD"),
-            "an empty diff is still an answer: {note:?}"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A diff can be enormous — a branch that touched a lockfile prints more
-    /// than the whole session — so it is capped like every other tool result:
-    /// whole lines, the head kept, and one row saying what was left out and how
-    /// to read it.
-    #[test]
-    fn a_huge_diff_is_capped_and_says_what_it_dropped() {
-        let root = repo("diff-huge");
-        isolated_work(&root, 2, "a big change");
-        let worktree = git::worktree_path(&root, 2);
-        let body: String = (0..800).map(|line| format!("line {line}\n")).collect();
-        std::fs::write(worktree.join("big.txt"), body).unwrap();
-        git(&worktree, &["add", "-A"]);
-        git(&worktree, &["commit", "-qm", "big"]);
-        let mut app = app_at(root.clone());
-
-        run(&mut app, "/diff 2");
-
-        let note = app
-            .chat
-            .notices_for(AgentId::ROOT)
-            .next()
-            .map(|notice| notice.text.clone())
-            .expect("the diff is the answer");
-        assert!(
-            note.contains("+line 0") && note.starts_with("big.txt @@"),
-            "the head of the change is what is kept: {:?}",
-            &note[..note.len().min(200)]
-        );
-        assert!(
-            !note.contains("+line 799"),
-            "and the tail is what is dropped"
-        );
-        let marker = note.lines().last().expect("a last row");
-        assert!(
-            marker.starts_with("[+") && marker.ends_with("reads the rest]"),
-            "one row says how much is left and how to read it: {marker:?}"
-        );
-        assert!(
-            note.len() <= app.cfg().cmd_cap() + 200,
-            "the cap is the tool-result cap, not a shape of its own: {} bytes",
-            note.len()
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// A node can name a branch git no longer has — a leftover restored with a
-    /// name the human deleted by hand — and the honest answer is git's own
-    /// complaint, not a diff against a revision that does not resolve.
-    #[test]
-    fn a_diff_of_a_branch_git_no_longer_has_fails_honestly() {
-        let root = repo("diff-gone");
-        let mut app = app_at(root.clone());
-        app.tree.insert(Spawn {
-            id: AgentId(7),
-            parent: AgentId::ROOT,
-            brief: "work that left".to_string(),
-            depth: 1,
-            branch: Some("mush/7".to_string()),
-            cmd: crossbeam_channel::unbounded().0,
-        });
-
-        run(&mut app, "/diff 7");
-
-        assert!(
-            text_of(&app).contains("cannot diff mush/7"),
-            "the failure names the branch that could not be read: {}",
-            text_of(&app)
-        );
-        assert!(
-            app.chat.notices_for(AgentId::ROOT).next().is_none(),
-            "and nothing was written as if a diff had been read"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The cap is on bytes of whole lines, and it never cuts a glyph in half:
-    /// one minified file is one line, and half a UTF-8 sequence in a transcript
-    /// is worse than a shorter row.
-    #[test]
-    fn a_long_text_is_cut_at_whole_lines_and_on_a_char_boundary() {
-        let text = "alpha\nbravo\ncharlie\n";
-        assert_eq!(head_lines(text, 100), (text.trim_end().to_string(), 0));
-        assert_eq!(head_lines(text, 11), ("alpha\nbravo".to_string(), 1));
-        assert_eq!(head_lines(text, 5), ("alpha".to_string(), 2));
-        assert_eq!(head_lines("", 10), (String::new(), 0));
-        // Two two-byte glyphs, one byte short of a third: the boundary is what
-        // decides, not the count.
-        assert_eq!(head_lines("εεεε", 5), ("εε".to_string(), 0));
-    }
-
-    /// `/forget` drops the conversation, not the work: the branch survives, so
-    /// the honest thing is to say it is still there.
-    #[test]
-    fn forgetting_an_agent_drops_the_node_and_keeps_the_worktree() {
-        let root = repo("forget");
-        isolated_work(&root, 6, "leave me");
-        let mut app = app_at(root.clone());
-        app.chat
-            .replace_transcript(AgentId(6), vec![Message::user("hello")]);
-
-        app.forget_agent(AgentId(6));
-
-        assert!(app.tree.agents.iter().all(|node| node.id != AgentId(6)));
-        assert!(
-            app.chat.transcript(AgentId(6)).is_empty(),
-            "its transcript goes with it"
-        );
-        assert!(
-            root.join(".mush/wt/6").exists(),
-            "forgetting is not discarding"
-        );
-        assert_eq!(
-            app.tree.focused,
-            AgentId::ROOT,
-            "focus cannot point at a ghost"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// The root is not forgettable, and a running agent has to be stopped first.
-    #[test]
-    fn forgetting_refuses_the_root_and_a_running_agent() {
-        let (mut app, _rx) = test_app("forget-guards");
-        app.forget_agent(AgentId::ROOT);
-        assert!(app.tree.agents.iter().any(|node| node.id == AgentId::ROOT));
-
-        app.tree.insert(Spawn {
-            id: AgentId(9),
-            parent: AgentId::ROOT,
-            brief: "busy".to_string(),
-            depth: 1,
-            branch: None,
-            cmd: crossbeam_channel::unbounded().0,
-        });
-        app.forget_agent(AgentId(9));
-        assert!(
-            app.tree.agents.iter().any(|node| node.id == AgentId(9)),
-            "a running agent is not forgotten under itself"
-        );
-    }
-
     /// A stored conversation comes back with its subagents: a live mailbox each
     /// (so a follow-up message is delivered, not lost) and the transcript it had
     /// (which is the whole point of storing it).
@@ -4480,8 +3533,8 @@ mod tests {
     }
 
     /// One decision at restore: a stored branch whose worktree is gone is not
-    /// the agent's any more (finding U13). The row must not offer `/diff` or
-    /// `/merge` for a reclaimed directory, must not paint a dead path in its
+    /// the agent's any more (finding U13). The row must not offer a diff
+    /// for a reclaimed directory, must not paint a dead path in its
     /// footer, and must not refuse a nudge the actor would happily run in the
     /// main checkout.
     #[test]
@@ -4493,7 +3546,7 @@ mod tests {
             vec![Message::user("port the parser")],
         );
         stored.agents[0].branch = Some("mush/2".to_string());
-        let (mut app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
 
         let node = app.tree.node(AgentId(2)).expect("the agent is restored");
         assert!(
@@ -4504,23 +3557,6 @@ mod tests {
         assert!(
             app.worktree_gone(AgentId(2)).is_none(),
             "a nudge must not be refused for a branch the agent no longer has"
-        );
-
-        // The words the human reads: `/diff` says there is no branch, instead
-        // of running git against a revision nothing can show.
-        app.apply_command(Command::Worktree {
-            verb: Verb::Diff,
-            id: 2,
-        });
-        let (said, kind) = app.status_line().expect("the refusal is on the bar");
-        assert_eq!(
-            kind,
-            StatusKind::Error,
-            "a refusal is a failure, not chatter"
-        );
-        assert!(
-            said.contains("no worktree branch"),
-            "a dropped branch has no diff to show: {said}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -4956,20 +3992,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A window the human stated is remembered for the workspace, so `/context`
-    /// must not lose it: the command is not done until the file says so.
-    #[test]
-    fn a_stated_context_is_on_disk_before_the_command_returns() {
-        let root = dir("context");
-        let (mut app, _writer) = app_writing(&root);
-        run(&mut app, "/context 240000");
-
-        let stored = Session::load(&root).expect("the command flushed it");
-        assert_eq!(stored.context, Some(240_000));
-        drop(app);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     /// The shipped default window is not the human's: a session budgeted on it
     /// must store `context: null`, or the next launch would read a default
     /// nobody stated back as a statement — and no endpoint could ever teach
@@ -4992,28 +4014,6 @@ mod tests {
         let stored = Session::load(&root).expect("the send flushed it");
         assert_eq!(stored.context, None, "a guess is not a statement");
         assert_eq!(stored.model, app.cfg().model);
-        drop(app);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// `/forget` is a deletion, and a deletion that only lived in memory would
-    /// come back at the next start — the agent would be listed as if the human
-    /// had never dropped it.
-    #[test]
-    fn a_forgotten_agent_is_gone_from_the_file() {
-        let root = repo("forget-file");
-        isolated_work(&root, 6, "leave me");
-        let (mut app, _writer) = app_writing(&root);
-        app.chat
-            .replace_transcript(AgentId(6), vec![Message::user("hello")]);
-
-        app.forget_agent(AgentId(6));
-
-        let stored = Session::load(&root).expect("the command flushed it");
-        assert!(
-            stored.agents.iter().all(|agent| agent.id != 6),
-            "a forgotten agent cannot come back from the file"
-        );
         drop(app);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5490,7 +4490,7 @@ mod tests {
         assert!(!app.busy(), "and the machine is free again");
     }
 
-    /// `/new` clears the stored conversation too, not just the visible one: the
+    /// Ctrl-N clears the stored conversation too, not just the visible one: the
     /// old chat coming back at the next start is exactly what the flush stops.
     #[test]
     fn a_new_chat_clears_the_stored_conversation() {
@@ -5500,30 +4500,10 @@ mod tests {
         app.send_message();
         assert_eq!(Session::load(&root).unwrap().messages.len(), 1);
 
-        run(&mut app, "/new");
+        ctrl(&mut app, 'n');
 
         let stored = Session::load(&root).expect("the command flushed it");
         assert!(stored.messages.is_empty(), "the old chat is not resumed");
-        drop(app);
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
-    /// `/merge` lands an agent, and landing it is stored: a restart must not
-    /// offer to merge work that is already in HEAD.
-    #[test]
-    fn a_landed_merge_is_in_the_file_before_the_command_returns() {
-        let root = repo("merge-file");
-        isolated_work(&root, 3, "add the parser");
-        let (mut app, _writer) = app_writing(&root);
-        run(&mut app, "/merge 3");
-
-        let stored = Session::load(&root).expect("the command flushed it");
-        let landed = stored
-            .agents
-            .iter()
-            .find(|agent| agent.id == 3)
-            .expect("the agent it landed");
-        assert_eq!(landed.landed, Some(session::StoredLanded::Merged));
         drop(app);
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -5931,17 +4911,18 @@ mod tests {
     /// the trailing constraint behind a `Min(6)` chat, and at 40×10 the panes
     /// above it took the row it was owed: the frame painted the tree, the
     /// transcript and the message box, and the ` chat ` row — the focus badge,
-    /// the key hint, and the only home an Info line or a command's usage error
-    /// has — was simply not there.
+    /// the key hint, and the only home a failure has — was simply not there.
     #[test]
     fn the_bar_keeps_a_row_on_the_shortest_terminals() {
         let (mut app, _rx) = test_app("bar-floor");
         crowd(&mut app, 3);
-        // `/diff 9` is a failure with no other home: it is not a message, so it
-        // is never in the transcript, and the row it is about does not exist.
-        run(&mut app, "/diff 9");
+        // Failing to reach an agent's mailbox is a failure with no other home:
+        // it is not a message, so it is never in the transcript. `crowd`'s
+        // children are spawned with a receiver nobody holds.
+        app.tree.focus(AgentId(1));
+        run(&mut app, "/compact");
         assert!(
-            text_of(&app).contains("no agent #9"),
+            text_of(&app).contains("agent #1 is gone"),
             "the line the bar is supposed to carry: {}",
             text_of(&app)
         );
@@ -5951,7 +4932,7 @@ mod tests {
             assert_eq!(rows.len(), height as usize, "{width}x{height}");
             let bar = rows.last().unwrap();
             assert!(
-                bar.contains(" chat ") && bar.contains("no agent #9"),
+                bar.contains(" chat ") && bar.contains("agent #1 is gone"),
                 "the bar is missing its only row at {width}x{height}: {rows:?}"
             );
         }
@@ -6401,17 +5382,17 @@ mod tests {
         app_root(&root, None, session_save::fake::Recorder::new())
     }
 
-    /// `/new` must do what Ctrl-N does: a cleared chat with a live root, not
+    /// Ctrl-N must do what Ctrl-N does: a cleared chat with a live root, not
     /// an empty pane over a stale conversation.
     #[test]
-    fn slash_new_restarts_the_root_and_clears_the_conversation() {
+    fn ctrl_n_restarts_the_root_and_clears_the_conversation() {
         let (mut app, _rx) = test_app("new");
         app.chat
             .push_message(AgentId::ROOT, Message::user("an old task"));
         app.chat.note_for(AgentId::ROOT, "old noise");
         let before = app.cell.handle();
 
-        run(&mut app, "/new");
+        ctrl(&mut app, 'n');
 
         assert!(
             app.chat.transcript(AgentId::ROOT).is_empty(),
@@ -6445,14 +5426,14 @@ mod tests {
         assert_eq!(app.tree.agents[0].phase, Phase::Thinking);
     }
 
-    /// An actor `/new` abandoned can still be finishing a request (up to the
+    /// An actor Ctrl-N abandoned can still be finishing a request (up to the
     /// HTTP timeout); its events must not land in the new conversation. Ids
     /// collide by design — the new root is #0 too.
     #[test]
     fn events_from_an_abandoned_conversation_are_ignored() {
         let (mut app, _rx) = test_app("stale");
         let abandoned = app.tree.conversation();
-        run(&mut app, "/new");
+        ctrl(&mut app, 'n');
         assert_ne!(app.tree.conversation(), abandoned, "a new conversation tag");
         app.chat
             .push_message(AgentId::ROOT, Message::user("current work"));
@@ -6588,7 +5569,7 @@ mod tests {
 
     /// A window an actor learned reaches the UI's cell, through the event that
     /// announced it — not as a mutex write the UI never hears about (finding
-    /// B7). The bar, `/context` and the tool caps read one number, and the
+    /// B7). The bar and the tool caps read one number, and the
     /// actors holding a handle from before the event measure against the same
     /// one.
     #[test]
@@ -6612,7 +5593,7 @@ mod tests {
         assert_eq!(
             app.cfg().context_tokens,
             4_096,
-            "the bar, /context and the caps read the learned window"
+            "the bar and the caps read the learned window"
         );
         assert!(
             !app.cfg().context_explicit,
@@ -7446,14 +6427,14 @@ mod tests {
         );
     }
 
-    /// A tree `/new` abandoned can still spawn children, and their `Spawned`
+    /// A tree Ctrl-N abandoned can still spawn children, and their `Spawned`
     /// events are dropped — so this is the only moment the UI can tell such a
     /// child to go away. Without it the child runs unseen forever.
     #[test]
     fn a_child_spawned_by_an_abandoned_tree_is_shut_down() {
         let (mut app, _rx) = test_app("stale-child");
         let abandoned = app.tree.conversation();
-        run(&mut app, "/new");
+        ctrl(&mut app, 'n');
         let (child_tx, child_rx) = crossbeam_channel::unbounded::<AgentMsg>();
 
         app.update(Msg::Agent {
@@ -7478,7 +6459,7 @@ mod tests {
     }
 
     /// Ctrl-C cancels work; it must not end an idle root, which only comes
-    /// back with `/new`.
+    /// back with Ctrl-N.
     #[test]
     fn ctrl_c_stops_running_agents_only() {
         let (mut app, _rx) = test_app("interrupt");
@@ -9676,7 +8657,7 @@ mod tests {
         assert_eq!(error.kind, "bad_request");
     }
 
-    /// A read's revision is only meaningful inside one conversation. `/new`
+    /// A read's revision is only meaningful inside one conversation. Ctrl-N
     /// moves it forward and the payload names the new conversation, so a
     /// client's stale token conflicts instead of landing a draft in the wrong
     /// chat (finding A1).
@@ -9690,7 +8671,7 @@ mod tests {
         let revision = before["revision"].as_u64().expect("a revision");
         let conversation = before["conversation"].as_u64().expect("an epoch");
 
-        app.apply_command(Command::New);
+        ctrl(&mut app, 'n');
 
         let after = attach_ok(app.handle_attach(
             "a client",
@@ -9720,7 +8701,7 @@ mod tests {
         ));
         assert_eq!(
             error.kind, "conflict",
-            "a token from before /new cannot land in the new chat"
+            "a token from before Ctrl-N cannot land in the new chat"
         );
         assert_eq!(app.chat.input().text(), "", "and the box is untouched");
     }

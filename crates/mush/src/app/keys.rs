@@ -277,7 +277,7 @@ pub enum Intent {
     /// has no opinion about all the time.
     Ignore,
     Quit,
-    /// New chat: `/new`, and the old conversation is gone.
+    /// New chat: Ctrl-N, and the old conversation is gone.
     NewChat,
     /// Stop the focused agent's run (`Ctrl-C`).
     Interrupt,

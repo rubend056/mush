@@ -867,21 +867,20 @@ fn unread_footer(app: &App, node: &AgentNode) -> String {
 }
 
 /// Where an isolated agent's work is — or where it went. Pure, so the row's
-/// promise can be asserted: a landed worktree must not name a `git diff` or a
-/// `/merge` that can no longer work.
+/// promise can be asserted: a landed worktree must not name a `git diff` that
+/// can no longer work.
 fn agent_detail(node: &AgentNode) -> Vec<String> {
     match node.landed {
         Some(Landed::Merged) => vec!["merged into HEAD".to_string()],
         Some(Landed::Discarded) => vec!["discarded — its work is gone".to_string()],
         None => match &node.branch {
             // This is the one place on screen that says an isolated agent
-            // exists at all, and the commands that land it.
+            // exists at all, and the git command that reads its work.
             Some(branch) => vec![
                 // The worktree path comes from core like every other one: the
-                // row must name the directory `/discard` would remove.
+                // row must name the directory a `git worktree remove` takes.
                 format!("{}/{}", git::WORKTREE_DIR, node.id),
                 format!("git diff HEAD...{branch}"),
-                format!("/merge {}", node.id),
             ],
             None => Vec::new(),
         },
@@ -1106,7 +1105,7 @@ mod tests {
     }
 
     /// A landed worktree still has a branch recorded, so the row must key off
-    /// `landed` to stop offering a diff and a merge that can no longer work.
+    /// `landed` to stop offering a `git diff` that can no longer work.
     #[test]
     fn a_landed_agent_does_not_offer_commands_that_cannot_work() {
         let mut merged = node(Phase::Done, 1);
@@ -1115,31 +1114,27 @@ mod tests {
         let text = agent_detail(&merged).join(" · ");
         assert_eq!(text, "merged into HEAD");
         assert!(!text.contains("git diff"), "{text}");
-        assert!(!text.contains("/merge"), "{text}");
 
         let mut discarded = node(Phase::Done, 1);
         discarded.branch = Some("mush/9".to_string());
         discarded.landed = Some(Landed::Discarded);
         let text = agent_detail(&discarded).join(" · ");
         assert!(text.contains("discarded"), "{text}");
-        assert!(!text.contains("/merge"), "{text}");
+        assert!(!text.contains("git diff"), "{text}");
     }
 
     /// Before anything lands, the row is the one place that says where an
-    /// isolated agent's work is and how to bring it in.
+    /// isolated agent's work is and the git command that reads it.
     #[test]
-    fn an_unmerged_agent_names_its_worktree_and_the_command_to_merge_it() {
+    fn an_unmerged_agent_names_its_worktree_and_the_git_command_to_read_it() {
         let mut open = node(Phase::Done, 1);
         open.branch = Some("mush/9".to_string());
         let text = agent_detail(&open).join(" · ");
-        // The commands are keyed by the *id* (the worktree is `.mush/wt/<id>`),
-        // which need not match the number in the branch name.
+        // The worktree is keyed by the *id* (`.mush/wt/<id>`), which need not
+        // match the number in the branch name.
         assert_eq!(
             text,
-            format!(
-                ".mush/wt/{} · git diff HEAD...mush/9 · /merge {}",
-                open.id, open.id
-            )
+            format!(".mush/wt/{} · git diff HEAD...mush/9", open.id)
         );
     }
 

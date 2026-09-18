@@ -1,7 +1,7 @@
 //! One owner for the endpoint, the model, the key and the context window.
 //!
 //! The context window is the fact that made this module necessary (finding B7):
-//! the bar, `/context` and the tool caps read the UI's copy, while every request
+//! the bar and the tool caps read the UI's copy, while every request
 //! an actor sends reads the tree's copy, and both used to be written by hand at
 //! each site that learned something. A number one side learned and the other
 //! did not is a screen that promises room the next request does not have.
@@ -92,8 +92,8 @@ impl ConfigCell {
     }
 
     /// Change the configuration: the UI's copy and the actors' copy in one
-    /// write, so a `/model`, `/url`, `/key` or `/context` cannot reach one of
-    /// them and not the other (finding B7).
+    /// write, so a `/model`, `/url` or `/key` cannot reach one of them and not
+    /// the other (finding B7).
     pub fn edit(&mut self, f: impl FnOnce(&mut Config)) {
         f(&mut self.ui);
         self.shared.adopt(&self.ui);
@@ -121,7 +121,7 @@ impl ConfigCell {
     /// Point the cell at another tree's cell, keeping the configuration the UI
     /// shows.
     ///
-    /// `/new` starts a fresh root, whose cell is what a later `/model` has to
+    /// Ctrl-N starts a fresh root, whose cell is what a later `/model` has to
     /// reach or the new actor never hears about it. The configuration in force
     /// travels with the swap: the new tree starts where the old one left off
     /// rather than on the values the process started with.
@@ -189,7 +189,7 @@ impl ConfigHandle {
         }
     }
 
-    /// Whether two handles are the same cell. `/new` starts a fresh tree, and
+    /// Whether two handles are the same cell. Ctrl-N starts a fresh tree, and
     /// what makes the UI adopt its handle is that a later `/model` has to reach
     /// *that* actor: the test for it asks this, rather than reaching for the
     /// lock the handle deliberately does not expose.
@@ -308,7 +308,7 @@ mod tests {
         assert_eq!(handle.config().unwrap().context_tokens, 32_000);
     }
 
-    /// `/new` replaces the tree: the fresh root gets the configuration in
+    /// Ctrl-N replaces the tree: the fresh root gets the configuration in
     /// force, and a later edit reaches it.
     #[test]
     fn a_new_trees_cell_starts_where_the_old_one_left_off() {

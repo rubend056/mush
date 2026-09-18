@@ -174,8 +174,9 @@ const CANCELLED: &str = "cancelled";
 pub enum Outcome {
     /// The run finished; the string is its summary.
     Finished(String),
-    /// The run was stopped (Ctrl-C, `agent_control stop`, `/new`). Not a
-    /// result and not a failure: the actor is idle and resumable.
+    /// The run was stopped (Ctrl-C, `agent_control stop`, or the tree being shut
+    /// down by Ctrl-N). Not a result and not a failure: the actor is idle and
+    /// resumable.
     Stopped,
     /// The run never ended: mush went away with it in flight, and nothing was
     /// committed by it. Not `Stopped` — there is no actor left to resume — and
@@ -459,7 +460,7 @@ pub enum AgentMsg {
     /// Cancel the current run. An idle agent ignores it — Stop cancels work,
     /// it does not end an agent.
     Stop,
-    /// End this actor for good (`/new`, Ctrl-N). A `Stop` cannot do this: an
+    /// End this actor for good (Ctrl-N). A `Stop` cannot do this: an
     /// actor holds its own mailbox open, so it never learns that everyone else
     /// let go — it has to be told.
     Shutdown,
@@ -522,7 +523,7 @@ pub enum AgentEvent {
     Notice(String),
     Message(Message),
     Done,
-    /// The run was stopped by a request (a Stop, Ctrl-C, `/new`). The actor is
+    /// The run was stopped by a request (a Stop, Ctrl-C, Ctrl-N). The actor is
     /// still alive, so the row goes quiet instead of claiming a failure.
     Stopped,
     /// The parent has read a child's result: the line is in its transcript now,
@@ -552,7 +553,7 @@ pub enum AgentEvent {
         line: String,
     },
     /// The window the endpoint itself named when it rejected a request; the UI
-    /// adopts it so the bar, `/context`, and the tool caps agree with the agent
+    /// adopts it so the bar and the tool caps agree with the agent
     /// (finding B7). `source` travels with the number so the UI trusts it on the
     /// same terms the actor did.
     Context {
@@ -615,7 +616,7 @@ pub struct AgentCtx {
     pub machine: Arc<dyn Machine>,
     /// Every job this tree started, and the machine-wide lock. One registry for
     /// the whole tree, because a job is a fact about the *machine*: the budget
-    /// is machine-wide, the lock is machine-wide, and `/new` kills what the old
+    /// is machine-wide, the lock is machine-wide, and Ctrl-N kills what the old
     /// tree left running (`crate::jobs`).
     pub registry: Arc<jobs::Registry>,
     /// The clock every wait is measured against. `wait_agents` and a running
@@ -870,7 +871,7 @@ pub(crate) fn spawn_scripted(
     root_actor(ConfigHandle::own(cfg), model, events, conversation, root)
 }
 
-/// One conversation per `/new`, so stale events can be told apart: an actor
+/// One conversation per Ctrl-N, so stale events can be told apart: an actor
 /// left over from a replaced tree can still be finishing a request, and its
 /// events must not land in the new chat.
 fn next_conversation() -> ConversationId {
@@ -949,8 +950,8 @@ pub struct ReviveSpec {
 /// A merged or discarded branch is not this agent's any more — its work is in
 /// the main checkout, and its actor would commit into the human's own tree if
 /// it kept the name (`revive` sends it to the root, where the work now is).
-/// The node and the actor must read the same answer, or the row offers `/diff`
-/// and `/merge` for a reclaimed directory while the actor runs in the checkout
+/// The node and the actor must read the same answer, or the row offers a
+/// branch for a reclaimed directory while the actor runs in the checkout
 /// (finding U13); this one function is where both get it.
 pub fn live_branch(root: &Path, id: u64, branch: Option<String>) -> Option<String> {
     branch.filter(|_| git::worktree_path(root, id).exists())
@@ -1096,8 +1097,8 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
             Err(error) if error == CANCELLED => Outcome::Stopped,
             Err(error) => Outcome::Failed(error),
         };
-        // An isolated agent's branch *is* the deliverable mush documents for it
-        // (`/diff`, `/merge`, `/discard`), so its work is committed here instead
+        // An isolated agent's branch *is* the deliverable — the thing a human
+        // lands with git — so its work is committed here instead
         // of being left as untracked files in the worktree. Before the parent is
         // told, so a diff or merge it triggers already sees the work.
         let work = actor.branch.clone().map(|branch| {
@@ -1459,12 +1460,13 @@ fn absorb(
 }
 
 /// Whether this actor is an isolated agent whose worktree has been reclaimed
-/// (`/merge`, `/discard`, or a hand-run `git worktree remove`).
+/// (a hand-run `git worktree remove`, or a `landed` agent restored from an old
+/// session).
 ///
 /// It must not run again: its file tools resolve their directory from the
 /// workspace it was spawned with, so a write would recreate the dead path as a
-/// plain directory that no surface — not `git status`, not `/diff`, not
-/// `/merge` — can show, diff or land (finding S1). `App::deliver` refuses the
+/// plain directory that no surface — not `git status`, not `git diff`, not
+/// `git merge` — can show, diff or land (finding S1). `App::deliver` refuses the
 /// human's own message before it is sent; this is the backstop for every other
 /// sender (a parent's `agent_control message`).
 fn worktree_gone(actor: &Actor) -> bool {
@@ -3209,8 +3211,8 @@ fn wait_commands_tool(
     )
 }
 
-/// Commit whatever an isolated agent left in its worktree, so the branch that
-/// `/diff`, `/merge`, and `/discard` name actually carries the work. Returns the
+/// Commit whatever an isolated agent left in its worktree, so the branch the
+/// row names actually carries the work. Returns the
 /// short revision when something was committed, `None` when the run changed
 /// nothing. The subject is built above, next to the id, brief and outcome it is
 /// made of.
@@ -3538,7 +3540,7 @@ fn run_shell(
 ) -> Result<String, ToolError> {
     let spawned = actor.ctx.machine.spawn(&ShellCommand { command, root })?;
     // From here to the end of the call the command is the registry's as much as
-    // this actor's: quitting mush, a `Stop` and `/new` all reach it (finding
+    // this actor's: quitting mush, a `Stop` and Ctrl-N all reach it (finding
     // S4). It is *not* a job — no id, no line, no budget — it is a tool call
     // whose result the model is waiting for, which is exactly why nothing was
     // watching it before.
@@ -3643,7 +3645,7 @@ fn command_report(stdout: &str, stderr: &str) -> String {
 ///   watcher's own kill sets the same flag an outside one does, which is why
 ///   the arm below only touches an exit.
 /// - A command killed from *outside* the watcher — quitting mush (`kill_all`),
-///   `/new`, or the registry's half of a `Stop` — is reported as a cancel. The
+///   Ctrl-N, or the registry's half of a `Stop` — is reported as a cancel. The
 ///   process died from the signal mush sent it, and `-1` handed to the model as
 ///   an exit code would read as the command's own doing; this is the arm
 ///   finding S4's fix needs.
@@ -6648,7 +6650,7 @@ mod tests {
     }
 
     /// `Stop` cancels work and is a no-op for an idle agent; only `Shutdown`
-    /// ends one — which is what keeps `/new` from leaving an orphan root
+    /// ends one — which is what keeps Ctrl-N from leaving an orphan root
     /// behind that still answers to agent #0.
     #[test]
     fn stop_cancels_but_shutdown_ends() {
@@ -8090,26 +8092,27 @@ mod tests {
                 "mush/1",
             ],
         );
-        assert!(merged.is_ok(), "/merge must merge: {merged:?}");
+        assert!(merged.is_ok(), "a merge must merge: {merged:?}");
         assert!(
             root.join("iso.txt").exists(),
-            "after /merge the file must be in the human's workspace"
+            "after the merge the file must be in the human's workspace"
         );
         let removed = git::run(&root, &["worktree", "remove", ".mush/wt/1"]);
         assert!(
             removed.is_ok(),
-            "/discard must remove the worktree: {removed:?}"
+            "`git worktree remove` must remove the worktree: {removed:?}"
         );
         let deleted = git::run(&root, &["branch", "-D", "mush/1"]);
         assert!(
             deleted.is_ok(),
-            "/discard must delete the branch: {deleted:?}"
+            "`git branch -D` must delete the branch: {deleted:?}"
         );
         let _ = fs::remove_dir_all(&root);
     }
 
     /// A tree whose isolated child has finished its first run, left `iso.txt` on
-    /// `mush/1`, and is now idle — the state `/merge` and `/discard` start from.
+    /// `mush/1`, and is now idle — the state a hand-run merge or discard starts
+    /// from.
     ///
     /// Returns the repository, the recorded events, and the *live* child's
     /// mailbox, so a test can do what the commands do and then nudge it. The
@@ -8185,8 +8188,8 @@ mod tests {
         (root, events, child_tx)
     }
 
-    /// Do what `/merge` does to a child, with real git: land the branch, then
-    /// reclaim the worktree and the branch.
+    /// Do what a merge by hand does to a child, with real git: land the branch,
+    /// then reclaim the worktree and the branch.
     fn land_with_merge(root: &Path) {
         git::run(root, &["merge", "--no-edit", "mush/1"]).expect("merge mush/1");
         let worktree = git::worktree_path(root, 1);
@@ -8198,8 +8201,8 @@ mod tests {
         git::run(root, &["branch", "-d", "mush/1"]).expect("delete the branch");
     }
 
-    /// Do what `/discard` does: reclaim the worktree and delete the branch,
-    /// without merging.
+    /// Do what a discard by hand does: reclaim the worktree and delete the
+    /// branch, without merging.
     fn land_with_discard(root: &Path) {
         let worktree = git::worktree_path(root, 1);
         git::run(
@@ -8210,9 +8213,9 @@ mod tests {
         git::run(root, &["branch", "-D", "mush/1"]).expect("delete the branch");
     }
 
-    /// After `/merge`, a nudge to the child must be refused: its actor is alive
-    /// but its worktree is gone, so a run would recreate `.mush/wt/1` as a plain
-    /// directory where no surface could see, diff or land the file — the work
+    /// After a merge by hand, a nudge to the child must be refused: its actor is
+    /// alive but its worktree is gone, so a run would recreate `.mush/wt/1` as a
+    /// plain directory where no surface could see, diff or land the file — the work
     /// would exist somewhere nothing can reach (finding S1). The test asserts
     /// the refusal, the untouched main tree, and no recreated directory.
     #[test]
@@ -8249,8 +8252,8 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// The same after `/discard`: the work was thrown away on purpose, and a
-    /// nudge must not quietly recreate the path it was thrown from.
+    /// The same after a discard by hand: the work was thrown away on purpose, and
+    /// a nudge must not quietly recreate the path it was thrown from.
     #[test]
     fn a_nudge_to_a_discarded_child_is_refused_not_run_in_the_phantom_path() {
         let (root, events, child_tx) = finished_isolated_child("s1-discarded");

@@ -205,25 +205,6 @@ pub fn worktrees(dir: &Path) -> Option<Vec<Worktree>> {
     Some(parse_worktrees(&text))
 }
 
-/// Clear git's registry entries for worktrees whose checkout is gone
-/// (`git worktree prune`), and answer how many entries went.
-///
-/// Only `.git/worktrees/` administration goes: no branch, commit, file, or
-/// record of an agent is touched, so the work stays reachable — a human who
-/// needs the branch later still has it (finding P13). The count is the
-/// difference of two listings, which is git's own answer rather than a count
-/// of the entries this side guessed were prunable.
-pub fn prune_worktrees(dir: &Path) -> Result<usize, String> {
-    let before = worktrees(dir)
-        .ok_or_else(|| GIT_UNAVAILABLE.to_string())?
-        .len();
-    run(dir, &["worktree", "prune"])?;
-    let after = worktrees(dir)
-        .ok_or_else(|| GIT_UNAVAILABLE.to_string())?
-        .len();
-    Ok(before.saturating_sub(after))
-}
-
 /// Parse `git worktree list --porcelain`: blank-line-separated blocks, each
 /// starting with `worktree <path>` and carrying `branch refs/heads/<name>` when
 /// a branch is out. A detached or bare worktree simply has no branch line, and
@@ -557,42 +538,6 @@ mod tests {
         // A trailing blank line, and a listing that is only whitespace.
         assert_eq!(parse_worktrees("\n\n").len(), 0);
         assert_eq!(parse_worktrees("").len(), 0);
-    }
-
-    /// `git worktree prune` clears the registry entry for a checkout deleted by
-    /// hand and touches nothing else: the branch still resolves, so the work
-    /// stays reachable for whoever comes back to it (finding P13).
-    #[test]
-    fn pruning_takes_the_dead_registry_entry_and_leaves_the_branch() {
-        let dir = init_repo("prune-dead");
-        let (path, branch) = worktree_add(&dir, 8, None).unwrap();
-        fs::write(path.join("work.txt"), "the work\n").unwrap();
-        assert!(commit_all(&path, "mush #8: do the thing")
-            .unwrap()
-            .is_some());
-        // What `rm -rf .mush` does: the checkout goes, the registry and the
-        // branch stay.
-        fs::remove_dir_all(&path).unwrap();
-        let registered = |dir: &Path| {
-            worktrees(dir)
-                .unwrap()
-                .into_iter()
-                .any(|worktree| worktree.id == Some(8))
-        };
-        assert!(registered(&dir), "git still names the deleted worktree");
-
-        assert_eq!(prune_worktrees(&dir).unwrap(), 1);
-        assert!(!registered(&dir), "the dead registry entry is gone");
-        assert!(
-            resolve(&dir, &branch).is_some(),
-            "pruning is not discarding: the branch is still there"
-        );
-        assert_eq!(
-            prune_worktrees(&dir).unwrap(),
-            0,
-            "pruning again is a no-op"
-        );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     /// The path and the branch are one formatting rule, and the id round-trips

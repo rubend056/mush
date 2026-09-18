@@ -39,7 +39,7 @@ use crate::http;
 /// tells the human whether to check the URL or the size of the reply.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ModelError {
-    /// The human cancelled (Ctrl-C, `agent_control stop`, `/new`) while the
+    /// The human cancelled (Ctrl-C, `agent_control stop`, Ctrl-N) while the
     /// reply was in flight.
     Cancelled,
     /// The request could not be encoded.

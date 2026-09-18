@@ -25,7 +25,7 @@ pub trait Events: Send + Sync {
 
 /// The real sink: the UI thread's channel, stamped with the conversation.
 ///
-/// The stamp is what lets the UI recognise an event from a tree `/new`
+/// The stamp is what lets the UI recognise an event from a tree Ctrl-N
 /// abandoned and drop it, instead of folding a finished request into the new
 /// chat.
 pub struct Ui {
