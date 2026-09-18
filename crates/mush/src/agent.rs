@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use mush_core::config::parse_context_hint;
 use mush_core::git;
 use mush_core::message::{ChatRequest, ChatResponse};
-use mush_core::text::{first_line, sanitize, truncate};
+use mush_core::text::{first_line, sanitize, truncate, truncate_flag};
 use mush_core::tools::ToolName;
 use mush_core::transcript::{
     needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
@@ -283,11 +283,13 @@ const SUBJECT_COLUMNS: usize = 60;
 /// (`isolated w…`), which neither reads as English nor matches the brief; the
 /// whole word that does not fit is dropped and the `…` says so. A first line
 /// with no space to cut on keeps the hard cut — a clipped subject is better
-/// than no subject.
+/// than no subject. Whether the line was cut at all is
+/// [`truncate_flag`]'s answer, never the `…`'s: a brief that ends in an ellipsis
+/// of its own would otherwise lose the word in front of it.
 fn subject_brief(brief: &str) -> String {
     let first = first_line(brief);
-    let cut = truncate(&first, SUBJECT_COLUMNS);
-    if !cut.ends_with('…') {
+    let (cut, cut_short) = truncate_flag(&first, SUBJECT_COLUMNS);
+    if !cut_short {
         return cut;
     }
     let body = cut.trim_end_matches('…');
@@ -410,8 +412,13 @@ impl Outcome {
             }
         };
         let first = body.lines().next().unwrap_or("").trim();
-        let cut = truncate(first, DIGEST_COLUMNS);
-        if body.chars().count() > cut.chars().count() {
+        let (cut, cut_short) = truncate_flag(first, DIGEST_COLUMNS);
+        // The size is named whenever the digest is not the whole body: the first
+        // line was cut to fit, or the body runs on past it. The flag is what
+        // says the first, because counting the characters cannot — one dropped
+        // wide glyph costs two columns and no characters, so the counts tie and
+        // the digest used to hide a cut without saying so.
+        if cut_short || body.chars().count() > first.chars().count() {
             format!("#{id} {mark} {cut} ({} chars total)", body.chars().count())
         } else {
             format!("#{id} {mark} {cut}")
@@ -4028,6 +4035,19 @@ mod tests {
         assert!(kept.starts_with("port the parser"), "{cut}");
     }
 
+    /// A first line that ends in `…` was not cut by anyone: the ellipsis is the
+    /// brief's own character. Reading it as the cut's mark swallowed the word
+    /// before it — `fix the …` came out as `fix the…`, a subject about a
+    /// different sentence — which is what a caller guessing at "was this cut?"
+    /// from the string itself costs. The cut knows, and now says.
+    #[test]
+    fn a_brief_that_ends_in_an_ellipsis_keeps_its_words() {
+        assert_eq!(
+            commit_subject(7, "fix the …", &Outcome::Finished("done".into())),
+            "mush #7: fix the …"
+        );
+    }
+
     /// A brief cut to a budget is cut by *columns*, not characters: a CJK brief
     /// counted by characters is twice as wide as the subject that holds it
     /// (finding B9). This module used to carry its own character-counting
@@ -4717,6 +4737,32 @@ mod tests {
             );
             let _ = fs::remove_dir_all(actor.ws.root());
         }
+    }
+
+    /// The digest names the size of what it hides exactly when it hides
+    /// something: a body the column holds whole gains no `(N chars total)`, and
+    /// a body the cut shortened always does — even when the `…` stands in for a
+    /// dropped *wide* glyph, where the character counts tie and a count-based
+    /// guess fell silent about the very cut it was there to report.
+    #[test]
+    fn a_digest_names_its_size_only_when_it_hides_something() {
+        let whole = "x".repeat(DIGEST_COLUMNS);
+        assert_eq!(
+            Outcome::Finished(whole.clone()).digest(1),
+            format!("#1 ✓ {whole}"),
+            "a body exactly the column width is whole"
+        );
+
+        // One wide glyph past the budget: the cut keeps 99 columns of `x` and
+        // spends the last on the ellipsis, so the digest has as many
+        // *characters* as the body and the count comparison saw nothing hidden.
+        let wide = format!("{}你", "x".repeat(DIGEST_COLUMNS - 1));
+        let digest = Outcome::Finished(wide.clone()).digest(1);
+        assert!(digest.contains('…'), "the cut says so: {digest}");
+        assert!(
+            digest.ends_with(&format!("({} chars total)", wide.chars().count())),
+            "the digest says how much it hid: {digest}"
+        );
     }
 
     /// `status` is a listing, not a delivery: a child's whole final
