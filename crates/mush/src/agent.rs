@@ -1955,30 +1955,41 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     }
 
     let id = ctx.ids.fetch_add(1, Ordering::SeqCst);
-    let (child_ws, branch, note) = if isolated {
+    // Why isolation was not available, if it was asked for and refused. One
+    // reason, two readers: the child's brief carries it for the model (which
+    // wrote `isolated: true` and has to know it did not get its own worktree),
+    // and the parent's pane carries it for the human — who asked for two
+    // siblings that would not touch the same files, and whose rows would
+    // otherwise look exactly like a child that never asked to be isolated.
+    // Every way `worktree_add` refuses takes this road: no repository, no
+    // commit to fork from, git's own refusal to add the worktree.
+    let mut degraded: Option<String> = None;
+    let (child_ws, branch) = if isolated {
         // A private worktree on `mush/<id>`, based on the parent's branch (or
         // HEAD). The reason it cannot be made is reported either way, so
         // isolation degrades to the shared workspace instead of failing the
         // delegation.
         match git::worktree_add(&ctx.root, id, actor.branch.as_deref()) {
             Ok((path, branch)) => match Workspace::new(&path) {
-                Ok(child_ws) => (child_ws, Some(branch), String::new()),
+                Ok(child_ws) => (child_ws, Some(branch)),
                 // Isolation is best-effort: degrade to the shared workspace
                 // rather than fail the delegation outright.
-                Err(error) => (
-                    actor.ws.clone(),
-                    None,
-                    format!(" (isolated unavailable: {error}; running in place)"),
-                ),
+                Err(error) => {
+                    degraded = Some(error.to_string());
+                    (actor.ws.clone(), None)
+                }
             },
-            Err(reason) => (
-                actor.ws.clone(),
-                None,
-                format!(" (isolated unavailable: {reason}; running in place)"),
-            ),
+            Err(reason) => {
+                degraded = Some(reason);
+                (actor.ws.clone(), None)
+            }
         }
     } else {
-        (actor.ws.clone(), None, String::new())
+        (actor.ws.clone(), None)
+    };
+    let note = match &degraded {
+        Some(reason) => format!(" (isolated unavailable: {reason}; running in place)"),
+        None => String::new(),
     };
 
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AgentMsg>();
@@ -1995,6 +2006,21 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
             cmd: cmd_tx.clone(),
         },
     );
+
+    // The same fact, to the human. The child's brief below tells the model; a
+    // row with no branch is not an explanation, and two "isolated" siblings
+    // editing one workspace while the human believes they are apart is the
+    // failure this line exists to prevent. It is a notice on the parent — the
+    // pane the human is reading when they asked for this child — and it says
+    // which child, because a parent may spawn several.
+    if let Some(reason) = &degraded {
+        ctx.emit(
+            parent,
+            AgentEvent::Notice(format!(
+                "#{id} isolated unavailable: {reason} — it shares this workspace"
+            )),
+        );
+    }
 
     // Who the child is goes in the system prompt; the parent's task is the
     // first user message, mirroring the root's system+user shape. Some
@@ -6087,6 +6113,99 @@ mod tests {
             "/discard must delete the branch: {deleted:?}"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `isolated: true` in a workspace that is not a git repository: the child
+    /// runs in the shared workspace, and until now *only the model* was told —
+    /// the reason travelled in the child's brief and nowhere else. The human
+    /// asked for a child of their own, and what they got was one sharing their
+    /// checkout, with a row that looks exactly like a child that never asked to
+    /// be isolated: two of them would edit the same files while the human
+    /// believed they were apart.
+    ///
+    /// Both halves are pinned here: the spawn's answer to the model is
+    /// unchanged (the same result line, and the brief still carrying why), and
+    /// the same fact now reaches the parent's pane as a notice.
+    #[test]
+    fn a_degraded_isolation_is_said_to_the_human_too() {
+        let gate = Arc::new(Gate::new());
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .held(gate.clone())
+                .says("child answered"),
+        );
+        // A scratch directory, not `init_git_repo`: the workspace this test
+        // opens is exactly the plain one the finding describes.
+        let (actor, events, _mailbox) = build_actor_about(
+            "isolation-in-place",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "do the thing", "isolated": true }),
+            &cancel,
+        )
+        .unwrap();
+
+        // The model's answer is unchanged: the same line it always got, and the
+        // child's own brief still carries the reason it has no worktree.
+        assert_eq!(
+            report,
+            "spawned agent #1 · runs until it stops calling tools · wait_agents returns its summary"
+        );
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the child must ask for its first turn"
+        );
+        let asked = scripted.asked();
+        assert!(
+            asked[0].saw("(isolated unavailable: not a git repository; running in place)"),
+            "the model is still told: {:?}",
+            asked[0].messages
+        );
+        gate.release();
+
+        // The human's half: a notice on the parent, naming the child and the
+        // reason, and — the row's own honesty — a spawn with no branch, so no
+        // surface can claim a worktree this child does not have.
+        let notices: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(text) => Some(text),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            vec![
+                "#1 isolated unavailable: not a git repository — it shares this workspace"
+                    .to_string()
+            ],
+            "the human must be told what the model was told"
+        );
+        let spawned_branch = events
+            .events()
+            .into_iter()
+            .find_map(|(_, event)| match event {
+                AgentEvent::Spawned { branch, .. } => Some(branch),
+                _ => None,
+            })
+            .expect("the child was spawned");
+        assert_eq!(
+            spawned_branch, None,
+            "the row has no branch, so it cannot imply a worktree that does not exist"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// Root -> child -> grandchild, each isolated: the grandchild's file must
