@@ -23,7 +23,8 @@ path), and a command runs with its cwd at the workspace root. Never touch paths 
 workspace.\n\
 - Read before you edit: use the shell (`sed -n '1,200p' file`, `rg pattern`) — `edit_file` needs \
 the exact text it replaces, and refuses a match that is missing or not unique.\n\
-- When you are done finish with a concise summary of what you did.";
+- When you are done finish with a concise summary of what you did.
+- Don't forget to have fun :)";
 
 /// What is true of the machine for every agent, root or leaf. One home, read by
 /// both prompts; the child pays for every word here on every request.
