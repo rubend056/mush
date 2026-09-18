@@ -315,7 +315,7 @@ fn job_title(command: &str) -> String {
 const QUIT_LINE_COLUMNS: usize = 72;
 
 /// The line a quit over live work paints: `Ctrl-Q again quits · kills #0
-/// thinking, #3 wait_commands + 1 job`.
+/// thinking, #3 wait + 1 job`.
 ///
 /// The first clause is the decision the human is making twice; everything after
 /// it is [`App::what_a_quit_kills`], one item per thing, joined until the row
@@ -965,7 +965,7 @@ impl App {
             }
             AgentEvent::ResultRead { child } => {
                 // The parent's actor has handed a child's result to the model —
-                // folded it, or answered a `wait_agents` for it — so the child's
+                // folded it, or answered a `wait` for it — so the child's
                 // row stops wearing `✉`. Only the owner of that fact moves the
                 // mark: a row that guessed itself clear would be claiming a
                 // reading that never happened (finding H4).
@@ -8402,7 +8402,7 @@ mod tests {
     }
 
     /// One frame with a nested tree: the root is at rest with work out, its own
-    /// child #1 is parked in `wait_agents`, and the grandchild #2 is working.
+    /// child #1 is parked in `wait`, and the grandchild #2 is working.
     ///
     /// The bar's sentence is a promise about when the root resumes — "the root
     /// resumes as they finish" — and the root resumes when *its* children
@@ -8444,7 +8444,7 @@ mod tests {
             id: AgentId::ROOT,
             event: AgentEvent::Done,
         });
-        app.tree.activity(AgentId(1), "wait_agents 3s");
+        app.tree.activity(AgentId(1), "wait 3s");
         app.tree.activity(AgentId(2), "read_file deep.txt 2s");
         assert_eq!(
             (

@@ -523,7 +523,7 @@ impl App {
                 // advanced.
                 //
                 // A run parked in a wait is *not* one: the foot's `working…` may
-                // only claim a model call, and `wait_agents` is not one — the
+                // only claim a model call, and `wait` is not one — the
                 // agent is waiting for somebody else's result, and the row says
                 // so (`waiting on agents 3s`). Painting the spinner over that
                 // was exactly the lie finding U7 named.
@@ -999,7 +999,7 @@ fn phase_glyph(phase: &Phase) -> &'static str {
 /// What the row says the agent is doing, ageing with the phase so a slow model
 /// is visible as `thinking 42s` rather than a static word.
 ///
-/// A run parked in a wait says so instead of naming the tool: `wait_agents 3s`
+/// A run parked in a wait says so instead of naming the tool: `wait 3s`
 /// reads like a model call in flight, and the human asked for an hourglass for
 /// the case where nothing is being computed — a napping orchestrator was the
 /// one agent on the screen claiming work it was not doing (finding U7).
@@ -1016,7 +1016,7 @@ fn phase_detail(node: &AgentNode) -> String {
             Some(waiting) => format!("waiting on {} {age}", waiting.noun()),
             // The actor's label is the tool name and its summarized arguments;
             // with no arguments it ends in a space, which the row would paint
-            // as a double one (`wait_agents  3s`).
+            // as a double one (`wait  3s`).
             None => format!("{} {age}", what.trim_end()),
         },
         Phase::Compacting(kind) => format!("{} {age}", kind.words().trim_end_matches('…')),
