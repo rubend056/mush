@@ -37,7 +37,8 @@
 //! message is trimmed before the window is cut, and the foot is capped and
 //! counted. `ui.rs` keeps the frame around it — the border, the prompt and the
 //! cursor — and paints what this returns, title included, because a pane one row
-//! tall has no row to spend on saying what it is hiding.
+//! tall has no row to spend on saying what it is hiding, or that the human has
+//! scrolled away from the bottom.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -822,6 +823,17 @@ impl Chat {
         if foot.hidden > 0 && !foot.counted {
             title.push_str(&format!("· {} · /notes ", more_label(foot.hidden)));
         }
+        // A pane that is not at the bottom says so. The foot staying put is
+        // what makes it a foot, but a window holding rows above the newest line
+        // looks exactly like one following it, and the human who scrolled away
+        // is the only one who knows they did (finding T10). The rows are the
+        // held window's own offset, and the key named is the chat pane's way
+        // back down to the newest line.
+        if let Reading::Holding { offset, up_to } = self.reading(pane.agent) {
+            if up_to <= self.transcript(pane.agent).len() {
+                title.push_str(&format!("· scrolled ↑{offset} rows · PgDn "));
+            }
+        }
         Painted { lines, title }
     }
 
@@ -1455,6 +1467,53 @@ mod tests {
         assert!(
             bottom.iter().any(|row| row.contains("arrived")),
             "{bottom:?}"
+        );
+    }
+
+    /// A pane holding rows above the newest line says so in its title: the foot
+    /// staying put is what makes it a foot, but a held window and a following
+    /// one look identical, and the pane is the only place that fact can live at
+    /// every size (finding T10). The marker is derived from the reading, so it
+    /// is there the instant they scroll and gone the instant they come back.
+    #[test]
+    fn a_pane_away_from_the_bottom_says_so_in_its_title() {
+        let mut chat = Chat::bare();
+        for index in 0..12 {
+            say(&mut chat, AgentId::ROOT, &format!("line {index}"));
+        }
+        assert_eq!(
+            chat.painted(&pane(AgentId::ROOT), 60, 6).title,
+            " mush ",
+            "a pane at the bottom has nothing to say about it"
+        );
+
+        chat.scroll_by(AgentId::ROOT, 3);
+        assert_eq!(
+            chat.painted(&pane(AgentId::ROOT), 60, 6).title,
+            " mush · scrolled ↑3 rows · PgDn "
+        );
+
+        // Both of the title's facts fit side by side: the foot's own count —
+        // which the title carries only when the pane has no row to spend on the
+        // count line — and the reading position.
+        chat.note_for(AgentId::ROOT, "a long note ".repeat(20));
+        let painted = chat.painted(&pane(AgentId::ROOT), 60, 2);
+        assert!(
+            painted.title.contains("/notes") && painted.title.contains("scrolled ↑3 rows"),
+            "both facts fit: {}",
+            painted.title
+        );
+        assert_eq!(
+            chat.painted(&pane(AgentId(1)), 60, 6).title,
+            " agent #1 ",
+            "another pane is still at the bottom"
+        );
+
+        chat.scroll_by(AgentId::ROOT, -3);
+        assert_eq!(
+            chat.painted(&pane(AgentId::ROOT), 60, 6).title,
+            " mush ",
+            "and coming back to the newest line takes the marker with it"
         );
     }
 
