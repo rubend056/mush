@@ -164,7 +164,7 @@ pub fn tool_schemas() -> Vec<Value> {
             json!({
                 "type": "object",
                 "properties": {
-                    "command": { "type": "string", "description": "Shell command (run with sh -c)." },
+                    "command": { "type": "string", "description": "Sh command." },
                     "detach": { "type": "boolean", "description": "Return at once; it keeps running as a job (a server, a watch) and you are told when it finishes. A command that outlives 60s detaches by itself." },
                     "exclusive": { "type": "boolean", "description": "Own the machine while it runs: benchmarks, profiling, a fixed port. Siblings are refused, not interleaved." }
                 },
@@ -209,8 +209,7 @@ pub fn tool_schemas() -> Vec<Value> {
             ToolName::Wait,
             "Block until everything you own has finished \u{2014} every child and every job \u{2014} then \
              answer with one digest: a result you have not read comes in full, an already-read one as a \
-             line. Returns at once when nothing is in flight. Cancellable; a nudge or a message ends the \
-             wait.",
+             line. Returns at once when nothing is in flight.",
             json!({ "type": "object", "properties": {} }),
         ),
     ]
