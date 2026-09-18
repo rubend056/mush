@@ -2489,7 +2489,17 @@ fn run_command(
                 }
                 error
             })?;
-        let id = detach_now(actor, &registry, command, exclusive, spawned)?;
+        let id = detach_now(
+            actor,
+            &registry,
+            jobs::Launch::started(
+                actor.id,
+                command.to_string(),
+                exclusive,
+                actor.my_tx.clone(),
+                spawned,
+            ),
+        )?;
         state.running_jobs.insert(id);
         return Ok(detached_line(id));
     }
@@ -2547,31 +2557,27 @@ impl Detach<'_> {
     }
 }
 
-/// Hand a running command to the registry and return its id.
+/// Hand a running command to the registry as a job and return its id.
+///
+/// The `launch` is built by the caller, because where the process group comes
+/// from is the caller's fact: one that has just been started (`detach: true`),
+/// or the one a foreground call was holding when it outlived
+/// `CMD_DETACH_AFTER` (see `jobs::Launch::held`).
 fn detach_now(
     actor: &Actor,
     registry: &Arc<jobs::Registry>,
-    command: &str,
-    exclusive: bool,
-    job: Box<dyn Job>,
+    launch: jobs::Launch,
 ) -> Result<u64, String> {
-    let id = registry
-        .launch(jobs::Launch {
-            owner: actor.id,
-            command: command.to_string(),
-            exclusive,
-            job,
-            mailbox: actor.my_tx.clone(),
-        })
-        .map_err(|refused| {
-            registry.release_machine(actor.id);
-            refused.message(actor.id)
-        })?;
+    let command = launch.command.clone();
+    let id = registry.launch(launch).map_err(|refused| {
+        registry.release_machine(actor.id);
+        refused.message(actor.id)
+    })?;
     actor.ctx.emit(
         actor.id,
         AgentEvent::JobStarted {
             job: id,
-            command: command.to_string(),
+            command: command.clone(),
         },
     );
     Ok(id)
@@ -2622,20 +2628,40 @@ fn run_shell(
     actor: &Actor,
     state: &mut ActorState,
 ) -> Result<String, String> {
-    let mut job = actor.ctx.machine.spawn(&ShellCommand { command, root })?;
-    let ended = wait_bounded(job.as_mut(), timeout, detach.after(), cancel, actor, state)?;
+    let spawned = actor.ctx.machine.spawn(&ShellCommand { command, root })?;
+    // From here to the end of the call the command is the registry's as much as
+    // this actor's: quitting mush, a `Stop` and `/new` all reach it (finding
+    // S4). It is *not* a job — no id, no line, no budget — it is a tool call
+    // whose result the model is waiting for, which is exactly why nothing was
+    // watching it before.
+    let mut running = actor.ctx.registry.hold(actor.id, spawned);
+    let ended = wait_bounded(&mut running, timeout, detach.after(), cancel, actor, state)?;
     if matches!(ended, Ended::Detached) {
         if let Detach::Job {
             registry,
             exclusive,
         } = detach
         {
-            let id = detach_now(actor, registry, command, exclusive, job)?;
+            let id = detach_now(
+                actor,
+                registry,
+                jobs::Launch::held(
+                    actor.id,
+                    command.to_string(),
+                    exclusive,
+                    actor.my_tx.clone(),
+                    running,
+                ),
+            )?;
             state.running_jobs.insert(id);
             return Ok(detached_line(id));
         }
     }
-    let (stdout, stderr) = job.output(CMD_CAP);
+    // A kill that arrived from *outside* the watcher — a quit, which is what
+    // finding S4 is about, or the registry's half of a `Stop` — must not be
+    // reported as the command's own exit: `-1` is a signal nobody asked about.
+    let ended = ending(ended, running.stopped());
+    let (stdout, stderr) = running.output(CMD_CAP);
 
     // No `$ {command}` echo: the tool call is already rendered from the
     // assistant message that made it (`⚙ run_command …`), so printing it here
@@ -2662,6 +2688,28 @@ fn run_shell(
         Ended::Detached => report.push_str(&format!("[timed out after {}s]", timeout.as_secs())),
     }
     Ok(report)
+}
+
+/// How a command's end is read once the watcher has returned.
+///
+/// Three ways a foreground command stops must not be confusable in the report:
+///
+/// - A command the watcher stopped — its time was up, it wrote past the output
+///   cap, or a `Stop` reached the run — is reported with *that* reason. The
+///   watcher's own kill sets the same flag an outside one does, which is why
+///   the arm below only touches an exit.
+/// - A command killed from *outside* the watcher — quitting mush (`kill_all`),
+///   `/new`, or the registry's half of a `Stop` — is reported as a cancel. The
+///   process died from the signal mush sent it, and `-1` handed to the model as
+///   an exit code would read as the command's own doing; this is the arm
+///   finding S4's fix needs.
+/// - A command that ended by itself keeps its real exit status, signal deaths
+///   included: nobody asked for those.
+fn ending(ended: Ended, stopped_from_outside: bool) -> Ended {
+    match ended {
+        Ended::Exited(_) if stopped_from_outside => Ended::Cancelled,
+        ended => ended,
+    }
 }
 
 /// Wait for a command, stopping it when its time is up, a cancellation arrives,
@@ -5298,6 +5346,175 @@ mod tests {
             actor.ctx.registry.running(),
             0,
             "and nothing was left over as a job"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The three ways a foreground command can stop must not be confusable in
+    /// the report the model reads, and the flag mush sets when it kills a
+    /// command is the same one for all of them: what tells them apart is *who*
+    /// killed it and *how* the watcher learned of it.
+    #[test]
+    fn the_three_ways_a_foreground_command_ends_are_not_confusable() {
+        // A kill from outside the watcher: the process died of a signal, and
+        // that is a cancel — not `[exit -1]`, which reads as the command's own
+        // doing. This is the arm finding S4 added.
+        assert!(matches!(ending(Ended::Exited(-1), true), Ended::Cancelled));
+        // A command that ended by itself keeps its exit status, whoever else's
+        // signal it was.
+        assert!(matches!(ending(Ended::Exited(3), false), Ended::Exited(3)));
+        assert!(matches!(
+            ending(Ended::Exited(-1), false),
+            Ended::Exited(-1)
+        ));
+        // The watcher's own kills keep their own reasons. They set the same
+        // flag on the way out, so an arm that keyed off the flag rather than
+        // off the *shape* of the end would report a timeout as a cancel — which
+        // is exactly what happened when this was written, and what
+        // `a_command_that_runs_forever_is_killed_on_time` and
+        // `a_runaway_writer_is_stopped_at_the_output_limit` caught.
+        assert!(matches!(ending(Ended::TimedOut, true), Ended::TimedOut));
+        assert!(matches!(
+            ending(Ended::TooMuchOutput, true),
+            Ended::TooMuchOutput
+        ));
+        assert!(matches!(ending(Ended::Cancelled, true), Ended::Cancelled));
+    }
+
+    /// The quit half of finding S4, at the seam: a command killed from *outside*
+    /// the watcher — nothing sets the run's own cancel flag, which is the shape
+    /// a quit has — is reported as a cancel rather than as an exit code of `-1`.
+    /// The kill is the registry's, the same call `App::drop` makes.
+    ///
+    /// The real clock here on purpose: the watcher sleeps ten milliseconds a
+    /// poll, so the test has the whole sixty-second detach window to land its
+    /// kill, and the command dies within one poll of it. No fake-clock race
+    /// against a deadline nobody is testing.
+    #[test]
+    fn a_foreground_command_killed_from_outside_reports_cancelled() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let (actor, _mailbox) =
+            scripted_tools_actor("killed-outside", machine.clone(), Arc::new(clock::System));
+        let registry = actor.ctx.registry.clone();
+        let owner = actor.id;
+
+        let running = std::thread::spawn(move || {
+            let mut state = ActorState::default();
+            let cancel = AtomicBool::new(false);
+            exec_tool(
+                &actor,
+                &mut state,
+                ToolName::RunCommand,
+                &json!({ "command": "make" }),
+                &cancel,
+            )
+        });
+        // Wait for the call to be holding the command, which is the state the
+        // whole fix is about: until it is held, there is nothing to kill.
+        let mut held = false;
+        for _ in 0..2_000 {
+            if registry.holding_foreground(owner) {
+                held = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(held, "the command never got going");
+
+        registry.kill_owned(owner);
+        let report = running
+            .join()
+            .expect("the agent thread must finish")
+            .unwrap();
+
+        assert_eq!(
+            report, "[cancelled]",
+            "a kill from outside is not an exit code"
+        );
+        assert_eq!(machine.kills(), 1, "and the command was killed once");
+        assert!(
+            !registry.holding_foreground(owner),
+            "the call holds nothing now"
+        );
+    }
+
+    /// `Stop` cancels the work in flight, and a `run_command` the agent is
+    /// waiting on *is* work in flight (§5.5). The kill reaches the command the
+    /// same way it reaches a job — the registry's `kill_owned`, through the
+    /// same slot the call is held in — and the model is told the command was
+    /// cancelled rather than handed a signal's `-1` as if it were an exit code.
+    #[test]
+    fn a_stop_kills_the_foreground_command() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, mailbox) = scripted_tools_actor("stop-foreground", machine.clone(), clock);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        // The human's Ctrl-C, in the actor's own terms: the mailbox is drained
+        // by the watcher's next pass, which is the latency a Stop has.
+        mailbox.send(AgentMsg::Stop).unwrap();
+
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "make" }),
+            &cancel,
+        )
+        .unwrap();
+
+        assert_eq!(report, "[cancelled]", "a stop is not an exit code");
+        assert_eq!(machine.kills(), 1, "and the command really was killed");
+        assert!(
+            !actor.ctx.registry.holding_foreground(actor.id),
+            "the call is over, so its slot is gone"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A command that ends by itself is reported with *its* exit status, leaves
+    /// no slot held, and is never signalled afterwards — by the call's own end
+    /// or by a later `kill_all`. That last part is the safety half of finding
+    /// S4's fix: a process group id is free once the command is reaped, so a
+    /// kill that landed on a slot a finished call had left behind could kill
+    /// somebody else's process. Nothing here is killed, so the count says so.
+    #[test]
+    fn a_foreground_command_that_ends_normally_leaves_nothing_behind() {
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::exits(3).says("first"))
+                .runs(Script::exits(0).says("second")),
+        );
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("foreground-ends", machine.clone(), clock);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let mut call = |command: &str| {
+            exec_tool(
+                &actor,
+                &mut state,
+                ToolName::RunCommand,
+                &json!({ "command": command }),
+                &cancel,
+            )
+            .unwrap()
+        };
+
+        assert_eq!(call("ouch"), "first\n[exit 3]", "its own exit status");
+        assert!(
+            !actor.ctx.registry.holding_foreground(actor.id),
+            "a finished call holds nothing"
+        );
+        // A later command is a fresh call with a fresh slot, and the finished
+        // one is not in the way of it.
+        assert_eq!(call("again"), "second\n[exit 0]");
+        assert!(!actor.ctx.registry.holding_foreground(actor.id));
+        assert_eq!(machine.kills(), 0, "nothing that ended was signalled");
+        actor.ctx.registry.kill_all();
+        assert_eq!(
+            machine.kills(),
+            0,
+            "and no later kill lands on a slot a finished call left behind"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }

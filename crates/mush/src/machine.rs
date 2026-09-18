@@ -329,10 +329,19 @@ pub(crate) mod fake {
             self.written += self.script.grows;
             let polls = self.polls;
             self.polls += 1;
+            // A killed command is a *dead* command, and the real shell says so:
+            // the child is reaped and `status.code()` is `None`, which the
+            // report has always spelled `-1`. A fake that kept a killed command
+            // "running" forever could not tell a watcher that noticed the kill
+            // from one that slept through it — which is finding S4's whole
+            // question — so the death is scripted here too.
+            if self.killed {
+                return Ok(Some(-1));
+            }
+            // `exits_after` counts the polls that pass *before* it ends; a kill
+            // lands before the poll that would have ended it.
             match self.script.exits_after {
-                // `exits_after` counts the polls that pass *before* it ends; a
-                // kill lands before the poll that would have ended it.
-                Some(after) if polls >= after && !self.killed => Ok(Some(self.script.code)),
+                Some(after) if polls >= after => Ok(Some(self.script.code)),
                 _ => Ok(None),
             }
         }

@@ -3634,13 +3634,13 @@ mod tests {
                 .unwrap();
             let (tx, rx) = crossbeam_channel::unbounded();
             registry
-                .launch(Launch {
+                .launch(Launch::started(
                     owner,
-                    command: "cargo build".to_string(),
-                    exclusive: false,
+                    "cargo build".to_string(),
+                    false,
+                    tx,
                     job,
-                    mailbox: tx,
-                })
+                ))
                 .unwrap();
             job_rx.push(rx);
         }
@@ -3661,6 +3661,56 @@ mod tests {
             );
         }
         assert_eq!(registry.running(), 0, "nothing is left running");
+    }
+
+    /// Quitting kills the command an agent is *waiting on*, not only a detached
+    /// job. A `run_command` without `detach` is spawned for the length of a tool
+    /// call and used to be registered nowhere, so `kill_all` — the last thing
+    /// `App::drop` does — could not see it: a plain `sleep 10; touch marker`
+    /// survived a clean `Ctrl-Q`, in its own process group, and did its work
+    /// after mush was gone (finding S4). The hold below is the same one the
+    /// agent takes, and the quit is the same one the human's `Ctrl-Q` runs.
+    #[test]
+    fn quitting_kills_a_running_foreground_command() {
+        use crate::machine::fake::{Script, Scripted as ScriptedMachine};
+        use crate::machine::{Machine, ShellCommand};
+
+        let (app, _rx) = test_app("foreground-dies-on-quit");
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let registry = app.tree.handles().jobs;
+        let job = machine
+            .spawn(&ShellCommand {
+                command: "sleep 10; touch marker",
+                root: std::path::Path::new("/tmp"),
+            })
+            .unwrap();
+        let held = registry.hold(0, job);
+        assert!(
+            registry.holding_foreground(0),
+            "the call holds it while the model waits on it"
+        );
+        assert_eq!(machine.kills(), 0, "and nothing has stopped it yet");
+
+        drop(app);
+
+        assert_eq!(
+            machine.kills(),
+            1,
+            "quitting killed the command the agent was waiting on"
+        );
+        // The call is over, so its slot is gone: the registry is left holding
+        // nothing, and this test keeps it alive precisely to check that.
+        drop(held);
+        assert!(
+            !registry.holding_foreground(0),
+            "a finished call leaves no slot behind"
+        );
+        registry.kill_all();
+        assert_eq!(
+            machine.kills(),
+            1,
+            "so the next quit cannot kill the same command twice"
+        );
     }
 
     /// `c` on a row is aimed at the work, and a detached job is work in flight:
@@ -3685,13 +3735,13 @@ mod tests {
             .unwrap();
         let (tx, job_rx) = crossbeam_channel::unbounded();
         registry
-            .launch(Launch {
-                owner: 0,
-                command: "cargo bench".to_string(),
-                exclusive: false,
+            .launch(Launch::started(
+                0,
+                "cargo bench".to_string(),
+                false,
+                tx,
                 job,
-                mailbox: tx,
-            })
+            ))
             .unwrap();
         // The root is idle — and the row must not say so as if the machine were.
         assert!(!app.tree.agents[0].phase.is_busy());
