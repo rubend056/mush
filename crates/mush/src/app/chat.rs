@@ -364,6 +364,16 @@ pub struct Chat {
     /// else's — the fact that tells a parent's steering apart from the human's
     /// nudge, which is the only thing two such lines differ by.
     pending: Option<String>,
+    /// Whether the model's own reasoning is painted above the turn it decided.
+    ///
+    /// A *view*, shown by default: the reasoning is already stored with the
+    /// turn in the session file and replayed to the endpoint (a thinking
+    /// endpoint refuses a replayed turn without it), so hiding it costs the
+    /// conversation nothing — which is why `Ctrl-T` writes no notice and
+    /// touches no stored line. It lives here, beside the transcript it hides,
+    /// rather than in `App`, because every pane paints through this one
+    /// transcript and the choice is about the reading, not about the frame.
+    reasoning: bool,
 }
 
 impl Chat {
@@ -378,7 +388,20 @@ impl Chat {
             spoken: HashMap::new(),
             revisions: HashMap::new(),
             pending: None,
+            reasoning: true,
         }
+    }
+
+    /// Whether a pane paints the model's reasoning above the turn it decided.
+    pub fn shows_reasoning(&self) -> bool {
+        self.reasoning
+    }
+
+    /// `Ctrl-T`: show or hide the model's reasoning. A view, so it is not a
+    /// change to the conversation and not a thing to say. `clear` deliberately
+    /// leaves it alone: the human's choice outlives the chat it was made in.
+    pub fn set_reasoning(&mut self, on: bool) {
+        self.reasoning = on;
     }
 
     /// The revision of the UI's copy of `agent`'s transcript. A conversation
@@ -519,6 +542,10 @@ impl Chat {
     }
 
     /// Ctrl-N: the conversation is gone, the box and the scrollback with it.
+    ///
+    /// The reasoning toggle is *not* reset: it is a view the human chose, not a
+    /// fact about the conversation, and a new chat they cannot read the way
+    /// they just asked for is a preference the UI forgot.
     pub fn clear(&mut self) {
         self.root.clear();
         self.agents.clear();
@@ -973,7 +1000,7 @@ impl Chat {
             }
             let voice = self.voice_at(pane.agent, index, message);
             let mut chunk = Vec::new();
-            render_message(&mut chunk, message, voice, width);
+            render_message(&mut chunk, message, voice, width, self.reasoning);
             count += chunk.len();
             chunks.push(chunk);
         }
@@ -1214,6 +1241,45 @@ fn tool_label(call: &mush_core::ToolCall, width: usize) -> String {
     .to_string()
 }
 
+/// The rows of one turn's `reasoning_content`, or none at all.
+///
+/// `None` and whitespace-only reasonings paint *nothing* — not a bare mark row.
+/// A thinking endpoint really does return `""` for a reply that did no thinking
+/// (and `reasoning_content` is `None` for every line that never had one), so a
+/// mark with no words under it would cost a row of the pane on most turns in a
+/// long session, and say nothing with it.
+///
+/// The shape is the `"tool"` arm's, which already solved "a mark on the first
+/// row and an indent under it": the block indents by the same two columns the
+/// tool arm does, the mark sits on the first row, and every row is wrapped
+/// *inside* the indent plus the mark's own columns so nothing is clipped from
+/// the right edge. Dim, because it is what the model thought and not what it
+/// told the human, and marked `⋯ ` — a thought trails off into the reply under
+/// it. Nothing is capped: see the arm that calls this.
+fn reasoning_rows(out: &mut Vec<Line<'static>>, message: &Message, width: usize) {
+    const INDENT: usize = 2;
+    const MARK: &str = "⋯ ";
+    let Some(reasoning) = message.reasoning_content.as_deref() else {
+        return;
+    };
+    if reasoning.trim().is_empty() {
+        return;
+    }
+    let style = dim();
+    let lead = INDENT + MARK.width();
+    for (index, line) in wrap_text(reasoning, width.saturating_sub(lead))
+        .into_iter()
+        .enumerate()
+    {
+        let head = if index == 0 {
+            format!("{}{MARK}", " ".repeat(INDENT))
+        } else {
+            " ".repeat(lead)
+        };
+        out.push(Line::from(Span::styled(format!("{head}{line}"), style)));
+    }
+}
+
 /// The rows of one marked line: the mark on the first row, its own width of
 /// blank under it, and the words wrapped *inside* the columns the mark leaves.
 ///
@@ -1330,12 +1396,15 @@ fn report(text: &str) -> bool {
             .any(|tail| rest[digits..].starts_with(tail))
 }
 
-/// One message's rows: who said it, wrapped at the pane's width.
+/// One message's rows: who said it, wrapped at the pane's width. `reasoning`
+/// is the pane's `Ctrl-T` choice, threaded in rather than read off a `Chat`
+/// this free function has no handle on.
 fn render_message(
     out: &mut Vec<Line<'static>>,
     message: &Message,
     voice: Option<Voice>,
     width: usize,
+    reasoning: bool,
 ) {
     match message.role.as_str() {
         "user" => {
@@ -1357,6 +1426,15 @@ fn render_message(
             out.push(Line::from(""));
         }
         "assistant" => {
+            // The reasoning comes first because that is the order it decided
+            // the turn in: the human reading down the pane sees what the model
+            // thought, then what it said. It is a block of its own rather than
+            // a third colour on the reply, and it carries no cap — the "tool"
+            // arm caps a result because a result is a file dump, while this is
+            // the text the human pressed `Ctrl-T` to read.
+            if reasoning {
+                reasoning_rows(out, message, width);
+            }
             let text = message.text();
             if !text.trim().is_empty() {
                 marked(
@@ -1453,6 +1531,15 @@ mod tests {
             compacting: None,
             spin: 0,
             label: "test-model · ctx ~500k",
+        }
+    }
+
+    /// An assistant turn carrying the endpoint's own reasoning, the way a
+    /// thinking model returns one.
+    fn thinking(text: &str, reasoning: &str) -> Message {
+        Message {
+            reasoning_content: Some(reasoning.into()),
+            ..Message::assistant(text)
         }
     }
 
@@ -1706,7 +1793,7 @@ mod tests {
         for width in [30usize, 40, 60, 80, 120] {
             for message in [Message::user(&text), Message::assistant(&text)] {
                 let mut rows = Vec::new();
-                render_message(&mut rows, &message, Some(Voice::Human), width);
+                render_message(&mut rows, &message, Some(Voice::Human), width, true);
                 let painted = shown(&rows);
                 for row in &painted {
                     assert!(
@@ -1806,10 +1893,136 @@ mod tests {
             &Message::user("aaaa bbbb"),
             Some(Voice::Human),
             5,
+            true,
         );
         assert_eq!(
             shown(&rows),
             vec!["aaaa".to_string(), "bbbb".to_string(), String::new()]
+        );
+    }
+
+    /// The model's own reasoning is painted above the turn it decided, dim, with
+    /// the mark on the first row only: the endpoint's `reasoning_content` was
+    /// already captured, stored and replayed, and no pane ever showed it.
+    #[test]
+    fn the_reasoning_is_shown_by_default_above_the_turn_it_decided() {
+        let mut chat = Chat::bare();
+        assert!(chat.shows_reasoning(), "shown until the human hides it");
+        say(&mut chat, AgentId::ROOT, "make it faster");
+        chat.push_message(
+            AgentId::ROOT,
+            thinking("done", "one two three four five six"),
+        );
+
+        let rows = pane_rows(&chat, &pane(AgentId::ROOT), 24, 5);
+        let painted = shown(&rows);
+        assert_eq!(
+            painted,
+            vec![
+                "you › make it faster",
+                "",
+                "  ⋯ one two three four",
+                "    five six",
+                "mush › done",
+            ]
+        );
+        // Above the reply it decided, and every row of the block is dim — the
+        // continuation row carries the indent and no second mark.
+        let mark = rows
+            .iter()
+            .position(|row| row.to_string().contains('⋯'))
+            .unwrap();
+        let reply = rows
+            .iter()
+            .position(|row| row.to_string().contains("mush ›"))
+            .unwrap();
+        assert!(mark < reply, "the reasoning comes first: {painted:?}");
+        for row in &rows[mark..reply] {
+            assert!(
+                row.spans
+                    .iter()
+                    .all(|span| span.style.fg == Some(Color::DarkGray)),
+                "the block is dim: {row:?}"
+            );
+        }
+        assert_eq!(rows[mark].to_string().matches('⋯').count(), 1, "one mark");
+    }
+
+    /// `Ctrl-T` off is the whole block gone, and `Ctrl-N` keeps the choice: a
+    /// view the human set is not a fact about the conversation, and a new chat
+    /// they cannot read the way they just asked for is a preference the UI
+    /// forgot.
+    #[test]
+    fn hiding_the_reasoning_paints_no_row_and_a_new_chat_keeps_the_choice() {
+        let mut chat = Chat::bare();
+        say(&mut chat, AgentId::ROOT, "make it faster");
+        chat.push_message(AgentId::ROOT, thinking("done", "weighing the words"));
+        chat.set_reasoning(false);
+
+        assert!(!chat.shows_reasoning());
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane(AgentId::ROOT), 24, 5)),
+            vec!["you › make it faster", "", "mush › done"]
+        );
+
+        chat.clear();
+        assert!(
+            !chat.shows_reasoning(),
+            "the human's view outlives the chat it was set in"
+        );
+        chat.set_reasoning(true);
+        assert!(chat.shows_reasoning());
+    }
+
+    /// A reasoning that trims to nothing costs no row at all: DeepSeek really
+    /// returns `""` for a reply that did no thinking, and `None` is every other
+    /// model's line — a bare `⋯ ` row would spend a row of the pane on most
+    /// turns of a long session and say nothing with it.
+    #[test]
+    fn an_empty_reasoning_paints_no_row_at_all() {
+        for reasoning in [None, Some(""), Some("   "), Some("\n\t ")] {
+            let mut chat = Chat::bare();
+            say(&mut chat, AgentId::ROOT, "make it faster");
+            chat.push_message(
+                AgentId::ROOT,
+                Message {
+                    reasoning_content: reasoning.map(str::to_string),
+                    ..Message::assistant("done")
+                },
+            );
+            assert_eq!(
+                shown(&pane_rows(&chat, &pane(AgentId::ROOT), 24, 3)),
+                vec!["you › make it faster", "", "mush › done"],
+                "{reasoning:?} painted a row"
+            );
+        }
+    }
+
+    /// A tool-call turn is a turn too, and its reasoning is the only place the
+    /// model said why it is calling: the block is painted above the `⚙` rows,
+    /// and the turn's empty `content` paints no `mush › ` row above them.
+    #[test]
+    fn a_tool_call_turn_shows_its_reasoning_above_the_calls() {
+        let mut chat = Chat::bare();
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                role: "assistant".into(),
+                reasoning_content: Some("read the file first".into()),
+                tool_calls: Some(vec![mush_core::ToolCall {
+                    id: "call_1".into(),
+                    kind: "function".into(),
+                    function: mush_core::FunctionCall {
+                        name: "read_file".into(),
+                        arguments: r#"{"path":"src/a.rs"}"#.into(),
+                    },
+                }]),
+                ..Default::default()
+            },
+        );
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane(AgentId::ROOT), 40, 2)),
+            vec!["  ⋯ read the file first", "  ⚙ read_file src/a.rs"]
         );
     }
 

@@ -252,7 +252,7 @@ elided, and the cursor is always on screen.
 
 | Context | Keys |
 |---|---|
-| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker |
+| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning |
 | picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End`, `PgUp`/`PgDn` move the list, `Enter` take the row, `Esc` close |
 | agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them, `←` the row's parent, `→` its first child, `Enter` show its transcript, `c` cancel that agent, `Esc` back to the root |
 | chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete`, `↑`/`↓`/`PgUp`/`PgDn` scroll, `Esc` clear · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/compact` `/notes` `/help` `/quit` |
@@ -270,6 +270,16 @@ other lines mush writes. And the text itself is untrusted: a model reply, a tool
 result and a tool call's arguments are defanged before they are painted, so an
 `ESC ]0; …` in them cannot rename the terminal window and a `CSI 2J` cannot
 repaint the frame they are drawn on.
+
+A thinking endpoint's own reasoning is painted above the turn it decided, dim
+and marked `⋯ `, one block per assistant turn. It is the endpoint's
+`reasoning_content` for that turn and nothing else: it is already stored with
+the turn in `.mush/session.json` and replayed with it on the next request — a
+thinking endpoint refuses a replayed turn without it — so the block adds a
+*view* of what the request already carries. `Ctrl-T` shows or hides it in every
+pane; the toggle writes nothing, sends nothing and is not stored, and a new chat
+keeps whatever the human chose. A reasoning that trims to nothing paints no row
+at all, so a reply that did no thinking costs no line.
 
 ---
 

@@ -110,6 +110,11 @@ pub const KEYS: &[Binding] = &[
     },
     Binding {
         context: Context::Anywhere,
+        keys: "Ctrl-T",
+        help: "show or hide the model's reasoning",
+    },
+    Binding {
+        context: Context::Anywhere,
         keys: "Tab / Shift-Tab",
         help: "cycle panes (agents, chat)",
     },
@@ -306,6 +311,10 @@ pub enum Intent {
     InterruptAll,
     /// Open the model picker (`Ctrl-P`).
     OpenModelPicker,
+    /// Show or hide the model's reasoning above the turn it decided (`Ctrl-T`).
+    /// A view: the reasoning is already stored with the turn, so this changes
+    /// what the pane paints and nothing else.
+    ToggleReasoning,
     /// Cycle the pane focus: `+1` for `Tab`, `-1` for `Shift-Tab`.
     CycleFocus(i64),
     PickerClose,
@@ -357,6 +366,7 @@ pub fn key(focus: Focus, picker_open: bool, key: KeyEvent) -> Intent {
             KeyCode::Char('x') => return Intent::InterruptAll,
             KeyCode::Char('n') => return Intent::NewChat,
             KeyCode::Char('p') => return Intent::OpenModelPicker,
+            KeyCode::Char('t') => return Intent::ToggleReasoning,
             _ => {}
         }
     }
@@ -482,6 +492,7 @@ mod tests {
                     (ctrl('x'), Intent::InterruptAll),
                     (ctrl('n'), Intent::NewChat),
                     (ctrl('p'), Intent::OpenModelPicker),
+                    (ctrl('t'), Intent::ToggleReasoning),
                     (none(KeyCode::Tab), Intent::CycleFocus(1)),
                     (none(KeyCode::BackTab), Intent::CycleFocus(-1)),
                     // Shift-Tab is also reported as BackTab with SHIFT held.
@@ -495,6 +506,35 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// `Ctrl-T` is the reasoning toggle wherever the keyboard is: in either
+    /// pane, and with a picker up — it is a view of the pane behind the modal,
+    /// exactly like the other app-wide Ctrl keys. The one help line both
+    /// surfaces print is the key table's own.
+    #[test]
+    fn ctrl_t_toggles_the_reasoning_from_anywhere() {
+        for focus in [Focus::Agents, Focus::Chat] {
+            for picker_open in [false, true] {
+                assert_eq!(
+                    at(focus, picker_open, ctrl('t')),
+                    Intent::ToggleReasoning,
+                    "{focus:?} picker={picker_open}"
+                );
+            }
+        }
+        let help = |keys: &str| {
+            KEYS.iter()
+                .find(|binding| binding.keys == keys)
+                .unwrap_or_else(|| panic!("no `{keys}` row"))
+                .help
+        };
+        assert_eq!(help("Ctrl-T"), "show or hide the model's reasoning");
+        let table = help_table();
+        assert!(
+            table.contains("Ctrl-T"),
+            "both help surfaces render this table:\n{table}"
+        );
     }
 
     /// The agent pane owns the rows: moving, both ends, focusing, stopping, and

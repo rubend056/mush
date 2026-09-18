@@ -2124,6 +2124,18 @@ impl App {
         self.say("new chat — agents stopped, root restarted");
     }
 
+    /// `Ctrl-T`: show or hide the model's reasoning above the turn it decided.
+    ///
+    /// A view, so it is not said and not stored: a notice would be written into
+    /// the conversation ([`Chat::stored_notices`]) and the reasoning is already
+    /// there — `Ctrl-T` changes only what the panes paint, which is what
+    /// `dirty_screen` records. Every pane reads through the same `Chat`, so one
+    /// flip is every pane's.
+    fn toggle_reasoning(&mut self) {
+        self.chat.set_reasoning(!self.chat.shows_reasoning());
+        self.dirty_screen = true;
+    }
+
     /// Ask every actor in the tree to shut down. `Shutdown`, not `Stop`: a
     /// cancelled actor goes back to waiting for work (which is what Ctrl-C
     /// should do), while Ctrl-N needs the threads to be gone — and an actor
@@ -2306,6 +2318,7 @@ impl App {
             Intent::Interrupt => self.interrupt(),
             Intent::InterruptAll => self.interrupt_all(),
             Intent::OpenModelPicker => self.open_model_picker(),
+            Intent::ToggleReasoning => self.toggle_reasoning(),
             Intent::CycleFocus(direction) => self.cycle_focus(direction),
             Intent::PickerClose => self.picker = None,
             Intent::PickerPick => self.pick_cursor(),
@@ -5607,6 +5620,53 @@ mod tests {
         app.send_message();
         assert!(app.busy());
         assert_eq!(app.tree.agents[0].phase, Phase::Thinking);
+    }
+
+    /// `Ctrl-T` flips what the chat pane paints — the endpoint's own reasoning
+    /// above the turn it decided — and `Ctrl-N` leaves the choice as the human
+    /// made it: the toggle is a view, not a fact about the conversation.
+    #[test]
+    fn ctrl_t_shows_and_hides_the_reasoning_and_ctrl_n_keeps_the_choice() {
+        let (mut app, _rx) = test_app("reasoning");
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message {
+                reasoning_content: Some("weighing the greeting".into()),
+                ..Message::assistant("hello")
+            },
+        );
+        assert!(
+            chat_rows(&mut app)
+                .iter()
+                .any(|row| row.contains("⋯ weighing the greeting")),
+            "shown by default: {:?}",
+            chat_rows(&mut app)
+        );
+
+        ctrl(&mut app, 't');
+        assert!(!app.chat.shows_reasoning());
+        assert!(
+            !chat_rows(&mut app)
+                .iter()
+                .any(|row| row.contains("weighing the greeting")),
+            "one toggle hides it in the pane: {:?}",
+            chat_rows(&mut app)
+        );
+
+        ctrl(&mut app, 't');
+        assert!(
+            app.chat.shows_reasoning(),
+            "and the same key brings it back"
+        );
+
+        // Ctrl-N starts a new chat, not a new preference.
+        ctrl(&mut app, 't');
+        assert!(!app.chat.shows_reasoning());
+        ctrl(&mut app, 'n');
+        assert!(
+            !app.chat.shows_reasoning(),
+            "the human's view outlives the chat it was set in"
+        );
     }
 
     /// An actor Ctrl-N abandoned can still be finishing a request (up to the
