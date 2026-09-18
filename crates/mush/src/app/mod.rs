@@ -20,7 +20,9 @@ mod tree;
 
 pub use chat::{Chat, Pane, Rank};
 pub use settings::{ConfigCell, ConfigHandle, WindowSource};
-pub use tree::{AgentId, AgentNode, AgentTree, ConversationId, Existing, Landed, Phase, Spawn};
+pub use tree::{
+    AgentId, AgentNode, AgentTree, Compacting, ConversationId, Existing, Landed, Phase, Spawn,
+};
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -884,12 +886,27 @@ impl App {
                 // did, and it writes the actors' copy with it.
                 self.cell.learn_context(tokens, source);
             }
-            AgentEvent::Compact { summary } => {
+            AgentEvent::Compacting { why, cancel } => {
+                // A fold was accepted, parked, or put on the wire. It is a
+                // phase, not a status line: the row, the bar and the foot all
+                // read this one answer, and it lasts exactly as long as the
+                // fold does — where a status line is dropped for an agent at
+                // rest, which is the agent an idle `/compact` runs on, and
+                // fades on a timer for one that is not (finding U11).
+                self.tree.compacting(id, why, cancel);
+            }
+            AgentEvent::CompactingEnded { in_run } => {
+                self.tree.compacting_ended(id, in_run);
+            }
+            AgentEvent::Compact { summary, in_run } => {
                 // The actor's transcript is now [system, user(summary)];
                 // mirror it so nudges, saves, and the visible chat stay in
                 // sync with what the model actually sees.
                 let carried = Message::user(prompt::compaction_message(&summary));
                 self.chat.replace_transcript(id, vec![carried]);
+                // The fold is over, and the row must stop saying it is folding:
+                // the summary is read where it now lives, in the transcript.
+                self.tree.compacted(id, in_run);
                 if id == AgentId::ROOT {
                     // A fold is deliberate and expensive, and the transcript it
                     // leaves is what a restart resumes from — so it is written
@@ -1020,7 +1037,24 @@ impl App {
     /// Everything else the bar's line one carries is an event with no other
     /// home — a failure, a stop, a job's report, a command's answer — and the
     /// newest of those is the status, not this.
+    ///
+    /// A fold the human is waiting for comes first, because it is the one
+    /// derived state that answers a question they are holding in their head:
+    /// the fold is running, and the words they are about to type are not lost.
+    /// The row says which kind of fold it is (`compacting…`, `folding at the
+    /// next step…`) with its age; this is the sentence that lets them keep
+    /// typing (finding U11).
     pub fn tree_line(&self) -> Option<String> {
+        let focused = self.tree.focused;
+        if self
+            .tree
+            .node(focused)
+            .is_some_and(|node| node.phase.compacting().is_some())
+        {
+            return Some(format!(
+                "compacting #{focused} · keep typing — your message is answered after the fold"
+            ));
+        }
         let working = self
             .tree
             .agents
@@ -1684,16 +1718,27 @@ impl App {
     ///
     /// The request goes to the agent, not to its row: the fold itself is the
     /// actor's job, and its `Compact` event is what replaces the transcript
-    /// here, saves the session and moves the meter. So nothing is claimed
-    /// about the agent's phase — unlike a nudge, which the row shows as
-    /// `thinking…` because a run really is about to start. A mailbox that is
-    /// gone is the one thing the human has to hear, and it is said plainly
-    /// rather than left as a status line about work nobody is doing
-    /// (finding B10).
+    /// here, saves the session and moves the meter. What the row shows is the
+    /// actor's own answer — `Compacting::Parked` the moment it takes a request
+    /// it cannot run yet, `Compacting::Requested` while the summarize call is
+    /// on the wire (finding U11); the line this writes is the acknowledgement
+    /// for the instant before either arrives. A mailbox that is gone is the one
+    /// thing the human has to hear, and it is said plainly rather than left as
+    /// a status line about work nobody is doing (finding B10).
     fn compact_focused(&mut self) {
         let target = self.tree.focused;
+        // The transcript travels with the request, for the root only: an actor
+        // restored from a session starts with none, and a fold is not a run, so
+        // this is the only hand-over it will ever get (a child is revived with
+        // its transcript). Sending it unconditionally would be wrong — the
+        // actor's own copy is the newer one while a run is in flight.
+        let messages = if target == AgentId::ROOT {
+            self.chat.conversation()
+        } else {
+            Vec::new()
+        };
         match self.tree.agent_tx.get(&target) {
-            Some(tx) if tx.send(AgentMsg::Compact).is_ok() => {
+            Some(tx) if tx.send(AgentMsg::Compact(messages)).is_ok() => {
                 self.say(format!("compacting #{target}…"));
             }
             _ => self.fail(format!("agent #{target} is gone")),
@@ -3716,6 +3761,7 @@ mod tests {
             conversation,
             id: AgentId::ROOT,
             event: AgentEvent::Compact {
+                in_run: false,
                 summary: "porting the parser".to_string(),
             },
         });
@@ -4495,6 +4541,7 @@ mod tests {
             conversation: abandoned,
             id: AgentId::ROOT,
             event: AgentEvent::Compact {
+                in_run: false,
                 summary: "stale summary".to_string(),
             },
         });
@@ -4876,7 +4923,7 @@ mod tests {
         run(&mut app, "/compact");
 
         assert!(
-            matches!(asked.try_recv(), Ok(AgentMsg::Compact)),
+            matches!(asked.try_recv(), Ok(AgentMsg::Compact(_))),
             "the request goes to the agent whose pane is focused"
         );
         assert_eq!(text_of(&app), "compacting #1…");

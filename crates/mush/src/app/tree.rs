@@ -63,6 +63,9 @@ pub enum Phase {
     Thinking,
     /// The last thing the agent reported doing: `edit_file src/lib.rs`, `run_command cargo test`, `summarizing…`.
     Activity(String),
+    /// The conversation is being folded into a summary (context compaction),
+    /// or a request to do so is queued behind the run in flight.
+    Compacting(Compacting),
     /// A Stop is on its way and the actor has not yielded yet.
     Cancelling,
     /// A Stop landed: the run ended with no result, but the actor is still
@@ -79,10 +82,15 @@ pub enum Phase {
 
 impl Phase {
     /// Whether work is in flight. `Idle`, `Done`, and `Failed` are at rest.
+    ///
+    /// A fold counts: a summarize call is a request on the wire like any other,
+    /// and the agent that makes it is not at rest while it waits. That is what
+    /// keeps a fold in the repaint tick, out of the "Ctrl-C stops nothing"
+    /// answer, and honest about being cancellable.
     pub fn is_busy(&self) -> bool {
         matches!(
             self,
-            Phase::Thinking | Phase::Activity(_) | Phase::Cancelling
+            Phase::Thinking | Phase::Activity(_) | Phase::Compacting(_) | Phase::Cancelling
         )
     }
 
@@ -104,6 +112,54 @@ impl Phase {
             Some(ToolName::WaitAgents) => Some(Waiting::Agents),
             Some(ToolName::WaitCommands) => Some(Waiting::Jobs),
             _ => None,
+        }
+    }
+
+    /// Whether this phase is a fold, and which kind.
+    ///
+    /// The same shape as [`Phase::waiting`], for the same reason: `compacting…`
+    /// is not a model call the human can mistake for the run's own, and not a
+    /// tool label either, so the row glyph, the row's words, the status bar and
+    /// the transcript's foot all read this one answer instead of each guessing
+    /// from the text the actor happened to write (finding U11).
+    pub fn compacting(&self) -> Option<Compacting> {
+        match self {
+            Phase::Compacting(kind) => Some(*kind),
+            _ => None,
+        }
+    }
+}
+
+/// A fold of an agent's conversation: the summarize call `/compact` asks for,
+/// and the one the window filling up triggers by itself.
+///
+/// Two facts the screen has to tell apart, because they are two different
+/// things to wait for: the fold has not started yet (a run is in flight, and a
+/// fold never lands between an assistant's tool calls and their results), or
+/// the summarize request is on the wire right now. Which of the two the human
+/// *asked* for is the third variant, and it is what the words say: a fold the
+/// window triggered is not a fold somebody is waiting on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Compacting {
+    /// Accepted while a run was in flight: the fold happens at the next
+    /// message boundary. The actor says so the moment it takes the request, so
+    /// a `/compact` that is going to wait is never silent about it.
+    Parked,
+    /// The summarize call is on the wire, because the human asked (`/compact`).
+    Requested,
+    /// The summarize call is on the wire, because the history is three
+    /// quarters of the window: nobody asked, and the reason is the history.
+    NearlyFull,
+}
+
+impl Compacting {
+    /// What the row and the transcript's foot say. One spelling, so the two
+    /// cannot describe the same fold differently.
+    pub fn words(self) -> &'static str {
+        match self {
+            Compacting::Parked => "folding at the next step…",
+            Compacting::Requested => "compacting…",
+            Compacting::NearlyFull => "context nearly full — compacting…",
         }
     }
 }
@@ -571,14 +627,101 @@ impl AgentTree {
     /// activity: a status that arrives after the run's own end (a late or
     /// duplicated commit line) is dropped, so a finished agent is never put
     /// back to work (finding B5).
+    ///
+    /// A fold is never replaced by a label, and it is not a status being
+    /// honoured: the run behind a *parked* fold keeps announcing `edit_file …`,
+    /// and those labels must not erase the request the human is waiting for. A
+    /// fold ends where it began — its own `Compacting` event, the transcript
+    /// replacing `Compact`, or one of the run's own endings — and what the run
+    /// was doing is still in the transcript, where every tool call writes an
+    /// `⚙` line.
     pub fn activity(&mut self, id: AgentId, label: impl Into<String>) {
         if !self.is_busy(id) {
             return;
         }
         if let Some(node) = self.node_mut(id) {
+            if node.phase.compacting().is_some() {
+                return;
+            }
             node.phase = Phase::Activity(label.into());
             node.since = Instant::now();
         }
+    }
+
+    /// A fold of this agent's conversation: accepted (and parked behind the run
+    /// in flight), or on the wire now.
+    ///
+    /// An accepted fold is visible from rest, which is the whole point (finding
+    /// U11): `activity` refuses a status from an agent that is not already
+    /// busy, so the one setter that could have carried `compacting…` dropped it
+    /// — an agent paying for a summarize request while its row said `✓`.
+    ///
+    /// `cancel` is the fold's own flag when the fold owns one (an idle
+    /// `/compact` has no run to cancel, so this is the only handle a Stop can
+    /// reach); `None` leaves the run's flag in place for a fold inside a run.
+    pub fn compacting(&mut self, id: AgentId, kind: Compacting, cancel: Option<Arc<AtomicBool>>) {
+        if let Some(cancel) = cancel {
+            self.agent_cancel.insert(id, cancel);
+        }
+        if let Some(node) = self.node_mut(id) {
+            node.phase = Phase::Compacting(kind);
+            node.since = Instant::now();
+        }
+    }
+
+    /// The fold landed: the conversation it summarized is the one the pane now
+    /// shows, and the summary it produced is read where it now lives, in the
+    /// transcript.
+    ///
+    /// `in_run` is whether the fold was part of a run that is still going: that
+    /// run wears `thinking…` (the phase between its request and the tool it
+    /// names) until it names one, where an idle fold's agent goes back to
+    /// `✓ done` with the last reply it produced.
+    pub fn compacted(&mut self, id: AgentId, in_run: bool) {
+        if !self.compacting_over(id, in_run) {
+            return;
+        }
+        if let Some(node) = self.node_mut(id) {
+            node.phase = if in_run { Phase::Thinking } else { Phase::Done };
+            node.since = Instant::now();
+        }
+    }
+
+    /// The fold is over and the transcript is unchanged — the summarize call
+    /// failed, returned no summary, or answered something mush could not read
+    /// as one. The `compacting…` phase must not outlive the request that
+    /// justified it: a failed fold that left the row claiming work forever is
+    /// the same lie as a fold nobody can see (finding U11). What went wrong is
+    /// the notice the actor emitted, not a `✗` on a row that ran nothing.
+    ///
+    /// `in_run` is whether the run the fold was part of is still going: it
+    /// wears `thinking…` (the phase between a request and the tool it names),
+    /// where an idle fold's agent is back at rest.
+    pub fn compacting_ended(&mut self, id: AgentId, in_run: bool) {
+        if !self.compacting_over(id, in_run) {
+            return;
+        }
+        if let Some(node) = self.node_mut(id) {
+            node.phase = if in_run { Phase::Thinking } else { Phase::Idle };
+            node.since = Instant::now();
+        }
+    }
+
+    /// Forget the fold state of `id`, and the flag it owned. Returns whether
+    /// there was a fold at all: one that ended *inside* a run leaves that run's
+    /// phase — and the flag the run still needs — alone.
+    fn compacting_over(&mut self, id: AgentId, in_run: bool) -> bool {
+        let was = self
+            .node(id)
+            .is_some_and(|node| node.phase.compacting().is_some());
+        if was && !in_run {
+            // A fold from rest owns its flag: nothing else holds it, so it goes
+            // when the fold does. A fold inside a run does not own one — the
+            // run's lives in the same place, and a run that is still going must
+            // stay stoppable.
+            self.agent_cancel.remove(&id);
+        }
+        was
     }
 
     /// The run finished: `summary` is what it produced, and it always replaces
@@ -706,8 +849,20 @@ impl AgentTree {
 
     /// A nudge is on its way: the row shows the agent thinking. Returns the
     /// phase it replaced, so a delivery that fails can put it back (B10).
+    ///
+    /// A fold is not replaced by it: the words land after the summarize call,
+    /// not instead of it, and a row that started saying `thinking…` while the
+    /// fold is still on the wire is the same lie the fold phase exists to stop.
+    /// The run the nudge starts announces itself with `Running` when it does
+    /// start.
     pub fn nudge(&mut self, id: AgentId) -> Option<Phase> {
         let previous = self.node(id).map(|node| node.phase.clone());
+        if previous
+            .as_ref()
+            .is_some_and(|phase| phase.compacting().is_some())
+        {
+            return previous;
+        }
         if let Some(node) = self.node_mut(id) {
             node.phase = Phase::Thinking;
             node.since = Instant::now();
