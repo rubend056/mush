@@ -61,7 +61,9 @@ pub enum Phase {
     Idle,
     /// A request is in flight and the model has not named a tool yet.
     Thinking,
-    /// The last thing the agent reported doing: `edit_file src/lib.rs`, `run_command cargo test`, `summarizing…`.
+    /// The last thing the agent reported doing: a tool call's own label
+    /// (`edit_file src/lib.rs`, `run_command cargo test`), or how the run's
+    /// worktree ended (`committed abc123 on mush/1`).
     Activity(String),
     /// The conversation is being folded into a summary (context compaction),
     /// or a request to do so is queued behind the run in flight.
