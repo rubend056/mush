@@ -171,6 +171,16 @@ pub(crate) fn agent_line(row: &AgentRow, width: usize) -> String {
         id = row.id,
         glyph = row.glyph
     );
+    if row.result_unread {
+        // `✉` — this result has not been read by its parent — and `✉N` for the
+        // reads this agent owes its own children (finding H4). Both marks ride
+        // with the glyph: they are facts about the agent, and the row says them
+        // in the head, before the title it can give up (R1).
+        head.push_str(" ✉");
+    }
+    if row.unread_children > 0 {
+        head.push_str(&format!(" ✉{}", row.unread_children));
+    }
     if row.waiting > 0 {
         // R4's `⏸`, owned by the children it is about: the parent's own state
         // stays in the glyph, and this says how much it has out.

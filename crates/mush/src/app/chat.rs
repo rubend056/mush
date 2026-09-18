@@ -110,16 +110,23 @@ pub enum NoticeKind {
     /// the things that did, and the stop is the honest mark — `⊘`, the same
     /// reading `agent_status` gives a stopped child.
     Stopped,
+    /// A run that never ended: the process went away with it in flight, or the
+    /// agent's actor vanished. Not a failure — nothing the model did broke —
+    /// and not a stop — the human did not ask for it, and there is no actor
+    /// left to resume. `⚠`, because what it leaves behind is a worktree nobody
+    /// should trust before looking at it (finding H2).
+    CutOff,
 }
 
 impl NoticeKind {
     /// The mark a line of this kind leads with, and how it is painted: `·` for a
-    /// line mush wrote, `⊘` for a run it stopped, `!` in red for one it failed
-    /// to do.
+    /// line mush wrote, `⊘` for a run it stopped, `⚠` for a run that never
+    /// ended, `!` in red for one it failed to do.
     fn mark(self) -> (&'static str, Style) {
         match self {
             NoticeKind::Info => ("· ", dim()),
             NoticeKind::Stopped => ("⊘ ", Style::default().fg(Color::Yellow)),
+            NoticeKind::CutOff => ("⚠ ", Style::default().fg(Color::Yellow)),
             NoticeKind::Error => ("! ", Style::default().fg(Color::Red)),
         }
     }
@@ -200,12 +207,12 @@ impl Rank {
 }
 
 impl Notice {
-    /// Where this line sits in the precedence table. A failure and a run mush
-    /// stopped are both the thing the human has to read; only a line mush merely
-    /// wrote yields.
+    /// Where this line sits in the precedence table. A failure, a run mush
+    /// stopped and a run that never ended are all the thing the human has to
+    /// read; only a line mush merely wrote yields.
     pub fn rank(&self) -> Rank {
         match self.kind {
-            NoticeKind::Error | NoticeKind::Stopped => Rank::Alert,
+            NoticeKind::Error | NoticeKind::Stopped | NoticeKind::CutOff => Rank::Alert,
             NoticeKind::Info => Rank::Said,
         }
     }
@@ -228,6 +235,11 @@ impl Notice {
     /// (see [`Chat::dismiss_said`] and [`Chat::expire_said`]). A failure or a
     /// stop is news: it belongs to its run, is written to the session, and only
     /// the next run replaces it.
+    ///
+    /// A cut-off line is news in the same sense — it is a fact about a run, not
+    /// about a moment — but not in the second one: nothing writes it to the
+    /// session, because the stored *status* already carries it in the row's own
+    /// vocabulary and a restored `⚠` must not come back as a red `!`.
     fn is_chatter(&self) -> bool {
         self.kind == NoticeKind::Info
     }
@@ -586,6 +598,20 @@ impl Chat {
         self.push_notice(agent, kind, text);
     }
 
+    /// A run that never ended, said where the human reads it: the agent's row
+    /// wears `⚠`, and this is the line under it that says what that means.
+    ///
+    /// It is the counterpart of [`Self::note_error_for`] for the one ending that
+    /// has no event of its own — nothing reported it, because the thing that
+    /// would have reported it is the thing that vanished (finding H2). Only the
+    /// newest line about an agent is current, so this replaces an earlier
+    /// failure, stop or cut-off exactly as a new failure would.
+    pub fn note_cut_off_for(&mut self, agent: AgentId, text: impl Into<String>) {
+        self.notices
+            .retain(|notice| notice.agent != agent || notice.kind == NoticeKind::Info);
+        self.push_notice(agent, NoticeKind::CutOff, text);
+    }
+
     /// Forget what mush said about one agent, and say whether it said anything.
     ///
     /// Called when the agent starts a run: a line that answered a command
@@ -705,6 +731,7 @@ impl Chat {
             let marker = match notice.kind {
                 NoticeKind::Info => "·",
                 NoticeKind::Stopped => "⊘",
+                NoticeKind::CutOff => "⚠",
                 NoticeKind::Error => "!",
             };
             let age = short_age(Duration::from_secs(now.saturating_sub(notice.at)));
@@ -1279,8 +1306,9 @@ fn elsewhere(agent: AgentId, index: usize, text: &str) -> Voice {
     }
 }
 
-/// Whether a line is one of mush's reports — `#1 done: …`, `#c2 stopped: …` —
-/// written by the run loop and the job registry with exactly this vocabulary.
+/// Whether a line is one of mush's reports — `#1 done: …`, `#c2 stopped: …`,
+/// `#3 cut off: …` — written by the run loop, the job registry and the UI's own
+/// last-resort report with exactly this vocabulary.
 fn report(text: &str) -> bool {
     let Some(rest) = text.strip_prefix('#') else {
         return false;
@@ -1288,7 +1316,7 @@ fn report(text: &str) -> bool {
     let rest = rest.strip_prefix('c').unwrap_or(rest);
     let digits = rest.chars().take_while(char::is_ascii_digit).count();
     digits > 0
-        && [" done:", " stopped:", " failed:"]
+        && [" done:", " stopped:", " failed:", " cut off:"]
             .iter()
             .any(|tail| rest[digits..].starts_with(tail))
 }

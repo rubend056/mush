@@ -180,6 +180,13 @@ pub struct AgentRow {
     pub focused: bool,
     /// Children whose own run is in flight, drawn as `⏸N`.
     pub waiting: usize,
+    /// This agent's own is in the list and its parent has not read its result
+    /// yet, drawn as `✉` (finding H4).
+    pub result_unread: bool,
+    /// How many of this agent's children's results it owes a read on, drawn as
+    /// `✉N`: the same fact as the children's own `✉`, read from the other end,
+    /// and the one that survives a pane too short to show their rows.
+    pub unread_children: usize,
     pub title: String,
     /// The branch, its delta and any jobs: `mush/3 +12−4 ⚙1`.
     pub place: String,
@@ -411,12 +418,22 @@ impl App {
             }
             place.push_str(&format!("⚙{jobs}"));
         }
+        // Two more facts, both marks rather than text, because a row is a
+        // glance: `✉` on a result its parent has not read, and `✉N` for how many
+        // of this agent's own children's results *it* has not read. One fact
+        // read from either end — the child's mark says which result, the
+        // parent's count says who is owed a read (finding H4). The value is
+        // derived here, from the tree, because it is a fact about the agent and
+        // not a decision about the frame: the painter only fits it into the
+        // columns it has.
         AgentRow {
             id: node.id,
             depth: node.depth,
             glyph: phase_glyph(&node.phase),
             focused: self.tree.focused == node.id,
             waiting: self.tree.busy_children(node.id),
+            result_unread: node.result_unread,
+            unread_children: self.tree.unread_children(node.id).len(),
             title: node.title(),
             place,
             activity: phase_detail(node),
@@ -754,6 +771,17 @@ fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>>
             dim(),
         )));
     }
+    // The selected row's unread results, in full. A mark is a glance and this is
+    // the sentence under it: which results nobody has read yet, and by whom —
+    // the question a human arrives at the pane with ("did #2 see #6?"), which
+    // one envelope on one row cannot answer for a tree of twelve (finding H4).
+    let unread = unread_footer(app, node);
+    if !unread.is_empty() {
+        lines.push(Line::from(Span::styled(
+            format!(" {}", truncate(&unread, width.saturating_sub(2))),
+            dim(),
+        )));
+    }
     // The selected row's jobs, in full: which command, how long, and whether it
     // is the one holding the machine. Read from the same registry the row's
     // count comes from, so the two can never disagree.
@@ -769,6 +797,48 @@ fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>>
         )));
     }
     lines
+}
+
+/// What the selected row's `✉` marks mean, spelled out: its own result if its
+/// parent has not read it, and how many of its children's results it owes a
+/// read on.
+///
+/// Derived from the nodes here rather than stored beside them, so the sentence
+/// and the marks are the same fact twice read (finding H4). It lives in this
+/// module because it is a derived value like every other one the frame paints;
+/// `ui.rs` never sees `App` (refactor B17).
+fn unread_footer(app: &App, node: &AgentNode) -> String {
+    /// How many ids a list names before it counts the rest: three is what fits a
+    /// row of the footer at the pane's narrowest, and the count behind it is
+    /// what a human needs next. The same shape the hidden-row counts use.
+    const NAMED: usize = 3;
+
+    let named = |ids: &[AgentId]| {
+        let head = ids
+            .iter()
+            .take(NAMED)
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if ids.len() > NAMED {
+            format!("{head} +{}", ids.len() - NAMED)
+        } else {
+            head
+        }
+    };
+
+    let mut parts = Vec::new();
+    if node.result_unread {
+        parts.push(match node.parent {
+            Some(parent) => format!("✉ result unread by #{parent}"),
+            None => "✉ result unread".to_string(),
+        });
+    }
+    let owed = app.tree.unread_children(node.id);
+    if !owed.is_empty() {
+        parts.push(format!("✉{} unread from {}", owed.len(), named(&owed)));
+    }
+    parts.join(" · ")
 }
 
 /// Where an isolated agent's work is — or where it went. Pure, so the row's
@@ -796,8 +866,14 @@ fn agent_detail(node: &AgentNode) -> Vec<String> {
 /// The glyph is derived from the agent's own phase, never stored and never
 /// borrowed from the tree: `·` until it does something, `◐` while its own run is
 /// in flight, `⊘` while a cancel is in flight and after it lands, `✓` only when
-/// a run finished, `✗` when it failed, `≡` while its conversation is being
-/// folded.
+/// a run finished, `✗` when it failed, `⚠` when the run never ended at all,
+/// `≡` while its conversation is being folded.
+///
+/// A cut-off run cannot borrow `⊘`: a stop is the human's doing and the actor is
+/// alive to be nudged again, while a cut-off agent's run died where it stood and
+/// left nothing committed (finding H2). It cannot borrow `✗` either — nothing
+/// the model or the endpoint did failed, and the agent's work is still on disk,
+/// untouched and unlanded.
 ///
 /// Waiting on children is a *different fact* from working and is drawn as a
 /// different mark (`agent_line`'s `⏸N`), because a parent that is mid-turn with
@@ -811,6 +887,7 @@ fn phase_glyph(phase: &Phase) -> &'static str {
         // `⊘` while a cancel is in flight and after it lands: a stopped agent
         // is not a finished one, and must not borrow `✓`.
         Phase::Cancelling | Phase::Stopped => "⊘",
+        Phase::CutOff => "⚠",
         Phase::Idle => "·",
         Phase::Done => "✓",
         Phase::Compacting(_) => "≡",
@@ -847,6 +924,11 @@ fn phase_detail(node: &AgentNode) -> String {
         // run that was interrupted, so showing it would claim work that was
         // never delivered. `node.summary` is deliberately not consulted.
         Phase::Stopped => "stopped · re-send to resume".to_string(),
+        // No age, deliberately: the moment the run died is the moment mush
+        // went away with it, and the only clock left to age it is the next
+        // launch's — which would count from the restart, not from the cut-off
+        // (finding H2).
+        Phase::CutOff => "cut off · nothing committed".to_string(),
         Phase::Failed(error) => error.clone(),
         Phase::Idle | Phase::Done => node.summary.clone().unwrap_or_default(),
     }
@@ -959,6 +1041,7 @@ mod tests {
             summary: None,
             leftover: false,
             landed: None,
+            result_unread: false,
         }
     }
 

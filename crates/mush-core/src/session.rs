@@ -47,12 +47,31 @@ pub fn now_secs() -> u64 {
 ///
 /// The UI's `Phase` is the live version of this and cannot be stored: a phase
 /// carries an `Instant`, and an age frozen at shutdown would be a lie.
+///
+/// Five values for four endings, because one of them is not an ending:
+/// `Running` is written while a run is *in flight* and no run ever writes it as
+/// its own result — so a file read back with `Running` in it is a file whose
+/// process went away with the run still going. That is the one cut-off a
+/// restart can prove, and it is why `Running` exists at all: the old writer
+/// flattened a mid-run agent to `Idle`, and a killed agent came back looking
+/// exactly like one that had never been asked to do anything (`docs/findings.md`
+/// H2).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StoredStatus {
-    /// Never ran, or its run was interrupted and it is idle again.
+    /// Never ran, or its run ended without a result the row kept.
     #[default]
     Idle,
+    /// A run was in flight when this status was written. It is never an
+    /// ending: `Done`, `Stopped` and `Failed` are what a run that ends writes.
+    /// A file that still says `running` is the record of a run nobody finished
+    /// — the process, the terminal, or the harness went away first.
+    Running,
+    /// The run never ended. Distinct from `Stopped` (the human's Ctrl-C: the
+    /// actor is alive and a message resumes it) and from `Failed` (the model or
+    /// the endpoint said no): nothing was committed by that run, and the agent
+    /// is not waiting for anything.
+    CutOff,
     Done,
     Stopped,
     Failed(String),
