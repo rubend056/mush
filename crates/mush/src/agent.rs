@@ -1057,6 +1057,29 @@ fn tool_schemas(actor: &Actor) -> Vec<Value> {
     }
 }
 
+/// One turn's ask, with the bounded retry a transport hiccup gets: the pause
+/// waits on the run's clock, the cancel flag is read between attempts, and
+/// every retry is a line in this agent's transcript rather than a spinner that
+/// looks stuck (finding B23). Everything the endpoint *answered* — a status, a
+/// refusal, a body that did not parse — is returned unchanged, first time. Both
+/// callers ask through this; only their error arms differ.
+fn ask(
+    actor: &Actor,
+    request: &ChatRequest<'_>,
+    cancel: &AtomicBool,
+) -> Result<ChatResponse, ModelError> {
+    retrying(
+        actor.ctx.clock.as_ref(),
+        cancel,
+        |line| {
+            actor
+                .ctx
+                .emit(actor.id, AgentEvent::Notice(line.to_string()))
+        },
+        || actor.ctx.model.chat(request, cancel),
+    )
+}
+
 /// One run: model turns → tool calls → results, until the model answers.
 fn run_loop(
     actor: &Actor,
@@ -1166,22 +1189,9 @@ fn run_loop(
             request.reasoning_effort = Some(effort.to_string());
         }
 
-        // One turn's ask, with the bounded retry a transport hiccup gets: the
-        // pause waits on the run's clock, the cancel flag is read between
-        // attempts, and every retry is a line in this agent's transcript rather
-        // than a spinner that looks stuck (finding B23). Everything the
-        // endpoint *answered* — a status, a refusal, a body that did not parse
-        // — is returned unchanged, first time.
-        let reply = match retrying(
-            actor.ctx.clock.as_ref(),
-            cancel,
-            |line| {
-                actor
-                    .ctx
-                    .emit(actor.id, AgentEvent::Notice(line.to_string()))
-            },
-            || actor.ctx.model.chat(&request, cancel),
-        ) {
+        // One turn's ask: the retry policy and the retry line are [`ask`]'s,
+        // the error arms below are the run's own.
+        let reply = match ask(actor, &request, cancel) {
             Ok(reply) => reply,
             // The reader stops the moment the human cancels; that is a
             // cancellation, not a failure to reach the endpoint.
@@ -1571,8 +1581,8 @@ fn compact_history(
         return Err(CANCELLED.to_string());
     }
 
-    let mut ask = messages.clone();
-    ask.push(Message::user(COMPACT_INSTRUCTION));
+    let mut folded = messages.clone();
+    folded.push(Message::user(COMPACT_INSTRUCTION));
     // A summarize request: the run's own request, byte for byte, plus that one
     // user message. Same system prompt, same tools, same `tool_choice`, same
     // thinking knobs. What shapes the prompt shapes the endpoint's cache, and
@@ -1591,7 +1601,7 @@ fn compact_history(
     let schemas = tool_schemas(actor);
     let request = ChatRequest {
         model: &cfg.model,
-        messages: &ask,
+        messages: &folded,
         tools: &schemas,
         tool_choice: "auto",
         stream: false,
@@ -1605,16 +1615,7 @@ fn compact_history(
         },
         reasoning_effort: cfg.reasoning_effort().map(str::to_string),
     };
-    let reply = match retrying(
-        actor.ctx.clock.as_ref(),
-        cancel,
-        |line| {
-            actor
-                .ctx
-                .emit(actor.id, AgentEvent::Notice(line.to_string()))
-        },
-        || actor.ctx.model.chat(&request, cancel),
-    ) {
+    let reply = match ask(actor, &request, cancel) {
         Ok(reply) => reply,
         // A cancelled run is already ending; do not report a network failure.
         Err(ModelError::Cancelled) => return Err(CANCELLED.to_string()),
