@@ -189,6 +189,21 @@ pub fn short_age(elapsed: Duration) -> String {
     }
 }
 
+/// Below this the screen has no room to be honest: the painter shows a single
+/// notice instead of shreds, and [`App::below_floor`] stops keys that would act
+/// without anything visible to show for it. One pair of numbers, owned here
+/// rather than by the painter, so the notice, the input gate and the tests
+/// cannot disagree about where the floor is (finding P11 / refactor B3).
+pub const MIN_WIDTH: u16 = 40;
+pub const MIN_HEIGHT: u16 = 10;
+
+/// Whether a terminal of this size is below the floor. The predicate is one
+/// function so the painter — which passes the frame's own size — and the input
+/// gate — which passes the size `main` reported — cannot disagree.
+pub const fn is_below_floor(width: u16, height: u16) -> bool {
+    width < MIN_WIDTH || height < MIN_HEIGHT
+}
+
 /// A transient line for the workspace bar. Nothing here describes work in
 /// progress — that is derived from the agents' phases — so it cannot go stale.
 /// `Info` fades; `Error` stays until something replaces it.
@@ -280,11 +295,13 @@ pub struct App {
     pub status: Option<Status>,
     pub should_quit: bool,
     pub dirty_screen: bool,
-    /// The terminal's width, as of the last size `main` reported. `/notes`
-    /// wraps its lines to the popup this size paints them in, so the report has
-    /// to know it — `ui.rs` is not asked to wrap, and the screen keeps one
-    /// owner of the popup's geometry.
+    /// The terminal's size, as of the last size `main` reported. `/notes` wraps
+    /// its lines to the popup this size paints them in, and [`App::below_floor`]
+    /// reads it to refuse input the screen cannot show the effect of — so the
+    /// floor is a state `App` knows rather than only the painter's early return
+    /// (finding P11 / refactor B3).
     term_width: u16,
+    term_height: u16,
     pub spin: u64,
 }
 
@@ -294,11 +311,21 @@ impl App {
         self.cell.ui()
     }
 
-    /// Record the terminal width `main` read, so a `/notes` report can be
-    /// wrapped to the popup that size paints. One setter, called at startup and
-    /// from the resize event — the only two places the terminal's size changes.
-    pub fn set_term_width(&mut self, width: u16) {
+    /// Record the terminal size `main` read, so a `/notes` report can be
+    /// wrapped to the popup that size paints and so the floor is known. One
+    /// setter, called at startup and from the resize event — the only two
+    /// places the terminal's size changes.
+    pub fn set_term_size(&mut self, width: u16, height: u16) {
         self.term_width = width;
+        self.term_height = height;
+    }
+
+    /// Whether the terminal is too small for anything but the floor notice.
+    /// `ui.rs` paints the notice; this is what stops a key from acting with no
+    /// visible result — the destructive `Ctrl-N` on a screen showing only
+    /// `mush needs at least 40×10` was the bug this exists for (finding P11).
+    pub fn below_floor(&self) -> bool {
+        is_below_floor(self.term_width, self.term_height)
     }
 
     pub fn new(
@@ -335,7 +362,10 @@ impl App {
             status: None,
             should_quit: false,
             dirty_screen: true,
+            // The ubiquitous terminal, and above the floor: `main` reports the
+            // real size before the first key can be read.
             term_width: 80,
+            term_height: 24,
             spin: 0,
         };
         // The failures come back before the agents do, because the agent that
@@ -499,6 +529,15 @@ impl App {
         self.chat.used_tokens_for(self.tree.focused)
     }
 
+    /// How long ago the git snapshot was read, for the bar to say when it is
+    /// old. The read is refreshed on the transitions a human drives (a focus
+    /// change, a command, a save) and every two seconds while an agent works,
+    /// so between events it ages — and an aged fact must not look live
+    /// (finding P8).
+    pub fn git_age(&self) -> Option<Duration> {
+        self.git_at.map(|at| at.elapsed())
+    }
+
     /// Register git worktrees left over from earlier sessions (`mush/<id>`
     /// branches) as finished tree nodes, so `/diff`, `/merge`, `/discard` keep
     /// working after a restart.
@@ -575,6 +614,40 @@ impl App {
         self.tree.repair_focus();
     }
 
+    /// What `/worktrees` says: the truth about `.mush/wt` on disk *and* what
+    /// this session has adopted. The old line counted only the leftovers the
+    /// tree already knew, so a worktree `git worktree list` named — its branch
+    /// not `mush/<id>`, so `discover_worktrees` skipped it — was invisible and
+    /// the message claimed there were none while the directory sat there
+    /// (finding P10). The disk is the fact; the adopted set is what the
+    /// commands can act on; the sentence has to say both to be true.
+    fn worktree_report(&self) -> String {
+        let root = self.ws.root();
+        // `None` is git not answering; say so rather than claim a count.
+        let Some(worktrees) = git::worktrees(root) else {
+            return "cannot list worktrees — git did not answer".to_string();
+        };
+        let dir = root.join(git::WORKTREE_DIR);
+        let on_disk = worktrees
+            .iter()
+            .filter(|worktree| worktree.path.starts_with(&dir))
+            .count();
+        let registered = self.tree.agents.iter().filter(|node| node.leftover).count();
+        if on_disk == 0 {
+            return "no worktrees under .mush/wt on disk".to_string();
+        }
+        let mut line = format!("{on_disk} worktree(s) under .mush/wt on disk");
+        if registered == on_disk {
+            line.push_str(" · all registered — /diff, /merge, /discard work on them");
+        } else {
+            // The difference is a worktree mush cannot name (`mush/<id>`
+            // branch missing, or the id already taken) — name the count, not a
+            // guess at the cause.
+            line.push_str(&format!(" · {registered} registered as leftovers"));
+        }
+        line
+    }
+
     // ---------------------------------------------------------------- updates
 
     pub fn update(&mut self, msg: Msg) {
@@ -584,8 +657,10 @@ impl App {
             Msg::Paste(text) => {
                 // A paste is something the human wants to say, so it lands in
                 // the message box whichever pane has focus. An open picker is
-                // the one place a paste has no meaning.
-                if self.picker.is_none() {
+                // the one place a paste has no meaning; below the floor there
+                // is no box on screen for it to land in, so it is refused the
+                // way a key is (finding P11).
+                if self.picker.is_none() && !self.below_floor() {
                     // Terminals disagree about line endings in a paste.
                     let text = text.replace("\r\n", "\n").replace('\r', "\n");
                     self.chat.insert(&text);
@@ -890,11 +965,23 @@ impl App {
     /// being sent to: `ctx 3.1k/500k`. The window alone says how much room there
     /// is, never how much of it this conversation has taken — and the pane can
     /// be a subagent's, whose own next request is what this number measures.
+    ///
+    /// At the window and past it there is no longer a fraction to print: a
+    /// learned window can be smaller than the transcript already held, so the
+    /// meter read `ctx 1.2k/1k` — a ratio greater than one with nothing saying
+    /// so (finding P9). At the limit it says `full`; past it, it says `over`.
     pub fn context_meter(&self) -> String {
         let used = self.context_used_tokens();
-        let window = tokens_label(self.cfg().context_tokens);
+        let window = self.cfg().context_tokens;
         let mark = if self.cfg().context_explicit { "" } else { "~" };
-        format!("ctx {used}/{mark}{window}", used = tokens_label(used))
+        let used_label = tokens_label(used);
+        let window_label = tokens_label(window);
+        let state = match used.cmp(&window) {
+            std::cmp::Ordering::Greater => " over",
+            std::cmp::Ordering::Equal => " full",
+            std::cmp::Ordering::Less => "",
+        };
+        format!("ctx {used_label}/{mark}{window_label}{state}")
     }
 
     /// Remember something that went wrong. Errors do not fade: they stay until
@@ -1129,12 +1216,7 @@ impl App {
             Command::Worktrees => {
                 self.discover_worktrees();
                 self.refresh_git();
-                let count = self.tree.agents.iter().filter(|n| n.leftover).count();
-                self.say(if count > 0 {
-                    format!("{count} leftover worktree(s) registered — /diff, /merge, /discard work on them")
-                } else {
-                    "no leftover worktrees".to_string()
-                });
+                self.say(self.worktree_report());
             }
             Command::Provider(None) => self.open_provider_picker(),
             Command::Provider(Some(name)) => self.apply_provider(&name),
@@ -1179,6 +1261,11 @@ impl App {
                 });
             }
         }
+        // A command is a transition the human drove: whatever they asked for
+        // may have changed the workspace, and the bar they read next should
+        // not be yesterday's answer (finding P8). The arms that already
+        // refreshed are no worse for the second ask — `git_in_flight` drops it.
+        self.refresh_git();
     }
 
     // ------------------------------------------------------------ providers
@@ -1730,6 +1817,13 @@ impl App {
         if let Some(error) = self.session_save.take_error() {
             self.fail(format!("could not save session: {error}"));
         }
+        // A save is a moment the state is being fixed; the repository is part
+        // of that picture, so refresh it here rather than leaving the bar with
+        // a read older than the file on disk (finding P8). Only the human-
+        // driven flushes come through here — a streamed response uses the
+        // debounced `save_session` — so this does not put a git process on the
+        // message path.
+        self.refresh_git();
     }
 
     /// The conversation as it is stored: the root transcript, every subagent's,
@@ -1801,7 +1895,16 @@ impl App {
     /// binding is testable without an `App` — which the old shape, where an arm
     /// both matched a key and did its work, made impossible (finding B2).
     fn on_key(&mut self, key: KeyEvent) {
-        self.apply_intent(keys::key(self.focus, self.picker.is_some(), key));
+        let intent = keys::key(self.focus, self.picker.is_some(), key);
+        // Below the floor the screen is a single notice: a key whose effect the
+        // human cannot see — `Ctrl-N` wipes the conversation and starts a new
+        // one — must not act. `Ctrl-Q` is the exception: a terminal too small
+        // to read is still a way out. The floor is `App`'s state, not the
+        // painter's early return (finding P11 / refactor B3).
+        if self.below_floor() && intent != Intent::Quit {
+            return;
+        }
+        self.apply_intent(intent);
     }
 
     /// Do what an intent says. One arm per intent, every side effect of the
@@ -1923,6 +2026,12 @@ impl App {
         };
         let next = (index as i64 + direction).rem_euclid(order.len() as i64) as usize;
         self.focus = order[next];
+        // Looking somewhere new is a moment the human reads the bar, and the
+        // git line has no other reason to move: refresh on the transition, or
+        // a file written outside mush stays invisible on a screen nobody has
+        // touched (finding P8). The read is cheap and `git_in_flight` drops a
+        // second ask while the first is out.
+        self.refresh_git();
     }
 
     /// Focus the row the tree's cursor is on, and say whose pane the chat now
@@ -1980,6 +2089,9 @@ impl App {
                 .map(|node| node.brief.clone())
                 .unwrap_or_default();
             self.say(format!("agent #{id}: {brief}"));
+            // A focus change is a read-the-bar moment; refresh the git line so
+            // it is current when the human looks (finding P8).
+            self.refresh_git();
         }
     }
 
@@ -2193,6 +2305,274 @@ mod tests {
         )
     }
 
+    /// An `App` with the UI channel kept, so a read that finishes on its own
+    /// thread (`Msg::Git`) can be waited for instead of raced.
+    fn app_and_rx(root: std::path::PathBuf) -> (App, Receiver<Msg>) {
+        let ws = Workspace::new(&root).unwrap();
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let cell = ConfigCell::own(cfg);
+        let handle = spawn(cell.handle(), tx.clone(), root.clone());
+        let app = App::new(
+            ws,
+            cell,
+            None,
+            handle,
+            tx,
+            session_save::fake::Recorder::new(),
+        );
+        (app, rx)
+    }
+
+    /// Adopt the next `Msg::Git` that arrives within the deadline, applying any
+    /// message in front of it. A read that never comes back is a test failure,
+    /// so this panics rather than proceeding on a stale snapshot.
+    fn wait_git(app: &mut App, rx: &Receiver<Msg>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(msg) => {
+                    let is_git = matches!(msg, Msg::Git { .. });
+                    app.update(msg);
+                    if is_git {
+                        return;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        panic!("no git read came back");
+    }
+
+    /// The git line is refreshed on the transitions a human drives — a focus
+    /// change and a command — so a file written outside mush does not leave the
+    /// bar asserting a clean tree indefinitely (finding P8). The snapshot only
+    /// moved on agent events and on a tick while something ran.
+    #[test]
+    fn a_focus_change_and_a_command_refresh_the_git_read() {
+        let root = repo("refresh-git");
+        let (mut app, rx) = app_and_rx(root.clone());
+        wait_git(&mut app, &rx);
+        assert_eq!(
+            app.git.as_ref().map(|g| g.dirty),
+            Some(0),
+            "clean at the first read"
+        );
+
+        // A file written outside mush, after the read.
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        app.cycle_focus(1);
+        wait_git(&mut app, &rx);
+        assert_eq!(
+            app.git.as_ref().map(|g| g.dirty),
+            Some(1),
+            "a focus change re-reads the repository"
+        );
+
+        std::fs::write(root.join("b.txt"), "new\n").unwrap();
+        app.apply_command(Command::Context(None));
+        wait_git(&mut app, &rx);
+        assert_eq!(
+            app.git.as_ref().map(|g| g.dirty),
+            Some(2),
+            "a command re-reads the repository"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Over-full is a real state — a learned window smaller than the transcript
+    /// already held — and the meter must not print a ratio greater than one
+    /// with no mark (finding P9).
+    #[test]
+    fn the_context_meter_says_full_and_over_at_the_window() {
+        let (mut app, _rx) = test_app("meter-full");
+        // The smallest window the cell will hold, 1,024 tokens.
+        app.cell.edit(|cfg| cfg.set_context(1_024));
+        app.chat.insert(&"z".repeat(3_000));
+        app.send_message();
+        let used = app.context_used_tokens();
+        assert!(used > 1_024, "the message passed the window: {used}");
+        let over = app.context_meter();
+        assert!(over.ends_with(" over"), "{over}");
+
+        // Exactly at the window is `full`, not an over-full ratio.
+        app.cell.edit(|cfg| cfg.set_context(used));
+        let full = app.context_meter();
+        assert!(full.ends_with(" full"), "{full}");
+        assert!(!full.contains(" over"), "{full}");
+    }
+
+    /// `/worktrees` asks about disk, not only about the leftovers the session
+    /// already knows: a worktree `git worktree list` names but whose branch is
+    /// not `mush/<id>` was invisible to `discover_worktrees`, and the message
+    /// then said there were none while the directory sat there (finding P10).
+    #[test]
+    fn worktrees_reports_what_is_on_disk_even_when_it_cannot_name_it() {
+        let root = repo("wt-truth");
+        git(
+            &root,
+            &["worktree", "add", "-q", "-b", "scratch", ".mush/wt/1"],
+        );
+        let mut app = app_at(root.clone());
+        assert_eq!(
+            app.tree.agents.iter().filter(|n| n.leftover).count(),
+            0,
+            "a hand-named branch is not adopted as a leftover"
+        );
+
+        run(&mut app, "/worktrees");
+        let line = text_of(&app).to_string();
+        assert!(
+            line.contains("1 worktree(s) under .mush/wt on disk"),
+            "{line}"
+        );
+        assert!(line.contains("0 registered as leftovers"), "{line}");
+        assert!(!line.contains("no worktrees"), "{line}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A worktree mush can name is registered, and `/worktrees` says so both
+    /// ways: what is on disk and what the commands can act on.
+    #[test]
+    fn worktrees_reports_a_registered_leftover() {
+        let root = repo("wt-reg");
+        isolated_work(&root, 3, "port the parser module");
+        let mut app = app_at(root.clone());
+        run(&mut app, "/worktrees");
+        let line = text_of(&app).to_string();
+        assert!(
+            line.contains("1 worktree(s) under .mush/wt on disk"),
+            "{line}"
+        );
+        assert!(line.contains("all registered"), "{line}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Below the floor the screen is one notice, so a key whose effect the
+    /// human cannot see must not act: `Ctrl-N` used to wipe the conversation
+    /// and start a new one from a screen showing only the floor message
+    /// (finding P11 / refactor B3).
+    #[test]
+    fn the_floor_refuses_keys_except_quit() {
+        let (mut app, _rx) = test_app("floor-keys");
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("keep me"));
+        app.set_term_size(30, 8);
+        assert!(app.below_floor());
+
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::CONTROL,
+        )));
+        assert_eq!(text_of(&app), "", "Ctrl-N did not start a new chat");
+        assert!(
+            app.chat
+                .conversation()
+                .iter()
+                .any(|m| m.content.as_deref() == Some("keep me")),
+            "the conversation survives"
+        );
+
+        // A paste has no box on screen to land in either.
+        app.update(Msg::Paste("typed while tiny".to_string()));
+        assert!(!app.chat.input().text().contains("typed while tiny"));
+
+        // Quit still works: a terminal too small to read is still a way out.
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(app.should_quit);
+
+        // Grown back, the keymap drives the app again.
+        let (mut app, _rx) = test_app("floor-grown");
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("keep me"));
+        app.set_term_size(30, 8);
+        app.set_term_size(120, 32);
+        assert!(!app.below_floor());
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(
+            app.chat
+                .conversation()
+                .iter()
+                .all(|m| m.content.as_deref() != Some("keep me")),
+            "Ctrl-N runs once the terminal is big enough"
+        );
+    }
+
+    /// At the ubiquitous 80×24 the facts line carries the branch, the dirty
+    /// count and the delta. The bar needed 26 rows for its second line, so at 24
+    /// the doc's "always in view" was simply false (finding P12).
+    #[test]
+    fn the_facts_line_survives_at_80x24() {
+        let (mut app, _rx) = test_app("facts-24");
+        app.git = Some(git::RepoStatus {
+            branch: "main".to_string(),
+            dirty: 3,
+            stat: git::Stat {
+                files: 1,
+                added: 12,
+                removed: 4,
+            },
+        });
+        app.git_at = Some(Instant::now());
+        let rows = screen(&mut app, 80, 24);
+        let facts = rows.last().unwrap();
+        assert!(
+            facts.contains("main") && facts.contains("±3") && facts.contains("+12−4"),
+            "the facts row is missing the repository: {facts}"
+        );
+    }
+
+    /// In compact mode the pane still owes the selected row a footer: the
+    /// worktree and the commands to land it, which its row had to drop. Under
+    /// six inner rows the footer used to vanish entirely (finding P12).
+    #[test]
+    fn a_compact_pane_pays_the_selected_row_a_footer() {
+        let (mut app, _rx) = test_app("compact-footer");
+        let conversation = app.tree.conversation();
+        for id in 1..=4u64 {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId::ROOT,
+                event: AgentEvent::Spawned {
+                    child: id,
+                    parent: 0,
+                    brief: format!("task {id}"),
+                    depth: 1,
+                    branch: Some(format!("mush/{id}")),
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+        }
+        app.tree.move_cursor(1);
+        let rows = screen(&mut app, 60, 17);
+        assert!(
+            rows.iter().any(|row| row.contains(".mush/wt/1")),
+            "the selected row's worktree is on screen: {rows:?}"
+        );
+    }
+
+    /// A pane smaller than the tree says how many rows it is hiding and which
+    /// side they are on: nineteen agents in a four-row pane hid fifteen with
+    /// nothing on screen saying so (finding P12).
+    #[test]
+    fn a_pane_smaller_than_the_tree_names_the_hidden_rows() {
+        let (mut app, _rx) = test_app("hidden-rows");
+        crowd(&mut app, 19);
+        let title = screen(&mut app, 60, 17)[0].clone();
+        assert!(title.contains('▼'), "rows below are named: {title}");
+
+        app.tree.cursor_bottom();
+        let title = screen(&mut app, 60, 17)[0].clone();
+        assert!(title.contains('▲'), "at the bottom they are above: {title}");
+    }
+
     /// An `App` whose session writes go to a real writer on a real path, for
     /// the tests that read the file back. The writer is returned so a test can
     /// see how many writes the conversation cost.
@@ -2254,7 +2634,7 @@ mod tests {
     fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
         // Exactly what `main` does at startup and on resize: the width the
         // next frame (and any `/notes` opened between frames) sees.
-        app.set_term_width(width);
+        app.set_term_size(width, height);
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
         let buffer = terminal.backend().buffer();
