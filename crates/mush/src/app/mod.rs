@@ -2144,6 +2144,274 @@ mod tests {
         )
     }
 
+    /// An `App` with the UI channel kept, so a read that finishes on its own
+    /// thread (`Msg::Git`) can be waited for instead of raced.
+    fn app_and_rx(root: std::path::PathBuf) -> (App, Receiver<Msg>) {
+        let ws = Workspace::new(&root).unwrap();
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let cell = ConfigCell::own(cfg);
+        let handle = spawn(cell.handle(), tx.clone(), root.clone());
+        let app = App::new(
+            ws,
+            cell,
+            None,
+            handle,
+            tx,
+            session_save::fake::Recorder::new(),
+        );
+        (app, rx)
+    }
+
+    /// Adopt the next `Msg::Git` that arrives within the deadline, applying any
+    /// message in front of it. A read that never comes back is a test failure,
+    /// so this panics rather than proceeding on a stale snapshot.
+    fn wait_git(app: &mut App, rx: &Receiver<Msg>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(msg) => {
+                    let is_git = matches!(msg, Msg::Git { .. });
+                    app.update(msg);
+                    if is_git {
+                        return;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        panic!("no git read came back");
+    }
+
+    /// The git line is refreshed on the transitions a human drives — a focus
+    /// change and a command — so a file written outside mush does not leave the
+    /// bar asserting a clean tree indefinitely (finding P8). The snapshot only
+    /// moved on agent events and on a tick while something ran.
+    #[test]
+    fn a_focus_change_and_a_command_refresh_the_git_read() {
+        let root = repo("refresh-git");
+        let (mut app, rx) = app_and_rx(root.clone());
+        wait_git(&mut app, &rx);
+        assert_eq!(
+            app.git.as_ref().map(|g| g.dirty),
+            Some(0),
+            "clean at the first read"
+        );
+
+        // A file written outside mush, after the read.
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        app.cycle_focus(1);
+        wait_git(&mut app, &rx);
+        assert_eq!(
+            app.git.as_ref().map(|g| g.dirty),
+            Some(1),
+            "a focus change re-reads the repository"
+        );
+
+        std::fs::write(root.join("b.txt"), "new\n").unwrap();
+        app.apply_command(Command::Context(None));
+        wait_git(&mut app, &rx);
+        assert_eq!(
+            app.git.as_ref().map(|g| g.dirty),
+            Some(2),
+            "a command re-reads the repository"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Over-full is a real state — a learned window smaller than the transcript
+    /// already held — and the meter must not print a ratio greater than one
+    /// with no mark (finding P9).
+    #[test]
+    fn the_context_meter_says_full_and_over_at_the_window() {
+        let (mut app, _rx) = test_app("meter-full");
+        // The smallest window the cell will hold, 1,024 tokens.
+        app.cell.edit(|cfg| cfg.set_context(1_024));
+        app.chat.insert(&"z".repeat(3_000));
+        app.send_message();
+        let used = app.context_used_tokens();
+        assert!(used > 1_024, "the message passed the window: {used}");
+        let over = app.context_meter();
+        assert!(over.ends_with(" over"), "{over}");
+
+        // Exactly at the window is `full`, not an over-full ratio.
+        app.cell.edit(|cfg| cfg.set_context(used));
+        let full = app.context_meter();
+        assert!(full.ends_with(" full"), "{full}");
+        assert!(!full.contains(" over"), "{full}");
+    }
+
+    /// `/worktrees` asks about disk, not only about the leftovers the session
+    /// already knows: a worktree `git worktree list` names but whose branch is
+    /// not `mush/<id>` was invisible to `discover_worktrees`, and the message
+    /// then said there were none while the directory sat there (finding P10).
+    #[test]
+    fn worktrees_reports_what_is_on_disk_even_when_it_cannot_name_it() {
+        let root = repo("wt-truth");
+        git(
+            &root,
+            &["worktree", "add", "-q", "-b", "scratch", ".mush/wt/1"],
+        );
+        let mut app = app_at(root.clone());
+        assert_eq!(
+            app.tree.agents.iter().filter(|n| n.leftover).count(),
+            0,
+            "a hand-named branch is not adopted as a leftover"
+        );
+
+        run(&mut app, "/worktrees");
+        let line = text_of(&app).to_string();
+        assert!(
+            line.contains("1 worktree(s) under .mush/wt on disk"),
+            "{line}"
+        );
+        assert!(line.contains("0 registered as leftovers"), "{line}");
+        assert!(!line.contains("no worktrees"), "{line}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A worktree mush can name is registered, and `/worktrees` says so both
+    /// ways: what is on disk and what the commands can act on.
+    #[test]
+    fn worktrees_reports_a_registered_leftover() {
+        let root = repo("wt-reg");
+        isolated_work(&root, 3, "port the parser module");
+        let mut app = app_at(root.clone());
+        run(&mut app, "/worktrees");
+        let line = text_of(&app).to_string();
+        assert!(
+            line.contains("1 worktree(s) under .mush/wt on disk"),
+            "{line}"
+        );
+        assert!(line.contains("all registered"), "{line}");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Below the floor the screen is one notice, so a key whose effect the
+    /// human cannot see must not act: `Ctrl-N` used to wipe the conversation
+    /// and start a new one from a screen showing only the floor message
+    /// (finding P11 / refactor B3).
+    #[test]
+    fn the_floor_refuses_keys_except_quit() {
+        let (mut app, _rx) = test_app("floor-keys");
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("keep me"));
+        app.set_term_size(30, 8);
+        assert!(app.below_floor());
+
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::CONTROL,
+        )));
+        assert_eq!(text_of(&app), "", "Ctrl-N did not start a new chat");
+        assert!(
+            app.chat
+                .conversation()
+                .iter()
+                .any(|m| m.content.as_deref() == Some("keep me")),
+            "the conversation survives"
+        );
+
+        // A paste has no box on screen to land in either.
+        app.update(Msg::Paste("typed while tiny".to_string()));
+        assert!(!app.chat.input().text().contains("typed while tiny"));
+
+        // Quit still works: a terminal too small to read is still a way out.
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('q'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(app.should_quit);
+
+        // Grown back, the keymap drives the app again.
+        let (mut app, _rx) = test_app("floor-grown");
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("keep me"));
+        app.set_term_size(30, 8);
+        app.set_term_size(120, 32);
+        assert!(!app.below_floor());
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('n'),
+            KeyModifiers::CONTROL,
+        )));
+        assert!(
+            app.chat
+                .conversation()
+                .iter()
+                .all(|m| m.content.as_deref() != Some("keep me")),
+            "Ctrl-N runs once the terminal is big enough"
+        );
+    }
+
+    /// At the ubiquitous 80×24 the facts line carries the branch, the dirty
+    /// count and the delta. The bar needed 26 rows for its second line, so at 24
+    /// the doc's "always in view" was simply false (finding P12).
+    #[test]
+    fn the_facts_line_survives_at_80x24() {
+        let (mut app, _rx) = test_app("facts-24");
+        app.git = Some(git::RepoStatus {
+            branch: "main".to_string(),
+            dirty: 3,
+            stat: git::Stat {
+                files: 1,
+                added: 12,
+                removed: 4,
+            },
+        });
+        app.git_at = Some(Instant::now());
+        let rows = screen(&mut app, 80, 24);
+        let facts = rows.last().unwrap();
+        assert!(
+            facts.contains("main") && facts.contains("±3") && facts.contains("+12−4"),
+            "the facts row is missing the repository: {facts}"
+        );
+    }
+
+    /// In compact mode the pane still owes the selected row a footer: the
+    /// worktree and the commands to land it, which its row had to drop. Under
+    /// six inner rows the footer used to vanish entirely (finding P12).
+    #[test]
+    fn a_compact_pane_pays_the_selected_row_a_footer() {
+        let (mut app, _rx) = test_app("compact-footer");
+        let conversation = app.tree.conversation();
+        for id in 1..=4u64 {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId::ROOT,
+                event: AgentEvent::Spawned {
+                    child: id,
+                    parent: 0,
+                    brief: format!("task {id}"),
+                    depth: 1,
+                    branch: Some(format!("mush/{id}")),
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+        }
+        app.tree.move_cursor(1);
+        let rows = screen(&mut app, 60, 17);
+        assert!(
+            rows.iter().any(|row| row.contains(".mush/wt/1")),
+            "the selected row's worktree is on screen: {rows:?}"
+        );
+    }
+
+    /// A pane smaller than the tree says how many rows it is hiding and which
+    /// side they are on: nineteen agents in a four-row pane hid fifteen with
+    /// nothing on screen saying so (finding P12).
+    #[test]
+    fn a_pane_smaller_than_the_tree_names_the_hidden_rows() {
+        let (mut app, _rx) = test_app("hidden-rows");
+        crowd(&mut app, 19);
+        let title = screen(&mut app, 60, 17)[0].clone();
+        assert!(title.contains('▼'), "rows below are named: {title}");
+
+        app.tree.cursor_bottom();
+        let title = screen(&mut app, 60, 17)[0].clone();
+        assert!(title.contains('▲'), "at the bottom they are above: {title}");
+    }
+
     /// An `App` whose session writes go to a real writer on a real path, for
     /// the tests that read the file back. The writer is returned so a test can
     /// see how many writes the conversation cost.

@@ -101,7 +101,12 @@ pub fn draw(frame: &mut Frame, app: &mut App) {
     // Size tiers (docs/mush.md §4.5 R3). Narrow or short terminals stack the
     // agent strip above the chat, because two columns starve both panes.
     let compact = area.width < 80 || area.height < 20;
-    let bar_rows = if area.height >= 26 { 2 } else { 1 };
+    // Two rows from 24 up, so the facts line — the branch, the dirty count and
+    // the line delta — is on screen at the ubiquitous 80×24, where it used to
+    // need 26 and was simply absent (finding P12). Below 24 the extra row is
+    // worth more to the transcript, and the compact footer carries the selected
+    // agent's own branch and worktree instead.
+    let bar_rows = if area.height >= 24 { 2 } else { 1 };
 
     if compact {
         // Every pane's height is computed here, and every constraint is a
@@ -186,34 +191,75 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
     let focused = app.focus == Focus::Agents;
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(border(focused))
-        .title(agents_title(app, area.width.saturating_sub(2) as usize));
+        .border_style(border(focused));
     let inner = block.inner(area);
+
+    // The rows in painted order: pre-order over the parent links, so a child is
+    // drawn under its parent rather than after everything spawned before it
+    // (finding U4). The tree derives that order, this only paints it.
+    let rows = app.tree.rows();
+    let cursor = app.tree.cursor();
+
+    // The cursor row's facts live in a footer under the list, so the list may
+    // degrade to `◐ #2` on a narrow pane without losing anything: facts move,
+    // they do not vanish. A tall pane spends up to three lines on it; a short
+    // (compact) pane still owes the selected row one line — under six inner
+    // rows it got none, so in compact the selected row's branch, worktree and
+    // landing commands were nowhere on screen (finding P12).
+    let footer = if inner.width == 0 || inner.height < 3 || rows.is_empty() {
+        Vec::new()
+    } else {
+        let budget = if inner.height >= 8 { 3 } else { 1 };
+        compact_footer(
+            agent_footer(app, rows[cursor], inner.width as usize),
+            budget,
+        )
+    };
+    // One row is the separator between the list and the facts.
+    let footer_rows = if footer.is_empty() {
+        0
+    } else {
+        footer.len() as u16 + 1
+    };
+    let list_area = Rect {
+        height: inner.height.saturating_sub(footer_rows),
+        ..inner
+    };
+
+    // How many rows the list leaves off screen, and which side. `List` scrolls
+    // to keep the cursor visible and this pane is one row per agent, so the
+    // window is arithmetic rather than a guess: with the cursor in view the
+    // first visible row is the cursor's row minus the rows above it. `▲`/`▼`
+    // name the side, which a bare `+17` cannot — at the bottom of a 4-row pane
+    // over nineteen agents the hidden rows are all above (finding P12).
+    let visible = list_area.height as usize;
+    let first = cursor.saturating_sub(visible.saturating_sub(1));
+    let above = if visible == 0 {
+        0
+    } else {
+        first.min(rows.len())
+    };
+    let below = if visible == 0 {
+        rows.len()
+    } else {
+        rows.len().saturating_sub(first + visible)
+    };
+
+    let block = block.title(agents_title(
+        app,
+        area.width.saturating_sub(2) as usize,
+        above,
+        below,
+    ));
     frame.render_widget(block, area);
 
     if inner.height == 0 || inner.width == 0 || app.tree.agents.is_empty() {
         return;
     }
 
-    // The cursor row's facts live in a footer, so the list may degrade to
-    // `◐ #2` on a narrow pane without losing anything: it moves, not vanishes.
-    let footer_rows = if inner.height >= 6 {
-        3.min(inner.height - 2)
-    } else {
-        0
-    };
-    let list_area = Rect {
-        height: inner.height - footer_rows,
-        ..inner
-    };
-
     // `List` draws `› ` outside the item's width, so the selected row would be
     // two columns narrower than its neighbours. Budget for it up front.
     let row_width = (inner.width as usize).saturating_sub(2);
-    // The rows in painted order: pre-order over the parent links, so a child is
-    // drawn under its parent rather than after everything spawned before it
-    // (finding U4). The tree derives that order, this only paints it.
-    let rows = app.tree.rows();
     let items: Vec<ListItem> = rows
         .iter()
         .map(|node| ListItem::new(agent_line(app, node, row_width)))
@@ -222,14 +268,11 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
         .highlight_symbol("› ");
     let mut state = ListState::default();
-    let cursor = app.tree.cursor();
     state.select(Some(cursor));
     frame.render_stateful_widget(list, list_area, &mut state);
 
-    if footer_rows > 0 {
-        let node = rows[cursor];
-        let lines = agent_footer(app, node, inner.width as usize);
-        let start = inner.y + inner.height - lines.len() as u16;
+    if !footer.is_empty() {
+        let start = inner.y + inner.height - footer.len() as u16;
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(
                 "─".repeat(inner.width as usize),
@@ -237,13 +280,28 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
             ))),
             Rect::new(inner.x, start - 1, inner.width, 1),
         );
-        for (offset, line) in lines.into_iter().enumerate() {
+        for (offset, line) in footer.into_iter().enumerate() {
             frame.render_widget(
                 Paragraph::new(line),
                 Rect::new(inner.x, start + offset as u16, inner.width, 1),
             );
         }
     }
+}
+
+/// The footer lines a pane of `budget` rows can afford, chosen by what a short
+/// pane most needs to say. `agent_footer` builds the identity line (`#2 lexer`)
+/// first because it names the row; but a one-line footer keeps the *detail*
+/// line instead — where the work is and how to land it — because the selected
+/// row already wears its identity in the list, and the detail is the fact that
+/// exists nowhere else on a compact screen (finding P12).
+fn compact_footer(mut full: Vec<Line<'static>>, budget: usize) -> Vec<Line<'static>> {
+    if budget >= 2 || full.len() < 2 {
+        full.truncate(budget);
+        return full;
+    }
+    // budget == 1 and there is a detail line: keep it, drop the identity.
+    full.split_off(1).into_iter().take(1).collect()
 }
 
 /// ` agents · 3 working · 2 waiting · Σ +324 −40`: what the whole tree is doing,
@@ -262,9 +320,19 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
 /// that is not the count. The totals are last because the least is lost last:
 /// every branch's own `+add −del` is on its row and in the selected row's
 /// footer, while who is working exists only here.
-fn agents_title(app: &App, width: usize) -> String {
+///
+/// The hidden-row counts are first because they exist *only* here: a 4-row pane
+/// over nineteen agents used to hide fifteen with nothing on screen saying so
+/// (finding P12). `▲`/`▼` names the side the missing rows are on.
+fn agents_title(app: &App, width: usize, above: usize, below: usize) -> String {
     let roster = app.tree.roster();
     let mut cells = Vec::new();
+    if above > 0 {
+        cells.push(format!("▲{above}"));
+    }
+    if below > 0 {
+        cells.push(format!("▼{below}"));
+    }
     if roster.working > 0 {
         cells.push(format!("{} working", roster.working));
     }
@@ -900,5 +968,53 @@ mod tests {
                 open.id, open.id
             )
         );
+    }
+
+    /// The floor notice must never name a size the program does not need: the
+    /// fixed 25-column string was truncated at 24 columns to `40×1` (finding
+    /// P11). Every spelling that fits is tried longest-first, and the one that
+    /// fits is the one painted.
+    #[test]
+    fn the_floor_notice_fits_the_terminal_it_is_painted_in() {
+        // The full sentence at its own width and wider.
+        assert_eq!(floor_notice(80), "mush needs at least 40×10");
+        assert_eq!(floor_notice(25), "mush needs at least 40×10");
+        // Narrower than the sentence: a shorter honest spelling.
+        assert_eq!(floor_notice(24), "needs at least 40×10");
+        assert_eq!(floor_notice(19), "40×10 minimum");
+        assert_eq!(floor_notice(11), "needs 40×10");
+        assert_eq!(floor_notice(5), "40×10");
+        // And it never lies about the size, at any narrow width.
+        for width in 0..=25u16 {
+            assert!(
+                floor_notice(width).contains(&format!("{MIN_WIDTH}×{MIN_HEIGHT}")),
+                "the notice at {width} must name the real floor"
+            );
+        }
+    }
+
+    /// The facts line's git cell says how old a read is once it has aged past
+    /// the point an event would have refreshed it (finding P8), and stays plain
+    /// while the read is fresh.
+    #[test]
+    fn a_stale_git_read_is_labelled_in_the_facts_cell() {
+        let git = git::RepoStatus {
+            branch: "main".to_string(),
+            dirty: 2,
+            stat: git::Stat {
+                files: 2,
+                added: 5,
+                removed: 1,
+            },
+        };
+        assert_eq!(git_cell(&git, Some(Duration::from_secs(1))), "main ±2 +5−1");
+        assert_eq!(git_cell(&git, None), "main ±2 +5−1");
+        assert_eq!(
+            git_cell(&git, Some(Duration::from_secs(30))),
+            "main ±2 +5−1 · 30s ago"
+        );
+        // An empty branch is a detached HEAD, not a blank cell.
+        let detached = git::RepoStatus::default();
+        assert_eq!(git_cell(&detached, None), "detached");
     }
 }
