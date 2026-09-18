@@ -91,13 +91,16 @@ pub enum Focus {
     Chat,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PickerKind {
     Model,
     Provider,
     /// The lines mush wrote about the focused agent, for `/notes`. Nothing here
     /// is a choice, so `Enter` and `Esc` do the same thing.
     Notes,
+    /// The keys and the commands, for `/help`. Like `Notes`, nothing here is a
+    /// choice: the list exists to be read, and it opens at the top.
+    Help,
 }
 
 /// A small modal list that grabs the keyboard until Enter or Esc: the models,
@@ -123,6 +126,13 @@ impl Picker {
                 self.cursor + 1,
                 self.items.len()
             ),
+            PickerKind::Help => format!(
+                // Same reason: the list is longer than any popup, so the title
+                // says where in it the reader is.
+                " help · line {}/{} ",
+                self.cursor + 1,
+                self.items.len()
+            ),
         }
     }
 
@@ -135,7 +145,7 @@ impl Picker {
             PickerKind::Model | PickerKind::Provider => {
                 " j/k or PgUp/PgDn · Enter pick · Esc cancel "
             }
-            PickerKind::Notes => " j/k or PgUp/PgDn scrolls · Esc closes ",
+            PickerKind::Notes | PickerKind::Help => " j/k or PgUp/PgDn scrolls · Esc closes ",
         }
     }
 }
@@ -198,11 +208,14 @@ fn cut_off_notice() -> String {
 /// a human learning the keyboard from a subset of it (the key half of finding
 /// B2). It is a notice rather than a status line: it is a thing to read, not a
 /// thing that just happened.
-fn help_notice() -> String {
+/// The two tables as one text, wrapped to the width the surface reading it
+/// paints at: `mush --help` passes `usize::MAX`, the `/help` popup passes the
+/// columns it has.
+fn help_notice(width: usize) -> String {
     format!(
         "mush keys:\n{}\nCommands:\n{}",
-        keys::help_table(),
-        commands::table(&mush_core::provider::names_piped())
+        keys::help_table_at(width),
+        commands::table_at(&mush_core::provider::names_piped(), width)
     )
 }
 
@@ -1057,8 +1070,10 @@ impl App {
                     // leaves is what a restart resumes from — so it is written
                     // before this returns rather than waiting out the debounce.
                     self.flush_session();
-                    self.chat
-                        .note("context compacted — continuing from a summary");
+                    self.chat.note_for(
+                        AgentId::ROOT,
+                        "context compacted — continuing from a summary",
+                    );
                 } else {
                     self.mark_session_dirty();
                 }
@@ -1692,7 +1707,7 @@ impl App {
         }
         match command {
             Command::Quit => self.request_quit(),
-            Command::Help => self.chat.note(help_notice()),
+            Command::Help => self.open_help_picker(),
             Command::Notes => self.open_notes_picker(),
             Command::Compact => self.compact_focused(),
             Command::Provider(None) => self.open_provider_picker(),
@@ -1878,6 +1893,23 @@ impl App {
         });
     }
 
+    /// `/help`: the keys and the commands, in the readable list `/notes` opens.
+    ///
+    /// It used to be a notice in the transcript's foot, which shows two of its
+    /// forty-odd lines and counts the rest — help a human had to go hunting for
+    /// in a list named after something else, if they noticed the count at all
+    /// (finding U15). The popup is where a long text is actually read: wrapped
+    /// to the width it is painted at, scrollable, and opened at the top.
+    fn open_help_picker(&mut self) {
+        let width = screen::picker_text_width(self.term_width);
+        let items = help_notice(width).lines().map(str::to_string).collect();
+        self.picker = Some(Picker {
+            kind: PickerKind::Help,
+            items,
+            cursor: 0,
+        });
+    }
+
     fn open_provider_picker(&mut self) {
         let items: Vec<String> = Provider::ALL.iter().map(|p| p.name().to_string()).collect();
         let cursor = items
@@ -1961,7 +1993,7 @@ impl App {
             PickerKind::Provider => self.apply_provider(item),
             // Nothing to apply: the list is a reading, and `key_picker` closes it
             // on Enter exactly as it does on Esc.
-            PickerKind::Notes => {}
+            PickerKind::Notes | PickerKind::Help => {}
         }
     }
 
@@ -5288,14 +5320,14 @@ mod tests {
         assert_eq!(agents, chat, "and wider too");
     }
 
-    /// A send ends the chatter the last command left in the foot: `/help` and a
-    /// diff answer the thing the human typed *before* this message, and leaving
-    /// them there spends the pane's rows on a question nobody is asking any more
-    /// (finding U8). A failure is not a moment and survives the send.
+    /// A send ends the chatter the last command left in the foot: a command's
+    /// answer belongs to the moment the human typed *before* this message, and
+    /// leaving it there spends the pane's rows on a question nobody is asking
+    /// any more (finding U8). A failure is not a moment and survives the send.
     #[test]
     fn sending_the_next_message_ends_the_last_command_answer() {
         let (mut app, _rx) = test_app("chatter-send");
-        run(&mut app, "/help");
+        app.chat.note_for(AgentId::ROOT, "opened notes.txt");
         app.chat.note_error_for(AgentId::ROOT, "first failure");
         assert_eq!(
             app.chat.notices_for(AgentId::ROOT).count(),
@@ -5996,12 +6028,36 @@ mod tests {
         let (mut app, _rx) = test_app("compact-help");
         run(&mut app, "/help");
         let help = app
-            .chat
-            .notices_for(AgentId::ROOT)
-            .map(|notice| notice.text.clone())
-            .collect::<Vec<_>>()
+            .picker
+            .as_ref()
+            .expect("help opens a list")
+            .items
             .join("\n");
         assert!(help.contains("/compact"), "{help}");
+    }
+
+    /// The help is a readable list, not a two-row teaser in the foot: it opens
+    /// the popup `/notes` uses, at the top, and the popup paints it (finding
+    /// U15).
+    #[test]
+    fn help_opens_a_readable_list() {
+        let (mut app, _rx) = test_app("help-list");
+
+        run(&mut app, "/help");
+
+        let picker = app.picker.as_ref().expect("help opens a list");
+        assert_eq!(picker.kind, PickerKind::Help);
+        assert_eq!(picker.cursor, 0, "help opens at its head");
+        assert!(
+            picker.items.iter().any(|row| row.contains("mush keys")),
+            "the list carries the keys: {}",
+            picker.items.join("\n")
+        );
+        let rows = screen(&mut app, 120, 32);
+        assert!(
+            rows.iter().any(|row| row.contains(" help · line 1/")),
+            "the popup paints the list and where in it the reader is: {rows:?}"
+        );
     }
 
     /// A fold the human asked for is on the screen while it runs, at both sizes
@@ -6168,12 +6224,16 @@ mod tests {
     #[test]
     fn help_names_the_whole_key_table() {
         let (mut app, _rx) = test_app("keys-help");
+        // A real terminal size, the way `main` reports it: the list wraps to the
+        // popup this screen paints, and a phrase split by a narrow terminal is
+        // not a missing binding.
+        app.set_term_size(200, 50);
         run(&mut app, "/help");
         let help = app
-            .chat
-            .notices_for(AgentId::ROOT)
-            .map(|notice| notice.text.clone())
-            .collect::<Vec<_>>()
+            .picker
+            .as_ref()
+            .expect("help opens a list")
+            .items
             .join("\n");
         for want in [
             "j / k, ↑ / ↓",

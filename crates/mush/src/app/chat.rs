@@ -547,6 +547,11 @@ impl Chat {
 
     /// A line for the transcript that is not a message: a hint, or a failure.
     /// It concerns the root conversation unless tagged otherwise.
+    ///
+    /// Test-only now: a line that answers a command goes to the pane the human
+    /// is looking at (`/help`'s own arm), so production callers name their
+    /// agent through [`Self::note_for`].
+    #[cfg(test)]
     pub fn note(&mut self, text: impl Into<String>) {
         self.note_for(AgentId::ROOT, text);
     }

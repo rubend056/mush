@@ -583,7 +583,7 @@ impl App {
                 PickerKind::Provider => item == self.cfg().provider.name(),
                 // Nothing in this list is a choice, so nothing is marked as
                 // one.
-                PickerKind::Notes => false,
+                PickerKind::Notes | PickerKind::Help => false,
             };
             let label = if current {
                 format!("• {item}")

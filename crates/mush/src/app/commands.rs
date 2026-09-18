@@ -180,10 +180,17 @@ pub const COMMANDS: &[Spec] = &[
     },
 ];
 
-/// The command table as text, one aligned line per command: what the transcript
-/// notice and `mush --help` both print. `providers` is the list `--provider`
-/// accepts, already spelled the way a command line wants it.
+/// The command table as text, one aligned line per command: what `mush --help`
+/// prints. `providers` is the list `--provider` accepts, already spelled the
+/// way a command line wants it.
 pub fn table(providers: &str) -> String {
+    table_at(providers, usize::MAX)
+}
+
+/// The same table, rendered for a surface `width` columns wide: the usage stays
+/// in its column and a description that does not fit hangs under its own
+/// column (finding U15). `usize::MAX` is the unwrapped form `--help` prints.
+pub fn table_at(providers: &str, width: usize) -> String {
     let rows: Vec<(String, &str)> = COMMANDS
         .iter()
         .map(|spec| {
@@ -193,15 +200,27 @@ pub fn table(providers: &str) -> String {
             (usage, spec.help)
         })
         .collect();
-    let width = rows
+    let usage_width = rows
         .iter()
         .map(|(usage, _)| usage.chars().count())
         .max()
         .unwrap_or(0);
-    rows.iter()
-        .map(|(usage, help)| format!("    {usage:<width$}  {help}"))
-        .collect::<Vec<_>>()
-        .join("\n")
+    let description_column = 4 + usage_width + 2;
+    let room = width.saturating_sub(description_column).max(1);
+    let mut out = String::new();
+    for (usage, help) in &rows {
+        let lead = format!("    {usage:<usage_width$}  ");
+        let mut wrapped = mush_core::text::wrap_text(help, room).into_iter();
+        if let Some(first) = wrapped.next() {
+            out.push_str(&lead);
+            out.push_str(&first);
+            out.push('\n');
+        }
+        for continuation in wrapped {
+            out.push_str(&format!("{:description_column$}{continuation}\n", ""));
+        }
+    }
+    out.trim_end().to_string()
 }
 
 /// Read a typed line.

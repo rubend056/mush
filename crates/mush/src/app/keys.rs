@@ -21,7 +21,7 @@
 //!
 //! The whole table lives in [`KEYS`] — one row per binding — and both help
 //! surfaces render it through [`help_table`]: `mush --help`'s KEYS block and
-//! the in-app `/help` notice. A binding therefore cannot be documented in one
+//! the in-app `/help` list. A binding therefore cannot be documented in one
 //! and missing from the other, which is what the hand-written `--help` prose
 //! and the six-key `/help` line allowed (the key half of finding B2). This is
 //! the same one-source shape `commands::table` gives the slash commands. [`key`]
@@ -33,6 +33,8 @@
 //! test so that a future change to either is a decision rather than an accident.
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+
+use mush_core::text::wrap_text;
 
 use super::Focus;
 
@@ -216,14 +218,28 @@ pub const KEYS: &[Binding] = &[
 /// The key table as text: a heading per context, then `keys` and `what it does`
 /// in one aligned column.
 ///
-/// Both `mush --help`'s KEYS block and the in-app `/help` notice print exactly
+/// Both `mush --help`'s KEYS block and the in-app `/help` list print exactly
 /// this string, so the two cannot disagree about a binding.
 pub fn help_table() -> String {
-    let width = KEYS
+    help_table_at(usize::MAX)
+}
+
+/// The same table, rendered for a surface `width` columns wide: the keys stay
+/// in their column and a description that does not fit hangs under its own
+/// column rather than under the keys, so a popup no wider than a phone does
+/// not read as a broken two-column page (finding U15). `width` is a byte/column
+/// budget of the longest row; `usize::MAX` is the unwrapped form `--help`
+/// prints.
+pub fn help_table_at(width: usize) -> String {
+    let key_width = KEYS
         .iter()
         .map(|binding| binding.keys.chars().count())
         .max()
         .unwrap_or(0);
+    // Four spaces of indent, the keys column, its two-space gutter: where a
+    // wrapped description starts.
+    let description_column = 4 + key_width + 2;
+    let room = width.saturating_sub(description_column).max(1);
     let mut out = String::new();
     let mut shown: Option<Context> = None;
     for binding in KEYS {
@@ -234,12 +250,16 @@ pub fn help_table() -> String {
             out.push_str(&format!("  {}:\n", binding.context.label()));
             shown = Some(binding.context);
         }
-        out.push_str(&format!(
-            "    {:<width$}  {}\n",
-            binding.keys,
-            binding.help,
-            width = width
-        ));
+        let lead = format!("    {:<key_width$}  ", binding.keys);
+        let mut wrapped = wrap_text(binding.help, room).into_iter();
+        if let Some(first) = wrapped.next() {
+            out.push_str(&lead);
+            out.push_str(&first);
+            out.push('\n');
+        }
+        for continuation in wrapped {
+            out.push_str(&format!("{:description_column$}{continuation}\n", ""));
+        }
     }
     out.trim_end().to_string()
 }
