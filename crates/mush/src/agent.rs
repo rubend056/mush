@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use mush_core::config::parse_context_hint;
 use mush_core::git;
 use mush_core::message::{ChatRequest, ChatResponse};
-use mush_core::text::{first_line, sanitize, truncate};
+use mush_core::text::{first_line, sanitize, truncate, truncate_flag};
 use mush_core::tools::ToolName;
 use mush_core::transcript::{
     needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
@@ -283,11 +283,13 @@ const SUBJECT_COLUMNS: usize = 60;
 /// (`isolated w…`), which neither reads as English nor matches the brief; the
 /// whole word that does not fit is dropped and the `…` says so. A first line
 /// with no space to cut on keeps the hard cut — a clipped subject is better
-/// than no subject.
+/// than no subject. Whether the line was cut at all is
+/// [`truncate_flag`]'s answer, never the `…`'s: a brief that ends in an ellipsis
+/// of its own would otherwise lose the word in front of it.
 fn subject_brief(brief: &str) -> String {
     let first = first_line(brief);
-    let cut = truncate(&first, SUBJECT_COLUMNS);
-    if !cut.ends_with('…') {
+    let (cut, cut_short) = truncate_flag(&first, SUBJECT_COLUMNS);
+    if !cut_short {
         return cut;
     }
     let body = cut.trim_end_matches('…');
@@ -398,20 +400,32 @@ impl Outcome {
     /// and mark it read. `agent_status` used to print every child's entire
     /// final message on every call, so a parent that polled it re-read every
     /// child's report again and again (the replay this digest closes).
+    ///
+    /// This is also the *one* sentence per ending: a listing and a wait both
+    /// read it and only add their own marks around it, because two surfaces
+    /// that each spell an ending are two chances to disagree about what a stop
+    /// means.
     fn digest(&self, id: u64) -> String {
         let (mark, body) = match self {
             Outcome::Finished(summary) => ("✓", summary.as_str()),
             Outcome::Failed(error) => ("✗", error.as_str()),
             Outcome::Stopped => {
-                return format!("#{id} ⊘ stopped — idle and resumable");
+                return format!(
+                    "#{id} ⊘ stopped — idle and resumable (control message resumes it)"
+                );
             }
             Outcome::CutOff => {
                 return format!("#{id} ⚠ cut off — the run never ended; nothing was committed");
             }
         };
         let first = body.lines().next().unwrap_or("").trim();
-        let cut = truncate(first, DIGEST_COLUMNS);
-        if body.chars().count() > cut.chars().count() {
+        let (cut, cut_short) = truncate_flag(first, DIGEST_COLUMNS);
+        // The size is named whenever the digest is not the whole body: the first
+        // line was cut to fit, or the body runs on past it. The flag is what
+        // says the first, because counting the characters cannot — one dropped
+        // wide glyph costs two columns and no characters, so the counts tie and
+        // the digest used to hide a cut without saying so.
+        if cut_short || body.chars().count() > first.chars().count() {
             format!("#{id} {mark} {cut} ({} chars total)", body.chars().count())
         } else {
             format!("#{id} {mark} {cut}")
@@ -479,11 +493,14 @@ pub enum AgentMsg {
     /// Not a result and not a delivery: a listing fact (`status`), so it
     /// starts no run and marks nothing read (finding H1).
     Work { id: u64, run: u64, work: Work },
-    /// A child that was at rest began a run the parent did not start: the human
-    /// nudged it, or a client did. The UI is the only hand that sees that, and
-    /// the parent's books need it — a wait would otherwise answer a stale
-    /// result, and the shared-workspace guard would miss a sibling that is
-    /// working (audit of the prompt vs behaviour, row 1).
+    /// A child that began a run the parent did not start: the human nudged it,
+    /// a client did, or the parent's own `control message` started it. The
+    /// witnesses are the hand that saw it — the UI, which is the human's — and
+    /// the child's own actor, which is the only one that knows a `Steer`
+    /// *resumed* it instead of being read mid-run. The parent's books need it
+    /// either way: a wait would otherwise answer a stale result, and the
+    /// shared-workspace guard would miss a sibling that is working (audit of the
+    /// prompt vs behaviour, row 1).
     ChildRunning { id: u64 },
     /// A job this agent started ended. `line` is the report its owner reads,
     /// rendered once by the registry; `news` says whether it is worth waking a
@@ -1087,6 +1104,20 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
                 cancel: cancel.clone(),
             },
         );
+        // Say it to the parent too, and *before* the run does anything: a run
+        // starting is the child's own news, and a parent that infers it from
+        // its own books can be wrong. Its own `control message` is the case: a
+        // `Steer` the parent read as "mid-run" may have arrived after the run
+        // ended, so it *starts* one — and the completion of the run before it
+        // is still travelling to the parent, which would then record it and
+        // leave a working child marked at rest (a `status` line, the
+        // one-shared-child guard, and the next `wait` all read that). The
+        // message order closes it: the parent drains the completion first, then
+        // this, and the books end where the child really is. The root's parent
+        // receiver is dead, so its send is dropped.
+        let _ = actor
+            .parent_tx
+            .send(AgentMsg::ChildRunning { id: actor.id });
         actor.ctx.live.fetch_add(1, Ordering::SeqCst);
         let result = run_loop(&actor, &mut state, &mut transcript, &cancel);
         actor.ctx.live.fetch_sub(1, Ordering::SeqCst);
@@ -2452,10 +2483,19 @@ fn drain_mailbox(
 /// model read, and hearing the same report again cannot make it unread
 /// (`docs/findings.md` B24: the defect was the unconditional
 /// `state.delivered.remove(&id)` that used to end this function).
+///
+/// The *running* mark is the same kind of fact and is cleared under the same
+/// rule: only a run ending — a run the books have not heard of — is a child
+/// coming to rest. A result recorded again is not. It used to clear the mark
+/// unconditionally, so the timeout's fresh path (`wait_digest(fresh_only)`,
+/// which re-records what it hands over) took the running mark off a child the
+/// human had nudged: `status` reported an idle child, the one-shared-child guard
+/// saw the workspace free, and the next `wait` answered a result the child was
+/// busy pasting over (audit row 1).
 fn note_completion(state: &mut ActorState, id: u64, run: u64, outcome: Outcome) -> String {
-    state.running.remove(&id);
     let line = outcome.line(id);
     if state.completed.get(&id).map(|completion| completion.run) != Some(run) {
+        state.running.remove(&id);
         state.completed.insert(id, Completion { run, outcome });
     }
     line
@@ -2802,6 +2842,11 @@ fn parked_message(state: &ActorState) -> Option<Waiting> {
     said
 }
 
+/// The answer to a `wait` that was asked with nothing behind it — no children
+/// and no jobs, at the call or by the time the loop looked. One spelling, two
+/// roads out of `wait_tool`.
+const NOTHING_TO_WAIT_FOR: &str = "nothing to wait for: no children and no jobs";
+
 fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Result<String, String> {
     // `wait` has no arguments: "everything I own has finished" is the only
     // thing the call can mean now (finding H15 — a model that reasoned
@@ -2810,7 +2855,7 @@ fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Resu
     let owned =
         !state.children.is_empty() || !state.running_jobs.is_empty() || !state.done_jobs.is_empty();
     if !owned {
-        return Ok("nothing to wait for: no children and no jobs".to_string());
+        return Ok(NOTHING_TO_WAIT_FOR.to_string());
     }
     let clock = actor.ctx.clock.as_ref();
     let deadline = clock.now() + Duration::from_secs(WAIT_TIMEOUT_SECS);
@@ -2843,7 +2888,7 @@ fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Resu
             // once, here.
             let answers = wait_digest(actor, state, false);
             if answers.is_empty() {
-                return Ok("nothing to wait for: no children and no jobs".to_string());
+                return Ok(NOTHING_TO_WAIT_FOR.to_string());
             }
             return Ok(answers.join("\n"));
         }
@@ -2946,7 +2991,9 @@ fn status_tool(actor: &Actor, state: &ActorState) -> Result<String, String> {
     if !state.children.is_empty() {
         sections.push(format!("agents:\n{}", child_listing(state)));
     }
-    if jobs != "no jobs" {
+    // `None` is "no jobs": a third section, not a string to compare against —
+    // a job really named `no jobs` used to be able to hide itself here.
+    if let Some(jobs) = jobs {
         sections.push(format!("jobs:\n{jobs}"));
     }
     if sections.is_empty() {
@@ -2976,21 +3023,13 @@ fn child_listing(state: &ActorState) -> String {
         // run, so an older branch never reads as the newer run's work.
         let work = state.work_for(id).map(Work::digest).unwrap_or_default();
         match state.outcome(id) {
-            // Each state gets its own mark: a stopped child was neither
-            // finished (✓) nor failed (✗), and a parent that cannot tell them
-            // apart treats a stop as a result.
-            Some(outcome @ (Outcome::Finished(_) | Outcome::Failed(_))) => {
-                lines.push(format!("{unread}{}{work}", outcome.digest(id)));
-            }
-            Some(Outcome::Stopped) => lines.push(format!(
-                "{unread}#{id} ⊘ stopped — idle and resumable (control message resumes it){work}"
-            )),
-            // A run that never ended. Its own line, because the parent's next
-            // move depends on it: there is no result coming and the work may be
-            // sitting uncommitted (finding H2).
-            Some(Outcome::CutOff) => lines.push(format!(
-                "{unread}#{id} ⚠ cut off — the run never ended; nothing was committed"
-            )),
+            // One sentence per ending, and the ending owns it: the listing
+            // composes only its marks around what `digest` says — the `✉` of a
+            // result nobody has read, and the work fact — for every variant.
+            // Each state kept its own sentence here once, which is how a
+            // stopped child came to read one way to a listing and another to a
+            // `wait` (finding H2).
+            Some(outcome) => lines.push(format!("{unread}{}{work}", outcome.digest(id))),
             None => lines.push(format!("#{id} ◐ running")),
         }
     }
@@ -3785,26 +3824,90 @@ mod tests {
     /// Stopped, finished and failed are three different things, and a parent
     /// that cannot tell them apart treats a stop as a result. Each gets its own
     /// mark: `✓` only ever means a run produced something.
+    ///
+    /// The sentence is written **once**, for all four endings: the listing is
+    /// that sentence plus the marks it composes around it (`✉`, and the work
+    /// fact when the run left one), and the wait's digest is the same sentence
+    /// again — a reader that re-spelled an ending could say something about a
+    /// stop that no other surface said.
     #[test]
     fn status_distinguishes_stopped_from_done_and_failed() {
         let (actor, _mailbox) = test_actor("status-marks");
         let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
         let mut state = ActorState::default();
-        state.children.insert(1, tx.clone());
-        note_completion(&mut state, 1, 1, Outcome::Stopped);
-        state.children.insert(2, tx.clone());
-        note_completion(&mut state, 2, 1, Outcome::Finished("did the thing".into()));
-        state.children.insert(3, tx);
-        note_completion(&mut state, 3, 1, Outcome::Failed("no route".into()));
+        let outcomes = [
+            Outcome::Stopped,
+            Outcome::CutOff,
+            Outcome::Finished("did the thing".into()),
+            Outcome::Failed("no route".into()),
+        ];
+        for (index, outcome) in outcomes.iter().enumerate() {
+            let id = index as u64 + 1;
+            state.children.insert(id, tx.clone());
+            note_completion(&mut state, id, 1, outcome.clone());
+        }
 
+        // Nothing has been read, so every line carries the `✉` and no work
+        // fact has been sent: the line *is* the outcome's sentence plus that
+        // one mark.
+        let listing = child_listing(&state);
+        let lines: Vec<&str> = listing.lines().collect();
+        for (index, outcome) in outcomes.iter().enumerate() {
+            let id = index as u64 + 1;
+            assert_eq!(
+                lines[index],
+                format!("✉ {}", outcome.digest(id)),
+                "the listing is the outcome's sentence, marked"
+            );
+        }
         let lines = status_tool(&actor, &state).unwrap();
         assert!(lines.contains("#1 ⊘ stopped"), "a stop is not a ✓: {lines}");
-        assert!(lines.contains("#2 ✓ did the thing"), "{lines}");
-        assert!(lines.contains("#3 ✗ no route"), "{lines}");
+        assert!(lines.contains("#2 ⚠ cut off"), "{lines}");
+        assert!(lines.contains("#3 ✓ did the thing"), "{lines}");
+        assert!(lines.contains("#4 ✗ no route"), "{lines}");
         // The old shape — a sentinel string leaking into the parent's view —
         // reported a stopped child as a *finished* one.
         assert!(!lines.contains("#1 ✓"), "{lines}");
         assert!(!lines.contains("cancelled"), "{lines}");
+
+        // The work fact is the other mark, hung on the same sentence.
+        note_work(
+            &mut state,
+            1,
+            1,
+            Work::Clean {
+                branch: "mush/1".into(),
+            },
+        );
+        let listing = child_listing(&state);
+        let first = listing.lines().next().unwrap();
+        assert_eq!(
+            first,
+            format!(
+                "✉ {}{}",
+                Outcome::Stopped.digest(1),
+                Work::Clean {
+                    branch: "mush/1".into()
+                }
+                .digest()
+            ),
+            "the listing adds the work fact to the same sentence"
+        );
+
+        // And the other reader: `wait` answers an already-read result with the
+        // same digest, so both roads say one thing about one ending.
+        for id in 1..=outcomes.len() as u64 {
+            state.delivered.insert(id, 1);
+        }
+        let answers = wait_digest(&actor, &mut state, false);
+        for (index, outcome) in outcomes.iter().enumerate() {
+            let id = index as u64 + 1;
+            assert_eq!(
+                answers[index],
+                format!("{} (already read — no new run since)", outcome.digest(id)),
+                "the wait's digest is the same sentence"
+            );
+        }
     }
 
     /// A finished isolated child's listing says where its work is and whether
@@ -4017,6 +4120,19 @@ mod tests {
             "the cut must fall between words: {cut:?} of {brief:?}"
         );
         assert!(kept.starts_with("port the parser"), "{cut}");
+    }
+
+    /// A first line that ends in `…` was not cut by anyone: the ellipsis is the
+    /// brief's own character. Reading it as the cut's mark swallowed the word
+    /// before it — `fix the …` came out as `fix the…`, a subject about a
+    /// different sentence — which is what a caller guessing at "was this cut?"
+    /// from the string itself costs. The cut knows, and now says.
+    #[test]
+    fn a_brief_that_ends_in_an_ellipsis_keeps_its_words() {
+        assert_eq!(
+            commit_subject(7, "fix the …", &Outcome::Finished("done".into())),
+            "mush #7: fix the …"
+        );
     }
 
     /// A brief cut to a budget is cut by *columns*, not characters: a CJK brief
@@ -4710,6 +4826,32 @@ mod tests {
         }
     }
 
+    /// The digest names the size of what it hides exactly when it hides
+    /// something: a body the column holds whole gains no `(N chars total)`, and
+    /// a body the cut shortened always does — even when the `…` stands in for a
+    /// dropped *wide* glyph, where the character counts tie and a count-based
+    /// guess fell silent about the very cut it was there to report.
+    #[test]
+    fn a_digest_names_its_size_only_when_it_hides_something() {
+        let whole = "x".repeat(DIGEST_COLUMNS);
+        assert_eq!(
+            Outcome::Finished(whole.clone()).digest(1),
+            format!("#1 ✓ {whole}"),
+            "a body exactly the column width is whole"
+        );
+
+        // One wide glyph past the budget: the cut keeps 99 columns of `x` and
+        // spends the last on the ellipsis, so the digest has as many
+        // *characters* as the body and the count comparison saw nothing hidden.
+        let wide = format!("{}你", "x".repeat(DIGEST_COLUMNS - 1));
+        let digest = Outcome::Finished(wide.clone()).digest(1);
+        assert!(digest.contains('…'), "the cut says so: {digest}");
+        assert!(
+            digest.ends_with(&format!("({} chars total)", wide.chars().count())),
+            "the digest says how much it hid: {digest}"
+        );
+    }
+
     /// `status` is a listing, not a delivery: a child's whole final
     /// message used to be printed on every call, so a parent that polled its
     /// children re-read every report, and the fold then re-delivered it as the
@@ -5169,8 +5311,7 @@ mod tests {
     }
 
     /// A standalone actor over a scratch workspace, for exercising the mailbox
-    /// plumbing with no model, no UI, and no threads.
-    /// Several edits to the *same* file in one batch must all land: every file
+    /// plumbing with no model, no UI, and no threads.    /// Several edits to the *same* file in one batch must all land: every file
     /// tool re-reads from disk, so the second edit sees the first one's result
     /// instead of clobbering it with a stale copy.
     #[test]
@@ -5211,6 +5352,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("2 times"), "{error}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// `status` with nothing behind it: the registry answers `None` rather than
+    /// a sentinel line the caller compares with a string, and the listing is the
+    /// one sentence a model can act on. The sentinel was a count spelled as
+    /// text — a job really named `no jobs` could hide behind it.
+    #[test]
+    fn a_status_with_no_jobs_is_none_and_no_section() {
+        let (actor, _mailbox) = test_actor("status-none");
+        assert_eq!(
+            actor.ctx.registry.status_for(actor.id),
+            None,
+            "an owner with no jobs has none, not a line saying so"
+        );
+        assert_eq!(
+            status_tool(&actor, &ActorState::default()).unwrap(),
+            "no children and no jobs"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -9392,6 +9552,76 @@ mod tests {
     /// Only ever spent waiting for an event, never asserting on it.
     const WAIT: Duration = Duration::from_secs(5);
 
+    /// A run starting is told to the parent by the actor that starts it.
+    ///
+    /// The parent's own books are a guess otherwise: `control message` decides
+    /// whether it is resuming a child or interrupting one from the mark it
+    /// holds, and the mark can be one completion behind — a `Steer` that reads
+    /// as "mid-run" can be the thing that starts the run. The child is the only
+    /// witness, so it says so as the run begins, and the completion of the run
+    /// before it (drained first, same channel) cannot leave a working child
+    /// marked at rest.
+    #[test]
+    fn a_starting_run_tells_its_parent() {
+        let model = Arc::new(Scripted::new().says("done"));
+        let (actor, _events, _mailbox) = scripted_actor("child-running", &model);
+        let (parent_tx, parent_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let child = Actor { parent_tx, ..actor };
+        start(child, vec![Message::user("do the thing")], true);
+
+        // The run's start, before the run's report — which is the order that
+        // makes the parent's mark exact rather than a guess.
+        let first = parent_rx
+            .recv_timeout(WAIT)
+            .expect("the parent is told the run started");
+        assert!(
+            matches!(first, AgentMsg::ChildRunning { id: 7 }),
+            "the mark, not the report"
+        );
+        let second = parent_rx.recv_timeout(WAIT).expect("then the run reports");
+        assert!(
+            matches!(second, AgentMsg::ChildDone { id: 7, run: 1, .. }),
+            "and the report follows"
+        );
+
+        // The other end of that order, on the parent's own books: the
+        // completion of the run *before* the one just started, folded first,
+        // leaves the child marked at rest for exactly one message — and the
+        // start that follows puts the mark back, because the child really is
+        // running.
+        let (actor, _mailbox) = test_actor("stale-then-running");
+        let mut state = ActorState::default();
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+        state.running.insert(1);
+        note_completion(&mut state, 1, 1, Outcome::Stopped);
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ChildDone {
+                id: 1,
+                run: 2,
+                outcome: Outcome::Stopped,
+            },
+        );
+        assert!(
+            !state.running.contains(&1),
+            "the run that ended is booked as ended"
+        );
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ChildRunning { id: 1 },
+        );
+        assert!(
+            state.running.contains(&1),
+            "and the run that started is booked as started"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// What the actors told the UI, as a test watches a run.
     ///
     /// One pass over the event channel answers all of it, so a deadline is
@@ -9704,6 +9934,11 @@ mod tests {
     /// A child the human resumed is *running*, whatever its last report said:
     /// the listing says so, and a wait does not answer the stale result as if
     /// it had just finished (audit row 1 and 3).
+    ///
+    /// Both shapes of that report: one the model has read, and one nobody has —
+    /// the second is the one the timeout's fresh path walks, recording the same
+    /// result again, and a result recorded again is not the child coming to
+    /// rest.
     #[test]
     fn a_resumed_child_reads_as_running_and_a_wait_holds() {
         let clock = Arc::new(Advanceable::new());
@@ -9739,6 +9974,50 @@ mod tests {
             "the deadline is what ended it: {:?}",
             clock.elapsed()
         );
+
+        // The same with a result nobody has read: the timeout hands it over (it
+        // is the one road a fresh result travels) while the child runs on. The
+        // completion the fresh path records is the one the nudge resumed *past*,
+        // so the running mark stays — otherwise the parent's books say a running
+        // child is at rest, and `status`, the one-shared-child guard and the
+        // next `wait` all read that.
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor(
+            "resumed-unread",
+            Arc::new(ScriptedMachine::new()),
+            clock.clone(),
+        );
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+        note_completion(
+            &mut state,
+            1,
+            1,
+            Outcome::Finished("run one's result".into()),
+        );
+        assert!(state.unread(1), "nobody has read the result yet");
+
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ChildRunning { id: 1 },
+        );
+
+        let report = wait_tool(&actor, &mut state, &cancel).unwrap();
+        assert!(
+            report.contains("wait timed out") && report.contains("run one's result"),
+            "the timeout hands over the unread result and names what still runs: {report}"
+        );
+        assert!(
+            state.running.contains(&1),
+            "recording a result again is not the child coming to rest: {:?}",
+            state.running
+        );
+        let lines = status_tool(&actor, &state).unwrap();
+        assert!(lines.contains("#1 ◐ running"), "{lines}");
     }
 
     /// A result the model has already read is not what a wait returns while a

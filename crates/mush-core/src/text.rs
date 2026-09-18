@@ -198,6 +198,23 @@ fn wrap_capped(text: &str, width: usize, max_lines: Option<usize>) -> Vec<String
 /// all of those at once, for callers nobody has written yet, and it cannot turn
 /// into work per frame: the text is about to be walked to `max` columns anyway.
 pub fn truncate(text: &str, max: usize) -> String {
+    truncate_flag(text, max).0
+}
+
+/// [`truncate`], and whether it dropped anything: `(text, cut_short)`.
+///
+/// A caller that has to *say* that it cut — a subject, a digest — is asking a
+/// question only the arithmetic can answer, and two callers used to answer it by
+/// looking at the string instead: `subject_brief` read a trailing `…`, and
+/// `Outcome::digest` compared character counts. Both were wrong about the same
+/// edge, in opposite directions: a brief that really ends in `…` is not a brief
+/// that was cut (the word before it was swallowed), and a cut whose `…` stands in
+/// for a dropped wide glyph has the same number of characters as the body (so the
+/// digest fell silent about the very text it hid).
+///
+/// The flag is “the returned text is not the whole text”, so `truncate(text, 0)`
+/// on a non-empty text is a cut and on an empty text is not.
+pub fn truncate_flag(text: &str, max: usize) -> (String, bool) {
     cut(&sanitize_upto(text, max), max)
 }
 
@@ -222,16 +239,19 @@ fn sanitize_upto(text: &str, max: usize) -> String {
 /// [`truncate`] over text that is already safe to paint: the column arithmetic
 /// alone, so a caller that has sanitized its own field does not pay for it
 /// twice.
-fn cut(text: &str, max: usize) -> String {
+///
+/// The flag says whether the text came back whole, which is the one thing a
+/// caller cannot read off the string (see [`truncate_flag`]).
+fn cut(text: &str, max: usize) -> (String, bool) {
     if max == 0 {
-        return String::new();
+        return (String::new(), !text.is_empty());
     }
     let (out, _) = text.unicode_truncate(max);
     if out.len() == text.len() {
-        return text.to_string();
+        return (text.to_string(), false);
     }
     let (body, _) = text.unicode_truncate(max - 1);
-    format!("{body}…")
+    (format!("{body}…"), true)
 }
 
 /// Lay out one row in the width it has.
@@ -303,7 +323,7 @@ pub fn fit_row(
         let room = remaining.saturating_sub(1);
         if UnicodeWidthStr::width(brief.as_str()) <= room || room >= MIN_FIELD {
             line.push(' ');
-            line.push_str(&cut(&brief, room));
+            line.push_str(&cut(&brief, room).0);
         }
     }
     if show_branch {
@@ -315,6 +335,37 @@ pub fn fit_row(
         line.push_str(&cell);
     }
     line.trim_end().to_string()
+}
+
+/// The nearest character boundary at or before `at`, never past the end of
+/// `text`.
+///
+/// A byte budget lands inside a multi-byte character often enough that a
+/// caller slicing by bytes has to walk back for a boundary first, and the walk
+/// was hand-rolled in two places on the same file (`Workspace`'s head cut for a
+/// read and for a tool result) with a third going the other way
+/// (`tail_for_model`). They have to agree about the two ends — a walk that does
+/// not stop at zero panics, one that does not stop at the text's end runs off
+/// it — so the rule lives here, beside the width arithmetic it is a part of.
+///
+/// `at` past the end is the end, so a caller passing a size and a cap in any
+/// order cannot panic.
+pub fn boundary_at_or_before(text: &str, at: usize) -> usize {
+    let mut cut = at.min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
+}
+
+/// The nearest character boundary at or after `at`, never past the end of
+/// `text`: [`boundary_at_or_before`]'s twin, for the tail of a long result.
+pub fn boundary_at_or_after(text: &str, at: usize) -> usize {
+    let mut cut = at.min(text.len());
+    while cut < text.len() && !text.is_char_boundary(cut) {
+        cut += 1;
+    }
+    cut
 }
 
 /// Show only the edges of a secret for confirmation without leaking it.
@@ -430,6 +481,73 @@ mod tests {
         let row = fit_row("▶ #1", &("x".repeat(30) + "\x1b]0;PWNED\x07"), "", &[], 20);
         assert!(!row.contains('\x1b'), "{row:?}");
         assert!(UnicodeWidthStr::width(row.as_str()) <= 20, "{row:?}");
+    }
+
+    /// The cut says whether it cut, which is the one thing a caller cannot read
+    /// off the string: a text that already ends in `…` is not a text that was
+    /// truncated, and a cut whose `…` replaced a dropped wide glyph has as many
+    /// characters as the body it came from. Two callers used to guess, from the
+    /// ellipsis and from the counts, and each guessed wrong on one of the two.
+    #[test]
+    fn the_cut_says_whether_it_cut() {
+        let (same, cut) = truncate_flag("lexer", 40);
+        assert_eq!(same, "lexer");
+        assert!(!cut, "nothing was dropped");
+
+        // The ellipsis belongs to the text, and the flag is not fooled.
+        let (kept, cut) = truncate_flag("fix the …", 40);
+        assert_eq!(kept, "fix the …");
+        assert!(!cut);
+
+        let (long, cut) = truncate_flag("abcdefghijkl", 8);
+        assert_eq!(long, "abcdefg…");
+        assert!(cut, "a cut text says so");
+
+        // The cut whose ellipsis stands in for a wide glyph: two columns for
+        // one character, so the result has the body's character count.
+        let wide = format!("{}你", "x".repeat(9));
+        let (cut_text, cut) = truncate_flag(&wide, 10);
+        assert_eq!(cut_text.chars().count(), wide.chars().count());
+        assert!(cut_text.ends_with('…'));
+        assert!(cut, "columns were spent, whatever the counts say");
+
+        // Nothing fits in nothing.
+        assert_eq!(truncate_flag("text", 0), (String::new(), true));
+        assert_eq!(truncate_flag("", 0), (String::new(), false));
+    }
+
+    /// A byte budget lands on a character boundary from either side: the walk
+    /// is one rule, and the two ends it has to respect are the test.
+    #[test]
+    fn a_byte_cut_lands_on_a_character_boundary() {
+        // a|é|中|b — five bytes of characters, seven bytes of text.
+        let text = "aé中b";
+        assert_eq!(boundary_at_or_before(text, 2), 1, "é starts at 1");
+        assert_eq!(boundary_at_or_before(text, 3), 3);
+        assert_eq!(boundary_at_or_before(text, 4), 3);
+        assert_eq!(
+            boundary_at_or_before(text, 0),
+            0,
+            "nothing before the start"
+        );
+        assert_eq!(
+            boundary_at_or_before(text, 99),
+            text.len(),
+            "a cap past the end is the end, not a panic"
+        );
+
+        assert_eq!(boundary_at_or_after(text, 2), 3);
+        assert_eq!(boundary_at_or_after(text, 4), 6);
+        assert_eq!(boundary_at_or_after(text, 1), 1, "already a boundary");
+        assert_eq!(boundary_at_or_after(text, 99), text.len());
+
+        // Both halves of the same cut are strings the caller may slice with.
+        for cut in 0..=text.len() {
+            let head = boundary_at_or_before(text, cut);
+            let tail = boundary_at_or_after(text, cut);
+            assert!(text.is_char_boundary(head) && head <= cut, "{cut}");
+            assert!(text.is_char_boundary(tail) && tail >= cut, "{cut}");
+        }
     }
 
     /// The brief's first line, collapsed onto one row: the arithmetic the commit
