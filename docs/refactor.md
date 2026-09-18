@@ -560,3 +560,35 @@ The rule the waves have settled into, so it is not re-derived each time:
    sizes and reports what the screen says against what is true. Its findings get
    the same treatment as any other row: a home is named, a fixer is sent, and the
    row's status is moved in `docs/findings.md`.
+
+---
+
+## 11. The duplication queue (what the review after the last integration found)
+
+Measured at `0bd7e8a`: 32 150 lines total, ~19 250 of them tests (`app/mod.rs`
+6 224 / 3 966 test, `agent.rs` 6 872 / 4 104, `app/chat.rs` 2 524, `jobs.rs` 1 358,
+`ui.rs` 1 024). Ranked by (net lines × confidence) ÷ risk; `D` rows are in the
+fix wave, `⬜` are still open.
+
+| # | What | Net | Status |
+|---|---|---|---|
+| D1 | The `App` test fixture is hand-rolled twelve times (`app/mod.rs`: `app_at`, `app_and_rx`, `app_writing`, `app_recording`, `reopened`, `test_app` + six inline). One `app_root(root, stored, save) -> (App, Receiver<Msg>)`. | ≈ −70 | ⬜ |
+| D2 | Two enums answer "what is a wait waiting on": `tree::Waiting` and `jobs::Waited`, with the same `noun()` and the same tool names spelled again in `Waited::tool()`. Keep `jobs::Waited`; `Phase::waiting() -> Option<jobs::Waited>`. | ≈ −20 | ⬜ |
+| D3 | `retrying(...)` + its announce closure are copied verbatim (`agent.rs` run loop and `compact_history`). One `fn ask(actor, request, cancel)`; the error arms stay per-caller. | ≈ −9 | ⬜ |
+| D4 | `App::say`/`App::fail` differ only in `kind`, and the "name the agent if it is not focused" branch is written twice. One `set_status(kind, text)` + `say_for(id, text)`. | ≈ −12 | ⬜ |
+| D5 | `describe()` derives "stated / the provider's default" twice (`main.rs`), and `AgentTree::has` re-spells `node(id).is_some()`. | ≈ −6 | ⬜ |
+| D6 | `paint_diff` re-implements `git::commit`'s `rev-parse --verify ^{commit}` probe (`git.rs` keeps the one home). | ≈ −5 | ⬜ |
+| D7 | `App::busy` and `App::working_agents` are two derivations of "own run or a job". One `in_flight(node)`; `tree.busy()` stays agent-only on purpose. | ≈ −3 | ⬜ |
+| D8 | The `ChatRequest` shape and the thinking/reasoning knobs are built twice (`agent.rs` run loop and `compact_history`) — **and this copy is where the bug lives**: the fold sends `max_tokens` even on an endpoint configured for `max_completion_tokens`, and `compact_history` swallows a `Status`/`Malformed` as `Ok(())`, so compaction silently never happens there. | ≈ −10 | ⬜ |
+| D9 | Two "elide cells from the right until they fit" loops (`ui.rs` `agents_title`, `facts_line`) — **deferred**: item 7's `Screen` refactor rewrites `ui.rs`, so this lands after B17. | ≈ −8 | ⬜ |
+| D10 | The `bar_rows` rule (`>= 24`) is written in the painter and again in the test helper `selected_rows`; one `ui::bar_rows(height)`. Same file, same deferral as D9. | ≈ −2 | ⬜ |
+
+**Genuinely not duplicated (checked, do not re-litigate):** `ConfigCell`'s two
+faces over one `believable()`; `keys::KEYS`/`commands::COMMANDS` each rendered
+from one row list; `ToolName`; the worktree verbs' one-row-earlier shape;
+`Outcome::line` writing and `chat::report` parsing (a persistence boundary: the
+reader must not trust the writer); `git::run`'s two contracts; `Phase` ↔
+`StoredStatus` as a tested inverse pair; `Roster`/`busy_children`; `agent.rs`'s
+layered test fixtures; the sanitize-at-the-door arrangement (different surfaces,
+one rule — the redundancy is in the construction, D4).
+
