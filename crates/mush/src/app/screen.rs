@@ -353,6 +353,13 @@ impl App {
         let nodes = self.tree.rows();
         let cursor = self.tree.cursor();
 
+        // The rows are built before the footer, because the footer reads the
+        // cursor row's activity off the row already built for it. Deriving
+        // `phase_detail` a second time here would call `node.since.elapsed()`
+        // again, and a clock tick between the two calls would paint two ages
+        // for one frame (finding R26).
+        let rows: Vec<AgentRow> = nodes.iter().map(|node| self.agent_row(node)).collect();
+
         // The cursor row's facts live in a footer under the list, so the list
         // may degrade to `◐ #2` on a narrow pane without losing anything: facts
         // move, they do not vanish. A tall pane spends up to three lines on it;
@@ -364,7 +371,7 @@ impl App {
         } else {
             let budget = if inner.height >= 8 { 3 } else { 1 };
             compact_footer(
-                agent_footer(self, nodes[cursor], inner.width as usize),
+                agent_footer(self, nodes[cursor], &rows[cursor], inner.width as usize),
                 budget,
             )
         };
@@ -404,7 +411,7 @@ impl App {
             list_area,
             focused,
             title: elide_title(&title_cells(self, above, below), inner.width as usize),
-            rows: nodes.iter().map(|node| self.agent_row(node)).collect(),
+            rows,
             cursor,
             footer,
         }
@@ -800,8 +807,10 @@ fn compact_footer(mut full: Vec<Line<'static>>, budget: usize) -> Vec<Line<'stat
 }
 
 /// The footer under the tree: the cursor row's full facts, so a narrow pane
-/// still tells the whole story.
-fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>> {
+/// still tells the whole story. The row is the one already built for the
+/// cursor: its `activity` is the age the list is painting, so the footer and
+/// the row cannot show two ages for one frame (finding R26).
+fn agent_footer(app: &App, node: &AgentNode, row: &AgentRow, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
         Span::styled(format!(" #{} ", node.id), Style::default().fg(Color::Cyan)),
@@ -817,7 +826,7 @@ fn agent_footer(app: &App, node: &AgentNode, width: usize) -> Vec<Line<'static>>
     // stopped agent, so the one row the human is reading was the one whose
     // activity could vanish from the screen entirely (finding P4).
     let mut detail = agent_detail(node);
-    let activity = phase_detail(node);
+    let activity = row.activity.clone();
     if !activity.is_empty() {
         detail.insert(0, activity);
     }

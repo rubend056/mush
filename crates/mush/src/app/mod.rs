@@ -6615,6 +6615,22 @@ mod tests {
         assert!(!rows.contains("thinking"), "no `thinking` survives: {rows}");
     }
 
+    /// The cursor row's age is derived once per frame: the footer reads the
+    /// activity off the row already built for the list, not the clock again, so
+    /// the two surfaces cannot paint two ages for one frame (finding R26).
+    #[test]
+    fn the_row_and_the_footer_paint_one_age_for_the_cursor() {
+        let (mut app, _rx) = test_app("one-age");
+        app.tree.begin(AgentId::ROOT, None);
+        app.tree.age(AgentId::ROOT, Duration::from_secs(70));
+        let frame = screen(&mut app, 120, 32).join("\n");
+        assert_eq!(
+            frame.matches("thinking 1m10s").count(),
+            2,
+            "the row and the footer both name the same age: {frame}"
+        );
+    }
+
     /// The pane title counts the phases it names, and no agent is in two of its
     /// counts (finding U2).
     ///
