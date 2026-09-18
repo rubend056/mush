@@ -150,6 +150,11 @@ pub struct Panes {
 pub struct AgentsPane {
     /// The pane's whole rect, border included.
     pub area: Rect,
+    /// Where the rows are painted: the inner rect minus the footer and its
+    /// separator. The painter reads this instead of working the same geometry
+    /// out again, so the hidden-row counts (which are arithmetic over it) are
+    /// counts of the rows that are really on screen (finding V1).
+    pub list_area: Rect,
     pub focused: bool,
     /// The title's clauses, ranked so that the ones that exist *only* here come
     /// first: the hidden-row counts (`▲3`, `▼17`), then what the whole tree is
@@ -383,6 +388,7 @@ impl App {
 
         AgentsPane {
             area,
+            list_area,
             focused,
             title_cells: agents_title(self, above, below),
             rows: nodes.iter().map(|node| self.agent_row(node)).collect(),

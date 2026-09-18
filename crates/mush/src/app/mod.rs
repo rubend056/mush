@@ -1282,9 +1282,12 @@ impl App {
             return None;
         }
         let waiting = self.tree.busy_children(AgentId::ROOT);
-        Some(format!(
+        // Through the door like every other bar string: the sentence is numbers
+        // and fixed words *today*, and the bar's documented invariant is that
+        // nothing reaches it unsanitized (finding V6).
+        Some(mush_core::text::sanitize(&format!(
             "waiting on {waiting} subagent(s) — the root resumes as they finish"
-        ))
+        )))
     }
 
     /// The last assistant reply in an agent's transcript (its final summary).
@@ -6091,6 +6094,57 @@ mod tests {
         );
     }
 
+    /// V4: the bar's fallback is the painter's, not the derivation's. The test
+    /// that moved into `screen.rs` stops at `bar_word(None, None)` being `None`,
+    /// so nothing pinned the words a human reads when there is nothing to say —
+    /// and the `/help` in them is how a human finds the commands at all.
+    #[test]
+    fn an_empty_bar_paints_the_hint() {
+        let (mut app, _rx) = test_app("bar-hint");
+        let frame = screen(&mut app, 120, 32).join("\n");
+        assert!(
+            frame.contains("/help"),
+            "the bar's fallback names where the commands are: {frame}"
+        );
+    }
+
+    /// V2: the size tiers are a fact about the layout, and nothing pinned the
+    /// boundaries — a column or a row moved and every test stayed green. Below
+    /// 80 columns or below 20 rows the panes stack; at 80×20 they sit side by
+    /// side. The titles' rows are how the two layouts read from outside.
+    #[test]
+    fn the_size_tiers_paint_the_two_layouts() {
+        let (mut app, _rx) = test_app("sweep-tiers");
+        spawn_agent(&mut app, 1, 0, 1, "a task", None);
+        let title_rows = |app: &mut App, width: u16, height: u16| {
+            let rows = screen(app, width, height);
+            let agents = rows.iter().position(|row| row.contains(" agents "));
+            let chat = rows.iter().position(|row| row.contains(" mush "));
+            (agents, chat)
+        };
+
+        let (agents, chat) = title_rows(&mut app, 79, 24);
+        assert!(
+            agents.is_some() && chat.is_some() && agents != chat,
+            "79 columns stacks the tree over the chat: {agents:?} vs {chat:?}"
+        );
+        let (agents, chat) = title_rows(&mut app, 60, 19);
+        assert!(
+            agents != chat,
+            "19 rows stacks them: {agents:?} vs {chat:?}"
+        );
+        // The corner itself: side by side.
+        let (agents, chat) = title_rows(&mut app, 80, 20);
+        assert_eq!(
+            agents, chat,
+            "80×20 is the first size with room for both panes side by side"
+        );
+        let (agents, chat) = title_rows(&mut app, 80, 24);
+        assert_eq!(agents, chat, "and taller keeps them side by side");
+        let (agents, chat) = title_rows(&mut app, 100, 30);
+        assert_eq!(agents, chat, "and wider too");
+    }
+
     /// A send ends the chatter the last command left in the foot: `/help` and a
     /// diff answer the thing the human typed *before* this message, and leaving
     /// them there spends the pane's rows on a question nobody is asking any more
@@ -7763,9 +7817,13 @@ mod tests {
     ///
     /// `words` are painted at *every* size with a floor to paint in: the facts
     /// that must survive the smallest screen, and the ones a bug in the size
-    /// tiers would take away. `roomy` are painted at every size at least 80×24,
-    /// where the transcript's foot, the selected row's footer and the facts line
-    /// all have the room they were built for. `reopen` is for the popups whose
+    /// tiers would take away. `roomy` are painted at the two presentation sizes
+    /// the audit photographs (200×50 and 120×32), where the transcript's foot,
+    /// the selected row's footer and the facts line all have the room they were
+    /// built for — and, per state, with both focus states, because a focused
+    /// pane's border, its highlight and the chat cursor are painted differently
+    /// and the rewrite had dropped that half of the old sweep (finding V3).
+    /// `reopen` is for the popups whose
     /// item wrapping is derived from the terminal's width *when they open*
     /// (`/notes`): the sweep opens them again for each size, which is what a
     /// human resizing the terminal with the popup up would get.
@@ -8239,6 +8297,7 @@ mod tests {
     /// class the audit's ten defects all belonged to (refactor B17).
     #[test]
     fn the_draw_sweep_asserts_painted_text_not_that_it_did_not_panic() {
+        let paint = shot;
         let (mut states, _keep) = sweep_states();
         for state in &mut states {
             let Sweep {
@@ -8305,6 +8364,26 @@ mod tests {
                     for word in roomy.iter() {
                         assert!(text.contains(word), "{at}: must paint `{word}`:\n{text}");
                     }
+                    // The other focus state, at the same size: the words must
+                    // not depend on which pane holds the keyboard, and the
+                    // focused border and the cursor are the parts a one-focus
+                    // sweep never painted (finding V3).
+                    let was = app.focus;
+                    app.focus = match was {
+                        Focus::Chat => Focus::Agents,
+                        Focus::Agents => Focus::Chat,
+                    };
+                    let other = paint(app, width, height);
+                    let text = other.text();
+                    for word in roomy.iter() {
+                        assert!(
+                            text.contains(word),
+                            "{at}: must paint `{word}` with {:?} focused:\n{text}",
+                            app.focus
+                        );
+                    }
+                    other.assert_shape(name, width, height);
+                    app.focus = was;
                 }
                 shot.assert_shape(name, width, height);
             }
@@ -8377,6 +8456,55 @@ mod tests {
         app.tree.cursor_top();
         let text = shot(&mut app, 200, 50).text();
         assert!(!text.contains('▲') && !text.contains('▼'), "{text}");
+    }
+
+    /// V1: the window the counts name is the window the painter paints. The
+    /// counts are arithmetic over `AgentsPane::list_area`, and the painter now
+    /// reads that same value instead of deriving the geometry again — so this
+    /// reads both back: `▲N`/`▼M` must be exactly the rows the window does not
+    /// hold, and the agent rows painted inside the window must be the window's.
+    #[test]
+    fn the_window_the_counts_name_is_the_window_the_painter_paints() {
+        let (mut app, _rx) = a_twenty_agent_tree("sweep-window");
+        for &(width, height) in &[(40u16, 10u16), (80u16, 24u16), (120u16, 32u16)] {
+            app.set_term_size(width, height);
+            let screen_value = app.screen(Rect::new(0, 0, width, height));
+            let Screen::Panes(panes) = &screen_value else {
+                continue;
+            };
+            let pane = &panes.agents;
+            let window = pane.list_area.height as usize;
+            let rows = pane.rows.len();
+
+            let hidden: usize = pane
+                .title_cells
+                .iter()
+                .filter_map(|cell| {
+                    let digits = cell.strip_prefix('▲').or_else(|| cell.strip_prefix('▼'))?;
+                    digits.parse::<usize>().ok()
+                })
+                .sum();
+            assert_eq!(
+                hidden,
+                rows.saturating_sub(window),
+                "{width}×{height}: ▲/▼ must name exactly what the window hides"
+            );
+
+            let frame = shot(&mut app, width, height);
+            let painted = (pane.list_area.y..pane.list_area.bottom())
+                .filter(|&y| {
+                    let line: String = (pane.list_area.x..pane.list_area.right())
+                        .map(|x| frame.cells[y as usize][x as usize].clone())
+                        .collect();
+                    line.contains('#')
+                })
+                .count();
+            assert_eq!(
+                painted,
+                window.min(rows),
+                "{width}×{height}: the window holds {window} rows but {painted} were painted"
+            );
+        }
     }
 
     /// The pane's title wears the counts that fit it and drops the rest whole:

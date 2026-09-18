@@ -99,18 +99,11 @@ fn draw_agents(frame: &mut Frame, pane: &AgentsPane) {
     let list = List::new(items).highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
     let mut state = ListState::default();
     state.select(Some(pane.cursor));
-    // The list is the rows and nothing else: the cursor row's facts live in the
-    // footer below it, so a narrow pane degrades to `◐ #2` without losing them.
-    let footer_rows = if pane.footer.is_empty() {
-        0
-    } else {
-        pane.footer.len() as u16 + 1
-    };
-    let list_area = Rect {
-        height: inner.height.saturating_sub(footer_rows),
-        ..inner
-    };
-    frame.render_stateful_widget(list, list_area, &mut state);
+    // The rows go where the pane said they go. The geometry is derived once, in
+    // `App::agents_pane`, because the hidden-row counts in the title are
+    // arithmetic over it: a painter that worked it out again could place the
+    // list one row off from the count that names what it hides (finding V1).
+    frame.render_stateful_widget(list, pane.list_area, &mut state);
 
     if !pane.footer.is_empty() {
         // One row is the separator between the list and the facts.
