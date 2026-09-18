@@ -50,12 +50,16 @@ impl Drop for Guard {
 /// Bind the socket and serve it on a thread of its own.
 ///
 /// A bind that fails is never fatal — mush runs without attach and says so on
-/// stderr — so the error is returned rather than raised. A socket file left by
-/// a crash is cleared first: it is not a live listener, and `bind` would refuse
-/// the name a dead one holds.
+/// stderr — so the error is returned rather than raised. A socket *file* with
+/// nothing listening behind it is a crash's leftover, not a live mush, and is
+/// cleared so this bind can take the name; a file a live listener holds is
+/// another mush, and the bind refuses the name rather than stealing its
+/// socket.
 pub fn serve(root: &Path, ui_tx: Sender<Msg>) -> Result<Guard, String> {
     let path = socket_path(root);
-    let _ = std::fs::remove_file(&path);
+    if path.exists() && UnixStream::connect(&path).is_err() {
+        let _ = std::fs::remove_file(&path);
+    }
     let listener = UnixListener::bind(&path)
         .map_err(|error| format!("could not bind {}: {error}", path.display()))?;
     let guard = Guard { path };
@@ -624,6 +628,35 @@ mod tests {
         drop(client);
         drop(guard);
         assert!(!socket.exists(), "the guard removed the socket file");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A socket file with nothing listening behind it is a crash's leftover and
+    /// is cleared; a file a live listener holds is another mush, and it is not
+    /// stolen — the bind fails and the caller runs without attach.
+    #[test]
+    fn a_stale_socket_is_cleared_and_a_live_one_is_not_stolen() {
+        let root = std::env::temp_dir().join(format!("mush-attach-stale-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+        let path = socket_path(&root);
+
+        let live = UnixListener::bind(&path).unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        assert!(
+            serve(&root, tx.clone()).is_err(),
+            "a live socket is refused, not stolen"
+        );
+        assert!(path.exists(), "and it is left where it was");
+        // Closing the listener leaves the file with nothing behind it — the
+        // shape a crash leaves.
+        drop(live);
+        assert!(UnixStream::connect(&path).is_err());
+
+        let guard = serve(&root, tx).unwrap();
+        assert!(UnixStream::connect(&path).is_ok(), "the new socket is live");
+        drop(guard);
+        assert!(!path.exists());
         let _ = std::fs::remove_dir_all(&root);
     }
 }
