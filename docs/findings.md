@@ -238,3 +238,40 @@ And H9's `Phase::doing` is a third phase-word derivation beside M3's
 `Phase::label`/`detail` and `screen.rs`'s `phase_glyph`/`phase_detail`; `doing()`
 collapses `Stopped|Done|Failed` to `"idle"`, so the quit line can read
 `#0 idle + 1 job` for a stopped agent that owns a live job (see refactor §11).
+
+## 7. The `Screen`, reviewed (B17, `7e123e1`)
+
+`ui.rs` went from 1 024 to 298 lines and `app/screen.rs` (1 064) took the
+derivation; the reviewer read both against the old file, function by function,
+with a string-literal and a constant census, and then *injected eight bugs* to
+ask which painted fact each test really pins. The value holds: `Screen` caches
+nothing (`App` has no `Screen` field; `screen(&self, area)` only reads), every
+constant, fallback and rule has one home, `Rank` precedence has one home with the
+colour left in `ui::rank_style`, transcript windowing/foot has one owner, and the
+`Shot` harness derives its facts from the value rather than from the buffer (that
+is why three of the injections fail). What the injections found instead:
+
+| ID | What | Status | Home |
+|---|---|---|---|
+| V1 | **The `▲N`/`▼N` counts are a model of the `List`'s scroll, never compared with the rows actually painted.** The pane's window geometry (`inner`, `footer_rows`, `list_area`) is derived in `app/screen.rs` to compute the counts and *again* in `ui.rs` to place the list; the counts are arithmetic over the first, by assumption. Proof: deleting the painter's separator row (`ui.rs`'s `footer_rows`) fails **only** `page_keys_move_the_tree_cursor_a_page_and_clamp_at_both_ends`, at 80×24, with a message about the highlight — the 15×14 sweep does not notice, because its "twenty agents" state asserts the title's words and never `▲/▼`. So the two can drift and the count can lie about the window. | ⬜ | one `AgentsPane::list_area: Rect` set where the pane is laid out and read by both (refactor §11 `R25`); protecting test: an assertion that reads which rows the list window holds next to the counts |
+| V2 | **The size-tier boundaries are pinned by nothing.** Moving `screen.rs`'s `area.width < 80 \|\| area.height < 20` to `< 19` (or `< 79`) leaves all 398 tests green, though the sweep re-lays out 15 sizes — its own doc claims its `words` are "the ones a bug in the size tiers would take away". The bar's edge at 24 *is* pinned (`the_facts_line_survives_at_80x24`, which fails on 24→25). | ⬜ | a test that 79×24/80×24 and 60×19/60×20 paint the stacked vs the side-by-side layout (the tree's row width, or the `▲/▼`-free title) |
+| V3 | **The rewrite dropped the old sweep's both-focus-states pass.** `the_layout_survives_every_size` drew every size in both focus states on purpose ("a border is painted differently when it is focused and a focused-but-tiny pane is the awkward case"); `Focus::Agents` is now painted at exactly one size in the whole suite (120×32), because no sweep state changes focus from `App::new`'s `Focus::Chat`. The practical loss is small (focus changes the border colour and the chat cursor) but the doc should not claim a sweep it does not run. | ⬜ | set both focus states in the sweep, or say in the sweep's doc that it paints one |
+| V4 | **A moved unit test lost its last assertion.** `ui.rs`'s `an_error_outranks_the_tree_line` ended with `assert!(text.contains("/help"))` — "nothing to say is the hint"; the version at `screen.rs` stops at `bar_word(None, None).is_none()`, so it checks the derivation, not the painter's fallback. No functional gap (the sweep's `fresh` state covers `Tab cycles panes` at 15 sizes), but the rule lost its direct test with the move. | ⬜ | restore the assertion on the painted bar |
+| V5 | **`roomy`'s doc contradicts its test** — prose added by this integration: the doc says it is asserted "at every size at least 80×24" while the test checks two exact sizes. | ⬜ | one of the two sentences |
+| V6 | **The bar's sanitize invariant is documented as total but not held.** `app/mod.rs` says "every string the bar can show is created by `say`/`fail`", while `bar_word(self.status_line(), tree.as_deref())` lets `tree_line`'s string reach the bar *outside* `set_status`'s sanitize door. Harmless today (numbers and fixed words) and fragile the moment an agent label lands in that sentence. Part of `R10`. | ⬜ | either route `tree_line` through the door or weaken the doc to say exactly which strings bypass it |
+| V7 | **The sweep's blind spots, named:** hidden-row counts and derived-line counting are caught by their own `the_sweep_*` tests but not by the 15×14 sweep; tier boundaries (V2) and window/count drift (V1) by nothing (the latter only incidentally). Three of eight injections slipped past the sweep, which is the honest measure of what "15 sizes × 14 states" buys. | ⬜ | for the UX wave: a sweep state that asserts `▲/▼` and `!contains("more lines")`, plus V2's tier test |
+
+---
+
+## 7.5 Status moves owed by this session (apply in the doc-sync wave)
+
+- `B25` (line 110) → **✅** closed by `f313916` (`http.rs::retrying_interrupted`),
+  merged `883769f`: every IO site (read, request head/body/flush, connect, TLS
+  handshake) retries `ErrorKind::Interrupted` with the cancel flag and the
+  deadline consulted on every interrupt, so a `SIGWINCH` mid-read can no longer
+  end a run as `cannot reach …: Interrupted system call`. Three tests fail before
+  it and pass after; `model.rs::transport` still excludes `Interrupted` and now
+  says why. Reproduced and re-verified over a real pty (`/tmp/b25-repro.py`).
+- `H9` (line 191) → **✅** (already recorded in its row).
+- The `Screen` census in `docs/refactor.md`'s header (`ui.rs` 298 / `screen.rs`
+  1 064) is still right.
