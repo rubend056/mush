@@ -332,7 +332,7 @@ mod tests {
         assert!(!prompt.contains("port the parser"));
         // Subagents get the same workspace rules as the root, from one block.
         assert!(prompt.contains("Rules:"));
-        assert!(prompt.contains("Read before you edit"));
+        assert!(prompt.contains(RULES));
         assert!(prompt.contains("`/tmp/x`"));
     }
 

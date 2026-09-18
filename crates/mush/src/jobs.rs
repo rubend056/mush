@@ -1193,6 +1193,7 @@ mod tests {
     use crate::events::fake::Recorder;
     use crate::machine::fake::{Script, Scripted as ScriptedMachine};
     use crate::machine::{Machine, ShellCommand};
+    use mush_core::tools::ToolName;
 
     /// A registry over a scripted machine and an advanceable clock, so a job's
     /// whole life is asserted without a subprocess and without waiting.
@@ -1648,7 +1649,9 @@ mod tests {
         );
         assert_eq!(registry.running(), MAX_JOBS, "and it took no slot");
         assert!(
-            Refused::Budget.message(8).contains("control"),
+            Refused::Budget
+                .message(8)
+                .contains(ToolName::Control.as_str()),
             "the refusal tells the model how to make room"
         );
         registry.kill_all();

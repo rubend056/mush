@@ -2912,6 +2912,12 @@ fn in_flight(state: &ActorState) -> Vec<String> {
     out
 }
 
+/// The digest a repeat `wait` answers with: the same sentence the listing
+/// carries, plus the mark that it is not news.
+fn already_read(digest: &str) -> String {
+    format!("{digest} (already read — no new run since)")
+}
+
 /// Every result this agent has, in id order: children first, then jobs. A
 /// child's result nobody has read comes in full and is marked read; one already
 /// read comes as its digest, never the body again, and never the past reported
@@ -2946,7 +2952,7 @@ fn wait_digest(actor: &Actor, state: &mut ActorState, fresh_only: bool) -> Vec<S
                 .emit(actor.id, AgentEvent::ResultRead { child: id });
             out.push(body);
         } else {
-            out.push(format!("{digest} (already read — no new run since)"));
+            out.push(already_read(&digest));
         }
     }
     let mut jobs: Vec<u64> = state.done_jobs.keys().copied().collect();
@@ -3894,7 +3900,7 @@ mod tests {
             let id = index as u64 + 1;
             assert_eq!(
                 answers[index],
-                format!("{} (already read — no new run since)", outcome.digest(id)),
+                already_read(&outcome.digest(id)),
                 "the wait's digest is the same sentence"
             );
         }
