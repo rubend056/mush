@@ -257,16 +257,15 @@ fn draw_agents(frame: &mut Frame, app: &mut App, area: Rect) {
         return;
     }
 
-    // `List` draws `› ` outside the item's width, so the selected row would be
-    // two columns narrower than its neighbours. Budget for it up front.
-    let row_width = (inner.width as usize).saturating_sub(2);
+    // The row gets the pane's whole inner width. A `› ` highlight symbol used
+    // to be drawn outside it, which spent two columns on a mark the highlight
+    // style already made — and put a second arrow beside the row's own `▶`.
+    let row_width = inner.width as usize;
     let items: Vec<ListItem> = rows
         .iter()
         .map(|node| ListItem::new(agent_line(app, node, row_width)))
         .collect();
-    let list = List::new(items)
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
-        .highlight_symbol("› ");
+    let list = List::new(items).highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan));
     let mut state = ListState::default();
     state.select(Some(cursor));
     frame.render_stateful_widget(list, list_area, &mut state);
