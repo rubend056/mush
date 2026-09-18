@@ -1706,7 +1706,7 @@ impl App {
             Intent::PickerMove(step) => self.move_picker(step),
             Intent::PickerFirst => self.set_picker_cursor(0),
             Intent::PickerLast => self.set_picker_cursor(usize::MAX),
-            Intent::TreeMove(step) => self.tree.move_cursor(step),
+            Intent::TreeMove(step) => self.move_tree_cursor(step),
             Intent::TreeWalk(direction) => self.tree_walk(direction),
             Intent::TreeFirst => self.tree.cursor_top(),
             Intent::TreeLast => self.tree.cursor_bottom(),
@@ -1808,6 +1808,22 @@ impl App {
         };
         let next = (index as i64 + direction).rem_euclid(order.len() as i64) as usize;
         self.focus = order[next];
+    }
+
+    /// Move the tree's cursor `step` rows — one for `j`/`k`, a whole page for
+    /// `PgUp`/`PgDn`, the pair `PickerMove` carries.
+    ///
+    /// `move_cursor` is the tree's only cursor setter and it moves a *sign*,
+    /// one row per call, stopping at either end of the list — so the step is
+    /// taken one row at a time, and a page from the first or the last row is an
+    /// honest no-op rather than a wrap or an index off the end. Rows are the
+    /// painted ones: `rows()` paints every agent exactly once, so the storage
+    /// length `move_cursor` clamps against is the length the pane draws, and
+    /// the cursor it lands on is a row the human can see.
+    fn move_tree_cursor(&mut self, step: i64) {
+        for _ in 0..step.abs() {
+            self.tree.move_cursor(step.signum());
+        }
     }
 
     /// Focus the row the tree's cursor is on, and say whose pane the chat now
@@ -4093,6 +4109,7 @@ mod tests {
             "→",
             "Ctrl-Q",
             "↑ / ↓, PgUp / PgDn",
+            "page up / down the rows",
         ] {
             assert!(
                 help.contains(want),
@@ -4191,6 +4208,124 @@ mod tests {
             app.tree.cursor_id(),
             Some(AgentId::ROOT),
             "the parent link, not the row above"
+        );
+    }
+
+    /// `PgUp`/`PgDn` in the agents pane move the cursor a whole page, stop at
+    /// both ends of the painted rows, and leave the selection on the row the
+    /// pane paints as selected — a run with twenty-four children is paged, not
+    /// walked a row at a time.
+    #[test]
+    fn page_keys_move_the_tree_cursor_a_page_and_clamp_at_both_ends() {
+        let (mut app, _rx) = test_app("tree-page");
+        app.focus = Focus::Agents;
+        // The receivers are kept for the test's life, so the children's
+        // mailboxes stay open: a child whose actor has gone is a row the pane
+        // still paints, but this is the tree a run builds.
+        let mut _mailboxes = Vec::new();
+        for id in 1..=24u64 {
+            let (cmd, mailbox) = crossbeam_channel::unbounded::<AgentMsg>();
+            _mailboxes.push(mailbox);
+            app.tree.insert(Spawn {
+                id: AgentId(id),
+                parent: AgentId::ROOT,
+                brief: format!("child {id}"),
+                depth: 1,
+                branch: None,
+                cmd,
+            });
+        }
+        let painted: Vec<AgentId> = app.tree.rows().iter().map(|node| node.id).collect();
+        assert_eq!(painted.len(), 25, "the root and twenty-four children");
+        assert!(
+            painted.len() > 18,
+            "more rows than an 80x24 pane shows, so the bottom is reached by paging"
+        );
+        let bottom = *painted.last().unwrap();
+
+        let down = KeyEvent::new(KeyCode::PageDown, KeyModifiers::NONE);
+        let up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
+        // The page is whatever the key table says it is, so this test cannot
+        // disagree with `keys.rs` about the distance.
+        let page = match keys::key(Focus::Agents, false, down) {
+            Intent::TreeMove(step) => step,
+            other => panic!("PgDn in the agents pane is not a page: {other:?}"),
+        };
+        assert!(page > 1, "a page is more than a row");
+        let page = page as usize;
+
+        app.tree.cursor_top();
+        app.on_key(down);
+        assert_eq!(
+            app.tree.cursor_id(),
+            Some(painted[page]),
+            "one page down the painted rows"
+        );
+        app.on_key(down);
+        assert_eq!(app.tree.cursor_id(), Some(painted[page * 2]), "two pages");
+        // Only five rows are left: the third page clamps on the last painted
+        // row instead of wrapping to the top or running off the end.
+        app.on_key(down);
+        assert_eq!(app.tree.cursor_id(), Some(bottom), "clamped at the bottom");
+        app.on_key(down);
+        assert_eq!(
+            app.tree.cursor_id(),
+            Some(bottom),
+            "and the end stays the end"
+        );
+
+        app.on_key(up);
+        assert_eq!(
+            app.tree.cursor_id(),
+            Some(painted[page + 4]),
+            "a page back up"
+        );
+        app.on_key(up);
+        app.on_key(up);
+        assert_eq!(app.tree.cursor_id(), Some(painted[0]), "clamped at the top");
+        app.on_key(up);
+        assert_eq!(
+            app.tree.cursor_id(),
+            Some(painted[0]),
+            "and the top stays the top"
+        );
+
+        // The selection is the row that becomes visible: the pane scrolls to
+        // follow the cursor, and the last row sits below an eighteen-row
+        // window. At the top of the list it is not on the pane at all — the
+        // control that says the check below is about following the cursor and
+        // not about a row that happened to be painted.
+        app.tree.cursor_top();
+        let top_view = screen(&mut app, 80, 24);
+        assert!(
+            !top_view
+                .iter()
+                .any(|row| row.contains(&format!("#{bottom}"))),
+            "the bottom row is outside the pane's window at the top of the list:\n{}",
+            top_view.join("\n")
+        );
+
+        app.on_key(down);
+        app.on_key(down);
+        app.on_key(down);
+        assert_eq!(app.tree.cursor_id(), Some(bottom));
+        let rows = screen(&mut app, 80, 24);
+        // The row and the cursor row's footer both name the agent; exactly one
+        // of them wears the highlight the pane paints on the selection.
+        let named: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.contains(&format!("#{bottom}")))
+            .collect();
+        assert!(
+            !named.is_empty(),
+            "the page's row is on the pane now — the list followed the cursor:\n{}",
+            rows.join("\n")
+        );
+        assert_eq!(
+            named.iter().filter(|row| row.contains('›')).count(),
+            1,
+            "and it is the row the pane paints as selected:\n{}",
+            rows.join("\n")
         );
     }
 
