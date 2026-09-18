@@ -28,7 +28,7 @@ root's first user message:
    (Exercises a nudge that arrives while a reply is being generated.)
 
 5. TURNS (user message contains "TURNS"): every turn calls run_command until
-   the request carries the wrap-up instruction ("turn limit"), which is
+   the request carries the wrap-up instruction ("runaway guard"), which is
    answered with a summary. (Exercises the final turn of a run.)
 
 6. ORPHAN (user message contains "ORPHAN"): the first turn runs
@@ -109,8 +109,11 @@ class Handler(BaseHTTPRequestHandler):
             reply = {"role": "assistant", "content": "first reply"}
         elif "STEERME" in joined:
             reply = {"role": "assistant", "content": "steered"}
-        elif "TURNS" in joined and "turn limit" in joined:
+        elif "TURNS" in joined and "runaway guard" in joined:
             # The wrap-up turn: tools are withdrawn and a summary is asked for.
+            # The phrase is the one the real instruction carries
+            # (`WRAP_UP_INSTRUCTION`); "turn limit" was the old prompt's wording
+            # and the scripted run fell through to the loop guard (S8 iv).
             reply = {"role": "assistant",
                      "content": "wrapped up: the work done so far is in the workspace"}
         elif "TURNS" in joined:

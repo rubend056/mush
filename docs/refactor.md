@@ -764,3 +764,19 @@ are now actionable and belong to the fix wave that follows, as do the
 rest of `R1`–`R8` and `R11`–`R20` — `R3`/`R7` are one
 item, and `R6` is judged and deliberately left. Line numbers in a table are
 those of the tree its section header names.
+
+**The integration that followed (`eab825e`..`f70374f`, see `findings.md` §8):**
+`R3`/`R7` landed by folding in `mush/91` (`ActorState::record_child` /
+`record_job`, the one home of once-only delivery), as did `R5` (a fold that
+came to nothing ends its own phase) and the one `Registry::kill` walk. From
+this queue's own rows: **`R25` landed** (`AgentsPane::list_area` is derived
+once, where the `▲/▼` counts are, and the painter reads it — `V1`'s test reads
+both back), as did `R10`'s third item (`tree_line` now goes through
+`sanitize`, `V6`) and the `roomy` doc contradiction (`V5`). The sixth review's
+`D9`, `D10`, `R9`, and `R10`'s first two stale comments, plus `R26`–`R29`,
+are still open and unchanged from the prices in that section.
+
+The class the next blind audit should hunt — one fact with several spellings,
+and a poll with a side effect — is named in `findings.md` §8, with the recipe
+that found this wave's rows. The census it asks for is `scripts/census.py`
+(`findings.md` §8.5).

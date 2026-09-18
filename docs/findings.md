@@ -275,3 +275,139 @@ is why three of the injections fail). What the injections found instead:
 - `H9` (line 191) → **✅** (already recorded in its row).
 - The `Screen` census in `docs/refactor.md`'s header (`ui.rs` 298 / `screen.rs`
   1 064) is still right.
+
+---
+
+## 8. The class: one fact, N spellings
+
+Every row above is an instance; this section names the disease, because the
+next blind audit should hunt the class instead of waiting for the next
+instance of it.
+
+**The rule the tree states, and the code kept breaking:** a fact that is not a
+*value at the seam where it is born* gets re-derived by every reader. The
+readers then disagree — and a reader that re-derives a *delivery* hands the
+model a result twice. `derived-not-stored, one owner per fact` was applied to
+the screen and never to the model-facing facts: `delivered`, `revisions`,
+`napping`, a stored `branch`, the list window.
+
+The three shapes this wave hit, each with its rows:
+
+| Shape | What it looks like | The rule that closes it |
+|---|---|---|
+| **A read that is not recorded** | `B26`: `agent_status` printed every child's whole final message on every call and recorded nothing, so the fold printed the same report again; `wait_agents` answered from history with no mark of new-vs-old. | **One result, one delivery.** A child's outcome (a job's report) reaches a model exactly once, through a road that asks `record_child`/`record_job`; a *listing* renders a bounded digest and never a body; a repeated wait answers `already read`, not the body again. |
+| **A side effect inside a poll** | `B27`: `wait_for_results` rendered-and-marked *every* ready child while returning only the first, so one wait marked bodies read that the model was never handed. | **A poll is a question.** Anything called in a loop to ask about state is pure; delivery happens only for what the answer actually returns. |
+| **A conclusion stored, or re-derived** | `U12` (two predicates for the same nap), `U13`/`A8` (a branch the actor does not have), `V1`/`R25` (a window the counts only assume), `A1` (a revision that restarts at 0). | **Derive once, where the reader can check.** If two surfaces can disagree, one of them is a finding. |
+
+### 8.1 The two rows this wave added
+
+| ID | What | Status | Home |
+|---|---|---|---|
+| B26 | **A parent that polls re-reads every child's whole report, and the same report can be folded again.** Seen live (the session whose `.mush/session.json` this file was written from): the root's context held 173,593 chars, of which `agent_status` answers were 63,576 (30.3%, four calls of 3.1–34.2 KB); `#64`'s full report appeared **five times** in that context (msgs 2, 15, 43, 45, 58). Three roads did it: (1) `status_tool` rendered `Outcome::Finished(summary)` — the child's *entire final message* — on every call and, taking `&ActorState`, could not mark a read; (2) the fold at the next message boundary then pushed the same text again as `#N done: …`, because the delivery mark is the only thing it reads and nothing had set it; (3) an un-ided `wait_agents` answered any *recorded* outcome, read or unread, with no way to tell — the model itself wrote "The wait answered with #64's already-read summary — H15 again". The tool's description called `agent_status` a description, so polling it was the rational move. | ✅ | `status_tool` is a listing: `Outcome::digest` is one line (first line cut at `DIGEST_COLUMNS`, plus the size of the whole) and `✉` marks an unread result; `record_child`/`record_job` (folded in from `mush/91`) is the one home of "mark as read and say whether it was fresh", and `wait_tool` answers a repeat with the digest and `(already read)`. `every_delivery_road_hands_a_result_over_once` is the sweep: wait, fold and wake, one table — the body arrives once, nothing re-folds it, a listing never carries it, a repeat never replays it. Landed in `45116ad` |
+| B27 | **A wait for the first result marked the others read.** `wait_for_results` called its `result` closure for *every* candidate each poll — and that closure both rendered the line and wrote the delivery mark — then returned only the first. So `wait_agents` with no ids marked every ready child read and handed over one; the other bodies could never be delivered (the fold saw them read), and the model could not know they were lost. Found by writing the road sweep for B26, not by reading the wait. | ✅ | `WaitResults { is_ready, deliver }`: `is_ready` is pure, `deliver` runs only for the ids the call returns (the first, every one with `all`, or what the deadline found). `a_wait_returns_the_first_result_or_all_of_them` now asserts the second child stays unread after a first-result wait. Landed in `45116ad` |
+
+### 8.2 The blind-audit recipe
+
+The wave's own review method, written down so the next audit can start here:
+
+1. **Census the facts, then their derivations.** List every fact a frame or a
+   model answer can carry (a phase, a count, `unread`, a revision, a branch, a
+   window, a summary…). For each, grep its derivation sites and its *string
+   shapes*. More than one site, or more than one shape, is a finding before
+   any bug is seen: `R25`/`V1`, `U12`, `U13` and `B26` all fell out of this
+   step alone.
+2. **Sweep the roads.** For each fact, table every road that hands it to a
+   reader and assert the invariant *across* the table, not per road. A
+   per-road test cannot see a road that forgot to record — which is why 21k
+   lines of tests missed B26.
+3. **Polls are pure; counts are arithmetic.** Anything a loop calls to ask a
+   question must not mutate; any count must be computed over the thing it
+   counts, at answer time (`V1`, `R25`).
+4. **Inject a bug per fact and name the failing test.** A fact no injection
+   can break is a fact no test pins; a blind spot is a finding, not an
+   embarrassment (V7's method).
+
+---
+
+## 8.5 Where the lines are (the census)
+
+`scripts/census.py` is the method — run it from the repository root. The
+numbers below are what it printed at `f70374f`, next to the same count at the
+first commit past 9k lines (`143325a15`, the "4x LOC" that started this):
+
+| | `143325a15` | `f70374f` | growth |
+|---|---|---|---|
+| total | 9,200 | 41,123 | 4.5x |
+| **prod** (blank/comments/tests stripped) | 4,183 | **7,679** | **1.8x** |
+| tests (inside `mod tests` blocks) | 3,065 | 21,277 | 6.9x |
+| comments | 1,255 | 9,468 | 7.5x |
+
+The fix wave's own delta, `eab825e..f70374f` (five commits, ~20 findings):
+**prod +64, tests +1,197, comments +708** — behaviour moved by sixty-four
+lines and the harness around it by twelve hundred.
+
+The two big files are 46% of the tree and 58% of the tests: `app/mod.rs`
+(9,665 total, 6,642 test) and `agent.rs` (9,130, 5,640 test).
+
+What the census says, and what it does not:
+
+- The behaviour is ~7.7k lines and the harness ~21k. A fast offline suite is
+  worth paying for, so the *volume* is not the defect — the **shape** is. The
+  tests pin roads and sentences one at a time, which is exactly why they could
+  not see a fact with two spellings or a road that forgot to record. Coverage
+  that cannot span two roads is prose with assertions.
+- Comments are 23% of all lines. A rule with one home needs one sentence, so
+  comment mass is a proxy for rules living in prose — and the measurable
+  consequence is drift (`H11`, `R10`, `V5`), every one of which is recorded in
+  this file.
+- Run the census per wave and write the delta beside the wave's rows. A wave
+  that grows prod and tests together is buying coverage; one that grows
+  comments faster than prod is buying prose.
+
+---
+
+## 8.75 Status moves owed by this wave (apply in the doc-sync)
+
+Closed by the wave that wrote §8 (commits `eab825e`..`f70374f`):
+
+- **Folded in from the stopped agents' worktrees**: `mush/90` (H2's `CutOff`
+  outcome and H4's `✉`/`✉N` result marks) and `mush/91` (R3/R7's
+  `record_child`/`record_job`, R5's fold-that-came-to-nothing, and one
+  `Registry::kill` walk) — `eab825e`, `45116ad`.
+- **B26, B27** — §8.1.
+- **H13** ✅ — a refusal before anything ran is `ToolError::Refused` and never a
+  loop round, and the sibling's refusal names the holder, its command, and says
+  not to retry (`4cb4739`). The third fix (a lock to queue on) is still a
+  proposal.
+- **H14** ✅ — a loop-stop records its count, and the next run opens with the
+  guard's own words, so a nudge can resume it (`4cb4739`).
+- **H15** ✅ — a wait with no ids says it returns the first finish; an unread
+  result comes over in full and an already-read one as a digest; `agent_status`
+  says it is a listing, not a delivery (`4cb4739`, schema reserve 1700→1750).
+- **U12** ✅ — `AgentTree::napping` read by the title's bucket and the bar
+  (`642fda8`).
+- **U13** ✅ — `agent::live_branch` is the one decision about a stored branch,
+  shared by `revive` and the node (`642fda8`).
+- **A1–A8** ✅ — the revision is process-monotone and the payload carries the
+  conversation; one thread per connection and a bounded CLI wait; `mush read`
+  escapes newlines; a client's send is a message (empty refused); `--` ends the
+  options; `unavailable` is its own kind; the socket guard is built before the
+  spawn; the roster reports the main checkout when a worktree is gone
+  (`9b02a3b`). A7 has no test (a thread-spawn failure is not scriptable here).
+- **V1–V6** ✅ — one `AgentsPane::list_area` and the window/counts test; the
+  tier-boundary test; both focus states at the presentation sizes; the painted
+  `/help` fallback; the `roomy` doc; `tree_line` through `sanitize`
+  (`f70374f`). V7's blind spots are the tests those rows added.
+- **S8(iv)** ✅ — `scripts/mock_llm.py`'s `TURNS` scenario waits for `runaway
+  guard`, the phrase the wrap-up instruction really carries.
+
+Still owed, in this file's own terms: **H5**'s honest reply half, **H1**'s
+actor-side facts (what the actor holds, a finished-but-unread result on the
+wire, delivery/parked in the session file), **H6** (the load-sensitive frame
+test), **H7/H8/H10/H12** (spawn base, machine picture, prune, per-agent
+accounting — milestones), and **H13**'s third fix.
+
+For the doc hand (`README.md`, `docs/mush.md`): the rows now wear `✉`/`✉N`
+and `⚠ cut off`, `agent_status` is a bounded listing, a wait distinguishes
+unread from already-read, and `/new` steps the attach revision forward — none
+of which the glyph tables or the attach prose say yet.
