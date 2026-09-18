@@ -1089,14 +1089,12 @@ fn absorb(
                 })
                 .map(|(id, completion)| (*id, completion.run))
                 .collect();
-            // Adoption may only *add* marks, never remove one. Every line this
-            // actor folds is now emitted as a `Message` event, so the copy the
-            // UI hands back carries it — but that copy can be older than the
-            // emit (the human typed in between). Un-marking a delivery the
-            // model has already read would inject the same result a second
-            // time; the two copies converge at the next adoption instead.
-            // Adoption may only *add* marks, never move one backwards: a mark
-            // that names a *later* run than the adopted transcript holds stays.
+            // Adoption may only *add* marks, never remove one or move one
+            // backwards: every line this actor folds is emitted as a `Message`
+            // event, so the copy the UI hands back carries it — but that copy
+            // can be older than the emit, and un-marking a delivery the model
+            // has already read would inject the same result twice. A mark
+            // naming a later run than the adopted transcript holds stays.
             for (id, run) in announced {
                 state.delivered.entry(id).or_insert(run);
             }
