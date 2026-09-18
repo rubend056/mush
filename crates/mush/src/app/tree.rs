@@ -798,13 +798,7 @@ impl AgentTree {
     /// names) until it names one, where an idle fold's agent goes back to
     /// `✓ done` with the last reply it produced.
     pub fn compacted(&mut self, id: AgentId, in_run: bool) {
-        if !self.compacting_over(id, in_run) {
-            return;
-        }
-        if let Some(node) = self.node_mut(id) {
-            node.phase = if in_run { Phase::Thinking } else { Phase::Done };
-            node.since = Instant::now();
-        }
+        self.fold_over(id, in_run, Phase::Done);
     }
 
     /// The fold is over and the transcript is unchanged — the summarize call
@@ -818,11 +812,21 @@ impl AgentTree {
     /// wears `thinking…` (the phase between a request and the tool it names),
     /// where an idle fold's agent is back at rest.
     pub fn compacting_ended(&mut self, id: AgentId, in_run: bool) {
+        self.fold_over(id, in_run, Phase::Idle);
+    }
+
+    /// End a fold: `at_rest` is the phase the agent wears when the fold was not
+    /// part of a run (`✓ done` for one that landed, `idle` for one that came to
+    /// nothing), and a fold still inside its run wears `thinking…` either way.
+    ///
+    /// One body for both endings, so the two cannot disagree about the run they
+    /// were part of, the flag they hand back, or the clock they restart (R2).
+    fn fold_over(&mut self, id: AgentId, in_run: bool, at_rest: Phase) {
         if !self.compacting_over(id, in_run) {
             return;
         }
         if let Some(node) = self.node_mut(id) {
-            node.phase = if in_run { Phase::Thinking } else { Phase::Idle };
+            node.phase = if in_run { Phase::Thinking } else { at_rest };
             node.since = Instant::now();
         }
     }
