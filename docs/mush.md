@@ -125,30 +125,14 @@ and never share state with the painter.
 
 ### System prompt
 
-`mush-core/src/prompt.rs` generates the entire prompt: one line naming the
-workspace, then the rules, the delegation policy, and what the machine is like
-(§5.6). The blocks are shared with the subagent prompt, so a rule has one home
-rather than two copies that drift:
-
-```text
-You are mush, a coding agent working in the workspace at <ROOT>.
-
-Rules:
-- Work inside the workspace: paths are workspace-relative ("src/main.rs", not an absolute path), and a command runs with its cwd at the workspace root. Never touch paths outside the workspace.
-- Read before you edit: use the shell (`sed -n '1,200p' file`, `rg pattern`) — `edit_file` needs the exact text it replaces, and refuses a match that is missing or not unique.
-- When you are done finish with a concise summary of what you did.
-
-Delegation:
-- spawn_agent(brief, title, base?) starts a subagent with no memory of this conversation: the brief must carry every fact, file, and the exact deliverable; title is three words naming it in the tree.
-- base gives the child its own worktree and branch forked from that ref, so siblings with bases run in parallel; without one the child works in this workspace, and only one such child may run at a time. Decide up front, or wait for the running one first. (The check can only fail after the brief exists, so decide before writing it.)
-- A subagent runs until it stops calling tools, so a brief is bounded by the work, not a turn count: split by what is independent, not by how long you think it takes.
-- Delegate independent, large, or context-heavy subtasks; do single edits and lookups yourself. Prefer a few big delegations over many small ones.
-- Ending your turn while children still run is fine: they keep working and a finish wakes you with its "#N done: summary". wait is optional — use it when you want the results now (its schema says what it hands over).
-
-The machine is shared (CPU, ports, /tmp — a worktree isolates files, nothing else):
-- A long command detaches into a job instead of dying: run_command answers "[still running — detached as #c2]" and the command keeps its own process group. The tools' schemas say what starts one, and what reads, waits on or stops it.
-- exclusive=true owns the machine for timing- or port-sensitive work (a benchmark, a profiler, a fixed port): a sibling's command queues behind it and is refused if the lock outlasts the wait (`#N holds the machine`) — do not retry in a loop.
-```
+`mush-core/src/prompt.rs` generates the entire prompt, and is the only place it
+exists: this section describes its shape rather than quoting it, because a quote
+here is a second copy, and a second copy goes stale on its own. One line names
+the workspace, then the rules, the delegation policy, and what the machine is
+like (§5.6) — `RULES`, `DELEGATION` and `MACHINE`. The blocks are shared with the
+subagent prompt, so a rule has one home rather than two copies that drift, and
+the prompt is kept small on purpose: every word of it is paid for on every
+request of every turn.
 
 The DELEGATION block is only in a prompt whose tools include delegation: a leaf
 at `MAX_DEPTH` has no `spawn_agent`, so it is not told how to use it. A
