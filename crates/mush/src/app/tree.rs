@@ -890,8 +890,9 @@ impl AgentTree {
         self.agent_cursor.min(self.agents.len().saturating_sub(1))
     }
 
+    /// Whether `id` is in the tree: the question [`Self::node`] also answers.
     pub fn has(&self, id: AgentId) -> bool {
-        self.agents.iter().any(|node| node.id == id)
+        self.node(id).is_some()
     }
 
     pub fn node(&self, id: AgentId) -> Option<&AgentNode> {

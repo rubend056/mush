@@ -313,25 +313,20 @@ fn describe(config: &Config, approved: bool) -> Vec<(String, String)> {
     let reply_cap = format!("{} tokens as {cap}", config.reply_cap());
     // Both of these are stated values with a provider default, so the line says
     // which one a request will carry *and* where it came from: a value nobody
-    // stated is the provider's, not the human's.
-    let source = if config.reasoning_effort_stated() {
-        "stated"
-    } else {
-        "the provider's default"
-    };
-    let effort = format!("{} ({source})", config.reasoning_effort().unwrap_or("none"));
-    let source = if config.thinking_stated() {
-        "stated"
-    } else {
-        "the provider's default"
-    };
+    // stated is the provider's, not the human's. Indexed by `stated`, so the
+    // rule is written once.
+    let sources = ["the provider's default", "stated"];
+    let source = |stated: bool| sources[stated as usize];
+    let effort = config.reasoning_effort().unwrap_or("none");
+    let effort = format!("{effort} ({})", source(config.reasoning_effort_stated()));
     let thinking = format!(
-        "{} ({source})",
+        "{} ({})",
         if config.thinking_enabled() {
             "on"
         } else {
             "off"
-        }
+        },
+        source(config.thinking_stated())
     );
     let approve = if approved {
         "yes (-y recorded; nothing asks yet)"
