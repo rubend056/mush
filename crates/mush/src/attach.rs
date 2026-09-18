@@ -142,6 +142,33 @@ fn peer_label(stream: &UnixStream) -> String {
         .unwrap_or_else(|| "a client".to_string())
 }
 
+/// The CLI's half of the protocol: connect to the socket under `dir`, send one
+/// request, read the one answer. `no mush is running in <dir>` when nothing is
+/// bound there, so the caller's message names the directory the human gave.
+pub fn ask(dir: &Path, request: &Request) -> Result<Response, String> {
+    let socket = socket_path(dir);
+    let stream = UnixStream::connect(&socket)
+        .map_err(|_| format!("no mush is running in {}", dir.display()))?;
+    let mut writer = stream
+        .try_clone()
+        .map_err(|error| format!("could not use the socket: {error}"))?;
+    let mut bytes = request.encode();
+    bytes.push('\n');
+    writer
+        .write_all(bytes.as_bytes())
+        .and_then(|()| writer.flush())
+        .map_err(|error| format!("could not send the request: {error}"))?;
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    reader
+        .read_line(&mut line)
+        .map_err(|error| format!("no answer from mush: {error}"))?;
+    if line.trim().is_empty() {
+        return Err("mush closed the connection without an answer".to_string());
+    }
+    decode(line.trim_end())
+}
+
 // ------------------------------------------------------------------- protocol
 
 /// One parsed request line.
@@ -247,6 +274,42 @@ pub fn parse_request(line: &str) -> Result<Request, BadRequest> {
     Ok(Request { id, op })
 }
 
+impl Request {
+    /// The line this request is sent as. One place the wire shape is written,
+    /// so the CLI cannot spell a field the parser reads differently.
+    pub fn encode(&self) -> String {
+        let mut object = serde_json::Map::new();
+        object.insert("id".to_string(), self.id.clone());
+        match &self.op {
+            Op::Read { agent, since } => {
+                object.insert("op".to_string(), json!("read"));
+                object.insert("agent".to_string(), json!(agent));
+                object.insert("since".to_string(), json!(since));
+            }
+            Op::Agents => {
+                object.insert("op".to_string(), json!("agents"));
+            }
+            Op::Focus { agent } => {
+                object.insert("op".to_string(), json!("focus"));
+                object.insert("agent".to_string(), json!(agent));
+            }
+            Op::Edit {
+                agent,
+                base,
+                text,
+                send,
+            } => {
+                object.insert("op".to_string(), json!("edit"));
+                object.insert("agent".to_string(), json!(agent));
+                object.insert("base".to_string(), json!(base));
+                object.insert("text".to_string(), json!(text));
+                object.insert("send".to_string(), json!(send));
+            }
+        }
+        Value::Object(object).to_string()
+    }
+}
+
 /// One answer, ready to serialize as a line.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Response {
@@ -255,6 +318,13 @@ pub struct Response {
 }
 
 impl Response {
+    pub fn ok(id: Value, body: Value) -> Self {
+        Self {
+            id,
+            reply: Reply::Ok(body),
+        }
+    }
+
     pub fn error(id: Value, error: ReplyError) -> Self {
         Self {
             id,
@@ -320,4 +390,40 @@ impl ReplyError {
             revision: Some(revision),
         }
     }
+
+    /// One line for a CLI to print on stderr.
+    pub fn describe(&self) -> String {
+        match (&self.message, self.revision) {
+            (Some(message), _) => format!("{}: {message}", self.kind),
+            (None, Some(revision)) => format!("{}: revision {revision} — read again", self.kind),
+            (None, None) => self.kind.clone(),
+        }
+    }
+}
+
+/// Parse one response line (the CLI's side).
+pub fn decode(line: &str) -> Result<Response, String> {
+    let value: Value = serde_json::from_str(line).map_err(|error| format!("not JSON: {error}"))?;
+    let id = value.get("id").cloned().unwrap_or(Value::Null);
+    if let Some(body) = value.get("ok") {
+        return Ok(Response::ok(id, body.clone()));
+    }
+    if let Some(error) = value.get("error") {
+        return Ok(Response::error(
+            id,
+            ReplyError {
+                kind: error
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("error")
+                    .to_string(),
+                message: error
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                revision: error.get("revision").and_then(Value::as_u64),
+            },
+        ));
+    }
+    Err("a response with neither `ok` nor `error`".to_string())
 }
