@@ -592,8 +592,6 @@ reader must not trust the writer); `git::run`'s two contracts; `Phase` ↔
 layered test fixtures; the sanitize-at-the-door arrangement (different surfaces,
 one rule — the redundancy is in the construction, D4).
 
-### The second review (after the `mush/38`+`mush/41` integration)
-
 Measured there: 33 504 lines in `crates` (`agent.rs` 7 681 with 4 689 test,
 `app/mod.rs` 6 428 / 4 126). Items `R1`–`R10`; `D` numbering continues from the
 first table.
@@ -619,4 +617,46 @@ re-inlined); the sanitize doors and `truncate`/`fit_row` (no new copy);
 `Compacting`'s three variants (constructed only where the *why* is known);
 `Phase::Compacting` → `StoredStatus::Idle` on save (a persistence decision).
 
+### The second review (after the `mush/38`+`mush/41` integration)
 
+Measured there: 33 504 lines in `crates` (`agent.rs` 7 681 with 4 689 test,
+`app/mod.rs` 6 428 / 4 126). `D` numbering continues from the first table.
+
+| # | What | Net | Status |
+|---|---|---|---|
+| R1 | `absorb`'s `Run` arm carries the same "Adoption may only *add* marks …" paragraph twice (`agent.rs:1058` and `:1064`, one per author). Merge into one paragraph above the single `state.delivered.entry(id).or_insert(run)`. | ≈ −2 | ⬜ |
+| R2 | `AgentTree::compacted` and `AgentTree::compacting_ended` are the same body twice, differing only in the at-rest phase (`Phase::Done` vs `Phase::Idle`). One private `fold_over(id, in_run, at_rest)`. | ≈ −5 | ⬜ |
+| R3 | The "deliver a completion once" rule is open-coded seven times (both `absorb` arms, `drain_mailbox`, `fold_completions`' two loops, both wait tools). Two `ActorState` methods (`record_child(id, run, outcome) -> (String, bool)`, `record_job(...)`) and each caller keeps only its own decision. **This is the B24 path: exactly one delivery per run must survive.** | ≈ −15 | ⬜ |
+| R4 | The "at rest with children working" predicate is derived twice and the two disagree — the real defect below (`U12`). One `AgentTree::napping(id)`, read by `roster`, `tree_line` and the `⏸N` mark. | ≈ −4 + fix | ⬜ |
+| R5 | The fold's "came to nothing" ending is emitted by each caller for the same `Ok(false)` (`agent.rs:1232` and `:1863`); `compact_history` already knows `in_run`, so it should emit `CompactingEnded` on its three `Ok(false)` returns. | ≈ −5 | ⬜ |
+| R6 | Run identity is four homes plus the adoption scan. Folding `completed`+`delivered` into one `Completion { run, outcome, read }` (and `done_jobs`+`delivered_jobs` likewise) is **not** clearly better: `completed` says what the child last reported, `delivered` what the model has read, and the merged shape would clobber the newer record on an out-of-order arrival. Prefer R3's helpers. | ≈ −8 | ⬜ (judged) |
+| R7 | Overlaps R3 (the two `absorb` arms are one shape); pick one home, not both. | — | ⬜ |
+| R8 | The fold's *verb* is spelled again in the bar (`app/mod.rs:1075`) and in the acknowledgement (`:1757`) while `Compacting::words()` owns the row's words — so the bar says "compacting" for a fold its own row calls "folding at the next step". Derive the verb from `Compacting`. | ≈ 0 | ⬜ |
+| R9 | `draw_chat` looks the focused node up twice (`ui.rs:584`, `:590`) where one binding has two projections. | ≈ −3 | ⬜ |
+| R10 | Stale words left behind by the integration: `tree.rs:64` still offers `summarizing…` as an `Activity` example; `ui.rs:311` says `M waiting` are "the `⏸` rows" (a *working* agent wears `⏸N` since U1); `app/mod.rs:964` says `say`/`fail` own every string the bar's line can be (the fold sentence in `tree_line` is a third). | ≈ −4 | ⬜ |
+
+**Confirmed not duplicated by the second review:** the fold's state (all five
+surfaces read the one node phase — no surface re-derives it); the run identity's
+homes (each knows something the others cannot); `busy_children` (used, never
+re-inlined); the sanitize doors and `truncate`/`fit_row` (no new copy);
+`Outcome::line` vs `status_tool`'s listing (two readers, two formats);
+`Compacting`'s three variants (constructed only where the *why* is known);
+`Phase::Compacting` → `StoredStatus::Idle` on save (a persistence decision).
+
+---
+
+### The third review (after the `mush/46` integration)
+
+Confirmed: the doubled `absorb` paragraph (R1) is still there; `diff_rows`'
+preamble/hunk knowledge has exactly one home and `git.rs` is not it (presentation,
+not a parser); `subject_brief`/`parse_commit_subject` are a tested writer/reader pair
+across a persistence boundary (keep); `Focus` has three writers, each a different
+move, and two readers — no drift. What it added:
+
+| # | What | Net | Status |
+|---|---|---|---|
+| # | What | Net | Status |
+|---|---|---|---|
+| R11 | "The brief's first line, whitespace collapsed" is written four times: the real `first_line` (`agent.rs`), `job_title`'s body and `subject_brief` (`app/mod.rs`, the copy this integration added) and `AgentNode::title` (`app/tree.rs`). One home in `mush_core::text`, where the string arithmetic already lives (B9). | ≈ −8 | ⬜ |
+| R12 | `Landed`'s "merged"/"discarded" word is matched in two places in `app/mod.rs` (`worktree_gone`, `worktree_command`). One `Landed::past()`, next to the `Waiting::noun` precedent. | ≈ −6 | ⬜ |
+| R13 | The UI's `worktree_gone` and the actor's `worktree_gone` are deliberately two-sided (the UI can keep the words in the box and out of the transcript; the actor is the backstop for a sender the UI never sees) — **keep both** — but their *predicates* are derived from different inputs and after a restore they disagree: `restore_agents` passes the stored `branch` unfiltered while `revive` filters it on `worktree_path(root, id).exists()`, so a restored agent whose worktree is gone keeps a branch its actor does not have. One decision at restore (`U13`). | +2 | ⬜ |
