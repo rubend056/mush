@@ -858,22 +858,14 @@ impl App {
                     crate::jobs::label(job),
                     job_title(&command)
                 );
-                if id == self.tree.focused {
-                    self.say(note);
-                } else {
-                    self.say(format!("agent #{id}: {note}"));
-                }
+                self.say_for(id, note);
             }
             AgentEvent::JobDone { job, line } => {
                 // A job's report is the owner's to read in its transcript (the
                 // actor folds it in); on the screen it is the bar's line, and
                 // the badge the job was on goes out with it.
                 let _ = job;
-                if id == self.tree.focused {
-                    self.say(line);
-                } else {
-                    self.say(format!("agent #{id}: {line}"));
-                }
+                self.say_for(id, line);
             }
             AgentEvent::Context { tokens, source } => {
                 // The actor learned the endpoint's real window from a server
@@ -941,21 +933,34 @@ impl App {
             .collect()
     }
 
-    /// Remember a transient line for the bar: what a command just did, what the
-    /// human just asked for. It fades.
-    ///
-    /// The line is [`mush_core::text::sanitize`]d here, at the one door into the
-    /// bar, because the bar paints it whole: it does no width arithmetic, so it
-    /// never calls `truncate` or `fit_row` and the rule those carry cannot reach
-    /// it. The same door serves [`Self::fail`], and between them they own every
-    /// string the bar's line can be.
-    pub fn say(&mut self, text: impl Into<String>) {
+    /// The one door a bar line goes through: the text is
+    /// [`mush_core::text::sanitize`]d here, because the bar paints it whole —
+    /// it does no width arithmetic, so the `truncate`/`fit_row` rule cannot
+    /// reach it. Private, so every string the bar can show is created by
+    /// [`Self::say`] or [`Self::fail`], which differ only in the kind.
+    fn set_status(&mut self, kind: StatusKind, text: impl Into<String>) {
         let text = text.into();
         self.status = Some(Status {
-            kind: StatusKind::Info,
+            kind,
             text: mush_core::text::sanitize(&text),
             set_at: Instant::now(),
         });
+    }
+
+    /// Remember a transient line for the bar: what a command just did, what the
+    /// human just asked for. It fades.
+    pub fn say(&mut self, text: impl Into<String>) {
+        self.set_status(StatusKind::Info, text);
+    }
+
+    /// A bar line about `id`, named with the agent unless it is the focused
+    /// one: the focused agent's own line needs no name.
+    fn say_for(&mut self, id: AgentId, text: String) {
+        if id == self.tree.focused {
+            self.say(text);
+        } else {
+            self.say(format!("agent #{id}: {text}"));
+        }
     }
 
     /// `500k`, `8192`, `1M` — one glance, no counting zeroes.
@@ -995,15 +1000,10 @@ impl App {
     /// a later line replaces them.
     ///
     /// A failure is where the *endpoint's* own words reach the bar — a 500's
-    /// error body, a refusal's reason — so this is the other half of the rule
-    /// `say` carries (see its doc).
+    /// error body, a refusal's reason — so it goes through the same door `say`
+    /// does (see [`Self::set_status`]).
     pub fn fail(&mut self, text: impl Into<String>) {
-        let text = text.into();
-        self.status = Some(Status {
-            kind: StatusKind::Error,
-            text: mush_core::text::sanitize(&text),
-            set_at: Instant::now(),
-        });
+        self.set_status(StatusKind::Error, text);
     }
 
     /// The transient line, if it is still worth showing.
