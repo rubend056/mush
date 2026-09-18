@@ -2818,6 +2818,11 @@ fn parked_message(state: &ActorState) -> Option<Waiting> {
     said
 }
 
+/// The answer to a `wait` that was asked with nothing behind it — no children
+/// and no jobs, at the call or by the time the loop looked. One spelling, two
+/// roads out of `wait_tool`.
+const NOTHING_TO_WAIT_FOR: &str = "nothing to wait for: no children and no jobs";
+
 fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Result<String, String> {
     // `wait` has no arguments: "everything I own has finished" is the only
     // thing the call can mean now (finding H15 — a model that reasoned
@@ -2826,7 +2831,7 @@ fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Resu
     let owned =
         !state.children.is_empty() || !state.running_jobs.is_empty() || !state.done_jobs.is_empty();
     if !owned {
-        return Ok("nothing to wait for: no children and no jobs".to_string());
+        return Ok(NOTHING_TO_WAIT_FOR.to_string());
     }
     let clock = actor.ctx.clock.as_ref();
     let deadline = clock.now() + Duration::from_secs(WAIT_TIMEOUT_SECS);
@@ -2859,7 +2864,7 @@ fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Resu
             // once, here.
             let answers = wait_digest(actor, state, false);
             if answers.is_empty() {
-                return Ok("nothing to wait for: no children and no jobs".to_string());
+                return Ok(NOTHING_TO_WAIT_FOR.to_string());
             }
             return Ok(answers.join("\n"));
         }
@@ -2962,7 +2967,9 @@ fn status_tool(actor: &Actor, state: &ActorState) -> Result<String, String> {
     if !state.children.is_empty() {
         sections.push(format!("agents:\n{}", child_listing(state)));
     }
-    if jobs != "no jobs" {
+    // `None` is "no jobs": a third section, not a string to compare against —
+    // a job really named `no jobs` used to be able to hide itself here.
+    if let Some(jobs) = jobs {
         sections.push(format!("jobs:\n{jobs}"));
     }
     if sections.is_empty() {
@@ -5224,8 +5231,7 @@ mod tests {
     }
 
     /// A standalone actor over a scratch workspace, for exercising the mailbox
-    /// plumbing with no model, no UI, and no threads.
-    /// Several edits to the *same* file in one batch must all land: every file
+    /// plumbing with no model, no UI, and no threads.    /// Several edits to the *same* file in one batch must all land: every file
     /// tool re-reads from disk, so the second edit sees the first one's result
     /// instead of clobbering it with a stale copy.
     #[test]
@@ -5266,6 +5272,25 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("2 times"), "{error}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// `status` with nothing behind it: the registry answers `None` rather than
+    /// a sentinel line the caller compares with a string, and the listing is the
+    /// one sentence a model can act on. The sentinel was a count spelled as
+    /// text — a job really named `no jobs` could hide behind it.
+    #[test]
+    fn a_status_with_no_jobs_is_none_and_no_section() {
+        let (actor, _mailbox) = test_actor("status-none");
+        assert_eq!(
+            actor.ctx.registry.status_for(actor.id),
+            None,
+            "an owner with no jobs has none, not a line saying so"
+        );
+        assert_eq!(
+            status_tool(&actor, &ActorState::default()).unwrap(),
+            "no children and no jobs"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 

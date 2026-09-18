@@ -934,7 +934,12 @@ impl Registry {
     /// The jobs `owner` should know about: what is running, and what recently
     /// ended. One line each with the window under it — read live from the
     /// command while it runs, so `status` is never a stale copy.
-    pub fn status_for(&self, owner: u64) -> String {
+    ///
+    /// `None` is "this owner has no jobs", which used to be the sentinel line
+    /// `"no jobs"` that the caller compared with `!=` — a string that meant a
+    /// count, and that any job whose own text happened to read `no jobs` would
+    /// have collided with. Whether there are jobs is a value now.
+    pub fn status_for(&self, owner: u64) -> Option<String> {
         let now = self.clock.now();
         let held = self.held();
         let mine: Vec<Record> = self
@@ -943,7 +948,7 @@ impl Registry {
             .filter(|record| record.owner == owner)
             .collect();
         if mine.is_empty() {
-            return "no jobs".to_string();
+            return None;
         }
         let mut lines = Vec::new();
         // The windows share one budget: every job's headline — what the model
@@ -981,7 +986,7 @@ impl Registry {
                 }
             }
         }
-        lines.join("\n")
+        Some(lines.join("\n"))
     }
 
     /// A copy of the records, so nothing is read or killed while the registry's
@@ -1318,10 +1323,12 @@ mod tests {
         );
         assert_eq!(registry.running(), 0, "and it is no longer a live job");
         assert_eq!(machine.kills(), 0, "nothing had to be killed");
+        let listed = registry
+            .status_for(7)
+            .expect("the finished job stays listed");
         assert!(
-            registry.status_for(7).contains("exit 3"),
-            "a finished job stays listed: {}",
-            registry.status_for(7)
+            listed.contains("exit 3"),
+            "a finished job stays listed: {listed}"
         );
         // The UI heard too, so the badge on the owner's row goes out.
         assert!(events
@@ -1353,10 +1360,10 @@ mod tests {
             other => panic!("agent 8's job must report its stop: {:?}", other.is_ok()),
         }
         assert_eq!(registry.running(), 1, "agent 7's job is untouched");
+        let listed = registry.status_for(7).expect("the running job is listed");
         assert!(
-            registry.status_for(7).contains("running"),
-            "and it is still running: {}",
-            registry.status_for(7)
+            listed.contains("running"),
+            "and it is still running: {listed}"
         );
 
         // `control stop` is the same act, with an answer for the model:
@@ -1420,7 +1427,7 @@ mod tests {
         assert_eq!(registry.running(), 1);
         assert!(registry.has_room());
         assert_eq!(registry.held(), None);
-        let status = registry.status_for(7);
+        let status = registry.status_for(7).expect("the job is still listed");
         assert!(status.starts_with("#c1 running "), "{status}");
         assert!(status.ends_with("cargo build"), "{status}");
         // Every writer too: admission, the lock, and a stop are still answered
@@ -1472,7 +1479,7 @@ mod tests {
             launch(&registry, &machine, 7);
         }
 
-        let status = registry.status_for(7);
+        let status = registry.status_for(7).expect("the jobs are listed");
         for id in 1..=2 * MAX_JOBS as u64 {
             assert!(
                 status.contains(&label(id)),
@@ -1498,7 +1505,7 @@ mod tests {
         let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs().says(&window)));
         let lone = Registry::bare();
         launch(&lone, &machine, 7);
-        let status = lone.status_for(7);
+        let status = lone.status_for(7).expect("the lone job is listed");
         assert!(
             status.contains(&"0123456789".repeat(100)),
             "a single job's window is the full JOB_TAIL: {} bytes",

@@ -269,6 +269,12 @@ pub enum StatusKind {
 /// command, short enough that it never becomes furniture.
 const INFO_TTL: Duration = Duration::from_secs(5);
 
+/// What a stop key answers with when there is no work to stop.
+///
+/// The same words from both stop keys — `Ctrl-C` on an idle tree and `Ctrl-X`
+/// with nothing in flight — because it is one fact and one place it is read.
+const NOTHING_RUNNING: &str = "nothing running · Ctrl-Q quits · Ctrl-N starts a new chat";
+
 /// How long the session file may lag the conversation.
 ///
 /// The human reads the transcript, not the file, and the file is only read
@@ -2482,7 +2488,7 @@ impl App {
         };
         let Some(id) = target else {
             if busy.is_empty() {
-                self.say("nothing running · Ctrl-Q quits · Ctrl-N starts a new chat");
+                self.say(NOTHING_RUNNING);
             } else {
                 // Several agents are busy and the focused one is not among
                 // them: stopping the wrong one silently would be worse than
@@ -2502,7 +2508,7 @@ impl App {
     fn interrupt_all(&mut self) {
         let targets = self.working_agents();
         if targets.is_empty() {
-            self.say("nothing running · Ctrl-Q quits · Ctrl-N starts a new chat");
+            self.say(NOTHING_RUNNING);
             return;
         }
         let ids = targets.clone();
@@ -6698,10 +6704,7 @@ mod tests {
     fn ctrl_c_stops_running_agents_only() {
         let (mut app, _rx) = test_app("interrupt");
         app.interrupt();
-        assert_eq!(
-            text_of(&app),
-            "nothing running · Ctrl-Q quits · Ctrl-N starts a new chat"
-        );
+        assert_eq!(text_of(&app), NOTHING_RUNNING);
 
         app.chat.insert("hello");
         app.send_message();
