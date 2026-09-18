@@ -27,7 +27,7 @@
 //! | `/key [SECRET]` | optional | show the key in use, or set one |
 //! | `/models` | ignored | re-read the endpoint's model list |
 //! | `/worktrees` | ignored | re-scan for leftover isolated worktrees |
-//! | `/diff <id>` | required, an id | print the git command that reads the work |
+//! | `/diff <id>` | required, an id | run the diff of its work against HEAD |
 //! | `/merge <id>` | required, an id | merge it into HEAD and reclaim it |
 //! | `/discard <id>` | required, an id | throw it away and reclaim it |
 //! | `/forget <id>` | required, an id | drop the agent from this session |
@@ -65,7 +65,7 @@ impl Verb {
     /// What it does, in the help table's own words.
     const fn help(self) -> &'static str {
         match self {
-            Verb::Diff => "print the git command that reads its work",
+            Verb::Diff => "show the diff of its work against HEAD",
             Verb::Merge => "merge its work into HEAD, and reclaim its worktree",
             Verb::Discard => "throw its work away, and reclaim its worktree",
         }

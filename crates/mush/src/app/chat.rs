@@ -18,12 +18,18 @@
 //!
 //! A notice is a line *about* a conversation, and it has a lifetime here rather
 //! than a life of its own. It carries when it happened and which agent it
-//! concerns; a command's answer is dropped when that agent runs again, a run's
-//! failure replaces the agent's older failure and is written to the session, and
-//! `/new` or `/forget` takes them both away. Before this, every notice ever
-//! written stayed until `/new`, a failure from twenty runs ago was painted under
-//! the newest message as if it were the newest thing said, and none of it
-//! survived a restart.
+//! concerns; it is one of two kinds, and they age differently. **Chatter** — a
+//! hint, a command's answer, a diff, a usage line, anything a run did not fail
+//! at — belongs to the moment it answers: the agent's next run ends it, the
+//! human's next send ends it, and `SAID_TTL` ends it if neither happens. A
+//! repeated chatter line collapses into one with a count, so an empty-reply
+//! loop cannot spend the foot row by row. **News** — a failure, a run mush
+//! stopped — belongs to its run: a new one replaces the agent's old one, it is
+//! written to the session so a restart still says what broke, and no clock
+//! takes it away. Before this, every notice ever written stayed until `/new`, a
+//! failure from twenty runs ago was painted under the newest message as if it
+//! were the newest thing said, none of it survived a restart, and a line about
+//! one moment spent the foot for the life of the session.
 //!
 //! What a pane paints is built here too (`painted`), because which rows it shows
 //! is a fact about the conversation, its scrollback and its notes — not about the
@@ -31,7 +37,8 @@
 //! message is trimmed before the window is cut, and the foot is capped and
 //! counted. `ui.rs` keeps the frame around it — the border, the prompt and the
 //! cursor — and paints what this returns, title included, because a pane one row
-//! tall has no row to spend on saying what it is hiding.
+//! tall has no row to spend on saying what it is hiding, or that the human has
+//! scrolled away from the bottom.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -62,6 +69,17 @@ const FOOT_ROWS: usize = 3;
 /// arithmetical. Two, because the third is what says they are an excerpt.
 const FOOT_NOTE_ROWS: usize = 2;
 
+/// How long a chatter line is worth a row of the foot, in seconds.
+///
+/// The bar fades an `Info` line after five seconds (`INFO_TTL`) because the bar
+/// is glanced at as it changes; the foot is read after the fact — a human looks
+/// up from the model to see what mush said — so the same five seconds would
+/// erase `/help` before it was read. Two minutes is long enough for that glance
+/// and short enough that a line about one moment cannot become furniture, which
+/// is the half of finding U8 a run's end and the human's next send do not
+/// cover: an agent that never runs again leaves nothing behind but this.
+const SAID_TTL: u64 = 120;
+
 /// A line for the transcript that is not a message: a note from mush itself.
 /// It is tagged with the agent it concerns, so a root-level failure is not
 /// rendered into every child's transcript (finding B19), and stamped with when
@@ -74,6 +92,10 @@ pub struct Notice {
     /// carries: the row's phase has an `Instant`, which cannot survive a
     /// restart, so the line is where the age of a failure lives.
     pub at: u64,
+    /// How many times in a row this exact line was said. One line said twice is
+    /// one line — an empty-reply loop is one fact, not five — but a human
+    /// reading it is owed the number (see [`Self::line`]).
+    pub count: u32,
     pub text: String,
 }
 
@@ -187,6 +209,28 @@ impl Notice {
             NoticeKind::Info => Rank::Said,
         }
     }
+
+    /// The line as it is read: the text, and how often it was said when it was
+    /// said more than once. Collapsing repeats must not hide that the thing
+    /// happened five times — the count is the difference between "the reply was
+    /// empty" and "the reply was empty every turn until the run gave up".
+    fn line(&self) -> String {
+        if self.count > 1 {
+            format!("{} ×{}", self.text, self.count)
+        } else {
+            self.text.clone()
+        }
+    }
+
+    /// Whether this line is chatter: a line about one moment, said at one
+    /// moment. Everything a run did *not* fail at is chatter — a hint, a
+    /// command's answer, a diff, a usage line — and it ends with the moment
+    /// (see [`Chat::dismiss_said`] and [`Chat::expire_said`]). A failure or a
+    /// stop is news: it belongs to its run, is written to the session, and only
+    /// the next run replaces it.
+    fn is_chatter(&self) -> bool {
+        self.kind == NoticeKind::Info
+    }
 }
 
 /// One transcript pane as it is painted: the rows, top first, and the title it
@@ -198,6 +242,21 @@ impl Notice {
 pub struct Painted {
     pub lines: Vec<Line<'static>>,
     pub title: String,
+}
+
+/// The lines mush wrote about one agent, as `/notes` reads them: the rows of
+/// the list, oldest first, and the row the newest note starts at.
+///
+/// The second half is the answer to finding T7: the report used to be a bare
+/// list of rows, so the popup could only open on the last one — and a long note
+/// wraps into many rows, so the row it opened on was the middle of a sentence,
+/// with the stamp and the start of the note above the fold. Where a note begins
+/// is a fact about the notes, so it is derived here rather than guessed from the
+/// rows by whoever opens the list.
+pub struct Notes {
+    pub rows: Vec<String>,
+    /// The index of the newest note's first row. `0` for an empty list.
+    pub newest: usize,
 }
 
 /// The foot of one transcript pane: the rows a pane paints under the
@@ -438,10 +497,12 @@ impl Chat {
 
     /// An information line — what a command just did, what a run just hit.
     ///
-    /// It belongs to the moment it answers: the agent's next run is a different
-    /// moment (see [`Self::clear_notes_for`]), and nothing about it is written
-    /// to the session, because a restart has no moment to answer. A new line
-    /// does not replace the old one; the run does, or `/new` does.
+    /// It belongs to the moment it answers, so it is *chatter*: the agent's next
+    /// run ends it ([`Self::clear_notes_for`]), the human's next send ends it
+    /// ([`Self::dismiss_said`]), and `SAID_TTL` ends it if neither happens.
+    /// Nothing about it is written to the session, because a restart has no
+    /// moment to answer. A failure is the opposite and is not written here —
+    /// see [`Self::note_error_for`].
     pub fn note_for(&mut self, agent: AgentId, text: impl Into<String>) {
         self.push_notice(agent, NoticeKind::Info, text);
     }
@@ -499,6 +560,38 @@ impl Chat {
         self.notices.len() != before
     }
 
+    /// End every chatter line, wherever it is: the human just did the next
+    /// thing, and a line that answered the thing before it is over.
+    ///
+    /// This is the other half of the lifetime a command's answer has. Its agent
+    /// may never run again — a `/help` read once, a diff of work already merged
+    /// by hand — and until this existed the line sat in the foot until `/new`,
+    /// spending the transcript's rows on a moment nobody was in any more
+    /// (finding U8). Every agent's chatter goes, not only the focused one's:
+    /// the moment ended for the human, and which pane happened to show the line
+    /// is not what makes it stale.
+    ///
+    /// Failures and stops are deliberately untouched: they are the run's record
+    /// of itself, and they age out on their own terms.
+    pub fn dismiss_said(&mut self) -> bool {
+        let before = self.notices.len();
+        self.notices.retain(|notice| !notice.is_chatter());
+        self.notices.len() != before
+    }
+
+    /// End every chatter line that has outlived `SAID_TTL`, as of `now`.
+    ///
+    /// The clock is the fallback for a human who does nothing at all: `/help`
+    /// read once and then left on a screen for an hour was the finding. Called
+    /// from the tick, the same place the bar's own `Info` line expires, so both
+    /// of mush's transient lines have one home for their lifetime.
+    pub fn expire_said(&mut self, now: u64) -> bool {
+        let before = self.notices.len();
+        self.notices
+            .retain(|notice| !(notice.is_chatter() && now.saturating_sub(notice.at) >= SAID_TTL));
+        self.notices.len() != before
+    }
+
     /// Every note this conversation would hand back to a restarted mush: the
     /// failures, oldest first. The information lines are deliberately absent —
     /// they answered a command in a moment that is over, and a restored
@@ -530,6 +623,10 @@ impl Chat {
                 agent: AgentId(notice.agent),
                 kind: NoticeKind::Error,
                 at: notice.at,
+                // A restored failure is one line, whatever it said before it was
+                // written: the count is a fact about this process's turns, and
+                // the file has no turns to count.
+                count: 1,
                 text: notice.text,
             });
         }
@@ -551,9 +648,20 @@ impl Chat {
     /// happened, what it said, and — because the foot can only ever show two of
     /// its lines — the rest of it, wrapped here rather than clipped, since a
     /// list row cannot wrap itself.
-    pub fn notes_report(&self, agent: AgentId, now: u64, width: usize) -> Vec<String> {
+    ///
+    /// The list also carries where the newest note *begins*, because a long
+    /// note wraps into many rows and the row that says when it happened and how
+    /// it started is the head: a reader dropped at the bottom lands mid-sentence
+    /// with the age above the fold (finding T7). See [`Notes::newest`].
+    pub fn notes_report(&self, agent: AgentId, now: u64, width: usize) -> Notes {
         let mut rows = Vec::new();
+        let mut newest = 0;
         for notice in self.notices_for(agent) {
+            // The head of the newest note is the last one this loop starts: a
+            // later notice, if there is one, moves it down. A note that wraps
+            // to no rows at all (an empty text another version stored) leaves
+            // the head where it was rather than pointing past the list.
+            let head = rows.len();
             let marker = match notice.kind {
                 NoticeKind::Info => "·",
                 NoticeKind::Stopped => "⊘",
@@ -566,7 +674,7 @@ impl Chat {
             // Wrapping at `width` and then prepending the lead made the very
             // first row `lead.len()` columns too wide, which is exactly the row
             // that was clipped even on an 80-column popup.
-            for (index, line) in wrap_text(&notice.text, width.saturating_sub(lead.len()))
+            for (index, line) in wrap_text(&notice.line(), width.saturating_sub(lead.len()))
                 .into_iter()
                 .enumerate()
             {
@@ -576,17 +684,50 @@ impl Chat {
                     rows.push(format!("{}{line}", " ".repeat(lead.len())));
                 }
             }
+            if rows.len() > head {
+                newest = head;
+            }
         }
-        rows
+        Notes { rows, newest }
     }
 
     fn push_notice(&mut self, agent: AgentId, kind: NoticeKind, text: impl Into<String>) {
+        let text = text.into();
+        // One line said twice in a row is one line: an empty reply on five
+        // consecutive turns is one fact about the run, and printing it five
+        // times spent the foot — the rows the transcript was supposed to have —
+        // on one sentence (finding U8). The newest stamp and the count keep the
+        // collapsed line honest about how often it happened; a different line
+        // in between starts a new one, because then it *is* two moments.
+        if let Some(last) = self
+            .notices
+            .iter_mut()
+            .rev()
+            .find(|notice| notice.agent == agent)
+        {
+            if last.kind == kind && last.text == text {
+                last.count += 1;
+                last.at = session::now_secs();
+                return;
+            }
+        }
         self.notices.push(Notice {
             agent,
             kind,
             at: session::now_secs(),
-            text: text.into(),
+            count: 1,
+            text,
         });
+    }
+
+    /// Backdate every line by `seconds`, so a test can reach the far side of
+    /// `SAID_TTL` without sleeping. Test-only: nothing in production rewrites a
+    /// stamp, and the age a restored failure reports is the age the file says.
+    #[cfg(test)]
+    pub fn age_notices(&mut self, seconds: u64) {
+        for notice in &mut self.notices {
+            notice.at = notice.at.saturating_sub(seconds);
+        }
     }
 
     /// Where the pane showing `agent` is reading from. A conversation nobody
@@ -681,6 +822,17 @@ impl Chat {
         // room for.
         if foot.hidden > 0 && !foot.counted {
             title.push_str(&format!("· {} · /notes ", more_label(foot.hidden)));
+        }
+        // A pane that is not at the bottom says so. The foot staying put is
+        // what makes it a foot, but a window holding rows above the newest line
+        // looks exactly like one following it, and the human who scrolled away
+        // is the only one who knows they did (finding T10). The rows are the
+        // held window's own offset, and the key named is the chat pane's way
+        // back down to the newest line.
+        if let Reading::Holding { offset, up_to } = self.reading(pane.agent) {
+            if up_to <= self.transcript(pane.agent).len() {
+                title.push_str(&format!("· scrolled ↑{offset} rows · PgDn "));
+            }
         }
         Painted { lines, title }
     }
@@ -999,7 +1151,7 @@ fn marked(out: &mut Vec<Line<'static>>, mark: &str, style: Style, text: &str, wi
 fn footnote_lines(notice: &Notice, width: usize) -> Vec<Line<'static>> {
     let (mark, style) = notice.kind.mark();
     let mut rows = Vec::new();
-    marked(&mut rows, mark, style, &notice.text, width);
+    marked(&mut rows, mark, style, &notice.line(), width);
     rows
 }
 
@@ -1315,6 +1467,53 @@ mod tests {
         assert!(
             bottom.iter().any(|row| row.contains("arrived")),
             "{bottom:?}"
+        );
+    }
+
+    /// A pane holding rows above the newest line says so in its title: the foot
+    /// staying put is what makes it a foot, but a held window and a following
+    /// one look identical, and the pane is the only place that fact can live at
+    /// every size (finding T10). The marker is derived from the reading, so it
+    /// is there the instant they scroll and gone the instant they come back.
+    #[test]
+    fn a_pane_away_from_the_bottom_says_so_in_its_title() {
+        let mut chat = Chat::bare();
+        for index in 0..12 {
+            say(&mut chat, AgentId::ROOT, &format!("line {index}"));
+        }
+        assert_eq!(
+            chat.painted(&pane(AgentId::ROOT), 60, 6).title,
+            " mush ",
+            "a pane at the bottom has nothing to say about it"
+        );
+
+        chat.scroll_by(AgentId::ROOT, 3);
+        assert_eq!(
+            chat.painted(&pane(AgentId::ROOT), 60, 6).title,
+            " mush · scrolled ↑3 rows · PgDn "
+        );
+
+        // Both of the title's facts fit side by side: the foot's own count —
+        // which the title carries only when the pane has no row to spend on the
+        // count line — and the reading position.
+        chat.note_for(AgentId::ROOT, "a long note ".repeat(20));
+        let painted = chat.painted(&pane(AgentId::ROOT), 60, 2);
+        assert!(
+            painted.title.contains("/notes") && painted.title.contains("scrolled ↑3 rows"),
+            "both facts fit: {}",
+            painted.title
+        );
+        assert_eq!(
+            chat.painted(&pane(AgentId(1)), 60, 6).title,
+            " agent #1 ",
+            "another pane is still at the bottom"
+        );
+
+        chat.scroll_by(AgentId::ROOT, -3);
+        assert_eq!(
+            chat.painted(&pane(AgentId::ROOT), 60, 6).title,
+            " mush ",
+            "and coming back to the newest line takes the marker with it"
         );
     }
 
@@ -2048,7 +2247,7 @@ mod tests {
         assert_eq!(shown(&painted.lines), vec!["mush › the newest reply"]);
         assert_eq!(painted.title, " mush ", "{:?}", painted.title);
         assert!(
-            chat.notes_report(AgentId::ROOT, 0, 34).is_empty(),
+            chat.notes_report(AgentId::ROOT, 0, 34).rows.is_empty(),
             "and there is in fact nothing to read"
         );
 
@@ -2070,7 +2269,7 @@ mod tests {
         let at = chat.notices_for(AgentId(1)).next().expect("the hint").at;
 
         // Narrow enough to wrap the hint into several list rows.
-        let rows = chat.notes_report(AgentId(1), at, 20);
+        let rows = chat.notes_report(AgentId(1), at, 20).rows;
         assert!(rows.len() > 2, "the long line wraps: {rows:?}");
         assert!(rows[0].starts_with("0s · could not"), "{:?}", rows[0]);
         assert!(
@@ -2087,7 +2286,7 @@ mod tests {
             "and wrapped whole instead of being clipped: {rows:?}"
         );
         assert!(
-            chat.notes_report(AgentId(2), at, 20).is_empty(),
+            chat.notes_report(AgentId(2), at, 20).rows.is_empty(),
             "and it is one agent's list, not every agent's (finding B19)"
         );
     }
@@ -2113,7 +2312,7 @@ mod tests {
         // `ui::picker_text_width` (a 40-column terminal and an 80-column one),
         // which is what makes this the real painted width and not a stand-in.
         for width in [34usize, 46, 74] {
-            let rows = chat.notes_report(AgentId(1), at, width);
+            let rows = chat.notes_report(AgentId(1), at, width).rows;
             assert!(
                 rows.iter().any(|row| row.contains("tango")),
                 "the tail of the note survives at {width}: {rows:?}"
@@ -2154,6 +2353,107 @@ mod tests {
             chat.stored_notices().len(),
             0,
             "a forgotten failure is not written to the session either"
+        );
+    }
+
+    /// One line said five times is one line with a count: an empty reply on five
+    /// consecutive turns is one fact about the run, and printing it five times
+    /// spent the foot — the rows the conversation was supposed to have — on one
+    /// sentence (finding U8).
+    #[test]
+    fn a_line_said_again_and_again_collapses_into_one_with_a_count() {
+        let mut chat = Chat::bare();
+        for _ in 0..5 {
+            chat.note_for(AgentId::ROOT, "model produced an empty reply");
+        }
+        let notices: Vec<&Notice> = chat.notices_for(AgentId::ROOT).collect();
+        assert_eq!(notices.len(), 1, "five turns, one line");
+        assert_eq!(notices[0].count, 5, "and it says how many");
+        // The count is not a field for a test's benefit: it is what the pane
+        // and `/notes` read, and it must not hide that it happened five times.
+        let at = notices[0].at;
+        assert_eq!(
+            chat.notes_report(AgentId::ROOT, at, 40).rows,
+            vec!["0s · model produced an empty reply ×5".to_string()]
+        );
+        let lines = chat.painted(&pane(AgentId::ROOT), 40, 4).lines;
+        assert!(
+            shown(&lines).join("\n").contains("×5"),
+            "the foot says it once, with the count: {:?}",
+            shown(&lines)
+        );
+
+        // A different line in between means two moments, not repeats: the
+        // collapse is about the same line *in a row*.
+        chat.note_for(AgentId::ROOT, "could not compact");
+        chat.note_for(AgentId::ROOT, "model produced an empty reply");
+        assert_eq!(
+            chat.notices_for(AgentId::ROOT).count(),
+            3,
+            "the same words after another line are a new line"
+        );
+    }
+
+    /// A failure is the run's record and outlives the moment; a hint is the
+    /// moment, and the human's next act ends it. `/notes` reads the same list,
+    /// so a line that has ended is gone from there too — one answer to "what
+    /// does this pane still have to say" (finding U8).
+    #[test]
+    fn the_human_s_next_act_ends_the_chatter_and_keeps_the_failure() {
+        let mut chat = Chat::bare();
+        chat.note_for(AgentId(1), "opened notes.txt");
+        chat.note_for(AgentId::ROOT, "merged mush/1 into HEAD");
+        chat.note_error_for(AgentId(1), "no route to host");
+
+        assert!(chat.dismiss_said(), "there was chatter to end");
+        assert_eq!(
+            chat.notices_for(AgentId(1))
+                .map(|notice| notice.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["no route to host"],
+            "the child's failure is not the child's chatter"
+        );
+        assert_eq!(
+            chat.notices_for(AgentId::ROOT).count(),
+            0,
+            "and every agent's chatter goes, not only the focused one's"
+        );
+        assert!(!chat.dismiss_said(), "and there is nothing left to end");
+        assert_eq!(
+            chat.stored_notices().len(),
+            1,
+            "the failure is still the line the session keeps"
+        );
+    }
+
+    /// The clock is the fallback for a human who does nothing: `SAID_TTL` ends
+    /// the chatter with no key pressed at all, which is the half of the finding
+    /// that neither the next run nor the next send covers. A failure has no
+    /// such clock — the bar keeps its red line until something replaces it, and
+    /// so does the pane.
+    #[test]
+    fn chatter_expires_on_its_clock_and_a_failure_does_not() {
+        let mut chat = Chat::bare();
+        chat.note_for(AgentId::ROOT, "reply cut off at 20480 tokens");
+        chat.note_error_for(AgentId::ROOT, "no route to host");
+        let now = chat.notices_for(AgentId::ROOT).next().expect("the hint").at;
+
+        assert!(
+            !chat.expire_said(now + SAID_TTL - 1),
+            "a line still inside its moment is still there"
+        );
+        assert_eq!(chat.notices_for(AgentId::ROOT).count(), 2);
+        assert!(chat.expire_said(now + SAID_TTL), "and then it is not");
+        assert_eq!(
+            chat.notices_for(AgentId::ROOT)
+                .map(|notice| notice.text.as_str())
+                .collect::<Vec<_>>(),
+            vec!["no route to host"],
+            "the failure outlives any clock"
+        );
+        assert!(
+            !chat.expire_said(u64::MAX),
+            "and no later moment takes it either"
         );
     }
 

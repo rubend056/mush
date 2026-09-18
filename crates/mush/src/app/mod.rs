@@ -99,7 +99,15 @@ impl Picker {
         match self.kind {
             PickerKind::Model => " models · Enter picks ".to_string(),
             PickerKind::Provider => " provider · Enter picks ".to_string(),
-            PickerKind::Notes => " notes · newest last ".to_string(),
+            PickerKind::Notes => format!(
+                // The position is part of the title because the list opens in
+                // the middle of a long note (see `open_notes_picker`): without
+                // it, a popup whose head is above the fold looks like the whole
+                // note, and nothing says a keypress reads the rest.
+                " notes · newest last · line {}/{} ",
+                self.cursor + 1,
+                self.items.len()
+            ),
         }
     }
 
@@ -626,6 +634,13 @@ impl App {
                 self.dirty_screen = true;
             }
         }
+        // The same expiry for the pane's own transient lines, on the same tick:
+        // a command's answer or a hint that nobody ended by acting must not sit
+        // in the foot for the life of the session (finding U8). Failures are not
+        // chatter and are never taken away here.
+        if self.chat.expire_said(session::now_secs()) {
+            self.dirty_screen = true;
+        }
         // A `⊘` whose acknowledgement never arrives leaves a row spinning
         // forever, which is worse than an idle one (finding B6).
         if self.tree.expire_cancels() {
@@ -950,6 +965,18 @@ impl App {
 
     // ------------------------------------------------------------- chat / LLM
 
+    /// The human's next act ends the moment the last chatter line answered
+    /// (finding U8): a `/help`, a diff or a hint was about the thing they typed
+    /// *before* this one, and leaving it in the foot spends rows on a question
+    /// nobody is asking any more. Failures stay — they are the run's record, not
+    /// a moment's — and so does the pane's red line, which is the bar's copy of
+    /// the same fact.
+    fn ends_the_moment(&mut self) {
+        if self.chat.dismiss_said() {
+            self.dirty_screen = true;
+        }
+    }
+
     /// Send what is in the message box: a command to run, or a message for the
     /// focused agent.
     ///
@@ -962,7 +989,15 @@ impl App {
         if text.is_empty() {
             return;
         }
-        match commands::parse_command(&text) {
+        let parsed = commands::parse_command(&text);
+        // `/notes` is the reader of the chatter lines, not the act that
+        // supersedes them: a human asking for the rest of the foot is reading
+        // it, and dismissing what they came to read would make the pane's
+        // `+N more · /notes` point at nothing (see `ends_the_moment`).
+        if !matches!(&parsed, Ok(Command::Notes)) {
+            self.ends_the_moment();
+        }
+        match parsed {
             Ok(command) => self.apply_command(command),
             // No slash: the human is talking to an agent.
             Err(CommandError::NotACommand) => self.deliver(text),
@@ -1255,8 +1290,11 @@ impl App {
     /// The foot shows at most two of them, so this is the other half of that
     /// cap: a list where a long line is wrapped rather than clipped, which is
     /// what `/help` and a multi-line failure need. Newest last, the same order
-    /// the pane reads in, with the cursor on it — the newest is what the human
-    /// came back for.
+    /// the pane reads in, and the cursor opens on the *head of the newest* note
+    /// rather than on the list's last row: a note longer than the popup wraps
+    /// into many rows, and its last row is the middle of a sentence with the
+    /// stamp that says when it happened above the fold (finding T7). One
+    /// keypress down from there reads the rest of it.
     fn open_notes_picker(&mut self) {
         let agent = self.tree.focused;
         // Wrapped for the popup this terminal actually paints: the width comes
@@ -1264,16 +1302,15 @@ impl App {
         // the list instead of being clipped by it (`picker_text_width` says
         // what).
         let width = crate::ui::picker_text_width(self.term_width);
-        let items = self.chat.notes_report(agent, session::now_secs(), width);
-        if items.is_empty() {
+        let notes = self.chat.notes_report(agent, session::now_secs(), width);
+        if notes.rows.is_empty() {
             self.say(format!("nothing written about #{agent} yet"));
             return;
         }
-        let cursor = items.len() - 1;
         self.picker = Some(Picker {
             kind: PickerKind::Notes,
-            items,
-            cursor,
+            items: notes.rows,
+            cursor: notes.newest,
         });
     }
 
@@ -1401,9 +1438,7 @@ impl App {
         // The read is the one verb that changes nothing, so it goes first: it
         // is the answer to "what would merging this do".
         if verb == Verb::Diff {
-            let text = format!("git diff HEAD...{branch}");
-            self.say(text.clone());
-            self.chat.note(text);
+            self.paint_diff(id, &branch);
             return;
         }
         if busy {
@@ -1475,6 +1510,86 @@ impl App {
                 }
             }
         }
+    }
+
+    /// `/diff`: run the diff of an isolated agent's work against HEAD and paint
+    /// it, instead of naming the command and leaving the human to type it. The
+    /// old answer was the command and nothing else — a transcript whose only
+    /// reply to "what did this agent do" was `· git diff HEAD...mush/2`, which
+    /// is an instruction, not an answer (finding T9).
+    ///
+    /// The shapes, because a diff can be enormous:
+    ///
+    /// * The **bar** gets the one-glance line — the stat, or "nothing changed"
+    ///   — because a bar row is one row.
+    /// * The **transcript** gets the diff itself, capped at `cmd_cap()` bytes
+    ///   of whole lines, head first, with a last row naming the command that
+    ///   reads the rest. That is the cap idiom the tool results already keep
+    ///   (`READ_CAP`, `CMD_CAP`, and the eight rows one result is painted
+    ///   with): git's output is not special, and a branch that touched a
+    ///   lockfile can print more diff than every conversation in the session.
+    /// * The **model** gets nothing. `/diff` is the human's command: its answer
+    ///   goes to `Chat`'s notices, never to the messages that are sent, so no
+    ///   tokens are spent and there is no model-facing shape to pick. A model
+    ///   that wants a diff has `run_command`.
+    ///
+    /// An empty diff says so. `branch` at HEAD is a fact about the work —
+    /// nothing changed — and silence would leave the human unable to tell it
+    /// from a command that did not run.
+    fn paint_diff(&mut self, id: AgentId, branch: &str) {
+        let root = self.ws.root().to_path_buf();
+        let command = format!("git diff HEAD...{branch}");
+        // Both names are resolved to commits before git reads them, for the same
+        // reason `git::branch_stat` does it: a branch name is untrusted input,
+        // and one beginning with `-` would be taken by `diff` as an option.
+        let resolve = |name: &str| {
+            git::run(
+                &root,
+                &["rev-parse", "--verify", &format!("{name}^{{commit}}")],
+            )
+        };
+        let (Ok(base), Ok(tip)) = (resolve("HEAD"), resolve(branch)) else {
+            // The branch a node names can be gone — a hand-run `git branch -d`,
+            // a worktree git pruned — and the honest answer is git's own, not a
+            // diff against a name that does not resolve.
+            self.fail(format!(
+                "cannot diff {branch}: it does not resolve to a commit — {command}"
+            ));
+            return;
+        };
+        let range = format!("{base}...{tip}");
+        let stat = match git::run(&root, &["diff", "--shortstat", &range]) {
+            Ok(text) => git::parse_shortstat(&text).unwrap_or_default(),
+            Err(error) => {
+                self.fail(format!("cannot diff {branch}: {error}"));
+                return;
+            }
+        };
+        let diff = match git::run(&root, &["diff", &range]) {
+            Ok(text) => text,
+            Err(error) => {
+                self.fail(format!("cannot diff {branch}: {error}"));
+                return;
+            }
+        };
+        let summary = format!("#{id} {branch} {}", stat.compact());
+        if diff.is_empty() {
+            self.say(format!("{summary} — nothing changed"));
+            self.chat
+                .note(format!("{command} — nothing changed; {branch} is at HEAD"));
+            return;
+        }
+        let (head, elided) = head_lines(&diff, self.cfg().cmd_cap());
+        let mut note = format!("{summary} · {command}");
+        note.push('\n');
+        note.push_str(&head);
+        if elided > 0 {
+            note.push_str(&format!(
+                "\n[+{elided} more lines — {command} reads the rest]"
+            ));
+        }
+        self.say(summary);
+        self.chat.note(note);
     }
 
     /// `/compact`: ask the focused agent to fold its conversation into a
@@ -1950,6 +2065,52 @@ impl Drop for App {
     }
 }
 
+/// The head of a long text, in whole lines and at most `max` bytes, with how
+/// many lines were left out.
+///
+/// Whole lines because a diff is read as rows: half a hunk header is not a
+/// shorter diff, it is a broken one. Bytes because that is the cap the other
+/// tool results keep ([`Config::cmd_cap`]), which is what makes `/diff`'s answer
+/// the same size of thing as a `run_command` result instead of a rule of its
+/// own. A single line longer than the whole cap is cut at a char boundary — one
+/// minified file is one line, and it must not be able to fill the transcript
+/// either.
+fn head_lines(text: &str, max: usize) -> (String, usize) {
+    /// The longest prefix that is at most `max` bytes and ends on a char
+    /// boundary: a truncated UTF-8 glyph in a transcript is worse than a
+    /// shorter row.
+    fn char_head(text: &str, max: usize) -> &str {
+        if text.len() <= max {
+            return text;
+        }
+        let mut end = max;
+        while end > 0 && !text.is_char_boundary(end) {
+            end -= 1;
+        }
+        &text[..end]
+    }
+
+    let lines: Vec<&str> = text.lines().collect();
+    let mut kept = String::new();
+    for line in &lines {
+        // The newline between two kept rows is part of the budget: `max` is a
+        // byte count of what is handed on, not of the rows' text alone.
+        let next = line.len() + usize::from(!kept.is_empty());
+        if kept.len() + next > max {
+            break;
+        }
+        if !kept.is_empty() {
+            kept.push('\n');
+        }
+        kept.push_str(line);
+    }
+    if kept.is_empty() && !lines.is_empty() {
+        kept = char_head(lines[0], max).to_string();
+    }
+    let kept_lines = kept.lines().count();
+    (kept, lines.len().saturating_sub(kept_lines))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2305,6 +2466,169 @@ mod tests {
             .unwrap();
         assert_eq!(node.landed, None);
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `/diff` runs the diff and paints it. The old arm printed the command it
+    /// *would* have run — a transcript whose only answer to "what did this agent
+    /// do" was `· git diff HEAD...mush/1`, which is an instruction, not an
+    /// answer (finding T9).
+    #[test]
+    fn the_diff_command_runs_the_diff_and_paints_it() {
+        let root = repo("diff");
+        isolated_work(&root, 1, "add the parser");
+        let mut app = app_at(root.clone());
+
+        run(&mut app, "/diff 1");
+
+        // The bar got the one-glance line, in the vocabulary the row uses.
+        assert_eq!(text_of(&app), "#1 mush/1 +1−0");
+        let note = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .next()
+            .map(|notice| notice.text.clone())
+            .expect("the diff is the answer");
+        assert!(
+            note.starts_with("#1 mush/1 +1−0 · git diff HEAD...mush/1\n"),
+            "the answer names the work and the command that would re-read it: {note:?}"
+        );
+        assert!(
+            note.contains("diff --git a/work.txt b/work.txt") && note.contains("+the work"),
+            "and the diff itself is painted, not named: {note:?}"
+        );
+        // The model pays nothing for a command the human typed: this is a
+        // notice, not a message, and notices are never sent anywhere.
+        assert!(
+            app.chat.transcript(AgentId::ROOT).is_empty(),
+            "the diff is the human's reading, not a turn"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A branch with nothing on it is a fact — the work is at HEAD — and saying
+    /// nothing would be indistinguishable from a command that did not run.
+    #[test]
+    fn a_diff_with_nothing_to_show_says_so() {
+        let root = repo("diff-empty");
+        let worktree = git::worktree_path(&root, 3);
+        std::fs::create_dir_all(root.join(".mush")).unwrap();
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                worktree.to_str().unwrap(),
+                "-b",
+                &git::branch_name(3),
+            ],
+        );
+        let mut app = app_at(root.clone());
+
+        run(&mut app, "/diff 3");
+
+        assert_eq!(text_of(&app), "#3 mush/3 ±0 — nothing changed");
+        let note = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .next()
+            .map(|notice| notice.text.clone())
+            .expect("an answer either way");
+        assert!(
+            note.contains("nothing changed") && note.contains("mush/3 is at HEAD"),
+            "an empty diff is still an answer: {note:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A diff can be enormous — a branch that touched a lockfile prints more
+    /// than the whole session — so it is capped like every other tool result:
+    /// whole lines, the head kept, and one row saying what was left out and how
+    /// to read it.
+    #[test]
+    fn a_huge_diff_is_capped_and_says_what_it_dropped() {
+        let root = repo("diff-huge");
+        isolated_work(&root, 2, "a big change");
+        let worktree = git::worktree_path(&root, 2);
+        let body: String = (0..800).map(|line| format!("line {line}\n")).collect();
+        std::fs::write(worktree.join("big.txt"), body).unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-qm", "big"]);
+        let mut app = app_at(root.clone());
+
+        run(&mut app, "/diff 2");
+
+        let note = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .next()
+            .map(|notice| notice.text.clone())
+            .expect("the diff is the answer");
+        assert!(
+            note.contains("+line 0") && note.contains("diff --git a/big.txt"),
+            "the head of the diff is what is kept: {:?}",
+            &note[..note.len().min(200)]
+        );
+        assert!(
+            !note.contains("+line 799"),
+            "and the tail is what is dropped"
+        );
+        let marker = note.lines().last().expect("a last row");
+        assert!(
+            marker.starts_with("[+") && marker.ends_with("reads the rest]"),
+            "one row says how much is left and how to read it: {marker:?}"
+        );
+        assert!(
+            note.len() <= app.cfg().cmd_cap() + 200,
+            "the cap is the tool-result cap, not a shape of its own: {} bytes",
+            note.len()
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A node can name a branch git no longer has — a leftover restored with a
+    /// name the human deleted by hand — and the honest answer is git's own
+    /// complaint, not a diff against a revision that does not resolve.
+    #[test]
+    fn a_diff_of_a_branch_git_no_longer_has_fails_honestly() {
+        let root = repo("diff-gone");
+        let mut app = app_at(root.clone());
+        app.tree.insert(Spawn {
+            id: AgentId(7),
+            parent: AgentId::ROOT,
+            brief: "work that left".to_string(),
+            depth: 1,
+            branch: Some("mush/7".to_string()),
+            cmd: crossbeam_channel::unbounded().0,
+        });
+
+        run(&mut app, "/diff 7");
+
+        assert!(
+            text_of(&app).contains("cannot diff mush/7"),
+            "the failure names the branch that could not be read: {}",
+            text_of(&app)
+        );
+        assert!(
+            app.chat.notices_for(AgentId::ROOT).next().is_none(),
+            "and nothing was written as if a diff had been read"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The cap is on bytes of whole lines, and it never cuts a glyph in half:
+    /// one minified file is one line, and half a UTF-8 sequence in a transcript
+    /// is worse than a shorter row.
+    #[test]
+    fn a_long_text_is_cut_at_whole_lines_and_on_a_char_boundary() {
+        let text = "alpha\nbravo\ncharlie\n";
+        assert_eq!(head_lines(text, 100), (text.trim_end().to_string(), 0));
+        assert_eq!(head_lines(text, 11), ("alpha\nbravo".to_string(), 1));
+        assert_eq!(head_lines(text, 5), ("alpha".to_string(), 2));
+        assert_eq!(head_lines("", 10), (String::new(), 0));
+        // Two two-byte glyphs, one byte short of a third: the boundary is what
+        // decides, not the count.
+        assert_eq!(head_lines("εεεε", 5), ("εε".to_string(), 0));
     }
 
     /// `/forget` drops the conversation, not the work: the branch survives, so
@@ -3469,6 +3793,7 @@ mod tests {
         assert!(
             app.chat
                 .notes_report(AgentId::ROOT, session::now_secs(), 74)
+                .rows
                 .is_empty(),
             "nothing has been written about a fresh conversation"
         );
@@ -3498,6 +3823,59 @@ mod tests {
             "oldest first, like the pane"
         );
         assert_eq!(picker.cursor, 4, "the cursor opens on the newest");
+    }
+
+    /// A note longer than the popup must not drop the human mid-sentence: the
+    /// list opens on the head of the newest note — the row that carries when it
+    /// happened and how it started — not on its last row (finding T7).
+    #[test]
+    fn the_notes_popup_opens_on_the_head_of_the_newest_note() {
+        let (mut app, _rx) = test_app("notes-head");
+        // Old enough to have a stamp, short enough to be one row.
+        app.chat.note_for(AgentId::ROOT, "opened notes.txt");
+        // The newest note, long enough to wrap into several rows at the width
+        // the popup is painted at.
+        app.chat.note_for(
+            AgentId::ROOT,
+            "the run failed while folding the transcript: the endpoint returned 503 \
+             for the third summarisation attempt, and the fold was abandoned with the \
+             conversation left half-written, so read the tail of the transcript before \
+             trusting anything above it",
+        );
+
+        let _ = screen(&mut app, 80, 24);
+        run(&mut app, "/notes");
+        let picker = app.picker.as_ref().expect("the lines mush wrote");
+        assert!(
+            picker.items.len() > 3,
+            "the newest note wraps, which is the case this is about: {:?}",
+            picker.items
+        );
+        assert!(
+            picker.cursor < picker.items.len() - 1,
+            "the cursor is not on the last row, which is mid-sentence: {:?}",
+            picker.items
+        );
+        assert_eq!(
+            picker.items[picker.cursor], "0s · the run failed while folding the",
+            "it opens on the head of the newest note, stamp included"
+        );
+        assert!(
+            picker.items[..picker.cursor]
+                .iter()
+                .any(|row| row.contains("opened notes.txt")),
+            "and the older note is above it, not scrolled away: {:?}",
+            picker.items
+        );
+        let title = picker.title();
+        assert!(
+            title.contains(&format!(
+                "line {}/{}",
+                picker.cursor + 1,
+                picker.items.len()
+            )),
+            "the title says where in the list the cursor is: {title}"
+        );
     }
 
     /// `/notes` is the escape hatch for the lines the foot ceded, so it has to
@@ -3546,6 +3924,93 @@ mod tests {
         assert!(
             rows.contains("Tab cycles panes · Enter sends"),
             "and the hints under it still get their rows: {rows}"
+        );
+    }
+
+    /// A send ends the chatter the last command left in the foot: `/help` and a
+    /// diff answer the thing the human typed *before* this message, and leaving
+    /// them there spends the pane's rows on a question nobody is asking any more
+    /// (finding U8). A failure is not a moment and survives the send.
+    #[test]
+    fn sending_the_next_message_ends_the_last_command_answer() {
+        let (mut app, _rx) = test_app("chatter-send");
+        run(&mut app, "/help");
+        app.chat.note_error_for(AgentId::ROOT, "first failure");
+        assert_eq!(
+            app.chat.notices_for(AgentId::ROOT).count(),
+            2,
+            "the bar line and the pane's list both exist"
+        );
+
+        app.chat.insert("carry on");
+        app.send_message();
+
+        let left: Vec<&str> = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .map(|notice| notice.text.as_str())
+            .collect();
+        assert_eq!(
+            left,
+            vec!["first failure"],
+            "the chatter went and the failure stayed: {left:?}"
+        );
+        assert!(
+            app.chat
+                .transcript(AgentId::ROOT)
+                .iter()
+                .any(|message| message.role == "user"),
+            "and the message itself was still sent"
+        );
+    }
+
+    /// `/notes` reads the chatter instead of superseding it: dismissing on the
+    /// way in would make the pane's own `+N more · /notes` point at nothing,
+    /// which is the half of finding U8 the command exists to answer.
+    #[test]
+    fn asking_for_the_notes_does_not_throw_them_away() {
+        let (mut app, _rx) = test_app("chatter-notes");
+        app.chat.note_for(AgentId::ROOT, "opened notes.txt");
+
+        app.chat.insert("/notes");
+        app.send_message();
+
+        assert!(app.picker.is_some(), "the list opened");
+        assert_eq!(
+            app.chat.notices_for(AgentId::ROOT).count(),
+            1,
+            "and it had the line it came to read"
+        );
+    }
+
+    /// The clock, on the tick that already expires the bar's own transient line:
+    /// a hint read once and then left on the screen must not outlive its moment,
+    /// because the agent it answers may never run again (finding U8).
+    #[test]
+    fn a_transient_line_leaves_the_foot_without_a_run() {
+        let (mut app, _rx) = test_app("chatter-clock");
+        app.chat.note_for(AgentId::ROOT, "opened notes.txt");
+        app.chat.note_error_for(AgentId::ROOT, "no route to host");
+
+        app.tick();
+        assert_eq!(
+            app.chat.notices_for(AgentId::ROOT).count(),
+            2,
+            "a line inside its moment is still there"
+        );
+
+        app.chat.age_notices(600);
+        app.tick();
+
+        let left: Vec<&str> = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .map(|notice| notice.text.as_str())
+            .collect();
+        assert_eq!(
+            left,
+            vec!["no route to host"],
+            "the tick took the chatter and left the failure: {left:?}"
         );
     }
 
