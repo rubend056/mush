@@ -633,6 +633,11 @@ struct ActorState {
     /// A `Stop` arrived with the work this actor is about to start; the run it
     /// points at is born cancelled (finding B6).
     stop_requested: bool,
+    /// How many identical rounds the previous run repeated before the loop
+    /// guard stopped it. The next run opens by saying so, so a nudge can
+    /// resume the agent instead of repeating the call that stopped it
+    /// (finding H14).
+    loop_stop: Option<usize>,
 }
 
 /// One child's run ending, as its parent keeps it: which run it was, and how it
@@ -1461,6 +1466,27 @@ fn ask(
     )
 }
 
+/// One round of the loop guard: did this batch repeat the last one, and does
+/// that make the run a loop?
+///
+/// A batch that asked for something and was *refused* before anything ran is
+/// not a repeat — nothing happened, so nothing is being repeated, and counting
+/// it is what killed a fixer and an integrator whose only crime was retrying a
+/// locked machine (finding H13). A refusal also clears the count: rounds that
+/// did run before it are not evidence about this one.
+fn count_round(last_batch: &mut String, repeats: &mut usize, batch: &str, refused: bool) {
+    if batch == last_batch {
+        if refused {
+            *repeats = 0;
+        } else {
+            *repeats += 1;
+        }
+    } else {
+        *repeats = 0;
+        *last_batch = batch.to_string();
+    }
+}
+
 /// One run: model turns → tool calls → results, until the model answers.
 fn run_loop(
     actor: &Actor,
@@ -1469,6 +1495,23 @@ fn run_loop(
     cancel: &Arc<AtomicBool>,
 ) -> Result<Option<String>, String> {
     let schemas = tool_schemas(actor);
+    // A run that follows a loop-stop opens with the guard's own words: the one
+    // fact that lets the model do something different instead of repeating the
+    // call that stopped the last run. Without it, a nudge did exactly what the
+    // row promised and the guard stopped it again, so a resumable agent was not
+    // (finding H14).
+    if let Some(count) = state.loop_stop.take() {
+        push_line(
+            actor,
+            messages,
+            format!(
+                "Your previous run was stopped as a loop: the same tool call repeated {count} \
+                 times with nothing changed in between. Do not repeat that call — change what \
+                 you do (different arguments, a different approach, or a wait for whatever it \
+                 was blocked on), or finish the run and say what you need."
+            ),
+        );
+    }
     // One learning attempt per run: a context-limit complaint teaches the
     // window, anything else is the run's error.
     let mut learned_context = false;
@@ -1477,6 +1520,9 @@ fn run_loop(
     // progress, not a turn count.
     let mut last_batch = String::new();
     let mut repeats = 0usize;
+    // Whether the batch just run was refused before anything ran — the one
+    // thing the guard must not read as a model repeating itself (finding H13).
+    let mut refused_round = false;
     // Consecutive replies the endpoint cut off at the token cap.
     let mut cut_offs = 0usize;
     // What the endpoint itself counted, when it says: the UI's meter is an
@@ -1711,18 +1757,15 @@ fn run_loop(
         // The same batch of calls, twice in a row with nothing changed in
         // between, means the model is repeating itself rather than working.
         // This — not a turn count — is the honest reason to stop a run early.
+        // A batch the machine *refused* is the exception: nothing ran, so
+        // nothing is repeating (finding H13).
         if !tool_calls.is_empty() {
             let batch = tool_calls
                 .iter()
                 .map(|call| format!("{}:{}", call.function.name, call.function.arguments))
                 .collect::<Vec<_>>()
                 .join("\n");
-            if batch == last_batch {
-                repeats += 1;
-            } else {
-                repeats = 0;
-                last_batch = batch;
-            }
+            count_round(&mut last_batch, &mut repeats, &batch, refused_round);
             if repeats >= LOOP_ROUNDS {
                 for call in &tool_calls {
                     let message = Message::tool(
@@ -1740,6 +1783,10 @@ fn run_loop(
                          anything — stopping it as a loop"
                     )),
                 );
+                // The next run starts with the guard's own words, so a nudge
+                // can actually resume: without them the model repeats the call
+                // that stopped it and is stopped again (finding H14).
+                state.loop_stop = Some(count);
                 return Err(format!(
                     "the run was stopped as a loop: the same tool call repeated {count} times \
                      with nothing changed in between"
@@ -1807,6 +1854,11 @@ fn run_loop(
         // Every call in a batch must be answered, or the transcript keeps an
         // assistant message whose tool calls dangle — which most servers then
         // reject for the rest of the conversation.
+        //
+        // Whether every call in this batch was refused *before it ran* is the
+        // loop guard's business (H13), so it is collected as the batch runs and
+        // handed to the next round's guard.
+        let mut all_refused = true;
         for (index, call) in tool_calls.iter().enumerate() {
             // Keep watching for a Stop/Shutdown between calls, and answer the
             // rest of the batch before leaving: a cancellation must not leave
@@ -1834,17 +1886,23 @@ fn run_loop(
 
             let result = match tool {
                 Some(tool) => exec_tool(actor, state, tool, &args, cancel),
-                None => Err(format!("unknown tool `{named}`")),
+                None => Err(ToolError::Failed(format!("unknown tool `{named}`"))),
             };
 
-            let output = match result {
-                Ok(output) => output,
-                Err(error) => format!("error: {error}"),
+            let (output, refused) = match result {
+                Ok(output) => (output, false),
+                Err(ToolError::Refused(why)) => (format!("error: {why}"), true),
+                Err(ToolError::Failed(error)) => (format!("error: {error}"), false),
             };
+            // Every call in this batch refused before it ran: the round counts
+            // as nothing attempted, which is what keeps the loop guard from
+            // condemning a model waiting on a locked machine (H13).
+            all_refused &= refused;
             let tool_message = Message::tool(call.id.clone(), output);
             messages.push(tool_message.clone());
             actor.ctx.emit(actor.id, AgentEvent::Message(tool_message));
         }
+        refused_round = all_refused;
         // Fold mailbox commands in at the message boundary, and honour a
         // cancellation now that every call has a result.
         drain_mailbox(actor, cancel, messages, state);
@@ -2353,15 +2411,37 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
     news
 }
 
+/// Why a tool call produced no result.
+///
+/// `Refused` is the machine saying *not now* — the lock is held, the job budget
+/// is full — so nothing ran and nothing changed. `Failed` is the call itself
+/// going wrong. The loop guard reads the difference: a batch of refusals is not
+/// a model repeating itself, and counting it as one killed an integrator and a
+/// fixer whose only mistake was retrying a locked machine (finding H13).
+#[derive(Debug)]
+enum ToolError {
+    Refused(String),
+    Failed(String),
+}
+
+impl From<String> for ToolError {
+    fn from(error: String) -> Self {
+        ToolError::Failed(error)
+    }
+}
+
 fn exec_tool(
     actor: &Actor,
     state: &mut ActorState,
     tool: ToolName,
     args: &Value,
     cancel: &AtomicBool,
-) -> Result<String, String> {
-    match tool {
-        ToolName::RunCommand => run_command(actor, state, args, cancel),
+) -> Result<String, ToolError> {
+    // `run_command` is the one tool that can be refused before anything runs
+    // (the machine lock, the job budget), so it returns the verdict itself;
+    // every other tool either ran or failed.
+    let answer = match tool {
+        ToolName::RunCommand => return run_command(actor, state, args, cancel),
         ToolName::SpawnAgent => spawn_tool(actor, state, args),
         ToolName::WaitAgents => wait_tool(actor, state, cancel, args),
         ToolName::AgentStatus => status_tool(state),
@@ -2378,7 +2458,8 @@ fn exec_tool(
                 .unwrap_or_else(|_| Config::new("http://127.0.0.1:1", "", None));
             direct_tool(&actor.ws, tool, args, &cfg)
         }
-    }
+    };
+    answer.map_err(ToolError::Failed)
 }
 
 fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<String, String> {
@@ -2985,7 +3066,7 @@ fn run_command(
     state: &mut ActorState,
     args: &Value,
     cancel: &AtomicBool,
-) -> Result<String, String> {
+) -> Result<String, ToolError> {
     let command = args
         .get("command")
         .and_then(Value::as_str)
@@ -2999,17 +3080,18 @@ fn run_command(
     // Two decisions, both made *before* a process exists: whether this command
     // may use the machine at all (the lock), and whether a long one has
     // somewhere to go (the budget). A command that cannot be watched or may not
-    // run must never be started.
+    // run must never be started. Neither is a failure of the work, so both are
+    // `Refused` — the model is not looping when it asks again later (H13).
     if let Err(held) = registry.machine_free_for(actor.id) {
-        return Err(Refused::Machine(held).message(actor.id));
+        return Err(ToolError::Refused(Refused::Machine(held).message(actor.id)));
     }
     if detach && !registry.has_room() {
-        return Err(Refused::Budget.message(actor.id));
+        return Err(ToolError::Refused(Refused::Budget.message(actor.id)));
     }
     if exclusive {
         registry
             .take_machine(actor.id, command)
-            .map_err(|held| Refused::Machine(held).message(actor.id))?;
+            .map_err(|held| ToolError::Refused(Refused::Machine(held).message(actor.id)))?;
     }
     // `detach: true` asks for a job from the start: the model knows it started
     // a server, and waiting sixty seconds to be told so is not an answer. This
@@ -3107,11 +3189,14 @@ fn detach_now(
     actor: &Actor,
     registry: &Arc<jobs::Registry>,
     launch: jobs::Launch,
-) -> Result<u64, String> {
+) -> Result<u64, ToolError> {
     let command = launch.command.clone();
+    // A launch can be refused after the checks above — a sibling may have
+    // taken the lock in between — and that is the machine saying "not now",
+    // not the call going wrong (H13).
     let id = registry.launch(launch).map_err(|refused| {
         registry.release_machine(actor.id);
-        refused.message(actor.id)
+        ToolError::Refused(refused.message(actor.id))
     })?;
     actor.ctx.emit(
         actor.id,
@@ -3167,7 +3252,7 @@ fn run_shell(
     cancel: &AtomicBool,
     actor: &Actor,
     state: &mut ActorState,
-) -> Result<String, String> {
+) -> Result<String, ToolError> {
     let spawned = actor.ctx.machine.spawn(&ShellCommand { command, root })?;
     // From here to the end of the call the command is the registry's as much as
     // this actor's: quitting mush, a `Stop` and `/new` all reach it (finding
@@ -6300,7 +6385,11 @@ mod tests {
         // lock is that everyone else knows what to wait for.
         let held = actor.ctx.registry.machine_free_for(9).unwrap_err();
         let refusal = Refused::Machine(held).message(9);
-        assert_eq!(refusal, "#7 holds the machine; retry when it finishes");
+        assert!(refusal.starts_with("#7 holds the machine"), "{refusal}");
+        assert!(
+            refusal.contains("do not retry this call"),
+            "the refusal must not read as try-again-now (H13): {refusal}"
+        );
 
         // And the job gives it up when it ends, not before.
         assert_eq!(
@@ -8808,6 +8897,88 @@ mod tests {
             fs::read_to_string(root.join("notes.txt")).ok().as_deref(),
             Some(format!("turn {}", RUNAWAY_TURNS - 2).as_str()),
             "the last turn before the guard must have done its work"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A refused round is not a repeat: nothing ran, so nothing is being
+    /// repeated. Two agents died to a lock refusal counted as "the same call
+    /// with nothing changed in between" (finding H13), so this is the rule the
+    /// guard reads, tested on its own.
+    #[test]
+    fn a_refused_round_is_not_a_loop() {
+        let mut last = String::new();
+        let mut repeats = 0usize;
+        for _ in 0..LOOP_ROUNDS + 3 {
+            count_round(&mut last, &mut repeats, "run_command:{}", true);
+        }
+        assert_eq!(repeats, 0, "refusals never accumulate");
+        // The same batch that actually ran does accumulate and trips the guard.
+        for _ in 0..LOOP_ROUNDS {
+            count_round(&mut last, &mut repeats, "run_command:{}", false);
+        }
+        assert_eq!(repeats, LOOP_ROUNDS, "a real repeat still trips it");
+        // And a different batch starts over, refusals or not.
+        count_round(&mut last, &mut repeats, "read_file:{}", false);
+        assert_eq!(repeats, 0);
+    }
+
+    /// A run stopped as a loop can be resumed. The next run opens with the
+    /// guard's own words, so the model is told to change what it does instead
+    /// of repeating the call that stopped it — nudging a loop-stopped agent
+    /// used to re-stop it immediately and identically, which made the row's
+    /// promise to resume it unactionable (finding H14).
+    #[test]
+    fn a_loop_stopped_run_resumes_with_a_warning() {
+        let root = scratch_dir("loop-resume");
+        let mut scripted = Scripted::new();
+        for _ in 0..LOOP_ROUNDS + 1 {
+            scripted = scripted.calls(vec![tool_call(
+                "call",
+                "write_file",
+                json!({ "path": "same.txt", "content": "same" }),
+            )]);
+        }
+        let scripted = Arc::new(scripted.says("changed my approach"));
+        let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
+        cfg.context_tokens = 128_000;
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
+        let opening = || {
+            vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user("LOOP: keep writing the same file".to_string()),
+            ]
+        };
+        root_tx.send(AgentMsg::Run(opening())).unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| !seen.errors.is_empty()),
+            "the loop guard must stop the run: {seen:?}"
+        );
+        assert!(
+            seen.errors
+                .iter()
+                .any(|error| error.contains("stopped as a loop")),
+            "the run ends as a loop: {:?}",
+            seen.errors
+        );
+
+        // The nudge: a new run with the human's words. The model must be told
+        // why it was stopped before it is asked again.
+        root_tx.send(AgentMsg::Run(opening())).unwrap();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done > 0),
+            "the resumed run must finish: {seen:?}"
+        );
+        let asked = scripted.asked();
+        assert!(
+            asked
+                .last()
+                .unwrap()
+                .saw("previous run was stopped as a loop"),
+            "the resumed request must carry the guard's words"
         );
         let _ = fs::remove_dir_all(&root);
     }

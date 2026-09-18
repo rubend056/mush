@@ -36,9 +36,11 @@ pub fn system_prompt(root: &str) -> String {
          count: split by what is independent, not by how long you think it takes.\n\
          - Delegate independent, large, or context-heavy subtasks; do single edits and lookups yourself. \
          Prefer a few big delegations over many small ones.\n\
-         - wait_agents blocks until a child finishes and returns its summary; agent_status lists your \
-         children; agent_control stops or messages one. wait_agents with all=true waits for every \
-         child instead of the first.\n\
+         - wait_agents blocks until a child finishes: with no ids it returns the *first* one to finish, \
+         with all=true it waits for every child. Its answer hands over the full summary of a result \
+         you have not read; a result you already read comes back as a digest marked \"already read\". \
+         agent_status lists your children with a one-line digest each and an unread mark; \
+         agent_control stops or messages one.\n\
          - Ending your turn while children still run is fine: they keep working and you are woken with \
          their \"#N done: summary\" results as each finishes. Use wait_agents when you need a result \
          before you continue.\n\
@@ -199,19 +201,21 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::WaitAgents,
-            "Block until a child finishes, or the timeout expires; returns its id and summary.",
+            "Block until a child finishes. Returns an unread result's summary; an already-read one as \
+             a marked digest.",
             json!({
                 "type": "object",
                 "properties": {
-                    "ids": { "type": "array", "items": { "type": "integer" }, "description": "Child ids to wait for; empty means all." },
+                    "ids": { "type": "array", "items": { "type": "integer" }, "description": "Child ids. Empty means any child: the first finish." },
                     "timeout": { "type": "integer", "description": "Seconds to wait; 0 waits forever. Default 600." },
-                    "all": { "type": "boolean", "description": "Every result, not the first." }
+                    "all": { "type": "boolean", "description": "Every child, not just the first finish." }
                 }
             }),
         ),
         tool(
             ToolName::AgentStatus,
-            "Describe your children: running, finished, failed, or stopped (idle until messaged).",
+            "List your children and their state: a one-line digest per result, unread ones marked. A \
+             listing, not a delivery \u{2014} wait_agents hands summaries over.",
             json!({ "type": "object", "properties": {} }),
         ),
         tool(

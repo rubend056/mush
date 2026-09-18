@@ -50,6 +50,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 
+use mush_core::text::truncate;
 use mush_core::workspace::tail_for_model;
 use mush_core::CMD_CAP;
 
@@ -103,6 +104,11 @@ pub const CMD_OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
 
 /// How long a command may run as a tool call before it becomes a job.
 pub const CMD_DETACH_AFTER: Duration = Duration::from_secs(60);
+
+/// How much of the holder's command goes into a refusal sentence. The command
+/// can be a paragraph; a refusal is a line the model reads and acts on, and
+/// the part it needs is the start (finding H13).
+const REFUSAL_COMMAND_COLUMNS: usize = 60;
 
 /// `#c2` — a job's name, as the model and the human both read it. The `c` is
 /// what tells a command's id from an agent's at a glance.
@@ -435,9 +441,18 @@ impl Refused {
                  (wait_commands) or stop it (command_control stop) before starting another",
                 held.command
             ),
-            Refused::Machine(held) => {
-                format!("#{} holds the machine; retry when it finishes", held.agent)
-            }
+            // A sibling's lock. The one thing this must not read as is "try
+            // again now": retrying the identical call is what mush's own loop
+            // guard counts, and it killed two agents that only met a locked
+            // machine (finding H13). Who holds it, what they are running, and
+            // what to do instead — a wait, or nothing until it finishes.
+            Refused::Machine(held) => format!(
+                "#{} holds the machine with an exclusive command ({}); do not retry this \
+                 call — wait for it (wait_commands) or do other work and try once after \
+                 it finishes",
+                held.agent,
+                truncate(&held.command, REFUSAL_COMMAND_COLUMNS)
+            ),
             Refused::Budget => format!(
                 "cannot detach: {MAX_JOBS} commands are already running as jobs (the limit). \
                  Stop one with command_control, or wait for one with wait_commands."
@@ -1634,10 +1649,15 @@ mod tests {
         assert!(registry.machine_free_for(3).is_ok());
         let held = registry.machine_free_for(4).unwrap_err();
         assert_eq!(held.agent, 3);
-        assert_eq!(
-            Refused::Machine(held).message(4),
-            "#3 holds the machine; retry when it finishes"
-        );
+        // The words must not read as "try again now": a repeated identical
+        // call is what the loop guard counts, and two agents died to a lock
+        // refusal counted as a loop (finding H13). They name the holder, what
+        // it runs, and say not to retry.
+        let refusal = Refused::Machine(held).message(4);
+        assert!(refusal.starts_with("#3 holds the machine"), "{refusal}");
+        assert!(refusal.contains("cargo bench"), "{refusal}");
+        assert!(refusal.contains("do not retry this call"), "{refusal}");
+        assert!(refusal.contains("wait_commands"), "{refusal}");
         // Only the holder can release it: a release from anyone else is a no-op
         // rather than a way to unlock a sibling.
         registry.release_machine(4);

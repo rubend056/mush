@@ -299,10 +299,13 @@ fn normalize_url(url: &str) -> String {
 /// one-non-isolated-sibling limit, that stopping a child is not finishing it,
 /// that a command already runs in the workspace root, and — with jobs — what
 /// `detach` and `exclusive` promise). They grew from ~3.1 KB when those rules
-/// were made explicit, to ~3.6 KB when the `cd` rule joined them, and to ~5 KB
-/// when the machine's three tools did; the `schemas_fit_the_budget_reserve` test
-/// is what makes that a decision rather than a silent drift.
-pub const SCHEMA_TOKENS: usize = 1_700;
+/// were made explicit, to ~3.6 KB when the `cd` rule joined them, to ~5 KB
+/// when the machine's three tools did, and to ~5.1 KB when the delegation
+/// tools had to say what their answers mean (a listing digests a result, a
+/// wait hands an unread one over — findings H15 and the replay); the
+/// `schemas_fit_the_budget_reserve` test is what makes that a decision rather
+/// than a silent drift.
+pub const SCHEMA_TOKENS: usize = 1_750;
 
 impl Config {
     /// Built-in defaults with the `MUSH_*` environment applied.
@@ -1317,15 +1320,16 @@ mod tests {
 
     #[test]
     fn history_budget_fits_the_context_window() {
-        // 8192 tokens: the full reserve (1700 schemas + 2048 reply — a quarter
-        // of the window — + 200 margin) leaves 12_732 bytes of history. The
-        // schema reserve has grown three times, each time with the test and the
+        // 8192 tokens: the full reserve (1750 schemas + 2048 reply — a quarter
+        // of the window — + 200 margin) leaves 12_582 bytes of history. The
+        // schema reserve has grown four times, each time with the test and the
         // comment moved together: 1100 when the delegation contract became
-        // explicit, 1220 when the `cd` rule joined it, and 1700 when the
-        // machine's three tools did. See SCHEMA_TOKENS.
+        // explicit, 1220 when the `cd` rule joined it, 1700 when the machine's
+        // three tools did, and 1750 when the delegation tools had to say what
+        // their answers mean (H15 and the replay). See SCHEMA_TOKENS.
         let small = Config::new("http://x:1", "m", None);
         assert_eq!(small.context_tokens, DEFAULT_CONTEXT_TOKENS);
-        assert_eq!(small.history_budget(), 12_732);
+        assert_eq!(small.history_budget(), 12_582);
 
         // A big window leaves a much larger budget, and the reply's share of it
         // grows with the window: 128k reserves 32k for one reply.
@@ -1335,7 +1339,7 @@ mod tests {
             max_completion_tokens: false,
             ..small.clone()
         };
-        assert_eq!(big.history_budget(), 282_300);
+        assert_eq!(big.history_budget(), 282_150);
 
         // A tiny window shrinks the reserve to half the window instead of
         // ignoring it: history still gets 1536 bytes, and no cap — which has
