@@ -583,8 +583,8 @@ wave (landed in `58a309c`); `⬜` are still open and a `✅` says what it measur
 | D6 | `paint_diff` re-implements `git::commit`'s `rev-parse --verify ^{commit}` probe (`git.rs` keeps the one home). | ≈ −5 | ✅ (−3) |
 | D7 | `App::busy` and `App::working_agents` are two derivations of "own run or a job". One `in_flight(node)`; `tree.busy()` stays agent-only on purpose. | ≈ −3 | ✅ (+4) |
 | D8 | The `ChatRequest` shape and the thinking/reasoning knobs are built twice (`agent.rs` run loop and `compact_history`) — **and this copy is where the bug lives**: the fold sends `max_tokens` even on an endpoint configured for `max_completion_tokens`, and `compact_history` swallows a `Status`/`Malformed` as `Ok(())`, so compaction silently never happens there. | ≈ −10 | ✅ (+151, tests included) |
-| D9 | Two "elide cells from the right until they fit" loops (`ui.rs` `agents_title`, `facts_line`) — **deferred**: item 7's `Screen` refactor rewrites `ui.rs`, so this lands after B17. | ≈ −8 | ⬜ (the `Screen` wave) |
-| D10 | The `bar_rows` rule (`>= 24`) is written in the painter and again in the test helper `selected_rows`; one `ui::bar_rows(height)`. Same file, same deferral as D9. | ≈ −2 | ⬜ (the `Screen` wave) |
+| D9 | Two "elide cells from the right until they fit" loops (`ui.rs` `agents_title`, `facts_line`) — **deferred**: item 7's `Screen` refactor rewrites `ui.rs`, so this lands after B17. | ≈ −8 | ⬜ (`7e123e1` landed the `Screen`; ready for the next fix wave) |
+| D10 | The `bar_rows` rule (`>= 24`) is written in the painter and again in the test helper `selected_rows`; one `ui::bar_rows(height)`. Same file, same deferral as D9. | ≈ −2 | ⬜ (`7e123e1` landed the `Screen`; ready for the next fix wave) |
 
 ### The first review (after the `mush/39` integration, `0bd7e8a`)
 
@@ -686,6 +686,37 @@ own, on `e747bc3`):
    `What` cells — a `✅` edit left two-cell rows in a four-column table — so the
    queue of record no longer said what any of the four was. Repaired in the same
    commit as this table.
+
+---
+
+### The fifth review (after the M3 attach wave, `f29b352`)
+
+Confirmed sound, do not re-litigate: one wire type (`Request`/`Op` have one
+`encode` and one parser, and the CLI builds the same type, so a client cannot
+spell a field the parser reads differently); `App` stays the only effector (the
+socket thread only sends `Msg::Attach` with a one-shot `bounded(1)`); a bad line
+is answered from the socket thread and the connection survives; `id` is echoed on
+every reply and is `null` only when the line could not be parsed; `advance`
+(`(prior+1).max(lines)`) is the right shape for a stored counter; a stale socket
+file is cleared and rebound while a live one is refused and left in place;
+`Guard::drop` removes the file; `focus` reuses `focus_cursor_row`, the same path
+Enter takes; an `edit` conflicts rather than guessing for a stale base *within* a
+conversation; `edit send` restores `tree.focused`; quitting with a client
+connected exits 0 and removes the socket; `Msg::Attach` is drained inside one
+30 ms tick. Its four the attach wave owed are in `docs/findings.md` §6 (`A1`–`A8`);
+the structural ones:
+
+| # | What | Net | Status |
+|---|---|---|---|
+| R21 | **`attach_agents` is a second derivation of the row the painter already derives.** `app/mod.rs`'s roster re-computes `focused`, `children_working`, `title`, `branch` and the phase words with the same expressions `screen::agent_row` uses (`AgentRow`), while the roster's own doc claims it *is* "the roster the tree pane paints" — so H2a/H2b/H4's `unread`/`unread_children` must be added in both places or the claim becomes false. One home: serialize `screen::AgentRow` plus its wire-only extras (`worktree`, `summary`, `leftover`, `revision`). | ≈ −20 | ⬜ |
+| R22 | **"What a phase is called" is spelled three times in two modules, and both doc comments still point at `ui.rs`, which no longer derives anything.** M3 added `Phase::label`/`Phase::detail` (read only by the roster), H9 added `Phase::doing` (read only by the quit line) — which overlaps `label()` on *thinking/compacting/cancelling* and collapses `Stopped|Done|Failed` to `"idle"`, so the quit line can read `#0 idle + 1 job` — and the painter's words are `screen.rs`'s `phase_glyph`/`phase_detail`. Owner: `screen.rs` owns painted prose, `Phase` owns the machine name. `doing()` derives from `label()`/`detail()`; `phase_detail` composes from them instead of re-spelling the stems; fix the two stale `ui.rs` pointers. | ≈ −15 | ⬜ |
+| R23 | **The response body is an untyped `Value` whose keys are spelled in producer and consumer, and the consumer silently defaults a missing key** (`main.rs`'s `field()` returns `""`/`0`), so a rename is a silent blank rather than an error. (The writer/reader boundary is not duplication per §11; the silent default is the seam.) Return a `String` from `print_lines`/`print_agents` and test them against a real `handle_attach` body — which also closes `A3` and pins an untested function. | ±0 | ⬜ |
+| R24 | `attach_focus` asks "is #N in the tree?" twice: `tree.has(id)` then `point_cursor_at`'s ignored return value. They agree only because `rows()` paints every node; use the one return value. | ≈ −3 | ⬜ |
+
+A new `Phase::CutOff` breaks every exhaustive match on `Phase` — `label`, `detail`,
+`doing`, `phase_glyph`, `phase_detail`, `is_busy`, `waiting`, `compacting` and the
+`Phase ↔ StoredStatus` pair. That is the compiler doing its job, and it is one
+more reason R22 should land before the H2/H4 wave that adds the variant.
 
 ---
 
