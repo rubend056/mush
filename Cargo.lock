@@ -409,6 +409,7 @@ dependencies = [
  "mush-core",
  "ratatui",
  "rustls",
+ "serde",
  "serde_json",
  "tempfile",
  "unicode-segmentation",

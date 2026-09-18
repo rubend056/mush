@@ -289,17 +289,11 @@ const JOB_TITLE_COLUMNS: usize = 30;
 /// A `command` the model wrote can be thirty lines of heredoc with a
 /// `cd /w &&` in front of it, and the bar and the row's footer each have one
 /// row to name it in: what is left is the last clause of the first line
-/// (`cargo build` out of `cd /w && cargo build --release`), collapsed and
-/// bounded like an agent's title. One derivation, so the two surfaces cannot
-/// spell the same job differently.
+/// (`cargo build` out of `cd /w && cargo build --release`), collapsed by
+/// [`mush_core::text::first_line`] and bounded like an agent's title. One
+/// derivation, so the two surfaces cannot spell the same job differently.
 fn job_title(command: &str) -> String {
-    let first = command
-        .lines()
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let first = mush_core::text::first_line(command);
     let clause = first.rsplit("&&").next().unwrap_or(&first).trim();
     mush_core::text::truncate(clause, JOB_TITLE_COLUMNS)
 }
@@ -988,25 +982,25 @@ impl App {
             }
             AgentEvent::Error(error) => {
                 self.tree.fail(id, error.clone());
-                self.mark_session_dirty();
                 self.refresh_git();
-                // The durable half of the same fact: the row's `✗` is derived and
-                // dies with the next run, while this line is tagged, stamped and
-                // written to the session, so a restart still says what broke.
-                self.chat.note_error_for(id, error.clone());
-                // A failure is the third way a run can end, and it is the one
-                // that did not reach the bar: `Stopped` says so, `Failed` fell
-                // back to the idle hint, so the newest thing that had happened
-                // could be a crash under a line advertising Ctrl-P. A guard-stop
+                // Only the agent the human is reading needs the bar — another
+                // agent's failure is on its own row's `✗` and in its own pane's
+                // foot — and the sentence names the agent, which the foot's `!`
+                // line (already in front of the human) does not. A guard-stop
                 // is this same event (the runaway guard's `stopped after N
-                // turns…` is the run's error), so both are said here. Only the
-                // agent the human is reading needs the bar — another agent's
-                // failure is on its own row's `✗` and in its own pane's foot —
-                // and the sentence names the agent, which the foot's `!` line
-                // (already in front of the human) does not.
-                if id == self.tree.focused {
-                    self.fail(format!("agent #{id} failed — {error}"));
-                }
+                // turns…` is the run's error), so one arm covers both endings.
+                let line = (id == self.tree.focused).then(|| {
+                    // A failure is the third way a run can end, and it is the
+                    // one that did not reach the bar: `Stopped` says so,
+                    // `Failed` fell back to the idle hint, so the newest thing
+                    // that had happened could be a crash under a line
+                    // advertising Ctrl-P.
+                    format!("agent #{id} failed — {error}")
+                });
+                // The durable half too: the row's `✗` is derived and dies with
+                // the next run, while the notice is tagged, stamped and written
+                // to the session, so a restart still says what broke.
+                self.fail_for(id, error, line);
             }
             AgentEvent::Done => {
                 let summary = self.last_assistant_text(id);
@@ -1201,12 +1195,31 @@ impl App {
     /// own next run supersedes it, as it supersedes any failure — but by then
     /// the human has run something in the conversation it opened.) The words
     /// come from the caller (`main`), which is the one place that knows the
-    /// path, the reason and where the only copy went.
+    /// path, the reason and where the only copy went — and they take the same
+    /// three homes [`Self::fail_for`] gives a run's own failure, so the two
+    /// cannot drift about what a failure does (refactor R19).
     pub fn session_unreadable(&mut self, text: impl Into<String>) {
         let text = text.into();
-        self.chat.note_error_for(AgentId::ROOT, text.clone());
-        self.fail(text);
+        self.fail_for(AgentId::ROOT, text.clone(), Some(text));
+    }
+
+    /// A failure, in the three places one outlives the moment: the durable
+    /// notice in `id`'s pane (stamped, ranked `Alert`, read back whole by the
+    /// pane's foot and `/notes`), the mark that makes the next save write it —
+    /// a failure is a fact about the workspace or the agent, not about the
+    /// moment it was noticed — and the bar's line (`line`), which the caller
+    /// owns because only it knows whether the bar is the place for this one.
+    ///
+    /// One door, so a new kind of failure cannot take two of the three and
+    /// forget the last: the run's own failure and a conversation that could not
+    /// be read are the same shape (refactor R19).
+    fn fail_for(&mut self, id: AgentId, text: impl Into<String>, line: Option<String>) {
+        let text = text.into();
+        self.chat.note_error_for(id, text);
         self.mark_session_dirty();
+        if let Some(line) = line {
+            self.fail(line);
+        }
     }
 
     /// Remember something that went wrong. Errors do not fade: they stay until
@@ -1249,9 +1262,11 @@ impl App {
     /// A fold the human is waiting for comes first, because it is the one
     /// derived state that answers a question they are holding in their head:
     /// the fold is running, and the words they are about to type are not lost.
-    /// The row says which kind of fold it is (`compacting…`, `folding at the
-    /// next step…`) with its age; this is the sentence that lets them keep
-    /// typing (finding U11).
+    /// The verb is [`Compacting::verb`] — the row says which kind of fold it is
+    /// (`compacting…`, `folding at the next step…`) with its age, and the bar
+    /// says the same word, so the two cannot describe one fold two ways
+    /// (finding U11, refactor R8). This is the sentence that lets them keep
+    /// typing.
     ///
     /// The count is the root's *own* busy children — [`AgentTree::busy_children`] —
     /// the same derivation the row's `⏸N` mark and the title's `M waiting`
@@ -1268,13 +1283,14 @@ impl App {
     /// derivations (finding U12).
     pub fn tree_line(&self) -> Option<String> {
         let focused = self.tree.focused;
-        if self
+        if let Some(kind) = self
             .tree
             .node(focused)
-            .is_some_and(|node| node.phase.compacting().is_some())
+            .and_then(|node| node.phase.compacting())
         {
             return Some(format!(
-                "compacting #{focused} · keep typing — your message is answered after the fold"
+                "{} #{focused} · keep typing — your message is answered after the fold",
+                kind.verb()
             ));
         }
         if !self.tree.napping(AgentId::ROOT) {
@@ -1368,13 +1384,10 @@ impl App {
     fn worktree_gone(&self, id: AgentId) -> Option<String> {
         let node = self.tree.node(id)?;
         if let Some(landed) = node.landed {
-            let past = match landed {
-                Landed::Merged => "merged",
-                Landed::Discarded => "discarded",
-            };
             return Some(format!(
-                "agent #{id} was {past} — its worktree is gone; \
-                 spawn a fresh agent or work in the root"
+                "agent #{id} was {} — its worktree is gone; \
+                 spawn a fresh agent or work in the root",
+                landed.past()
             ));
         }
         if node.branch.is_some() && !git::worktree_path(self.ws.root(), id.0).exists() {
@@ -1504,6 +1517,20 @@ impl App {
     /// `Enter` on a row, `edit` is the message box and the send — so the
     /// socket cannot reach a state the human could not.
     pub fn handle_attach(&mut self, from: &str, request: &attach::Request) -> attach::Response {
+        // A client's op is not the human's own key. A key means the human
+        // changed their mind, and every door a key takes a quit's warning back
+        // through is a deliberate [`Self::disarm_quit`]; a client's `focus`,
+        // draft or send must not end a confirmation the human is in the middle
+        // of. The warning *is* the arm (finding H9), so an op that says its own
+        // line would cancel the press they are holding — so the warning is put
+        // back exactly as it stood, same `set_at`, so it still fades when it
+        // would have. The client's answer travels on the socket it asked from.
+        //
+        // A *failure* the op caused is not put back under: it is the thing the
+        // human has to read (`chat::Rank::Alert`, the rank the warning holds
+        // too), and the bar has one row for the two — overwriting it would lose
+        // the op's own failure entirely (findings §6, H9).
+        let armed_quit = self.status.clone().filter(|_| self.quit_armed());
         let reply = match &request.op {
             attach::Op::Read { agent, since } => self.attach_read(*agent, *since),
             attach::Op::Agents => self.attach_agents(),
@@ -1515,6 +1542,13 @@ impl App {
                 send,
             } => self.attach_edit(from, *agent, *base, text, *send),
         };
+        if let Some(warning) = armed_quit {
+            let said = self.status.as_ref().map(|status| status.kind);
+            if !matches!(said, Some(StatusKind::Error)) {
+                self.status = Some(warning);
+                self.dirty_screen = true;
+            }
+        }
         attach::Response {
             id: request.id.clone(),
             reply,
@@ -1624,10 +1658,14 @@ impl App {
     /// keyboard all move together.
     fn attach_focus(&mut self, agent: u64) -> attach::Reply {
         let id = AgentId(agent);
-        if !self.tree.has(id) {
+        // One question, one answer: `point_cursor_at` asks the same "is #N in
+        // the tree?" of the rows the human actually sees and answers with
+        // whether the cursor landed on one. A separate `has` walk ahead of it
+        // was a second answer that agrees only while `rows()` paints every node
+        // (refactor R24).
+        if !self.tree.point_cursor_at(id) {
             return attach::Reply::Err(attach::ReplyError::bad_request(format!("no agent #{id}")));
         }
-        self.tree.point_cursor_at(id);
         self.focus_cursor_row();
         attach::Reply::Ok(serde_json::json!({}))
     }
@@ -2023,7 +2061,12 @@ impl App {
         };
         match self.tree.agent_tx.get(&target) {
             Some(tx) if tx.send(AgentMsg::Compact(messages)).is_ok() => {
-                self.say(format!("compacting #{target}…"));
+                // The word comes from the fold the human just asked for, so the
+                // acknowledgement and the row it is answered by read the same
+                // verb (refactor R8): a run in flight turns this request into a
+                // `Parked` fold a moment later, whose row says `folding at the
+                // next step…`.
+                self.say(format!("{} #{target}…", Compacting::Requested.verb()));
             }
             _ => self.fail(format!("agent #{target} is gone")),
         }
@@ -3562,6 +3605,34 @@ mod tests {
         }
     }
 
+    /// A landed agent's nudge is refused in the landing's own word: the past
+    /// tense is [`Landed::past`]'s, so the refusal and the row cannot tell the
+    /// same story two ways (refactor R12).
+    #[test]
+    fn a_nudge_to_a_landed_agent_names_how_it_landed() {
+        let root = dir("landed-refusal");
+        let mut stored = stored_with_agent(
+            &root,
+            session::StoredStatus::Done,
+            vec![Message::user("port the parser")],
+        );
+        stored.agents[0].landed = Some(session::StoredLanded::Merged);
+        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+        assert_eq!(
+            app.worktree_gone(AgentId(2)).as_deref(),
+            Some(
+                format!(
+                    "agent #2 was {} — its worktree is gone; \
+                     spawn a fresh agent or work in the root",
+                    Landed::Merged.past()
+                )
+                .as_str()
+            )
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// One decision at restore: a stored branch whose worktree is gone is not
     /// the agent's any more (finding U13). The row must not offer a diff
     /// for a reclaimed directory, must not paint a dead path in its
@@ -4126,6 +4197,48 @@ mod tests {
             job_rx.recv_timeout(Duration::from_secs(5)),
             Ok(AgentMsg::CommandDone { .. })
         ));
+    }
+
+    /// A stopped agent that still owns a running job is named as stopped, not
+    /// as idle: the agent's own state and the job beside it are two facts, and
+    /// the line that warns what a quit kills must not deny the first one
+    /// (findings §6, refactor R22).
+    #[test]
+    fn a_stopped_agent_over_a_live_job_is_named_as_stopped() {
+        use crate::jobs::Launch;
+        use crate::machine::fake::{Script, Scripted as ScriptedMachine};
+        use crate::machine::{Machine, ShellCommand};
+
+        let (mut app, _rx) = test_app("quit-stopped-job");
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let job = machine
+            .spawn(&ShellCommand {
+                command: "cargo build",
+                root: std::path::Path::new("/tmp"),
+            })
+            .unwrap();
+        let (tx, _job_rx) = crossbeam_channel::unbounded();
+        app.tree
+            .handles()
+            .jobs
+            .launch(Launch::started(
+                0,
+                "cargo build".to_string(),
+                false,
+                tx,
+                job,
+            ))
+            .unwrap();
+        // The run was stopped; the command it left behind is not.
+        app.tree.stopped(AgentId::ROOT);
+
+        ctrl(&mut app, 'q');
+
+        assert_eq!(
+            text_of(&app),
+            "Ctrl-Q again quits · kills #0 stopped + 1 job",
+            "a stopped agent is not an idle one"
+        );
     }
 
     /// The common quit kills nothing, so it stays one keystroke and stays
@@ -6073,41 +6186,69 @@ mod tests {
 
     /// A fold the human asked for is on the screen while it runs, at both sizes
     /// the audit photographs: the row wears its own glyph and words, the bar
-    /// says what happens to the words they are about to type, and the
-    /// transcript's foot repeats the fold rather than `working…` (finding U11).
+    /// says what happens to the words they are about to type — in the same verb
+    /// the row uses, whatever kind of fold it is — and the transcript's foot
+    /// repeats the fold rather than `working…` (finding U11, refactor R8).
     #[test]
     fn a_fold_in_flight_is_painted_on_every_surface() {
         let (mut app, _rx) = test_app("compact-painted");
         app.chat
             .push_message(AgentId::ROOT, Message::user("fold this".to_string()));
         let flag = Arc::new(AtomicBool::new(false));
-        app.on_agent(
-            AgentId::ROOT,
-            AgentEvent::Compacting {
-                why: Compacting::Requested,
-                cancel: Some(flag.clone()),
-            },
-        );
 
-        for (width, height) in [(80u16, 24u16), (40, 10)] {
-            let rows = screen(&mut app, width, height);
-            let painted = rows.join("\n");
-            assert!(
-                painted.contains("≡ #0"),
-                "the row says a fold, not a run, at {width}×{height}: {rows:?}"
+        for kind in [
+            Compacting::Requested,
+            Compacting::Parked,
+            Compacting::NearlyFull,
+        ] {
+            app.on_agent(
+                AgentId::ROOT,
+                AgentEvent::Compacting {
+                    why: kind,
+                    cancel: Some(flag.clone()),
+                },
             );
-            assert!(
-                painted.contains("compacting 0s") || painted.contains("compacting 1s"),
-                "with the fold's own words at {width}×{height}: {rows:?}"
+
+            assert_eq!(
+                app.tree_line().as_deref(),
+                Some(
+                    format!(
+                        "{} #0 · keep typing — your message is answered after the fold",
+                        kind.verb()
+                    )
+                    .as_str()
+                ),
+                "the bar names the fold with the row's own verb: {kind:?}"
             );
+
+            // The row's words, where there are columns for them: at 40 a tail
+            // cell that does not fit is dropped whole, not cut.
+            let wide = screen(&mut app, 80, 24).join("\n");
             assert!(
-                painted.contains("keep typing"),
-                "and the human's question answered at {width}×{height}: {rows:?}"
+                wide.contains(kind.words().trim_end_matches('…')),
+                "the row says {kind:?} in its own words: {wide}"
             );
-            assert!(
-                !painted.contains("working…"),
-                "a fold is not the run's own model call at {width}×{height}: {rows:?}"
-            );
+
+            for (width, height) in [(80u16, 24u16), (40, 10)] {
+                let rows = screen(&mut app, width, height);
+                let painted = rows.join("\n");
+                assert!(
+                    painted.contains("≡ #0"),
+                    "the row says a fold, not a run, at {width}×{height}: {rows:?}"
+                );
+                assert!(
+                    painted.contains(kind.verb()),
+                    "and the bar's line carries the same verb at {width}×{height}: {rows:?}"
+                );
+                assert!(
+                    painted.contains("keep typing"),
+                    "and the human's question answered at {width}×{height}: {rows:?}"
+                );
+                assert!(
+                    !painted.contains("working…"),
+                    "a fold is not the run's own model call at {width}×{height}: {rows:?}"
+                );
+            }
         }
 
         // The box still takes a line while the fold runs: mush never blocks
@@ -6180,8 +6321,9 @@ mod tests {
     }
 
     /// The bar's derived sentence answers "may I keep typing?" while the fold
-    /// runs, and it is the *same* fact the row draws — one derivation, so the
-    /// two cannot disagree about whether anything is folding (finding U11).
+    /// runs, and it is the *same* fact and the same verb the row draws — one
+    /// derivation, so the two cannot disagree about whether anything is folding
+    /// or about what to call it (finding U11, refactor R8).
     #[test]
     fn the_bar_answers_may_i_keep_typing_while_a_fold_runs() {
         let (mut app, _rx) = test_app("compact-bar");
@@ -6190,8 +6332,8 @@ mod tests {
         app.tree.compacting(AgentId::ROOT, Compacting::Parked, None);
         assert_eq!(
             app.tree_line().as_deref(),
-            Some("compacting #0 · keep typing — your message is answered after the fold"),
-            "a parked fold is what the human is waiting for"
+            Some("folding #0 · keep typing — your message is answered after the fold"),
+            "a parked fold is what the human is waiting for, and it is folding"
         );
         let rows = screen(&mut app, 80, 24).join("\n");
         assert!(rows.contains("keep typing"), "{rows}");
@@ -8830,6 +8972,87 @@ mod tests {
         assert_eq!(error.kind, "bad_request");
     }
 
+    /// A client's op is not the human's own key. The warning a `Ctrl-Q` armed
+    /// *is* the arm (finding H9), so an op that says its own line — `focus`'s
+    /// agent line, `edit`'s draft line — must not take the human's confirmation
+    /// out from under them; the second press is still theirs (findings §6).
+    #[test]
+    fn an_attach_op_does_not_disarm_the_humans_quit() {
+        let (mut app, _rx) = test_app("attach-quit-arm");
+        spawn_agent(&mut app, 1, 0, 1, "port the parser", None);
+        begin_run(&mut app, AgentId(1));
+
+        ctrl(&mut app, 'q');
+        assert!(app.quit_armed(), "a live agent's run armed the quit");
+        let warning = text_of(&app).to_string();
+
+        let body = attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(1, attach::Op::Focus { agent: 1 }),
+        ));
+        assert_eq!(body, serde_json::json!({}), "the op still did its work");
+        assert_eq!(app.tree.focused, AgentId(1), "the client moved the pane");
+        assert!(app.quit_armed(), "and the human's warning is still there");
+        assert_eq!(text_of(&app), warning, "word for word, and with its clock");
+
+        attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(
+                2,
+                attach::Op::Edit {
+                    agent: 1,
+                    base: app.chat.revision(AgentId(1)),
+                    text: "half typed".to_string(),
+                    send: false,
+                },
+            ),
+        ));
+        assert!(app.quit_armed(), "a draft does not take it either");
+        assert_eq!(text_of(&app), warning);
+
+        ctrl(&mut app, 'q');
+        assert!(
+            app.should_quit,
+            "the press the human was holding still ends it"
+        );
+    }
+
+    /// The one line an op may take the warning with: a failure of its own.
+    /// `Rank::Alert` is the rank the warning holds too, and the bar has one row
+    /// for the two — so the client's failure reaches the human, and the arm
+    /// goes with the line it lives on, as any other failure does (findings §6).
+    #[test]
+    fn an_attach_failure_lands_over_the_humans_warning() {
+        let (mut app, _rx) = test_app("attach-quit-failure");
+        // A node whose actor is gone: `spawn_agent` drops the mailbox, so the
+        // send this op is about to take fails the way a dead agent's does.
+        spawn_agent(&mut app, 1, 0, 1, "port the parser", None);
+        begin_run(&mut app, AgentId(1));
+
+        ctrl(&mut app, 'q');
+        assert!(app.quit_armed());
+
+        attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(
+                3,
+                attach::Op::Edit {
+                    agent: 1,
+                    base: app.chat.revision(AgentId(1)),
+                    text: "are you there?".to_string(),
+                    send: true,
+                },
+            ),
+        ));
+
+        assert_eq!(
+            text_of(&app),
+            "agent #1 is gone",
+            "the op's own failure is what the human reads"
+        );
+        assert!(!app.quit_armed(), "and the line it lives on went with it");
+    }
+
     /// A read's revision is only meaningful inside one conversation. Ctrl-N
     /// moves it forward and the payload names the new conversation, so a
     /// client's stale token conflicts instead of landing a draft in the wrong
@@ -9060,5 +9283,54 @@ mod tests {
             ),
             "the message reaches the agent's mailbox the way a typed one does"
         );
+    }
+
+    /// The CLI's printers read a body with `attach::Roster`/`attach::Transcript`
+    /// — one shape per answer — instead of fishing each key out of a `Value` and
+    /// defaulting what is missing. Pinned against a *real* `handle_attach` body,
+    /// the only place the producer's keys and the client's shape meet: a key
+    /// renamed on the producer's side is now the client's error, where before it
+    /// painted an empty column forever with nothing failing (finding R23).
+    #[test]
+    fn the_cli_shapes_read_the_roster_the_producer_writes() {
+        let (mut app, _rx) = test_app("attach-shape-roster");
+        let body = attach_ok(app.handle_attach("a client", &attach_request(1, attach::Op::Agents)));
+
+        let roster = attach::Roster::read(&body).expect("the producer's roster reads back");
+        assert_eq!(roster.agents.len(), 1, "the root alone");
+        let root = &roster.agents[0];
+        assert_eq!(root.id, 0);
+        assert_eq!(root.phase, "idle");
+        assert_eq!(root.parent, None, "the root hangs under nothing");
+        assert_eq!(root.activity, None, "an idle agent says nothing");
+        assert_eq!(root.children_working, 0);
+
+        let mut broken = body;
+        broken["agents"][0].as_object_mut().unwrap().remove("phase");
+        let error = attach::Roster::read(&broken).expect_err("a body missing `phase` is refused");
+        assert!(error.contains("phase"), "the missing key is named: {error}");
+    }
+
+    /// The same for a `read` answer: the transcript's lines and their indices,
+    /// and a line missing its `text` refused by name (finding R23).
+    #[test]
+    fn the_cli_shapes_read_the_transcript_the_producer_writes() {
+        let (mut app, _rx) = test_app("attach-shape-transcript");
+        app.chat.push_message(AgentId::ROOT, Message::user("hi"));
+        let body = attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(2, attach::Op::Read { agent: 0, since: 0 }),
+        ));
+
+        let transcript = attach::Transcript::read(&body).expect("the producer's lines read back");
+        assert_eq!(transcript.lines.len(), 1);
+        assert_eq!(transcript.lines[0].line, 0);
+        assert_eq!(transcript.lines[0].text, "hi");
+
+        let mut broken = body;
+        broken["lines"][0].as_object_mut().unwrap().remove("text");
+        let error =
+            attach::Transcript::read(&broken).expect_err("a line missing `text` is refused");
+        assert!(error.contains("text"), "the missing key is named: {error}");
     }
 }

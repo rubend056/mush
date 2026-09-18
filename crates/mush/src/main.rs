@@ -19,7 +19,7 @@ mod ui;
 
 use std::error::Error;
 use std::io::{self, Stdout};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -359,14 +359,11 @@ impl Cli {
         let response = attach::ask(self.dir(), &self.request())?;
         match response.reply {
             attach::Reply::Err(error) => Err(error.describe()),
-            attach::Reply::Ok(body) => {
-                match &self {
-                    Cli::Read { .. } => print_lines(&body),
-                    Cli::Agents { .. } => print_agents(&body),
-                    Cli::Focus { .. } | Cli::Edit { .. } => {}
-                }
-                Ok(())
-            }
+            attach::Reply::Ok(body) => match &self {
+                Cli::Read { .. } => print_lines(&body),
+                Cli::Agents { .. } => print_agents(&body),
+                Cli::Focus { .. } | Cli::Edit { .. } => Ok(()),
+            },
         }
     }
 }
@@ -395,7 +392,6 @@ fn parse_id(value: &str, command: &str) -> Result<u64, String> {
         .map_err(|_| format!("`mush {command}` needs an agent id, got `{value}`"))
 }
 
-/// `read`: the transcript lines, one per line as `index<TAB>text`.
 /// One transcript line, escaped so it prints as one line. A message with a
 /// newline in it (a pasted brief, a tool result) is still one line on the wire,
 /// and printing it raw made it read as two — under one index — with no way for
@@ -407,44 +403,39 @@ fn escape_line(text: &str) -> String {
         .replace('\t', "\\t")
 }
 
-fn print_lines(body: &Value) {
-    if let Some(lines) = body.get("lines").and_then(Value::as_array) {
-        for line in lines {
-            let index = line.get("line").and_then(Value::as_u64).unwrap_or(0);
-            let text = line.get("text").and_then(Value::as_str).unwrap_or("");
-            println!("{index}\t{}", escape_line(text));
-        }
+/// `read`: the transcript lines, one per line as `index<TAB>text`.
+fn print_lines(body: &Value) -> Result<(), String> {
+    for line in attach::Transcript::read(body)?.lines {
+        println!("{}\t{}", line.line, escape_line(&line.text));
     }
+    Ok(())
 }
 
 /// `agents`: the roster the tree paints, one row per line, tab-separated:
-/// `id parent phase activity title branch worktree children-working`.
-fn print_agents(body: &Value) {
-    let Some(agents) = body.get("agents").and_then(Value::as_array) else {
-        return;
-    };
-    for node in agents {
-        let field = |key: &str| match node.get(key) {
-            Some(Value::String(text)) => text.clone(),
-            Some(Value::Null) | None => String::new(),
-            Some(other) => other.to_string(),
-        };
-        let parent = node
-            .get("parent")
-            .and_then(Value::as_u64)
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "-".to_string());
+/// `id parent phase activity title branch worktree children-working`. An empty
+/// absent field prints as an empty column, and a root's missing parent as `-`.
+///
+/// The body is read as [`attach::Roster`] rather than fished key by key: a key
+/// the producer renamed used to leave this printer writing an empty column
+/// forever, with nothing failing (finding R23).
+fn print_agents(body: &Value) -> Result<(), String> {
+    for node in attach::Roster::read(body)?.agents {
         println!(
             "{id}\t{parent}\t{phase}\t{activity}\t{title}\t{branch}\t{worktree}\t{children}",
-            id = field("id"),
-            phase = field("phase"),
-            activity = field("activity"),
-            title = field("title"),
-            branch = field("branch"),
-            worktree = field("worktree"),
-            children = field("children_working"),
+            id = node.id,
+            parent = node
+                .parent
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            phase = node.phase,
+            activity = node.activity.unwrap_or_default(),
+            title = node.title,
+            branch = node.branch.unwrap_or_default(),
+            worktree = node.worktree,
+            children = node.children_working,
         );
     }
+    Ok(())
 }
 
 fn print_help() {
@@ -528,27 +519,25 @@ fn help_text() -> String {
 ///
 /// Paths are shown relative to the workspace: the bar already names where that
 /// is (`⌂ …`), and an absolute prefix would spend the line on something the
-/// human knows.
-fn unreadable_session_notice(root: &Path, reason: &str, kept: Result<PathBuf, String>) -> String {
-    let file = shown_under(root, &session::session_path(root));
+/// human knows. The elision is [`Workspace::rel`]'s, the one rule for it — a
+/// second one here would disagree about a path outside the root, or about the
+/// separator a Windows path arrives with (refactor R17).
+fn unreadable_session_notice(
+    workspace: &Workspace,
+    reason: &str,
+    kept: Result<PathBuf, String>,
+) -> String {
+    let file = workspace.rel(&session::session_path(workspace.root()));
     match kept {
         Ok(kept) => format!(
             "could not read {file} — {reason}; kept as {} · starting a new conversation",
-            shown_under(root, &kept)
+            workspace.rel(&kept)
         ),
         // The copy could not be set aside either. That is the worse half of the
         // news and it is said second, because naming a backup that is not there
         // would be the one lie this line must not tell.
         Err(error) => format!("could not read {file} — {reason}; {error}"),
     }
-}
-
-/// A path as the human reads it: relative to the workspace they opened.
-fn shown_under(root: &Path, path: &Path) -> String {
-    path.strip_prefix(root)
-        .unwrap_or(path)
-        .display()
-        .to_string()
 }
 
 /// `--print-config`: the resolved config and nothing else — no workspace, no
@@ -691,7 +680,7 @@ fn run() -> Result<(), Box<dyn Error>> {
             let kept = session::keep_unreadable(workspace.root());
             (
                 None,
-                Some(unreadable_session_notice(workspace.root(), &reason, kept)),
+                Some(unreadable_session_notice(&workspace, &reason, kept)),
             )
         }
     };
@@ -1012,12 +1001,13 @@ mod tests {
     /// The sentence a workspace whose session could not be read is told. It has
     /// to name the file, the reason and where the only copy went — and it must
     /// say *that* the copy could not be kept rather than name a backup that is
-    /// not there.
+    /// not there. The file is shown relative to the workspace by
+    /// [`Workspace::rel`], the one elision rule (refactor R17).
     #[test]
     fn the_unreadable_session_notice_names_the_file_the_reason_and_the_backup() {
-        let root = Path::new("/w");
-        let kept = Ok(root.join(".mush/session.json.bak"));
-        let notice = unreadable_session_notice(root, "expected value at line 1 column 2", kept);
+        let ws = scratch_workspace("unreadable-notice");
+        let kept = Ok(ws.root().join(".mush/session.json.bak"));
+        let notice = unreadable_session_notice(&ws, "expected value at line 1 column 2", kept);
         assert_eq!(
             notice,
             "could not read .mush/session.json — expected value at line 1 column 2; \
@@ -1026,33 +1016,31 @@ mod tests {
         // Relative to the workspace: the bar already says where that is, and an
         // absolute `/w/.mush/…` would spend the line on a prefix the human
         // already knows.
-        assert!(!notice.contains("/w/"), "{notice}");
+        assert!(
+            !notice.contains(&ws.root().display().to_string()),
+            "{notice}"
+        );
 
         // The copy could not be set aside either. That is the worse half of the
         // news, and the line says it instead of pointing at a file that is not
         // there.
         let notice = unreadable_session_notice(
-            root,
+            &ws,
             "expected value at line 1 column 2",
             Err("cannot keep session.json — Permission denied".to_string()),
         );
         assert!(notice.contains("cannot keep session.json"), "{notice}");
         assert!(!notice.contains("kept as"), "{notice}");
+        let _ = std::fs::remove_dir_all(ws.root());
     }
 
-    /// A path that is not under the root is shown as it is: a workspace opened
-    /// as another directory must not have a real path rewritten into a relative
-    /// one that means something else.
-    #[test]
-    fn a_path_outside_the_workspace_is_shown_whole() {
-        assert_eq!(
-            shown_under(Path::new("/w"), Path::new("/elsewhere/session.json")),
-            "/elsewhere/session.json"
-        );
-        assert_eq!(
-            shown_under(Path::new("/w"), Path::new("/w/.mush/session.json.bak.2")),
-            ".mush/session.json.bak.2"
-        );
+    /// A workspace in a directory of its own, for the tests that read a path
+    /// the way a human does.
+    fn scratch_workspace(name: &str) -> Workspace {
+        let dir = std::env::temp_dir().join(format!("mush-main-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        Workspace::new(&dir).unwrap()
     }
 
     /// A second positional is an error rather than a silent replacement

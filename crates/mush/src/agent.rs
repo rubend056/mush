@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use mush_core::config::parse_context_hint;
 use mush_core::git;
 use mush_core::message::{ChatRequest, ChatResponse};
-use mush_core::text::{sanitize, truncate};
+use mush_core::text::{first_line, sanitize, truncate};
 use mush_core::tools::ToolName;
 use mush_core::transcript::{
     needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
@@ -276,15 +276,17 @@ const SUBJECT_COLUMNS: usize = 60;
 /// [`SUBJECT_COLUMNS`] columns and cut at a word boundary.
 ///
 /// The first line because a subject is one line and the brief's first line is
-/// the task ("create a file called iso.txt…" — the reasons live below). The
-/// word boundary because [`truncate`] alone ends a subject mid-word
+/// the task ("create a file called iso.txt…" — the reasons live below), and the
+/// line is [`mush_core::text::first_line`]'s: one collapse of whitespace for the
+/// subject, an agent's title, a job's handle and a tool label alike (refactor
+/// R11). The word boundary because [`truncate`] alone ends a subject mid-word
 /// (`isolated w…`), which neither reads as English nor matches the brief; the
 /// whole word that does not fit is dropped and the `…` says so. A first line
 /// with no space to cut on keeps the hard cut — a clipped subject is better
 /// than no subject.
 fn subject_brief(brief: &str) -> String {
-    let first = brief.lines().next().unwrap_or("").trim();
-    let cut = truncate(first, SUBJECT_COLUMNS);
+    let first = first_line(brief);
+    let cut = truncate(&first, SUBJECT_COLUMNS);
     if !cut.ends_with('…') {
         return cut;
     }
@@ -2061,6 +2063,25 @@ edit_file). Do not repeat work you already completed in earlier calls.";
 const NOTHING_TO_COMPACT: &str =
     "nothing to compact — this transcript is already short enough to send whole";
 
+/// A fold that came to nothing, said the one way: the refusal when the human is
+/// the one who asked, and the end of the phase either way.
+///
+/// One door, so neither arm can answer the human differently from the other and
+/// neither can leave a `compacting…` on the row — a fold that came to nothing
+/// must not outlive the request that justified it (finding U11), and the
+/// automatic trigger, which nobody asked for, has nothing to report (refactor
+/// R16).
+fn nothing_to_compact(actor: &Actor, in_run: bool, asked: bool) {
+    if asked {
+        actor
+            .ctx
+            .emit(actor.id, AgentEvent::Notice(NOTHING_TO_COMPACT.to_string()));
+    }
+    actor
+        .ctx
+        .emit(actor.id, AgentEvent::CompactingEnded { in_run });
+}
+
 /// Fold the transcript into a summary: ask the model to condense it, then
 /// replace the conversation with `[system, user(summary)]` — the summary is
 /// the new opening task message, which trimming protects. Does nothing when
@@ -2097,17 +2118,7 @@ fn compact_history(
         // that quietly failed. The automatic trigger never reaches this arm
         // with an empty transcript (there is nothing to weigh), and it is
         // never told anything anyway.
-        if asked && messages.is_empty() {
-            actor
-                .ctx
-                .emit(actor.id, AgentEvent::Notice(NOTHING_TO_COMPACT.to_string()));
-        }
-        // Nothing was replaced, whether the transcript was empty or its opening
-        // message was something else entirely: the fold ends here as every
-        // other `Ok(false)` does, this arm being reached before a `Compacting`.
-        actor
-            .ctx
-            .emit(actor.id, AgentEvent::CompactingEnded { in_run });
+        nothing_to_compact(actor, in_run, asked);
         return Ok(false);
     }
     // Nothing left to fold: system + one message is already minimal
@@ -2115,14 +2126,7 @@ fn compact_history(
     // request and re-summarize the summary. A human who asked for it is told
     // so rather than left watching a status line that never ends.
     if messages.len() <= 2 {
-        if asked {
-            actor
-                .ctx
-                .emit(actor.id, AgentEvent::Notice(NOTHING_TO_COMPACT.to_string()));
-        }
-        actor
-            .ctx
-            .emit(actor.id, AgentEvent::CompactingEnded { in_run });
+        nothing_to_compact(actor, in_run, asked);
         return Ok(false);
     }
     let actor_id = actor.id;
@@ -3515,9 +3519,11 @@ use crate::jobs::CMD_OUTPUT_LIMIT;
 enum Ended {
     /// It ended by itself, with this exit code (`-1` when a signal ended it).
     Exited(i32),
-    TimedOut,
-    Cancelled,
-    TooMuchOutput,
+    /// mush stopped it. The reason is [`jobs::Stopped`]'s, not a second copy of
+    /// the same three variants: the watcher already decides between them with
+    /// `jobs::stopping`, and a fourth reason added there must reach the model's
+    /// sentence without a translation table to update in step (refactor R15).
+    Stopped(jobs::Stopped),
     /// It outlived `CMD_DETACH_AFTER` and is now a job; the caller hands the
     /// still-running process group over instead of killing it.
     Detached,
@@ -3561,13 +3567,7 @@ fn run_shell(
             match detach_now(
                 actor,
                 registry,
-                jobs::Launch::held(
-                    actor.id,
-                    command.to_string(),
-                    exclusive,
-                    actor.my_tx.clone(),
-                    running,
-                ),
+                jobs::Launch::held(command.to_string(), exclusive, actor.my_tx.clone(), running),
             ) {
                 Ok(id) => {
                     state.running_jobs.insert(id);
@@ -3592,30 +3592,51 @@ fn run_shell(
     let ended = ending(ended, running.stopped());
     let (stdout, stderr) = running.output(CMD_CAP);
     let mut report = command_report(&stdout, &stderr);
+    report.push_str(&end_note(
+        &ended,
+        timeout,
+        matches!(detach, Detach::Job { .. }),
+    ));
+    Ok(report)
+}
+
+/// The model's sentence for how its command ended: `[exit 0]`, `[cancelled]`,
+/// the timeout, the output cap.
+///
+/// One home for the whole translation table, so every reason mush stops a
+/// command has exactly one sentence and a new one cannot be added to one
+/// translator and missed by another (refactor R15). Pure: the one arm no run
+/// reaches — a command handed to the job registry builds no report at all — is
+/// read by the unit test beside the others rather than left to chance.
+fn end_note(ended: &Ended, timeout: Duration, detachable: bool) -> String {
     match ended {
-        Ended::Exited(code) => report.push_str(&format!("[exit {code}]")),
-        Ended::TimedOut => {
-            report.push_str(&format!("[timed out after {}s", timeout.as_secs()));
+        Ended::Exited(code) => format!("[exit {code}]"),
+        Ended::Stopped(jobs::Stopped::TimedOut) => {
+            let mut note = format!("[timed out after {}s", timeout.as_secs());
             // The one case where "a long command detaches by itself" cannot
             // happen: the machine-wide job budget is full. Saying only "timed
             // out" hid the reason the model was never told about (audit row 2).
-            if matches!(detach, Detach::No) {
-                report.push_str(&format!(
+            if !detachable {
+                note.push_str(&format!(
                     "; the {}-job budget is full, so it could not detach — stop one with \
                      command_control or wait for one",
                     jobs::MAX_JOBS
                 ));
             }
-            report.push(']');
+            note.push(']');
+            note
         }
-        Ended::Cancelled => report.push_str("[cancelled]"),
-        Ended::TooMuchOutput => report.push_str(&format!(
+        Ended::Stopped(jobs::Stopped::Cancelled) => "[cancelled]".to_string(),
+        Ended::Stopped(jobs::Stopped::TooMuchOutput) => format!(
             "[killed: output passed {CMD_OUTPUT_LIMIT} bytes; the first {CMD_CAP} are above]"
-        )),
-        // Only reachable without a `Detach::Job`, which returns above.
-        Ended::Detached => report.push_str(&format!("[timed out after {}s]", timeout.as_secs())),
+        ),
+        // Not an end, and not reachable from `run_shell`: a command that may
+        // detach is handed to the registry before a report is built. It used to
+        // print the timeout's sentence, which is one thing this cannot be (a
+        // detached command was never stopped); it says what would be true
+        // instead.
+        Ended::Detached => "[mush: the command was handed to the job registry]".to_string(),
     }
-    Ok(report)
 }
 
 /// What a command wrote, with no `$ {command}` echo: the tool call is already
@@ -3653,7 +3674,7 @@ fn command_report(stdout: &str, stderr: &str) -> String {
 ///   included: nobody asked for those.
 fn ending(ended: Ended, stopped_from_outside: bool) -> Ended {
     match ended {
-        Ended::Exited(_) if stopped_from_outside => Ended::Cancelled,
+        Ended::Exited(_) if stopped_from_outside => Ended::Stopped(jobs::Stopped::Cancelled),
         ended => ended,
     }
 }
@@ -3701,11 +3722,7 @@ fn wait_bounded(
             cancel.load(Ordering::SeqCst),
         ) {
             job.kill();
-            return Ok(match stopped {
-                jobs::Stopped::TimedOut => Ended::TimedOut,
-                jobs::Stopped::Cancelled => Ended::Cancelled,
-                jobs::Stopped::TooMuchOutput => Ended::TooMuchOutput,
-            });
+            return Ok(Ended::Stopped(stopped));
         }
         actor.ctx.clock.sleep(Duration::from_millis(10));
     }
@@ -3787,17 +3804,6 @@ fn read_args(args: &Value) -> String {
     String::new()
 }
 
-/// Everything up to the first newline, with runs of whitespace collapsed to one
-/// space, so a summary is always a single readable line.
-fn first_line(text: &str) -> String {
-    text.lines()
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3872,7 +3878,9 @@ mod tests {
     }
 
     /// A tool label is one line by definition. Truncating a command's raw text
-    /// kept its newlines, so a heredoc turned one row into several.
+    /// kept its newlines, so a heredoc turned one row into several. The
+    /// collapse itself is `mush_core::text::first_line`'s, tested there beside
+    /// the other string arithmetic (refactor R11).
     #[test]
     fn a_command_summary_collapses_to_one_line() {
         let label = summarize(&json!({
@@ -3880,7 +3888,6 @@ mod tests {
         }));
         assert!(!label.contains('\n'), "{label:?} must be one line");
         assert!(label.starts_with("cd /w && python3"), "{label}");
-        assert_eq!(first_line("  a\n\n  b  c \n"), "a");
     }
 
     /// A nudge parked during a run that was cancelled is already in the UI's
@@ -7130,10 +7137,14 @@ mod tests {
     /// killed it and *how* the watcher learned of it.
     #[test]
     fn the_three_ways_a_foreground_command_ends_are_not_confusable() {
+        let minute = Duration::from_secs(60);
         // A kill from outside the watcher: the process died of a signal, and
         // that is a cancel — not `[exit -1]`, which reads as the command's own
         // doing. This is the arm finding S4 added.
-        assert!(matches!(ending(Ended::Exited(-1), true), Ended::Cancelled));
+        assert!(matches!(
+            ending(Ended::Exited(-1), true),
+            Ended::Stopped(jobs::Stopped::Cancelled)
+        ));
         // A command that ended by itself keeps its exit status, whoever else's
         // signal it was.
         assert!(matches!(ending(Ended::Exited(3), false), Ended::Exited(3)));
@@ -7147,12 +7158,54 @@ mod tests {
         // is exactly what happened when this was written, and what
         // `a_command_that_runs_forever_is_killed_on_time` and
         // `a_runaway_writer_is_stopped_at_the_output_limit` caught.
-        assert!(matches!(ending(Ended::TimedOut, true), Ended::TimedOut));
-        assert!(matches!(
-            ending(Ended::TooMuchOutput, true),
-            Ended::TooMuchOutput
-        ));
-        assert!(matches!(ending(Ended::Cancelled, true), Ended::Cancelled));
+        for reason in [
+            jobs::Stopped::TimedOut,
+            jobs::Stopped::TooMuchOutput,
+            jobs::Stopped::Cancelled,
+        ] {
+            assert!(matches!(
+                ending(Ended::Stopped(reason), true),
+                Ended::Stopped(kept) if kept == reason
+            ));
+        }
+
+        // And every arm of the table has its own sentence: the three ways the
+        // watcher stops a command, an exit, and the end that is not one — a
+        // command handed to the job registry, which `run_shell` returns from
+        // before it builds a report, so no run reads it (refactor R15).
+        let notes = vec![
+            end_note(&Ended::Exited(0), minute, true),
+            end_note(&Ended::Stopped(jobs::Stopped::TimedOut), minute, true),
+            end_note(&Ended::Stopped(jobs::Stopped::Cancelled), minute, true),
+            end_note(&Ended::Stopped(jobs::Stopped::TooMuchOutput), minute, true),
+            end_note(&Ended::Detached, minute, true),
+        ];
+        let mut unique = notes.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            notes.len(),
+            "two ends share a sentence: {notes:?}"
+        );
+        assert_eq!(notes[0], "[exit 0]");
+        assert!(notes[1].starts_with("[timed out after 60s"), "{}", notes[1]);
+        assert_eq!(notes[2], "[cancelled]");
+        assert!(
+            notes[3].starts_with("[killed: output passed"),
+            "{}",
+            notes[3]
+        );
+        assert!(
+            notes[4].contains("registry"),
+            "a detached command is not a timed-out one: {}",
+            notes[4]
+        );
+        // The timeout's sentence says why it could not detach when the budget
+        // was the reason.
+        let full = end_note(&Ended::Stopped(jobs::Stopped::TimedOut), minute, false);
+        assert!(full.contains("budget is full"), "{full}");
+        assert!(!notes[1].contains("budget"), "{}", notes[1]);
     }
 
     /// The quit half of finding S4, at the seam: a command killed from *outside*

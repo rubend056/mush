@@ -61,7 +61,9 @@ pub enum Phase {
     Idle,
     /// A request is in flight and the model has not named a tool yet.
     Thinking,
-    /// The last thing the agent reported doing: `edit_file src/lib.rs`, `run_command cargo test`, `summarizing…`.
+    /// The last thing the agent reported doing: a tool call's own label
+    /// (`edit_file src/lib.rs`, `run_command cargo test`), or how the run's
+    /// worktree ended (`committed abc123 on mush/1`).
     Activity(String),
     /// The conversation is being folded into a summary (context compaction),
     /// or a request to do so is queued behind the run in flight.
@@ -157,28 +159,27 @@ impl Phase {
         }
     }
 
-    /// What this phase is, in the fewest words: `thinking`, `edit_file`,
-    /// `compacting`, `cancelling`, or `idle` for a phase at rest.
+    /// What this phase is, in the fewest words, for the one line that has to
+    /// name every live agent at once (finding H9).
     ///
-    /// The row spells the same phase out with its age (`ui::phase_detail`, for
-    /// the one agent the human is looking at). This is the form that fits
-    /// beside an id in the single line naming every live agent a quit is about
-    /// to kill (finding H9). A tool label answers with its first word, which is
-    /// the tool's own name — `edit_file` says what the agent is at without
-    /// spending the bar on the path it is editing.
+    /// Every phase but one answers with its machine name ([`Phase::label`]), so
+    /// the quit line and a client reading the attach roster cannot call the same
+    /// phase two things. This used to spell the stems again and collapse
+    /// `Stopped`, `Done` and `Failed` to `idle`, which made a stopped agent that
+    /// still owned a running job read `#0 idle + 1 job` — the agent was not
+    /// idle, and the job was the whole reason the line existed (findings §6,
+    /// refactor R22).
+    ///
+    /// [`Phase::Activity`] is the exception: `working` is the right word for a
+    /// roster cell but says nothing on the bar, where the tool's own name fits —
+    /// `edit_file` says what the agent is at without spending the row on the
+    /// path it is editing. The painter's prose for the one row the human is
+    /// looking at (`app::screen::phase_detail`) spells the same phase out with
+    /// its age, which is the painter's to say.
     pub fn doing(&self) -> &str {
         match self {
-            Phase::Thinking => "thinking",
             Phase::Activity(what) => what.split_whitespace().next().unwrap_or("working"),
-            Phase::Compacting(_) => "compacting",
-            Phase::Cancelling => "cancelling",
-            Phase::Idle | Phase::Stopped | Phase::Done | Phase::Failed(_) => "idle",
-            // A cut-off run is not at rest the way `idle` means — it never
-            // ended and committed nothing — and it is not in flight either, so
-            // a quit never names it in this list. The arm says which phase it
-            // is, and matches `Phase::label`, so a reader of one can read the
-            // other (finding H2).
-            Phase::CutOff => "cut off",
+            phase => phase.label(),
         }
     }
 }
@@ -206,8 +207,22 @@ pub enum Compacting {
 }
 
 impl Compacting {
-    /// What the row and the transcript's foot say. One spelling, so the two
-    /// cannot describe the same fold differently.
+    /// The verb for what is happening: a parked fold *folds* (it has not
+    /// started yet), an in-flight one *compacts*. The word every surface that
+    /// names the fold out loud reads — the status bar and `/compact`'s own
+    /// acknowledgement — so none of them can call a fold the row calls
+    /// `folding at the next step…` "compacting" (refactor R8).
+    pub fn verb(self) -> &'static str {
+        match self {
+            Compacting::Parked => "folding",
+            Compacting::Requested | Compacting::NearlyFull => "compacting",
+        }
+    }
+
+    /// What the row and the transcript's foot say: the verb above, spelled out
+    /// with what makes this fold the one it is. One spelling, so the two cannot
+    /// describe the same fold differently, and one that contains its own verb,
+    /// which the fold's unit test reads.
     pub fn words(self) -> &'static str {
         match self {
             Compacting::Parked => "folding at the next step…",
@@ -341,6 +356,22 @@ pub enum Landed {
     Discarded,
 }
 
+impl Landed {
+    /// The past tense of what happened, as a word.
+    ///
+    /// The one spelling of it, so the refusal that tells the human why a nudge
+    /// cannot run and the row that says where the work went cannot tell the
+    /// same story in two different words (refactor R12). It is the word and not
+    /// the sentence: each surface paints its own prose around it
+    /// (`app::screen::agent_detail` for the row).
+    pub fn past(self) -> &'static str {
+        match self {
+            Landed::Merged => "merged",
+            Landed::Discarded => "discarded",
+        }
+    }
+}
+
 /// One entry in the agent tree. In [`AgentTree::agents`] the order is *spawn*
 /// order — the order things happened, which is what a stored session keeps;
 /// the order a pane paints is derived from it by [`AgentTree::rows`]. Ids are
@@ -407,13 +438,11 @@ impl AgentNode {
         if let Some(given) = &self.title {
             return truncate(given, TITLE_COLUMNS);
         }
-        let words: Vec<&str> = self
-            .brief
-            .lines()
-            .next()
-            .unwrap_or("")
-            .split_whitespace()
-            .collect();
+        // The brief's first line, collapsed: [`mush_core::text::first_line`],
+        // the same line the commit subject and a job's handle are cut from
+        // (refactor R11).
+        let first = mush_core::text::first_line(&self.brief);
+        let words: Vec<&str> = first.split_whitespace().collect();
         if let Some(path) = words.iter().find(|word| is_path_like(word)) {
             return truncate(bare_word(path).trim_end_matches('.'), TITLE_COLUMNS);
         }
@@ -798,13 +827,7 @@ impl AgentTree {
     /// names) until it names one, where an idle fold's agent goes back to
     /// `✓ done` with the last reply it produced.
     pub fn compacted(&mut self, id: AgentId, in_run: bool) {
-        if !self.compacting_over(id, in_run) {
-            return;
-        }
-        if let Some(node) = self.node_mut(id) {
-            node.phase = if in_run { Phase::Thinking } else { Phase::Done };
-            node.since = Instant::now();
-        }
+        self.fold_over(id, in_run, Phase::Done);
     }
 
     /// The fold is over and the transcript is unchanged — the summarize call
@@ -818,11 +841,21 @@ impl AgentTree {
     /// wears `thinking…` (the phase between a request and the tool it names),
     /// where an idle fold's agent is back at rest.
     pub fn compacting_ended(&mut self, id: AgentId, in_run: bool) {
+        self.fold_over(id, in_run, Phase::Idle);
+    }
+
+    /// End a fold: `at_rest` is the phase the agent wears when the fold was not
+    /// part of a run (`✓ done` for one that landed, `idle` for one that came to
+    /// nothing), and a fold still inside its run wears `thinking…` either way.
+    ///
+    /// One body for both endings, so the two cannot disagree about the run they
+    /// were part of, the flag they hand back, or the clock they restart (R2).
+    fn fold_over(&mut self, id: AgentId, in_run: bool, at_rest: Phase) {
         if !self.compacting_over(id, in_run) {
             return;
         }
         if let Some(node) = self.node_mut(id) {
-            node.phase = if in_run { Phase::Thinking } else { Phase::Idle };
+            node.phase = if in_run { Phase::Thinking } else { at_rest };
             node.since = Instant::now();
         }
     }
@@ -1421,6 +1454,10 @@ mod tests {
             assert_eq!(Phase::Compacting(kind).compacting(), Some(kind));
             assert_eq!(kind.words(), words);
             assert!(
+                words.contains(kind.verb()),
+                "{kind:?}'s sentence has to say what it is doing: {words:?}"
+            );
+            assert!(
                 Phase::Compacting(kind).is_busy(),
                 "a fold is work in flight, not a nap: {kind:?}"
             );
@@ -1453,6 +1490,48 @@ mod tests {
             assert_eq!(phase.compacting(), None, "{phase:?} is not a fold");
             assert_eq!(phase.waiting(), None, "{phase:?} is not a wait");
         }
+    }
+
+    /// A phase has one name for every reader: the roster's machine name
+    /// ([`Phase::label`]) and the form that fits on the quit line
+    /// ([`Phase::doing`]) differ for exactly one phase — the tool label, whose
+    /// own name the bar has room for — so no surface can call the same phase
+    /// two things (refactor R22).
+    ///
+    /// The collapse this ends: `doing` used to answer `idle` for `Stopped`,
+    /// `Done` and `Failed`, so the quit line named a stopped agent that still
+    /// owned a running job as `#0 idle + 1 job` (findings §6).
+    #[test]
+    fn a_phase_has_one_name_for_every_reader() {
+        for phase in [
+            Phase::Idle,
+            Phase::Thinking,
+            Phase::Compacting(Compacting::Requested),
+            Phase::Cancelling,
+            Phase::Stopped,
+            Phase::CutOff,
+            Phase::Done,
+            Phase::Failed("no route".to_string()),
+        ] {
+            assert_eq!(phase.doing(), phase.label(), "{phase:?}");
+        }
+        let edit = Phase::Activity("edit_file src/lib.rs".to_string());
+        assert_eq!(
+            edit.label(),
+            "working",
+            "the roster carries the machine name"
+        );
+        assert_eq!(edit.doing(), "edit_file", "the bar carries the tool's own");
+        // A label with no words in it is still a word: nothing may read `#0 `.
+        assert_eq!(Phase::Activity(String::new()).doing(), "working");
+    }
+
+    /// A landing's past tense is one word, so the row's prose and the refusal
+    /// that stops a nudge cannot tell the same story two ways (refactor R12).
+    #[test]
+    fn a_landing_has_one_past_tense() {
+        assert_eq!(Landed::Merged.past(), "merged");
+        assert_eq!(Landed::Discarded.past(), "discarded");
     }
 
     /// A fold from rest is visible — the hole `activity` could not fill, because
