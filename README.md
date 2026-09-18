@@ -89,14 +89,10 @@ The root agent can delegate: `spawn_agent(brief, title, base?)` starts a
 subagent that has no memory of your conversation — the brief *is* the context.
 `title` (three words) names its row in the tree; `base`, a branch, tag or
 commit, is what gives the child a tree of its own (*Isolated agents* below).
-`status` lists everything the agent owns — each child's state and title or
-branch, each job's state, age and command — and it is a listing, not a
-delivery; `wait` takes no arguments and blocks until every child and every job
-has finished, then hands over one digest (a result not yet read in full, one
-already read as a line); `control {id, action, text?}` stops or messages one,
-naming it as `status` prints it (`2` for a child, `c2` for a job: a job can
-only be stopped, and a child that is stopped is not finished — it keeps its
-context and its work). Subagents can spawn their own, four levels deep
+`status`, `control` and `wait` are what manage the children and jobs that
+follow, and what each call takes and hands back is stated once: in the tool's
+own schema, and as the design record in the *agent contract* of
+[docs/mush.md](docs/mush.md). Subagents can spawn their own, four levels deep
 (`MAX_DEPTH` 3, the root included); `spawn_agent` vanishes from a leaf's
 toolset, so a leaf keeps five, and a live-agent budget (`MAX_AGENTS` 16) caps
 total fan-out.
@@ -104,7 +100,7 @@ total fan-out.
 The orchestrator may end its turn while children still run: mush shows
 `waiting on 1 subagent — the root resumes as they finish`, and the root is
 **woken with each child's `#N done: summary`** as they finish — early End is not
-a lost result, it's a nap. `wait` is for when you want the results now.
+a lost result, it's a nap.
 
 Deep chains are tested deterministically (root → child → grandchild, nested
 worktrees) but they need a model that actually delegates: small local models

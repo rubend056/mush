@@ -143,11 +143,10 @@ Delegation:
 - base gives the child its own worktree and branch forked from that ref, so siblings with bases run in parallel; without one the child works in this workspace, and only one such child may run at a time. Decide up front, or wait for the running one first. (The check can only fail after the brief exists, so decide before writing it.)
 - A subagent runs until it stops calling tools, so a brief is bounded by the work, not a turn count: split by what is independent, not by how long you think it takes.
 - Delegate independent, large, or context-heavy subtasks; do single edits and lookups yourself. Prefer a few big delegations over many small ones.
-- wait blocks until every child and every job you own has finished, then answers with one digest: a result you have not read comes in full, one you have already read as a line. status lists what is in flight; control stops or messages one.
-- Ending your turn while children still run is fine: they keep working and a finish wakes you with its "#N done: summary". wait is optional — use it when you want the results now.
+- Ending your turn while children still run is fine: they keep working and a finish wakes you with its "#N done: summary". wait is optional — use it when you want the results now (its schema says what it hands over).
 
 The machine is shared (CPU, ports, /tmp — a worktree isolates files, nothing else):
-- A long command detaches into a job instead of dying: run_command answers "[still running — detached as #c2]", detach=true asks for one at once, and any command that outlives 60s does it by itself. status lists your children and your jobs, wait blocks until every one of them has finished, and control stops one.
+- A long command detaches into a job instead of dying: run_command answers "[still running — detached as #c2]" and the command keeps its own process group. The tools' schemas say what starts one, and what reads, waits on or stops it.
 - exclusive=true owns the machine for timing- or port-sensitive work (a benchmark, a profiler, a fixed port): a sibling's command queues behind it and is refused if the lock outlasts the wait (`#N holds the machine`) — do not retry in a loop.
 ```
 
@@ -599,20 +598,20 @@ problem.
 **1. Long commands detach; they are not killed.** A command that outlives
 `CMD_DETACH_AFTER` (60 s) stops being a tool call and becomes a **job**: mush
 answers `[still running — detached as #c2; you will be told when it finishes]`
-and the process keeps going in its own process group. `detach: true` asks for that
-from the start (`npm run dev`). This replaces the plain 120 s kill, which was
-exactly wrong for a fresh worktree's cold build: the agent lost the build, read a
-timeout, and usually started over. (When the machine-wide budget is already full
-there is no room to hand a job to, and the foreground timeout is the whole story
-then.)
+and the process keeps going in its own process group (a dev server asks for the
+same thing from the start — `run_command`'s `detach`, §3). This replaces the
+plain 120 s kill, which was exactly wrong for a fresh worktree's cold build: the
+agent lost the build, read a timeout, and usually started over. (When the
+machine-wide budget is already full there is no room to hand a job to, and the
+foreground timeout is the whole story then.)
 
 **2. A job is a second-class actor.** It has an id, a command, an owner, a start
-time, an exit status, and a bounded window of output. `status` lists them,
-`control {id, action: stop}` ends one, and `CommandDone` lands in its owner's
-mailbox exactly like `ChildDone`: it wakes a napping agent, is delivered once,
-and folds in as `#c2 done: exit 0 · 3m12s · cargo test — test result: ok. …`.
-`wait` takes no arguments: it blocks until every child and every job the agent
-owns has finished, and answers with one digest.
+time, an exit status, and a bounded window of output. `CommandDone` lands in its
+owner's mailbox exactly like `ChildDone`: it wakes a napping agent, is delivered
+once, and folds in as `#c2 done: exit 0 · 3m12s · cargo test — test result: ok. …`.
+Which call lists a job, stops one, or waits on one is §3's table, one home for
+the contract — this section is about what the machine does, not what the schema
+says.
 
 Jobs are budgeted (`MAX_JOBS = 8`, machine-wide and beside `MAX_AGENTS`) because
 each is a thread, a process group, and disk. They die with their agent
