@@ -598,3 +598,39 @@ tests 21,503 (−683), comments 9,600 (−229). Net −1,271 lines.
 “Isolated agents” section (the three commands and `/worktrees`), plus
 `docs/mush.md` §3 (spawn signature and tool table) and §5.5 (`isolated
 unavailable`), already owed from §8.13.
+
+---
+
+## 8.19 `/help` that can be read (U15, `960e073`)
+
+`/help` wrote one forty-odd-line notice into the transcript's foot. The foot
+shows two rows and counts the rest, so the human saw this:
+
+```
+  +45 more lines · /notes
+· mush keys:
+    anywhere:
+```
+
+That is the cap working as designed — and useless as help: the rest was a
+keypress away in a list called `/notes`, which nobody who typed `/help` has any
+reason to guess. The `·` even made mush's own chatter look like part of the
+table.
+
+- **`/help` now opens the picker `/notes` uses** (`PickerKind::Help`), at the
+  top, scrollable with `j`/`k` and `PgUp`/`PgDn`, titled `help · line N/M`,
+  `Esc` closes. `help_opens_a_readable_list` pins the popup and the painted
+  title; `help_advertises_compact` and `help_names_the_whole_key_table` read
+  the list instead of a notice.
+- **The tables render at the popup's width.** `keys::help_table_at(width)` and
+  `commands::table_at(providers, width)` keep the keys/usage column and hang a
+  description that does not fit under its own column; `help_table()`/`table()`
+  are the `usize::MAX` forms `mush --help` prints, unchanged.
+- **Two seams retired.** `Chat::note` (root-only) is test-only: a line that
+  answers a command either opens a surface or is tagged with its agent, and the
+  compaction note now uses `note_for(AgentId::ROOT, …)` explicitly. The
+  briefly-added “help lands in the focused pane” rule went with the foot
+  notice — the popup has no pane to land in.
+
+**Census at `960e073`:** total 41,447 (was 41,343), **prod 7,568 (+34)**, tests
+21,531 (+28), comments 9,635 (+35).
