@@ -358,13 +358,6 @@ pub struct Foreground {
 }
 
 impl Foreground {
-    /// Hand the process group over: the slot goes with this call, and whoever
-    /// takes the [`Live`] owns the command from now on (see `Launch::held`).
-    fn release(&self) -> Live {
-        self.registry.forget_foreground(self.slot);
-        self.live.clone()
-    }
-
     /// Whether mush stopped this command from outside its own watcher — a quit,
     /// a `/new`, or a `Stop` aimed at the agent that started it. The answer the
     /// watcher gives the model must not read as the command's own exit code.
@@ -466,7 +459,8 @@ pub struct Launch {
     /// holding (finding S4): either way this is the process group the registry
     /// watches from here on. A foreground command is handed over, never
     /// re-spawned and never unheld, so the process group is in the registry's
-    /// reach every moment of its life.
+    /// reach every moment of its life — the slot it holds goes when
+    /// [`Registry::launch`] has written the job's record, not on the way in.
     source: Source,
     /// Where the completion lands: the owner's own mailbox, exactly as a child's
     /// completion does.
@@ -501,9 +495,10 @@ impl Launch {
     }
 
     /// A command a tool call was holding and has outlived `CMD_DETACH_AFTER`
-    /// for: the same process group, watched from now on as a job. Releasing the
-    /// hold is part of the move — there is no moment where it is in neither the
-    /// foreground slot nor the job list.
+    /// for: the same process group, watched from now on as a job. The hold is
+    /// released once the job's record exists: there is no moment where it is in
+    /// neither the foreground slot nor the job list, so a kill that lands in
+    /// this window still reaches it.
     pub fn held(
         owner: u64,
         command: String,
@@ -522,16 +517,24 @@ impl Launch {
 }
 
 impl Source {
-    /// The registry's grip on the process group this launch is about: a command
-    /// that just arrived wrapped here, or the one a foreground call was already
-    /// holding, released as part of the move.
-    fn into_live(self) -> Live {
+    /// The registry's grip on the process group this launch is about, and the
+    /// foreground slot that still holds it, if any.
+    ///
+    /// A held command's slot is *not* released here. It goes when the job's
+    /// record exists ([`Registry::launch`]), because this runs before the
+    /// registry lock is taken: a slot freed on the way in would leave a window
+    /// in which the command is in neither map, and a `kill_all` there would
+    /// miss the very process group it exists to kill (finding S4).
+    fn into_live(self) -> (Live, Option<Foreground>) {
         match self {
-            Source::Started(job) => Live {
-                job: Arc::new(Mutex::new(job)),
-                stop: Arc::new(AtomicBool::new(false)),
-            },
-            Source::Held(held) => held.release(),
+            Source::Started(job) => (
+                Live {
+                    job: Arc::new(Mutex::new(job)),
+                    stop: Arc::new(AtomicBool::new(false)),
+                },
+                None,
+            ),
+            Source::Held(held) => (held.live.clone(), Some(held)),
         }
     }
 }
@@ -760,7 +763,7 @@ impl Registry {
             mailbox,
             source,
         } = launch;
-        let live = source.into_live();
+        let (live, held) = source.into_live();
         let admitted = {
             let mut inner = self.inner();
             let refusal = if exclusive {
@@ -817,6 +820,10 @@ impl Registry {
                 return Err(refusal);
             }
         };
+        // The job's record exists, so the job list is what names this command
+        // from here on: the slot a foreground call was holding can go. Not
+        // before — the window in between is one a `kill_all` falls into.
+        drop(held);
         let registry = Arc::clone(self);
         let watching = live.clone();
         let started = self.clock.now();
@@ -869,18 +876,7 @@ impl Registry {
     /// tool call. A `Stop` aimed at an agent means "stop the work in flight",
     /// and a `run_command` the agent is waiting on is work in flight.
     pub fn kill_owned(&self, owner: u64) {
-        for (holder, live) in self.foregrounds() {
-            if holder == owner {
-                live.kill();
-            }
-        }
-        for record in self.jobs() {
-            if record.owner == owner {
-                if let Some(live) = record.live {
-                    live.kill();
-                }
-            }
-        }
+        self.kill(Some(owner));
     }
 
     /// Stop everything. This is what quitting mush runs, where a build an agent
@@ -889,12 +885,28 @@ impl Registry {
     /// of a tool call and registered nowhere, so nothing on the way out could
     /// see it.
     pub fn kill_all(&self) {
-        for (_, live) in self.foregrounds() {
-            live.kill();
+        self.kill(None);
+    }
+
+    /// Stop what `owner` started — both its jobs and the commands it is running
+    /// as tool calls — or, with `None`, everything this registry reaches.
+    ///
+    /// The reach is two maps, and this is the one walk over them: a killer that
+    /// walked only `jobs` would be a second, weaker rule, and the foreground
+    /// half is exactly what the weaker rule misses (finding S4).
+    fn kill(&self, owner: Option<u64>) {
+        // `map_or`, not `is_none_or`: the workspace declares Rust 1.74, where
+        // the latter does not exist yet (clippy's msrv lint keeps this honest).
+        for (holder, live) in self.foregrounds() {
+            if owner.map_or(true, |owner| owner == holder) {
+                live.kill();
+            }
         }
         for record in self.jobs() {
-            if let Some(live) = record.live {
-                live.kill();
+            if owner.map_or(true, |owner| owner == record.owner) {
+                if let Some(live) = record.live {
+                    live.kill();
+                }
             }
         }
     }
@@ -1018,13 +1030,14 @@ impl Drop for Registry {
     /// The backstop: whatever path ends the tree, no process group it started
     /// outlives it. `App` calls `kill_all` explicitly on the way out; this
     /// catches the paths that do not (a panic inside an actor, a test).
+    ///
+    /// It kills through [`Registry::kill`], the same walk `Stop`, `/new` and
+    /// quitting take, so the backstop is the rule and not a second copy of it:
+    /// walking the job list alone left the commands a tool call is holding —
+    /// the ones finding S4 is about — outside a drop that is meant to be
+    /// everything.
     fn drop(&mut self) {
-        let inner = self.inner();
-        for record in inner.jobs.values() {
-            if let Some(live) = &record.live {
-                live.kill();
-            }
-        }
+        self.kill(None);
     }
 }
 

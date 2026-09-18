@@ -8250,8 +8250,13 @@ mod tests {
         }
         let text = shot(&mut app, 200, 50).shown().join("\n");
         assert!(
-            text.contains("移植解析器"),
+            text.contains("移植解析"),
             "the row names the agent in its own script: {text}"
+        );
+        assert!(
+            text.contains("✉"),
+            "the unread mark rides the row it is about (H4); it is state, so the title yields \
+             to it by R1 — which is the one column this test gave up: {text}"
         );
         assert!(
             text.contains("请把解析器移植过来"),

@@ -150,6 +150,10 @@ pub const MAX_DEPTH: usize = 3;
 const MAX_AGENTS: u64 = 16;
 /// Default `wait_agents` timeout in seconds; 0 means forever.
 const WAIT_TIMEOUT_SECS: u64 = 600;
+/// How wide one line of an `agent_status` digest may be, in columns. A listing
+/// is for telling children apart and knowing what is unread; the body itself
+/// travels through the delivery roads, once (see [`Outcome::digest`]).
+const DIGEST_COLUMNS: usize = 100;
 /// Why a cancelled run ends. Internal to the actor: a run that ends with this
 /// becomes `Outcome::Stopped` at the actor boundary, so no other layer has to
 /// compare result text to know what happened.
@@ -334,6 +338,34 @@ impl Outcome {
     /// sitting uncommitted, so it has to be told rather than left to assume.
     fn is_news(&self) -> bool {
         !matches!(self, Outcome::Stopped)
+    }
+
+    /// A bounded rendering of this outcome for a *listing* (`agent_status`):
+    /// the first line, cut at [`DIGEST_COLUMNS`], plus the size of the whole.
+    ///
+    /// Never the body. A listing is not a delivery: the body is handed to the
+    /// model exactly once, by the roads that ask [`ActorState::record_child`]
+    /// and mark it read. `agent_status` used to print every child's entire
+    /// final message on every call, so a parent that polled it re-read every
+    /// child's report again and again (the replay this digest closes).
+    fn digest(&self, id: u64) -> String {
+        let (mark, body) = match self {
+            Outcome::Finished(summary) => ("✓", summary.as_str()),
+            Outcome::Failed(error) => ("✗", error.as_str()),
+            Outcome::Stopped => {
+                return format!("#{id} ⊘ stopped — idle and resumable");
+            }
+            Outcome::CutOff => {
+                return format!("#{id} ⚠ cut off — the run never ended; nothing was committed");
+            }
+        };
+        let first = body.lines().next().unwrap_or("").trim();
+        let cut = truncate(first, DIGEST_COLUMNS);
+        if body.chars().count() > cut.chars().count() {
+            format!("#{id} {mark} {cut} ({} chars total)", body.chars().count())
+        } else {
+            format!("#{id} {mark} {cut}")
+        }
     }
 }
 
@@ -622,6 +654,45 @@ impl ActorState {
         self.completed
             .get(&id)
             .map(|completion| &completion.outcome)
+    }
+
+    /// Whether `id`'s latest recorded outcome is one the model has not read.
+    /// The one derivation of the `✉` mark: `agent_status` prints it, and the
+    /// delivery roads consume it (a run recorded again under a mark that names
+    /// it is not fresh). A child with no recorded outcome is not unread — there
+    /// is nothing to read.
+    fn unread(&self, id: u64) -> bool {
+        match self.completed.get(&id) {
+            Some(completion) => self.delivered.get(&id) != Some(&completion.run),
+            None => false,
+        }
+    }
+
+    /// Record a child's completion and say whether its line is *fresh* — one
+    /// the model has not read yet: `(line, fresh)`. The record is kept either
+    /// way (it is what makes a *later* run newsworthy), and a fresh line is
+    /// marked read as it is handed back. The seven callers of "record and push
+    /// a completion once" — the two in [`absorb`], `drain_mailbox`'s, both of
+    /// [`fold_completions`]'s, and the two wait tools — differ only in what
+    /// they do with the answer (`Fold::Run` or `Fold::Idle`, or return the
+    /// line). Reading the same run again is not fresh: folding it would hand
+    /// the model a line it has answered (`docs/findings.md` B24).
+    fn record_child(&mut self, id: u64, run: u64, outcome: Outcome) -> (String, bool) {
+        let line = note_completion(self, id, run, outcome);
+        if self.delivered.get(&id) == Some(&run) {
+            return (line, false);
+        }
+        self.delivered.insert(id, run);
+        (line, true)
+    }
+
+    /// The same once-only delivery for a job: record the report and return its
+    /// line when the model has not read it, or `None` when it has — a report
+    /// recorded again is the *same* report, and folding it again would repeat a
+    /// line the model has answered (`docs/findings.md` B24).
+    fn record_job(&mut self, id: u64, line: String, news: bool) -> Option<String> {
+        let line = note_job(self, id, line, news);
+        self.delivered_jobs.insert(id).then_some(line)
     }
 }
 
@@ -1158,14 +1229,12 @@ fn absorb(
                 })
                 .map(|(id, completion)| (*id, completion.run))
                 .collect();
-            // Adoption may only *add* marks, never remove one. Every line this
-            // actor folds is now emitted as a `Message` event, so the copy the
-            // UI hands back carries it — but that copy can be older than the
-            // emit (the human typed in between). Un-marking a delivery the
-            // model has already read would inject the same result a second
-            // time; the two copies converge at the next adoption instead.
-            // Adoption may only *add* marks, never move one backwards: a mark
-            // that names a *later* run than the adopted transcript holds stays.
+            // Adoption may only *add* marks, never remove one or move one
+            // backwards: every line this actor folds is emitted as a `Message`
+            // event, so the copy the UI hands back carries it — but that copy
+            // can be older than the emit, and un-marking a delivery the model
+            // has already read would inject the same result twice. A mark
+            // naming a later run than the adopted transcript holds stays.
             for (id, run) in announced {
                 state.delivered.entry(id).or_insert(run);
             }
@@ -1229,21 +1298,21 @@ fn absorb(
             // completion counts as delivered because the model is about to
             // read it in this very run.
             let news = outcome.is_news();
-            let line = note_completion(state, id, run, outcome);
+            let (line, fresh) = state.record_child(id, run, outcome);
             // A run the model has already read is not news however often it is
             // reported: folding it here would hand the model a line it has
             // answered, and a result would even pay for a turn to repeat it
             // (`docs/findings.md` B24). The record itself is kept — it is what
             // makes a *later* run newsworthy.
-            if state.delivered.get(&id) == Some(&run) {
+            if !fresh {
                 return Fold::Idle;
             }
             push_line(actor, transcript, line);
-            state.delivered.insert(id, run);
             // The line is in this parent's transcript now, so the child's row
             // stops claiming nobody has read it — the one moment that fact
             // changes hands, told to the UI from the actor that owns it
-            // (finding H4).
+            // (finding H4). `fresh` is that moment's one home: every road that
+            // hands the model a result asks `record_child` first.
             actor
                 .ctx
                 .emit(actor.id, AgentEvent::ResultRead { child: id });
@@ -1262,16 +1331,16 @@ fn absorb(
             // same silence when the report has already been read, so a report
             // recorded again cannot repeat a line the model has answered
             // (`docs/findings.md` B24).
-            let line = note_job(state, id, line, news);
-            if state.delivered_jobs.contains(&id) {
-                return Fold::Idle;
-            }
-            push_line(actor, transcript, line);
-            state.delivered_jobs.insert(id);
-            if news {
-                Fold::Run
-            } else {
-                Fold::Idle
+            match state.record_job(id, line, news) {
+                None => Fold::Idle,
+                Some(line) => {
+                    push_line(actor, transcript, line);
+                    if news {
+                        Fold::Run
+                    } else {
+                        Fold::Idle
+                    }
+                }
             }
         }
     }
@@ -1444,15 +1513,11 @@ fn run_loop(
         // fire while it still fits; beyond that, trimming stays the last
         // resort.
         if state.compact_requested || needs_compaction(messages, budget) {
-            // A fold that came to nothing (a history nothing can be made of):
-            // the run carries on, and the phase the fold put on the row goes
-            // back to what a run wears between the request and the tool it
-            // names.
-            if !compact_history(actor, &cfg, messages, cancel, state, true)? {
-                actor
-                    .ctx
-                    .emit(actor.id, AgentEvent::CompactingEnded { in_run: true });
-            }
+            // A fold that came to nothing (a history nothing can be made of)
+            // says so itself: the run carries on, and the phase the fold put on
+            // the row goes back to what a run wears between the request and the
+            // tool it names.
+            compact_history(actor, &cfg, messages, cancel, state, true)?;
         }
         // Keep the whole request inside the endpoint's context window.
         trim_history(messages, budget);
@@ -1834,12 +1899,11 @@ const NOTHING_TO_COMPACT: &str =
 /// and the human's `/compact` both come through here, so they cannot disagree
 /// about what "the summary message" is or about when folding is worth a call.
 ///
-/// The `bool` in the `Ok` says whether the transcript was replaced: a fold that
+/// The `bool` in the `Ok` says whether the transcript was replaced. A fold that
 /// came to nothing (a short history, a refusal mush cannot read as a summary)
-/// is over, and the phase it put on the row has to be cleared by whoever knows
-/// what the actor is doing next. `in_run` is that answer, from the caller that
-/// knows it: a fold at a run's message boundary is part of the run, one
-/// `compact_now` makes belongs to no run at all.
+/// emits its own [`AgentEvent::CompactingEnded`] instead, so neither caller has
+/// to know how far it got: `in_run` is on both ends of the fold — a fold at a
+/// run's message boundary is part of the run, one `compact_now` makes is not.
 fn compact_history(
     actor: &Actor,
     cfg: &Config,
@@ -1867,8 +1931,12 @@ fn compact_history(
                 .ctx
                 .emit(actor.id, AgentEvent::Notice(NOTHING_TO_COMPACT.to_string()));
         }
-        // Nothing was replaced, whether the transcript was empty or the fold's
-        // opening message was something else entirely — the phase stays false.
+        // Nothing was replaced, whether the transcript was empty or its opening
+        // message was something else entirely: the fold ends here as every
+        // other `Ok(false)` does, this arm being reached before a `Compacting`.
+        actor
+            .ctx
+            .emit(actor.id, AgentEvent::CompactingEnded { in_run });
         return Ok(false);
     }
     // Nothing left to fold: system + one message is already minimal
@@ -1881,6 +1949,9 @@ fn compact_history(
                 .ctx
                 .emit(actor.id, AgentEvent::Notice(NOTHING_TO_COMPACT.to_string()));
         }
+        actor
+            .ctx
+            .emit(actor.id, AgentEvent::CompactingEnded { in_run });
         return Ok(false);
     }
     let actor_id = actor.id;
@@ -1973,6 +2044,11 @@ fn compact_history(
                     AgentEvent::Notice(format!("could not compact: {why}")),
                 );
             }
+            // Either way the fold is over, and the phase it put on the row
+            // goes — whether or not the human was told why.
+            actor
+                .ctx
+                .emit(actor.id, AgentEvent::CompactingEnded { in_run });
             return Ok(false);
         }
     };
@@ -1989,6 +2065,9 @@ fn compact_history(
                 AgentEvent::Notice("could not compact — the model returned no summary".to_string()),
             );
         }
+        actor
+            .ctx
+            .emit(actor.id, AgentEvent::CompactingEnded { in_run });
         return Ok(false);
     }
 
@@ -2034,32 +2113,23 @@ fn compact_now(actor: &Actor, state: &mut ActorState, transcript: &mut Vec<Messa
     // a fold that spins an hourglass while no key can stop it is worse than one
     // nobody can see.
     let cancel = Arc::new(AtomicBool::new(false));
-    match compact_history(actor, &cfg, transcript, &cancel, state, false) {
-        // A fold that landed needs nothing here: its `Compact` event is what
-        // the pane, the session and the meter read.
-        Ok(true) => {}
-        // Nothing came of it — the history was too short, or the endpoint
-        // answered something mush could not read as a summary. Either way the
-        // row must stop saying `compacting…`.
-        Ok(false) => {
-            actor
-                .ctx
-                .emit(actor.id, AgentEvent::CompactingEnded { in_run: false });
-        }
+    // A fold that landed needs nothing here: its `Compact` event is what the
+    // pane, the session and the meter read. A fold that came to nothing emits
+    // its own ending too, so only its *failures* are left to report.
+    if let Err(error) = compact_history(actor, &cfg, transcript, &cancel, state, false) {
         // The human stopped it. A stop is its own event, not a failure: the
         // actor is alive and resumable, and the row must say which of the two
         // just happened.
-        Err(error) if error == CANCELLED => {
+        if error == CANCELLED {
             actor.ctx.emit(actor.id, AgentEvent::Stopped);
-        }
-        Err(error) => {
+        } else {
             actor.ctx.emit(
                 actor.id,
                 AgentEvent::Notice(format!("could not compact: {error}")),
             );
             // The endpoint refused, could not be reached, or answered
-            // something unreadable: the fold is over either way, and the row
-            // must stop claiming it.
+            // something unreadable: the fold got as far as putting its
+            // `Compacting` on the row, and the row must stop claiming it.
             actor
                 .ctx
                 .emit(actor.id, AgentEvent::CompactingEnded { in_run: false });
@@ -2160,10 +2230,8 @@ fn drain_mailbox(
             // often it is recorded (`docs/findings.md` B24), which is what makes
             // a replayed record cost nothing.
             AgentMsg::CommandDone { id, line, news } => {
-                let line = note_job(state, id, line, news);
-                if !state.delivered_jobs.contains(&id) {
+                if let Some(line) = state.record_job(id, line, news) {
                     push_line(actor, messages, line);
-                    state.delivered_jobs.insert(id);
                 }
             }
             // The UI sends a whole transcript when it believes we are idle.
@@ -2259,8 +2327,9 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
         .collect();
     let mut news = false;
     for (job, line, job_news) in jobs {
-        push_line(actor, messages, note_job(state, job, line, job_news));
-        state.delivered_jobs.insert(job);
+        if let Some(line) = state.record_job(job, line, job_news) {
+            push_line(actor, messages, line);
+        }
         news |= job_news;
     }
     // A child's completion is always worth a turn: the model has to read a
@@ -2274,10 +2343,11 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
         .map(|(child, completion)| (*child, completion.run, completion.outcome.clone()))
         .collect();
     for (child, run, outcome) in children {
-        let line = note_completion(state, child, run, outcome);
-        push_line(actor, messages, line);
-        state.delivered.insert(child, run);
-        actor.ctx.emit(actor.id, AgentEvent::ResultRead { child });
+        let (line, fresh) = state.record_child(child, run, outcome);
+        if fresh {
+            push_line(actor, messages, line);
+            actor.ctx.emit(actor.id, AgentEvent::ResultRead { child });
+        }
         news = true;
     }
     news
@@ -2520,6 +2590,35 @@ fn wait_tool(
             unknown.join(", ")
         ));
     }
+    let mut results = WaitResults {
+        // Pure: which children hold a result this waiter can be given. Asking
+        // must not read anything — `deliver` is what the answer actually hands
+        // over, and only for the results this call returns (a poll that marked
+        // every ready child would swallow bodies the model never saw).
+        is_ready: &mut |state, id| state.completed.contains_key(&id),
+        // One home decides whether this answer is the model's first read of the
+        // run (`record_child`). A fresh result is delivered in full — the shape
+        // the fold uses, so adoption still recognises it — and the child's `✉`
+        // goes out with it. A result the model has already read is answered
+        // with its digest and said to be old, never with the body again
+        // (finding H15: a wait must not report the past as news, and must not
+        // replay a report the model has answered).
+        deliver: &mut |state, id| {
+            let Some(completion) = state.completed.get(&id).cloned() else {
+                return format!("#{id} (no result recorded)");
+            };
+            let digest = completion.outcome.digest(id);
+            let (body, fresh) = state.record_child(id, completion.run, completion.outcome);
+            if fresh {
+                actor
+                    .ctx
+                    .emit(actor.id, AgentEvent::ResultRead { child: id });
+                body
+            } else {
+                format!("{digest} (already read — no new run since)")
+            }
+        },
+    };
     wait_for_results(
         actor,
         state,
@@ -2527,29 +2626,30 @@ fn wait_tool(
         args,
         &candidates,
         jobs::Waited::Agents,
-        |state, id| {
-            // Not always `done`: a stopped child is reported as stopped, so a
-            // waiter knows there is no result yet rather than receiving one that
-            // says "cancelled". The mark names the run this answer came from: a
-            // run recorded *after* it is still unread, and folds then.
-            let completion = state.completed.get(&id)?.clone();
-            state.delivered.insert(id, completion.run);
-            // A `wait_agents` that asked for the result is a parent reading it,
-            // by definition, so the child's `✉` goes out with the line.
-            actor
-                .ctx
-                .emit(actor.id, AgentEvent::ResultRead { child: id });
-            Some(completion.outcome.line(id))
-        },
+        &mut results,
     )
+}
+
+/// The two questions a wait asks about one candidate, in one value — so the
+/// wait itself stays a small function rather than an argument list.
+///
+/// `is_ready` is a *pure* question (`true` = a result exists) and never touches
+/// the records; `deliver` turns one chosen result into the line the model
+/// reads, and is called only for the results a call actually returns. The split
+/// is the fix for a wait that asked about every child: it used to
+/// render-and-mark each ready one while returning only the first, so one wait
+/// silently marked results the model was never handed as read.
+struct WaitResults<'a> {
+    is_ready: &'a mut dyn FnMut(&ActorState, u64) -> bool,
+    deliver: &'a mut dyn FnMut(&mut ActorState, u64) -> String,
 }
 
 /// The one blocking wait `wait_agents` and `wait_commands` both run: poll the
 /// mailbox, honour a cancellation, notice the human, stop at the deadline, and
 /// return whatever results are ready. The two tools differ only in what "a
 /// result" is — a child's outcome or a job's report line — which the caller
-/// supplies, so the subtle parts (the deadline, the parked human, the cancel)
-/// exist once.
+/// supplies ([`WaitResults`]), so the subtle parts (the deadline, the parked
+/// human, the cancel) exist once.
 fn wait_for_results(
     actor: &Actor,
     state: &mut ActorState,
@@ -2557,7 +2657,7 @@ fn wait_for_results(
     args: &Value,
     candidates: &[u64],
     waiting_for: jobs::Waited,
-    mut result: impl FnMut(&mut ActorState, u64) -> Option<String>,
+    results: &mut WaitResults<'_>,
 ) -> Result<String, String> {
     // `all` asks for every result instead of the first one: the first is what an
     // orchestrator wants the moment one delegate is free, and `all` is what it
@@ -2599,37 +2699,63 @@ fn wait_for_results(
                 waiting_for.tool()
             ));
         }
-        let mut ready = Vec::new();
+        let mut finished: Vec<u64> = Vec::new();
         let mut waiting = Vec::new();
         for id in candidates {
-            match result(state, *id) {
-                Some(line) => ready.push(line),
-                None => waiting.push(waiting_for.label(*id)),
+            if (results.is_ready)(state, *id) {
+                finished.push(*id);
+            } else {
+                waiting.push(waiting_for.label(*id));
             }
         }
-        if (!all && !ready.is_empty()) || (all && waiting.is_empty()) {
-            return Ok(if all {
-                ready.join("\n")
+        // What this call returns: the first ready child, or every one of them
+        // once nothing is left running. Only these are delivered.
+        let take = if all {
+            if waiting.is_empty() {
+                finished.len()
             } else {
-                ready.remove(0)
-            });
+                0
+            }
+        } else {
+            usize::from(!finished.is_empty())
+        };
+        if take > 0 {
+            let answers: Vec<String> = finished
+                .iter()
+                .take(take)
+                .map(|id| (results.deliver)(state, *id))
+                .collect();
+            return Ok(answers.join("\n"));
         }
         if let Some(deadline) = deadline {
             if clock.now() >= deadline {
                 // What is known is returned, and what is not is named: a wait
                 // that timed out is not a wait that lost the results.
                 let note = format!("wait timed out — {} still running", waiting.join(", "));
-                return Ok(if ready.is_empty() {
-                    note
-                } else {
-                    format!("{}\n{note}", ready.join("\n"))
-                });
+                if finished.is_empty() {
+                    return Ok(note);
+                }
+                let answers: Vec<String> = finished
+                    .iter()
+                    .map(|id| (results.deliver)(state, *id))
+                    .collect();
+                return Ok(format!("{}\n{note}", answers.join("\n")));
             }
         }
         clock.sleep(Duration::from_millis(50));
     }
 }
 
+/// `agent_status`: what this agent's children are doing, as a bounded listing.
+///
+/// A listing is not a delivery. Each child's outcome is rendered as a digest —
+/// the first line, cut at [`DIGEST_COLUMNS`], with the size of the whole — and
+/// the results the model has not read yet wear `✉`. The body itself reaches the
+/// model exactly once, through the fold, the wake, or an explicit wait (the
+/// roads that ask [`ActorState::record_child`]). Printing the bodies here is
+/// what made a parent that polled its children re-read every report on every
+/// call; the `✉` tells it what is still worth waiting for, which is the fact a
+/// listing owes a reader.
 fn status_tool(state: &ActorState) -> Result<String, String> {
     if state.children.is_empty() {
         return Ok("no child agents".to_string());
@@ -2638,20 +2764,23 @@ fn status_tool(state: &ActorState) -> Result<String, String> {
     let mut ids: Vec<u64> = state.children.keys().copied().collect();
     ids.sort_unstable();
     for id in ids {
+        // The same `✉` the tree rows carry (H4): a result nobody has read.
+        let unread = if state.unread(id) { "✉ " } else { "" };
         match state.outcome(id) {
             // Each state gets its own mark: a stopped child was neither
             // finished (✓) nor failed (✗), and a parent that cannot tell them
             // apart treats a stop as a result.
-            Some(Outcome::Finished(summary)) => lines.push(format!("#{id} ✓ {summary}")),
-            Some(Outcome::Failed(error)) => lines.push(format!("#{id} ✗ {error}")),
+            Some(outcome @ (Outcome::Finished(_) | Outcome::Failed(_))) => {
+                lines.push(format!("{unread}{}", outcome.digest(id)));
+            }
             Some(Outcome::Stopped) => lines.push(format!(
-                "#{id} ⊘ stopped — idle and resumable (agent_control message resumes it)"
+                "{unread}#{id} ⊘ stopped — idle and resumable (agent_control message resumes it)"
             )),
             // A run that never ended. Its own line, because the parent's next
             // move depends on it: there is no result coming and the work may be
             // sitting uncommitted (finding H2).
             Some(Outcome::CutOff) => lines.push(format!(
-                "#{id} ⚠ cut off — the run never ended; nothing was committed"
+                "{unread}#{id} ⚠ cut off — the run never ended; nothing was committed"
             )),
             None => lines.push(format!("#{id} ◐ running")),
         }
@@ -2749,6 +2878,26 @@ fn wait_commands_tool(
             unknown.join(", ")
         ));
     }
+    let mut results = WaitResults {
+        // Pure, like the agents' half: asking about a job must not hand its
+        // report over — only the answer this call returns does that.
+        is_ready: &mut |state, id| state.done_jobs.contains_key(&id),
+        deliver: &mut |state, id| {
+            // The report is marked delivered as it is handed over, so the fold
+            // at the next message boundary cannot inject the same line again.
+            // Asking a second time answers with the job's line again — a wait
+            // is "tell me what happened", and the model that asks twice gets an
+            // answer twice rather than a silence it has to interpret. (A job's
+            // report is already bounded — exit status and the end of its
+            // output — so repeating it is not the replay a child's report is.)
+            let Some(report) = state.done_jobs.get(&id).cloned() else {
+                return jobs::label(id);
+            };
+            state
+                .record_job(id, report.line.clone(), report.news)
+                .unwrap_or(report.line)
+        },
+    };
     wait_for_results(
         actor,
         state,
@@ -2756,16 +2905,7 @@ fn wait_commands_tool(
         args,
         &candidates,
         jobs::Waited::Jobs,
-        |state, id| {
-            // The report is marked delivered as it is handed over, so the fold
-            // at the next message boundary cannot inject the same line again.
-            // Asking a second time answers with the job's line again — a wait
-            // is "tell me what happened", and the model that asks twice gets an
-            // answer twice rather than a silence it has to interpret.
-            let report = state.done_jobs.get(&id)?.line.clone();
-            state.delivered_jobs.insert(id);
-            Some(report)
-        },
+        &mut results,
     )
 }
 
@@ -4133,6 +4273,135 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// The sweep the replay bug asked for: every road that hands a parent a
+    /// child's body, one table, one invariant — the body arrives **once**, the
+    /// result is left read, nothing folds it again, and a repeated wait answers
+    /// with the digest instead of the report. The per-road tests each knew their
+    /// own road; this is the one that would have caught `agent_status` replaying
+    /// every child's report on every call.
+    #[test]
+    fn every_delivery_road_hands_a_result_over_once() {
+        let body = "## report\nfirst line of detail\nsecond line of detail";
+        for road in ["wait", "fold", "wake"] {
+            let (actor, _events, _mailbox) = recording_actor(&format!("road-{road}"));
+            let mut state = ActorState::default();
+            let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
+            state.children.insert(1, tx);
+            // The arrival road, which never delivers: a completion is recorded
+            // the moment it reaches the parent, and delivered by a boundary.
+            note_completion(&mut state, 1, 1, Outcome::Finished(body.into()));
+            let mut transcript = vec![Message::system("you are mush")];
+            let mut answer = String::new();
+            match road {
+                "wait" => {
+                    answer = exec_tool(
+                        &actor,
+                        &mut state,
+                        ToolName::WaitAgents,
+                        &json!({ "ids": [1], "timeout": 5 }),
+                        &AtomicBool::new(false),
+                    )
+                    .unwrap();
+                }
+                "fold" => {
+                    assert!(fold_completions(&actor, &mut state, &mut transcript));
+                }
+                "wake" => {
+                    assert!(matches!(
+                        absorb(
+                            &actor,
+                            &mut state,
+                            &mut transcript,
+                            AgentMsg::ChildDone {
+                                id: 1,
+                                run: 1,
+                                outcome: Outcome::Finished(body.into()),
+                            },
+                        ),
+                        Fold::Run
+                    ));
+                }
+                _ => unreachable!(),
+            }
+            let carried = transcript
+                .iter()
+                .filter(|message| message.text().contains(body))
+                .count()
+                + usize::from(answer.contains(body));
+            assert_eq!(carried, 1, "{road}: the body was delivered {carried} times");
+            assert!(!state.unread(1), "{road}: the result is still unread");
+            // Nothing folds it again: the once-only rule is what the mark is for.
+            let before = transcript.len();
+            assert!(
+                !fold_completions(&actor, &mut state, &mut transcript),
+                "{road}: the read result is still news"
+            );
+            assert_eq!(transcript.len(), before, "{road}: the fold replayed a line");
+            // And asking a second time answers with the digest, never the body
+            // (finding H15: a wait must not report the past as news).
+            let again = exec_tool(
+                &actor,
+                &mut state,
+                ToolName::WaitAgents,
+                &json!({ "ids": [1], "timeout": 5 }),
+                &AtomicBool::new(false),
+            )
+            .unwrap();
+            assert!(
+                !again.contains(body),
+                "{road}: the repeated wait replayed it: {again}"
+            );
+            assert!(again.contains("already read"), "{road}: {again}");
+            // The listing never carries the body, read or unread.
+            let listing = status_tool(&state).unwrap();
+            assert!(
+                !listing.contains(body),
+                "{road}: the listing carried the body"
+            );
+            let _ = fs::remove_dir_all(actor.ws.root());
+        }
+    }
+
+    /// `agent_status` is a listing, not a delivery: a child's whole final
+    /// message used to be printed on every call, so a parent that polled its
+    /// children re-read every report, and the fold then re-delivered it as the
+    /// same text a second time. Now the line is a bounded digest with the size
+    /// of what it is not showing, and `✉` says whether the body is still
+    /// waiting — the fold remains the one road that hands it over.
+    #[test]
+    fn a_listing_digests_a_result_and_says_what_is_unread() {
+        let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let mut state = ActorState::default();
+        state.children.insert(1, tx);
+        let long = format!("first line of a long report\n{}", "detail ".repeat(900));
+        note_completion(&mut state, 1, 1, Outcome::Finished(long.clone()));
+
+        let listing = status_tool(&state).unwrap();
+        assert!(
+            listing.contains("✉ #1 ✓ first line of a long report"),
+            "{listing}"
+        );
+        assert!(
+            listing.contains("chars total"),
+            "the digest says how much it hides: {listing}"
+        );
+        assert!(!listing.contains(&long), "the listing carried the body");
+        assert!(
+            listing.chars().count() < 200,
+            "the listing is bounded: {listing}"
+        );
+        assert!(state.unread(1), "a listing is not a read");
+
+        // Delivered once by the fold: the marker goes, the digest stays.
+        let (actor, _events, _mailbox) = recording_actor("listing-digest");
+        let mut transcript = vec![Message::system("you are mush")];
+        assert!(fold_completions(&actor, &mut state, &mut transcript));
+        let listing = status_tool(&state).unwrap();
+        assert!(!listing.contains('✉'), "nothing is unread now: {listing}");
+        assert!(listing.contains("first line of a long report"), "{listing}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// Two runs, the same failure text: the second is news, and folds once of
     /// its own. This is what makes plain `Outcome` equality (or a scan for the
     /// line) the wrong identity for a delivery — it would swallow a real second
@@ -4955,6 +5224,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(first, "#1 done: wrote the parser", "one result by default");
+        // The wait asked about every child but handed over only #1. #2's result
+        // must still be unread, or a wait for the first would swallow the body
+        // of a result it never answered with (the poll used to mark them all).
+        assert!(!state.unread(1), "the answer was #1's read");
+        assert!(
+            state.unread(2),
+            "#2's body was not handed over, so it is not read"
+        );
 
         let every = exec_tool(
             &actor,
@@ -4965,9 +5242,17 @@ mod tests {
         )
         .unwrap();
         assert!(
-            every.contains("#1 done: wrote the parser") && every.contains("#2 failed: no route"),
-            "every result, in the order they were asked about: {every}"
+            every.contains("#2 failed: no route"),
+            "every result, with #2's body delivered now: {every}"
         );
+        assert!(
+            every.contains("already read"),
+            "and #1 named as one the model has read, not replayed (H15): {every}"
+        );
+        let one = every.find("#1").expect("#1 is named");
+        let two = every.find("#2").expect("#2 is named");
+        assert!(one < two, "in the order they were asked about: {every}");
+        assert!(!state.unread(1) && !state.unread(2), "both are read now");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
