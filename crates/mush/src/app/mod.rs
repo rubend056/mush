@@ -943,10 +943,17 @@ impl App {
 
     /// Remember a transient line for the bar: what a command just did, what the
     /// human just asked for. It fades.
+    ///
+    /// The line is [`mush_core::text::sanitize`]d here, at the one door into the
+    /// bar, because the bar paints it whole: it does no width arithmetic, so it
+    /// never calls `truncate` or `fit_row` and the rule those carry cannot reach
+    /// it. The same door serves [`Self::fail`], and between them they own every
+    /// string the bar's line can be.
     pub fn say(&mut self, text: impl Into<String>) {
+        let text = text.into();
         self.status = Some(Status {
             kind: StatusKind::Info,
-            text: text.into(),
+            text: mush_core::text::sanitize(&text),
             set_at: Instant::now(),
         });
     }
@@ -986,10 +993,15 @@ impl App {
 
     /// Remember something that went wrong. Errors do not fade: they stay until
     /// a later line replaces them.
+    ///
+    /// A failure is where the *endpoint's* own words reach the bar — a 500's
+    /// error body, a refusal's reason — so this is the other half of the rule
+    /// `say` carries (see its doc).
     pub fn fail(&mut self, text: impl Into<String>) {
+        let text = text.into();
         self.status = Some(Status {
             kind: StatusKind::Error,
-            text: text.into(),
+            text: mush_core::text::sanitize(&text),
             set_at: Instant::now(),
         });
     }
@@ -1020,22 +1032,25 @@ impl App {
     /// Everything else the bar's line one carries is an event with no other
     /// home — a failure, a stop, a job's report, a command's answer — and the
     /// newest of those is the status, not this.
+    ///
+    /// The count is the root's *own* busy children — [`AgentTree::busy_children`] —
+    /// the same derivation the row's `⏸N` mark and the title's `M waiting`
+    /// read, and not every busy node in the tree. The sentence is a promise
+    /// about when the root resumes, and it resumes when its children finish: a
+    /// grandchild working under a child that is itself parked promised a resume
+    /// the grandchild's finish does not cause, and it contradicted the title of
+    /// the very frame it was painted in (a second owner of the fact U2 named).
     pub fn tree_line(&self) -> Option<String> {
-        let working = self
-            .tree
-            .agents
-            .iter()
-            .filter(|node| node.phase.is_busy())
-            .count();
+        let waiting = self.tree.busy_children(AgentId::ROOT);
         let root_is_working = self
             .tree
             .node(AgentId::ROOT)
             .is_some_and(|root| root.phase.is_busy());
-        if working == 0 || root_is_working {
+        if waiting == 0 || root_is_working {
             return None;
         }
         Some(format!(
-            "waiting on {working} subagent(s) — the root resumes as they finish"
+            "waiting on {waiting} subagent(s) — the root resumes as they finish"
         ))
     }
 
@@ -5799,6 +5814,254 @@ mod tests {
                 .unwrap_or_else(|error| panic!("draw failed at {width}x{height}: {error}"));
             app.focus = Focus::Chat;
         }
+    }
+
+    /// One painted frame, cell by cell and borders included: a leak lands *on*
+    /// a border column, which is the one thing `screen` trims away.
+    fn frame_grid(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+        app.set_term_size(width, height);
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| crate::ui::draw(frame, app)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// Deliver one hostile payload the way its actor does: a model reply (the
+    /// run then ends, so the reply becomes the row's and the footer's summary),
+    /// a run's failure (the endpoint's own words), and a tool result.
+    fn feed_hostile(app: &mut App, case: &str, text: &str) {
+        let conversation = app.tree.conversation();
+        let event = match case {
+            "reply" => {
+                app.update(Msg::Agent {
+                    conversation,
+                    id: AgentId::ROOT,
+                    event: AgentEvent::Message(Message::assistant(text)),
+                });
+                AgentEvent::Done
+            }
+            "error" => AgentEvent::Error(text.to_string()),
+            "result" => AgentEvent::Message(Message::tool("call_1", text)),
+            other => unreachable!("no case {other}"),
+        };
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event,
+        });
+    }
+
+    /// A pane is a terminal, and a terminal acts on what it is given — so the
+    /// one-line surfaces are fed the same bytes the verifier used, and what is
+    /// asserted is the *painted frame*, not the source string.
+    ///
+    /// The wrapped transcript was already defanged when this leaked: a reply of
+    /// `…\rREPLACED…` returned the cursor over the agents pane's own border from
+    /// the *footer*, an error body's `ESC ]0;PWNED BEL` renamed the window from
+    /// the *bar*, and a CSI in either wiped the frame. A test that reads the
+    /// transcript is exactly what let the other four surfaces through, so this
+    /// one reads the cells, at the audit's 80×24 and at the compact 40×10.
+    #[test]
+    fn a_one_line_surface_cannot_be_commanded_by_the_text_it_paints() {
+        const CR: &str = "\r";
+        const OSC: &str = "\x1b]0;PWNED\x07";
+        const CSI: &str = "\x1b[2J\x1b[H";
+        const BIDI: &str = "\u{2066}";
+
+        // Each case, with the commands in it and with plain words in the same
+        // places: the second is what the frame is measured against, so a pane
+        // that a leak moved is a pane whose border is somewhere else.
+        let payload = |case: &str, hostile: bool| -> String {
+            match (case, hostile) {
+                ("reply", true) => {
+                    format!("final reply{CR}STEP1 {OSC}{CSI}{BIDI}middle")
+                }
+                ("reply", false) => "final reply STEP1 middle".to_string(),
+                ("error", true) => {
+                    format!("model returned HTTP 500: boom{CR}REST {OSC} {CSI}{BIDI}after")
+                }
+                ("error", false) => "model returned HTTP 500: boom REST  after".to_string(),
+                ("result", true) => format!("boom{CR}REST {OSC} {CSI}{BIDI}after"),
+                ("result", false) => "boom REST  after".to_string(),
+                other => unreachable!("no case {other:?}"),
+            }
+        };
+        // What the surface still says once the commands are gone: the CR is
+        // marked, never taken away, and the words around it are the words.
+        let says = |case: &str| match case {
+            "reply" => "final reply␍STEP1",
+            _ => "boom␍REST",
+        };
+
+        for (width, height) in [(80u16, 24u16), (40, 10)] {
+            for case in ["reply", "error", "result"] {
+                let (mut app, _rx) = test_app("hostile-one-line");
+                feed_hostile(&mut app, case, &payload(case, true));
+                let frame = frame_grid(&mut app, width, height);
+
+                let (mut clean, _rx) = test_app("hostile-one-line-plain");
+                feed_hostile(&mut clean, case, &payload(case, false));
+                let pristine = frame_grid(&mut clean, width, height);
+
+                let painted = frame.join("\n");
+                for bad in ['\x1b', '\r'] {
+                    assert!(
+                        !painted.contains(bad),
+                        "{case} at {width}×{height} painted {bad:?}: {painted:?}"
+                    );
+                }
+                // Cell by cell, and never the newline this test joined them with:
+                // every other control byte, and the bidi isolates, are a command
+                // to a display rather than something to read.
+                for row in &frame {
+                    for ch in row.chars() {
+                        assert!(
+                            !ch.is_control()
+                                && !matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'),
+                            "{case} at {width}×{height} painted {ch:?}, which commands the display: {row:?}"
+                        );
+                    }
+                }
+                assert!(
+                    painted.contains(says(case)),
+                    "{case} at {width}×{height} lost its words: {painted:?}"
+                );
+
+                // The box skeleton belongs to the frame, not to the text: a
+                // border that moved or vanished is a pane that was overwritten.
+                for (y, (row, base)) in frame.iter().zip(pristine.iter()).enumerate() {
+                    for (x, (cell, want)) in row.chars().zip(base.chars()).enumerate() {
+                        if "─│┌┐└┘├┤┬┴┼".contains(want) {
+                            assert_eq!(
+                                cell, want,
+                                "{case} at {width}×{height} overwrote the border at {x},{y}: {row:?}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// A long unbroken token — the model reply that is one 20 000-character
+    /// word — must be cut at a one-line surface's edge, with the `…` the rest of
+    /// the UI uses, and never have its middle painted into a pane.
+    #[test]
+    fn a_one_line_surface_cuts_a_long_token_at_its_edge() {
+        let token = "S".repeat(20_000);
+        let reply = format!("final model reply\rSTEP1 middle {token}");
+
+        for (width, height) in [(80u16, 24u16), (40, 10)] {
+            let (mut app, _rx) = test_app("long-token");
+            feed_hostile(&mut app, "reply", &reply);
+            let frame = frame_grid(&mut app, width, height);
+            let painted = frame.join("\n");
+
+            assert!(!painted.contains('\r'), "{painted:?}");
+            // The agents pane paints none of the token: at 80×24 it is the
+            // thirty columns on the left, at 40×10 the three rows on top. (The
+            // transcript is *meant* to wrap the token — that is the one surface
+            // that may show its text.)
+            let pane: Vec<&String> = if width >= 80 {
+                frame.iter().collect()
+            } else {
+                frame.iter().take(3).collect()
+            };
+            for row in pane {
+                let cells: String = row
+                    .chars()
+                    .take(if width >= 80 { 30 } else { 40 })
+                    .collect();
+                assert!(
+                    !cells.contains("SSSS"),
+                    "the agents pane painted the token at {width}×{height}: {row:?}"
+                );
+            }
+            if width >= 80 {
+                assert!(
+                    painted.contains('…'),
+                    "the footer must say it cut the token: {painted:?}"
+                );
+            }
+        }
+    }
+
+    /// One frame with a nested tree: the root is at rest with work out, its own
+    /// child #1 is parked in `wait_agents`, and the grandchild #2 is working.
+    ///
+    /// The bar's sentence is a promise about when the root resumes — "the root
+    /// resumes as they finish" — and the root resumes when *its* children
+    /// finish, which is the derivation the row's `⏸N` and the title's `M
+    /// waiting` read. The bar counted every busy node in the tree instead, so
+    /// with a grandchild at work it promised a resume that the grandchild's
+    /// finish does not cause, in the same frame where the pane title named one
+    /// (finding U2's second owner).
+    #[test]
+    fn the_bar_and_the_title_agree_on_who_the_root_waits_for() {
+        let (mut app, _rx) = test_app("nested-wait");
+        let conversation = app.tree.conversation();
+        for (child, parent, depth) in [(1u64, 0u64, 1usize), (2, 1, 2)] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId(parent),
+                event: AgentEvent::Spawned {
+                    child,
+                    parent,
+                    brief: "a task".to_string(),
+                    depth,
+                    branch: None,
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId(child),
+                event: AgentEvent::Running {
+                    cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                },
+            });
+        }
+        // The root ended its turn with child #1 still out; #1 is parked on its
+        // own child, and #2 is the one actually working.
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Done,
+        });
+        app.tree.activity(AgentId(1), "wait_agents 3s");
+        app.tree.activity(AgentId(2), "read_file deep.txt 2s");
+        assert_eq!(
+            (
+                app.tree.busy_children(AgentId::ROOT),
+                app.tree.roster().working
+            ),
+            (1, 2),
+            "the tree this is about: the root waits on one of two busy agents"
+        );
+
+        let rows = screen(&mut app, 200, 50);
+        let title = rows.first().expect("the pane title is painted");
+        // The bar's message row, above the facts row it shares the foot with.
+        let bar = &rows[rows.len() - 2];
+
+        assert!(title.contains("2 working"), "{title:?}");
+        assert!(title.contains("1 waiting"), "{title:?}");
+        assert!(
+            bar.contains("waiting on 1 subagent(s)"),
+            "the bar counted a grandchild the root does not resume on: {bar:?}"
+        );
+        assert!(
+            !bar.contains("waiting on 2"),
+            "the bar disagrees with the title in the same frame: {bar:?}"
+        );
     }
 
     /// A status that arrives after the run ended must not put a finished agent
