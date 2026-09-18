@@ -359,14 +359,11 @@ impl Cli {
         let response = attach::ask(self.dir(), &self.request())?;
         match response.reply {
             attach::Reply::Err(error) => Err(error.describe()),
-            attach::Reply::Ok(body) => {
-                match &self {
-                    Cli::Read { .. } => print_lines(&body),
-                    Cli::Agents { .. } => print_agents(&body),
-                    Cli::Focus { .. } | Cli::Edit { .. } => {}
-                }
-                Ok(())
-            }
+            attach::Reply::Ok(body) => match &self {
+                Cli::Read { .. } => print_lines(&body),
+                Cli::Agents { .. } => print_agents(&body),
+                Cli::Focus { .. } | Cli::Edit { .. } => Ok(()),
+            },
         }
     }
 }
@@ -395,7 +392,6 @@ fn parse_id(value: &str, command: &str) -> Result<u64, String> {
         .map_err(|_| format!("`mush {command}` needs an agent id, got `{value}`"))
 }
 
-/// `read`: the transcript lines, one per line as `index<TAB>text`.
 /// One transcript line, escaped so it prints as one line. A message with a
 /// newline in it (a pasted brief, a tool result) is still one line on the wire,
 /// and printing it raw made it read as two — under one index — with no way for
@@ -407,44 +403,39 @@ fn escape_line(text: &str) -> String {
         .replace('\t', "\\t")
 }
 
-fn print_lines(body: &Value) {
-    if let Some(lines) = body.get("lines").and_then(Value::as_array) {
-        for line in lines {
-            let index = line.get("line").and_then(Value::as_u64).unwrap_or(0);
-            let text = line.get("text").and_then(Value::as_str).unwrap_or("");
-            println!("{index}\t{}", escape_line(text));
-        }
+/// `read`: the transcript lines, one per line as `index<TAB>text`.
+fn print_lines(body: &Value) -> Result<(), String> {
+    for line in attach::Transcript::read(body)?.lines {
+        println!("{}\t{}", line.line, escape_line(&line.text));
     }
+    Ok(())
 }
 
 /// `agents`: the roster the tree paints, one row per line, tab-separated:
-/// `id parent phase activity title branch worktree children-working`.
-fn print_agents(body: &Value) {
-    let Some(agents) = body.get("agents").and_then(Value::as_array) else {
-        return;
-    };
-    for node in agents {
-        let field = |key: &str| match node.get(key) {
-            Some(Value::String(text)) => text.clone(),
-            Some(Value::Null) | None => String::new(),
-            Some(other) => other.to_string(),
-        };
-        let parent = node
-            .get("parent")
-            .and_then(Value::as_u64)
-            .map(|id| id.to_string())
-            .unwrap_or_else(|| "-".to_string());
+/// `id parent phase activity title branch worktree children-working`. An empty
+/// absent field prints as an empty column, and a root's missing parent as `-`.
+///
+/// The body is read as [`attach::Roster`] rather than fished key by key: a key
+/// the producer renamed used to leave this printer writing an empty column
+/// forever, with nothing failing (finding R23).
+fn print_agents(body: &Value) -> Result<(), String> {
+    for node in attach::Roster::read(body)?.agents {
         println!(
             "{id}\t{parent}\t{phase}\t{activity}\t{title}\t{branch}\t{worktree}\t{children}",
-            id = field("id"),
-            phase = field("phase"),
-            activity = field("activity"),
-            title = field("title"),
-            branch = field("branch"),
-            worktree = field("worktree"),
-            children = field("children_working"),
+            id = node.id,
+            parent = node
+                .parent
+                .map(|id| id.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+            phase = node.phase,
+            activity = node.activity.unwrap_or_default(),
+            title = node.title,
+            branch = node.branch.unwrap_or_default(),
+            worktree = node.worktree,
+            children = node.children_working,
         );
     }
+    Ok(())
 }
 
 fn print_help() {

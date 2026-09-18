@@ -9055,4 +9055,53 @@ mod tests {
             "the message reaches the agent's mailbox the way a typed one does"
         );
     }
+
+    /// The CLI's printers read a body with `attach::Roster`/`attach::Transcript`
+    /// — one shape per answer — instead of fishing each key out of a `Value` and
+    /// defaulting what is missing. Pinned against a *real* `handle_attach` body,
+    /// the only place the producer's keys and the client's shape meet: a key
+    /// renamed on the producer's side is now the client's error, where before it
+    /// painted an empty column forever with nothing failing (finding R23).
+    #[test]
+    fn the_cli_shapes_read_the_roster_the_producer_writes() {
+        let (mut app, _rx) = test_app("attach-shape-roster");
+        let body = attach_ok(app.handle_attach("a client", &attach_request(1, attach::Op::Agents)));
+
+        let roster = attach::Roster::read(&body).expect("the producer's roster reads back");
+        assert_eq!(roster.agents.len(), 1, "the root alone");
+        let root = &roster.agents[0];
+        assert_eq!(root.id, 0);
+        assert_eq!(root.phase, "idle");
+        assert_eq!(root.parent, None, "the root hangs under nothing");
+        assert_eq!(root.activity, None, "an idle agent says nothing");
+        assert_eq!(root.children_working, 0);
+
+        let mut broken = body;
+        broken["agents"][0].as_object_mut().unwrap().remove("phase");
+        let error = attach::Roster::read(&broken).expect_err("a body missing `phase` is refused");
+        assert!(error.contains("phase"), "the missing key is named: {error}");
+    }
+
+    /// The same for a `read` answer: the transcript's lines and their indices,
+    /// and a line missing its `text` refused by name (finding R23).
+    #[test]
+    fn the_cli_shapes_read_the_transcript_the_producer_writes() {
+        let (mut app, _rx) = test_app("attach-shape-transcript");
+        app.chat.push_message(AgentId::ROOT, Message::user("hi"));
+        let body = attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(2, attach::Op::Read { agent: 0, since: 0 }),
+        ));
+
+        let transcript = attach::Transcript::read(&body).expect("the producer's lines read back");
+        assert_eq!(transcript.lines.len(), 1);
+        assert_eq!(transcript.lines[0].line, 0);
+        assert_eq!(transcript.lines[0].text, "hi");
+
+        let mut broken = body;
+        broken["lines"][0].as_object_mut().unwrap().remove("text");
+        let error =
+            attach::Transcript::read(&broken).expect_err("a line missing `text` is refused");
+        assert!(error.contains("text"), "the missing key is named: {error}");
+    }
 }

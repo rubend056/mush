@@ -19,6 +19,7 @@ use std::thread;
 use std::time::Duration;
 
 use crossbeam_channel::{bounded, Sender};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::app::Msg;
@@ -469,6 +470,73 @@ pub fn decode(line: &str) -> Result<Response, String> {
         ));
     }
     Err("a response with neither `ok` nor `error`".to_string())
+}
+
+// ------------------------------------------------------------- response bodies
+
+/// The shape of an `agents` answer, from the client's side: the keys
+/// `App::attach_agents` writes, read back as a type rather than fished out of
+/// a [`Value`] key by key.
+///
+/// The producer and the consumer each spelled the wire keys themselves, so a
+/// key renamed on one side left the consumer's `field` closure returning `""`
+/// and a client painted an empty column forever, with nothing failing (finding
+/// R23). One shape per body says which fields must be there; [`Roster::read`]
+/// is the only way to get one, and it *errors* on a key that went missing
+/// rather than defaulting it. Extra keys the producer adds are ignored, so the
+/// body can grow without a client breaking.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct Roster {
+    pub agents: Vec<RosterEntry>,
+}
+
+/// One `agents` row: what a client needs to paint the tree and to `edit`
+/// against it. The optional fields are the ones the producer writes as `null`
+/// (a root has no `parent`, an idle agent no `activity`).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct RosterEntry {
+    pub id: u64,
+    pub parent: Option<u64>,
+    pub phase: String,
+    pub activity: Option<String>,
+    pub title: String,
+    pub branch: Option<String>,
+    pub worktree: String,
+    pub children_working: usize,
+}
+
+impl Roster {
+    /// Read an `agents` body. A missing or wrongly-typed key names the key it
+    /// could not read, so a wire drift is a client's error and not a blank
+    /// column.
+    pub fn read(body: &Value) -> Result<Roster, String> {
+        serde_json::from_value(body.clone())
+            .map_err(|error| format!("could not read the `agents` answer: {error}"))
+    }
+}
+
+/// The shape of a `read` answer: the transcript lines, each with the index a
+/// later `edit`'s `base` is not about but a `since` is. See [`Roster`] for why
+/// this is a type and not a [`Value`].
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct Transcript {
+    pub lines: Vec<TranscriptLine>,
+}
+
+/// One transcript line: its 0-based index on the wire and its text, which may
+/// hold newlines and is escaped by the printer (finding A3).
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct TranscriptLine {
+    pub line: usize,
+    pub text: String,
+}
+
+impl Transcript {
+    /// Read a `read` body, reporting the key that would not read.
+    pub fn read(body: &Value) -> Result<Transcript, String> {
+        serde_json::from_value(body.clone())
+            .map_err(|error| format!("could not read the `read` answer: {error}"))
+    }
 }
 
 #[cfg(test)]
