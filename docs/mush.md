@@ -696,7 +696,7 @@ mush/
       tools.rs       tool names, argument helpers, exact-match edit semantics
       transcript.rs  pairing, repair, trimming and the compaction trigger
       userconfig.rs  the machine-global config file (where the API key lives)
-      workspace.rs   path resolution, listings, capped reads, atomic writes
+      workspace.rs   path resolution, whole reads, atomic writes
     mush/        # the binary: TUI + agent
       main.rs        CLI, terminal guard/panic hook, event loop
       app/mod.rs     state, `update`, intent and command dispatch
@@ -740,7 +740,6 @@ wrapping) is where the tests live.
 | `unicode-segmentation` | grapheme-correct cursor edits (already compiled via ratatui) |
 | `unicode-truncate` | display-width truncation and slicing (already compiled via ratatui) |
 | `tempfile` | secure scratch files for command output, atomic replace |
-| `walkdir` | workspace listings with a per-entry API and an explicit symlink policy |
 | `dirs` | platform-correct config directory |
 | `rustls`, `webpki-roots` | TLS for hosted https endpoints (DeepSeek); the client stays hand-rolled |
 

@@ -3109,7 +3109,7 @@ fn commit_worktree(
 /// nothing to keep in sync.
 fn edit_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
     let rel = tools::arg_string(args, "path")?;
-    let current = ws.read_file(&rel, usize::MAX)?;
+    let current = ws.read_file(&rel)?;
     // A list of edits is applied to one read and written once: all of
     // them land or none do, so a batch cannot leave the file
     // half-changed, and the edits see each other's results in order.
