@@ -422,13 +422,11 @@ impl AgentNode {
         if let Some(given) = &self.title {
             return truncate(given, TITLE_COLUMNS);
         }
-        let words: Vec<&str> = self
-            .brief
-            .lines()
-            .next()
-            .unwrap_or("")
-            .split_whitespace()
-            .collect();
+        // The brief's first line, collapsed: [`mush_core::text::first_line`],
+        // the same line the commit subject and a job's handle are cut from
+        // (refactor R11).
+        let first = mush_core::text::first_line(&self.brief);
+        let words: Vec<&str> = first.split_whitespace().collect();
         if let Some(path) = words.iter().find(|word| is_path_like(word)) {
             return truncate(bare_word(path).trim_end_matches('.'), TITLE_COLUMNS);
         }

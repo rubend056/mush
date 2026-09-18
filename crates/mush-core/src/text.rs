@@ -97,6 +97,24 @@ fn skip_escape(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
     }
 }
 
+/// The first line of `text`, with every run of whitespace collapsed to one
+/// space — a brief, a command or a summary read as one row.
+///
+/// The one home of "the brief's first line" (refactor R11): the commit subject,
+/// an agent's title, a job's handle and a tool call's label each began with this
+/// arithmetic, and the copies had already drifted — one kept a first line's
+/// inner runs of spaces because it only trimmed the ends. What a caller does
+/// with the line (cut it to columns, pick the words out of it, drop everything
+/// before its last `&&`) is that caller's decision and stays there.
+pub fn first_line(text: &str) -> String {
+    text.lines()
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Word-aware wrapping that preserves explicit newlines and never splits a
 /// grapheme's display width arithmetic.
 pub fn wrap_text(text: &str, width: usize) -> Vec<String> {
@@ -412,6 +430,23 @@ mod tests {
         let row = fit_row("▶ #1", &("x".repeat(30) + "\x1b]0;PWNED\x07"), "", &[], 20);
         assert!(!row.contains('\x1b'), "{row:?}");
         assert!(UnicodeWidthStr::width(row.as_str()) <= 20, "{row:?}");
+    }
+
+    /// The brief's first line, collapsed onto one row: the arithmetic the commit
+    /// subject, an agent's title, a job's handle and a tool label all begin with
+    /// (refactor R11).
+    #[test]
+    fn the_first_line_is_the_first_line_collapsed() {
+        // A second line is not part of it, and neither is the whitespace around
+        // the first: the run of blank lines between them collapses away.
+        assert_eq!(first_line("  a\n\n  b  c \n"), "a");
+        // Inner runs collapse too, so the four callers cannot disagree about a
+        // brief written with two spaces after a sentence.
+        assert_eq!(first_line("create  a   file\nand more"), "create a file");
+        assert_eq!(first_line("one line"), "one line");
+        assert_eq!(first_line("trailing   "), "trailing");
+        assert_eq!(first_line(""), "");
+        assert_eq!(first_line("\nsecond"), "");
     }
 
     #[test]

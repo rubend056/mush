@@ -289,17 +289,11 @@ const JOB_TITLE_COLUMNS: usize = 30;
 /// A `command` the model wrote can be thirty lines of heredoc with a
 /// `cd /w &&` in front of it, and the bar and the row's footer each have one
 /// row to name it in: what is left is the last clause of the first line
-/// (`cargo build` out of `cd /w && cargo build --release`), collapsed and
-/// bounded like an agent's title. One derivation, so the two surfaces cannot
-/// spell the same job differently.
+/// (`cargo build` out of `cd /w && cargo build --release`), collapsed by
+/// [`mush_core::text::first_line`] and bounded like an agent's title. One
+/// derivation, so the two surfaces cannot spell the same job differently.
 fn job_title(command: &str) -> String {
-    let first = command
-        .lines()
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let first = mush_core::text::first_line(command);
     let clause = first.rsplit("&&").next().unwrap_or(&first).trim();
     mush_core::text::truncate(clause, JOB_TITLE_COLUMNS)
 }

@@ -22,7 +22,7 @@ use serde_json::{json, Value};
 use mush_core::config::parse_context_hint;
 use mush_core::git;
 use mush_core::message::{ChatRequest, ChatResponse};
-use mush_core::text::{sanitize, truncate};
+use mush_core::text::{first_line, sanitize, truncate};
 use mush_core::tools::ToolName;
 use mush_core::transcript::{
     needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
@@ -276,15 +276,17 @@ const SUBJECT_COLUMNS: usize = 60;
 /// [`SUBJECT_COLUMNS`] columns and cut at a word boundary.
 ///
 /// The first line because a subject is one line and the brief's first line is
-/// the task ("create a file called iso.txt…" — the reasons live below). The
-/// word boundary because [`truncate`] alone ends a subject mid-word
+/// the task ("create a file called iso.txt…" — the reasons live below), and the
+/// line is [`mush_core::text::first_line`]'s: one collapse of whitespace for the
+/// subject, an agent's title, a job's handle and a tool label alike (refactor
+/// R11). The word boundary because [`truncate`] alone ends a subject mid-word
 /// (`isolated w…`), which neither reads as English nor matches the brief; the
 /// whole word that does not fit is dropped and the `…` says so. A first line
 /// with no space to cut on keeps the hard cut — a clipped subject is better
 /// than no subject.
 fn subject_brief(brief: &str) -> String {
-    let first = brief.lines().next().unwrap_or("").trim();
-    let cut = truncate(first, SUBJECT_COLUMNS);
+    let first = first_line(brief);
+    let cut = truncate(&first, SUBJECT_COLUMNS);
     if !cut.ends_with('…') {
         return cut;
     }
@@ -3787,17 +3789,6 @@ fn read_args(args: &Value) -> String {
     String::new()
 }
 
-/// Everything up to the first newline, with runs of whitespace collapsed to one
-/// space, so a summary is always a single readable line.
-fn first_line(text: &str) -> String {
-    text.lines()
-        .next()
-        .unwrap_or("")
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3872,7 +3863,9 @@ mod tests {
     }
 
     /// A tool label is one line by definition. Truncating a command's raw text
-    /// kept its newlines, so a heredoc turned one row into several.
+    /// kept its newlines, so a heredoc turned one row into several. The
+    /// collapse itself is `mush_core::text::first_line`'s, tested there beside
+    /// the other string arithmetic (refactor R11).
     #[test]
     fn a_command_summary_collapses_to_one_line() {
         let label = summarize(&json!({
@@ -3880,7 +3873,6 @@ mod tests {
         }));
         assert!(!label.contains('\n'), "{label:?} must be one line");
         assert!(label.starts_with("cd /w && python3"), "{label}");
-        assert_eq!(first_line("  a\n\n  b  c \n"), "a");
     }
 
     /// A nudge parked during a run that was cancelled is already in the UI's
