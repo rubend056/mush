@@ -4126,6 +4126,48 @@ mod tests {
         ));
     }
 
+    /// A stopped agent that still owns a running job is named as stopped, not
+    /// as idle: the agent's own state and the job beside it are two facts, and
+    /// the line that warns what a quit kills must not deny the first one
+    /// (findings §6, refactor R22).
+    #[test]
+    fn a_stopped_agent_over_a_live_job_is_named_as_stopped() {
+        use crate::jobs::Launch;
+        use crate::machine::fake::{Script, Scripted as ScriptedMachine};
+        use crate::machine::{Machine, ShellCommand};
+
+        let (mut app, _rx) = test_app("quit-stopped-job");
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let job = machine
+            .spawn(&ShellCommand {
+                command: "cargo build",
+                root: std::path::Path::new("/tmp"),
+            })
+            .unwrap();
+        let (tx, _job_rx) = crossbeam_channel::unbounded();
+        app.tree
+            .handles()
+            .jobs
+            .launch(Launch::started(
+                0,
+                "cargo build".to_string(),
+                false,
+                tx,
+                job,
+            ))
+            .unwrap();
+        // The run was stopped; the command it left behind is not.
+        app.tree.stopped(AgentId::ROOT);
+
+        ctrl(&mut app, 'q');
+
+        assert_eq!(
+            text_of(&app),
+            "Ctrl-Q again quits · kills #0 stopped + 1 job",
+            "a stopped agent is not an idle one"
+        );
+    }
+
     /// The common quit kills nothing, so it stays one keystroke and stays
     /// silent: a warning every quit must read is a warning nobody reads.
     #[test]

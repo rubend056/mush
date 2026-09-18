@@ -159,28 +159,27 @@ impl Phase {
         }
     }
 
-    /// What this phase is, in the fewest words: `thinking`, `edit_file`,
-    /// `compacting`, `cancelling`, or `idle` for a phase at rest.
+    /// What this phase is, in the fewest words, for the one line that has to
+    /// name every live agent at once (finding H9).
     ///
-    /// The row spells the same phase out with its age (`ui::phase_detail`, for
-    /// the one agent the human is looking at). This is the form that fits
-    /// beside an id in the single line naming every live agent a quit is about
-    /// to kill (finding H9). A tool label answers with its first word, which is
-    /// the tool's own name — `edit_file` says what the agent is at without
-    /// spending the bar on the path it is editing.
+    /// Every phase but one answers with its machine name ([`Phase::label`]), so
+    /// the quit line and a client reading the attach roster cannot call the same
+    /// phase two things. This used to spell the stems again and collapse
+    /// `Stopped`, `Done` and `Failed` to `idle`, which made a stopped agent that
+    /// still owned a running job read `#0 idle + 1 job` — the agent was not
+    /// idle, and the job was the whole reason the line existed (findings §6,
+    /// refactor R22).
+    ///
+    /// [`Phase::Activity`] is the exception: `working` is the right word for a
+    /// roster cell but says nothing on the bar, where the tool's own name fits —
+    /// `edit_file` says what the agent is at without spending the row on the
+    /// path it is editing. The painter's prose for the one row the human is
+    /// looking at (`app::screen::phase_detail`) spells the same phase out with
+    /// its age, which is the painter's to say.
     pub fn doing(&self) -> &str {
         match self {
-            Phase::Thinking => "thinking",
             Phase::Activity(what) => what.split_whitespace().next().unwrap_or("working"),
-            Phase::Compacting(_) => "compacting",
-            Phase::Cancelling => "cancelling",
-            Phase::Idle | Phase::Stopped | Phase::Done | Phase::Failed(_) => "idle",
-            // A cut-off run is not at rest the way `idle` means — it never
-            // ended and committed nothing — and it is not in flight either, so
-            // a quit never names it in this list. The arm says which phase it
-            // is, and matches `Phase::label`, so a reader of one can read the
-            // other (finding H2).
-            Phase::CutOff => "cut off",
+            phase => phase.label(),
         }
     }
 }
@@ -1436,6 +1435,40 @@ mod tests {
             assert_eq!(phase.compacting(), None, "{phase:?} is not a fold");
             assert_eq!(phase.waiting(), None, "{phase:?} is not a wait");
         }
+    }
+
+    /// A phase has one name for every reader: the roster's machine name
+    /// ([`Phase::label`]) and the form that fits on the quit line
+    /// ([`Phase::doing`]) differ for exactly one phase — the tool label, whose
+    /// own name the bar has room for — so no surface can call the same phase
+    /// two things (refactor R22).
+    ///
+    /// The collapse this ends: `doing` used to answer `idle` for `Stopped`,
+    /// `Done` and `Failed`, so the quit line named a stopped agent that still
+    /// owned a running job as `#0 idle + 1 job` (findings §6).
+    #[test]
+    fn a_phase_has_one_name_for_every_reader() {
+        for phase in [
+            Phase::Idle,
+            Phase::Thinking,
+            Phase::Compacting(Compacting::Requested),
+            Phase::Cancelling,
+            Phase::Stopped,
+            Phase::CutOff,
+            Phase::Done,
+            Phase::Failed("no route".to_string()),
+        ] {
+            assert_eq!(phase.doing(), phase.label(), "{phase:?}");
+        }
+        let edit = Phase::Activity("edit_file src/lib.rs".to_string());
+        assert_eq!(
+            edit.label(),
+            "working",
+            "the roster carries the machine name"
+        );
+        assert_eq!(edit.doing(), "edit_file", "the bar carries the tool's own");
+        // A label with no words in it is still a word: nothing may read `#0 `.
+        assert_eq!(Phase::Activity(String::new()).doing(), "working");
     }
 
     /// A fold from rest is visible — the hole `activity` could not fill, because
