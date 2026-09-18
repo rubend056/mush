@@ -4,7 +4,7 @@
 > root agent a task, and watch the tree of agents work — with the repository's
 > branch, dirty count, and line delta always in view.
 
-Status: **implemented and working end to end** (M0–M2.7 of §9). This document
+Status: **implemented and working end to end** (M0–M3 of §9). This document
 describes what is actually built, then what comes next. Decisions are marked
 `[DECIDED]` or `[OPEN]`.
 
@@ -59,8 +59,10 @@ The agent's tools are `list_files`, `read_file`, `write_file`, `edit_file`, and
 `run_command`. That is the entire surface for touching a workspace — plus four
 delegation tools that are only about other agents. Any other agent — a shell
 script, a different harness — can collaborate through the same two things: the
-workspace files and the shell. A richer attach protocol is planned (§9) but is
-not required for mush to be useful today.
+workspace files and the shell. The same two things are also how *you* drive
+mush: the attach protocol of §9 (M3) lets a script you run yourself read a
+transcript and hand a message to an agent over a UNIX socket, without needing
+to know anything about mush's internals.
 
 ---
 
@@ -607,7 +609,7 @@ Single-owner state. No locks. No async runtime.
   agent events     ───▶│  Msg::Agent ┴─▶ App::update(&mut self, Msg)│
                        │                          │                │
                        │                          ▼                │
-                       │            terminal.draw(|f| ui::draw(f, app))
+                       │   App::screen(area) ─▶ Screen ─▶ ui::draw(f, &Screen)
                        └───────────────────────────────────────────┘
                                    ▲
                                    │  AgentEvent (id-tagged)
@@ -665,7 +667,9 @@ mush/
       session_save.rs  the writer thread behind `.mush/session.json`
       input.rs       the message box's grapheme cursor and horizontal window
       http.rs        a few hundred lines of blocking HTTP/1.1 client
-      ui.rs          layout, panes, transcript rendering, word wrap
+      ui.rs          the painter: reads a `Screen` a value at a time and paints it
+     app/screen.rs  every painted value, derived by `App` (layout, rows, words)
+     attach.rs      the M3 socket: `.mush/mush.sock`, one JSON request per line
   docs/mush.md
   scripts/          pty smoke test + screen printer + scripted mock model server
 ```
@@ -775,14 +779,21 @@ a live one. Release profile uses `lto = "thin"`, `codegen-units = 1`,
   that names its holder (§5.6). This is the milestone for the machine, the way
   M2.6 is the milestone for the branch.
 
+- **M3 — External agents (attach).** `[DONE]` A UNIX socket at
+  `.mush/mush.sock` plus `mush read/agents/focus/edit`, so an agent you run
+  yourself can drive mush. Newline-delimited JSON; requests carry an `id`;
+  `edit` carries a base revision and returns `conflict` rather than guessing.
+  The attach thread never touches `App`: it sends a `Msg` and waits on the
+  reply, so the event loop stays the only effector. `read` answers an agent's
+  transcript lines with a monotone revision, `agents` answers the roster the
+  tree pane paints (this is the half of finding H1 that no longer needs
+  `.mush/session.json`), `focus` focuses an agent exactly as `Enter` on its row
+  does, and `edit` replaces the shared message box — or, with `send`, delivers
+  the human's message — only when the base revision still matches.
+
 **Next**
 
 None of these is started.
-
-- **M3 — External agents (attach).** A UNIX socket plus `mush read/edit/focus`
-  CLI, so an agent you run yourself can drive mush. Newline-delimited JSON;
-  requests carry an `id`; `edit` carries a base revision and returns `conflict`
-  rather than guessing.
 - **M4 — FS watching.** `[OBSOLETE v0.2]` There are no buffers to merge into;
   the periodic git snapshot already tells the human what moved.
 - **M5 — Spawn mode.** `mush` launches a configured agent in a pty pane with
@@ -811,7 +822,9 @@ slices must not mistake for one, and a dribbling body the deadline must still
 stop), an oversized or malformed response body, the git snapshot (branch, dirty
 count, per-branch diffstat, ref names that look like flags), the context-window
 precedence and the caps that follow it, row field priority and column-aware
-truncation, the `~` elision boundary, a draw sweep over thirteen terminal sizes,
+truncation, the `~` elision boundary, a draw sweep over fifteen terminal sizes ×
+fourteen states that asserts the *painted* text (not "does not panic"), the
+attach protocol's ops and one real socket exchange,
 the job registry (detach, the machine lock, the `all` waits, the tail window),
 the transport retry and what it must *not* retry, the notices' kinds and
 lifetimes, per-conversation scrollback, the floor refusing every key but `Ctrl-Q`,

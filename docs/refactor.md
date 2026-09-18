@@ -1,15 +1,15 @@
 # mush — refactor plan: seams and owners
 
-> Status: **Stages 0, 1, 2 and 3.5 complete.** On master: Stage 0 (all four
+> Status: **Stages 0, 1, 2, 3 and 3.5 complete.** On master: Stage 0 (all four
 > moves), `AgentTree` (`app/tree.rs`), `Chat` (`app/chat.rs`), `ConfigCell`
 > (`app/settings.rs`), the four seams (`ModelClient`, `Machine`, `Clock`,
-> `Events`), the `#[ignore]`d actor tests rewritten in process, and Stage 3.5
-> (`Intent` + parsed commands, `app/keys.rs` + `app/commands.rs`). Stage 3.4
-> (`ToolHost`) was dropped with the editor: there is one dispatcher per side, not
-> three. What is left of Stage 3 is the other half — the `Screen` value and the
-> draw sweep that asserts painted text (B17). The delegation-honesty family (N1,
-> N3–N6) is closed, and so is the wave this plan's checklist now also tracks
-> (`findings.md` U1–U10, B20–B23).
+> `Events`), the `#[ignore]`d actor tests rewritten in process, Stage 3.5
+> (`Intent` + parsed commands, `app/keys.rs` + `app/commands.rs`), and Stage 3's
+> other half — the `Screen` value and the draw sweep that asserts painted text
+> (`app/screen.rs` + `ui.rs`, B17, `7e123e1`). Stage 3.4 (`ToolHost`) was
+> dropped with the editor: there is one dispatcher per side, not three. The
+> delegation-honesty family (N1, N3–N6) is closed, and so is the wave this
+> plan's checklist now also tracks (`findings.md` U1–U10, B20–B23).
 >
 > Written 2026-09-17 against `d4f80ae` plus the
 > in-flight findings pass (`input.rs`, `config.rs`, `git.rs`, `http.rs`,
@@ -375,13 +375,14 @@ commit is another agent's) and `AgentTree`'s stale-cancel window, which already
 has `age` for tests. The default suite still opens local mock sockets in
 `http.rs`.
 
-**Stage 3 — `Screen` view and intents.** Stage 3.5 ✅ — keys go through `Intent`
+**Stage 3 — `Screen` view and intents.** ✅ Stage 3.5 — keys go through `Intent`
 (`app/keys.rs`), and slash commands are parsed values (`app/commands.rs`), with
-both help surfaces rendered from the one table (§3.5). The `Screen` half is **not
-built**: `ui::draw(frame, &Screen)` where `Screen` is built by `App::screen()`,
-so panes become pure functions of a value and the draw sweep can assert painted
-text at every size instead of only "does not panic" (B17). *Done when* no render
-function takes `&App`.
+both help surfaces rendered from the one table (§3.5). Stage 3 — `App::screen(&self,
+area) -> Screen` (`app/screen.rs`) now derives every painted value (tiers, pane
+rects, rows, words, ranks, the picker's window) and `ui::draw(frame, &Screen)`
+paints it, so `ui.rs` is 298 lines of column arithmetic and **no render function
+takes `&App`**; the draw sweep asserts the painted text over fifteen sizes ×
+fourteen states (B17, `7e123e1`).
 
 **Stage 4 — roadmap.** M2.8 = a job registry + `Machine`; M3 = the socket server
 over the two dispatchers; M4 = a base revision on `Buffer` + merge in core
@@ -440,8 +441,8 @@ not with a status that contradicts `findings.md`.
 | B14 | the row's summary is from the first run, forever | ✅ | `AgentTree::{begin, finish}` |
 | B15 | `screen.py` mis-reads CSI / `--keys` escapes | ✅ | `scripts/screen.py` — cursor clamped to the grid (a row past the bottom, or a shrink under a low cursor, raised `IndexError` on the next `X`), and `--keys` decodes the escapes it means instead of `unicode_escape`, which turned `é` into `Ã©` and left `\e` literal. `--self-test` pins both. |
 | B16 | `smoke.py --cancel` forks after starting a thread | ✅ | `scripts/smoke.py` — the pty is forked before the endpoint's thread exists; verified by running the scenario. |
-| B17 | the layout sweep asserts "does not panic", not painted text | ⬜ | `Screen` view + the draw sweep (Stage 3) |
-| B18 | `~` elision matches a prefix, not a directory | ✅ | `ui::facts_line` |
+| B17 | the layout sweep asserts "does not panic", not painted text | ✅ | `app/screen.rs` + `ui::draw(frame, &Screen)`; `the_draw_sweep_asserts_painted_text_not_that_it_did_not_panic` over 15 sizes × 14 states, plus seven focused `the_sweep_*` tests (`7e123e1`) |
+| B18 | `~` elision matches a prefix, not a directory | ✅ | `app/screen.rs::facts_line` (moved from `ui.rs` by B17) |
 | B19 | global notices render into every transcript | ✅ | `Notice.agent` + `Chat::notices_for` — no unscoped read exists |
 | N1 | `MAX_TURNS` turns "long" into "failed" | ✅ | `agent/run.rs`: `RUNAWAY_TURNS` + `LOOP_ROUNDS` (a run ends when it stops calling tools; only a *loop* ends it early) |
 | N2 | message box is append-only and clips at the right edge | ✅ | `Input` (grapheme cursor + window), `Chat::key` owns the editing keys |
@@ -460,7 +461,7 @@ not with a status that contradicts `findings.md`.
 | U8 | a transient notice never leaves | ✅ | `Chat`'s chatter lifetime (`clear_notes_for`, `dismiss_said`, `SAID_TTL`) + repeat collapse (`Notice.count`) |
 | U9 | the shipped DeepSeek window/reply cap is too small | ✅ | `provider::PROVIDERS` fallback 120 000 + `Config::reply_cap` (a quarter of the window, floored at 1 024 and capped at 120 000) |
 | U10 | walking back up a deep tree costs a keypress per ancestor | ✅ | `Intent::TreeWalk` on `←`/`→` (`app/keys.rs`) + `PickerMove(±PAGE)` |
-| U11 | compaction has no visible state anywhere | ⬜ | `agent.rs` (state on accept), `app/tree.rs` (`Phase::compacting`), `ui.rs` (glyph + row/bar/foot), `App` ("you can keep typing") — fix in flight (`mush/38`) |
+| U11 | compaction has no visible state anywhere | ✅ | `Phase::Compacting(Parked\|Requested\|NearlyFull)` (`app/tree.rs`), `≡` + the fold's words (`app/screen.rs`), the bar's "keep typing" sentence (`App::tree_line`), and `compact_now` owning the fold's cancel flag (`mush/38`) |
 | B20 | a child's completion reaches the model but not the screen, and can fold twice | ✅ | `agent::push_line` emits `AgentEvent::Message` with the fold, and `absorb` marks the adopted line delivered |
 | B21 | a parent in a tool-calling chain never heard its child finish | ✅ | the fold runs at every message boundary (`fold_completions`), not only on the tool-free turn |
 | B22 | a steering message to a subagent is invisible / an idle target not woken | ✅ | `AgentMsg::Steer` → `push_line` (delivered and emitted), and it is work to answer; the reply wording left over is H5's |
@@ -567,7 +568,9 @@ The rule the waves have settled into, so it is not re-derived each time:
 
 Measured at `0bd7e8a`: 32 150 lines total, ~19 250 of them tests (`app/mod.rs`
 6 224 / 3 966 test, `agent.rs` 6 872 / 4 104, `app/chat.rs` 2 524, `jobs.rs` 1 358,
-`ui.rs` 1 024). Ranked by (net lines × confidence) ÷ risk. `D1`–`D8` were the fix
+`ui.rs` 1 024). At `7e123e1` the same `ui.rs` is **298** lines and
+`app/screen.rs` is **1 064**; the census below is the one the reviews read.
+Ranked by (net lines × confidence) ÷ risk. `D1`–`D8` were the fix
 wave (landed in `58a309c`); `⬜` are still open and a `✅` says what it measured.
 
 | # | What | Net | Status |
@@ -690,8 +693,9 @@ own, on `e747bc3`):
 
 `D1`–`D8` landed in `58a309c`, and the measured deltas are in their status
 column (the estimates were off for `D3`, `D7` and `D8`; the fix wave's commit
-messages say by how much). `D9`, `D10`, `R9` and `R10` all live in `ui.rs`, so
-they belong to the fix wave that runs after the `Screen` (`B17`) wave lands; the
-rest of `R1`–`R8` and `R11`–`R20` are that wave's queue — `R3`/`R7` are one
+messages say by how much). `D9`, `D10`, `R9` and `R10` all live in the
+`ui.rs`/`app/screen.rs` pair; the `Screen` wave landed at `7e123e1`, so all four
+are now actionable and belong to the fix wave that follows, as do the
+rest of `R1`–`R8` and `R11`–`R20` — `R3`/`R7` are one
 item, and `R6` is judged and deliberately left. Line numbers in a table are
 those of the tree its section header names.
