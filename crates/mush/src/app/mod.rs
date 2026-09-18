@@ -1352,8 +1352,12 @@ impl App {
         }
         match parsed {
             Ok(command) => self.apply_command(command),
-            // No slash: the human is talking to an agent.
-            Err(CommandError::NotACommand) => self.deliver(text),
+            // No slash: the human is talking to an agent. A message that does
+            // not land is said on the bar by `deliver` itself; the human's own
+            // key has no client to answer with a refusal.
+            Err(CommandError::NotACommand) => {
+                let _ = self.deliver(text);
+            }
             // A command that exists but whose argument does not read. The line
             // was spelled beside the rule that rejected it, and the bar is
             // where every other complaint of this kind goes.
@@ -1399,7 +1403,14 @@ impl App {
     }
 
     /// A typed message, from the human to the focused agent.
-    fn deliver(&mut self, text: String) {
+    ///
+    /// `Err(line)` is a message that did **not** land, with the line the human's
+    /// bar says as the reason — a dead mailbox or a gone root, which the human
+    /// reads as a failure and which an attach client must answer with a refusal
+    /// instead of an `Ok` revision (`attach_edit`). The human's own path ignores
+    /// the return: the notice, the bar line and the dirty mark below are what
+    /// the human gets.
+    fn deliver(&mut self, text: String) -> Result<(), String> {
         // A request without a model is a guaranteed refusal from the endpoint,
         // and since discovery runs after the first frame this state is
         // reachable for as long as one fetch takes (finding A9). Saying so is
@@ -1407,9 +1418,10 @@ impl App {
         // and the words go back in the box, because a message that cannot be
         // sent is not something the human should have to retype.
         if self.cfg().model.is_empty() {
+            let line = "no model yet — /model picks one, /url points mush at an endpoint";
             self.chat.insert(&text);
-            self.fail("no model yet — /model picks one, /url points mush at an endpoint");
-            return;
+            self.fail(line);
+            return Err(line.to_string());
         }
         let target = self.tree.focused;
         if target == AgentId::ROOT {
@@ -1445,7 +1457,7 @@ impl App {
                     .unwrap_or(false);
                 if alive {
                     self.say("noted — folded in as the agent continues");
-                    return;
+                    return Ok(());
                 }
                 self.tree.idle(AgentId::ROOT);
             }
@@ -1456,9 +1468,12 @@ impl App {
                     // actor's `Running` event will agree with this, and brings
                     // the run's cancel flag with it.
                     self.tree.begin(AgentId::ROOT, None);
+                    Ok(())
                 }
                 _ => {
-                    self.fail("root agent is gone — Ctrl-N restarts it");
+                    let line = "root agent is gone — Ctrl-N restarts it";
+                    self.fail(line);
+                    Err(line.to_string())
                 }
             }
         } else {
@@ -1469,8 +1484,8 @@ impl App {
             // work (finding S1). The words stay in the box and nothing runs.
             if let Some(line) = self.worktree_gone(target) {
                 self.chat.insert(&text);
-                self.fail(line);
-                return;
+                self.fail(&line);
+                return Err(line);
             }
             // Nudge a specific agent; running ones fold it in, idle ones rerun.
             // If the mailbox is gone the node's phase is put back exactly as it
@@ -1483,10 +1498,13 @@ impl App {
                     // rest: the parent's books decide its waits and the
                     // one-shared-child guard, so they are told (audit row 1).
                     self.tell_parent_running(target);
+                    Ok(())
                 }
                 _ => {
+                    let line = format!("agent #{target} is gone");
                     self.tree.nudge_failed(target, previous);
-                    self.fail(format!("agent #{target} is gone"));
+                    self.fail(&line);
+                    Err(line)
                 }
             }
         }
@@ -1716,12 +1734,19 @@ impl App {
             // The same path a typed message takes: `deliver` sends to the
             // focused agent, so aim it there for the turn. The keyboard focus
             // is put back, because an external client steering an agent must
-            // not move the human's pane.
+            // not move the human's pane. A message that did not land is a
+            // refusal, not the `Ok` revision the client used to be handed: the
+            // human's bar already says the agent is gone, and the client that
+            // sent the words into that dead mailbox is the one party who could
+            // not see it (findings §6).
             let previous = self.tree.focused;
             self.tree.focused = id;
             self.chat.expect_human(text);
-            self.deliver(text.to_string());
+            let delivered = self.deliver(text.to_string());
             self.tree.focused = previous;
+            if let Err(line) = delivered {
+                return attach::Reply::Err(attach::ReplyError::bad_request(line));
+            }
         } else {
             self.chat.set_draft(id, text);
             self.say(format!("{from}: set the draft for #{id}"));
@@ -9017,6 +9042,12 @@ mod tests {
     /// `Rank::Alert` is the rank the warning holds too, and the bar has one row
     /// for the two — so the client's failure reaches the human, and the arm
     /// goes with the line it lives on, as any other failure does (findings §6).
+    ///
+    /// And it is told *to the client*: a message that landed in no mailbox is
+    /// not an `Ok` revision. The client used to be handed one, so the words
+    /// that never arrived read to the sender as delivered while the human's own
+    /// bar said the agent was gone — the one reader who could not see the
+    /// failure was the one who sent it.
     #[test]
     fn an_attach_failure_lands_over_the_humans_warning() {
         let (mut app, _rx) = test_app("attach-quit-failure");
@@ -9028,7 +9059,7 @@ mod tests {
         ctrl(&mut app, 'q');
         assert!(app.quit_armed());
 
-        attach_ok(app.handle_attach(
+        let error = attach_err(app.handle_attach(
             "a client",
             &attach_request(
                 3,
@@ -9040,6 +9071,8 @@ mod tests {
                 },
             ),
         ));
+        assert_eq!(error.kind, "bad_request", "the sender is told: {error:?}");
+        assert_eq!(error.message.as_deref(), Some("agent #1 is gone"));
 
         assert_eq!(
             text_of(&app),
