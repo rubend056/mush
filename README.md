@@ -8,15 +8,15 @@ mush does not edit files itself. The agents do, and mush is how you steer them
 and see what changed.
 
 ```
-┌ agents · 1 running · Σ +12 −3 ───┬ mush ──────────────────────────────┐
+┌ agents · 1 working · Σ +12 −3 ───┬ mush ──────────────────────────────┐
 │ ▶ · #0   you (root agent)        │ you › rename the lexer module       │
 │   ◐ #1   lexer    edit lex.rs 4s │ mush › Starting with the rename.    │
 │   ✓ #2   docs     wrote README   │       ⚙ edit_file src/lex.rs        │
 │                                  ├─────────────────────────────────────┤
 │                                  │ › _                                 │
 └──────────────────────────────────┴─────────────────────────────────────┘
- chat  #1 edit lex.rs 4s
- ⌂ ~/p/demo │ master ±3 +12−3 │ deepseek-flash · ctx ~500k
+ chat  Tab cycles panes · /help lists commands
+ ⌂ ~/p/demo │ master ±3 +12−3 │ deepseek-flash @ deepseek.com · ctx 12k/~500k
 ```
 
 ## Quick start
@@ -80,68 +80,78 @@ remembered in `.mush/session.json`.
 
 ## Subagents
 
-The root agent can delegate: `spawn_agent(brief)` starts a subagent that has
-no memory of your conversation — the brief *is* the context. `wait_agents`
-blocks until a child finishes, `agent_status` lists them, `agent_control`
-stops or messages (nudges) a running child. Subagents can spawn their own, up
-to `MAX_DEPTH` (3); the delegation tools vanish from a leaf's toolset, and a
-live-agent budget (16) caps total fan-out.
+The root agent can delegate: `spawn_agent(brief, title, base?)` starts a
+subagent that has no memory of your conversation — the brief *is* the context.
+`title` (three words) names its row in the tree; `base`, a branch, tag or
+commit, is what gives the child a tree of its own (*Isolated agents* below).
+`wait_agents` blocks until a child finishes, `agent_status` lists them,
+`agent_control` stops or messages (nudges) a running child. Subagents can spawn
+their own, four levels deep (`MAX_DEPTH` 3, the root included); the four
+delegation tools vanish from a leaf's toolset, and a live-agent budget
+(`MAX_AGENTS` 16) caps total fan-out.
 
 The orchestrator may end its turn while children still run: mush shows
-`waiting on N subagents`, and the root is **woken with each child's
-`#N done: summary`** as they finish — early End is not a lost result, it's a
-nap.
+`waiting on 1 subagent — the root resumes as they finish`, and the root is
+**woken with each child's `#N done: summary`** as they finish — early End is not
+a lost result, it's a nap.
 
 Deep chains are tested deterministically (root → child → grandchild, nested
 worktrees) but they need a model that actually delegates: small local models
 tend to flatten the chain and do the leaf work themselves. Prefer a capable
 model for orchestration.
 
-A run ends when the model stops calling tools; a *loop* — the same tool batch
-five rounds over with nothing changed in between — ends it early, and a 200-turn
-runaway guard gets a **wrap-up turn** instead of an error: tools are withdrawn,
-the model summarizes what was done and what is left, and that summary is the
-run's result.
+A run ends when the model stops calling tools; a repeated tool batch ends it
+early as a *loop*, and the runaway guard ends with a **wrap-up turn** instead of
+an error: tools are withdrawn, the model summarizes what was done and what is
+left, and that summary is the run's result.
 
 ## The agents pane
 
 The pane shows the whole tree: depth by indentation, `·` idle, `◐` running,
 `⊘` a cancel in flight or a run that landed stopped, `✓` done (with its final
-summary), `✗` failed. A running agent that has children out wears `⏸N`, counting
-them, and a running job adds `⚙N` to its owner's row. A row spends its columns on
+summary), `✗` failed, `⚠` a run that was cut off, `≡` a conversation being folded.
+A running agent that has children out wears `⏸N`, counting them; `✉` marks a
+result its parent has not read (`✉N` the ones from its own children); and a
+running job adds `⚙N` to its owner's row. A row spends its columns on
 state, then the branch and line delta (`mush/2 +8−0`), then the activity with its
 age (`edit_file src/lex.rs 12s`), then a short title derived from the brief
-(`lexer`); the pane title totals the tree (`agents · 2 running · Σ +324 −40`), and
-the selected row's full facts — the brief, the worktree, the merge commands, its
-jobs — sit in a footer under the list.
+(`lexer`); the pane title totals the tree (`agents · 2 working · 1 waiting · Σ +324 −40`), and
+the selected row's full facts — the brief, its activity, the worktree and the git
+command that reads it, its jobs — sit in a footer under the list.
 
-`Enter` on a row focuses that agent — the chat switches to its transcript and
-typing nudges it. `←`/`→` put the selection on that agent's parent or its first
-child, and `PgUp`/`PgDn` page the rows. `Esc` returns to the root, `c` cancels the
-selected agent, `Ctrl-C` stops the **focused** agent, and `Ctrl-X` stops every
-running one (an idle agent is left alone — it has nothing to cancel). A cancel
-reaches the model call itself: the request is read in short slices, so Ctrl-C
-stops a model that has not answered instead of waiting for its reply.
+`Enter` on a row shows that agent's transcript in the chat pane; the keyboard
+stays in the tree, so `Tab` is what puts it in the message box, where typing
+reaches the agent on screen. `←`/`→` put the selection on that agent's parent or
+its first child, and `PgUp`/`PgDn` page the rows. `Esc` returns to the root, `c`
+cancels the selected agent, `Ctrl-C` stops the **focused** agent, and `Ctrl-X`
+stops every running one (an idle agent is left alone — it has nothing to
+cancel). A cancel reaches the model call itself: the request is read in short
+slices, so Ctrl-C stops a model that has not answered instead of waiting for its
+reply.
 
 ## Isolated agents
 
-`isolated: true` gives a child its own git worktree
-(`.mush/wt/<id>` on branch `mush/<id>`), so parallel agents edit real files
-without colliding. Where that is impossible (a workspace that is not a git
-repository) the child shares the checkout and the parent's pane says so. A run's work is **committed** to that branch when the run
-ends (`mush #3: <brief>`), so the branch really carries it. **mush never
-auto-merges** — the tree shows the branch, and these run the git that reads and
-lands it:
+`base` gives a child its own git worktree (`.mush/wt/<id>` on branch
+`mush/<id>`), forked from that branch, tag or commit — so parallel agents edit
+real files without colliding. Without a `base` the child shares the checkout,
+and only one shared child may run at a time. A `base` git cannot resolve is a
+**failed delegation**, refused before anything is created, never a child that
+quietly runs somewhere else. A run's work is **committed** to the child's branch
+when the run ends (`mush #3: <brief>`, with the outcome spelled into the subject
+when it stopped, was cut off or failed), so the branch really carries it.
 
-```
-/diff <id>      runs `git diff HEAD...mush/3`: a stat line, then the hunks (capped)
-/merge <id>     runs `git merge mush/3`, then reclaims the worktree and the branch
-/discard <id>   runs `git worktree remove --force .mush/wt/3 && git branch -D mush/3`
+**mush never auto-merges** — the selected row's footer names the worktree and
+`git diff HEAD...mush/3`, and git itself lands or drops the work:
+
+```sh
+git merge mush/3                 # land it on the branch you are on
+git worktree remove .mush/wt/3   # reclaim the checkout
+git branch -D mush/3             # drop the branch
 ```
 
-Leftover worktrees (`mush/*` branches) are rediscovered on startup and shown
-in the tree, so those commands keep working after a restart; `/worktrees`
-re-scans.
+Leftover worktrees (a `mush/*` branch with a checkout still on disk) are
+rediscovered on startup and shown in the tree, so those commands keep working
+after a restart.
 
 Long running conversations are **auto-compacted**: when the history nears the
 endpoint's context window, mush asks the model to summarize everything
@@ -151,23 +161,15 @@ trimming only cuts in when the model itself cannot produce a summary.
 
 ## Keys
 
-| Key | Action |
+| Context | Keys |
 |---|---|
-| `Tab` / `Shift-Tab` | cycle panes (agents, chat) |
-| `Enter` | send message (chat) · focus agent (agents) |
-| `j` `k` · `↑` `↓` · `g` `G` `Home` `End` | move down/up the rows (agents) or the transcript (chat) |
-| `PgUp` `PgDn` | page the rows (agents), the transcript (chat), or a picker's list |
-| `←` `→` | the selected agent's parent / first child (agents) |
-| `Enter` · `c` · `Esc` | focus · cancel · back to the root (agents) |
-| `←` `→` `Home` `End` · `Backspace` `Delete` | edit the message box (chat) |
-| `Ctrl-P` | model picker |
-| `Ctrl-N` | new chat (stops every agent, restarts the root) |
-| `Ctrl-C` | stop the focused agent — an idle one is left alone, and a cancel reaches a model that is still thinking |
-| `Ctrl-X` | stop every running agent |
-| `Ctrl-Q` | quit |
+| anywhere | `Tab`/`Shift-Tab` cycle panes (agents, chat) · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent, restarts the root) · `Ctrl-C` stop the focused agent — an idle one is left alone, and a cancel reaches a model that is still thinking · `Ctrl-X` stop every running agent · `Ctrl-P` model picker |
+| agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them · `←`/`→` the row's parent / its first child · `Enter` show its transcript, keys staying in the tree · `c` cancel it · `Esc` back to the root |
+| chat | typing · `Enter` send · `Shift`/`Alt-Enter` a new line · `←`/`→`, `Home`/`End` move the box cursor · `Backspace`/`Delete` · `↑`/`↓`, `PgUp`/`PgDn` scroll the transcript · `Esc` clear the box |
+| picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move, `PgUp`/`PgDn` page the list · `Enter` take the row · `Esc` close |
 
-Chat commands: `/provider`, `/model`, `/context`, `/url`, `/key`, `/models`,
-`/worktrees`, `/diff`, `/merge`, `/discard`, `/notes`, `/new`, `/help`, `/quit`.
+Chat commands: `/provider`, `/model`, `/url`, `/key`, `/models`, `/compact`,
+`/notes`, `/help`, `/quit` (`mush --help` prints this table and the keys).
 
 ## The screen
 
@@ -180,16 +182,20 @@ transcript already show. Its **second line** (on terminals at least 24 rows tall
 is the stable facts, cut from the right when the terminal is narrow:
 
 ```
-⌂ ~/p/mush │ master ±3 +12−3 │ deepseek-flash · ctx ~500k
+⌂ ~/p/mush │ master ±3 +12−3 │ deepseek-flash @ deepseek.com · ctx 12k/~500k
 ```
 
 `±3` counts paths with uncommitted changes, `+12−3` the line delta against
-`HEAD`. Terminals narrower than 80 columns (or shorter than 20 rows) get a
+`HEAD`, and `ctx 12k/~500k` how much of the window this conversation has taken —
+the `~` says the window was assumed rather than stated.
+
+Terminals narrower than 80 columns (or shorter than 20 rows) get a
 **compact** layout: the agent strip on top, chat below. Below 40×10 mush says
 so instead of painting shreds.
 
 Under the conversation is mush's own **foot**: `·` for what happened, `!` for a
-failure. It never takes more than three rows — two for the lines and one for the
+failure, `⊘` for a run mush stopped, `⚠` for one that was cut off. It never takes
+more than three rows — two for the lines and one for the
 count; when there is more, the row that says `+N more lines · /notes` is the
 count, and `/notes` reads the whole list. A fatal
 run's failure is kept in `.mush/session.json` and is still there next time mush
@@ -216,12 +222,13 @@ half an hour for an endpoint that stalls and loses every time.
 Every request fits inside the endpoint's window, and the window comes from the
 first of these that knows:
 
-1. **You**: `--context N`, `MUSH_CONTEXT=N`, or `/context N`. A number you state
-   is remembered in `.mush/session.json` and never overruled.
-2. **The endpoint**, when it advertises one and mush fetched its model list:
-   llama.cpp's `meta.n_ctx`, vLLM's `max_model_len`, OpenRouter's
-   `context_length`. Discovery only runs when no model was named, or on
-   `/model`, `/models`, and `/url`.
+1. **You**: `--context N`, `MUSH_CONTEXT=N`, or a `context` in the home config. A
+   number you state is remembered in `.mush/session.json` and never overruled.
+2. **The endpoint**, when it advertises one and mush fetched its model list: the
+   first of `max_model_len`, `context_length`, `context_window`, `n_ctx` it
+   reports, at the top level or under `meta`. Discovery runs when no model was
+   named, and on `/url`, `/provider`, `/models` (a model picker fetches only if
+   its list is empty).
 3. **The model's documented window** — `deepseek-flash` and `deepseek-v4-pro`
    are 500k, so a hosted API (which answers with ids and nothing else) is not
    silently treated as an 8k local model.
@@ -240,8 +247,10 @@ and retries once.
 
 ## What it writes
 
-- `./.mush/` — workspace-local state, git-ignored by itself:
-  `session.json` (the root conversation, provider, endpoint, model).
+- `./.mush/` — workspace-local state, git-ignored by itself: `session.json`
+  (the conversation and the whole agent tree, the provider, endpoint and model,
+  a context window you stated, and each agent's last failure), and `wt/` for
+  isolated agents' worktrees.
 - The platform config directory (e.g. `~/.config/mush/config.json`) —
   machine-global defaults **including the API key**. The key never touches the
   workspace.
@@ -258,7 +267,7 @@ crates/mush-core/   pure domain: workspace, sessions, prompt, messages, config, 
 crates/mush/        the binary: TUI, agent actors, HTTP client
 scripts/smoke.py    end-to-end test that drives the real TUI over a pty
 scripts/screen.py   prints the painted screen as text at six terminal sizes
-scripts/mock_llm.py scripted model server, kept for manual pty smoke (no test refers to it)
+scripts/mock_llm.py scripted model server, kept for hand-driven runs (nothing in the repo calls it)
 docs/mush.md        the design doc
 ```
 
