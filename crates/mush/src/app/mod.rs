@@ -1032,22 +1032,25 @@ impl App {
     /// Everything else the bar's line one carries is an event with no other
     /// home — a failure, a stop, a job's report, a command's answer — and the
     /// newest of those is the status, not this.
+    ///
+    /// The count is the root's *own* busy children — [`AgentTree::busy_children`] —
+    /// the same derivation the row's `⏸N` mark and the title's `M waiting`
+    /// read, and not every busy node in the tree. The sentence is a promise
+    /// about when the root resumes, and it resumes when its children finish: a
+    /// grandchild working under a child that is itself parked promised a resume
+    /// the grandchild's finish does not cause, and it contradicted the title of
+    /// the very frame it was painted in (a second owner of the fact U2 named).
     pub fn tree_line(&self) -> Option<String> {
-        let working = self
-            .tree
-            .agents
-            .iter()
-            .filter(|node| node.phase.is_busy())
-            .count();
+        let waiting = self.tree.busy_children(AgentId::ROOT);
         let root_is_working = self
             .tree
             .node(AgentId::ROOT)
             .is_some_and(|root| root.phase.is_busy());
-        if working == 0 || root_is_working {
+        if waiting == 0 || root_is_working {
             return None;
         }
         Some(format!(
-            "waiting on {working} subagent(s) — the root resumes as they finish"
+            "waiting on {waiting} subagent(s) — the root resumes as they finish"
         ))
     }
 
@@ -5963,6 +5966,76 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// One frame with a nested tree: the root is at rest with work out, its own
+    /// child #1 is parked in `wait_agents`, and the grandchild #2 is working.
+    ///
+    /// The bar's sentence is a promise about when the root resumes — "the root
+    /// resumes as they finish" — and the root resumes when *its* children
+    /// finish, which is the derivation the row's `⏸N` and the title's `M
+    /// waiting` read. The bar counted every busy node in the tree instead, so
+    /// with a grandchild at work it promised a resume that the grandchild's
+    /// finish does not cause, in the same frame where the pane title named one
+    /// (finding U2's second owner).
+    #[test]
+    fn the_bar_and_the_title_agree_on_who_the_root_waits_for() {
+        let (mut app, _rx) = test_app("nested-wait");
+        let conversation = app.tree.conversation();
+        for (child, parent, depth) in [(1u64, 0u64, 1usize), (2, 1, 2)] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId(parent),
+                event: AgentEvent::Spawned {
+                    child,
+                    parent,
+                    brief: "a task".to_string(),
+                    depth,
+                    branch: None,
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId(child),
+                event: AgentEvent::Running {
+                    cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                },
+            });
+        }
+        // The root ended its turn with child #1 still out; #1 is parked on its
+        // own child, and #2 is the one actually working.
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Done,
+        });
+        app.tree.activity(AgentId(1), "wait_agents 3s");
+        app.tree.activity(AgentId(2), "read_file deep.txt 2s");
+        assert_eq!(
+            (
+                app.tree.busy_children(AgentId::ROOT),
+                app.tree.roster().working
+            ),
+            (1, 2),
+            "the tree this is about: the root waits on one of two busy agents"
+        );
+
+        let rows = screen(&mut app, 200, 50);
+        let title = rows.first().expect("the pane title is painted");
+        // The bar's message row, above the facts row it shares the foot with.
+        let bar = &rows[rows.len() - 2];
+
+        assert!(title.contains("2 working"), "{title:?}");
+        assert!(title.contains("1 waiting"), "{title:?}");
+        assert!(
+            bar.contains("waiting on 1 subagent(s)"),
+            "the bar counted a grandchild the root does not resume on: {bar:?}"
+        );
+        assert!(
+            !bar.contains("waiting on 2"),
+            "the bar disagrees with the title in the same frame: {bar:?}"
+        );
     }
 
     /// A status that arrives after the run ended must not put a finished agent
