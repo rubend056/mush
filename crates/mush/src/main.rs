@@ -265,6 +265,14 @@ impl Cli {
                     print_help();
                     std::process::exit(0);
                 }
+                "--" => {
+                    // End of options, as the ATTACH prose promises: everything
+                    // after it is positional, so a directory named like a
+                    // subcommand or a stray `--` in a script cannot turn into
+                    // an unknown option (finding A5).
+                    positional.extend(args.map(|arg| arg.to_string()));
+                    break;
+                }
                 "--agent" => agent = Some(number(args.next(), "--agent")?),
                 "--since" => since = number(args.next(), "--since")? as usize,
                 "--base" => base = number(args.next(), "--base")?,
@@ -388,12 +396,23 @@ fn parse_id(value: &str, command: &str) -> Result<u64, String> {
 }
 
 /// `read`: the transcript lines, one per line as `index<TAB>text`.
+/// One transcript line, escaped so it prints as one line. A message with a
+/// newline in it (a pasted brief, a tool result) is still one line on the wire,
+/// and printing it raw made it read as two — under one index — with no way for
+/// anything downstream to tell continuation from a new line (finding A3).
+fn escape_line(text: &str) -> String {
+    text.replace('\\', "\\\\")
+        .replace('\n', "\\n")
+        .replace('\r', "\\r")
+        .replace('\t', "\\t")
+}
+
 fn print_lines(body: &Value) {
     if let Some(lines) = body.get("lines").and_then(Value::as_array) {
         for line in lines {
             let index = line.get("line").and_then(Value::as_u64).unwrap_or(0);
             let text = line.get("text").and_then(Value::as_str).unwrap_or("");
-            println!("{index}\t{text}");
+            println!("{index}\t{}", escape_line(text));
         }
     }
 }
@@ -483,7 +502,8 @@ fn help_text() -> String {
          \x20                        an agent's transcript lines\n\
          \x20   mush focus [DIR] ID   focus that agent, as Enter on its row does\n\
          \x20   mush edit [DIR] [--agent N] --base R [--send] TEXT\n\
-         \x20                        set the message box's draft, or send it as the human\n\
+         \x20                       set the message box's draft, or send it as the human\n\
+         \x20                       (-- ends the options, for a directory named like one)\n\
          Endpoint, API key, model, and the request knobs live in\n\
          $MUSH_CONFIG or the platform config directory. That file is hand-editable,\n\
          every field is optional, and the one mush writes documents itself.\n\
@@ -1215,6 +1235,52 @@ mod tests {
         for sub in ["mush agents", "mush read", "mush focus", "mush edit"] {
             assert!(help.contains(sub), "`{sub}` is not in --help:\n{help}");
         }
+    }
+
+    /// `--` ends the options, in a subcommand as it does for the TUI, so a
+    /// directory named like a subcommand (or one starting with dashes) is
+    /// openable rather than an unknown option (finding A5).
+    #[test]
+    fn a_double_dash_ends_the_options() {
+        let parse = |argv: &[&str]| {
+            Cli::detect(&argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            parse(&["read", "--"]).unwrap(),
+            Some(Cli::Read {
+                dir: ".".into(),
+                agent: 0,
+                since: 0
+            })
+        );
+        assert_eq!(
+            parse(&["read", "--", "--weird"]).unwrap(),
+            Some(Cli::Read {
+                dir: "--weird".into(),
+                agent: 0,
+                since: 0
+            }),
+            "everything after `--` is positional"
+        );
+        assert_eq!(
+            parse(&["--", "agents"]).unwrap(),
+            None,
+            "a leading `--` is the TUI's, not a subcommand's"
+        );
+    }
+
+    /// One wire line prints as one line: a transcript line carrying a newline
+    /// is escaped, so a client can tell continuation from a new line (A3).
+    #[test]
+    fn a_read_line_is_escaped_onto_one_line() {
+        assert_eq!(escape_line("one\ntwo"), "one\\ntwo");
+        assert_eq!(escape_line("a\tb"), "a\\tb");
+        assert_eq!(
+            escape_line("c\\nd"),
+            "c\\\\nd",
+            "a real backslash stays visible"
+        );
+        assert!(!escape_line("x\ny").contains('\n'));
     }
 
     /// The subcommands parse before anything else: a directory, the flag forms

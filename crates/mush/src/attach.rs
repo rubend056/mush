@@ -30,6 +30,11 @@ const SOCKET_FILE: &str = "mush.sock";
 /// that has gone bad cannot spin the thread hot.
 const ACCEPT_BACKOFF: Duration = Duration::from_millis(20);
 
+/// How long the CLI waits for mush to answer a request, on the socket and on
+/// the write. A mush that is alive but not answering must not hang a script
+/// (the client half of finding A2).
+const ASK_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Where a running mush listens, and the CLI looks.
 pub fn socket_path(root: &Path) -> PathBuf {
     mush_core::session::mushroom_dir(root).join(SOCKET_FILE)
@@ -63,6 +68,9 @@ pub fn serve(root: &Path, ui_tx: Sender<Msg>) -> Result<Guard, String> {
     let listener = UnixListener::bind(&path)
         .map_err(|error| format!("could not bind {}: {error}", path.display()))?;
     let guard = Guard { path };
+    // The guard is built before the thread so the file is never left behind if
+    // the spawn fails: returning here drops it, and its `Drop` removes the
+    // socket (finding A7).
     thread::Builder::new()
         .name("mush-attach".to_string())
         .spawn(move || accept_loop(listener, ui_tx))
@@ -70,13 +78,23 @@ pub fn serve(root: &Path, ui_tx: Sender<Msg>) -> Result<Guard, String> {
     Ok(guard)
 }
 
-/// One connection at a time, serially. The UI thread is never blocked here
-/// because it never touches the socket: a slow client only makes the *next*
-/// client wait.
+/// One thread per connection, so an idle client holds nothing but its own
+/// thread. This used to be serial: a client that connected and said nothing
+/// blocked every other client, and `mush agents` simply did not return while
+/// it was held (finding A2). The UI thread is still never blocked here — it
+/// never touches the socket.
 fn accept_loop(listener: UnixListener, ui_tx: Sender<Msg>) {
     loop {
         match listener.accept() {
-            Ok((stream, _)) => serve_connection(stream, &ui_tx),
+            Ok((stream, _)) => {
+                let ui_tx = ui_tx.clone();
+                // A thread that cannot start ends this connection only; the
+                // listener keeps accepting, because a busy box must not take
+                // the attach surface down with it.
+                let _ = thread::Builder::new()
+                    .name("mush-attach-conn".to_string())
+                    .spawn(move || serve_connection(stream, &ui_tx));
+            }
             Err(_) => thread::sleep(ACCEPT_BACKOFF),
         }
     }
@@ -127,11 +145,11 @@ fn dispatch(line: &str, from: &str, ui_tx: &Sender<Msg>) -> Response {
         reply: reply_tx,
     });
     if sent.is_err() {
-        return Response::error(id, ReplyError::bad_request("mush is shutting down"));
+        return Response::error(id, ReplyError::unavailable("mush is shutting down"));
     }
     match reply_rx.recv() {
         Ok(response) => response,
-        Err(_) => Response::error(id, ReplyError::bad_request("the UI dropped the request")),
+        Err(_) => Response::error(id, ReplyError::unavailable("the UI dropped the request")),
     }
 }
 
@@ -153,6 +171,14 @@ pub fn ask(dir: &Path, request: &Request) -> Result<Response, String> {
     let socket = socket_path(dir);
     let stream = UnixStream::connect(&socket)
         .map_err(|_| format!("no mush is running in {}", dir.display()))?;
+    // The CLI's own bound: a mush that accepts the connection and then stops
+    // answering must not hang a script forever (the client half of finding A2).
+    stream
+        .set_read_timeout(Some(ASK_TIMEOUT))
+        .map_err(|error| format!("could not use the socket: {error}"))?;
+    stream
+        .set_write_timeout(Some(ASK_TIMEOUT))
+        .map_err(|error| format!("could not use the socket: {error}"))?;
     let mut writer = stream
         .try_clone()
         .map_err(|error| format!("could not use the socket: {error}"))?;
@@ -395,6 +421,19 @@ impl ReplyError {
         }
     }
 
+    /// The request was read and mush cannot answer it *now* — it is shutting
+    /// down, or the UI dropped it. Answered as `bad_request` twice, which told
+    /// a client that sent a perfectly good line to go and fix its syntax
+    /// (finding A6); the two cases a client may usefully retry have their own
+    /// kind.
+    pub fn unavailable(message: impl Into<String>) -> Self {
+        Self {
+            kind: "unavailable".to_string(),
+            message: Some(message.into()),
+            revision: None,
+        }
+    }
+
     /// One line for a CLI to print on stderr.
     pub fn describe(&self) -> String {
         match (&self.message, self.revision) {
@@ -629,6 +668,62 @@ mod tests {
         drop(guard);
         assert!(!socket.exists(), "the guard removed the socket file");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// One idle client must not hold the surface: a connection that says
+    /// nothing gets its own thread, so another client is answered while the
+    /// first is still open. Accepting serially, a held socket made `mush
+    /// agents` hang for as long as the holder felt like it (finding A2).
+    #[test]
+    fn an_idle_client_does_not_wedge_the_socket() {
+        let root = std::env::temp_dir().join(format!("mush-attach-idle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let guard = serve(&root, tx).unwrap();
+        let socket = socket_path(&root);
+
+        // A client that connects and says nothing at all.
+        let held = UnixStream::connect(&socket).unwrap();
+
+        // Another client is answered anyway, while the first is still open.
+        let mut other = UnixStream::connect(&socket).unwrap();
+        writeln!(other, r#"{{"id":7,"op":"agents"}}"#).unwrap();
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Msg::Attach { request, reply, .. } => {
+                assert_eq!(request.id, json!(7));
+                reply
+                    .send(Response::ok(request.id, json!({ "agents": [] })))
+                    .unwrap();
+            }
+            _ => panic!("expected Msg::Attach"),
+        }
+        let mut reader = BufReader::new(other);
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert_eq!(decode(line.trim_end()).unwrap().id, json!(7));
+
+        drop(held);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A request mush cannot answer *now* is `unavailable`, not a
+    /// `bad_request`: a client that sent a perfectly good line must not be told
+    /// to go and fix its syntax (finding A6).
+    #[test]
+    fn unavailable_is_its_own_kind() {
+        let error = ReplyError::unavailable("mush is shutting down");
+        let response = Response::error(json!(3), error);
+        let decoded = decode(&response.encode()).unwrap();
+        match decoded.reply {
+            Reply::Err(error) => {
+                assert_eq!(error.kind, "unavailable");
+                assert_eq!(error.describe(), "unavailable: mush is shutting down");
+            }
+            Reply::Ok(_) => panic!("expected an error"),
+        }
     }
 
     /// A socket file with nothing listening behind it is a crash's leftover and

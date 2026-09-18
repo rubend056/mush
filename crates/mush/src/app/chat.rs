@@ -506,7 +506,11 @@ impl Chat {
         self.notices.retain(|notice| notice.agent != agent);
         self.reading.remove(&agent);
         self.spoken.remove(&agent);
-        self.revisions.remove(&agent);
+        // The transcript is gone; the counter stays, moved forward. A client
+        // that read a revision for this id must never see that number come back
+        // for a *different* transcript and land a stale edit (finding A1).
+        let prior = self.revision(agent);
+        self.advance(agent, prior);
     }
 
     /// How big one conversation is, in tokens, roughly — the same
@@ -537,8 +541,24 @@ impl Chat {
         self.notices.clear();
         self.reading.clear();
         self.spoken.clear();
-        self.revisions.clear();
         self.pending = None;
+        // Every counter steps forward rather than resetting to nothing: a
+        // client that read a revision before `/new` must not see the same
+        // number come back for a different conversation, where its next edit
+        // would be accepted as if the transcript had stood still (finding A1).
+        // The root is always bumped — its revision is the one a client holds
+        // first — and so is every conversation the tree knew, whether or not a
+        // change had put an entry in the map (`revision`'s fallback is the line
+        // count, which is a token like any other).
+        let mut known: Vec<AgentId> = vec![AgentId::ROOT];
+        known.extend(self.agents.keys().copied());
+        known.extend(self.revisions.keys().copied());
+        known.sort_unstable();
+        known.dedup();
+        for id in known {
+            let prior = self.revision(id);
+            self.advance(id, prior);
+        }
     }
 
     /// A line for the transcript that is not a message: a hint, or a failure.
@@ -2419,6 +2439,51 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A revision is process-monotone: it is a token a client holds across
+    /// turns, so `/new` and `forget` move it *forward* instead of resetting it.
+    /// Restarting at 0 made a new conversation collide with a transcript the
+    /// client had already read, and its next edit landed as if nothing had
+    /// happened (finding A1).
+    #[test]
+    fn a_revision_never_steps_back_across_new_or_forget() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::user("first"));
+        chat.replace_transcript(AgentId(2), vec![Message::user("a child line")]);
+        let root_before = chat.revision(AgentId::ROOT);
+        let child_before = chat.revision(AgentId(2));
+
+        chat.clear();
+        assert!(
+            chat.revision(AgentId::ROOT) > root_before,
+            "/new steps the root forward: {}",
+            chat.revision(AgentId::ROOT)
+        );
+        assert!(
+            chat.revision(AgentId(2)) > child_before,
+            "and every conversation the client could hold"
+        );
+
+        // A conversation nobody had changed is a token too: an empty transcript
+        // reads as revision 0, and `/new` must not hand that same 0 back for a
+        // different (also empty) one — the case a client polls into.
+        let mut empty = Chat::bare();
+        let zero = empty.revision(AgentId::ROOT);
+        empty.clear();
+        assert!(
+            empty.revision(AgentId::ROOT) > zero,
+            "even an empty conversation's token moves on"
+        );
+
+        chat.forget(AgentId(2));
+        let after_forget = chat.revision(AgentId(2));
+        assert!(after_forget > child_before, "a forgotten id does not reset");
+        chat.replace_transcript(AgentId(2), vec![Message::user("a different child")]);
+        assert!(
+            chat.revision(AgentId(2)) > after_forget,
+            "a transcript that takes the id over never reuses the token"
+        );
     }
 
     /// Clearing is per agent, because a line about one conversation is not a

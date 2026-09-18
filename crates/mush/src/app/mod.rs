@@ -1498,7 +1498,12 @@ impl App {
     }
 
     /// The transcript lines of `agent` from `since` (0-based, inclusive), with
-    /// the revision a later `edit` must carry.
+    /// a revision a later `edit` must carry.
+    ///
+    /// The conversation's id travels with every answer: a revision is only
+    /// meaningful *within* one conversation, and `/new` is where a client that
+    /// polls with its own token would otherwise mistake a fresh transcript for
+    /// the one it has been reading (finding A1).
     fn attach_read(&self, agent: u64, since: usize) -> attach::Reply {
         let id = AgentId(agent);
         if !self.tree.has(id) {
@@ -1520,6 +1525,7 @@ impl App {
             .collect();
         attach::Reply::Ok(serde_json::json!({
             "agent": agent,
+            "conversation": self.tree.conversation().0,
             "revision": self.chat.revision(id),
             "lines": lines,
         }))
@@ -1554,19 +1560,26 @@ impl App {
         attach::Reply::Ok(serde_json::json!({
             // The root's transcript is the conversation; its revision is the
             // one token that covers the chat a client is most likely to edit.
+            "conversation": self.tree.conversation().0,
             "revision": self.chat.revision(AgentId::ROOT),
             "agents": agents,
         }))
     }
 
-    /// Where an agent works: its worktree when it has a branch, else the main
-    /// checkout. Derived from the branch, the same way the row's location is.
+    /// Where an agent works: its worktree when it has one that is still on
+    /// disk, else the main checkout.
+    ///
+    /// A merged or discarded agent keeps no branch (`live_branch` drops it at
+    /// restore and `/merge` drops it on landing), and a hand-run
+    /// `git worktree remove` takes the directory out from under a branch that
+    /// still exists — either way, reporting a dead path is a path a client must
+    /// not read files or run commands from (finding A8). The same question
+    /// `worktree_gone` asks, answered for the wire.
     fn attach_worktree(&self, id: AgentId) -> String {
-        match self.tree.node(id).and_then(|node| node.branch.as_ref()) {
-            Some(_) => git::worktree_path(self.ws.root(), id.0)
-                .display()
-                .to_string(),
-            None => self.ws.root().display().to_string(),
+        let path = git::worktree_path(self.ws.root(), id.0);
+        match self.tree.node(id) {
+            Some(node) if node.branch.is_some() && path.exists() => path.display().to_string(),
+            _ => self.ws.root().display().to_string(),
         }
     }
 
@@ -1614,6 +1627,17 @@ impl App {
             }
             if let Some(line) = self.worktree_gone(id) {
                 return attach::Reply::Err(attach::ReplyError::bad_request(line));
+            }
+            // A client's words are a *message*, not a command: `/new` typed
+            // here would be text an agent reads, where the same words at the
+            // human's keyboard would restart the tree. Saying that is the
+            // contract; the empty case is the one the typed path refuses
+            // (finding A4).
+            let text = text.trim();
+            if text.is_empty() {
+                return attach::Reply::Err(attach::ReplyError::bad_request(
+                    "refusing to send an empty message",
+                ));
             }
             // The same path a typed message takes: `deliver` sends to the
             // focused agent, so aim it there for the turn. The keyboard focus
@@ -9276,6 +9300,114 @@ mod tests {
             &attach_request(4, attach::Op::Focus { agent: 9 }),
         ));
         assert_eq!(error.kind, "bad_request");
+    }
+
+    /// A read's revision is only meaningful inside one conversation. `/new`
+    /// moves it forward and the payload names the new conversation, so a
+    /// client's stale token conflicts instead of landing a draft in the wrong
+    /// chat (finding A1).
+    #[test]
+    fn a_read_revision_is_scoped_to_its_conversation() {
+        let (mut app, _rx) = test_app("attach-epoch");
+        let before = attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(1, attach::Op::Read { agent: 0, since: 0 }),
+        ));
+        let revision = before["revision"].as_u64().expect("a revision");
+        let conversation = before["conversation"].as_u64().expect("an epoch");
+
+        app.apply_command(Command::New);
+
+        let after = attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(2, attach::Op::Read { agent: 0, since: 0 }),
+        ));
+        assert!(
+            after["revision"].as_u64().unwrap() > revision,
+            "the counter moved on, it did not restart: {after}"
+        );
+        assert_ne!(
+            after["conversation"].as_u64().unwrap(),
+            conversation,
+            "and the epoch names the conversation the revision belongs to"
+        );
+
+        let error = attach_err(app.handle_attach(
+            "a client",
+            &attach_request(
+                3,
+                attach::Op::Edit {
+                    agent: 0,
+                    base: revision,
+                    text: "a stale draft".to_string(),
+                    send: false,
+                },
+            ),
+        ));
+        assert_eq!(
+            error.kind, "conflict",
+            "a token from before /new cannot land in the new chat"
+        );
+        assert_eq!(app.chat.input().text(), "", "and the box is untouched");
+    }
+
+    /// A client's words are a message, never a command (the keyboard is where
+    /// commands live), and an empty one is refused rather than sent as a blank
+    /// user turn that starts a run (finding A4).
+    #[test]
+    fn an_empty_attach_send_is_refused_and_changes_nothing() {
+        let (mut app, _rx) = test_app("attach-empty-send");
+        let revision = app.chat.revision(AgentId::ROOT);
+        let error = attach_err(app.handle_attach(
+            "a client",
+            &attach_request(
+                9,
+                attach::Op::Edit {
+                    agent: 0,
+                    base: revision,
+                    text: "   \n".to_string(),
+                    send: true,
+                },
+            ),
+        ));
+        assert_eq!(error.kind, "bad_request");
+        assert!(
+            app.chat.transcript(AgentId::ROOT).is_empty(),
+            "nothing was appended"
+        );
+        assert_eq!(
+            app.chat.revision(AgentId::ROOT),
+            revision,
+            "and nothing moved"
+        );
+        assert!(
+            !app.tree.node(AgentId::ROOT).unwrap().phase.is_busy(),
+            "no run was started"
+        );
+    }
+
+    /// A branch whose worktree is gone is not a place a client can read files
+    /// or run commands: the roster reports the main checkout, where the work
+    /// actually is (finding A8). Reporting the dead path sent a client's next
+    /// `read_file` into a phantom directory.
+    #[test]
+    fn the_roster_does_not_report_a_dead_worktree() {
+        let (mut app, _rx) = test_app("attach-dead-worktree");
+        spawn_agent(&mut app, 1, 0, 1, "a task", Some("mush/1"));
+        // Nothing created `.mush/wt/1`, which is what a merged or discarded
+        // agent looks like from here.
+
+        let body = attach_ok(app.handle_attach("a client", &attach_request(1, attach::Op::Agents)));
+        let agents = body["agents"].as_array().expect("a roster");
+        let row = agents
+            .iter()
+            .find(|node| node["id"] == 1)
+            .expect("the child's row");
+        assert_eq!(
+            row["worktree"],
+            serde_json::json!(app.ws.root().display().to_string()),
+            "the worktree is where the work is"
+        );
     }
 
     /// A stale base is a `conflict` that names the revision that moved, and it
