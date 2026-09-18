@@ -1,20 +1,30 @@
 #!/usr/bin/env python3
-"""A scripted OpenAI-compatible model for deterministic agent tests.
+"""A scripted OpenAI-compatible model, for hand-driven runs.
 
 Usage: mock_llm.py PORT [MARKER]
 
-Serves /v1/models and /v1/chat/completions. Scenarios, selected by the
-root's first user message:
+Serves /v1/models and /v1/chat/completions for a message a human types. Nothing
+in the repo calls this script and no test uses it: the actor scenarios run
+in-process over a scripted client, `scripts/screen.py` needs no endpoint, and
+`scripts/smoke.py` talks to a real one. What it is good for is watching a tree
+work without a model — `scripts/screen.py --url http://127.0.0.1:PORT --ask
+"…"` on a pty.
+
+It scripts the six tools mush has (`edit_file`, `run_command`, `spawn_agent`,
+`status`, `control`, `wait`): a file is written by `run_command` with a shell
+redirect, a child is isolated with `base`, and a parent waits with `wait`, which
+takes no arguments. Scenarios, selected by the root's first user message:
 
 1. DEFAULT ("iso.txt"): a single isolated child.
-   Root:  spawn_agent(isolated) -> end the turn early -> the child must wake it.
-   Child: write_file(iso.txt) -> summary.
+   Root:  spawn_agent(brief, title, base) -> end the turn early -> the child
+          must wake it.
+   Child: run_command(printf > iso.txt) -> summary.
    (Exercises the wake-on-done path.)
 
 2. CHAIN (user message contains "CHAIN"): a two-level delegation.
-   Root:      spawn_agent #1 -> wait_agents([1]) -> final reply.
-   Child #1:  spawn_agent #2 (its own subagent) -> wait_agents([2]) -> summary.
-   Grandchild #2: write_file(deep.txt) -> summary.
+   Root:      spawn_agent #1 -> wait -> final reply.
+   Child #1:  spawn_agent #2 (its own subagent) -> wait -> summary.
+   Grandchild #2: run_command(printf > deep.txt) -> summary.
    (Exercises depth-2 chains and nested worktrees.)
 
 3. COMPACT (the request's final user message asks for a summary):
@@ -41,8 +51,6 @@ Subagents are told apart by "mush subagent" in the system prompt, and child
 vs grandchild by "at depth 1" vs "at depth 2". The parent's task travels as
 subagent's first user message, so task keywords ("iso.txt") are found in the
 joined transcript rather than in the system prompt.
-
-Used by the ignored tests in crates/mush/src/agent.rs.
 """
 import json
 import sys
@@ -71,6 +79,15 @@ class Handler(BaseHTTPRequestHandler):
             }],
         }
 
+    def write(self, path, content):
+        """A file written the way an agent writes one now: the shell does it.
+
+        The `echo` is not decoration — it is what tells the next turn, which
+        reads the transcript's tool results, that the file is on disk."""
+        return self.tool_call("run_command", {
+            "command": f"printf '{content}' > {path} && echo wrote {path}",
+        })
+
     def do_POST(self):  # /v1/chat/completions
         length = int(self.headers.get("Content-Length", 0))
         request = json.loads(self.rfile.read(length))
@@ -78,11 +95,11 @@ class Handler(BaseHTTPRequestHandler):
         joined = "\n".join(m.get("content") or "" for m in messages)
         system = messages[0].get("content") or "" if messages else ""
 
-        # A SLOWCHAIN or SLOWISO root asks for the same tree with a subagent
-        # that holds its reply open. The flag is on the server because every
-        # agent talks to the same one; the sleep itself is on the subagent turn
-        # below. It keeps a parent and its child at work together for long
-        # enough to photograph the tree (used by scripts/screen.py).
+        # A SLOWCHAIN or SLOWISO first message asks for the same tree with a
+        # subagent that holds its reply open. The flag is on the server because
+        # every agent talks to the same one; the sleep itself is on the subagent
+        # turn below. It keeps a parent and its child at work together for long
+        # enough to photograph the tree with a hand-driven `scripts/screen.py`.
         if "SLOWCHAIN" in joined or "SLOWISO" in joined:
             self.server.slow = True
         if "Summarize everything important" in joined:
@@ -138,69 +155,65 @@ class Handler(BaseHTTPRequestHandler):
                 if "wrote deep.txt" in joined:
                     reply = {"role": "assistant", "content": "created deep.txt"}
                 else:
-                    reply = self.tool_call("write_file", {
-                        "path": "deep.txt",
-                        "content": "deep work",
-                    })
+                    reply = self.write("deep.txt", "deep work")
             elif is_subagent:
                 if "extra.txt" in joined and "wrote extra.txt" not in joined:
                     # A nudge after the child's first run. Used by the S1
                     # evidence run: the child's worktree is gone by then, so a
                     # run here would recreate the dead path as a plain
                     # directory. mush refuses it instead.
-                    reply = self.tool_call("write_file", {
-                        "path": "extra.txt",
-                        "content": "phantom",
-                    })
+                    reply = self.write("extra.txt", "phantom")
                 elif "iso.txt" in joined:
                     # ISO scenario child: write the file itself.
                     if "wrote iso.txt" in joined:
                         reply = {"role": "assistant", "content": "created iso.txt in my worktree"}
                     else:
-                        reply = self.tool_call("write_file", {
-                            "path": "iso.txt",
-                            "content": "isolated work",
-                        })
+                        reply = self.write("iso.txt", "isolated work")
                 else:
                     # CHAIN scenario child: delegate onwards, then wait.
                     if "#2 done" in joined:
                         reply = {"role": "assistant", "content": "chain child done"}
                     elif "spawned agent" in joined:
-                        reply = self.tool_call("wait_agents", {"ids": [2], "timeout": 30})
+                        reply = self.tool_call("wait", {})
                     else:
                         reply = self.tool_call("spawn_agent", {
                             "brief": (
                                 "create a file called deep.txt containing exactly: deep work; "
                                 "you must delegate this to your own subagent"
                             ),
-                            "isolated": True,
+                            "title": "deep chain",
+                            "base": "HEAD",
                         })
             elif "CHAIN" in joined:
                 # Chain root: delegate, wait, report.
                 if "#1 done" in joined:
                     reply = {"role": "assistant", "content": "chain root done"}
                 elif "spawned agent" in joined:
-                    reply = self.tool_call("wait_agents", {"ids": [1], "timeout": 30})
+                    reply = self.tool_call("wait", {})
                 else:
                     reply = self.tool_call("spawn_agent", {
                         "brief": (
                             "delegate file creation to your own subagent: spawn one with "
-                            "brief 'create a file called deep.txt containing exactly: deep work' "
-                            "and isolated true, then wait for it, then report"
+                            "brief 'create a file called deep.txt containing exactly: deep work', "
+                            "then wait for it, then report"
                         ),
-                        "isolated": True,
+                        "title": "chain root",
+                        "base": "HEAD",
                     })
             else:
-                # Default: single isolated child; root ends early and must wake.
-                if "spawned agent" in joined:
+                # Default: single isolated child; the root ends its turn early
+                # and must wake. The child's result is checked first, because by
+                # then the transcript holds both lines.
+                if "#1 done" in joined:
+                    reply = {"role": "assistant", "content": "child finished"}
+                elif "spawned agent" in joined:
                     reply = {"role": "assistant",
                              "content": "child left running — I will handle its result when it finishes"}
-                elif "#1 done" in joined:
-                    reply = {"role": "assistant", "content": "child finished"}
                 else:
                     reply = self.tool_call("spawn_agent", {
                         "brief": "create a file called iso.txt containing exactly: isolated work",
-                        "isolated": True,
+                        "title": "iso child",
+                        "base": "HEAD",
                     })
 
         body = json.dumps({
