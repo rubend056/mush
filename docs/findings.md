@@ -538,3 +538,27 @@ name rides a path the brief already travelled, and deleting the degradation
 path paid for it. Owed in the doc-sync pass: `docs/mush.md` §3's signature and
 tool table (`brief, title, base?`) and §5.5's `isolated unavailable` sentence,
 which no longer exists.
+
+---
+
+## 8.15 The registry outlives the checkout (P13, `e63a84c`)
+
+`rm -rf .mush` deletes the checkouts and the session, but not
+`.git/worktrees/*`: git keeps naming every deleted `mush/<id>` worktree (each
+with a `prunable` line), and `discover_worktrees` registered all of them as
+`leftover worktree — found on startup` rows on every launch. 67 phantoms in the
+reference workspace, and no command could clear them.
+
+- **Discovery asks the disk, not just the registry.** `Worktree::on_disk()` is
+the one predicate; a registry entry whose checkout is gone gets no row.
+  Pinned by `worktrees_clears_dead_git_entries_and_keeps_the_branch`.
+- **`/worktrees` reconciles.** The re-scan runs `git worktree prune` and its
+  line says `cleared N stale git entries (branches kept)`. **No new command** —
+  clearing dead entries is part of the re-scan the command already promises.
+  The prune touches only `.git/worktrees/` administration: every branch,
+  commit, and stored transcript remains, so the work is still there when a
+  failing test later wants it. Pinned by
+  `pruning_takes_the_dead_registry_entry_and_leaves_the_branch`.
+
+**Census at `e63a84c`:** total 42,614 (was 42,477), **prod 7,819 (+12)**, tests
+22,186 (+80), comments 9,829 (+37).
