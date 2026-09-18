@@ -26,6 +26,8 @@ cargo build --release
 ./target/release/mush /path/to/project    # or just: mush
 ```
 
+`mush --version` (or `-V`) prints the version and exits.
+
 `Tab` moves between the **agents** tree and the **chat**. Type in the message
 box and press `Enter`. The agent works the workspace through six tools —
 `edit_file`, `run_command`, `spawn_agent`, `status`, `control`, `wait`: the
