@@ -7725,8 +7725,8 @@ mod tests {
             let rows = pane.rows.len();
 
             let hidden: usize = pane
-                .title_cells
-                .iter()
+                .title
+                .split(" · ")
                 .filter_map(|cell| {
                     let digits = cell.strip_prefix('▲').or_else(|| cell.strip_prefix('▼'))?;
                     digits.parse::<usize>().ok()

@@ -73,13 +73,10 @@ fn draw_agents(frame: &mut Frame, pane: &AgentsPane) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(border(pane.focused))
-        // The pane's own title, from the clauses the tree derived: the hidden
-        // row counts and what the whole tree is doing, cut from the right while
-        // they do not fit. The columns are the painter's; the numbers are not.
-        .title(agents_title(
-            &pane.title_cells,
-            pane.area.width.saturating_sub(2) as usize,
-        ));
+        // The pane's own title, already elided by `App::agents_pane` to the
+        // columns this pane has: the painter paints words, it does not choose
+        // them.
+        .title(pane.title.clone());
     let inner = block.inner(pane.area);
     frame.render_widget(block, pane.area);
 
@@ -122,26 +119,6 @@ fn draw_agents(frame: &mut Frame, pane: &AgentsPane) {
             );
         }
     }
-}
-
-/// The pane's title: ` agents · 3 working · 2 jobs · 2 waiting · Σ +324 −40`,
-/// with the clauses that do not fit dropped whole from the right.
-///
-/// Whole, because this pane is 32 columns wide at its widest and a clause cut
-/// mid-number (`Σ +324 −`, `2 waitin`) is a count that is not the count. The
-/// pane keeps its own name when none of them fit.
-fn agents_title(cells: &[String], width: usize) -> String {
-    for kept in (0..=cells.len()).rev() {
-        let title = if kept == 0 {
-            " agents ".to_string()
-        } else {
-            format!(" agents · {}", cells[..kept].join(" · "))
-        };
-        if UnicodeWidthStr::width(title.as_str()) <= width {
-            return title;
-        }
-    }
-    " agents ".to_string()
 }
 
 /// One row of the tree, fitted into the columns the pane has.

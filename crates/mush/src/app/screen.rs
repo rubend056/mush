@@ -156,13 +156,14 @@ pub struct AgentsPane {
     /// counts of the rows that are really on screen (finding V1).
     pub list_area: Rect,
     pub focused: bool,
-    /// The title's clauses, ranked so that the ones that exist *only* here come
-    /// first: the hidden-row counts (`▲3`, `▼17`), then what the whole tree is
-    /// doing (`2 working`, `1 waiting`), then the branches' totals (`Σ +324
-    /// −40`). The painter keeps the longest prefix of them that fits the pane,
-    /// dropping whole clauses — a clause cut mid-number is a count that is not
-    /// the count.
-    pub title_cells: Vec<String>,
+    /// The pane's title, already elided to the columns this pane has: the
+    /// clauses, ranked so that the ones that exist *only* here come first (the
+    /// hidden-row counts `▲3`, `▼17`, then what the whole tree is doing, then
+    /// the branches' totals), with the ones that do not fit dropped whole from
+    /// the right. Whole, because a clause cut mid-number is a count that is not
+    /// the count; and elided here rather than in the painter, so the `Screen`
+    /// owns every word a frame paints (finding D9).
+    pub title: String,
     pub rows: Vec<AgentRow>,
     /// The row the cursor is on: an index into `rows`.
     pub cursor: usize,
@@ -390,7 +391,7 @@ impl App {
             area,
             list_area,
             focused,
-            title_cells: agents_title(self, above, below),
+            title: elide_title(&title_cells(self, above, below), inner.width as usize),
             rows: nodes.iter().map(|node| self.agent_row(node)).collect(),
             cursor,
             footer,
@@ -670,6 +671,27 @@ fn facts_line(app: &App, width: usize) -> String {
 /// uncommitted delta — and, once the read has aged past [`GIT_STALE`], how old
 /// it is. A cached read must not read as a live one, so the age rides with the
 /// fact it qualifies and is elided with it, never after it (finding P8).
+/// The pane's title: ` agents · 3 working · 2 jobs · 2 waiting · Σ +324 −40`,
+/// with the clauses that do not fit dropped whole from the right.
+///
+/// Whole, because this pane is 32 columns wide at its widest and a clause cut
+/// mid-number (`Σ +324 −`, `2 waitin`) is a count that is not the count. The
+/// pane keeps its own name when none of them fit. The loop lives here, beside
+/// the cells it elides, so the painter only paints (finding D9).
+fn elide_title(cells: &[String], width: usize) -> String {
+    for kept in (0..=cells.len()).rev() {
+        let title = if kept == 0 {
+            " agents ".to_string()
+        } else {
+            format!(" agents · {}", cells[..kept].join(" · "))
+        };
+        if UnicodeWidthStr::width(title.as_str()) <= width {
+            return title;
+        }
+    }
+    " agents ".to_string()
+}
+
 fn git_cell(git: &git::RepoStatus, age: Option<Duration>) -> String {
     let mut cell = if git.branch.is_empty() {
         "detached".to_string()
@@ -693,10 +715,11 @@ fn git_cell(git: &git::RepoStatus, age: Option<Duration>) -> String {
 ///
 /// Every clause is a count of the phases, named for what it counts, and no
 /// agent is in two of them: `N working` is the agents whose own run is in
-/// flight, `M waiting` the ones at rest with children working (the `⏸` rows),
-/// and the totals are the branches'. It used to say `N running` over a number
-/// that included the napping ones, which is how the title came to contradict
-/// the rows under it (finding U2).
+/// flight, `M waiting` the ones at rest with children working — a subset of the
+/// rows wearing `⏸N`, which a working parent wears too (finding R10) — and the
+/// totals are the branches'. It used to say `N running` over a number that
+/// included the napping ones, which is how the title came to contradict the
+/// rows under it (finding U2).
 ///
 /// The hidden-row counts are first because they exist *only* here: a 4-row pane
 /// over nineteen agents used to hide fifteen with nothing on screen saying so
@@ -706,10 +729,9 @@ fn git_cell(git: &git::RepoStatus, age: Option<Duration>) -> String {
 /// `+add −del` is on its row and in the selected row's footer, while who is
 /// working exists only here. The machine's job count rides between the two
 /// counts it is read beside: it is the box's load, the one fact that says why a
-/// dozen isolated children feel slow (finding H8). The painter drops clauses
-/// from the right until the title fits — it knows the columns, this knows the
-/// numbers.
-fn agents_title(app: &App, above: usize, below: usize) -> Vec<String> {
+/// dozen isolated children feel slow (finding H8). This knows the numbers;
+/// [`elide_title`] spends the columns on them.
+fn title_cells(app: &App, above: usize, below: usize) -> Vec<String> {
     let roster = app.tree.roster();
     let mut cells = Vec::new();
     if above > 0 {
