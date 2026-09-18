@@ -613,6 +613,13 @@ impl AgentTree {
         self.jobs.live_for(id.0)
     }
 
+    /// How many commands the whole tree runs right now, for the pane title's
+    /// machine picture: every parallel worktree builds its own artifacts, so
+    /// the number is what says *why* a dozen agents feel slow (finding H8).
+    pub fn live_job_count(&self) -> usize {
+        self.jobs.live_total()
+    }
+
     /// Keep the id counter above `floor`. A leftover worktree or a restored
     /// agent holds an id the counter has never seen, so the next spawn has to
     /// start above it or two nodes share one (finding B1).

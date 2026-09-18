@@ -124,8 +124,8 @@ fn draw_agents(frame: &mut Frame, pane: &AgentsPane) {
     }
 }
 
-/// The pane's title: ` agents · 3 working · 2 waiting · Σ +324 −40`, with the
-/// clauses that do not fit dropped whole from the right.
+/// The pane's title: ` agents · 3 working · 2 jobs · 2 waiting · Σ +324 −40`,
+/// with the clauses that do not fit dropped whole from the right.
 ///
 /// Whole, because this pane is 32 columns wide at its widest and a clause cut
 /// mid-number (`Σ +324 −`, `2 waitin`) is a count that is not the count. The

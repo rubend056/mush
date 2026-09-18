@@ -7478,6 +7478,22 @@ mod tests {
         );
     }
 
+    /// The machine's load is a fact on the pane title: a row's `⚙N` is one
+    /// agent's share, and the whole tree's count is what says why a box full of
+    /// parallel worktrees is slow (finding H8).
+    #[test]
+    fn the_title_names_the_machines_load() {
+        let (mut app, _rx) = test_app("title-load");
+        assert!(
+            !screen(&mut app, 120, 32)[0].contains("job"),
+            "an idle machine says nothing about jobs"
+        );
+        running_job(&mut app, 0);
+        running_job(&mut app, 0);
+        let rows = screen(&mut app, 120, 32);
+        assert!(rows[0].contains(" agents · 2 jobs"), "{}", rows[0]);
+    }
+
     /// A clause that does not fit is dropped whole, and the totals are the last
     /// to go: the pane is at most 46 columns wide, and ` agents · 1 working · 1
     /// waiting · Σ +324 −40` is 44 of them — the half of it that would fit

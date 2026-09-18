@@ -695,6 +695,20 @@ impl Registry {
         self.jobs().iter().filter(|record| record.running()).count()
     }
 
+    /// How many commands the whole machine is running right now: the jobs plus
+    /// the foreground tool calls, which is what a row's `⚙N` counts. One sum
+    /// for the pane's title, so the box's load is a fact on screen and not
+    /// something a human has to infer from a dozen rows (finding H8).
+    pub fn live_total(&self) -> usize {
+        let inner = self.inner();
+        inner
+            .jobs
+            .values()
+            .filter(|record| record.running())
+            .count()
+            + inner.foregrounds.len()
+    }
+
     /// Whether there is room for one more job, as of right now.
     ///
     /// The question is asked at two different moments, and only the first of

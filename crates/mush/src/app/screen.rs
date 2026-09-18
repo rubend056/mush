@@ -688,8 +688,8 @@ fn git_cell(git: &git::RepoStatus, age: Option<Duration>) -> String {
     cell
 }
 
-/// ` agents · 3 working · 2 waiting · Σ +324 −40`: the clauses the agent pane's
-/// title is built from, ranked so that the least may be lost last.
+/// ` agents · 3 working · 2 jobs · 2 waiting · Σ +324 −40`: the clauses the
+/// agent pane's title is built from, ranked so that the least may be lost last.
 ///
 /// Every clause is a count of the phases, named for what it counts, and no
 /// agent is in two of them: `N working` is the agents whose own run is in
@@ -704,8 +704,11 @@ fn git_cell(git: &git::RepoStatus, age: Option<Duration>) -> String {
 ///
 /// The totals are last because the least is lost last: every branch's own
 /// `+add −del` is on its row and in the selected row's footer, while who is
-/// working exists only here. The painter drops clauses from the right until the
-/// title fits — it knows the columns, this knows the numbers.
+/// working exists only here. The machine's job count rides between the two
+/// counts it is read beside: it is the box's load, the one fact that says why a
+/// dozen isolated children feel slow (finding H8). The painter drops clauses
+/// from the right until the title fits — it knows the columns, this knows the
+/// numbers.
 fn agents_title(app: &App, above: usize, below: usize) -> Vec<String> {
     let roster = app.tree.roster();
     let mut cells = Vec::new();
@@ -717,6 +720,20 @@ fn agents_title(app: &App, above: usize, below: usize) -> Vec<String> {
     }
     if roster.working > 0 {
         cells.push(format!("{} working", roster.working));
+    }
+    // The machine's load, not one agent's: every isolated worktree builds its
+    // own artifacts, so with a dozen children the box is the bottleneck and
+    // this is the only surface that can say so — a row's `⚙N` is one agent's
+    // share (finding H8). Ranked before `waiting` because a napping agent is
+    // already visible on its own row as `⏸N`, while the load exists nowhere
+    // else.
+    let load = app.tree.live_job_count();
+    if load > 0 {
+        cells.push(if load == 1 {
+            "1 job".to_string()
+        } else {
+            format!("{load} jobs")
+        });
     }
     if roster.waiting > 0 {
         cells.push(format!("{} waiting", roster.waiting));
