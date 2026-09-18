@@ -1392,15 +1392,11 @@ fn run_loop(
         // fire while it still fits; beyond that, trimming stays the last
         // resort.
         if state.compact_requested || needs_compaction(messages, budget) {
-            // A fold that came to nothing (a history nothing can be made of):
-            // the run carries on, and the phase the fold put on the row goes
-            // back to what a run wears between the request and the tool it
-            // names.
-            if !compact_history(actor, &cfg, messages, cancel, state, true)? {
-                actor
-                    .ctx
-                    .emit(actor.id, AgentEvent::CompactingEnded { in_run: true });
-            }
+            // A fold that came to nothing (a history nothing can be made of)
+            // says so itself: the run carries on, and the phase the fold put on
+            // the row goes back to what a run wears between the request and the
+            // tool it names.
+            compact_history(actor, &cfg, messages, cancel, state, true)?;
         }
         // Keep the whole request inside the endpoint's context window.
         trim_history(messages, budget);
@@ -1782,12 +1778,11 @@ const NOTHING_TO_COMPACT: &str =
 /// and the human's `/compact` both come through here, so they cannot disagree
 /// about what "the summary message" is or about when folding is worth a call.
 ///
-/// The `bool` in the `Ok` says whether the transcript was replaced: a fold that
+/// The `bool` in the `Ok` says whether the transcript was replaced. A fold that
 /// came to nothing (a short history, a refusal mush cannot read as a summary)
-/// is over, and the phase it put on the row has to be cleared by whoever knows
-/// what the actor is doing next. `in_run` is that answer, from the caller that
-/// knows it: a fold at a run's message boundary is part of the run, one
-/// `compact_now` makes belongs to no run at all.
+/// emits its own [`AgentEvent::CompactingEnded`] instead, so neither caller has
+/// to know how far it got: `in_run` is on both ends of the fold — a fold at a
+/// run's message boundary is part of the run, one `compact_now` makes is not.
 fn compact_history(
     actor: &Actor,
     cfg: &Config,
@@ -1815,8 +1810,12 @@ fn compact_history(
                 .ctx
                 .emit(actor.id, AgentEvent::Notice(NOTHING_TO_COMPACT.to_string()));
         }
-        // Nothing was replaced, whether the transcript was empty or the fold's
-        // opening message was something else entirely — the phase stays false.
+        // Nothing was replaced, whether the transcript was empty or its opening
+        // message was something else entirely: the fold ends here as every
+        // other `Ok(false)` does, this arm being reached before a `Compacting`.
+        actor
+            .ctx
+            .emit(actor.id, AgentEvent::CompactingEnded { in_run });
         return Ok(false);
     }
     // Nothing left to fold: system + one message is already minimal
@@ -1829,6 +1828,9 @@ fn compact_history(
                 .ctx
                 .emit(actor.id, AgentEvent::Notice(NOTHING_TO_COMPACT.to_string()));
         }
+        actor
+            .ctx
+            .emit(actor.id, AgentEvent::CompactingEnded { in_run });
         return Ok(false);
     }
     let actor_id = actor.id;
@@ -1921,6 +1923,11 @@ fn compact_history(
                     AgentEvent::Notice(format!("could not compact: {why}")),
                 );
             }
+            // Either way the fold is over, and the phase it put on the row
+            // goes — whether or not the human was told why.
+            actor
+                .ctx
+                .emit(actor.id, AgentEvent::CompactingEnded { in_run });
             return Ok(false);
         }
     };
@@ -1937,6 +1944,9 @@ fn compact_history(
                 AgentEvent::Notice("could not compact — the model returned no summary".to_string()),
             );
         }
+        actor
+            .ctx
+            .emit(actor.id, AgentEvent::CompactingEnded { in_run });
         return Ok(false);
     }
 
@@ -1982,32 +1992,23 @@ fn compact_now(actor: &Actor, state: &mut ActorState, transcript: &mut Vec<Messa
     // a fold that spins an hourglass while no key can stop it is worse than one
     // nobody can see.
     let cancel = Arc::new(AtomicBool::new(false));
-    match compact_history(actor, &cfg, transcript, &cancel, state, false) {
-        // A fold that landed needs nothing here: its `Compact` event is what
-        // the pane, the session and the meter read.
-        Ok(true) => {}
-        // Nothing came of it — the history was too short, or the endpoint
-        // answered something mush could not read as a summary. Either way the
-        // row must stop saying `compacting…`.
-        Ok(false) => {
-            actor
-                .ctx
-                .emit(actor.id, AgentEvent::CompactingEnded { in_run: false });
-        }
+    // A fold that landed needs nothing here: its `Compact` event is what the
+    // pane, the session and the meter read. A fold that came to nothing emits
+    // its own ending too, so only its *failures* are left to report.
+    if let Err(error) = compact_history(actor, &cfg, transcript, &cancel, state, false) {
         // The human stopped it. A stop is its own event, not a failure: the
         // actor is alive and resumable, and the row must say which of the two
         // just happened.
-        Err(error) if error == CANCELLED => {
+        if error == CANCELLED {
             actor.ctx.emit(actor.id, AgentEvent::Stopped);
-        }
-        Err(error) => {
+        } else {
             actor.ctx.emit(
                 actor.id,
                 AgentEvent::Notice(format!("could not compact: {error}")),
             );
             // The endpoint refused, could not be reached, or answered
-            // something unreadable: the fold is over either way, and the row
-            // must stop claiming it.
+            // something unreadable: the fold got as far as putting its
+            // `Compacting` on the row, and the row must stop claiming it.
             actor
                 .ctx
                 .emit(actor.id, AgentEvent::CompactingEnded { in_run: false });
