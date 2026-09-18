@@ -189,6 +189,53 @@ pub enum Outcome {
     Failed(String),
 }
 
+/// How a run left its worktree, when it had one: the fact a parent deciding
+/// whether to merge is missing, and the one `.mush/session.json` could never
+/// carry (finding H1).
+///
+/// It travels beside the run's outcome on [`AgentMsg::Work`], never inside it:
+/// an outcome is delivered exactly once and marks a read, while this is a
+/// *listing* fact a parent may re-read as often as it likes without re-arming
+/// anything.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum Work {
+    /// The run committed its work on `branch`.
+    Committed { branch: String, revision: String },
+    /// The run changed nothing: the branch stands clean where it was.
+    Clean { branch: String },
+    /// The commit itself failed; the worktree may be dirty and unlanded.
+    Uncommitted { branch: String, error: String },
+}
+
+impl Work {
+    /// The line the UI prints when this happened. One home for the sentence,
+    /// so the transcript's status line and the listing agree about the same
+    /// commit.
+    fn status_line(&self) -> Option<String> {
+        match self {
+            Work::Committed { branch, revision } => {
+                Some(format!("committed {revision} on {branch}"))
+            }
+            Work::Clean { .. } => None,
+            Work::Uncommitted { error, .. } => {
+                Some(format!("could not commit the worktree: {error}"))
+            }
+        }
+    }
+
+    /// A bounded suffix for `agent_status`: where the work is and whether it
+    /// is committed. Never the body of anything, and never a read.
+    fn digest(&self) -> String {
+        match self {
+            Work::Committed { branch, revision } => format!(" · committed {revision} on {branch}"),
+            Work::Clean { branch } => format!(" · {branch} clean — nothing changed"),
+            Work::Uncommitted { branch, error } => {
+                format!(" · {branch} uncommitted ({})", truncate(error, 60))
+            }
+        }
+    }
+}
+
 /// What a commit subject can say about the run that produced it.
 ///
 /// A subject carries the *task*, not the result, so this is the projection of
@@ -425,6 +472,10 @@ pub enum AgentMsg {
     /// `Outcome` cannot say which of the two it is holding
     /// (`docs/findings.md` B24).
     ChildDone { id: u64, run: u64, outcome: Outcome },
+    /// How the run named by `run` left its worktree, sent with its `ChildDone`.
+    /// Not a result and not a delivery: a listing fact (`agent_status`), so it
+    /// starts no run and marks nothing read (finding H1).
+    Work { id: u64, run: u64, work: Work },
     /// A job this agent started ended. `line` is the report its owner reads,
     /// rendered once by the registry; `news` says whether it is worth waking a
     /// napping agent for (`ChildDone` and `Outcome::is_news` again: a job mush
@@ -620,6 +671,12 @@ struct ActorState {
     /// `ChildDone { run, .. }`. It counts runs, not turns, and is incremented
     /// where the run's outcome is decided.
     runs: u64,
+    /// How each child's last finished run left its worktree, keyed by the run
+    /// that left it: the branch, and whether the work is committed. A listing
+    /// fact (`agent_status`), never a delivery: reading it marks nothing, and
+    /// it is paired with the completion's run so an old branch can never be
+    /// read as the newer run's work (finding H1).
+    work: HashMap<u64, (u64, Work)>,
     /// Commands parked while a blocking tool call was in flight; folded in at
     /// the next message boundary (see `drain_signals`).
     deferred: Vec<AgentMsg>,
@@ -659,6 +716,15 @@ impl ActorState {
         self.completed
             .get(&id)
             .map(|completion| &completion.outcome)
+    }
+
+    /// How the child's *recorded* run left its worktree, if the child sent the
+    /// fact. Paired by run, so work recorded for an older run is not read as
+    /// the newer one's history (finding H1).
+    fn work_for(&self, id: u64) -> Option<&Work> {
+        let recorded = self.completed.get(&id)?.run;
+        let (run, work) = self.work.get(&id)?;
+        (*run == recorded).then_some(work)
     }
 
     /// Whether `id`'s latest recorded outcome is one the model has not read.
@@ -1019,27 +1085,30 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         // (`/diff`, `/merge`, `/discard`), so its work is committed here instead
         // of being left as untracked files in the worktree. Before the parent is
         // told, so a diff or merge it triggers already sees the work.
-        if let Some(branch) = actor.branch.clone() {
+        let work = actor.branch.clone().map(|branch| {
             match commit_worktree(actor.ws.root(), actor.id, &actor.brief, &outcome) {
-                Ok(Some(revision)) => {
-                    actor.ctx.emit(
-                        actor.id,
-                        AgentEvent::Status(format!("committed {revision} on {branch}")),
-                    );
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    actor.ctx.emit(
-                        actor.id,
-                        AgentEvent::Status(format!("could not commit the worktree: {error}")),
-                    );
-                }
+                Ok(Some(revision)) => Work::Committed { branch, revision },
+                Ok(None) => Work::Clean { branch },
+                Err(error) => Work::Uncommitted { branch, error },
             }
+        });
+        if let Some(line) = work.as_ref().and_then(Work::status_line) {
+            actor.ctx.emit(actor.id, AgentEvent::Status(line));
         }
         // This run is over, and this is its number: a parent that hears the
         // same run again has heard this report twice, while a run after it is
         // news even when the two read identically (`docs/findings.md` B24).
         state.runs += 1;
+        // The worktree fact goes before the report, so a parent draining its
+        // mailbox in order has it by the time it renders the listing (finding
+        // H1). It is listed, never delivered: it marks nothing read.
+        if let Some(work) = &work {
+            let _ = actor.parent_tx.send(AgentMsg::Work {
+                id: actor.id,
+                run: state.runs,
+                work: work.clone(),
+            });
+        }
         let _ = actor.parent_tx.send(AgentMsg::ChildDone {
             id: actor.id,
             run: state.runs,
@@ -1339,6 +1408,13 @@ fn absorb(
             } else {
                 Fold::Idle
             }
+        }
+        // How a run left its worktree: a listing fact, not a result. It starts
+        // no run and marks nothing read, whichever order it arrives in
+        // (finding H1).
+        AgentMsg::Work { id, run, work } => {
+            note_work(state, id, run, work);
+            Fold::Idle
         }
         AgentMsg::CommandDone { id, line, news } => {
             // `ChildDone` for a job: the same wake, the same once-only
@@ -2231,6 +2307,9 @@ fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
             AgentMsg::ChildDone { id, run, outcome } => {
                 note_completion(state, id, run, outcome);
             }
+            // A listing fact, not a signal: it starts nothing, ends nothing,
+            // and is folded nowhere (finding H1).
+            AgentMsg::Work { id, run, work } => note_work(state, id, run, work),
             AgentMsg::CommandDone { id, line, news } => {
                 note_job(state, id, line, news);
             }
@@ -2291,6 +2370,9 @@ fn drain_mailbox(
             AgentMsg::ChildDone { id, run, outcome } => {
                 note_completion(state, id, run, outcome);
             }
+            // The worktree fact of the run just recorded. It is not a result:
+            // nothing is pushed and no boundary is moved (finding H1).
+            AgentMsg::Work { id, run, work } => note_work(state, id, run, work),
             // A job's report is folded into the transcript as a user message:
             // the model reads `#c2 done: exit 0 · …` in the next request, and
             // the line is marked delivered so it is never injected twice. A
@@ -2335,6 +2417,18 @@ fn note_completion(state: &mut ActorState, id: u64, run: u64, outcome: Outcome) 
         state.completed.insert(id, Completion { run, outcome });
     }
     line
+}
+
+/// Record how a run left its worktree. Kept by run, and only the newest run's
+/// fact survives: a `Work` is never delivered (nothing reads it as a result),
+/// so this is a plain latest-value book (finding H1).
+fn note_work(state: &mut ActorState, id: u64, run: u64, work: Work) {
+    match state.work.get(&id) {
+        Some((known, _)) if *known > run => {}
+        _ => {
+            state.work.insert(id, (run, work));
+        }
+    }
 }
 
 /// The same bookkeeping for a job: it is no longer running, and its report is
@@ -2848,7 +2942,10 @@ fn wait_for_results(
 ///
 /// A listing is not a delivery. Each child's outcome is rendered as a digest —
 /// the first line, cut at [`DIGEST_COLUMNS`], with the size of the whole — and
-/// the results the model has not read yet wear `✉`. The body itself reaches the
+/// the results the model has not read yet wear `✉`. A finished isolated run
+/// also carries [`Work`]'s suffix: its branch and whether its work is
+/// committed, paired with the run the outcome came from (finding H1). The body
+/// itself reaches the
 /// model exactly once, through the fold, the wake, or an explicit wait (the
 /// roads that ask [`ActorState::record_child`]). Printing the bodies here is
 /// what made a parent that polled its children re-read every report on every
@@ -2864,15 +2961,20 @@ fn status_tool(state: &ActorState) -> Result<String, String> {
     for id in ids {
         // The same `✉` the tree rows carry (H4): a result nobody has read.
         let unread = if state.unread(id) { "✉ " } else { "" };
+        // Where the recorded run left its worktree, when its actor sent that
+        // fact: the branch and whether the work is committed, which is what a
+        // parent deciding whether to merge is missing (finding H1). Paired by
+        // run, so an older branch never reads as the newer run's work.
+        let work = state.work_for(id).map(Work::digest).unwrap_or_default();
         match state.outcome(id) {
             // Each state gets its own mark: a stopped child was neither
             // finished (✓) nor failed (✗), and a parent that cannot tell them
             // apart treats a stop as a result.
             Some(outcome @ (Outcome::Finished(_) | Outcome::Failed(_))) => {
-                lines.push(format!("{unread}{}", outcome.digest(id)));
+                lines.push(format!("{unread}{}{work}", outcome.digest(id)));
             }
             Some(Outcome::Stopped) => lines.push(format!(
-                "{unread}#{id} ⊘ stopped — idle and resumable (agent_control message resumes it)"
+                "{unread}#{id} ⊘ stopped — idle and resumable (agent_control message resumes it){work}"
             )),
             // A run that never ended. Its own line, because the parent's next
             // move depends on it: there is no result coming and the work may be
@@ -3727,6 +3829,72 @@ mod tests {
         // reported a stopped child as a *finished* one.
         assert!(!lines.contains("#1 ✓"), "{lines}");
         assert!(!lines.contains("cancelled"), "{lines}");
+    }
+
+    /// A finished isolated child's listing says where its work is and whether
+    /// it is committed — the fact a parent deciding whether to merge was
+    /// missing (finding H1) — and it is paired with the run it came from, so an
+    /// older branch can never ride a newer result.
+    #[test]
+    fn the_listing_carries_where_the_work_is() {
+        let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let mut state = ActorState::default();
+        state.children.insert(1, tx);
+        note_completion(&mut state, 1, 2, Outcome::Finished("wrote it".into()));
+        note_work(
+            &mut state,
+            1,
+            2,
+            Work::Committed {
+                branch: "mush/1".into(),
+                revision: "abc1234".into(),
+            },
+        );
+        let lines = status_tool(&state).unwrap();
+        assert!(lines.contains("#1 ✓ wrote it"), "{lines}");
+        assert!(lines.contains("committed abc1234 on mush/1"), "{lines}");
+
+        // A newer run has no work fact yet: the older run's branch must not be
+        // read as its history.
+        note_completion(&mut state, 1, 4, Outcome::Finished("again".into()));
+        let lines = status_tool(&state).unwrap();
+        assert!(!lines.contains("committed abc1234"), "{lines}");
+
+        // And when the newer run's own fact arrives, it is the one shown.
+        note_work(
+            &mut state,
+            1,
+            4,
+            Work::Clean {
+                branch: "mush/1".into(),
+            },
+        );
+        let lines = status_tool(&state).unwrap();
+        assert!(lines.contains("mush/1 clean — nothing changed"), "{lines}");
+    }
+
+    /// The work fact is a listing, not a signal: it starts no run and changes
+    /// no transcript.
+    #[test]
+    fn a_work_fact_starts_nothing() {
+        let (actor, _mailbox) = test_actor("work-quiet");
+        let mut state = ActorState::default();
+        let mut transcript = vec![Message::system("you are mush")];
+        let folded = absorb(
+            &actor,
+            &mut state,
+            &mut transcript,
+            AgentMsg::Work {
+                id: 1,
+                run: 1,
+                work: Work::Committed {
+                    branch: "mush/1".into(),
+                    revision: "abc1234".into(),
+                },
+            },
+        );
+        assert!(matches!(folded, Fold::Idle), "not work to answer");
+        assert_eq!(transcript.len(), 1, "nothing is pushed into the transcript");
     }
 
     /// The line a parent reads must name the outcome. A stopped run has no

@@ -110,6 +110,12 @@ pub struct AgentSession {
     /// The result the row showed, so a restored tree does not lose it.
     #[serde(default)]
     pub summary: Option<String>,
+    /// The parent had not read this agent's result when the file was written.
+    /// The ✉ mark is a delivery fact, not a phase: it survives a restart, so a
+    /// human who reopens the workspace still sees whose work is waiting to be
+    /// read (finding H1).
+    #[serde(default)]
+    pub result_unread: bool,
     #[serde(default)]
     pub messages: Vec<Message>,
 }
@@ -447,6 +453,7 @@ mod tests {
                 landed: Some(StoredLanded::Merged),
                 leftover: true,
                 summary: Some("did the thing".into()),
+                result_unread: true,
                 messages: vec![Message::user("do it"), Message::assistant("done")],
             }],
             notices: vec![StoredNotice {
@@ -476,6 +483,10 @@ mod tests {
         assert_eq!(child.landed, Some(StoredLanded::Merged));
         assert!(child.leftover);
         assert_eq!(child.summary.as_deref(), Some("did the thing"));
+        assert!(
+            child.result_unread,
+            "an unread result is a fact about delivery, and it survives the file"
+        );
         assert_eq!(child.messages.len(), 2);
         assert_eq!(child.messages[0].text(), "do it");
         // A failure outlives the run and the process: this is the one line a

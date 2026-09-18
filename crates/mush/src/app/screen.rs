@@ -397,8 +397,10 @@ impl App {
         }
     }
 
-    /// One row of the tree, with its fields derived from the node.
-    fn agent_row(&self, node: &AgentNode) -> AgentRow {
+    /// One row of the tree, with its fields derived from the node. `pub(super)`
+    /// so the attach roster can serialize the very row the pane paints instead
+    /// of deriving it a second time (finding R21).
+    pub(super) fn agent_row(&self, node: &AgentNode) -> AgentRow {
         // Two facts, two marks: `glyph · id` is this agent's own phase, and
         // `⏸N` counts the children that are working. The old row derived the
         // glyph from "has live children", so a busy agent wore `⏸` and its own

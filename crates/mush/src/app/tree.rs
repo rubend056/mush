@@ -140,9 +140,9 @@ impl Phase {
 
     /// A stable, one-word name for this phase, for a reader that is not the
     /// painter: the attach protocol's roster (M3). The glyph and the row's own
-    /// words stay `ui.rs`'s; this is the same distinction in text, so a client
-    /// can tell a `thinking` agent from a `working`, `compacting`, `stopped`
-    /// one without parsing a glyph.
+    /// words stay the painter's (`app/screen.rs`); this is the same distinction
+    /// in text, so a client can tell a `thinking` agent from a `working`,
+    /// `compacting`, `stopped` one without parsing a glyph.
     pub fn label(&self) -> &'static str {
         match self {
             Phase::Idle => "idle",
@@ -154,19 +154,6 @@ impl Phase {
             Phase::CutOff => "cut off",
             Phase::Done => "done",
             Phase::Failed(_) => "failed",
-        }
-    }
-
-    /// What this phase is doing, in its own words: the tool label an actor
-    /// wrote, the fold's words, or a failure. `None` for the phases whose whole
-    /// story is their name — a `thinking` agent has nothing else to say, and a
-    /// `done`/`idle` agent's result is the node's `summary`, not the phase's.
-    pub fn detail(&self) -> Option<&str> {
-        match self {
-            Phase::Activity(what) => Some(what),
-            Phase::Compacting(kind) => Some(kind.words()),
-            Phase::Failed(error) => Some(error),
-            _ => None,
         }
     }
 
@@ -480,6 +467,11 @@ pub struct Existing {
     pub summary: Option<String>,
     pub leftover: bool,
     pub landed: Option<Landed>,
+    /// Whether this agent's result was unread when the workspace stored it.
+    /// `false` for a worktree found on disk: a branch set aside on an earlier
+    /// run has no parent in this process, so there is no reader and no read to
+    /// owe (finding H1).
+    pub result_unread: bool,
     pub tx: Option<Sender<AgentMsg>>,
 }
 
@@ -678,11 +670,12 @@ impl AgentTree {
             summary: node.summary,
             leftover: node.leftover,
             landed: node.landed,
-            // Nothing here was read by anybody: a restored result was never
-            // handed to a parent *in this process*, so there is no fact to
-            // paint. Claiming `✉` would be a guess about a conversation the file
-            // does not record (finding H4).
-            result_unread: false,
+            // The stored file is where this fact survives a restart: a result
+            // its parent had not read comes back wearing `✉` (finding H1). A
+            // node registered from something other than the session file
+            // (`discover_worktrees`) passes `false`, because there is no
+            // conversation behind it to have read or not read.
+            result_unread: node.result_unread,
         });
     }
 
@@ -1310,6 +1303,7 @@ mod tests {
             summary: Some("found on startup".to_string()),
             leftover: true,
             landed: None,
+            result_unread: false,
             tx: None,
         }
     }

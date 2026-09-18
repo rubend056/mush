@@ -582,6 +582,7 @@ impl App {
                 summary,
                 leftover: agent.leftover,
                 landed,
+                result_unread: agent.result_unread,
                 tx: Some(tx),
             });
             // What it said in the previous conversation is where it resumes.
@@ -754,6 +755,7 @@ impl App {
                 summary: Some(summary.to_string()),
                 leftover: true,
                 landed: None,
+                result_unread: false,
                 tx: None,
             });
         }
@@ -1537,23 +1539,34 @@ impl App {
     /// The roster the tree pane paints, read from the tree and never from the
     /// session file, so a client can see the whole tree — phases, parents,
     /// working children — without a copy that lags it (M3 / H1).
+    ///
+    /// Each entry is [`App::agent_row`] — the one derivation of what a row
+    /// says — plus what a row cannot carry: where the node hangs, its phase's
+    /// machine name, its raw branch and worktree, the summary, and the
+    /// revision a client edits against. Deriving the row again here is how a
+    /// roster starts claiming things the pane does not say (finding R21).
     fn attach_agents(&self) -> attach::Reply {
         let agents: Vec<serde_json::Value> = self
             .tree
             .rows()
             .iter()
             .map(|node| {
+                let row = self.agent_row(node);
                 serde_json::json!({
-                    "id": node.id.0,
+                    "id": row.id.0,
                     "parent": node.parent.map(|parent| parent.0),
-                    "depth": node.depth,
+                    "depth": row.depth,
                     "phase": node.phase.label(),
-                    "activity": node.phase.detail(),
-                    "title": node.title(),
+                    // The row's activity, empty when the agent has nothing to
+                    // say; the wire keeps its `null` shape for that.
+                    "activity": (!row.activity.is_empty()).then_some(row.activity),
+                    "title": row.title,
                     "branch": node.branch.clone(),
                     "worktree": self.attach_worktree(node.id),
-                    "focused": self.tree.focused == node.id,
-                    "children_working": self.tree.busy_children(node.id),
+                    "focused": row.focused,
+                    "children_working": row.waiting,
+                    "result_unread": row.result_unread,
+                    "unread_children": row.unread_children,
                     "leftover": node.leftover,
                     "summary": node.summary.clone(),
                     "revision": self.chat.revision(node.id),
@@ -2371,6 +2384,7 @@ impl App {
                 }),
                 leftover: node.leftover,
                 summary: node.summary.clone(),
+                result_unread: node.result_unread,
                 // The system prompt is regenerated on the way back in, since it
                 // names a workspace that may have moved.
                 messages: self
@@ -4285,6 +4299,7 @@ mod tests {
                 landed: None,
                 leftover: false,
                 summary: Some("finished it".into()),
+                result_unread: true,
                 messages: vec![Message::user("port the parser"), Message::assistant("done")],
             }],
             notices: Vec::new(),
@@ -4301,6 +4316,10 @@ mod tests {
         assert_eq!(node.brief, "port the parser");
         assert_eq!(node.phase, Phase::Done);
         assert_eq!(node.summary.as_deref(), Some("finished it"));
+        assert!(
+            node.result_unread,
+            "a result nobody read before the restart still wears ✉ after it"
+        );
         // The transcript is what makes a follow-up possible: without it the
         // human is back to writing the brief from scratch.
         assert_eq!(app.chat.transcript(AgentId(2)).len(), 2);
@@ -4345,6 +4364,7 @@ mod tests {
                 landed: None,
                 leftover: false,
                 summary: None,
+                result_unread: false,
                 messages,
             }],
             notices: Vec::new(),
@@ -9385,13 +9405,34 @@ mod tests {
         assert_eq!(agents[1]["id"], serde_json::json!(1));
         assert_eq!(agents[1]["parent"], serde_json::json!(0));
         assert_eq!(agents[1]["phase"], "thinking");
-        assert_eq!(agents[1]["activity"], serde_json::Value::Null);
+        // The activity is the painted row's own words, age and all: one
+        // derivation for the pane and the wire (finding R21).
+        assert!(
+            agents[1]["activity"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with("thinking"),
+            "{}",
+            agents[1]["activity"]
+        );
         assert_eq!(agents[1]["branch"], "mush/1");
         assert_eq!(agents[1]["focused"], serde_json::json!(false));
         assert_eq!(
             agents[1]["revision"].as_u64(),
             Some(app.chat.revision(AgentId(1)))
         );
+
+        // A finished-but-unread result travels the wire from both ends: the
+        // child's own mark and the count its parent owes, the same fact the row
+        // paints as `✉`/`✉N` and the thing `.mush/session.json` could not say
+        // (finding H1).
+        app.tree.finish(AgentId(1), Some("lexer done".into()));
+        let body = attach_ok(app.handle_attach("a client", &attach_request(3, attach::Op::Agents)));
+        let agents = body["agents"].as_array().unwrap();
+        assert_eq!(agents[1]["result_unread"], serde_json::json!(true));
+        assert_eq!(agents[1]["unread_children"], serde_json::json!(0));
+        assert_eq!(agents[0]["result_unread"], serde_json::json!(false));
+        assert_eq!(agents[0]["unread_children"], serde_json::json!(1));
     }
 
     /// `focus` moves the pane, the keyboard and the tree cursor exactly as
