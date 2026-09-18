@@ -475,6 +475,11 @@ impl App {
 
         let label = self.cfg().label();
         let room = inner(transcript_area);
+        // One lookup of the focused node for the two facts the pane's activity
+        // line is built from: `busy` and `compacting` are projections of the
+        // same node, and asking the tree twice is one thing more to keep in
+        // step (finding R9).
+        let node = self.tree.node(self.tree.focused);
         let transcript = (room.height > 0 && room.width > 0).then(|| {
             // A 200-column transcript is not read, it is skimmed. Cap the
             // measure and leave the rest as margin.
@@ -490,15 +495,10 @@ impl App {
                 // agent is waiting for somebody else's result, and the row says
                 // so (`waiting on agents 3s`). Painting the spinner over that
                 // was exactly the lie finding U7 named.
-                busy: self
-                    .tree
-                    .node(self.tree.focused)
+                busy: node
                     .map(|node| node.phase.is_busy() && node.phase.waiting().is_none())
                     .unwrap_or(false),
-                compacting: self
-                    .tree
-                    .node(self.tree.focused)
-                    .and_then(|node| node.phase.compacting()),
+                compacting: node.and_then(|node| node.phase.compacting()),
                 spin: self.spin,
                 label: &label,
             };
