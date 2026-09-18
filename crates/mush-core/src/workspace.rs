@@ -24,11 +24,13 @@ const SKIP_DIRS: &[&str] = &[
     ".cache",
 ];
 
-/// Whether a walk should skip this entry: hidden names always, build/VCS
-/// directories by name (their contents are never part of the workspace).
+/// Whether a walk should skip this entry: VCS and build directories by name —
+/// their contents are never the workspace's work. Hidden names are *not*
+/// skipped: `.github/`, `.gitignore` and `.env.example` are exactly the files
+/// an agent is asked about (audit of the prompt vs behaviour, row 8).
 fn skipped(entry: &walkdir::DirEntry) -> bool {
     let name = entry.file_name().to_string_lossy();
-    name.starts_with('.') || (entry.file_type().is_dir() && SKIP_DIRS.contains(&name.as_ref()))
+    entry.file_type().is_dir() && SKIP_DIRS.contains(&name.as_ref())
 }
 
 /// A single workspace root. All agent file access goes through here, which is
@@ -88,11 +90,17 @@ impl Workspace {
         self.resolve(rel).map(|p| p.exists()).unwrap_or(false)
     }
 
-    /// List workspace-relative file paths, sorted. Hidden files and build/VCS
-    /// directories are skipped so a listing stays useful, and symlinks are not
-    /// followed (a link out of the workspace is not workspace content).
-    pub fn list_files(&self, limit: usize) -> Vec<String> {
+    /// List workspace-relative file paths, sorted, up to `limit`. The flag is
+    /// whether at least one more file exists: a listing that stopped silently read
+    /// as "there is no more" (audit row 8).
+    ///
+    /// Build and VCS directories are skipped by name; a dotfile is workspace
+    /// content — `.gitignore`, `.github/workflows/ci.yml`, `.env.example` — so
+    /// hidden names are listed. Hiding them was a listing that disagreed with what
+    /// the file tools would happily read.
+    pub fn list_files(&self, limit: usize) -> (Vec<String>, bool) {
         let mut out = Vec::new();
+        let mut truncated = false;
         let walk = WalkDir::new(&self.root)
             .min_depth(1)
             .follow_links(false)
@@ -105,16 +113,19 @@ impl Workspace {
             if !entry.file_type().is_file() {
                 continue;
             }
-            out.push(self.rel(entry.path()));
             if out.len() >= limit {
+                truncated = true;
                 break;
             }
+            out.push(self.rel(entry.path()));
         }
         out.sort();
-        out
+        (out, truncated)
     }
 
     /// Read a text file, capping the returned bytes. Binary files are refused.
+    /// A capped read says how much of how many bytes it is showing, so the
+    /// model knows there is a rest and roughly how big it is (audit row 9).
     pub fn read_file(&self, rel: &str, cap: usize) -> Result<String, String> {
         let path = self.resolve(rel)?;
         let bytes = fs::read(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
@@ -122,7 +133,16 @@ impl Workspace {
             return Err(format!("{rel} looks like a binary file"));
         }
         let text = String::from_utf8_lossy(&bytes).into_owned();
-        Ok(truncate_for_model(text, cap))
+        if text.len() <= cap {
+            return Ok(text);
+        }
+        let cut = head_cut(&text, cap);
+        Ok(format!(
+            "{}\n\n[mush: read truncated — {cut} of {} bytes shown; a wider read needs run_command \
+             (e.g. sed -n '1,200p' {rel})]",
+            &text[..cut],
+            text.len()
+        ))
     }
 
     /// Atomically create or replace a file, creating parent directories.
@@ -146,13 +166,19 @@ pub fn truncate_for_model(mut text: String, cap: usize) -> String {
     if text.len() <= cap {
         return text;
     }
-    let mut cut = cap;
-    while cut > 0 && !text.is_char_boundary(cut) {
-        cut -= 1;
-    }
+    let cut = head_cut(&text, cap);
     text.truncate(cut);
     text.push_str("\n\n[mush: output truncated]");
     text
+}
+
+/// Where a head cut lands, on a char boundary.
+pub fn head_cut(text: &str, cap: usize) -> usize {
+    let mut cut = cap.min(text.len());
+    while cut > 0 && !text.is_char_boundary(cut) {
+        cut -= 1;
+    }
+    cut
 }
 
 /// Cap text handed to a model from the *end*, marking the cut at the front.
@@ -219,7 +245,12 @@ mod tests {
         ws.write_file("a.txt", "éééééééééé").unwrap();
         let text = ws.read_file("a.txt", 5).unwrap();
         assert!(text.starts_with("é"));
-        assert!(text.ends_with("[mush: output truncated]"));
+        // A capped read says how much of how many bytes it is showing, so the
+        // model knows there is a rest (audit row 9).
+        assert!(
+            text.contains("[mush: read truncated — 4 of 20 bytes shown"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -248,14 +279,31 @@ mod tests {
     }
 
     #[test]
-    fn listing_skips_hidden_and_build_dirs() {
+    fn listing_never_hides_files_and_marks_its_limit() {
         let ws = temp_workspace("listing");
         fs::create_dir_all(ws.root().join(".git")).unwrap();
         fs::create_dir_all(ws.root().join("target")).unwrap();
+        fs::create_dir_all(ws.root().join(".github")).unwrap();
         fs::write(ws.root().join(".git/config"), "x").unwrap();
         fs::write(ws.root().join("target/out"), "x").unwrap();
-        fs::write(ws.root().join(".hidden"), "x").unwrap();
+        fs::write(ws.root().join(".github/ci.yml"), "x").unwrap();
+        fs::write(ws.root().join(".gitignore"), "x").unwrap();
         fs::write(ws.root().join("main.rs"), "x").unwrap();
-        assert_eq!(ws.list_files(100), vec!["main.rs".to_string()]);
+        let (files, truncated) = ws.list_files(100);
+        assert_eq!(
+            files,
+            vec![
+                ".github/ci.yml".to_string(),
+                ".gitignore".to_string(),
+                "main.rs".to_string(),
+            ],
+            "build and VCS dirs are skipped; a dotfile is workspace content"
+        );
+        assert!(!truncated);
+
+        // The limit is a fact the caller can pass on, never a silent stop.
+        let (shown, truncated) = ws.list_files(2);
+        assert_eq!(shown.len(), 2);
+        assert!(truncated, "there was a third file");
     }
 }

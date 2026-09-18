@@ -1024,6 +1024,7 @@ pub fn revive(
         &ws_root_str,
         depth,
         isolated.is_some(),
+        depth < MAX_DEPTH,
     ))];
     if messages.is_empty() && !brief.is_empty() {
         transcript.push(Message::user(brief));
@@ -2705,6 +2706,9 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         (actor.ws.clone(), None)
     };
     let note = match &degraded {
+        // The parent reads this too: a child that asked for isolation and did
+        // not get it is running in the parent's tree, and a reply that only
+        // omitted `on mush/N` let the parent believe otherwise (audit row 4).
         Some(reason) => format!(" (isolated unavailable: {reason}; running in place)"),
         None => String::new(),
     };
@@ -2760,7 +2764,12 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // Who the child is goes in the system prompt; the parent's task is the
     // first user message, mirroring the root's system+user shape. Some
     // servers' chat templates also reject a system-only first request.
-    let whoami = prompt::subagent_prompt(&child_ws.root_str(), depth + 1, branch.is_some());
+    let whoami = prompt::subagent_prompt(
+        &child_ws.root_str(),
+        depth + 1,
+        branch.is_some(),
+        depth + 1 < MAX_DEPTH,
+    );
     let brief_text = format!("{brief}{note}");
     let initial = if brief_text.trim().is_empty() {
         vec![
@@ -2798,7 +2807,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // guard far past any real task, so this is not a budget to size a brief
     // against any more.
     Ok(format!(
-        "spawned agent #{id}{on}{at} · runs until it stops calling tools · wait_agents returns its summary"
+        "spawned agent #{id}{on}{at}{note} · runs until it stops calling tools · wait_agents returns its summary"
     ))
 }
 
@@ -5149,7 +5158,11 @@ mod tests {
         )
         .unwrap();
 
-        assert!(report.contains("[timed out after 5s]"), "{report}");
+        assert!(report.contains("timed out after 5s"), "{report}");
+        assert!(
+            report.contains("budget is full"),
+            "and the reason it could not detach is named: {report}"
+        );
         assert!(
             clock.elapsed() >= timeout,
             "the deadline is what stopped it, not the end of the command: {:?}",
@@ -6830,7 +6843,7 @@ mod tests {
         let refusal = Refused::Machine(held).message(9);
         assert!(refusal.starts_with("#7 holds the machine"), "{refusal}");
         assert!(
-            refusal.contains("do not retry this call"),
+            refusal.contains("do not retry"),
             "the refusal must not read as try-again-now (H13): {refusal}"
         );
 
@@ -6974,7 +6987,7 @@ mod tests {
             panic!("a lock that outlasts the queue is refused");
         };
         assert!(why.starts_with("#2 holds the machine"), "{why}");
-        assert!(why.contains("do not retry this call"), "{why}");
+        assert!(why.contains("do not retry"), "{why}");
         assert!(
             clock.elapsed() >= LOCK_QUEUE,
             "the queue waited its whole bound: {:?}",
@@ -8326,11 +8339,13 @@ mod tests {
         )
         .unwrap();
 
-        // The model's answer is unchanged: the same line it always got, and the
-        // child's own brief still carries the reason it has no worktree.
+        // The model's answer names the degradation too: a reply that only
+        // omitted `on mush/N` let the parent believe it had a worktree child
+        // while the child ran in its tree (audit row 4).
         assert_eq!(
             report,
-            "spawned agent #1 · runs until it stops calling tools · wait_agents returns its summary"
+            "spawned agent #1 (isolated unavailable: not a git repository; running in place) · runs \
+             until it stops calling tools · wait_agents returns its summary"
         );
         assert!(
             gate.wait_until_asked(WAIT),

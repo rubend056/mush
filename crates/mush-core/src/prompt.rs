@@ -20,6 +20,7 @@ const RULES: &str = "\
 Rules:\n\
 - Every tool already works inside the workspace: paths are workspace-relative (\"src/main.rs\", not an \
 absolute path) and run_command/edit/read already runs there with its cwd at the workspace root.\n\
+- Never touch paths outside the workspace.\n\
 - When you are done finish with a concise summary of what you did.";
 
 /// What is true of the machine for every agent, root or leaf. One home, read by
@@ -30,7 +31,29 @@ The machine is shared (CPU, ports, /tmp — a worktree isolates files, nothing e
 as #c2]\", detach=true asks for one at once, and any command that outlives 60s does it by itself. \
 command_status lists your jobs, wait_commands waits for one, command_control stops one.\n\
 - exclusive=true owns the machine for timing- or port-sensitive work (a benchmark, a profiler, a fixed \
-port): a sibling's command is refused (`#N holds the machine`) — wait, do not retry.";
+port): a sibling's command queues behind it and is refused if the lock outlasts the wait (`#N holds the \
+machine`) — do not retry in a loop.";
+
+/// The delegation policy, for every agent that has the orchestration tools:
+/// the root and any subagent below `MAX_DEPTH`. It used to live only in the
+/// root's prompt, so a depth-1 orchestrator could spawn with no idea its brief
+/// had to be self-contained (audit row 6).
+const DELEGATION: &str = "\
+Delegation:\n\
+- spawn_agent(brief, isolated?, base?) starts a subagent with no memory of this conversation: the brief \
+must carry every fact, file, and the exact deliverable.\n\
+- An isolated subagent works in its own copy of the repository (its own git worktree and branch); a \
+shared one works in this workspace, so only one of those may run at a time. Decide up front: pass \
+isolated=true for siblings that should run in parallel, or wait_agents for the running one first. (The \
+check can only fail after the brief exists, so decide before writing it.)\n\
+- A subagent runs until it stops calling tools, so a brief is bounded by the work, not a turn count: \
+split by what is independent, not by how long you think it takes.\n\
+- Delegate independent, large, or context-heavy subtasks; do single edits and lookups yourself. Prefer \
+a few big delegations over many small ones.\n\
+- wait_agents blocks until a child finishes: no ids means the *first* finish, all=true every child; its \
+answer hands over an unread result's full summary, and an already-read one comes back as a digest. \
+Ending your turn while children still run is fine: they keep working and you are woken with their \
+\"#N done: summary\" results as each finishes.";
 
 /// The whole root-agent system prompt. If this grows much, something else went
 /// wrong.
@@ -40,21 +63,7 @@ pub fn system_prompt(root: &str) -> String {
          \n\
          {RULES}\n\
          \n\
-         Delegation:\n\
-         - spawn_agent(brief, isolated?, base?) starts a subagent with no memory of this conversation: the \
-         brief must carry every fact, file, and the exact deliverable.\n\
-         - An isolated subagent works in its own copy of the repository (its own git worktree and branch); \
-         a shared one works in this workspace, so only one of those may run at a time. Decide up front: \
-         pass isolated=true for siblings that should run in parallel, or wait_agents for the running one \
-         first. (The check can only fail after the brief exists, so decide before writing it.)\n\
-         - A subagent runs until it stops calling tools, so a brief is bounded by the work, not a turn \
-         count: split by what is independent, not by how long you think it takes.\n\
-         - Delegate independent, large, or context-heavy subtasks; do single edits and lookups yourself. \
-         Prefer a few big delegations over many small ones.\n\
-         - wait_agents blocks until a child finishes: no ids means the *first* finish, all=true every \
-         child; its answer hands over an unread result's full summary, and an already-read one comes back \
-         as a digest. Ending your turn while children still run is fine: they keep working and you are \
-         woken with their \"#N done: summary\" results as each finishes.\n\
+         {DELEGATION}\n\
          \n\
          {MACHINE}"
     )
@@ -68,7 +77,11 @@ pub fn system_prompt(root: &str) -> String {
 /// isolated agent's worktree is its cwd already, and an absolute path is
 /// refused by every file tool, so naming it in a command is a mistake the
 /// prompt should not invite.
-pub fn subagent_prompt(root: &str, depth: usize, isolated: bool) -> String {
+///
+/// `delegates` is whether this agent gets the orchestration tools (depth below
+/// `MAX_DEPTH`): the policy reads exactly when the tools are there (audit row
+/// 6).
+pub fn subagent_prompt(root: &str, depth: usize, isolated: bool, delegates: bool) -> String {
     let workspace = if isolated {
         format!(
             "You work at `{root}`, a worktree of your own branch. It \
@@ -77,12 +90,17 @@ pub fn subagent_prompt(root: &str, depth: usize, isolated: bool) -> String {
     } else {
         format!("Your workspace is `{root}`.")
     };
+    let policy = if delegates {
+        format!("\n\n{DELEGATION}")
+    } else {
+        String::new()
+    };
     format!(
         "You are a mush subagent at depth {depth}, working for a parent agent.\n\
          \n\
          {workspace}\n\
          \n\
-         {RULES}\n\
+         {RULES}{policy}\n\
          \n\
          {MACHINE}"
     )
@@ -357,7 +375,7 @@ mod tests {
 
     #[test]
     fn subagent_prompt_keeps_role_and_depth_out_of_the_task() {
-        let prompt = subagent_prompt("/tmp/x", 2, false);
+        let prompt = subagent_prompt("/tmp/x", 2, false, true);
         assert!(prompt.contains("depth 2"));
         assert!(prompt.contains("mush subagent"));
         // The task is a user message, never part of the system prompt.
@@ -369,13 +387,23 @@ mod tests {
         assert!(prompt.contains("`/tmp/x`"));
     }
 
+    /// The delegation policy is readable exactly by the agents that have the
+    /// orchestration tools: a depth-1 subagent can spawn, so it must know its
+    /// brief carries everything; a leaf cannot, so it is not told to (audit row
+    /// 6).
+    #[test]
+    fn only_a_delegating_subagent_reads_the_delegation_policy() {
+        assert!(subagent_prompt("/tmp/ws", 1, false, true).contains("Delegation:"));
+        assert!(!subagent_prompt("/tmp/ws", 3, false, false).contains("Delegation:"));
+    }
+
     #[test]
     fn subagent_prompt_names_an_isolated_worktree() {
-        let prompt = subagent_prompt("/tmp/wt/3", 1, true);
+        let prompt = subagent_prompt("/tmp/wt/3", 1, true, false);
         assert!(prompt.contains("worktree of your own branch"), "{prompt}");
         assert!(prompt.contains("`/tmp/wt/3`"), "{prompt}");
         // A shared child gets the shared-workspace sentence instead.
-        let shared = subagent_prompt("/tmp/wt/3", 1, false);
+        let shared = subagent_prompt("/tmp/wt/3", 1, false, false);
         assert!(!shared.contains("worktree of your own branch"), "{shared}");
     }
 
@@ -388,11 +416,13 @@ mod tests {
     fn the_prompts_keep_commands_in_the_workspace_root() {
         for prompt in [
             system_prompt("/tmp/ws"),
-            subagent_prompt("/tmp/ws", 1, true),
+            subagent_prompt("/tmp/ws", 1, true, true),
+            subagent_prompt("/tmp/ws", 3, false, false),
         ] {
             let lower = prompt.to_lowercase();
             assert!(lower.contains("workspace-relative"), "{prompt}");
             assert!(lower.contains("cwd at the workspace root"), "{prompt}");
+            assert!(lower.contains("never touch paths outside"), "{prompt}");
             assert!(
                 !lower.contains("bounded number of turns") && !lower.contains("turn budget"),
                 "no turn budget exists to size a brief against: {prompt}"
@@ -415,7 +445,7 @@ mod tests {
         );
         assert!(root.contains("worktree isolates files"), "{root}");
         // A subagent gets the same facts, from the same block.
-        let child = subagent_prompt("/tmp/ws", 1, true);
+        let child = subagent_prompt("/tmp/ws", 1, true, false);
         assert!(child.contains("machine is shared"), "{child}");
         assert!(child.contains("exclusive=true"), "{child}");
     }

@@ -132,23 +132,29 @@ pub fn arg_prefix(args: &Value) -> &str {
 }
 
 /// The result text of `list_files`: one path per line, or an empty answer the
-/// model can act on.
+/// model can act on. A walk that stopped at the limit says so — a listing that
+/// just ends reads as "there is no more" (audit row 8).
 pub fn list_result(ws: &Workspace, args: &Value, limit: usize) -> Result<String, String> {
     let prefix = arg_prefix(args);
-    let files: Vec<String> = ws
-        .list_files(limit)
+    let (files, truncated) = ws.list_files(limit);
+    let files: Vec<String> = files
         .into_iter()
         .filter(|file| {
             prefix.is_empty() || prefix == "." || file.starts_with(&format!("{prefix}/"))
         })
         .collect();
+    let more = if truncated {
+        format!("\n… more files exist than the {limit} shown — narrow the path to see them")
+    } else {
+        String::new()
+    };
     if files.is_empty() {
         Ok(format!(
-            "no files under `{}`",
+            "no files under `{}`{more}",
             if prefix.is_empty() { "." } else { prefix }
         ))
     } else {
-        Ok(files.join("\n"))
+        Ok(format!("{}{more}", files.join("\n")))
     }
 }
 

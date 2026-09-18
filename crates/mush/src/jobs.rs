@@ -445,11 +445,12 @@ impl Refused {
             // again now": retrying the identical call is what mush's own loop
             // guard counts, and it killed two agents that only met a locked
             // machine (finding H13). Who holds it, what they are running, and
-            // what to do instead — a wait, or nothing until it finishes.
+            // what to do instead — and no tool can wait on another agent's job,
+            // so `wait_commands` must not be offered (audit row 5).
             Refused::Machine(held) => format!(
-                "#{} holds the machine with an exclusive command ({}); do not retry this \
-                 call — wait for it (wait_commands) or do other work and try once after \
-                 it finishes",
+                "#{} holds the machine with an exclusive command ({}); this call queued and the lock \
+                 was still held — do not retry in a loop; do other work and try once after it finishes \
+                 (no tool can wait on another agent's job)",
                 held.agent,
                 truncate(&held.command, REFUSAL_COMMAND_COLUMNS)
             ),
@@ -1666,12 +1667,16 @@ mod tests {
         // The words must not read as "try again now": a repeated identical
         // call is what the loop guard counts, and two agents died to a lock
         // refusal counted as a loop (finding H13). They name the holder, what
-        // it runs, and say not to retry.
+        // it runs, and say not to retry — and they do not offer a wait tool,
+        // because no tool can wait on another agent's job (audit row 5).
         let refusal = Refused::Machine(held).message(4);
         assert!(refusal.starts_with("#3 holds the machine"), "{refusal}");
         assert!(refusal.contains("cargo bench"), "{refusal}");
-        assert!(refusal.contains("do not retry this call"), "{refusal}");
-        assert!(refusal.contains("wait_commands"), "{refusal}");
+        assert!(refusal.contains("do not retry"), "{refusal}");
+        assert!(
+            refusal.contains("no tool can wait on another agent"),
+            "{refusal}"
+        );
         // Only the holder can release it: a release from anyone else is a no-op
         // rather than a way to unlock a sibling.
         registry.release_machine(4);
