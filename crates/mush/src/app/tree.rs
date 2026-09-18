@@ -1115,11 +1115,12 @@ impl AgentTree {
     /// not yielded and the work really is in flight (its row wears `⊘` and says
     /// `cancelling…`).
     pub fn roster(&self) -> Roster {
+        let busy = self.busy_counts();
         let mut roster = Roster::default();
         for node in &self.agents {
             if node.phase.is_busy() {
                 roster.working += 1;
-            } else if self.napping(node.id) {
+            } else if self.napping_with(node.id, &busy) {
                 // At rest with work out: §5.5's napping orchestrator, which the
                 // row draws as `⏸`. Counted here and *nowhere else* — counting
                 // it as working as well is exactly what the title did wrong
@@ -1129,6 +1130,21 @@ impl AgentTree {
             }
         }
         roster
+    }
+
+    /// The per-parent count of children whose run is in flight, derived in one
+    /// walk. [`Self::busy_children`] scans the whole tree per call, and a frame
+    /// asked it once per row, which is quadratic in the tree the pane paints;
+    /// the pane builds this map once and looks a row up in it. A derivation,
+    /// not a stored fact, dropped with the frame (finding R29).
+    pub fn busy_counts(&self) -> HashMap<AgentId, usize> {
+        let mut busy: HashMap<AgentId, usize> = HashMap::new();
+        for node in &self.agents {
+            if let (Some(parent), true) = (node.parent, node.phase.is_busy()) {
+                *busy.entry(parent).or_insert(0) += 1;
+            }
+        }
+        busy
     }
 
     /// Whether this agent is at rest with work still out — §5.5's napping
@@ -1141,8 +1157,15 @@ impl AgentTree {
     /// so the title saying `0 waiting` while the bar promises `the root resumes
     /// as they finish` was one fact derived two ways (finding U12).
     pub fn napping(&self, id: AgentId) -> bool {
+        self.napping_with(id, &self.busy_counts())
+    }
+
+    /// [`Self::napping`] against a `busy` map already derived: one predicate,
+    /// whether the frame passes the map it built or a single call scans for its
+    /// own (finding R29).
+    fn napping_with(&self, id: AgentId, busy: &HashMap<AgentId, usize>) -> bool {
         self.node(id)
-            .is_some_and(|node| !node.phase.is_busy() && self.busy_children(id) > 0)
+            .is_some_and(|node| !node.phase.is_busy() && busy.get(&id).copied().unwrap_or(0) > 0)
     }
 
     /// The children of `id` whose results it has not read, in tree order.
@@ -1661,6 +1684,30 @@ mod tests {
         // `⊘` row is where that fact lives.
         tree.stopped(grandchild.id);
         assert_eq!(tree.roster(), Roster::default());
+    }
+
+    /// The busy map a pane looks a row up in is the same fact as
+    /// `busy_children` asked one id at a time: every node's count matches, so
+    /// the `⏸N` mark cannot drift from the tree it was derived from (finding
+    /// R29).
+    #[test]
+    fn the_busy_map_agrees_with_the_per_id_scan() {
+        let mut tree = AgentTree::bare();
+        let _a = spawn(&mut tree, 1, 0, 1);
+        let _b = spawn(&mut tree, 2, 0, 1);
+        let _c = spawn(&mut tree, 3, 1, 2);
+        let _d = spawn(&mut tree, 4, 3, 3);
+        // #1 is at rest under a working #3: one napping parent, one working.
+        tree.idle(AgentId(1));
+        let busy = tree.busy_counts();
+        for node in tree.rows() {
+            assert_eq!(
+                busy.get(&node.id).copied().unwrap_or(0),
+                tree.busy_children(node.id),
+                "the map and the scan disagree about #{}",
+                node.id
+            );
+        }
     }
 
     /// Rows come out in tree order, not in the order the agents were spawned
