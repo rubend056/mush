@@ -36,8 +36,9 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use super::Focus;
 
-/// How many rows a page key moves, in the chat's scrollback and in a picker's
-/// list. One number, so "a page" is the same distance wherever a human pages.
+/// How many rows a page key moves, in the chat's scrollback, in a picker's
+/// list and in the agent tree. One number, so "a page" is the same distance
+/// wherever a human pages.
 const PAGE: i64 = 10;
 
 /// The context a binding belongs to, so the help can group the rows the way a
@@ -159,6 +160,11 @@ pub const KEYS: &[Binding] = &[
         context: Context::Agents,
         keys: "g / G, Home / End",
         help: "first / last row",
+    },
+    Binding {
+        context: Context::Agents,
+        keys: "PgUp / PgDn",
+        help: "page up / down the rows",
     },
     Binding {
         context: Context::Agents,
@@ -288,7 +294,8 @@ pub enum Intent {
     PickerMove(i64),
     PickerFirst,
     PickerLast,
-    /// Move the tree's cursor `step` rows, without leaving the pane.
+    /// Move the tree's cursor `step` rows, without leaving the pane: one row
+    /// for `j`/`k`, a whole page for `PgUp`/`PgDn`.
     TreeMove(i64),
     /// Walk the tree along the parent links: `-1` selects the selected agent's
     /// parent (`←`), `+1` its first child (`→`). A root has no parent and a
@@ -385,6 +392,12 @@ fn tree(key: KeyEvent) -> Intent {
         // grandchild selected, `←` is its parent, not its uncle above it.
         KeyCode::Left => Intent::TreeWalk(-1),
         KeyCode::Right => Intent::TreeWalk(1),
+        // A long run is a long list: a page at a time, the same distance
+        // `PgUp`/`PgDn` move a picker's rows and the transcript, so a human who
+        // has paged one pane has paged them all. `TreeMove` carries the step
+        // the way `PickerMove` does, and `App` clamps it to the painted rows.
+        KeyCode::PageUp => Intent::TreeMove(-PAGE),
+        KeyCode::PageDown => Intent::TreeMove(PAGE),
         _ => Intent::Ignore,
     }
 }
@@ -477,6 +490,8 @@ mod tests {
             (none(KeyCode::Home), Intent::TreeFirst),
             (none(KeyCode::Char('G')), Intent::TreeLast),
             (none(KeyCode::End), Intent::TreeLast),
+            (none(KeyCode::PageUp), Intent::TreeMove(-PAGE)),
+            (none(KeyCode::PageDown), Intent::TreeMove(PAGE)),
             (none(KeyCode::Enter), Intent::TreeFocus),
             (none(KeyCode::Char('c')), Intent::TreeCancel),
             (none(KeyCode::Esc), Intent::TreeBackToRoot),
@@ -687,12 +702,37 @@ mod tests {
             Intent::Ignore
         );
         assert_eq!(
-            at(Focus::Agents, false, none(KeyCode::PageUp)),
-            Intent::Ignore
-        );
-        assert_eq!(
             at(Focus::Agents, false, none(KeyCode::Char(' '))),
             Intent::Ignore
+        );
+    }
+
+    /// `PgUp`/`PgDn` page whichever list has the keyboard: the agents pane
+    /// moves its cursor a page of rows and the chat still scrolls the
+    /// transcript. The two must be the same distance apart from the pane, or a
+    /// human would have to learn a second notion of "a page" — and the chat's
+    /// half is the one an over-eager match arm loses.
+    #[test]
+    fn page_up_and_page_down_page_the_pane_that_has_the_keyboard() {
+        assert_eq!(
+            at(Focus::Agents, false, none(KeyCode::PageUp)),
+            Intent::TreeMove(-PAGE),
+            "PgUp goes up a page of rows"
+        );
+        assert_eq!(
+            at(Focus::Agents, false, none(KeyCode::PageDown)),
+            Intent::TreeMove(PAGE),
+            "PgDn goes down a page of rows"
+        );
+        assert_eq!(
+            at(Focus::Chat, false, none(KeyCode::PageUp)),
+            Intent::Chat(ChatKey::Scroll(PAGE)),
+            "and the transcript still scrolls"
+        );
+        assert_eq!(
+            at(Focus::Chat, false, none(KeyCode::PageDown)),
+            Intent::Chat(ChatKey::Scroll(-PAGE)),
+            "down the transcript is the other sign"
         );
     }
 

@@ -840,7 +840,7 @@ mod tests {
         );
         // The tree walk the human asked for is named here too, and the real
         // scroll keys — not the wheel mush never takes (finding K3).
-        for want in ["←", "→", "↑ / ↓, PgUp / PgDn"] {
+        for want in ["←", "→", "↑ / ↓, PgUp / PgDn", "page up / down the rows"] {
             assert!(help.contains(want), "`{want}` is missing:\n{help}");
         }
         assert!(
