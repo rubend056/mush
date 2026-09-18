@@ -922,7 +922,7 @@ fn agent_detail(node: &AgentNode) -> Vec<String> {
             Some(branch) => vec![
                 // The worktree path comes from core like every other one: the
                 // row must name the directory a `git worktree remove` takes.
-                format!("{}/{}", git::WORKTREE_DIR, node.id),
+                git::worktree_rel(node.id.0),
                 format!("git diff HEAD...{branch}"),
             ],
             None => Vec::new(),
@@ -1177,7 +1177,7 @@ mod tests {
         // match the number in the branch name.
         assert_eq!(
             text,
-            format!(".mush/wt/{} · git diff HEAD...mush/9", open.id)
+            format!("{} · git diff HEAD...mush/9", git::worktree_rel(open.id.0))
         );
     }
 
