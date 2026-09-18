@@ -546,15 +546,17 @@ impl Config {
     /// provider's own name where the provider owns the endpoint (see
     /// [`crate::provider::ProviderSpec::display_endpoint`]), the configured URL
     /// otherwise.
+    ///
+    /// The model's own spelling is defanged as it is labelled, because it is a
+    /// name an *endpoint* chose (`/v1/models`) that only ever exists to be
+    /// painted: `ESC ]0;PWNED BEL` in a model id renamed the window through the
+    /// facts line. The id that is sent back in a request is [`Config::model`],
+    /// which this does not touch.
     pub fn label(&self) -> String {
         let model = if self.model.is_empty() {
             "no model".to_string()
         } else {
-            self.model
-                .rsplit('/')
-                .next()
-                .unwrap_or(&self.model)
-                .to_string()
+            crate::text::sanitize(self.model.rsplit('/').next().unwrap_or(&self.model))
         };
         let endpoint = match self.provider.spec().display_endpoint {
             Some(endpoint) => endpoint.to_string(),
@@ -1293,6 +1295,24 @@ mod tests {
     fn label_falls_back_when_no_model() {
         let cfg = Config::new("http://x:1", "", None);
         assert_eq!(cfg.label(), "no model @ http://x:1");
+    }
+
+    /// The model half of the label is a *name an endpoint chose*, painted in
+    /// the facts line and in the picker: an `ESC ]0;PWNED BEL` in it renamed the
+    /// window and a CSI wiped the frame. The label is defanged; the id a request
+    /// carries is not touched.
+    #[test]
+    fn a_label_defangs_the_model_an_endpoint_named() {
+        let hostile = "boom\rREST \x1b]0;PWNED\x07\x1b[2J\x1b[HMock";
+        let cfg = Config::new("http://x:1", hostile, None);
+        let label = cfg.label();
+        assert!(!label.contains('\x1b'), "{label:?}");
+        assert!(!label.contains('\r'), "{label:?}");
+        assert!(
+            label.starts_with("boom␍REST Mock @ http://x:1"),
+            "{label:?}"
+        );
+        assert_eq!(cfg.model, hostile, "the id a request sends is untouched");
     }
 
     #[test]

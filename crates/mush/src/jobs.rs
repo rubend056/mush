@@ -430,8 +430,19 @@ impl Registry {
         self.jobs().iter().filter(|record| record.running()).count()
     }
 
-    /// Whether there is room for one more job. Checked before a process is
-    /// spawned: a command that cannot be watched must not be started.
+    /// Whether there is room for one more job, as of right now.
+    ///
+    /// The question is asked at two different moments, and only the first of
+    /// them is before a process exists: `run_command` asks it up front for
+    /// `detach: true` — a command that cannot be watched must not be started —
+    /// while a *foreground* command asks it only to decide whether a command
+    /// that outlives `CMD_DETACH_AFTER` has somewhere to go. On that path the
+    /// process is already running, and the budget is really decided when
+    /// [`Registry::launch`] re-tests it under the registry's own lock; a
+    /// refusal there kills the process it cannot watch, so the model still gets
+    /// the refusal and no orphan survives. The check here cannot carry that
+    /// weight: another agent's job can take the slot between it and the
+    /// deadline.
     pub fn has_room(&self) -> bool {
         self.running() < MAX_JOBS
     }

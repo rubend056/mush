@@ -10,7 +10,7 @@ use std::time::Duration;
 use unicode_width::UnicodeWidthStr;
 
 use mush_core::git;
-use mush_core::text::{fit_row, truncate};
+use mush_core::text::{fit_row, sanitize, truncate};
 
 use crate::app::{
     is_below_floor, short_age, AgentId, AgentNode, App, Focus, Landed, Pane, Phase, PickerKind,
@@ -677,7 +677,12 @@ fn draw_picker(frame: &mut Frame, app: &App) {
         } else {
             format!("  {item}")
         };
-        items.push(ListItem::new(label));
+        // A model id comes from the endpoint and a note can carry a failure's
+        // own words, so the row is defanged where it is painted rather than
+        // where it is stored: an item is *data* — the id itself is sent back to
+        // the endpoint when it is picked — and rewriting it would change what
+        // is chosen (see `mush_core::text::sanitize`).
+        items.push(ListItem::new(sanitize(&label)));
     }
     let list = List::new(items)
         .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))

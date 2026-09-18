@@ -5222,31 +5222,38 @@ mod tests {
     /// a migration) ran twice — and the first copy belonged to nobody, so
     /// `kill_all` could not reach it and it outlived mush.
     ///
-    /// This one is a real `sh`, because the thing being asserted is that only
-    /// one process is started: the fake machine counts spawns, and this counts
-    /// side effects on disk.
+    /// What the bug *is* is a count, and the machine at the seam counts spawns,
+    /// so this needs no process of its own: it read a real `sh -c 'echo hit >> …
+    /// && sleep 0.2'` for a while, which put a subprocess and a 200 ms sleep in
+    /// a suite whose contract is that a default run needs neither. A second
+    /// spawn has no script left to run and fails loudly, so the count is also
+    /// asserted from the other side. The one thing a real process added — that
+    /// a file on disk was written once — is not expressible without one; the
+    /// spawn count is the same fact one layer up.
     #[test]
-    fn a_foreground_run_command_runs_the_command_once() {
-        let (actor, _mailbox) = test_actor("run-once");
+    fn a_foreground_run_command_reports_one_run_once() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::exits(0).says("hit")));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("run-once", machine.clone(), clock);
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
-        let hits = actor.ws.root().join("hits");
-        // The foreground copy is the one that sleeps, so a second copy that
-        // nobody waited for has certainly written before this returns.
+
         let report = exec_tool(
             &actor,
             &mut state,
             ToolName::RunCommand,
-            &json!({ "command": format!("echo hit >> {} && sleep 0.2", hits.display()) }),
+            &json!({ "command": "echo hit" }),
             &cancel,
         )
         .unwrap();
-        assert!(report.contains("[exit 0]"), "{report}");
+
         assert_eq!(
-            fs::read_to_string(&hits).unwrap(),
-            "hit\n",
-            "the command ran exactly once"
+            machine.spawned(),
+            vec!["echo hit".to_string()],
+            "the command ran exactly once — not twice, as it did when the tool \
+             box and the foreground path each spawned one"
         );
+        assert_eq!(report, "hit\n[exit 0]", "and its one run comes back once");
         assert_eq!(
             actor.ctx.registry.running(),
             0,

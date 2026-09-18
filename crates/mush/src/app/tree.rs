@@ -232,7 +232,9 @@ pub enum Landed {
     Discarded,
 }
 
-/// One entry in the agent tree. Order in the vector is tree order; ids are
+/// One entry in the agent tree. In [`AgentTree::agents`] the order is *spawn*
+/// order — the order things happened, which is what a stored session keeps;
+/// the order a pane paints is derived from it by [`AgentTree::rows`]. Ids are
 /// stable, so positions do not shift while agents are alive.
 pub struct AgentNode {
     pub id: AgentId,
@@ -356,7 +358,9 @@ const STALE_CANCEL: Duration = Duration::from_secs(10);
 
 /// The agents of one conversation, and everything keyed by their ids.
 pub struct AgentTree {
-    /// Tree order: the root first, then children as they were spawned.
+    /// Spawn order: the root first, then each agent as it was spawned. Not tree
+    /// order — a grandchild spawned before its uncle sits before it here, and
+    /// [`Self::rows`] is what turns this into the pre-order the pane paints.
     pub agents: Vec<AgentNode>,
     /// The row the agent pane highlights.
     pub agent_cursor: usize,
