@@ -299,6 +299,27 @@ fn is_filler(word: &str) -> bool {
     FILLER.contains(&bare_word(word).to_ascii_lowercase().as_str())
 }
 
+/// What asking an agent to stop actually did.
+///
+/// A Stop is not one thing: it can land, it can find nothing to stop, or it can
+/// find nobody to ask. The third is the one worth a value of its own — the human
+/// asked for a stop, and got a run that was cut off instead, which is a different
+/// fact about the agent, a different mark on its row, and a thing its parent has
+/// to be told (finding H2).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Stopped {
+    /// The actor heard the Stop. The run it was aimed at will end and say so
+    /// itself; an agent that was not working keeps the phase it had.
+    Heard,
+    /// The mailbox is dead and nothing was in flight: there is nothing to stop
+    /// and nothing to say. The row is left exactly as it was.
+    Gone,
+    /// The mailbox is dead with a run in flight. The run died where it stood and
+    /// committed nothing, so the row wears `⚠` — the one case where the honest
+    /// answer to Ctrl-C is not "stopped".
+    CutOff,
+}
+
 /// Where an isolated agent's work ended up, once the human landed it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Landed {
@@ -819,7 +840,14 @@ impl AgentTree {
     /// that will never happen, until a ten-second timer quietly cleared it
     /// (finding B6). What the actor *does* answer is a Stop on a run it really
     /// has: the run ends and its end-of-run event clears the mark at once.
-    pub fn cancel_requested(&mut self, id: AgentId) -> bool {
+    ///
+    /// A dead mailbox on a run in flight is the one case that is not a stop at
+    /// all: the human asked, but there was nobody left to ask, and the row says
+    /// `⚠` — the run died where it stood and committed nothing — rather than
+    /// `⊘`, whose whole meaning is "the actor is alive and a message resumes
+    /// it" (finding H2). The caller reads [`Stopped::CutOff`] and tells the
+    /// agent's parent, which is waiting for a result that will never come.
+    pub fn cancel_requested(&mut self, id: AgentId) -> Stopped {
         if let Some(flag) = self.agent_cancel.get(&id) {
             flag.store(true, Ordering::SeqCst);
         }
@@ -828,6 +856,7 @@ impl AgentTree {
             .get(&id)
             .map(|tx| tx.send(AgentMsg::Stop).is_ok())
             .unwrap_or(false);
+        let mut stopped = Stopped::Gone;
         if let Some(node) = self.node_mut(id) {
             if node.phase.is_busy() {
                 // Say so immediately: the actor may be mid-request, and a row
@@ -836,15 +865,21 @@ impl AgentTree {
                     Phase::Cancelling
                 } else {
                     // Nothing will ever answer, so the work it was showing can
-                    // never finish.
-                    Phase::Stopped
+                    // never finish — and what it *was* is the other thing the
+                    // row has to say: it was cut off, not stopped.
+                    stopped = Stopped::CutOff;
+                    Phase::CutOff
                 };
                 node.since = Instant::now();
             }
             // Otherwise the phase, and its clock, are left exactly as they
             // were: a Stop is not news about an agent that was not working.
         }
-        heard
+        if heard {
+            Stopped::Heard
+        } else {
+            stopped
+        }
     }
 
     /// Retire `⊘` marks whose acknowledgement will never arrive, so a row
@@ -1714,19 +1749,43 @@ mod tests {
 
     /// A Stop reaches a live mailbox; a dead one is a gone actor, and the row
     /// has to say so instead of showing work that can never finish
-    /// (finding B6).
+    /// (finding B6) — but what it says is `⚠`, not `⊘`: the human's Ctrl-C found
+    /// nobody to ask, and a stop promises an actor that a message resumes
+    /// (finding H2).
     #[test]
-    fn a_cancel_that_cannot_be_heard_marks_the_row_stopped() {
+    fn a_cancel_that_cannot_be_heard_cuts_the_row_off_rather_than_stopping_it() {
         let mut tree = AgentTree::bare();
         let (opened, rx) = child(&mut tree, 1);
         let id = opened.id;
 
-        assert!(tree.cancel_requested(id), "a live mailbox hears the Stop");
+        assert_eq!(
+            tree.cancel_requested(id),
+            Stopped::Heard,
+            "a live mailbox hears the Stop"
+        );
         assert!(matches!(rx.try_recv(), Ok(AgentMsg::Stop)));
         assert_eq!(tree.node(id).unwrap().phase, Phase::Cancelling);
 
         tree.agent_tx.remove(&id);
-        assert!(!tree.cancel_requested(id), "a dead mailbox is a gone actor");
+        assert_eq!(
+            tree.cancel_requested(id),
+            Stopped::CutOff,
+            "a dead mailbox with a run in flight is not a stop"
+        );
+        assert_eq!(tree.node(id).unwrap().phase, Phase::CutOff);
+    }
+
+    /// A dead mailbox with nothing in flight has nothing to say: the phase the
+    /// agent had is the phase it keeps, exactly as for a live one.
+    #[test]
+    fn a_cancel_that_cannot_be_heard_leaves_an_at_rest_agent_alone() {
+        let mut tree = AgentTree::bare();
+        let (opened, _rx) = child(&mut tree, 1);
+        let id = opened.id;
+        tree.stopped(id);
+        tree.agent_tx.remove(&id);
+
+        assert_eq!(tree.cancel_requested(id), Stopped::Gone);
         assert_eq!(tree.node(id).unwrap().phase, Phase::Stopped);
     }
 
@@ -1743,7 +1802,11 @@ mod tests {
         let id = opened.id;
 
         tree.fail(id, "no route".into());
-        assert!(tree.cancel_requested(id), "the mailbox is alive");
+        assert_eq!(
+            tree.cancel_requested(id),
+            Stopped::Heard,
+            "the mailbox is alive"
+        );
         assert_eq!(
             tree.node(id).unwrap().phase,
             Phase::Failed("no route".into()),
@@ -1778,7 +1841,11 @@ mod tests {
         let (opened, rx) = child(&mut tree, 1);
         let id = opened.id;
 
-        assert!(tree.cancel_requested(id), "a run is in flight");
+        assert_eq!(
+            tree.cancel_requested(id),
+            Stopped::Heard,
+            "a run is in flight"
+        );
         assert_eq!(tree.node(id).unwrap().phase, Phase::Cancelling);
         assert!(tree.busy(), "and the run is still on");
         assert!(matches!(rx.try_recv(), Ok(AgentMsg::Stop)));

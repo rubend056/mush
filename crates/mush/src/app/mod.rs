@@ -24,6 +24,7 @@ pub use screen::{AgentRow, AgentsPane, BarPane, ChatPane, PickerPane, Screen};
 pub use settings::{ConfigCell, ConfigHandle, WindowSource};
 pub use tree::{
     AgentId, AgentNode, AgentTree, Compacting, ConversationId, Existing, Landed, Phase, Spawn,
+    Stopped,
 };
 
 use std::collections::HashMap;
@@ -2400,9 +2401,49 @@ impl App {
 
     /// Ask one agent to stop and show it immediately. A dead mailbox is a gone
     /// actor: mark the row so it stops showing work that can never finish
-    /// (finding B6).
+    /// (finding B6) — and when it was mid-run, say what that *is*, because
+    /// "stopped" claims an actor that a message resumes and there is none
+    /// (finding H2).
     fn stop_one(&mut self, id: AgentId) {
-        self.tree.cancel_requested(id);
+        if self.tree.cancel_requested(id) == Stopped::CutOff {
+            self.report_cut_off(id);
+        }
+    }
+
+    /// An agent's actor is gone with its run in flight: the one ending no actor
+    /// can report, because the actor that would have reported it is the thing
+    /// that vanished.
+    ///
+    /// So the UI — the only observer left, and the one that just proved it by
+    /// finding the mailbox dead — says it in both places the fact has a reader.
+    /// The agent's own pane gets the `⚠` line under its `⚠` row. Its parent is
+    /// told through the very message a completion travels in (`ChildDone`),
+    /// which means the parent's own actor folds it into its transcript, wakes a
+    /// napping parent for it, and reports it to the model in the same words
+    /// every other ending uses — one owner of the line, one road into the
+    /// conversation (finding H2).
+    ///
+    /// A parent that is gone too, and the root, have nobody to tell; the row and
+    /// the pane still say it.
+    fn report_cut_off(&mut self, id: AgentId) {
+        self.chat.note_cut_off_for(id, cut_off_notice());
+        self.mark_session_dirty();
+        if id == self.tree.focused {
+            self.say(format!(
+                "agent #{id} was already gone — its run was cut off, nothing committed"
+            ));
+        }
+        let Some(parent) = self.tree.node(id).and_then(|node| node.parent) else {
+            return;
+        };
+        let Some(tx) = self.tree.agent_tx.get(&parent) else {
+            return;
+        };
+        let _ = tx.send(AgentMsg::ChildDone {
+            id: id.0,
+            run: agent::CUT_OFF_RUN,
+            outcome: agent::Outcome::CutOff,
+        });
     }
 
     fn cycle_focus(&mut self, direction: i64) {
@@ -8186,6 +8227,92 @@ mod tests {
         app.tick();
         assert_eq!(app.tree.agents[0].phase, Phase::Idle);
         assert!(!app.busy(), "the bar must stop claiming work");
+    }
+
+    /// The one ending no actor can report, because the actor that would have
+    /// reported it is the thing that vanished: a run in flight whose mailbox is
+    /// dead. The human's Ctrl-C finds nobody to ask, and what the row says is
+    /// `⚠` — the run died where it stood and committed nothing — not `⊘`,
+    /// whose whole meaning is an agent a message resumes (finding H2).
+    ///
+    /// The parent is told through the message a completion travels in, because
+    /// the UI is the only observer left that can send one.
+    #[test]
+    fn a_run_whose_actor_vanished_is_reported_to_its_parent_as_cut_off() {
+        let (mut app, _rx) = test_app("live-cut-off");
+        let conversation = app.tree.conversation();
+        // A live parent (#1) whose mailbox this test holds, and a child (#2)
+        // whose receiver is dropped: the actor is gone, the row does not know it
+        // yet.
+        let (parent_tx, parent_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        for (child, parent, depth, cmd) in [
+            (1, 0, 1, parent_tx),
+            (2, 1, 2, crossbeam_channel::unbounded().0),
+        ] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId::ROOT,
+                event: AgentEvent::Spawned {
+                    child,
+                    parent,
+                    brief: format!("task {child}"),
+                    depth,
+                    branch: None,
+                    cmd,
+                },
+            });
+        }
+        app.tree.begin(AgentId(2), None);
+        app.tree.focus(AgentId(2));
+
+        app.stop_one(AgentId(2));
+
+        assert_eq!(
+            app.tree.node(AgentId(2)).map(|node| node.phase.clone()),
+            Some(Phase::CutOff),
+            "a stop nobody can hear is not a stop"
+        );
+        match parent_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(AgentMsg::ChildDone { id, run, outcome }) => {
+                assert_eq!(id, 2, "the child that was cut off");
+                assert_eq!(
+                    outcome,
+                    agent::Outcome::CutOff,
+                    "not `done`, not `stopped`, not `failed`"
+                );
+                // A run that never ended has no number of its own, so the UI
+                // files it under one no real report can carry: the parent folds
+                // it once, keeps it, and no later run can read as the same one.
+                assert_eq!(run, agent::CUT_OFF_RUN, "the run that never got a number");
+            }
+            Ok(_) => panic!("the parent heard something other than a completion"),
+            Err(_) => panic!("the parent was never told"),
+        }
+        let notice = app
+            .chat
+            .notices_for(AgentId(2))
+            .map(|notice| notice.text.clone())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        assert!(notice.contains("nothing was committed"), "{notice}");
+        let rows = screen(&mut app, 120, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("⚠ #2")),
+            "the row says which ending this was: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.contains("cut off")),
+            "and the pane of the agent it happened to says why: {rows:?}"
+        );
+        // The line the human's own key earns is a status, and a status yields
+        // to the derived facts above it (R2): what *this* agent is doing is
+        // still on the row, while the root's nap is on the bar.
+        assert!(
+            app.status_line()
+                .is_some_and(|(text, _)| text.contains("cut off")),
+            "the key that did nothing says so: {:?}",
+            app.status_line()
+        );
     }
 
     /// The child's brief is the first thing its transcript shows, exactly as

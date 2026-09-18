@@ -337,6 +337,20 @@ impl Outcome {
     }
 }
 
+/// The run number a cut-off run is reported under.
+///
+/// A cut-off run *never ended*, so it never got the number a report carries:
+/// [`ActorState::runs`] is incremented where the outcome is decided, and this
+/// run had no outcome — the actor was gone before it could decide one. What the
+/// parent needs from [`AgentMsg::ChildDone`]'s `run` is identity, not
+/// arithmetic: a value no real report can carry is newer than every run the
+/// parent has read (so the line folds, and wakes a napping parent) and the same
+/// value twice is the same report (so it folds once — `docs/findings.md` B24).
+/// Nothing can ever claim it afterwards either: the actor that would is the
+/// thing that vanished. The UI is the only hand left that can file the report
+/// (`App::report_cut_off`).
+pub(crate) const CUT_OFF_RUN: u64 = u64::MAX;
+
 /// Commands sent into an agent actor's mailbox.
 pub enum AgentMsg {
     /// Adopt these messages and run. The actor keeps the transcript, so later
@@ -3390,6 +3404,14 @@ mod tests {
         assert!(!stopped.starts_with("#3 done"), "{stopped}");
         let failed = Outcome::Failed("no route".into()).line(3);
         assert!(failed.starts_with("#3 failed"), "{failed}");
+        // A run that never ended names itself too, and says the one thing the
+        // parent has to act on: its work is uncommitted (finding H2).
+        let cut_off = Outcome::CutOff.line(3);
+        assert!(cut_off.starts_with("#3 cut off"), "{cut_off}");
+        assert!(cut_off.contains("nothing was committed"), "{cut_off}");
+        assert!(cut_off.contains("never ended"), "{cut_off}");
+        assert!(!cut_off.starts_with("#3 done"), "{cut_off}");
+        assert!(!cut_off.starts_with("#3 stopped"), "{cut_off}");
     }
 
     /// A stop is the human's doing, not news: it must not wake a napping parent
@@ -3430,6 +3452,35 @@ mod tests {
             ),
             Fold::Run
         ));
+    }
+
+    /// A cut-off run is news for the same reason a stop is not: the parent is
+    /// waiting for a result that will never come, and the work it was waiting on
+    /// may be sitting uncommitted, so it has to be woken and told rather than
+    /// left to assume (finding H2).
+    #[test]
+    fn a_cut_off_child_wakes_a_napping_parent() {
+        let (actor, _mailbox) = test_actor("cut-off-wakes");
+        let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let mut state = ActorState::default();
+        state.children.insert(1, tx);
+        let mut messages = vec![Message::system("you are mush")];
+
+        assert!(matches!(
+            absorb(
+                &actor,
+                &mut state,
+                &mut messages,
+                AgentMsg::ChildDone {
+                    id: 1,
+                    run: CUT_OFF_RUN,
+                    outcome: Outcome::CutOff
+                }
+            ),
+            Fold::Run
+        ));
+        let line = messages.last().unwrap().text();
+        assert!(line.starts_with("#1 cut off"), "{line}");
     }
 
     /// The subject written for a commit and the subject read back from git must
