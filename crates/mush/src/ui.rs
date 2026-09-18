@@ -491,12 +491,15 @@ fn agent_detail(node: &AgentNode) -> Vec<String> {
 /// The glyph is derived from the agent's own phase, never stored and never
 /// borrowed from the tree: `·` until it does something, `◐` while its own run is
 /// in flight, `⊘` while a cancel is in flight and after it lands, `✓` only when
-/// a run finished, `✗` when it failed.
+/// a run finished, `✗` when it failed, `≡` while its conversation is being
+/// folded.
 ///
 /// Waiting on children is a *different fact* from working and is drawn as a
 /// different mark (`agent_line`'s `⏸N`), because a parent that is mid-turn with
 /// children running is working, not paused — the row that said `⏸` about it was
-/// claiming a park that never happened (finding U1).
+/// claiming a park that never happened (finding U1). Folding is a different
+/// fact again: it is a request of its own, and `◐` for it is what made a
+/// compaction look like the run's own model call (finding U11).
 fn phase_glyph(phase: &Phase) -> &'static str {
     match phase {
         Phase::Failed(_) => "✗",
@@ -505,6 +508,7 @@ fn phase_glyph(phase: &Phase) -> &'static str {
         Phase::Cancelling | Phase::Stopped => "⊘",
         Phase::Idle => "·",
         Phase::Done => "✓",
+        Phase::Compacting(_) => "≡",
         Phase::Thinking | Phase::Activity(_) => "◐",
     }
 }
@@ -516,6 +520,11 @@ fn phase_glyph(phase: &Phase) -> &'static str {
 /// reads like a model call in flight, and the human asked for an hourglass for
 /// the case where nothing is being computed — a napping orchestrator was the
 /// one agent on the screen claiming work it was not doing (finding U7).
+///
+/// A fold says what it is too, and its own words: a fold the human asked for,
+/// one the window triggered, and one parked behind the run in flight are three
+/// answers, and `◐ #0 root` for all of them is how a compaction became
+/// invisible (finding U11).
 fn phase_detail(node: &AgentNode) -> String {
     let age = short_age(node.since.elapsed());
     match &node.phase {
@@ -527,6 +536,7 @@ fn phase_detail(node: &AgentNode) -> String {
             // as a double one (`wait_agents  3s`).
             None => format!("{} {age}", what.trim_end()),
         },
+        Phase::Compacting(kind) => format!("{} {age}", kind.words().trim_end_matches('…')),
         Phase::Cancelling => "cancelling…".to_string(),
         // A stopped run has no result to show: its last summary belongs to a
         // run that was interrupted, so showing it would claim work that was
@@ -576,6 +586,10 @@ fn draw_chat(frame: &mut Frame, app: &mut App, area: Rect) {
                 .node(app.tree.focused)
                 .map(|node| node.phase.is_busy() && node.phase.waiting().is_none())
                 .unwrap_or(false),
+            compacting: app
+                .tree
+                .node(app.tree.focused)
+                .and_then(|node| node.phase.compacting()),
             spin: app.spin,
             label: &label,
         };

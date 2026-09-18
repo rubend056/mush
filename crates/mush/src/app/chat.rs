@@ -54,7 +54,7 @@ use mush_core::text::{truncate, wrap_text, wrap_text_capped};
 use crate::agent::summarize_args;
 use crate::app::keys::ChatKey;
 use crate::app::short_age;
-use crate::app::tree::AgentId;
+use crate::app::tree::{AgentId, Compacting};
 use crate::input::Input;
 use crate::ui::dim;
 
@@ -269,12 +269,18 @@ struct Foot {
 }
 
 /// What a pane knows that the conversation does not: which agent it is showing,
-/// whether that agent's run is in flight, where the animation is, and the
-/// endpoint/model line the empty state names.
+/// whether that agent's run is in flight, whether it is folding its
+/// conversation, where the animation is, and the endpoint/model line the empty
+/// state names.
 #[derive(Clone, Copy)]
 pub struct Pane<'a> {
     pub agent: AgentId,
     pub busy: bool,
+    /// The fold this agent is doing, if any: the pane's own activity line says
+    /// *that*, not `working…`, because a fold is not the run's model call and
+    /// the human waiting for it should see which of the two is moving (finding
+    /// U11).
+    pub compacting: Option<Compacting>,
     pub spin: u64,
     pub label: &'a str,
 }
@@ -957,8 +963,15 @@ impl Chat {
         }
         if pane.busy {
             worth.push(1);
+            // A fold says so: the row and the bar already do, and a pane that
+            // said `working…` while the conversation is being summarized would
+            // be the third surface disagreeing about one fact (finding U11).
+            let what = match pane.compacting {
+                Some(kind) => kind.words().to_string(),
+                None => "working…".to_string(),
+            };
             blocks.push(vec![Line::from(Span::styled(
-                format!("{} working…", SPINNER[(pane.spin as usize) % SPINNER.len()]),
+                format!("{} {what}", SPINNER[(pane.spin as usize) % SPINNER.len()]),
                 Style::default().fg(Color::Cyan),
             ))]);
             // Derived from a phase, so not a note: hiding it promises nothing
@@ -1347,6 +1360,7 @@ mod tests {
         Pane {
             agent,
             busy: false,
+            compacting: None,
             spin: 0,
             label: "test-model · ctx ~500k",
         }
