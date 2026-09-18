@@ -982,25 +982,25 @@ impl App {
             }
             AgentEvent::Error(error) => {
                 self.tree.fail(id, error.clone());
-                self.mark_session_dirty();
                 self.refresh_git();
-                // The durable half of the same fact: the row's `✗` is derived and
-                // dies with the next run, while this line is tagged, stamped and
-                // written to the session, so a restart still says what broke.
-                self.chat.note_error_for(id, error.clone());
-                // A failure is the third way a run can end, and it is the one
-                // that did not reach the bar: `Stopped` says so, `Failed` fell
-                // back to the idle hint, so the newest thing that had happened
-                // could be a crash under a line advertising Ctrl-P. A guard-stop
+                // Only the agent the human is reading needs the bar — another
+                // agent's failure is on its own row's `✗` and in its own pane's
+                // foot — and the sentence names the agent, which the foot's `!`
+                // line (already in front of the human) does not. A guard-stop
                 // is this same event (the runaway guard's `stopped after N
-                // turns…` is the run's error), so both are said here. Only the
-                // agent the human is reading needs the bar — another agent's
-                // failure is on its own row's `✗` and in its own pane's foot —
-                // and the sentence names the agent, which the foot's `!` line
-                // (already in front of the human) does not.
-                if id == self.tree.focused {
-                    self.fail(format!("agent #{id} failed — {error}"));
-                }
+                // turns…` is the run's error), so one arm covers both endings.
+                let line = (id == self.tree.focused).then(|| {
+                    // A failure is the third way a run can end, and it is the
+                    // one that did not reach the bar: `Stopped` says so,
+                    // `Failed` fell back to the idle hint, so the newest thing
+                    // that had happened could be a crash under a line
+                    // advertising Ctrl-P.
+                    format!("agent #{id} failed — {error}")
+                });
+                // The durable half too: the row's `✗` is derived and dies with
+                // the next run, while the notice is tagged, stamped and written
+                // to the session, so a restart still says what broke.
+                self.fail_for(id, error, line);
             }
             AgentEvent::Done => {
                 let summary = self.last_assistant_text(id);
@@ -1195,12 +1195,31 @@ impl App {
     /// own next run supersedes it, as it supersedes any failure — but by then
     /// the human has run something in the conversation it opened.) The words
     /// come from the caller (`main`), which is the one place that knows the
-    /// path, the reason and where the only copy went.
+    /// path, the reason and where the only copy went — and they take the same
+    /// three homes [`Self::fail_for`] gives a run's own failure, so the two
+    /// cannot drift about what a failure does (refactor R19).
     pub fn session_unreadable(&mut self, text: impl Into<String>) {
         let text = text.into();
-        self.chat.note_error_for(AgentId::ROOT, text.clone());
-        self.fail(text);
+        self.fail_for(AgentId::ROOT, text.clone(), Some(text));
+    }
+
+    /// A failure, in the three places one outlives the moment: the durable
+    /// notice in `id`'s pane (stamped, ranked `Alert`, read back whole by the
+    /// pane's foot and `/notes`), the mark that makes the next save write it —
+    /// a failure is a fact about the workspace or the agent, not about the
+    /// moment it was noticed — and the bar's line (`line`), which the caller
+    /// owns because only it knows whether the bar is the place for this one.
+    ///
+    /// One door, so a new kind of failure cannot take two of the three and
+    /// forget the last: the run's own failure and a conversation that could not
+    /// be read are the same shape (refactor R19).
+    fn fail_for(&mut self, id: AgentId, text: impl Into<String>, line: Option<String>) {
+        let text = text.into();
+        self.chat.note_error_for(id, text);
         self.mark_session_dirty();
+        if let Some(line) = line {
+            self.fail(line);
+        }
     }
 
     /// Remember something that went wrong. Errors do not fade: they stay until
