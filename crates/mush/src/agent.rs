@@ -476,6 +476,12 @@ pub enum AgentMsg {
     /// Not a result and not a delivery: a listing fact (`agent_status`), so it
     /// starts no run and marks nothing read (finding H1).
     Work { id: u64, run: u64, work: Work },
+    /// A child that was at rest began a run the parent did not start: the human
+    /// nudged it, or a client did. The UI is the only hand that sees that, and
+    /// the parent's books need it — a wait would otherwise answer a stale
+    /// result, and the shared-workspace guard would miss a sibling that is
+    /// working (audit of the prompt vs behaviour, row 1).
+    ChildRunning { id: u64 },
     /// A job this agent started ended. `line` is the report its owner reads,
     /// rendered once by the registry; `news` says whether it is worth waking a
     /// napping agent for (`ChildDone` and `Outcome::is_news` again: a job mush
@@ -671,6 +677,11 @@ struct ActorState {
     /// `ChildDone { run, .. }`. It counts runs, not turns, and is incremented
     /// where the run's outcome is decided.
     runs: u64,
+    /// The children that run in *this* agent's workspace rather than their own
+    /// worktree — including one whose isolation degraded. They are what the
+    /// one-shared-child rule is about: an isolated sibling edits its own tree
+    /// and conflicts with nothing here (audit row 7).
+    shared: HashSet<u64>,
     /// How each child's last finished run left its worktree, keyed by the run
     /// that left it: the branch, and whether the work is committed. A listing
     /// fact (`agent_status`), never a delivery: reading it marks nothing, and
@@ -1414,6 +1425,12 @@ fn absorb(
         // (finding H1).
         AgentMsg::Work { id, run, work } => {
             note_work(state, id, run, work);
+            Fold::Idle
+        }
+        // A child the human resumed begins a run: the parent's books follow,
+        // and nothing else happens — no line, no wake (audit row 1).
+        AgentMsg::ChildRunning { id } => {
+            state.running.insert(id);
             Fold::Idle
         }
         AgentMsg::CommandDone { id, line, news } => {
@@ -2310,6 +2327,11 @@ fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
             // A listing fact, not a signal: it starts nothing, ends nothing,
             // and is folded nowhere (finding H1).
             AgentMsg::Work { id, run, work } => note_work(state, id, run, work),
+            // A child the human resumed. Nothing to fold: the parent's book of
+            // what is running is the whole point (audit row 1).
+            AgentMsg::ChildRunning { id } => {
+                state.running.insert(id);
+            }
             AgentMsg::CommandDone { id, line, news } => {
                 note_job(state, id, line, news);
             }
@@ -2373,6 +2395,11 @@ fn drain_mailbox(
             // The worktree fact of the run just recorded. It is not a result:
             // nothing is pushed and no boundary is moved (finding H1).
             AgentMsg::Work { id, run, work } => note_work(state, id, run, work),
+            // A child the human resumed: the parent's books say it is running
+            // again, and nothing enters the transcript (audit row 1).
+            AgentMsg::ChildRunning { id } => {
+                state.running.insert(id);
+            }
             // A job's report is folded into the transcript as a user message:
             // the model reads `#c2 done: exit 0 · …` in the next request, and
             // the line is marked delivered so it is never injected twice. A
@@ -2604,16 +2631,34 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         })?),
         None => None,
     };
-    if !isolated && !state.running.is_empty() {
+    if !isolated {
         // Decide this *before* writing the brief: the check can only fail after
         // the brief exists, so the rule is stated in the tool schema and the
         // system prompt as well.
-        return Err(
-            "cannot spawn: a sibling agent already runs in this shared workspace, and only one \
-             non-isolated child may run at a time. Set isolated=true (its own git worktree) to \
-             run siblings in parallel, or wait_agents for the running one first."
-                .to_string(),
-        );
+        //
+        // Only a *shared* child conflicts with this workspace: an isolated
+        // sibling edits its own worktree, so a running one must not block a
+        // shared spawn — the old guard counted it and then said something false
+        // about this workspace (audit row 7).
+        let mut running_shared: Vec<u64> = state
+            .shared
+            .iter()
+            .copied()
+            .filter(|id| state.running.contains(id))
+            .collect();
+        if !running_shared.is_empty() {
+            running_shared.sort_unstable();
+            let names = running_shared
+                .iter()
+                .map(|id| format!("#{id}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(format!(
+                "cannot spawn: {names} already runs in this shared workspace, and only one shared child \
+                 may run at a time. Set isolated=true (its own git worktree) to run siblings in parallel, \
+                 or wait_agents for it first."
+            ));
+        }
     }
 
     let id = ctx.ids.fetch_add(1, Ordering::SeqCst);
@@ -2677,6 +2722,10 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         .and_then(|_| git::resolve(&git::worktree_path(&ctx.root, id), "HEAD"))
         .map(|sha| format!(" at {}", short_revision(&sha)))
         .unwrap_or_default();
+    // A degraded isolation lands in this workspace: it shares the tree, and the
+    // one-shared-child rule is about it exactly as much as about a child that
+    // never asked for a worktree.
+    let shares_workspace = branch.is_none();
 
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AgentMsg>();
     // The UI hears about the child before any of its events can arrive, so
@@ -2738,6 +2787,11 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
 
     state.children.insert(id, cmd_tx);
     state.running.insert(id);
+    // Which children share this workspace: the ones the one-shared-child rule
+    // is about. A degraded isolation lands here too — it is running in place.
+    if shares_workspace {
+        state.shared.insert(id);
+    }
     // A run is bounded by progress, not by a turn count: it ends when the model
     // stops calling tools, and is cut short only if it starts looping
     // (`LOOP_ROUNDS` identical rounds). The only hard ceiling is a runaway
@@ -2824,12 +2878,19 @@ fn wait_tool(
             unknown.join(", ")
         ));
     }
+    // Whether any candidate still runs, as the parent's books have it. While
+    // one does, an already-read result is not what a wait is for: returning it
+    // instantly makes "blocks until a child finishes" a lie, and a model that
+    // retries the wait is stopped by the loop guard (audit row 3).
+    let any_running = candidates.iter().any(|id| state.running.contains(id));
     let mut results = WaitResults {
         // Pure: which children hold a result this waiter can be given. Asking
         // must not read anything — `deliver` is what the answer actually hands
         // over, and only for the results this call returns (a poll that marked
         // every ready child would swallow bodies the model never saw).
-        is_ready: &mut |state, id| state.completed.contains_key(&id),
+        is_ready: &mut move |state: &ActorState, id: u64| {
+            state.completed.contains_key(&id) && (!any_running || state.unread(id))
+        },
         // One home decides whether this answer is the model's first read of the
         // run (`record_child`). A fresh result is delivered in full — the shape
         // the fold uses, so adoption still recognises it — and the child's `✉`
@@ -2954,9 +3015,22 @@ fn wait_for_results(
             usize::from(!finished.is_empty())
         };
         if take > 0 {
-            let answers: Vec<String> = finished
+            // A "first finish" answer is a *fresh* one when there is one: an
+            // unread result outranks an already-read one, so a wait for news
+            // never answers the digest of the old while the new result sits in
+            // the same list. `all` keeps the order the candidates were asked
+            // about.
+            let chosen: Vec<u64> = if all {
+                finished.clone()
+            } else {
+                let at = finished
+                    .iter()
+                    .position(|id| state.unread(*id))
+                    .unwrap_or(0);
+                vec![finished[at]]
+            };
+            let answers: Vec<String> = chosen
                 .iter()
-                .take(take)
                 .map(|id| (results.deliver)(state, *id))
                 .collect();
             return Ok(answers.join("\n"));
@@ -3001,6 +3075,13 @@ fn status_tool(state: &ActorState) -> Result<String, String> {
     let mut ids: Vec<u64> = state.children.keys().copied().collect();
     ids.sort_unstable();
     for id in ids {
+        // A child that is running again after its last report is *running*: the
+        // recorded outcome is history, and printing it made a resumed child
+        // read as stopped while it worked (audit row 1).
+        if state.running.contains(&id) {
+            lines.push(format!("#{id} ◐ running"));
+            continue;
+        }
         // The same `✉` the tree rows carry (H4): a result nobody has read.
         let unread = if state.unread(id) { "✉ " } else { "" };
         // Where the recorded run left its worktree, when its actor sent that
@@ -3056,9 +3137,15 @@ fn control_tool(state: &mut ActorState, args: &Value) -> Result<String, String> 
     };
     match sent {
         Ok(()) if action == "stop" => Ok(format!("stopping agent #{id}")),
-        Ok(()) if at_rest => Ok(format!(
-            "messaged agent #{id} — it was at rest, so this resumes it"
-        )),
+        Ok(()) if at_rest => {
+            // The words resume the child, so the parent's own books say it is
+            // running: a wait must not answer the old result, and the
+            // shared-workspace guard must see it (audit row 1).
+            state.running.insert(id);
+            Ok(format!(
+                "messaged agent #{id} — it was at rest, so this resumes it"
+            ))
+        }
         Ok(()) => Ok(format!(
             "messaged agent #{id} — it is mid-run, so it reads this at its next step"
         )),
@@ -9635,6 +9722,167 @@ mod tests {
             panic!("an unknown base is a failed call");
         };
         assert!(error.contains("unknown base"), "{error}");
+    }
+
+    /// A child the parent resumed with a message counts as running again: the
+    /// shared-workspace guard must not let a second shared child in behind its
+    /// back (audit of the prompt vs behaviour, row 1).
+    #[test]
+    fn a_resumed_child_arms_the_shared_guard_again() {
+        let (actor, _mailbox) = scripted_tools_actor(
+            "shared-resume",
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let spawn = |state: &mut ActorState, brief: &str| {
+            exec_tool(
+                &actor,
+                state,
+                ToolName::SpawnAgent,
+                &json!({ "brief": brief }),
+                &cancel,
+            )
+        };
+
+        spawn(&mut state, "first").unwrap();
+        // The child reported and is at rest: a second shared child is fine.
+        note_completion(&mut state, 1, 1, Outcome::Stopped);
+        spawn(&mut state, "second").unwrap();
+
+        // The parent resumes the first with a message. It is running again,
+        // even though nothing has reported yet.
+        exec_tool(
+            &actor,
+            &mut state,
+            ToolName::AgentControl,
+            &json!({ "id": 1, "action": "message", "text": "again" }),
+            &cancel,
+        )
+        .unwrap();
+        let refused = spawn(&mut state, "third").unwrap_err();
+        let ToolError::Failed(refused) = refused else {
+            panic!("a second shared child is refused, not a memory error");
+        };
+        assert!(refused.contains("#1"), "{refused}");
+        assert!(refused.contains("shared workspace"), "{refused}");
+    }
+
+    /// An isolated sibling edits its own worktree, so it must not block a
+    /// shared spawn — the old guard counted it and then said something false
+    /// about this workspace (audit row 7).
+    #[test]
+    fn an_isolated_sibling_does_not_block_a_shared_spawn() {
+        let (actor, _mailbox) = scripted_tools_actor(
+            "shared-vs-isolated",
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let root = actor.ctx.root.clone();
+        git_in(&root, &["init", "-q", "-b", "main"]);
+        git_in(&root, &["config", "user.email", "t@t"]);
+        git_in(&root, &["config", "user.name", "t"]);
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        git_in(&root, &["add", "-A"]);
+        git_in(&root, &["commit", "-qm", "init"]);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+
+        exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "in my own worktree", "isolated": true }),
+            &cancel,
+        )
+        .unwrap();
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "in the shared tree" }),
+            &cancel,
+        )
+        .expect("a running isolated sibling does not share this workspace");
+        assert!(report.contains("spawned agent #2"), "{report}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A child the human resumed is *running*, whatever its last report said:
+    /// the listing says so, and a wait does not answer the stale result as if
+    /// it had just finished (audit row 1 and 3).
+    #[test]
+    fn a_resumed_child_reads_as_running_and_a_wait_holds() {
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor(
+            "resumed-wait",
+            Arc::new(ScriptedMachine::new()),
+            clock.clone(),
+        );
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+        note_completion(&mut state, 1, 1, Outcome::Stopped);
+        state.delivered.insert(1, 1);
+
+        // The human nudged it: the parent's books are told.
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ChildRunning { id: 1 },
+        );
+        let lines = status_tool(&state).unwrap();
+        assert!(lines.contains("#1 ◐ running"), "{lines}");
+
+        // A wait no longer answers the old stopped digest: it waits, and the
+        // clock is what ends it.
+        let report = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 600 })).unwrap();
+        assert!(report.starts_with("wait timed out"), "{report}");
+        assert!(!report.contains("stopped"), "{report}");
+        assert!(
+            clock.elapsed() >= Duration::from_secs(600),
+            "the deadline is what ended it: {:?}",
+            clock.elapsed()
+        );
+    }
+
+    /// A result the model has already read is not what a wait returns while a
+    /// sibling is still running: the wait blocks for news, and only answers the
+    /// read result once nothing is left to run (audit row 3).
+    #[test]
+    fn a_wait_does_not_answer_a_read_result_while_a_sibling_runs() {
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor(
+            "wait-fresh",
+            Arc::new(ScriptedMachine::new()),
+            clock.clone(),
+        );
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let (one, _one_rx) = crossbeam_channel::unbounded();
+        let (two, _two_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, one);
+        state.children.insert(2, two);
+        // #1 finished and was read; #2 is still working.
+        note_completion(&mut state, 1, 1, Outcome::Finished("old news".into()));
+        state.delivered.insert(1, 1);
+        state.running.insert(2);
+
+        let report = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 600 })).unwrap();
+        assert!(
+            report.starts_with("wait timed out") && report.contains("#2"),
+            "it waits for the running child, not the read one: {report}"
+        );
+
+        // Once nothing runs, what is recorded is all there is: the read result
+        // comes back, marked as read.
+        state.running.clear();
+        note_completion(&mut state, 2, 1, Outcome::Finished("new news".into()));
+        let report = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 600 })).unwrap();
+        assert!(report.contains("#2 done: new news"), "{report}");
     }
 
     /// A scratch git repo with one initial commit, ready for worktrees. The

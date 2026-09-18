@@ -1415,7 +1415,7 @@ impl App {
             // run they start may take minutes, and a crash in it must not lose
             // the request. This is one write per turn, not one per response.
             self.flush_session();
-            // The root's own phase, not the tree's: a napping orchestrator is
+            // The root's own phase, not the tree's: a napping orchestrator is idle, and
             // idle, and its next message starts a run rather than nudging a
             // conversation that is not in flight.
             let root_busy = self
@@ -1468,12 +1468,34 @@ impl App {
             let previous = self.tree.nudge(target);
             self.chat.push_message(target, Message::user(text.clone()));
             match self.tree.agent_tx.get(&target) {
-                Some(tx) if tx.send(AgentMsg::Nudge(text)).is_ok() => {}
+                Some(tx) if tx.send(AgentMsg::Nudge(text)).is_ok() => {
+                    // The human resumed a child its parent may believe is at
+                    // rest: the parent's books decide its waits and the
+                    // one-shared-child guard, so they are told (audit row 1).
+                    self.tell_parent_running(target);
+                }
                 _ => {
                     self.tree.nudge_failed(target, previous);
                     self.fail(format!("agent #{target} is gone"));
                 }
             }
+        }
+    }
+
+    /// Tell `id`'s parent, when it has one, that the child is running again.
+    ///
+    /// The parent's own books are the only place a wait and the
+    /// one-shared-child guard look, and a human's nudge is a resume the parent
+    /// cannot see from its side (audit of the prompt vs behaviour, row 1).
+    ///
+    /// `pub(crate)` because the attach surface delivers through the same door
+    /// as the message box.
+    pub(crate) fn tell_parent_running(&self, id: AgentId) {
+        let Some(parent) = self.tree.node(id).and_then(|node| node.parent) else {
+            return;
+        };
+        if let Some(tx) = self.tree.agent_tx.get(&parent) {
+            let _ = tx.send(AgentMsg::ChildRunning { id: id.0 });
         }
     }
 
@@ -6682,6 +6704,34 @@ mod tests {
             "the ✓ is not rewritten"
         );
         assert_eq!(text_of(&app), "agent #1 is gone");
+    }
+
+    /// A human's nudge to a child tells the parent's books the child is running
+    /// again: the parent's waits and the one-shared-child guard read them, and
+    /// a resume is invisible from the parent's side otherwise (audit row 1).
+    #[test]
+    fn a_human_nudge_tells_the_parent_the_child_is_running() {
+        let (mut app, _rx) = test_app("nudge-parent");
+        let (child_tx, _child_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "lexer".to_string(),
+            depth: 1,
+            branch: None,
+            cmd: child_tx,
+        });
+        let (parent_tx, parent_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.agent_tx.insert(AgentId::ROOT, parent_tx);
+        app.tree.focus(AgentId(1));
+
+        app.chat.insert("carry on");
+        app.send_message();
+
+        assert!(
+            matches!(parent_rx.try_recv(), Ok(AgentMsg::ChildRunning { id: 1 })),
+            "the parent is told the child it believed at rest is running"
+        );
     }
 
     /// `Enter` on a tree row shows that agent *and* hands it the keyboard
