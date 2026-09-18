@@ -720,6 +720,40 @@ more reason R22 should land before the H2/H4 wave that adds the variant.
 
 ---
 
+### The sixth review (after the `Screen` wave, `7e123e1`)
+
+Read against the replaced `ui.rs` function by function, plus a string-literal and
+a constant census, plus eight injected bugs. The two deliberate semantic changes
+(the build/elide split in `agents_title`, and `bar_line` → `screen::bar_word`
+returning `(Rank, String)` with colour left to `ui::rank_style`) were verified
+byte-identical in output, so `D9`'s and `R9`'s risks are lower than priced and
+their line counts move. Re-priced here, with `D9`/`D10`'s deferral over because
+`7e123e1` landed:
+
+| # | What | Net | Status |
+|---|---|---|---|
+| D9 (re-priced) | The two "drop cells from the right until they fit" loops are now **cross-module** (`ui::agents_title` joins with ` · `, `screen::facts_line` with ` │ `) and their floors differ (the title falls back to `" agents "`, the facts line never drops its first cell). Better than one shared helper: pre-elide in `agents_pane`, so `title_cells` becomes a `String` and the painter's rule disappears. | ≈ −5 (was −8) | ⬜ |
+| D10 (re-priced) | Confirmed: the `bar_rows` rule is in the prover and in the test helper; now a pure function of height. | ≈ −2 | ⬜ (`screen::bar_rows`) |
+| R9 (relocated) | `node(focused)` looked up twice for two projections, now at `screen.rs:456–461`. One binding. | ≈ −3 | ⬜ |
+| R10 (relocated, all three still there) | `tree.rs:64` still offers `summarizing…` (no `AgentEvent::Status` sends it); `screen.rs:668`'s "`M waiting` … (the `⏸` rows)" is false since U1 (`AgentRow.waiting = busy_children` marks a *working* parent too, while `roster.waiting` counts only Idle/Done — the two docs in the tree contradict each other); `app/mod.rs:983`'s "every string the bar can show is created by `say`/`fail`" is a third, `tree_line`, bypassing `set_status`'s sanitize door (`findings.md` `V6`). **Plus one new stale comment this integration added**: `mod.rs:6869` says `roomy` is asserted "at every size at least 80×24" while `:7401` checks two exact sizes (`V5`). | ≈ −4 | ⬜ |
+| R25 | **The tree pane's window geometry is derived twice** — `inner`/`footer_rows`/`list_area` in `screen.rs:331–355` (to derive `▲/▼`) and again in `ui.rs:82–112` (to place the `List`); only the painter's copy is real, so the counts are a model of the scroll. Deleting the painter's separator row fails only one incidental highlight test at 80×24 (`findings.md` `V1`, injection H). One `AgentsPane::list_area: Rect`, set where the pane is laid out, read by both. | ≈ −7 | ⬜ |
+| R26 | `phase_detail(cursor_node)` is derived **twice per frame** — once per row (`screen.rs:422`) and again for the footer (`:342` → `:741`), each reading `node.since.elapsed()` separately, so a boundary crossing could paint two ages in one frame. The footer should read the row it already built. | ≈ −2 | ⬜ |
+| R27 | The worktree path **string** is assembled in the UI although its doc claims core owns it: `format!("{}/{}", git::WORKTREE_DIR, node.id)` (`.mush/wt/{id}`) is spelled at `screen.rs:784`, `crates/mush-core/src/git.rs:161`, and in a test at `screen.rs:1011`. One `git::worktree_rel(id)`, used by `worktree_path` and the row. | ≈ −1 | ⬜ |
+| R28 | Test-only: `selected_rows` re-implements `shot` (same `set_term_size` + `screen()` + `Terminal::new` + `draw` + buffer read) at two call sites. One `fn painted(app, w, h) -> (Screen, Buffer)`. | ≈ −8 (tests) | ⬜ |
+| R29 | `busy_children(id)` is an O(n) scan called per node in `roster()`, per row in `agent_row` and once in `tree_line` — the same fact walked ~2n+1 times per frame — and `App::live_jobs`, the documented one door, is bypassed by `in_flight`. One per-frame `HashMap<AgentId, usize>`. | ≈ −3 | ⬜ |
+
+Confirmed **not** duplicated (do not re-litigate): `Screen` caches nothing and
+`App` holds no frame; `picker_width`/`picker_text_width`, `agents_columns`,
+`floor_notice`/`is_below_floor`, `phase_glyph`/`phase_detail`, `agent_detail`/
+`agent_footer`/`compact_footer`, `facts_line`/`git_cell`, `HINT`, `border(focused)`
+each have one home; `trim_trailing_blanks` and `FOOT_ROWS` have one owner
+(`Chat::painted`/`Chat::foot`); `job_lines` *is* `live_jobs().map`, not a second
+derivation; `git_cell` and the row's `place` answer different questions;
+`mush_core::text::{sanitize, truncate, fit_row}` are the only sanitary doors, and
+the sweep reads painted cells rather than source text.
+
+---
+
 ### Where the queues stand
 
 `D1`–`D8` landed in `58a309c`, and the measured deltas are in their status
