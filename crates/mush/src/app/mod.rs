@@ -1637,10 +1637,14 @@ impl App {
     /// keyboard all move together.
     fn attach_focus(&mut self, agent: u64) -> attach::Reply {
         let id = AgentId(agent);
-        if !self.tree.has(id) {
+        // One question, one answer: `point_cursor_at` asks the same "is #N in
+        // the tree?" of the rows the human actually sees and answers with
+        // whether the cursor landed on one. A separate `has` walk ahead of it
+        // was a second answer that agrees only while `rows()` paints every node
+        // (refactor R24).
+        if !self.tree.point_cursor_at(id) {
             return attach::Reply::Err(attach::ReplyError::bad_request(format!("no agent #{id}")));
         }
-        self.tree.point_cursor_at(id);
         self.focus_cursor_row();
         attach::Reply::Ok(serde_json::json!({}))
     }
