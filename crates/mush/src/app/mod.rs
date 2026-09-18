@@ -4661,10 +4661,18 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// How long one frame costs on a session the size of a real one. A frame
-    /// that does not fit in a 60 fps budget is felt as lag, so this is a
-    /// regression guard as much as a measurement.
+    /// How long one frame costs on a session the size of a real one.
+    ///
+    /// `#[ignore]`d on purpose: the 16 ms budget is a property of an *idle* box,
+    /// and this suite runs while sibling agents build on the same machine, so a
+    /// bar this tight flakes and a gate that is green "usually" is not a gate
+    /// (finding H6). Run it deliberately, alone, with
+    /// `cargo test -- --ignored a_frame_fits`.
+    ///
+    /// When it is run, a frame that does not fit a 60 fps budget is felt as lag,
+    /// so it is a regression guard as much as a measurement.
     #[test]
+    #[ignore = "the 16 ms budget needs an idle box; run it alone with --ignored"]
     fn a_frame_fits_in_a_60fps_budget_on_a_long_transcript() {
         use ratatui::backend::TestBackend;
         use ratatui::Terminal;
