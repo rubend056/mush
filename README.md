@@ -170,7 +170,7 @@ trimming only cuts in when the model itself cannot produce a summary.
 
 | Context | Keys |
 |---|---|
-| anywhere | `Tab`/`Shift-Tab` cycle panes (agents, chat) · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent, restarts the root) · `Ctrl-C` stop the focused agent — an idle one is left alone, and a cancel reaches a model that is still thinking · `Ctrl-X` stop every running agent · `Ctrl-P` model picker |
+| anywhere | `Tab`/`Shift-Tab` cycle panes (agents, chat) · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent, restarts the root) · `Ctrl-C` stop the focused agent — an idle one is left alone, and a cancel reaches a model that is still thinking · `Ctrl-X` stop every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning |
 | agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them · `←`/`→` the row's parent / its first child · `Enter` show its transcript, keys staying in the tree · `c` cancel it · `Esc` back to the root |
 | chat | typing · `Enter` send · `Shift`/`Alt-Enter` a new line · `←`/`→`, `Home`/`End` move the box cursor · `Backspace`/`Delete` · `↑`/`↓`, `PgUp`/`PgDn` scroll the transcript · `Esc` clear the box |
 | picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move, `PgUp`/`PgDn` page the list · `Enter` take the row · `Esc` close |
