@@ -1,9 +1,9 @@
 //! The system prompts and the tool schemas.
 //!
 //! These things *are* the agent contract. They are kept deliberately small: a
-//! model only has to know how to read, edit, run, and delegate — mush handles
-//! the rest. Leaf agents (at `MAX_DEPTH`) simply don't receive the
-//! orchestration tools, which is how deep chains stay bounded.
+//! model only has to know how to edit, run, and delegate — the shell does the
+//! reading and writing, and mush handles the rest. Leaf agents (at `MAX_DEPTH`)
+//! simply don't receive `spawn_agent`, which is how deep chains stay bounded.
 //!
 //! Ownership, so nothing is said twice: the prompts own *how to work* (the
 //! rules, the delegation policy, what the machine is like); each schema owns
@@ -18,9 +18,11 @@ use crate::tools::ToolName;
 /// subagent used to spell these rules twice, and the copies had drifted.
 const RULES: &str = "\
 Rules:\n\
-- Every tool already works inside the workspace: paths are workspace-relative (\"src/main.rs\", not an \
-absolute path) and run_command/edit/read already runs there with its cwd at the workspace root.\n\
-- Never touch paths outside the workspace.\n\
+- Work inside the workspace: paths are workspace-relative (\"src/main.rs\", not an absolute \
+path), and a command runs with its cwd at the workspace root. Never touch paths outside the \
+workspace.\n\
+- Read before you edit: use the shell (`sed -n '1,200p' file`, `rg pattern`) — `edit_file` needs \
+the exact text it replaces, and refuses a match that is missing or not unique.\n\
 - When you are done finish with a concise summary of what you did.";
 
 /// What is true of the machine for every agent, root or leaf. One home, read by
@@ -29,7 +31,8 @@ const MACHINE: &str = "\
 The machine is shared (CPU, ports, /tmp — a worktree isolates files, nothing else):\n\
 - A long command detaches into a job instead of dying: run_command answers \"[still running — detached \
 as #c2]\", detach=true asks for one at once, and any command that outlives 60s does it by itself. \
-command_status lists your jobs, wait_commands waits for one, command_control stops one.\n\
+status lists your children and your jobs, wait blocks until every one of them has finished, and \
+control stops one.\n\
 - exclusive=true owns the machine for timing- or port-sensitive work (a benchmark, a profiler, a fixed \
 port): a sibling's command queues behind it and is refused if the lock outlasts the wait (`#N holds the \
 machine`) — do not retry in a loop.";
@@ -44,16 +47,17 @@ Delegation:\n\
 must carry every fact, file, and the exact deliverable; title is three words naming it in the tree.\n\
 - base gives the child its own worktree and branch forked from that ref, so siblings with bases run in \
 parallel; without one the child works in this workspace, and only one such child may run at a time. \
-Decide up front, or wait_agents for the running one first. (The check can only fail after the brief \
+Decide up front, or wait for the running one first. (The check can only fail after the brief \
 exists, so decide before writing it.)\n\
 - A subagent runs until it stops calling tools, so a brief is bounded by the work, not a turn count: \
 split by what is independent, not by how long you think it takes.\n\
 - Delegate independent, large, or context-heavy subtasks; do single edits and lookups yourself. Prefer \
 a few big delegations over many small ones.\n\
-- wait_agents blocks until a child finishes: no ids means the *first* finish, all=true every child; its \
-answer hands over an unread result's full summary, and an already-read one comes back as a digest. \
-Ending your turn while children still run is fine: they keep working and you are woken with their \
-\"#N done: summary\" results as each finishes.";
+- wait blocks until every child and every job you own has finished, then answers with one digest: a \
+result you have not read comes in full, one you have already read as a line. status lists what is in \
+flight; control stops or messages one.\n\
+- Ending your turn while children still run is fine: they keep working and a finish wakes you with its \
+\"#N done: summary\". wait is optional — use it when you want the results now.";
 
 /// The whole root-agent system prompt. If this grows much, something else went
 /// wrong.
@@ -74,9 +78,9 @@ pub fn system_prompt(root: &str) -> String {
 /// as the first user message, mirroring the root's system+user shape.
 /// `root` is what a human reading a log would recognise as this agent's
 /// workspace. It is deliberately *not* offered as something to type: an
-/// isolated agent's worktree is its cwd already, and an absolute path is
-/// refused by every file tool, so naming it in a command is a mistake the
-/// prompt should not invite.
+/// isolated agent's worktree is its cwd already, and `edit_file` refuses an
+/// absolute path, so naming it in a command is a mistake the prompt should not
+/// invite.
 ///
 /// `delegates` is whether this agent gets the orchestration tools (depth below
 /// `MAX_DEPTH`): the policy reads exactly when the tools are there (audit row
@@ -123,54 +127,10 @@ fn tool(name: ToolName, description: &str, parameters: Value) -> Value {
     })
 }
 
-/// The three arguments both waits take, written once: they promise the same
-/// release rule and the same defaults. Only `ids` may differ.
-fn wait_parameters(ids: &str) -> Value {
-    json!({
-        "type": "object",
-        "properties": {
-            "ids": { "type": "array", "items": { "type": "integer" }, "description": ids },
-            "timeout": { "type": "integer", "description": "Seconds to wait; 0 waits forever. Default 600." },
-            "all": { "type": "boolean", "description": "Every result, not just the first." }
-        }
-    })
-}
-
 /// JSON-Schema tool definitions in the OpenAI `tools` format, keyed by the tool
 /// they describe: a schema without an executor cannot be written down.
 pub fn tool_schemas() -> Vec<Value> {
     vec![
-        tool(
-            ToolName::ListFiles,
-            "List files, optionally under a subdirectory.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string", "description": "Workspace-relative directory, default the root." }
-                }
-            }),
-        ),
-        tool(
-            ToolName::ReadFile,
-            "Read a file.",
-            json!({
-                "type": "object",
-                "properties": { "path": { "type": "string", "description": "Workspace-relative file path." } },
-                "required": ["path"]
-            }),
-        ),
-        tool(
-            ToolName::WriteFile,
-            "Create or replace a file.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "path": { "type": "string" },
-                    "content": { "type": "string", "description": "The complete new content." }
-                },
-                "required": ["path", "content"]
-            }),
-        ),
         tool(
             ToolName::EditFile,
             "Replace text: one old_string/new_string, or `edits` for several replacements at once. A batch lands all-or-nothing in one call, so prefer it for multi-part changes. Ambiguous matches are refused unless replace_all is set.",
@@ -199,7 +159,7 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::RunCommand,
-            "Run a shell command in the workspace root.",
+            "Run a shell command in the workspace root. The result is capped to fit the context window; a capped result says so — rerun it narrower (rg, head, a smaller path) to see the rest.",
             json!({
                 "type": "object",
                 "properties": {
@@ -224,51 +184,33 @@ pub fn tool_schemas() -> Vec<Value> {
             }),
         ),
         tool(
-            ToolName::WaitAgents,
-            "Block until a child finishes. Returns an unread result's summary; an already-read one as \
-             a marked digest.",
-            wait_parameters("Child ids. Empty means any child: the first finish."),
-        ),
-        tool(
-            ToolName::AgentStatus,
-            "List your children and their state: a one-line digest per result, unread ones marked. A \
-             listing, not a delivery \u{2014} wait_agents hands summaries over.",
+            ToolName::Status,
+            "List your children and your jobs in one place: each child's state and title or branch, each \
+             job's state, age and command. A listing, not a delivery \u{2014} wait hands results over.",
             json!({ "type": "object", "properties": {} }),
         ),
         tool(
-            ToolName::AgentControl,
-            "Stop a child or message it. Stopping is not finishing: it keeps its context and work, and a later message resumes it.",
+            ToolName::Control,
+            "Stop or message one thing you own: a child agent (`2`) or a job (`c2`), as status names it. \
+             `message` is agent-only \u{2014} it steers a child, resuming one at rest, and needs `text`. \
+             Stopping a child is not finishing: it keeps its context and work.",
             json!({
                 "type": "object",
                 "properties": {
-                    "id": { "type": "integer" },
+                    "id": { "type": "string", "description": "The target as status lists it: `2` for child agent #2, `c2` for job #c2." },
                     "action": { "type": "string", "enum": ["stop", "message"] },
-                    "text": { "type": "string", "description": "Text, when action is message." }
+                    "text": { "type": "string", "description": "The message, when action is message. Agent-only \u{2014} a job cannot be messaged." }
                 },
                 "required": ["id", "action"]
             }),
         ),
         tool(
-            ToolName::CommandStatus,
-            "List your jobs: what is running, how long, and the end of what it wrote.",
+            ToolName::Wait,
+            "Block until everything you own has finished \u{2014} every child and every job \u{2014} then \
+             answer with one digest: a result you have not read comes in full, an already-read one as a \
+             line. Returns at once when nothing is in flight. Cancellable; a nudge or a message ends the \
+             wait.",
             json!({ "type": "object", "properties": {} }),
-        ),
-        tool(
-            ToolName::CommandControl,
-            "Stop one of your jobs.",
-            json!({
-                "type": "object",
-                "properties": {
-                    "id": { "type": "integer", "description": "The number in `#c2`." },
-                    "action": { "type": "string", "enum": ["stop"] }
-                },
-                "required": ["id", "action"]
-            }),
-        ),
-        tool(
-            ToolName::WaitCommands,
-            "Block until a job finishes, or the timeout expires; returns its exit status and the end of its output.",
-            wait_parameters("Job ids; empty means all of yours."),
         ),
     ]
 }
@@ -319,8 +261,8 @@ mod tests {
         assert_eq!(leaf_names, workspace);
     }
 
-    /// Depth is bounded by what a leaf can see: the delegation tools are gone
-    /// and the job tools stay.
+    /// Depth is bounded by what a leaf can see: the one delegation tool is gone
+    /// and the workspace and job tools stay.
     #[test]
     fn a_leaf_keeps_the_workspace_and_job_tools() {
         let leaf = leaf_tool_schemas();
@@ -328,15 +270,11 @@ mod tests {
             .iter()
             .map(|schema| schema["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 8);
-        for kept in [
-            "edit_file",
-            "command_status",
-            "command_control",
-            "wait_commands",
-        ] {
+        assert_eq!(names.len(), 5);
+        for kept in ["edit_file", "run_command", "status", "control", "wait"] {
             assert!(names.contains(&kept), "a leaf loses {kept}");
         }
+        assert!(!names.contains(&"spawn_agent"), "{names:?}");
     }
 
     /// The root's schemas must fit the tokens `Config::history_budget`
@@ -352,25 +290,35 @@ mod tests {
         );
     }
 
-    /// The two waits take the same three arguments: `wait_parameters` writes
-    /// them once, and only `ids` may differ.
+    /// `wait` takes no arguments: it is "everything I own has finished", and a
+    /// parameter is exactly the reasoning (ids? all? timeout?) H15 found a
+    /// model getting wrong. The two parameterless listings take none either.
     #[test]
-    fn the_two_wait_tools_take_the_same_arguments() {
-        let prop = |tool: &str, key: &str| {
+    fn the_control_and_wait_schemas_are_parameterless_where_they_promise() {
+        let schema = |tool: &str| {
             tool_schemas()
                 .into_iter()
                 .find(|schema| schema["function"]["name"] == tool)
-                .expect("the wait tool has a schema")["function"]["parameters"]["properties"][key]
+                .expect("the tool has a schema")["function"]["parameters"]
                 .clone()
         };
-        for key in ["timeout", "all"] {
+        for tool in ["wait", "status"] {
             assert_eq!(
-                prop("wait_agents", key),
-                prop("wait_commands", key),
-                "{key} is one promise, not two"
+                schema(tool)["properties"].as_object().map(|p| p.len()),
+                Some(0),
+                "{tool} takes no arguments"
             );
         }
-        assert_ne!(prop("wait_agents", "ids"), prop("wait_commands", "ids"));
+        // `control` names its target as `status` prints it, and `message` says
+        // it is the agent-only action.
+        let control = schema("control");
+        assert_eq!(control["properties"]["id"]["type"], "string");
+        assert_eq!(control["properties"]["action"]["enum"][1], "message");
+        assert!(control["properties"]["text"]["description"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("agent-only"));
     }
 
     #[test]
@@ -383,7 +331,7 @@ mod tests {
         assert!(!prompt.contains("port the parser"));
         // Subagents get the same workspace rules as the root, from one block.
         assert!(prompt.contains("Rules:"));
-        assert!(prompt.contains("Every tool already works inside the workspace"));
+        assert!(prompt.contains("Read before you edit"));
         assert!(prompt.contains("`/tmp/x`"));
     }
 

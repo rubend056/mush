@@ -52,7 +52,7 @@ pub trait Job: Send {
     /// The *last* `cap` bytes of each stream, marked when truncated. This is
     /// the window a detached job keeps: a job ends, and what it ended with is
     /// the part worth reading (see `crate::jobs`). A running job is read from
-    /// here too, so what `command_status` shows and what the completion reports
+    /// here too, so what `status` shows and what the completion reports
     /// are the same bytes.
     fn tail(&self, cap: usize) -> (String, String);
 

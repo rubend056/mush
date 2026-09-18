@@ -28,7 +28,7 @@ use mush_core::transcript::{
     needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
     COMPACT_REPLY_TOKENS,
 };
-use mush_core::{prompt, tools, Config, Message, Workspace, CMD_CAP, CMD_TIMEOUT_SECS};
+use mush_core::{prompt, tools, Config, Message, Workspace, CMD_TIMEOUT_SECS};
 
 use crate::app::{
     tokens_label, AgentId, Compacting, ConfigHandle, ConversationId, Msg, WindowSource,
@@ -139,7 +139,7 @@ fn refusal_error(reason: &str) -> String {
 }
 
 /// Consecutive cut-off replies before the run gives up. A cut reply is usually
-/// a *too big* answer — a whole file in one `write_file`, or a long reasoning
+/// a *too big* answer — a big edit in one call, or a long reasoning
 /// pass — not a broken model, so the run asks for smaller pieces and carries
 /// on. It is bounded because a model that cannot write small enough is not
 /// going to start now.
@@ -148,9 +148,9 @@ const TRUNCATION_ROUNDS: usize = 3;
 pub const MAX_DEPTH: usize = 3;
 /// Hard ceiling on simultaneously running agents across the whole tree.
 const MAX_AGENTS: u64 = 16;
-/// Default `wait_agents` timeout in seconds; 0 means forever.
+/// Default `wait` timeout in seconds; 0 means forever.
 const WAIT_TIMEOUT_SECS: u64 = 600;
-/// How wide one line of an `agent_status` digest may be, in columns. A listing
+/// How wide one line of a `status` digest may be, in columns. A listing
 /// is for telling children apart and knowing what is unread; the body itself
 /// travels through the delivery roads, once (see [`Outcome::digest`]).
 const DIGEST_COLUMNS: usize = 100;
@@ -174,7 +174,7 @@ const CANCELLED: &str = "cancelled";
 pub enum Outcome {
     /// The run finished; the string is its summary.
     Finished(String),
-    /// The run was stopped (Ctrl-C, `agent_control stop`, or the tree being shut
+    /// The run was stopped (Ctrl-C, `control stop`, or the tree being shut
     /// down by Ctrl-N). Not a result and not a failure: the actor is idle and
     /// resumable.
     Stopped,
@@ -224,7 +224,7 @@ impl Work {
         }
     }
 
-    /// A bounded suffix for `agent_status`: where the work is and whether it
+    /// A bounded suffix for `status`: where the work is and whether it
     /// is committed. Never the body of anything, and never a read.
     fn digest(&self) -> String {
         match self {
@@ -369,7 +369,7 @@ impl Outcome {
             Outcome::Finished(summary) => format!("#{id} done: {summary}"),
             Outcome::Stopped => format!(
                 "#{id} stopped: the run ended before it finished — this agent is idle, \
-                 not done; agent_control message resumes it"
+                 not done; control message resumes it"
             ),
             Outcome::CutOff => format!(
                 "#{id} cut off: the run never ended — nothing was committed; \
@@ -388,7 +388,7 @@ impl Outcome {
         !matches!(self, Outcome::Stopped)
     }
 
-    /// A bounded rendering of this outcome for a *listing* (`agent_status`):
+    /// A bounded rendering of this outcome for a *listing* (`status`):
     /// the first line, cut at [`DIGEST_COLUMNS`], plus the size of the whole.
     ///
     /// Never the body. A listing is not a delivery: the body is handed to the
@@ -440,7 +440,7 @@ pub enum AgentMsg {
     /// these words before sending them, so the actor folds them in without
     /// telling it to add them again.
     Nudge(String),
-    /// A steering message from another agent — what `agent_control message`
+    /// A steering message from another agent — what `control message`
     /// sends (`docs/findings.md` B22). It is the same kind of work as a nudge
     /// and travels the same roads, but it is *not* the human's own typing: the
     /// UI has never seen these words, so the actor emits the line as it folds
@@ -474,7 +474,7 @@ pub enum AgentMsg {
     /// (`docs/findings.md` B24).
     ChildDone { id: u64, run: u64, outcome: Outcome },
     /// How the run named by `run` left its worktree, sent with its `ChildDone`.
-    /// Not a result and not a delivery: a listing fact (`agent_status`), so it
+    /// Not a result and not a delivery: a listing fact (`status`), so it
     /// starts no run and marks nothing read (finding H1).
     Work { id: u64, run: u64, work: Work },
     /// A child that was at rest began a run the parent did not start: the human
@@ -528,7 +528,7 @@ pub enum AgentEvent {
     Stopped,
     /// The parent has read a child's result: the line is in its transcript now,
     /// wherever it came from — the fold at a message boundary, the wake-up a
-    /// napping parent got, or a `wait_agents` that asked for it.
+    /// napping parent got, or a `wait` that asked for it.
     ///
     /// Emitted by the *parent* (the id it is tagged with) about the child it
     /// names, because the parent owns the `delivered` set. This is that fact
@@ -619,7 +619,7 @@ pub struct AgentCtx {
     /// is machine-wide, the lock is machine-wide, and Ctrl-N kills what the old
     /// tree left running (`crate::jobs`).
     pub registry: Arc<jobs::Registry>,
-    /// The clock every wait is measured against. `wait_agents` and a running
+    /// The clock every wait is measured against. `wait` and a running
     /// command are the two places mush spends real time, so both read it here:
     /// a test can reach a timeout or a deadline by advancing a fake instead of
     /// waiting for the real one.
@@ -661,7 +661,7 @@ struct ActorState {
     /// arrives — even mid-batch — and folded into the transcript by
     /// [`fold_completions`].
     completed: HashMap<u64, Completion>,
-    /// The run of each child whose outcome the model has read (via `wait_agents`
+    /// The run of each child whose outcome the model has read (via `wait`
     /// or a folded line). A *later* run leaves this mark naming an older run, so
     /// the new outcome is announced; re-recording the run the mark names changes
     /// nothing, which is what keeps one piece of news from folding twice
@@ -688,7 +688,7 @@ struct ActorState {
     shared: HashSet<u64>,
     /// How each child's last finished run left its worktree, keyed by the run
     /// that left it: the branch, and whether the work is committed. A listing
-    /// fact (`agent_status`), never a delivery: reading it marks nothing, and
+    /// fact (`status`), never a delivery: reading it marks nothing, and
     /// it is paired with the completion's run so an old branch can never be
     /// read as the newer run's work (finding H1).
     work: HashMap<u64, (u64, Work)>,
@@ -743,7 +743,7 @@ impl ActorState {
     }
 
     /// Whether `id`'s latest recorded outcome is one the model has not read.
-    /// The one derivation of the `✉` mark: `agent_status` prints it, and the
+    /// The one derivation of the `✉` mark: `status` prints it, and the
     /// delivery roads consume it (a run recorded again under a mark that names
     /// it is not fresh). A child with no recorded outcome is not unread — there
     /// is nothing to read.
@@ -1468,7 +1468,7 @@ fn absorb(
 /// plain directory that no surface — not `git status`, not `git diff`, not
 /// `git merge` — can show, diff or land (finding S1). `App::deliver` refuses the
 /// human's own message before it is sent; this is the backstop for every other
-/// sender (a parent's `agent_control message`).
+/// sender (a parent's `control` message).
 fn worktree_gone(actor: &Actor) -> bool {
     actor.branch.is_some() && !actor.ws.root().exists()
 }
@@ -1822,7 +1822,7 @@ fn run_loop(
                 actor.ctx.emit(actor.id, AgentEvent::Message(message));
             }
             // A cut-off reply is not a result, but it is usually a *big* answer
-            // rather than a broken model (a whole file in one `write_file`, or
+            // rather than a broken model (a whole file in one `run_command`, or
             // a long reasoning pass). Ask for smaller pieces and carry on;
             // only keep failing if the model will not write that small.
             cut_offs += 1;
@@ -2048,9 +2048,10 @@ next run needs to know.";
 /// work that was already written before the cut.
 const TRUNCATION_INSTRUCTION: &str = "\
 Your previous reply was cut off by the endpoint's length limit, so none of it \
-ran. Do the same work in smaller steps: one file per call, a few hundred lines \
-at a time (write the first part with write_file, then add the rest with \
-edit_file). Do not repeat work you already completed in earlier calls.";
+ran. Do the same work in smaller steps: one file or edit per call, a few hundred \
+lines at a time (create a file with a heredoc — `cat > file <<'EOF'` — then \
+extend it with `edit_file`). Do not repeat work you already completed in \
+earlier calls.";
 
 /// What a human who typed `/compact` is told when there is nothing to fold.
 ///
@@ -2504,7 +2505,7 @@ fn push_line(actor: &Actor, messages: &mut Vec<Message>, text: String) {
 /// any of them is *news* (a result, which the model still has to answer).
 ///
 /// This is the one home of "a result is never lost just because nobody called
-/// `wait_agents` in time" (docs/mush.md §5.5), and it runs at *every* message
+/// `wait` in time" (docs/mush.md §5.5), and it runs at *every* message
 /// boundary: after a batch of tool results, and on a tool-free turn. It used to
 /// run only on the tool-free turn, so a parent in a long chain of tool calls —
 /// sixty turns of reading, editing and running the gate — never heard that its
@@ -2584,21 +2585,11 @@ fn exec_tool(
     let answer = match tool {
         ToolName::RunCommand => return run_command(actor, state, args, cancel),
         ToolName::SpawnAgent => spawn_tool(actor, state, args),
-        ToolName::WaitAgents => wait_tool(actor, state, cancel, args),
-        ToolName::AgentStatus => status_tool(state),
-        ToolName::AgentControl => control_tool(state, args),
-        ToolName::CommandStatus => command_status_tool(actor),
-        ToolName::CommandControl => command_control_tool(actor, args),
-        ToolName::WaitCommands => wait_commands_tool(actor, state, cancel, args),
-        // The file tools read and write the workspace directly.
-        ToolName::ListFiles | ToolName::ReadFile | ToolName::WriteFile | ToolName::EditFile => {
-            let cfg = actor
-                .ctx
-                .cfg
-                .config()
-                .unwrap_or_else(|_| Config::new("http://127.0.0.1:1", "", None));
-            direct_tool(&actor.ws, tool, args, &cfg)
-        }
+        ToolName::Status => status_tool(actor, state),
+        ToolName::Control => control_tool(actor, state, args),
+        ToolName::Wait => wait_tool(actor, state, cancel),
+        // `edit_file` is the one file operation the shell cannot do safely.
+        ToolName::EditFile => edit_tool(&actor.ws, args),
     };
     answer.map_err(ToolError::Failed)
 }
@@ -2614,7 +2605,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     if ctx.live.load(Ordering::SeqCst) >= MAX_AGENTS {
         return Err(format!(
             "cannot spawn: {MAX_AGENTS} agents are already running tree-wide (the limit). \
-             Wait for one with wait_agents before spawning another."
+             Wait for one with wait before spawning another."
         ));
     }
     let brief = tools::arg_string(args, "brief")?;
@@ -2663,7 +2654,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
             return Err(format!(
                 "cannot spawn: {names} already runs in this shared workspace, and only one shared child \
                  may run at a time. Pass base=<branch or commit> to give a sibling its own worktree, or \
-                 wait_agents for it first."
+                 wait for it first."
             ));
         }
     }
@@ -2761,7 +2752,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // guard far past any real task, so this is not a budget to size a brief
     // against any more.
     Ok(format!(
-        "spawned agent #{id}{on}{at} · runs until it stops calling tools · wait_agents returns its summary"
+        "spawned agent #{id}{on}{at} · runs until it stops calling tools · wait returns its summary"
     ))
 }
 
@@ -2807,131 +2798,18 @@ fn parked_message(state: &ActorState) -> Option<Waiting> {
     said
 }
 
-fn wait_tool(
-    actor: &Actor,
-    state: &mut ActorState,
-    cancel: &AtomicBool,
-    args: &Value,
-) -> Result<String, String> {
-    let ids: Vec<u64> = args
-        .get("ids")
-        .and_then(Value::as_array)
-        .map(|list| list.iter().filter_map(Value::as_u64).collect())
-        .unwrap_or_default();
-    let candidates: Vec<u64> = if ids.is_empty() {
-        let mut children: Vec<u64> = state.children.keys().copied().collect();
-        children.sort_unstable();
-        children
-    } else {
-        ids
-    };
-    if candidates.is_empty() {
-        return Ok("no child agents to wait for".to_string());
+fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Result<String, String> {
+    // `wait` has no arguments: "everything I own has finished" is the only
+    // thing the call can mean now (finding H15 — a model that reasoned
+    // `ids`/`all`/`timeout` wrong waited nine minutes on a child that was
+    // already dead). The release rule is the whole name.
+    let owned =
+        !state.children.is_empty() || !state.running_jobs.is_empty() || !state.done_jobs.is_empty();
+    if !owned {
+        return Ok("nothing to wait for: no children and no jobs".to_string());
     }
-    // Waiting on an id that was never spawned would block for the whole
-    // timeout and then claim the agents are still running. Say so instead.
-    let unknown: Vec<String> = candidates
-        .iter()
-        .filter(|id| !state.children.contains_key(id))
-        .map(|id| format!("#{id}"))
-        .collect();
-    if !unknown.is_empty() {
-        return Err(format!(
-            "no such child agent(s): {} — agent_status lists yours",
-            unknown.join(", ")
-        ));
-    }
-    // Whether any candidate still runs, as the parent's books have it. While
-    // one does, an already-read result is not what a wait is for: returning it
-    // instantly makes "blocks until a child finishes" a lie, and a model that
-    // retries the wait is stopped by the loop guard (audit row 3).
-    let any_running = candidates.iter().any(|id| state.running.contains(id));
-    let mut results = WaitResults {
-        // Pure: which children hold a result this waiter can be given. Asking
-        // must not read anything — `deliver` is what the answer actually hands
-        // over, and only for the results this call returns (a poll that marked
-        // every ready child would swallow bodies the model never saw).
-        is_ready: &mut move |state: &ActorState, id: u64| {
-            state.completed.contains_key(&id) && (!any_running || state.unread(id))
-        },
-        // One home decides whether this answer is the model's first read of the
-        // run (`record_child`). A fresh result is delivered in full — the shape
-        // the fold uses, so adoption still recognises it — and the child's `✉`
-        // goes out with it. A result the model has already read is answered
-        // with its digest and said to be old, never with the body again
-        // (finding H15: a wait must not report the past as news, and must not
-        // replay a report the model has answered).
-        deliver: &mut |state, id| {
-            let Some(completion) = state.completed.get(&id).cloned() else {
-                return format!("#{id} (no result recorded)");
-            };
-            let digest = completion.outcome.digest(id);
-            let (body, fresh) = state.record_child(id, completion.run, completion.outcome);
-            if fresh {
-                actor
-                    .ctx
-                    .emit(actor.id, AgentEvent::ResultRead { child: id });
-                body
-            } else {
-                format!("{digest} (already read — no new run since)")
-            }
-        },
-    };
-    wait_for_results(
-        actor,
-        state,
-        cancel,
-        args,
-        &candidates,
-        jobs::Waited::Agents,
-        &mut results,
-    )
-}
-
-/// The two questions a wait asks about one candidate, in one value — so the
-/// wait itself stays a small function rather than an argument list.
-///
-/// `is_ready` is a *pure* question (`true` = a result exists) and never touches
-/// the records; `deliver` turns one chosen result into the line the model
-/// reads, and is called only for the results a call actually returns. The split
-/// is the fix for a wait that asked about every child: it used to
-/// render-and-mark each ready one while returning only the first, so one wait
-/// silently marked results the model was never handed as read.
-struct WaitResults<'a> {
-    is_ready: &'a mut dyn FnMut(&ActorState, u64) -> bool,
-    deliver: &'a mut dyn FnMut(&mut ActorState, u64) -> String,
-}
-
-/// The one blocking wait `wait_agents` and `wait_commands` both run: poll the
-/// mailbox, honour a cancellation, notice the human, stop at the deadline, and
-/// return whatever results are ready. The two tools differ only in what "a
-/// result" is — a child's outcome or a job's report line — which the caller
-/// supplies ([`WaitResults`]), so the subtle parts (the deadline, the parked
-/// human, the cancel) exist once.
-fn wait_for_results(
-    actor: &Actor,
-    state: &mut ActorState,
-    cancel: &AtomicBool,
-    args: &Value,
-    candidates: &[u64],
-    waiting_for: jobs::Waited,
-    results: &mut WaitResults<'_>,
-) -> Result<String, String> {
-    // `all` asks for every result instead of the first one: the first is what an
-    // orchestrator wants the moment one delegate is free, and `all` is what it
-    // wants before it proceeds with the whole set.
-    let all = args.get("all").and_then(Value::as_bool).unwrap_or(false);
-    let timeout = args
-        .get("timeout")
-        .and_then(Value::as_u64)
-        .unwrap_or(WAIT_TIMEOUT_SECS);
-    // A model-supplied timeout must never overflow the clock; an
-    // unrepresentable one just means "forever" (0 means that too).
     let clock = actor.ctx.clock.as_ref();
-    let deadline = (timeout > 0)
-        .then(|| clock.now().checked_add(Duration::from_secs(timeout)))
-        .flatten();
-
+    let deadline = clock.now() + Duration::from_secs(WAIT_TIMEOUT_SECS);
     loop {
         // This is the one tool that blocks for minutes, so it is also the one
         // that must notice a cancellation (and a completion) promptly.
@@ -2950,90 +2828,131 @@ fn wait_for_results(
                 Waiting::Parent => "your parent sent you a message",
             };
             return Ok(format!(
-                "interrupted — {who} while you waited; it is in \
-                 your transcript. Answer it; your {} are still running. Use {} again when \
-                 you need a result.",
-                waiting_for.noun(),
-                waiting_for.tool()
+                "interrupted — {who} while you waited; it is in your transcript. Answer it; \
+                 your work is still running. Use wait again when you need a result."
             ));
         }
-        let mut finished: Vec<u64> = Vec::new();
-        let mut waiting = Vec::new();
-        for id in candidates {
-            if (results.is_ready)(state, *id) {
-                finished.push(*id);
-            } else {
-                waiting.push(waiting_for.label(*id));
+        let running = in_flight(state);
+        if running.is_empty() {
+            // Everything this agent owns has finished (or was already): hand
+            // over every result in one digest. Nothing in flight returns at
+            // once, here.
+            let answers = wait_digest(actor, state, false);
+            if answers.is_empty() {
+                return Ok("nothing to wait for: no children and no jobs".to_string());
             }
-        }
-        // What this call returns: the first ready child, or every one of them
-        // once nothing is left running. Only these are delivered.
-        let take = if all {
-            if waiting.is_empty() {
-                finished.len()
-            } else {
-                0
-            }
-        } else {
-            usize::from(!finished.is_empty())
-        };
-        if take > 0 {
-            // A "first finish" answer is a *fresh* one when there is one: an
-            // unread result outranks an already-read one, so a wait for news
-            // never answers the digest of the old while the new result sits in
-            // the same list. `all` keeps the order the candidates were asked
-            // about.
-            let chosen: Vec<u64> = if all {
-                finished.clone()
-            } else {
-                let at = finished
-                    .iter()
-                    .position(|id| state.unread(*id))
-                    .unwrap_or(0);
-                vec![finished[at]]
-            };
-            let answers: Vec<String> = chosen
-                .iter()
-                .map(|id| (results.deliver)(state, *id))
-                .collect();
             return Ok(answers.join("\n"));
         }
-        if let Some(deadline) = deadline {
-            if clock.now() >= deadline {
-                // What is known is returned, and what is not is named: a wait
-                // that timed out is not a wait that lost the results.
-                let note = format!("wait timed out — {} still running", waiting.join(", "));
-                if finished.is_empty() {
-                    return Ok(note);
-                }
-                let answers: Vec<String> = finished
-                    .iter()
-                    .map(|id| (results.deliver)(state, *id))
-                    .collect();
-                return Ok(format!("{}\n{note}", answers.join("\n")));
+        if clock.now() >= deadline {
+            // What is known is returned, and what is not is named: a wait that
+            // timed out is not a wait that lost the results. Only the *unread*
+            // ones travel — a result the model has already read is the past,
+            // and a timeout is not the moment to report it as news (H15).
+            let note = format!("wait timed out — {} still running", running.join(", "));
+            let answers = wait_digest(actor, state, true);
+            if answers.is_empty() {
+                return Ok(note);
             }
+            return Ok(format!("{}\n{note}", answers.join("\n")));
         }
         clock.sleep(Duration::from_millis(50));
     }
 }
 
-/// `agent_status`: what this agent's children are doing, as a bounded listing.
+/// Everything this agent owns that is still running, as the labels the model
+/// reads: its children (`#2`) and its jobs (`#c2`). One `wait` means all of it —
+/// the two id spaces are separate, so a child and a job may share a number and
+/// both must be counted — and this is the set that keeps blocking.
+fn in_flight(state: &ActorState) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut children: Vec<u64> = state
+        .children
+        .keys()
+        .copied()
+        .filter(|id| state.running.contains(id))
+        .collect();
+    children.sort_unstable();
+    out.extend(children.into_iter().map(|id| format!("#{id}")));
+    let mut jobs: Vec<u64> = state.running_jobs.iter().copied().collect();
+    jobs.sort_unstable();
+    out.extend(jobs.into_iter().map(jobs::label));
+    out
+}
+
+/// Every result this agent has, in id order: children first, then jobs. A
+/// child's result nobody has read comes in full and is marked read; one already
+/// read comes as its digest, never the body again, and never the past reported
+/// as news (finding H15/B26). A job's report is its line, and asking twice
+/// answers with the line twice — a job ends once, so there is no "already read"
+/// digest to give.
 ///
-/// A listing is not a delivery. Each child's outcome is rendered as a digest —
-/// the first line, cut at [`DIGEST_COLUMNS`], with the size of the whole — and
-/// the results the model has not read yet wear `✉`. A finished isolated run
-/// also carries [`Work`]'s suffix: its branch and whether its work is
-/// committed, paired with the run the outcome came from (finding H1). The body
-/// itself reaches the
-/// model exactly once, through the fold, the wake, or an explicit wait (the
-/// roads that ask [`ActorState::record_child`]). Printing the bodies here is
-/// what made a parent that polled its children re-read every report on every
-/// call; the `✉` tells it what is still worth waiting for, which is the fact a
-/// listing owes a reader.
-fn status_tool(state: &ActorState) -> Result<String, String> {
-    if state.children.is_empty() {
-        return Ok("no child agents".to_string());
+/// `fresh_only` is the timeout's answer: only results nobody has read, because
+/// the wait did not finish and a digest of something already answered is not
+/// what the model is waiting for.
+fn wait_digest(actor: &Actor, state: &mut ActorState, fresh_only: bool) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut children: Vec<u64> = state
+        .completed
+        .keys()
+        .copied()
+        .filter(|id| state.children.contains_key(id))
+        .collect();
+    children.sort_unstable();
+    for id in children {
+        if fresh_only && !state.unread(id) {
+            continue;
+        }
+        let Some(completion) = state.completed.get(&id).cloned() else {
+            continue;
+        };
+        let digest = completion.outcome.digest(id);
+        let (body, fresh) = state.record_child(id, completion.run, completion.outcome);
+        if fresh {
+            actor
+                .ctx
+                .emit(actor.id, AgentEvent::ResultRead { child: id });
+            out.push(body);
+        } else {
+            out.push(format!("{digest} (already read — no new run since)"));
+        }
     }
+    let mut jobs: Vec<u64> = state.done_jobs.keys().copied().collect();
+    jobs.sort_unstable();
+    for id in jobs {
+        if let Some(report) = state.done_jobs.get(&id).cloned() {
+            let line = state
+                .record_job(id, report.line.clone(), report.news)
+                .unwrap_or(report.line);
+            out.push(line);
+        }
+    }
+    out
+}
+
+/// `status`: what this agent's children *and* jobs are doing, in one listing.
+///
+/// The two used to be two calls (`agent_status`, `command_status`), which is
+/// the wrong shape for the question a model actually has — "what have I got in
+/// flight?" — and made it poll both. A listing is not a delivery: each child's
+/// outcome is a digest, each job's is its current line, `✉` marks the results
+/// nobody has read, and `wait` is what hands them over.
+fn status_tool(actor: &Actor, state: &ActorState) -> Result<String, String> {
+    let jobs = actor.ctx.registry.status_for(actor.id);
+    let mut sections = Vec::new();
+    if !state.children.is_empty() {
+        sections.push(format!("agents:\n{}", child_listing(state)));
+    }
+    if jobs != "no jobs" {
+        sections.push(format!("jobs:\n{jobs}"));
+    }
+    if sections.is_empty() {
+        return Ok("no children and no jobs".to_string());
+    }
+    Ok(sections.join("\n"))
+}
+
+/// The child half of `status`: one line per child, in id order.
+fn child_listing(state: &ActorState) -> String {
     let mut lines = Vec::new();
     let mut ids: Vec<u64> = state.children.keys().copied().collect();
     ids.sort_unstable();
@@ -3060,7 +2979,7 @@ fn status_tool(state: &ActorState) -> Result<String, String> {
                 lines.push(format!("{unread}{}{work}", outcome.digest(id)));
             }
             Some(Outcome::Stopped) => lines.push(format!(
-                "{unread}#{id} ⊘ stopped — idle and resumable (agent_control message resumes it){work}"
+                "{unread}#{id} ⊘ stopped — idle and resumable (control message resumes it){work}"
             )),
             // A run that never ended. Its own line, because the parent's next
             // move depends on it: there is no result coming and the work may be
@@ -3071,35 +2990,84 @@ fn status_tool(state: &ActorState) -> Result<String, String> {
             None => lines.push(format!("#{id} ◐ running")),
         }
     }
-    Ok(lines.join("\n"))
+    lines.join("\n")
 }
 
-fn control_tool(state: &mut ActorState, args: &Value) -> Result<String, String> {
-    let id = args
-        .get("id")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "missing `id`".to_string())?;
+/// `control`: stop or message one thing this agent owns — a child or a job.
+///
+/// The target is named the way `status` lists it, because the two id spaces are
+/// separate: a child is `#2` (and `2`), a job is `#c2` (and `c2`). An integer id
+/// could not tell a child #2 from a job #c2, and both can be this agent's at
+/// once, so the label carries which.
+fn control_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<String, String> {
+    let target = tools::arg_string(args, "id")?;
     let action = tools::arg_string(args, "action")?;
+    match parse_target(&target)? {
+        Target::Job(id) => match action.as_str() {
+            "stop" => actor.ctx.registry.stop(actor.id, id),
+            other => Err(format!(
+                "unknown action `{other}` for a job ({}) — a job can only be stopped",
+                jobs::label(id)
+            )),
+        },
+        Target::Agent(id) => match action.as_str() {
+            "stop" => stop_agent(state, id),
+            "message" => message_agent(state, args, id),
+            other => Err(format!(
+                "unknown action `{other}` for agent #{id} (stop or message)"
+            )),
+        },
+    }
+}
+
+/// A `control` target, parsed from what `status` printed.
+enum Target {
+    Agent(u64),
+    Job(u64),
+}
+
+/// Read `control`'s `id`: `#c2`/`c2` names a job, `#2`/`2` a child agent. The
+/// leading `#` is optional because `status` prints one and a model often copies
+/// it; the `c` is not, because a bare number could be either.
+fn parse_target(raw: &str) -> Result<Target, String> {
+    let text = raw.trim().trim_start_matches('#');
+    match text.strip_prefix('c') {
+        Some(digits) => digits.parse::<u64>().map(Target::Job),
+        None => text.parse::<u64>().map(Target::Agent),
+    }
+    .map_err(|_| {
+        format!("`{raw}` is not a target; status names one as `2` (a child) or `c2` (a job)")
+    })
+}
+
+/// Stop a child this agent owns. Stopping is not finishing: the child keeps its
+/// context and work, and a later `control message` resumes it.
+fn stop_agent(state: &mut ActorState, id: u64) -> Result<String, String> {
     let Some(cmd) = state.children.get(&id) else {
-        return Err(format!("no such child agent #{id}"));
+        return Err(format!("no such child agent #{id} — status lists yours"));
+    };
+    // A dead mailbox means the child is gone; saying "stopping" anyway would
+    // have the model wait on a result that can never arrive.
+    cmd.send(AgentMsg::Stop)
+        .map(|_| format!("stopping agent #{id}"))
+        .map_err(|_| format!("agent #{id} is gone"))
+}
+
+/// Message a child this agent owns. The words resume an idle child, so the
+/// parent's own book says it is running: a wait must not answer the old result,
+/// and the shared-workspace guard must see it (audit row 1).
+fn message_agent(state: &mut ActorState, args: &Value, id: u64) -> Result<String, String> {
+    let Some(cmd) = state.children.get(&id) else {
+        return Err(format!("no such child agent #{id} — status lists yours"));
     };
     // Whether the words are read *now* or at the child's next message boundary
     // is the parent's own book (`running`), and the reply says which: "messaged
     // agent #N" claimed delivery with no way to tell a child that resumes from
     // one that is mid-run (finding H5).
     let at_rest = !state.running.contains(&id);
-    // A dead mailbox means the child is gone; saying "stopping" anyway would
-    // have the model wait on a result that can never arrive.
-    let sent = match action.as_str() {
-        "stop" => cmd.send(AgentMsg::Stop).map_err(|_| (id, "stop")),
-        "message" => {
-            let text = tools::arg_string(args, "text")?;
-            cmd.send(AgentMsg::Steer(text)).map_err(|_| (id, "message"))
-        }
-        other => return Err(format!("unknown action `{other}` (stop or message)")),
-    };
+    let text = tools::arg_string(args, "text")?;
+    let sent = cmd.send(AgentMsg::Steer(text));
     match sent {
-        Ok(()) if action == "stop" => Ok(format!("stopping agent #{id}")),
         Ok(()) if at_rest => {
             // The words resume the child, so the parent's own books say it is
             // running: a wait must not answer the old result, and the
@@ -3112,103 +3080,8 @@ fn control_tool(state: &mut ActorState, args: &Value) -> Result<String, String> 
         Ok(()) => Ok(format!(
             "messaged agent #{id} — it is mid-run, so it reads this at its next step"
         )),
-        Err((id, _)) => Err(format!("agent #{id} is gone")),
+        Err(_) => Err(format!("agent #{id} is gone")),
     }
-}
-
-/// `command_status`: what this agent's commands are doing, live from the one
-/// registry that holds them. A running job is read through its own window, so
-/// this is always current and never a copy.
-fn command_status_tool(actor: &Actor) -> Result<String, String> {
-    Ok(actor.ctx.registry.status_for(actor.id))
-}
-
-/// `command_control`: stop a job this agent started.
-fn command_control_tool(actor: &Actor, args: &Value) -> Result<String, String> {
-    let id = args
-        .get("id")
-        .and_then(Value::as_u64)
-        .ok_or_else(|| "missing `id`".to_string())?;
-    let action = tools::arg_string(args, "action")?;
-    match action.as_str() {
-        "stop" => actor.ctx.registry.stop(actor.id, id),
-        other => Err(format!("unknown action `{other}` (stop)")),
-    }
-}
-
-/// `wait_commands`: the same wait as `wait_agents`, over jobs. A job's report
-/// arrives in the owner's mailbox like a child's completion, so waiting is the
-/// same act — and `all` means the same thing.
-fn wait_commands_tool(
-    actor: &Actor,
-    state: &mut ActorState,
-    cancel: &AtomicBool,
-    args: &Value,
-) -> Result<String, String> {
-    let ids: Vec<u64> = args
-        .get("ids")
-        .and_then(Value::as_array)
-        .map(|list| list.iter().filter_map(Value::as_u64).collect())
-        .unwrap_or_default();
-    let mut candidates: Vec<u64> = if ids.is_empty() {
-        // Every job this agent started: the running ones and the ones whose
-        // reports it has already been given.
-        let mut mine: Vec<u64> = state
-            .running_jobs
-            .iter()
-            .chain(state.done_jobs.keys())
-            .copied()
-            .collect();
-        mine.sort_unstable();
-        mine.dedup();
-        mine
-    } else {
-        ids
-    };
-    candidates.dedup();
-    if candidates.is_empty() {
-        return Ok("no jobs to wait for".to_string());
-    }
-    let unknown: Vec<String> = candidates
-        .iter()
-        .filter(|id| !state.running_jobs.contains(id) && !state.done_jobs.contains_key(id))
-        .map(|id| jobs::label(*id))
-        .collect();
-    if !unknown.is_empty() {
-        return Err(format!(
-            "no such job(s): {} — command_status lists yours",
-            unknown.join(", ")
-        ));
-    }
-    let mut results = WaitResults {
-        // Pure, like the agents' half: asking about a job must not hand its
-        // report over — only the answer this call returns does that.
-        is_ready: &mut |state, id| state.done_jobs.contains_key(&id),
-        deliver: &mut |state, id| {
-            // The report is marked delivered as it is handed over, so the fold
-            // at the next message boundary cannot inject the same line again.
-            // Asking a second time answers with the job's line again — a wait
-            // is "tell me what happened", and the model that asks twice gets an
-            // answer twice rather than a silence it has to interpret. (A job's
-            // report is already bounded — exit status and the end of its
-            // output — so repeating it is not the replay a child's report is.)
-            let Some(report) = state.done_jobs.get(&id).cloned() else {
-                return jobs::label(id);
-            };
-            state
-                .record_job(id, report.line.clone(), report.news)
-                .unwrap_or(report.line)
-        },
-    };
-    wait_for_results(
-        actor,
-        state,
-        cancel,
-        args,
-        &candidates,
-        jobs::Waited::Jobs,
-        &mut results,
-    )
 }
 
 /// Commit whatever an isolated agent left in its worktree, so the branch the
@@ -3225,61 +3098,40 @@ fn commit_worktree(
     git::commit_all(root, &commit_subject(id, brief, outcome))
 }
 
-/// The five file tools, executed against a workspace on disk. Only the agent's
-/// own thread touches the files: the human's screen never holds a copy, so
-/// there is nothing to keep in sync.
-fn direct_tool(
-    ws: &Workspace,
-    tool: ToolName,
-    args: &Value,
-    cfg: &Config,
-) -> Result<String, String> {
-    match tool {
-        ToolName::ListFiles => tools::list_result(ws, args, cfg.list_limit()),
-        ToolName::ReadFile => {
-            let rel = tools::arg_string(args, "path")?;
-            ws.read_file(&rel, cfg.read_cap())
+/// `edit_file`: the one file operation no shell line gives safely. Exact and
+/// unique replacement means a wrong edit is impossible, and a batch lands
+/// all-or-nothing so the file cannot be left half-changed. Only the agent's own
+/// thread touches the file: the human's screen never holds a copy, so there is
+/// nothing to keep in sync.
+fn edit_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
+    let rel = tools::arg_string(args, "path")?;
+    let current = ws.read_file(&rel, usize::MAX)?;
+    // A list of edits is applied to one read and written once: all of
+    // them land or none do, so a batch cannot leave the file
+    // half-changed, and the edits see each other's results in order.
+    let updated = match args.get("edits").and_then(Value::as_array) {
+        Some(list) if !list.is_empty() => {
+            let mut edits = Vec::with_capacity(list.len());
+            for entry in list {
+                edits.push(tools::Edit {
+                    old: tools::arg_string(entry, "old_string")?,
+                    new: tools::arg_string(entry, "new_string")?,
+                    replace_all: entry
+                        .get("replace_all")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                });
+            }
+            tools::edit_text_many(&current, &edits, &rel)?
         }
-        ToolName::WriteFile => {
-            let rel = tools::arg_string(args, "path")?;
-            let content = tools::arg_string(args, "content")?;
-            ws.write_file(&rel, &content)?;
-            Ok(format!("wrote {rel}"))
+        _ => {
+            let old = tools::arg_string(args, "old_string")?;
+            let new = tools::arg_string(args, "new_string")?;
+            tools::edit_text(&current, &old, &new, &rel)?
         }
-        ToolName::EditFile => {
-            let rel = tools::arg_string(args, "path")?;
-            let current = ws.read_file(&rel, usize::MAX)?;
-            // A list of edits is applied to one read and written once: all of
-            // them land or none do, so a batch cannot leave the file
-            // half-changed, and the edits see each other's results in order.
-            let updated = match args.get("edits").and_then(Value::as_array) {
-                Some(list) if !list.is_empty() => {
-                    let mut edits = Vec::with_capacity(list.len());
-                    for entry in list {
-                        edits.push(tools::Edit {
-                            old: tools::arg_string(entry, "old_string")?,
-                            new: tools::arg_string(entry, "new_string")?,
-                            replace_all: entry
-                                .get("replace_all")
-                                .and_then(Value::as_bool)
-                                .unwrap_or(false),
-                        });
-                    }
-                    tools::edit_text_many(&current, &edits, &rel)?
-                }
-                _ => {
-                    let old = tools::arg_string(args, "old_string")?;
-                    let new = tools::arg_string(args, "new_string")?;
-                    tools::edit_text(&current, &old, &new, &rel)?
-                }
-            };
-            ws.write_file(&rel, &updated)?;
-            Ok(format!("edited {rel}"))
-        }
-        // Everything else is dispatched by `exec_tool`: reaching here would
-        // mean a tool with no implementation, which the match now forbids.
-        other => Err(format!("`{other}` is not a file tool")),
-    }
+    };
+    ws.write_file(&rel, &updated)?;
+    Ok(format!("edited {rel}"))
 }
 
 /// How long a sibling's command queues for a machine lock held by another
@@ -3504,12 +3356,28 @@ fn detached_line(id: u64) -> String {
 }
 
 /// Hard ceiling on what one command may write to its scratch files. The model
-/// only ever sees the first `CMD_CAP` bytes, so a command that gets here is not
-/// communicating, it is running away — and it must not fill the disk. The size
-/// is checked every few milliseconds (see `wait_bounded`), so a fast writer can
-/// overshoot by a few tens of MB before the kill lands. It lives in
+/// only ever sees the first `command_cap` bytes, so a command that gets here is
+/// not communicating, it is running away — and it must not fill the disk. The
+/// size is checked every few milliseconds (see `wait_bounded`), so a fast writer
+/// can overshoot by a few tens of MB before the kill lands. It lives in
 /// `crate::jobs` beside the other rule a job and a tool call share.
 use crate::jobs::CMD_OUTPUT_LIMIT;
+
+/// The bytes one command result may carry.
+///
+/// The command is now the only road by which a big text result reaches the
+/// model — the file tools' own caps went with them — so the result is bounded by
+/// the context budget, not by a fixed number: a quarter of what the history can
+/// hold, capped at the old read ceiling (see `Config::cmd_cap`). A result that
+/// hits it says so and says what to do (`truncate_for_model`).
+fn command_cap(actor: &Actor) -> usize {
+    actor
+        .ctx
+        .cfg
+        .config()
+        .map(|cfg| cfg.cmd_cap())
+        .unwrap_or(mush_core::CMD_CAP)
+}
 
 /// Why a command stopped running.
 enum Ended {
@@ -3557,7 +3425,7 @@ fn run_shell(
             // its refusal kills the process group, and the launch owns the only
             // handle to the output — a report built after that would have
             // nothing to show (audit row 2).
-            let (stdout, stderr) = running.output(CMD_CAP);
+            let (stdout, stderr) = running.output(command_cap(actor));
             match detach_now(
                 actor,
                 registry,
@@ -3590,7 +3458,8 @@ fn run_shell(
     // finding S4 is about, or the registry's half of a `Stop` — must not be
     // reported as the command's own exit: `-1` is a signal nobody asked about.
     let ended = ending(ended, running.stopped());
-    let (stdout, stderr) = running.output(CMD_CAP);
+    let cap = command_cap(actor);
+    let (stdout, stderr) = running.output(cap);
     let mut report = command_report(&stdout, &stderr);
     match ended {
         Ended::Exited(code) => report.push_str(&format!("[exit {code}]")),
@@ -3602,7 +3471,7 @@ fn run_shell(
             if matches!(detach, Detach::No) {
                 report.push_str(&format!(
                     "; the {}-job budget is full, so it could not detach — stop one with \
-                     command_control or wait for one",
+                     control or wait for one",
                     jobs::MAX_JOBS
                 ));
             }
@@ -3610,7 +3479,7 @@ fn run_shell(
         }
         Ended::Cancelled => report.push_str("[cancelled]"),
         Ended::TooMuchOutput => report.push_str(&format!(
-            "[killed: output passed {CMD_OUTPUT_LIMIT} bytes; the first {CMD_CAP} are above]"
+            "[killed: output passed {CMD_OUTPUT_LIMIT} bytes; the first {cap} are above]"
         )),
         // Only reachable without a `Detach::Job`, which returns above.
         Ended::Detached => report.push_str(&format!("[timed out after {}s]", timeout.as_secs())),
@@ -3742,15 +3611,12 @@ fn read_args(args: &Value) -> String {
     if let Some(brief) = args.get("brief").and_then(Value::as_str) {
         return truncate(&first_line(brief), 40);
     }
-    // The orchestration tools, which name none of the three above: the tools a
-    // human watching a tree most needs to read are exactly the ones that
-    // rendered as a bare `⚙ agent_control` — R4's "`⚙ name summarized-args`"
-    // vacuous for the calls that steer the run.
-    //
-    // `agent_control {id, action, text?}` and `command_control {id, action}`
-    // share a shape, so they share an arm: the id is the target and the action
-    // is what is being done to it.
-    if let Some(id) = args.get("id").and_then(Value::as_u64) {
+    // `control {id, action, text?}`, which names none of the three above: the
+    // tools a human watching a tree most needs to read are exactly the calls
+    // that steer the run, and they rendered as a bare `⚙ control` otherwise
+    // (R4's "`⚙ name summarized-args`" vacuous for them). The id is the target
+    // and the action is what is being done to it.
+    if let Some(id) = args.get("id").and_then(Value::as_str) {
         let action = args.get("action").and_then(Value::as_str).unwrap_or("");
         let mut label = format!("#{id}");
         if !action.is_empty() {
@@ -3762,28 +3628,8 @@ fn read_args(args: &Value) -> String {
         }
         return label;
     }
-    // `wait_agents {ids?, timeout?}` and `wait_commands {ids?, timeout?}`: which
-    // ids are being waited on, and how long. An empty list is not "nothing" —
-    // the schema reads it as *all* of them.
-    if let Some(ids) = args.get("ids").and_then(Value::as_array) {
-        let list: Vec<String> = ids
-            .iter()
-            .filter_map(Value::as_u64)
-            .map(|id| format!("#{id}"))
-            .collect();
-        let mut label = if list.is_empty() {
-            "all".to_string()
-        } else {
-            list.join(" ")
-        };
-        if let Some(timeout) = args.get("timeout").and_then(Value::as_u64) {
-            label.push_str(&format!(" {timeout}s"));
-        }
-        return label;
-    }
-    if let Some(timeout) = args.get("timeout").and_then(Value::as_u64) {
-        return format!("{timeout}s");
-    }
+    // `status` and `wait` take no arguments: there is nothing to summarize, and
+    // the label is the tool's own name alone.
     String::new()
 }
 
@@ -3845,29 +3691,22 @@ mod tests {
         );
     }
 
-    /// The orchestration tools carry no path, command or brief, so they rendered
-    /// as a bare `⚙ agent_control` — for exactly the calls an orchestrator uses
-    /// to steer a tree, which is where a human most needs to know *whom*.
+    /// The `control` tool carries no path, command or brief, so it would render
+    /// as a bare `⚙ control` — for exactly the calls an orchestrator uses to
+    /// steer a tree, which is where a human most needs to know *whom* and what.
     #[test]
-    fn an_orchestration_call_summarizes_its_target() {
+    fn a_control_call_summarizes_its_target() {
         assert_eq!(
-            summarize(&json!({"id": 2, "action": "message", "text": "keep the steps small"})),
+            summarize(&json!({"id": "2", "action": "message", "text": "keep the steps small"})),
             "#2 message \"keep the steps small\""
         );
         assert_eq!(
-            summarize(&json!({"id": 3, "action": "stop"})),
-            "#3 stop",
-            "command_control and agent_control share one shape"
+            summarize(&json!({"id": "c3", "action": "stop"})),
+            "#c3 stop",
+            "a job's label carries the `c` status printed"
         );
-        assert_eq!(summarize(&json!({"ids": [1, 2]})), "#1 #2");
-        assert_eq!(
-            summarize(&json!({"ids": [], "timeout": 60})),
-            "all 60s",
-            "an empty id list is the schema's `all`, not nothing"
-        );
-        assert_eq!(summarize(&json!({"timeout": 30})), "30s");
         // A tool with no arguments has nothing to summarize, and says so by
-        // summarizing nothing: `command_status`, `agent_status`.
+        // summarizing nothing: `status`, `wait`.
         assert_eq!(summarize(&json!({})), "");
     }
 
@@ -3916,7 +3755,7 @@ mod tests {
             id: id.into(),
             kind: "function".into(),
             function: FunctionCall {
-                name: "read_file".into(),
+                name: "edit_file".into(),
                 arguments: "{}".into(),
             },
         }
@@ -3939,7 +3778,8 @@ mod tests {
     /// that cannot tell them apart treats a stop as a result. Each gets its own
     /// mark: `✓` only ever means a run produced something.
     #[test]
-    fn agent_status_distinguishes_stopped_from_done_and_failed() {
+    fn status_distinguishes_stopped_from_done_and_failed() {
+        let (actor, _mailbox) = test_actor("status-marks");
         let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
         let mut state = ActorState::default();
         state.children.insert(1, tx.clone());
@@ -3949,7 +3789,7 @@ mod tests {
         state.children.insert(3, tx);
         note_completion(&mut state, 3, 1, Outcome::Failed("no route".into()));
 
-        let lines = status_tool(&state).unwrap();
+        let lines = status_tool(&actor, &state).unwrap();
         assert!(lines.contains("#1 ⊘ stopped"), "a stop is not a ✓: {lines}");
         assert!(lines.contains("#2 ✓ did the thing"), "{lines}");
         assert!(lines.contains("#3 ✗ no route"), "{lines}");
@@ -3965,6 +3805,7 @@ mod tests {
     /// older branch can never ride a newer result.
     #[test]
     fn the_listing_carries_where_the_work_is() {
+        let (actor, _mailbox) = test_actor("status-work");
         let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
         let mut state = ActorState::default();
         state.children.insert(1, tx);
@@ -3978,14 +3819,14 @@ mod tests {
                 revision: "abc1234".into(),
             },
         );
-        let lines = status_tool(&state).unwrap();
+        let lines = status_tool(&actor, &state).unwrap();
         assert!(lines.contains("#1 ✓ wrote it"), "{lines}");
         assert!(lines.contains("committed abc1234 on mush/1"), "{lines}");
 
         // A newer run has no work fact yet: the older run's branch must not be
         // read as its history.
         note_completion(&mut state, 1, 4, Outcome::Finished("again".into()));
-        let lines = status_tool(&state).unwrap();
+        let lines = status_tool(&actor, &state).unwrap();
         assert!(!lines.contains("committed abc1234"), "{lines}");
 
         // And when the newer run's own fact arrives, it is the one shown.
@@ -3997,7 +3838,7 @@ mod tests {
                 branch: "mush/1".into(),
             },
         );
-        let lines = status_tool(&state).unwrap();
+        let lines = status_tool(&actor, &state).unwrap();
         assert!(lines.contains("mush/1 clean — nothing changed"), "{lines}");
     }
 
@@ -4242,7 +4083,7 @@ mod tests {
     }
 
     /// Steering a subagent is visible (`docs/findings.md` B22). The words a
-    /// parent's `agent_control message` puts in a child's transcript are
+    /// parent's `control message` puts in a child's transcript are
     /// emitted to the UI, which routes them into that child's transcript — the
     /// human reads what their model was told, and the session file keeps it.
     ///
@@ -4256,14 +4097,14 @@ mod tests {
         let mut messages = vec![Message::system("you are mush")];
         let text = "stop spawning subagents";
 
-        // Sent the way `agent_control message` sends it.
+        // Sent the way `control message` sends it.
         let (child_tx, child_rx) = crossbeam_channel::unbounded();
         state.children.insert(1, child_tx);
         let sent = exec_tool(
             &actor,
             &mut state,
-            ToolName::AgentControl,
-            &json!({ "id": 1, "action": "message", "text": text }),
+            ToolName::Control,
+            &json!({ "id": "1", "action": "message", "text": text }),
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -4281,8 +4122,8 @@ mod tests {
         let sent = exec_tool(
             &actor,
             &mut state,
-            ToolName::AgentControl,
-            &json!({ "id": 1, "action": "message", "text": "keep going" }),
+            ToolName::Control,
+            &json!({ "id": "1", "action": "message", "text": "keep going" }),
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -4362,7 +4203,7 @@ mod tests {
         mailbox.send(AgentMsg::Steer("stop".into())).unwrap();
 
         let started = Instant::now();
-        let result = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 600 })).unwrap();
+        let result = wait_tool(&actor, &mut state, &cancel).unwrap();
 
         assert!(
             result.contains("your parent sent you a message"),
@@ -4472,18 +4313,18 @@ mod tests {
         assert!(fold_completions(&actor, &mut state, &mut messages));
         assert_eq!(read(&events), vec![1, 2], "the fold is a reading too");
 
-        // 3. The road the model asked for: `wait_agents` hands the result over
+        // 3. The road the model asked for: `wait` hands the result over
         //    itself, so the mark goes out with the line.
         note_completion(&mut state, 3, 1, Outcome::Finished("waited for".into()));
         let cancel = AtomicBool::new(false);
-        let waited = wait_tool(&actor, &mut state, &cancel, &json!({ "ids": [3] })).unwrap();
+        let waited = wait_tool(&actor, &mut state, &cancel).unwrap();
         assert!(waited.contains("#3 done"), "{waited}");
         assert_eq!(read(&events), vec![1, 2, 3], "and so is a wait");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// A completion that the incoming transcript already carries (as a
-    /// `wait_agents` result, say) is not news: announcing it again would spend
+    /// `wait` result, say) is not news: announcing it again would spend
     /// a turn repeating what the model just read.
     #[test]
     fn adopting_a_transcript_that_announces_a_completion_keeps_it_delivered() {
@@ -4683,7 +4524,7 @@ mod tests {
     }
 
     /// The batch the human saw: three children failed while the parent worked,
-    /// one of them had already been answered through `wait_agents`, and then
+    /// one of them had already been answered through a `wait`, and then
     /// the records were replayed. Before the fix the next boundary pushed the
     /// answered failure as well — a second copy of a line the model had just
     /// been told, in a message that read as freshly replayed news.
@@ -4711,21 +4552,19 @@ mod tests {
         drain_signals(&actor, &cancel, &mut state);
         assert_eq!(messages.len(), 1, "nothing is folded between tool calls");
 
-        // The model asks for #4's result first: the wait answers with the line
-        // and that answer is what the model has read.
-        let answered = exec_tool(
-            &actor,
-            &mut state,
-            ToolName::WaitAgents,
-            &json!({ "ids": [4], "timeout": 5 }),
-            &cancel,
-        )
-        .unwrap();
-        assert_eq!(answered, format!("#4 failed: {error}"));
+        // The model asks for the results: `wait` answers all three, and that
+        // answer is what the model has read.
+        let answered = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
+        for id in [4u64, 5, 6] {
+            assert!(
+                answered.contains(&format!("#{id} failed: {error}")),
+                "#{id} is delivered in full: {answered}"
+            );
+        }
         assert_eq!(
             state.delivered.get(&4),
             Some(&1),
-            "an answer from `wait_agents` is a delivery"
+            "an answer from `wait` is a delivery"
         );
 
         // And now every record is sent again — the replay.
@@ -4738,29 +4577,39 @@ mod tests {
                 })
                 .unwrap();
         }
+        // A *new* completion nobody has read is still news.
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        state.children.insert(7, tx);
+        mailbox
+            .send(AgentMsg::ChildDone {
+                id: 7,
+                run: 1,
+                outcome: Outcome::Failed(error.into()),
+            })
+            .unwrap();
         drain_mailbox(&actor, &AtomicBool::new(false), &mut messages, &mut state);
 
         assert!(
             fold_completions(&actor, &mut state, &mut messages),
-            "the two results nobody has read are still news"
+            "only the unread result is news"
         );
         let folded: Vec<&str> = messages.iter().map(Message::text).collect();
-        assert_eq!(
-            folded
-                .iter()
-                .filter(|line| line.starts_with("#4 failed"))
-                .count(),
-            0,
-            "the failure the wait answered with is not folded again: {folded:?}"
-        );
-        for id in [5u64, 6] {
-            let line = format!("#{id} failed: {error}");
+        for id in [4u64, 5, 6] {
             assert_eq!(
-                folded.iter().filter(|folded| **folded == line).count(),
-                1,
-                "one line for #{id}: {folded:?}"
+                folded
+                    .iter()
+                    .filter(|line| line.starts_with(&format!("#{id} failed")))
+                    .count(),
+                0,
+                "the failure the wait answered with is not folded again: {folded:?}"
             );
         }
+        let line = format!("#7 failed: {error}");
+        assert_eq!(
+            folded.iter().filter(|folded| **folded == line).count(),
+            1,
+            "one line for the unread result: {folded:?}"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -4788,8 +4637,8 @@ mod tests {
                     answer = exec_tool(
                         &actor,
                         &mut state,
-                        ToolName::WaitAgents,
-                        &json!({ "ids": [1], "timeout": 5 }),
+                        ToolName::Wait,
+                        &json!({}),
                         &AtomicBool::new(false),
                     )
                     .unwrap();
@@ -4833,8 +4682,8 @@ mod tests {
             let again = exec_tool(
                 &actor,
                 &mut state,
-                ToolName::WaitAgents,
-                &json!({ "ids": [1], "timeout": 5 }),
+                ToolName::Wait,
+                &json!({}),
                 &AtomicBool::new(false),
             )
             .unwrap();
@@ -4844,7 +4693,7 @@ mod tests {
             );
             assert!(again.contains("already read"), "{road}: {again}");
             // The listing never carries the body, read or unread.
-            let listing = status_tool(&state).unwrap();
+            let listing = status_tool(&actor, &state).unwrap();
             assert!(
                 !listing.contains(body),
                 "{road}: the listing carried the body"
@@ -4853,7 +4702,7 @@ mod tests {
         }
     }
 
-    /// `agent_status` is a listing, not a delivery: a child's whole final
+    /// `status` is a listing, not a delivery: a child's whole final
     /// message used to be printed on every call, so a parent that polled its
     /// children re-read every report, and the fold then re-delivered it as the
     /// same text a second time. Now the line is a bounded digest with the size
@@ -4861,13 +4710,14 @@ mod tests {
     /// waiting — the fold remains the one road that hands it over.
     #[test]
     fn a_listing_digests_a_result_and_says_what_is_unread() {
+        let (actor, _mailbox) = test_actor("listing-digest");
         let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
         let mut state = ActorState::default();
         state.children.insert(1, tx);
         let long = format!("first line of a long report\n{}", "detail ".repeat(900));
         note_completion(&mut state, 1, 1, Outcome::Finished(long.clone()));
 
-        let listing = status_tool(&state).unwrap();
+        let listing = status_tool(&actor, &state).unwrap();
         assert!(
             listing.contains("✉ #1 ✓ first line of a long report"),
             "{listing}"
@@ -4884,10 +4734,9 @@ mod tests {
         assert!(state.unread(1), "a listing is not a read");
 
         // Delivered once by the fold: the marker goes, the digest stays.
-        let (actor, _events, _mailbox) = recording_actor("listing-digest");
         let mut transcript = vec![Message::system("you are mush")];
         assert!(fold_completions(&actor, &mut state, &mut transcript));
-        let listing = status_tool(&state).unwrap();
+        let listing = status_tool(&actor, &state).unwrap();
         assert!(!listing.contains('✉'), "nothing is unread now: {listing}");
         assert!(listing.contains("first line of a long report"), "{listing}");
         let _ = fs::remove_dir_all(actor.ws.root());
@@ -5266,7 +5115,8 @@ mod tests {
 
         assert!(report.contains("output passed"), "{report}");
         assert_eq!(machine.kills(), 1, "the runaway writer was killed");
-        assert!(report.len() < CMD_CAP * 2, "report grew: {}", report.len());
+        let cap = command_cap(&actor);
+        assert!(report.len() < cap * 2, "report grew: {}", report.len());
         assert!(
             clock.elapsed() < Duration::from_secs(30),
             "bytes stopped it, not the command's own timeout: {:?}",
@@ -5298,11 +5148,12 @@ mod tests {
         )
         .unwrap();
         assert!(
-            report.contains("[mush: output truncated]"),
-            "cap was not marked"
+            report.contains("output truncated at"),
+            "cap was not marked: {report}"
         );
+        let cap = command_cap(&actor);
         assert!(
-            report.len() < CMD_CAP * 2,
+            report.len() < cap * 2,
             "report grew past the cap: {}",
             report.len()
         );
@@ -5317,7 +5168,6 @@ mod tests {
     #[test]
     fn several_edits_to_one_file_in_a_batch_all_land() {
         let (actor, _mailbox) = test_actor("multi-edit");
-        let cfg = Config::new("http://127.0.0.1:1", "test", None);
         fs::write(actor.ws.root().join("f.rs"), "let a = 1;\nlet b = 2;\n").unwrap();
 
         // Exactly what a batch of three `edit_file` calls does, in order.
@@ -5326,11 +5176,9 @@ mod tests {
             ("let b = 2;", "let b = 20;"),
             ("let b = 20;", "let b = 21;"),
         ] {
-            direct_tool(
+            edit_tool(
                 &actor.ws,
-                ToolName::EditFile,
                 &json!({ "path": "f.rs", "old_string": old, "new_string": new }),
-                &cfg,
             )
             .unwrap();
         }
@@ -5347,14 +5195,11 @@ mod tests {
     #[test]
     fn an_ambiguous_edit_is_refused_not_guessed() {
         let (actor, _mailbox) = test_actor("ambiguous");
-        let cfg = Config::new("http://127.0.0.1:1", "test", None);
         fs::write(actor.ws.root().join("f.rs"), "x = 1;\nx = 2;\n").unwrap();
 
-        let error = direct_tool(
+        let error = edit_tool(
             &actor.ws,
-            ToolName::EditFile,
             &json!({ "path": "f.rs", "old_string": "x = ", "new_string": "y = " }),
-            &cfg,
         )
         .unwrap_err();
         assert!(error.contains("2 times"), "{error}");
@@ -5508,7 +5353,7 @@ mod tests {
         (actor, recorder, my_tx)
     }
 
-    /// The root napping on `wait_agents` must hear the human. Parking their
+    /// The root napping on `wait` must hear the human. Parking their
     /// words is not enough when the wait can last the whole timeout: the model
     /// would not see them until the child it was waiting on finished, which is
     /// the opposite of steering. The wait ends, and the words stay parked so
@@ -5528,7 +5373,7 @@ mod tests {
             .send(AgentMsg::Nudge("what about the tests?".into()))
             .unwrap();
         let started = Instant::now();
-        let result = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 5 })).unwrap();
+        let result = wait_tool(&actor, &mut state, &cancel).unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "the message ends the wait, not the 600 s timeout ({:?})",
@@ -5567,7 +5412,7 @@ mod tests {
         state.running.insert(1);
 
         let started = Instant::now();
-        let result = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 600 })).unwrap();
+        let result = wait_tool(&actor, &mut state, &cancel).unwrap();
 
         assert!(result.contains("wait timed out"), "{result}");
         assert!(
@@ -5583,12 +5428,11 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
-    /// `wait_commands` is `wait_agents` over jobs, and it had no test at all —
-    /// not through `run_command`, not through the tool. This is the call site:
-    /// two jobs are started, the wait returns their reports, and a wait with no
-    /// `ids` reaches the jobs this agent started on its own books.
+    /// `wait` reaches the jobs this agent started on its own books as well as
+    /// its children: two jobs are started, the wait returns both reports in one
+    /// digest, and an agent with neither children nor jobs is answered at once.
     #[test]
-    fn wait_commands_returns_a_jobs_report() {
+    fn wait_returns_a_jobs_report() {
         let machine = Arc::new(
             ScriptedMachine::new()
                 .runs(Script::exits(0).says("build ok"))
@@ -5614,10 +5458,10 @@ mod tests {
         // Each job's own watcher thread delivers its report to this actor's
         // mailbox. Block on those two arrivals *before* the wait begins, rather
         // than let the wait's fake clock race the watcher being scheduled: on
-        // this clock a `timeout: 5` elapses in microseconds, so a report whose
+        // this clock the deadline elapses in microseconds, so a report whose
         // thread had not yet been given the CPU made the wait answer "wait
         // timed out — #c1 still running" — a fact about the scheduler, not
-        // about `wait_commands`. The recorded event is what the wait reads
+        // about `wait`. The recorded event is what the wait reads
         // anyway (`drain_signals` records a `CommandDone` through this same
         // `note_job`), so this changes only *when* the report is known.
         for _ in 0..2 {
@@ -5633,34 +5477,14 @@ mod tests {
             }
         }
 
-        // One report, by id: the wait answers with the job's own line.
-        let one = exec_tool(
-            &actor,
-            &mut state,
-            ToolName::WaitCommands,
-            &json!({ "ids": [1], "timeout": 5 }),
-            &cancel,
-        )
-        .unwrap();
-        assert!(one.contains("exit 0"), "{one}");
-        assert!(one.contains("make build"), "{one}");
-        assert!(
-            !one.contains("make test"),
-            "and only what was asked for: {one}"
-        );
-
-        // No ids: every job this agent started, and no `all` means the first
-        // report that is ready rather than every one.
-        let mine = exec_tool(
-            &actor,
-            &mut state,
-            ToolName::WaitCommands,
-            &json!({ "timeout": 5 }),
-            &cancel,
-        )
-        .unwrap();
-        assert!(mine.contains("exit 0"), "{mine}");
-        assert!(!mine.contains('\n'), "one result, not a list: {mine}");
+        // One call, one digest: both reports, each in the job's own words.
+        let both = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
+        assert!(both.contains("exit 0"), "{both}");
+        assert!(both.contains("make build"), "{both}");
+        assert!(both.contains("make test"), "{both}");
+        let build = both.find("make build").expect("build is named");
+        let test = both.find("make test").expect("test is named");
+        assert!(build < test, "in id order: {both}");
 
         // Nothing to wait for is an answer, not an error.
         let (idle, _mailbox) = scripted_tools_actor(
@@ -5672,22 +5496,23 @@ mod tests {
             exec_tool(
                 &idle,
                 &mut ActorState::default(),
-                ToolName::WaitCommands,
+                ToolName::Wait,
                 &json!({}),
                 &cancel
             )
             .unwrap(),
-            "no jobs to wait for"
+            "nothing to wait for: no children and no jobs"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
         let _ = fs::remove_dir_all(idle.ws.root());
     }
 
-    /// `all` asks for every result instead of the first one. It is the whole
-    /// difference between "one delegate is free" and "the whole set is in", and
-    /// it appeared nowhere in the suite — on either wait.
+    /// One `wait` means everything: with two results recorded and nothing in
+    /// flight, a single call answers both — an unread result in full, an
+    /// already-read one as a line — and the schema has no `all`/`ids` for a
+    /// model to reason wrong (finding H15).
     #[test]
-    fn a_wait_returns_the_first_result_or_all_of_them() {
+    fn one_wait_means_everything() {
         let (actor, _mailbox) = test_actor("wait-all");
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
@@ -5699,55 +5524,42 @@ mod tests {
             1,
             Completion {
                 run: 1,
-                outcome: Outcome::Finished("wrote the parser".into()),
+                outcome: Outcome::Finished("wrote the parser\nand the tests".into()),
             },
         );
         state.completed.insert(
             2,
             Completion {
                 run: 1,
-                outcome: Outcome::Failed("no route".into()),
+                outcome: Outcome::Failed("no route\nto the server".into()),
             },
         );
 
-        let first = exec_tool(
-            &actor,
-            &mut state,
-            ToolName::WaitAgents,
-            &json!({ "timeout": 5 }),
-            &cancel,
-        )
-        .unwrap();
-        assert_eq!(first, "#1 done: wrote the parser", "one result by default");
-        // The wait asked about every child but handed over only #1. #2's result
-        // must still be unread, or a wait for the first would swallow the body
-        // of a result it never answered with (the poll used to mark them all).
-        assert!(!state.unread(1), "the answer was #1's read");
-        assert!(
-            state.unread(2),
-            "#2's body was not handed over, so it is not read"
-        );
-
-        let every = exec_tool(
-            &actor,
-            &mut state,
-            ToolName::WaitAgents,
-            &json!({ "all": true, "timeout": 5 }),
-            &cancel,
-        )
-        .unwrap();
+        // Nothing is running, so the call returns at once with both bodies —
+        // both were unread, so both are delivered in full.
+        let every = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
+        assert!(every.contains("#1 done: wrote the parser"), "{every}");
         assert!(
             every.contains("#2 failed: no route"),
-            "every result, with #2's body delivered now: {every}"
+            "the second child's body is not swallowed: {every}"
         );
         assert!(
-            every.contains("already read"),
-            "and #1 named as one the model has read, not replayed (H15): {every}"
+            every.contains("and the tests") && every.contains("to the server"),
+            "an unread result comes over in full, not as its first line: {every}"
         );
         let one = every.find("#1").expect("#1 is named");
         let two = every.find("#2").expect("#2 is named");
-        assert!(one < two, "in the order they were asked about: {every}");
+        assert!(one < two, "in id order: {every}");
         assert!(!state.unread(1) && !state.unread(2), "both are read now");
+
+        // A second wait is not a replay: both come back as lines, never the
+        // bodies again (finding H15/B26).
+        let again = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
+        assert!(again.contains("already read"), "{again}");
+        assert!(
+            !again.contains("and the tests") && !again.contains("to the server"),
+            "a body the model has read is not handed over twice — only its first line: {again}"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -5773,19 +5585,12 @@ mod tests {
         assert!(started.contains("detached as #c1"), "{started}");
 
         let begun = Instant::now();
-        let result = exec_tool(
-            &actor,
-            &mut state,
-            ToolName::WaitCommands,
-            &json!({ "timeout": 30 }),
-            &cancel,
-        )
-        .unwrap();
+        let result = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
 
         assert!(result.contains("wait timed out"), "{result}");
         assert!(result.contains("#c1 still running"), "{result}");
         assert!(
-            clock.elapsed() >= Duration::from_secs(30),
+            clock.elapsed() >= Duration::from_secs(600),
             "the deadline ended it: {:?}",
             clock.elapsed()
         );
@@ -5815,7 +5620,7 @@ mod tests {
         ];
         mailbox.send(AgentMsg::Run(transcript)).unwrap();
         let started = Instant::now();
-        let result = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 5 })).unwrap();
+        let result = wait_tool(&actor, &mut state, &cancel).unwrap();
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "a newer transcript ends the wait ({:?})",
@@ -5833,7 +5638,7 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
-    /// The same rule, end to end: the root delegates, parks in `wait_agents`,
+    /// The same rule, end to end: the root delegates, parks in `wait`,
     /// the human types, and the model answers their words in that run — while
     /// the child is still working, not after it finishes.
     ///
@@ -5844,7 +5649,7 @@ mod tests {
     /// on the way out of the test however it ends, and the wait itself is
     /// bounded, so even a killed test process cannot leave a child spinning.
     #[test]
-    fn a_human_message_reaches_a_root_napping_on_wait_agents() {
+    fn a_human_message_reaches_a_root_parked_in_a_wait() {
         /// Opens the gate when the test leaves, panic or not: the child is a
         /// real command looping until the file appears, and an assertion that
         /// fires before the write would otherwise leak that shell for good.
@@ -5876,11 +5681,7 @@ mod tests {
                     json!({ "brief": "hold the gate until the test opens it" }),
                 )])
                 .when(|asked: &Asked| asked.depth().is_none() && !asked.saw("what about the tests"))
-                .calls(vec![tool_call(
-                    "c1",
-                    "wait_agents",
-                    json!({ "timeout": 60 }),
-                )])
+                .calls(vec![tool_call("c1", "wait", json!({}))])
                 // Woken by the child's own result, after the human was served.
                 .when(|asked: &Asked| asked.depth().is_none() && asked.saw("#1 done"))
                 .says("thanks — carrying on")
@@ -5913,7 +5714,7 @@ mod tests {
             .unwrap();
 
         // The wait is in flight once the root's second request carries the
-        // spawn result — the request whose answer calls `wait_agents`.
+        // spawn result — the request whose answer calls `wait`.
         let parked = |needle: &str| {
             let asked = scripted.asked();
             asked
@@ -5988,7 +5789,7 @@ mod tests {
 
     /// A reply cut off at the token cap is not a result, but it is usually a
     /// *too big* answer rather than a broken model (a whole file in one
-    /// `write_file`, or a long reasoning pass). The run must not die on it: it
+    /// `run_command`, or a long reasoning pass). The run must not die on it: it
     /// answers the dangling calls, asks for smaller steps, and carries on.
     #[test]
     fn a_cut_off_reply_is_answered_with_smaller_steps() {
@@ -5997,14 +5798,14 @@ mod tests {
                 // The first reply is cut off mid-tool-call: the half-written
                 // call it started must never run.
                 .cut_off_call(
-                    "write_file",
-                    "{\"path\": \"big.rs\", \"content\": \"fn main(",
+                    "run_command",
+                    "{\"command\": \"cat > big.rs <<'EOF'\\nfn main(",
                 )
                 // The model then does as it was told, in smaller pieces.
                 .calls(vec![tool_call(
                     "c1",
-                    "write_file",
-                    json!({ "path": "big.rs", "content": "fn main() {}\n" }),
+                    "run_command",
+                    json!({ "command": "cat > big.rs <<'EOF'\nfn main() {}\nEOF" }),
                 )])
                 .says("wrote it in one small piece"),
         );
@@ -6062,9 +5863,9 @@ mod tests {
         let scripted = Arc::new(
             Scripted::new()
                 .calls(vec![
-                    tool_call("", "read_file", json!({ "path": "missing.rs" })),
-                    tool_call("dup", "read_file", json!({ "path": "missing.rs" })),
-                    tool_call("dup", "list_files", json!({})),
+                    tool_call("", "run_command", json!({ "command": "true" })),
+                    tool_call("dup", "run_command", json!({ "command": "true" })),
+                    tool_call("dup", "edit_file", json!({ "path": "missing.rs" })),
                 ])
                 .says("done"),
         );
@@ -6129,8 +5930,8 @@ mod tests {
                         reasoning_content: Some(reasoning.into()),
                         tool_calls: Some(vec![tool_call(
                             "c0",
-                            "write_file",
-                            json!({ "path": "note.txt", "content": "hi" }),
+                            "run_command",
+                            json!({ "command": "printf hi > note.txt" }),
                         )]),
                         ..Default::default()
                     },
@@ -6283,8 +6084,8 @@ mod tests {
         let mut assistant = Message::assistant("");
         assistant.tool_calls = Some(vec![tool_call(
             "c0",
-            "write_file",
-            json!({ "path": "secret.txt", "content": "x" }),
+            "run_command",
+            json!({ "command": "printf x > secret.txt" }),
         )]);
         let scripted = Arc::new(Scripted::new().finishing(assistant, "content_filter"));
         let (actor, _events, mailbox) = scripted_actor("filtered-call", &scripted);
@@ -6345,7 +6146,11 @@ mod tests {
     fn the_runs_usage_adds_up_over_its_calls() {
         let scripted = Arc::new(
             Scripted::new()
-                .calls(vec![tool_call("c1", "list_files", json!({}))])
+                .calls(vec![tool_call(
+                    "c1",
+                    "run_command",
+                    json!({ "command": "ls" }),
+                )])
                 .with_usage(1_100, 11, 1_111)
                 .says("done")
                 // The same server, not reporting a total this time.
@@ -6447,8 +6252,8 @@ mod tests {
                 .cut_off("two")
                 .calls(vec![tool_call(
                     "w",
-                    "write_file",
-                    json!({ "path": "piece.txt", "content": "a small piece" }),
+                    "run_command",
+                    json!({ "command": "printf 'a small piece' > piece.txt" }),
                 )])
                 .cut_off("three")
                 .cut_off("four")
@@ -7045,36 +6850,24 @@ mod tests {
         // The job's own tools: status names it, what it is doing, and how long
         // — the age itself is asserted on the pure formatter, because the job's
         // own thread is advancing the same clock as this test reads.
-        let status = call(ToolName::CommandStatus, json!({})).unwrap();
+        let status = call(ToolName::Status, json!({})).unwrap();
         assert!(status.contains("#c1 running "), "{status}");
         assert!(status.contains("npm run dev"), "{status}");
 
-        let stopped = call(
-            ToolName::CommandControl,
-            json!({ "id": 1, "action": "stop" }),
-        )
-        .unwrap();
+        let stopped = call(ToolName::Control, json!({ "id": "c1", "action": "stop" })).unwrap();
         assert_eq!(stopped, "stopping job #c1");
         // A stop is a request to the job's own thread; the report is what the
-        // owner reads next, and `command_status` then says it ended.
+        // owner reads next, and `status` then says it ended.
         match actor.rx.recv_timeout(Duration::from_secs(5)) {
             Ok(AgentMsg::CommandDone { line, .. }) => assert!(line.contains("stopped after")),
             other => panic!("the stop must be reported: {:?}", other.is_ok()),
         }
-        let status = call(ToolName::CommandStatus, json!({})).unwrap();
+        let status = call(ToolName::Status, json!({})).unwrap();
         assert!(status.contains("stopped after"), "{status}");
         // An id that was never a job is an error the model can correct, and
         // another action is one it cannot use.
-        assert!(call(
-            ToolName::CommandControl,
-            json!({ "id": 99, "action": "stop" })
-        )
-        .is_err());
-        assert!(call(
-            ToolName::CommandControl,
-            json!({ "id": 1, "action": "poke" })
-        )
-        .is_err());
+        assert!(call(ToolName::Control, json!({ "id": "c99", "action": "stop" })).is_err());
+        assert!(call(ToolName::Control, json!({ "id": "c1", "action": "poke" })).is_err());
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -7325,11 +7118,11 @@ mod tests {
 
     /// A leaf (depth `MAX_DEPTH`) has no delegation tools — that is what bounds
     /// the tree — but its own jobs are its business: the subagent prompt names
-    /// `command_status`/`wait_commands`/`command_control`, so the schema has to
+    /// `status`/`control`/`wait`, so the schema has to
     /// carry them, and the executors have to answer a leaf exactly as they
     /// answer the root.
     #[test]
-    fn a_leaf_agent_keeps_the_job_tools_and_can_manage_its_job() {
+    fn a_leaf_agent_has_no_delegation_but_still_manages_its_own_job() {
         let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
         let clock = Arc::new(Advanceable::new());
         let (mut actor, _mailbox) = scripted_tools_actor("leaf-jobs", machine, clock);
@@ -7342,11 +7135,10 @@ mod tests {
             .iter()
             .map(|schema| schema["function"]["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"command_status"), "{names:?}");
-        assert!(names.contains(&"command_control"), "{names:?}");
-        assert!(names.contains(&"wait_commands"), "{names:?}");
+        assert!(names.contains(&"status"), "{names:?}");
+        assert!(names.contains(&"control"), "{names:?}");
+        assert!(names.contains(&"wait"), "{names:?}");
         assert!(!names.contains(&"spawn_agent"), "{names:?}");
-        assert!(!names.contains(&"wait_agents"), "{names:?}");
 
         // And they work: a leaf detaches a job, lists it and stops it.
         let mut state = ActorState::default();
@@ -7359,15 +7151,11 @@ mod tests {
         )
         .unwrap();
         assert!(started.contains("detached as #c1"), "{started}");
-        let status = call(ToolName::CommandStatus, json!({})).unwrap();
+        let status = call(ToolName::Status, json!({})).unwrap();
         assert!(status.contains("#c1 running "), "{status}");
         assert!(status.contains("npm run dev"), "{status}");
         assert_eq!(
-            call(
-                ToolName::CommandControl,
-                json!({ "id": 1, "action": "stop" })
-            )
-            .unwrap(),
+            call(ToolName::Control, json!({ "id": "c1", "action": "stop" })).unwrap(),
             "stopping job #c1"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
@@ -7528,9 +7316,17 @@ mod tests {
         let gate = Arc::new(Gate::new());
         let scripted = Arc::new(
             Scripted::new()
-                .calls(vec![tool_call("c1", "list_files", json!({}))])
+                .calls(vec![tool_call(
+                    "c1",
+                    "run_command",
+                    json!({ "command": "ls" }),
+                )])
                 .held(gate.clone())
-                .calls(vec![tool_call("c2", "list_files", json!({}))])
+                .calls(vec![tool_call(
+                    "c2",
+                    "run_command",
+                    json!({ "command": "ls" }),
+                )])
                 .says("read it"),
         );
         let events = Recorder::new();
@@ -7553,7 +7349,7 @@ mod tests {
             "the second request never reached the model"
         );
         // The child finishes mid-run, between two tool-calling turns. Nobody
-        // asks for it: `wait_agents` is never called.
+        // asks for it: `wait` is never called.
         root_tx
             .send(AgentMsg::ChildDone {
                 id: 1,
@@ -7644,8 +7440,8 @@ mod tests {
             Scripted::new()
                 .calls(vec![tool_call(
                     "call_1",
-                    "write_file",
-                    json!({ "path": "note.txt", "content": "hello" }),
+                    "run_command",
+                    json!({ "command": "printf hello > note.txt" }),
                 )])
                 .says("wrote note.txt"),
         );
@@ -7678,7 +7474,11 @@ mod tests {
         assert!(asked[0].tools > 0, "the first turn offered the tools");
         let carried = asked[1].messages.last().unwrap();
         assert_eq!(carried.role, "tool");
-        assert_eq!(carried.text(), "wrote note.txt");
+        assert_eq!(
+            carried.text(),
+            "[exit 0]",
+            "the command ran; it wrote no output for the tool result to carry"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -7691,7 +7491,11 @@ mod tests {
     fn a_childs_result_reaches_a_parent_that_keeps_calling_tools() {
         let model = Arc::new(
             Scripted::new()
-                .calls(vec![tool_call("c0", "list_files", json!({}))])
+                .calls(vec![tool_call(
+                    "c0",
+                    "run_command",
+                    json!({ "command": "ls" }),
+                )])
                 .says("all done"),
         );
         let (actor, _events, mailbox) = scripted_actor("child-done-mid-batch", &model);
@@ -8003,8 +7807,8 @@ mod tests {
                 .held(gate.clone())
                 .calls(vec![tool_call(
                     "c1",
-                    "write_file",
-                    json!({ "path": "iso.txt", "content": "isolated work" }),
+                    "run_command",
+                    json!({ "command": "printf 'isolated work' > iso.txt" }),
                 )])
                 .when(|asked: &Asked| asked.depth() == Some(1))
                 .says("created iso.txt in my worktree")
@@ -8116,8 +7920,9 @@ mod tests {
     ///
     /// Returns the repository, the recorded events, and the *live* child's
     /// mailbox, so a test can do what the commands do and then nudge it. The
-    /// child's script answers the nudge with a `write_file extra.txt`, so a test
-    /// that forgot to land the worktree would see the file really written.
+    /// child's script answers the nudge with a `run_command` that writes
+    /// `extra.txt`, so a test that forgot to land the worktree would see the
+    /// file really written.
     fn finished_isolated_child(label: &str) -> (PathBuf, Arc<Recorder>, Sender<AgentMsg>) {
         let root = init_git_repo(label);
         let scripted = Arc::new(
@@ -8125,16 +7930,16 @@ mod tests {
                 .when(|asked: &Asked| asked.depth() == Some(1) && !asked.saw("wrote iso.txt"))
                 .calls(vec![tool_call(
                     "c1",
-                    "write_file",
-                    json!({ "path": "iso.txt", "content": "isolated work" }),
+                    "run_command",
+                    json!({ "command": "printf 'isolated work' > iso.txt" }),
                 )])
                 // The nudge turn: only ever reached if the worktree-nudge is
                 // allowed to run, which is the bug this test pins.
                 .when(|asked: &Asked| asked.depth() == Some(1) && asked.saw("write extra.txt"))
                 .calls(vec![tool_call(
                     "c2",
-                    "write_file",
-                    json!({ "path": "extra.txt", "content": "phantom" }),
+                    "run_command",
+                    json!({ "command": "printf phantom > extra.txt" }),
                 )])
                 .when(|asked: &Asked| asked.depth() == Some(1))
                 .says("created iso.txt in my worktree")
@@ -8328,7 +8133,7 @@ mod tests {
     /// Root -> child -> grandchild, each isolated: the grandchild's file must
     /// land in `.mush/wt/2/` on a branch that carries it, branched off the
     /// child's worktree (`mush/2` based on `mush/1`), and the summaries bubble up
-    /// through wait_agents. Three actors ask one scripted model at once; each
+    /// through wait. Three actors ask one scripted model at once; each
     /// reply says which of them it is for.
     #[test]
     fn deep_chain_writes_nested_worktrees() {
@@ -8339,8 +8144,8 @@ mod tests {
                 .when(|asked: &Asked| asked.depth() == Some(2) && !asked.saw("wrote deep.txt"))
                 .calls(vec![tool_call(
                     "c2",
-                    "write_file",
-                    json!({ "path": "deep.txt", "content": "deep work" }),
+                    "run_command",
+                    json!({ "command": "printf 'deep work' > deep.txt" }),
                 )])
                 .when(|asked: &Asked| asked.depth() == Some(2))
                 .says("created deep.txt")
@@ -8348,11 +8153,7 @@ mod tests {
                 .when(|asked: &Asked| asked.depth() == Some(1) && asked.saw("#2 done"))
                 .says("chain child done")
                 .when(|asked: &Asked| asked.depth() == Some(1) && asked.saw("spawned agent"))
-                .calls(vec![tool_call(
-                    "c1b",
-                    "wait_agents",
-                    json!({ "ids": [2], "timeout": 30 }),
-                )])
+                .calls(vec![tool_call("c1b", "wait", json!({}))])
                 .when(|asked: &Asked| asked.depth() == Some(1))
                 .calls(vec![tool_call(
                     "c1a",
@@ -8367,11 +8168,7 @@ mod tests {
                 .when(|asked: &Asked| asked.saw("#1 done"))
                 .says("chain root done")
                 .when(|asked: &Asked| asked.saw("spawned agent"))
-                .calls(vec![tool_call(
-                    "c0b",
-                    "wait_agents",
-                    json!({ "ids": [1], "timeout": 30 }),
-                )])
+                .calls(vec![tool_call("c0b", "wait", json!({}))])
                 .calls(vec![tool_call(
                     "c0a",
                     "spawn_agent",
@@ -8460,8 +8257,8 @@ mod tests {
                 .when(|asked: &Asked| asked.depth() == Some(1) && !asked.saw("wrote iso.txt"))
                 .calls(vec![tool_call(
                     "c1",
-                    "write_file",
-                    json!({ "path": "iso.txt", "content": "isolated work" }),
+                    "run_command",
+                    json!({ "command": "printf 'isolated work' > iso.txt" }),
                 )])
                 .when(|asked: &Asked| asked.depth() == Some(1))
                 .says("created iso.txt in my worktree")
@@ -8676,8 +8473,8 @@ mod tests {
                 .held(gate.clone())
                 .calls(vec![tool_call(
                     "c1",
-                    "write_file",
-                    json!({ "path": "note.txt", "content": "worth folding" }),
+                    "run_command",
+                    json!({ "command": "printf 'worth folding' > note.txt" }),
                 )])
                 .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
                 .says(summary)
@@ -8721,7 +8518,7 @@ mod tests {
         let fold = &asked[1];
         assert!(fold.saw(COMPACT_INSTRUCTION), "the second ask is the fold");
         assert!(
-            fold.saw("wrote note.txt"),
+            fold.saw("[exit 0]"),
             "the fold happens at the boundary, behind the batch's result: {:?}",
             fold.messages.iter().map(Message::text).collect::<Vec<_>>()
         );
@@ -8759,8 +8556,8 @@ mod tests {
                 .held(gate.clone())
                 .calls(vec![tool_call(
                     "c1",
-                    "write_file",
-                    json!({ "path": "note.txt", "content": "worth folding" }),
+                    "run_command",
+                    json!({ "command": "printf 'worth folding' > note.txt" }),
                 )])
                 .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
                 .says(summary)
@@ -8824,8 +8621,8 @@ mod tests {
                 .says(summary)
                 .calls(vec![tool_call(
                     "c1",
-                    "write_file",
-                    json!({ "path": "after.txt", "content": "written after the fold" }),
+                    "run_command",
+                    json!({ "command": "printf 'written after the fold' > after.txt" }),
                 )])
                 .says("done"),
         );
@@ -9347,7 +9144,7 @@ mod tests {
     /// Hitting the turn limit must end with a summary, not a bare `stopped
     /// after 200 turns without finishing`: the safety valve stays, the failure
     /// goes (finding N1). Every turn before the guard does real work — one
-    /// `write_file`, with the arguments differing each turn so the run is not
+    /// `run_command`, with the arguments differing each turn so the run is not
     /// stopped early as a loop instead.
     #[test]
     fn the_turn_limit_ends_with_a_summary() {
@@ -9358,8 +9155,8 @@ mod tests {
         for turn in 0..RUNAWAY_TURNS - 1 {
             scripted = scripted.calls(vec![tool_call(
                 "call",
-                "write_file",
-                json!({ "path": "notes.txt", "content": format!("turn {turn}") }),
+                "run_command",
+                json!({ "command": format!("printf 'turn {turn}' > notes.txt") }),
             )]);
         }
         let scripted = Arc::new(scripted.says(WRAPPED_UP));
@@ -9453,7 +9250,7 @@ mod tests {
         }
         assert_eq!(repeats, LOOP_ROUNDS, "a real repeat still trips it");
         // And a different batch starts over, refusals or not.
-        count_round(&mut last, &mut repeats, "read_file:{}", false);
+        count_round(&mut last, &mut repeats, "edit_file:{}", false);
         assert_eq!(repeats, 0);
     }
 
@@ -9469,8 +9266,8 @@ mod tests {
         for _ in 0..LOOP_ROUNDS + 1 {
             scripted = scripted.calls(vec![tool_call(
                 "call",
-                "write_file",
-                json!({ "path": "same.txt", "content": "same" }),
+                "run_command",
+                json!({ "command": "printf same > same.txt" }),
             )]);
         }
         let scripted = Arc::new(scripted.says("changed my approach"));
@@ -9726,8 +9523,8 @@ mod tests {
         exec_tool(
             &actor,
             &mut state,
-            ToolName::AgentControl,
-            &json!({ "id": 1, "action": "message", "text": "again" }),
+            ToolName::Control,
+            &json!({ "id": "1", "action": "message", "text": "again" }),
             &cancel,
         )
         .unwrap();
@@ -9855,12 +9652,12 @@ mod tests {
             &mut Vec::new(),
             AgentMsg::ChildRunning { id: 1 },
         );
-        let lines = status_tool(&state).unwrap();
+        let lines = status_tool(&actor, &state).unwrap();
         assert!(lines.contains("#1 ◐ running"), "{lines}");
 
         // A wait no longer answers the old stopped digest: it waits, and the
         // clock is what ends it.
-        let report = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 600 })).unwrap();
+        let report = wait_tool(&actor, &mut state, &cancel).unwrap();
         assert!(report.starts_with("wait timed out"), "{report}");
         assert!(!report.contains("stopped"), "{report}");
         assert!(
@@ -9892,7 +9689,7 @@ mod tests {
         state.delivered.insert(1, 1);
         state.running.insert(2);
 
-        let report = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 600 })).unwrap();
+        let report = wait_tool(&actor, &mut state, &cancel).unwrap();
         assert!(
             report.starts_with("wait timed out") && report.contains("#2"),
             "it waits for the running child, not the read one: {report}"
@@ -9902,7 +9699,7 @@ mod tests {
         // comes back, marked as read.
         state.running.clear();
         note_completion(&mut state, 2, 1, Outcome::Finished("new news".into()));
-        let report = wait_tool(&actor, &mut state, &cancel, &json!({ "timeout": 600 })).unwrap();
+        let report = wait_tool(&actor, &mut state, &cancel).unwrap();
         assert!(report.contains("#2 done: new news"), "{report}");
     }
 

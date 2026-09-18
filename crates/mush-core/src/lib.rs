@@ -25,13 +25,11 @@ pub use session::Session;
 pub use userconfig::UserConfig;
 pub use workspace::Workspace;
 
-/// Ceiling for bytes of file content handed to a model in one read. Small
-/// windows get less: a single tool result must never fill the transcript (see
-/// `Config::read_cap`).
-pub const READ_CAP: usize = 16_000;
-/// Ceiling for bytes of command output handed to a model in one result.
-pub const CMD_CAP: usize = 6_000;
+/// Ceiling for bytes of command output handed to a model in one result. The
+/// command is now the only road by which a big text result reaches the model —
+/// the file tools are gone — so this is the old read ceiling, and
+/// `Config::cmd_cap` scales it down to a quarter of the history budget for a
+/// window too small to hold it.
+pub const CMD_CAP: usize = 16_000;
 /// How long a shell command may run before it is killed.
 pub const CMD_TIMEOUT_SECS: u64 = 120;
-/// Ceiling for the number of files returned by a single listing.
-pub const LIST_LIMIT: usize = 4_000;

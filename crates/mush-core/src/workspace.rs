@@ -160,15 +160,20 @@ impl Workspace {
 }
 
 /// Cap text handed to a model, cutting on a char boundary and marking the
-/// cut, so a partial result can never be mistaken for the whole file.
-/// `usize::MAX` keeps everything.
+/// cut, so a partial result can never be mistaken for the whole output. The
+/// marker says how much was kept and what to do next — the command result is
+/// now the one road big text travels, and a model that cannot tell truncation
+/// from completion is the defect this prevents. `usize::MAX` keeps everything.
 pub fn truncate_for_model(mut text: String, cap: usize) -> String {
     if text.len() <= cap {
         return text;
     }
     let cut = head_cut(&text, cap);
     text.truncate(cut);
-    text.push_str("\n\n[mush: output truncated]");
+    text.push_str(&format!(
+        "\n\n[mush: output truncated at {cap} bytes — rerun it narrower (rg, head, a smaller \
+         path) to see the rest]"
+    ));
     text
 }
 
@@ -188,7 +193,8 @@ pub fn head_cut(text: &str, cap: usize) -> usize {
 /// keeps the head instead, which is right for a file the model is about to edit
 /// and wrong for a log it is about to read. Keeping the tail is also what makes a
 /// crash legible at all — the interesting bytes are the ones written just before
-/// it stopped.
+/// it stopped. The marker names the cap and the way past it, like
+/// `truncate_for_model`'s.
 pub fn tail_for_model(text: &str, cap: usize) -> String {
     if text.len() <= cap {
         return text.to_string();
@@ -197,7 +203,11 @@ pub fn tail_for_model(text: &str, cap: usize) -> String {
     while cut < text.len() && !text.is_char_boundary(cut) {
         cut += 1;
     }
-    format!("[mush: output truncated]\n\n{}", &text[cut..])
+    format!(
+        "[mush: output truncated at {cap} bytes (the end is shown) — rerun it narrower to see \
+         the rest]\n\n{}",
+        &text[cut..]
+    )
 }
 
 /// Write via a same-directory temp file plus `rename`, so readers never observe
@@ -257,9 +267,11 @@ mod tests {
     fn truncation_keeps_short_text_intact() {
         assert_eq!(truncate_for_model("short".to_string(), 100), "short");
         assert_eq!(truncate_for_model(String::new(), 0), "");
-        assert_eq!(
-            truncate_for_model("abcdef".to_string(), 3),
-            "abc\n\n[mush: output truncated]"
+        let cut = truncate_for_model("abcdef".to_string(), 3);
+        assert!(cut.starts_with("abc"), "{cut}");
+        assert!(
+            cut.contains("output truncated at 3 bytes") && cut.contains("rerun it narrower"),
+            "a partial result says so and what to do: {cut}"
         );
     }
 
@@ -268,14 +280,17 @@ mod tests {
     #[test]
     fn a_tail_keeps_the_end_and_marks_the_cut_at_the_front() {
         assert_eq!(tail_for_model("short", 100), "short");
-        assert_eq!(
-            tail_for_model("abcdef", 3),
-            "[mush: output truncated]\n\ndef"
+        let tail = tail_for_model("abcdef", 3);
+        assert!(tail.ends_with("def"), "{tail}");
+        assert!(
+            tail.starts_with("[mush: output truncated at 3 bytes"),
+            "{tail}"
         );
+        assert!(tail.contains("rerun it narrower"), "{tail}");
         // The cut lands on a char boundary, never inside a character.
         let tail = tail_for_model("éééééé", 5);
         assert!(tail.ends_with("é"), "{tail}");
-        assert!(tail.starts_with("[mush: output truncated]"), "{tail}");
+        assert!(tail.starts_with("[mush: output truncated"), "{tail}");
     }
 
     #[test]

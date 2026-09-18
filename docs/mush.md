@@ -20,16 +20,17 @@ edit the files.
 - `mush` is a TUI in Rust. One binary. **No async runtime.**
 - Workspace-first: `mush [DIR]`, or just `mush` in the folder you are in.
 - An **agent is built in**: it talks to any OpenAI-compatible endpoint
-  (default `http://rubendpc:8078`) and edits the workspace through five file
-  tools; it can delegate work through four more, and hand a long command to a
-  **job** it can check on later through three more.
+  (default `http://rubendpc:8078`) and works the workspace through six tools:
+  the shell (`run_command`) lists, reads and writes, `edit_file` replaces exact
+  text, `spawn_agent` delegates, and `status`, `control` and `wait` manage what
+  it started — a long command becomes a **job** the agent can check on later.
 - mush holds **no file state**: agents read and write files directly, and the
   UI shows their tree, their transcripts, and the git facts.
 - The agent's **system prompt is three short blocks** — the rules, the
   delegation policy, and what the machine is like — and the root's tool set is
-  twelve functions. A leaf keeps eight of them: the four delegation tools are
-  omitted, which is what bounds the tree. Small prompt, small interface, one
-  consequence of the other.
+  six functions. A leaf keeps five of them: `spawn_agent` is omitted, which is
+  what bounds the tree. Small prompt, small interface, one consequence of the
+  other.
 - Everything mush writes lives in `<DIR>/.mush/`, which **git-ignores itself**.
 - Architecture is a single-owner **event loop**: `Msg` in, `App::update`, `ui::draw`.
 - KISS is enforced by the dependency budget of §7.
@@ -60,14 +61,17 @@ edit the files.
 
 ### Why files + a shell is still the interface
 
-The agent's tools are `list_files`, `read_file`, `write_file`, `edit_file`, and
-`run_command`. That is the entire surface for touching a workspace — plus four
-delegation tools that are only about other agents. Any other agent — a shell
-script, a different harness — can collaborate through the same two things: the
-workspace files and the shell. The same two things are also how *you* drive
-mush: the attach protocol of §9 (M3) lets a script you run yourself read a
-transcript and hand a message to an agent over a UNIX socket, without needing
-to know anything about mush's internals.
+The agent's tools for touching a workspace are `run_command` — a real shell,
+which lists, reads and writes better than a bespoke tool could (`rg`, `sed -n
+'1,200p' file`, `ls -la`, `mkdir -p dir && cat > file <<'EOF'`) — and
+`edit_file`, whose exact-and-unique replacement is a safety property `sed -i`
+does not have. That is the entire surface for files — plus `spawn_agent` and
+the `status`/`control`/`wait` that manage what an agent starts. Any other
+agent — a shell script, a different harness — can collaborate through the same
+two things: the workspace files and the shell. The same two things are also how
+*you* drive mush: the attach protocol of §9 (M3) lets a script you run yourself
+read a transcript and hand a message to an agent over a UNIX socket, without
+needing to know anything about mush's internals.
 
 ---
 
@@ -77,7 +81,7 @@ An editor-shaped design has a hard problem: the agent reads and writes files on
 disk while the human has the same file open in memory. Whoever saves last wins.
 
 mush avoids it by not being an editor. Agents do their own file I/O on their own
-threads (`read_file`, `write_file`, `edit_file`), and the UI holds only what the
+threads (`edit_file`, `run_command`), and the UI holds only what the
 human needs to steer them: the agent tree, the focused transcript, the message
 box, and the git snapshot. There is no live buffer, so there is no stale copy,
 no lock, and no save race — a consequence of a smaller product.
@@ -88,14 +92,26 @@ and never share state with the painter.
 
 ### Safety rules that stay
 
-- **Atomic saves.** Every agent write is temp-file + `rename`; readers never see
-  a half-written file, and a crash cannot corrupt the original.
-- **Workspace jail.** Every agent path is resolved against the root and rejected
-  if it escapes (`..`, absolute paths). The agent cannot touch `/etc`.
+- **Atomic saves.** Every `edit_file` write is temp-file + `rename`; readers
+  never see a half-written file, and a crash cannot corrupt the original.
+- **Workspace confinement is a convention, not a fence.** `edit_file` resolves
+  its `path` against the root and rejects an escape (`..`, absolute paths), but
+  `run_command` is a real shell and nothing confines it. So the rules name the
+  workspace, tell the agent that paths are workspace-relative and that commands
+  run with their cwd at its root, and say never to touch paths outside it — and
+  the prompt says so in one place (`RULES`). There is no enforced *path jail*:
+  the agent is trusted to stay, not stopped from leaving.
 - **Edits are exact.** `edit_file` refuses if `old_string` is missing or appears
   more than once, so an edit can never hit the wrong occurrence.
-- **Truncated reads are capped, edits are not.** Reads to the model are capped
-  for context; edit operations always work on the complete file.
+- **Command output is capped, edits are not.** One cap bounds every big-text
+  result — the shell's (`CMD_CAP = 16 000` bytes, scaled down by
+  `Config::cmd_cap()` to a quarter of the history budget, floored at 512) — and a
+  job's report is the same kind of window, a **tail** (§5.6). A capped result
+  says so and says the way past it: a result whose head is kept ends with
+  `[mush: output truncated at {cap} bytes — rerun it narrower (rg, head, a smaller path) to see the rest]`,
+  and a result whose *end* matters keeps its tail, preceded by
+  `[mush: output truncated at {cap} bytes (the end is shown) — rerun it narrower to see the rest]`.
+  Edit operations always work on the complete file.
 - **Bounded loops.** A run ends when the model stops calling tools; a *loop* —
   the same tool batch five rounds over with nothing changed in between — ends it
   early, and a 200-turn runaway guard withdraws the tools and asks for a
@@ -118,24 +134,25 @@ rather than two copies that drift:
 You are mush, a coding agent working in the workspace at <ROOT>.
 
 Rules:
-- Every tool already works inside the workspace: paths are workspace-relative ("src/main.rs", not an absolute path) and run_command/edit/read already runs there with its cwd at the workspace root.
-- Never touch paths outside the workspace.
+- Work inside the workspace: paths are workspace-relative ("src/main.rs", not an absolute path), and a command runs with its cwd at the workspace root. Never touch paths outside the workspace.
+- Read before you edit: use the shell (`sed -n '1,200p' file`, `rg pattern`) — `edit_file` needs the exact text it replaces, and refuses a match that is missing or not unique.
 - When you are done finish with a concise summary of what you did.
 
 Delegation:
 - spawn_agent(brief, title, base?) starts a subagent with no memory of this conversation: the brief must carry every fact, file, and the exact deliverable; title is three words naming it in the tree.
-- base gives the child its own worktree and branch forked from that ref, so siblings with bases run in parallel; without one the child works in this workspace, and only one such child may run at a time. Decide up front, or wait_agents for the running one first. (The check can only fail after the brief exists, so decide before writing it.)
+- base gives the child its own worktree and branch forked from that ref, so siblings with bases run in parallel; without one the child works in this workspace, and only one such child may run at a time. Decide up front, or wait for the running one first. (The check can only fail after the brief exists, so decide before writing it.)
 - A subagent runs until it stops calling tools, so a brief is bounded by the work, not a turn count: split by what is independent, not by how long you think it takes.
 - Delegate independent, large, or context-heavy subtasks; do single edits and lookups yourself. Prefer a few big delegations over many small ones.
-- wait_agents blocks until a child finishes: no ids means the *first* finish, all=true every child; its answer hands over an unread result's full summary, and an already-read one comes back as a digest. Ending your turn while children still run is fine: they keep working and you are woken with their "#N done: summary" results as each finishes.
+- wait blocks until every child and every job you own has finished, then answers with one digest: a result you have not read comes in full, one you have already read as a line. status lists what is in flight; control stops or messages one.
+- Ending your turn while children still run is fine: they keep working and a finish wakes you with its "#N done: summary". wait is optional — use it when you want the results now.
 
 The machine is shared (CPU, ports, /tmp — a worktree isolates files, nothing else):
-- A long command detaches into a job instead of dying: run_command answers "[still running — detached as #c2]", detach=true asks for one at once, and any command that outlives 60s does it by itself. command_status lists your jobs, wait_commands waits for one, command_control stops one.
+- A long command detaches into a job instead of dying: run_command answers "[still running — detached as #c2]", detach=true asks for one at once, and any command that outlives 60s does it by itself. status lists your children and your jobs, wait blocks until every one of them has finished, and control stops one.
 - exclusive=true owns the machine for timing- or port-sensitive work (a benchmark, a profiler, a fixed port): a sibling's command queues behind it and is refused if the lock outlasts the wait (`#N holds the machine`) — do not retry in a loop.
 ```
 
 The DELEGATION block is only in a prompt whose tools include delegation: a leaf
-at `MAX_DEPTH` has no orchestration tools, so it is not told how to use them. A
+at `MAX_DEPTH` has no `spawn_agent`, so it is not told how to use it. A
 subagent's prompt is otherwise the same shape — who it is (depth), the workspace
 it works in (the shared one, or its own worktree with a `base`) — and the brief
 travels as the first user message, not in the system prompt, mirroring the
@@ -144,26 +161,24 @@ message, so the human's picture of a child starts where the child's does.
 
 ### Tools
 
+Six tools, in schema order — the shell does the listing, reading and writing, so
+`edit_file` is the only file tool and `run_command` the road for everything else
+(§1):
+
 | Tool | Arguments | Notes |
 |---|---|---|
-| `list_files` | `path?` | recursive, skips `.git`, `.mush`, `target`, `node_modules`, … |
-| `read_file` | `path` | capped per result (the cap scales with the context window) |
-| `write_file` | `path`, `content` | atomic; creates parent directories |
-| `edit_file` | `path`, `old_string?`, `new_string?`, `edits?` | exact and unique match required; a batch of `edits` lands all-or-nothing in one call, and `replace_all` allows a rename |
-| `run_command` | `command`, `detach?`, `exclusive?` | `sh -c` in the root, own process group; 120 s timeout, 8 MB output limit, cancellable; `detach` starts a job at once, `exclusive` takes the machine lock (§5.6) |
+| `edit_file` | `path`, `old_string`/`new_string` or `edits` | exact-and-unique replacement; a batch lands all-or-nothing in one call; a missing or ambiguous match is refused |
+| `run_command` | `command`, `detach?`, `exclusive?` | a shell in the workspace root, own process group; 120 s timeout, output capped to fit the window, cancellable; `detach` starts a job at once, `exclusive` takes the machine lock (§5.6) |
 | `spawn_agent` | `brief`, `title`, `base?` | a new agent with its own transcript; `title` names its row, and `base` forks a worktree on `mush/<id>` for it (§5.5) |
-| `wait_agents` | `ids?`, `timeout?`, `all?` | blocks until a child finishes; an unread result's summary, an already-read one as a digest |
-| `agent_status` | — | lists the children and their state |
-| `agent_control` | `id`, `action`, `text?` | stops or messages one child |
-| `command_status` | — | lists this agent's jobs: state, age, and the end of what each wrote |
-| `command_control` | `id`, `action` | stops one of this agent's jobs |
-| `wait_commands` | `ids?`, `timeout?`, `all?` | blocks until one of them ends; `all` waits for every one |
+| `status` | — | your children and your jobs in one listing: state, title or branch, age, command; a listing, not a delivery |
+| `control` | `id`, `action`, `text?` | stop or message one, naming it as `status` prints it (`2` for a child, `c2` for a job); a job can only be stopped |
+| `wait` | — | blocks until every child and every job you own has finished, then one digest; returns at once when nothing is in flight |
 
-The four delegation rows are omitted from a leaf agent's schema (`MAX_DEPTH`),
-which is what bounds the tree, so a root has twelve tools and a leaf eight; the
-three job rows are not omitted, because a leaf may run a build in the background
-while it edits (§5.6). `mush_core::tools::TOOL_NAMES` is the single list of
-names, and a test asserts the schemas match it.
+The `spawn_agent` row is omitted from a leaf agent's schema (`MAX_DEPTH`), which
+is what bounds the tree, so a root has six tools and a leaf five; the `status`,
+`control` and `wait` rows are not omitted, because they manage the *jobs* a leaf
+may run in the background while it edits (§5.6). `mush_core::tools::TOOL_NAMES`
+is the single list of names, and a test asserts the schemas match it.
 
 Tool calls execute as a normal OpenAI function-calling loop: the assistant
 message, then one `role: "tool"` message per call, then the next request. Every
@@ -250,7 +265,7 @@ always ten rows, in every pane and every list.
 
 The transcript is not only the human's words, and it says so. `you › ` marks a
 line the human typed — and only a line the human typed: a subagent's brief opens
-its pane as `brief › `, a parent's `agent_control` words arrive as `parent › `,
+its pane as `brief › `, a parent's `control` message arrives as `parent › `,
 and a folded result (`#1 done: …`) is mush's own report, marked `· ` like the
 other lines mush writes. And the text itself is untrusted: a model reply, a tool
 result and a tool call's arguments are defanged before they are painted, so an
@@ -349,19 +364,19 @@ are computed in `App`.
   instead of it — and `⊘` marks both a cancel in flight and a run that landed
   stopped, so a guard-stop is not dressed as a failure. `✉` marks a result its
   parent has not read, `✉N` the ones from an agent's own children. Tool calls are
-  `⚙ name summarized-args` (never raw JSON, the orchestration tools included:
-  `⚙ agent_control #4 message "…"`), and notices are neutral `·` unless something
+  `⚙ name summarized-args` (never raw JSON, the tools that steer a run included:
+  `⚙ control #4 message "…"`), and notices are neutral `·` unless something
   actually failed (`!`).
 
 ```
 ┌ agents · 2 working · 1 waiting · Σ +324 −40 ───────────────────┐
 │   ◐ #0 you        edit src/lib.rs                              │
-│   ◐ #1 ⏸2 lexer   wait_agents                                  │
-│     ◐ #2 tests    write tests/lex.rs                           │
+│   ◐ #1 ⏸2 lexer   wait                                         │
+│     ◐ #2 tests    edit tests/lex.rs                            │
 │   ✓ #3 docs       wrote README.md                              │
 ├────────────────────────────────────────────────────────────────┤
-│ #2 write tests/lex.rs                                          │
-│ write tests/lex.rs 3s · .mush/wt/2 · git diff HEAD...mush/2    │
+│ #2 edit tests/lex.rs                                           │
+│ edit tests/lex.rs 3s · .mush/wt/2 · git diff HEAD...mush/2     │
 └────────────────────────────────────────────────────────────────┘
 ```
 
@@ -384,8 +399,9 @@ stored choice) › what the endpoint advertises (`max_model_len`, `context_lengt
 documented window (`deepseek-flash` and `deepseek-v4-pro`: 500k) › the provider
 default. Derived windows are never persisted — they are re-read, so a stale guess
 cannot outlive its cause — and the caps a tool result may use follow the window,
-so one `read_file` can never fill an 8k transcript. A server that complains about
-the context length teaches mush the number it names, and the run retries once.
+so one command's output can never fill an 8k transcript. A server that complains
+about the context length teaches mush the number it names, and the run retries
+once.
 
 Everything mush knows about a named vendor — the name a human types, its
 default endpoint, the models it documents, their windows, whether the thinking
@@ -519,10 +535,10 @@ the process ended resumes from the transcript it had.
 ## 5.5 Subagents: actors, not a framework
 
 Agents are one thread each, owning one transcript; parents and children talk
-directly through mailboxes (`spawn_agent`, `wait_agents`, `agent_status`,
-`agent_control`), while the UI observes via id-tagged events. Depth and live
-count are hard budgets; the delegation tools are simply omitted from a leaf's
-schema. Every agent does its own file I/O on its own thread. A child given a
+directly through mailboxes (`spawn_agent`, `status`, `control`, `wait`), while
+the UI observes via id-tagged events. Depth and live count are hard budgets; the
+delegation tool is simply omitted from a leaf's schema. Every agent does its own
+file I/O on its own thread. A child given a
 `base` gets its own git worktree (`.mush/wt/<id>`, branch `mush/<id>`) forked
 from that ref; without one it shares the checkout, and only one shared child may
 run at a time. A `base` git cannot resolve is a *failed delegation* —
@@ -542,7 +558,7 @@ list`, so those commands keep working across a restart.
 An orchestrator that ends its turn while children still run is not finished, it
 is napping: the completion is folded into its transcript as a user message and
 the run restarts, so a result is never lost just because nobody called
-`wait_agents` in time.
+`wait` in time.
 
 Two different messages end an agent's work, and the difference matters:
 `Stop` cancels the run in flight (Ctrl-C, `c` on a running row) and leaves the
@@ -591,12 +607,12 @@ there is no room to hand a job to, and the foreground timeout is the whole story
 then.)
 
 **2. A job is a second-class actor.** It has an id, a command, an owner, a start
-time, an exit status, and a bounded window of output. `command_status` lists them,
-`command_control {id, action: stop}` ends one, and `CommandDone` lands in its
-owner's mailbox exactly like `ChildDone`: it wakes a napping agent, is delivered
-once, and folds in as `#c2 done: exit 0 · 3m12s · cargo test — test result: ok. …`.
-`wait_commands {ids?, timeout?, all?}` mirrors `wait_agents`, which gains the same
-`all` — ask for every result instead of the first one.
+time, an exit status, and a bounded window of output. `status` lists them,
+`control {id, action: stop}` ends one, and `CommandDone` lands in its owner's
+mailbox exactly like `ChildDone`: it wakes a napping agent, is delivered once,
+and folds in as `#c2 done: exit 0 · 3m12s · cargo test — test result: ok. …`.
+`wait` takes no arguments: it blocks until every child and every job the agent
+owns has finished, and answers with one digest.
 
 Jobs are budgeted (`MAX_JOBS = 8`, machine-wide and beside `MAX_AGENTS`) because
 each is a thread, a process group, and disk. They die with their agent
@@ -621,7 +637,7 @@ detached exclusive job holds the lock for its whole life. The lock coordinates
 one — a per-agent cap would let eight agents hold eight builds each, which is the
 situation the cap exists to prevent — and a job does **not** count against
 `MAX_AGENTS`: the two are separate budgets for separate resources. A job's kept
-output is a **tail**, consistently, in the completion line and in `command_status`
+output is a **tail**, consistently, in the completion line and in `status`
 alike: a job is read when it *ends*, and what ended it (`test result: FAILED`, `error:
 could not compile`, the panic) is at the bottom, not the top.
 
@@ -645,7 +661,7 @@ Single-owner state. No locks. No async runtime.
                                    ▲
                                    │  AgentEvent (id-tagged)
                        agent threads: model HTTP loop
-                       └ file tools and `run_command` run on the agent's own thread
+                       └ the shell runs on the agent's own thread
 ```
 
 - One `crossbeam` channel carries every input into the UI thread.
@@ -680,7 +696,7 @@ mush/
       tools.rs       tool names, argument helpers, exact-match edit semantics
       transcript.rs  pairing, repair, trimming and the compaction trigger
       userconfig.rs  the machine-global config file (where the API key lives)
-      workspace.rs   path jail, listings, capped reads, atomic writes
+      workspace.rs   path resolution, listings, capped reads, atomic writes
     mush/        # the binary: TUI + agent
       main.rs        CLI, terminal guard/panic hook, event loop
       app/mod.rs     state, `update`, intent and command dispatch
@@ -777,13 +793,13 @@ a live one. Release profile uses `lto = "thin"`, `codegen-units = 1`,
 
 **Done**
 
-- **M0 — Core.** workspace path jail, atomic writes, session persistence, message
-  types, prompt/tool schemas, config resolution.
+- **M0 — Core.** workspace path resolution, atomic writes, session persistence,
+  message types, prompt/tool schemas, config resolution.
 - **M1 — Editor.** `[REMOVED v0.2]` open/edit/save, modal keys, panes. mush is not
   an editor; the message box of §4 is what remains of it.
-- **M2 — Agent.** OpenAI function-calling loop, file tools on the agent thread,
-  streaming-free status spinner, cancellation, history trimming, context
-  compaction.
+- **M2 — Agent.** OpenAI function-calling loop, a file-editing tool and the shell
+  on the agent thread, streaming-free status spinner, cancellation, history
+  trimming, context compaction.
 - **M2.5 — Subagents.** actor-per-agent with mailboxes, delegation tools, the
   agent tree, isolated git worktrees, wake-on-completion, bounded depth and
   fan-out.
@@ -808,10 +824,10 @@ a live one. Release profile uses `lto = "thin"`, `codegen-units = 1`,
 - **M2.8 — Concurrent work (jobs + one lock).** `[DONE]` A command that outlives
   `CMD_DETACH_AFTER` (60 s), or that asked with `detach: true`, becomes a **job**:
   ids drawn from the tree's one counter (`#c2`), a machine-wide registry
-  (`MAX_JOBS = 8`), `command_status`/`command_control`/`wait_commands`, `all` on
-  both waits, a kept window that is the **tail**, jobs that die with their owner
-  and with mush, and `run_command({exclusive: true})` taking a workspace-wide lock
-  that names its holder (§5.6). This is the milestone for the machine, the way
+  (`MAX_JOBS = 8`), the job surface of `status`/`control`/`wait`, a kept window
+  that is the **tail**, jobs that die with their owner and with mush, and
+  `run_command({exclusive: true})` taking a workspace-wide lock that names its
+  holder (§5.6). This is the milestone for the machine, the way
   M2.6 is the milestone for the branch.
 
 - **M3 — External agents (attach).** `[DONE]` A UNIX socket at
@@ -847,12 +863,13 @@ later one.
 ## 10. Testing
 
 - **Unit tests.** Message-box semantics (grapheme edits, the cursor window, wide
-glyphs), path jail and escaping, capped reads, atomic writes, session and
-user-config round-trips, `.mush` self-ignore, history trimming and its
-termination guard, compaction, tool-execution semantics (list filtering,
-unique-match edits), tool-pair repair, argument validation, shell-command
-timeout, cancellation, output cap and runaway-writer limit, URL/status-line
-parsing (IPv6 literals included), the model-list timeout, cancelling a chat
+glyphs), path resolution and escaping, capped reads and the command cap, atomic
+writes, session and user-config round-trips, `.mush` self-ignore, history
+trimming and its termination guard, compaction, tool-execution semantics
+(exact-and-unique edits, a batch that lands all-or-nothing), tool-pair repair,
+argument validation, shell-command timeout, cancellation, output cap and
+runaway-writer limit, URL/status-line parsing (IPv6 literals included), the
+model-list timeout, cancelling a chat
 request mid-wait and the request deadline (plus the slow-but-alive body the
 slices must not mistake for one, and a dribbling body the deadline must still
 stop), an oversized or malformed response body, the git snapshot (branch, dirty
@@ -861,7 +878,7 @@ precedence and the caps that follow it, row field priority and column-aware
 truncation, the `~` elision boundary, a draw sweep over fifteen terminal sizes ×
 a sweep of states that asserts the *painted* text (not "does not panic"), the
 attach protocol's ops and one real socket exchange,
-the job registry (detach, the machine lock, the `all` waits, the tail window),
+the job registry (detach, the machine lock, the tail window),
 the transport retry and what it must *not* retry, the notices' kinds and
 lifetimes, per-conversation scrollback, the floor refusing every key but `Ctrl-Q`,
 config precedence, schema/prompt invariants, word wrapping, the actor mailbox
@@ -898,7 +915,7 @@ one makes a TLS handshake against `https://api.deepseek.com`.
   defects of §4.5 were found and how the next layer gets reviewed. Pass `--ask`
   with a reachable endpoint to see the agent's own screens (thinking, cancel,
   done); without it the empty screens need no model at all.
-- **Not yet.** A fuzz target for the path jail. Property tests for the merge
+- **Not yet.** A fuzz target for path resolution. Property tests for the merge
   verbs are moot now the merge commands are gone — git is what runs them.
 
 Run it:
@@ -939,7 +956,7 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
    is a nudge), or is watching enough now that the row and its footer carry the
    brief?
 9. `[DECIDED]` Job output is a **tail**, consistently, in the completion line and
-   in `command_status` alike: a job is read when it ends, and what ended it is at
+   in `status` alike: a job is read when it ends, and what ended it is at
    the bottom of the log. The head is what a *foreground* command keeps, because
    the model reads it while the command still runs; that is a different window
    for a different reader, not a second copy of this one.

@@ -108,7 +108,7 @@ pub enum NoticeKind {
     /// A run mush itself stopped — the loop guard ending a model that kept
     /// repeating one call. Nothing the model did *failed*: R4 reserves `!` for
     /// the things that did, and the stop is the honest mark — `⊘`, the same
-    /// reading `agent_status` gives a stopped child.
+    /// reading `status` gives a stopped child.
     Stopped,
     /// A run that never ended: the process went away with it in flight, or the
     /// agent's actor vanished. Not a failure — nothing the model did broke —
@@ -136,7 +136,7 @@ impl NoticeKind {
 ///
 /// A conversation is not only the human's words: a child's pane opens with the
 /// brief its parent spawned it with, a folded completion (`#1 done: …`) is
-/// mush's own report of another agent, and `agent_control message` puts a
+/// mush's own report of another agent, and a `control` message puts a
 /// parent's words in a child's transcript. All three used to render as
 /// `you › ` — the human's own voice, in their own mouth, for words they never
 /// said. Each of them is now a voice of its own, so `you › ` means the human
@@ -148,7 +148,7 @@ pub enum Voice {
     Human,
     /// The brief a parent spawned this agent with, which opens its transcript.
     Brief,
-    /// A parent's words to this agent (`agent_control message`). `agent_control`
+    /// A parent's words to this agent (a `control` message). `control`
     /// only reaches the sender's own children, so the speaker is its parent.
     Parent,
     /// A line mush itself wrote into the conversation: a child's or a job's
@@ -2045,7 +2045,7 @@ mod tests {
 
     /// A line the human did not say is not painted in the human's voice. Three
     /// kinds of them reach a child's pane: the brief its parent spawned it with,
-    /// a parent's steering (`agent_control message`, the words of which the
+    /// a parent's steering (a `control` message, the words of which the
     /// human has no other way to see), and mush's own report of a completion it
     /// folded in. All three read `you › …` — the human's words in the human's
     /// mouth — while the human's own nudge to the same agent must keep it.
