@@ -39,8 +39,6 @@ pub struct ProviderSpec {
     pub name: &'static str,
     /// Endpoint used when no URL is given.
     pub default_base_url: &'static str,
-    /// Whether the provider requires an API key for normal use.
-    pub needs_api_key: bool,
     /// The provider's documented models, used when the endpoint cannot list
     /// them (offline, missing key, or a server without `/v1/models`). Empty
     /// means "ask the endpoint and nothing else".
@@ -77,7 +75,6 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         provider: Provider::DeepSeek,
         name: "deepseek",
         default_base_url: "https://api.deepseek.com",
-        needs_api_key: true,
         models: &[
             ModelSpec {
                 id: "deepseek-flash",
@@ -103,7 +100,6 @@ pub const PROVIDERS: &[ProviderSpec] = &[
         provider: Provider::Custom,
         name: "custom",
         default_base_url: "http://rubendpc:8078",
-        needs_api_key: false,
         models: &[],
         fallback_context_tokens: DEFAULT_CONTEXT_TOKENS,
         thinking_by_default: false,
@@ -162,11 +158,6 @@ impl Provider {
     /// Endpoint used when no URL is given.
     pub fn default_base_url(&self) -> &'static str {
         self.spec().default_base_url
-    }
-
-    /// Whether the provider requires an API key for normal use.
-    pub fn needs_api_key(&self) -> bool {
-        self.spec().needs_api_key
     }
 }
 
