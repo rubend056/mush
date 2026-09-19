@@ -352,21 +352,12 @@ impl App {
         let inner = inner(area);
         let nodes = self.tree.rows();
         let cursor = self.tree.cursor();
-        // One walk over the tree for every count this pane paints: `busy_children`
-        // scans per call, and asking it once per row was quadratic in the tree
-        // (finding R29). The title's buckets are one more walk of their own,
-        // inside `roster`.
-        let busy = self.tree.busy_counts();
-
         // The rows are built before the footer, because the footer reads the
         // cursor row's activity off the row already built for it. Deriving
         // `phase_detail` a second time here would call `node.since.elapsed()`
         // again, and a clock tick between the two calls would paint two ages
         // for one frame (finding R26).
-        let rows: Vec<AgentRow> = nodes
-            .iter()
-            .map(|node| self.row(node, busy.get(&node.id).copied().unwrap_or(0)))
-            .collect();
+        let rows = self.rows(&nodes);
 
         // The cursor row's facts live in a footer under the list, so the list
         // may degrade to `◐ #2` on a narrow pane without losing anything: facts
@@ -435,16 +426,24 @@ impl App {
         }
     }
 
-    /// One row of the tree, with its fields derived from the node. `pub(super)`
-    /// so the attach roster can serialize the very row the pane paints instead
-    /// of deriving it a second time (finding R21).
-    pub(super) fn agent_row(&self, node: &AgentNode) -> AgentRow {
-        self.row(node, self.tree.busy_children(node.id))
+    /// The rows for `nodes`, in their order, with the parent's busy-child count
+    /// derived in one [`super::tree::AgentTree::busy_counts`] walk for the whole
+    /// call rather than once per row, which was quadratic in the tree the pane
+    /// paints (finding R29).
+    ///
+    /// `pub(super)` so the attach roster serializes the very rows the pane
+    /// paints instead of deriving them a second time (finding R21).
+    pub(super) fn rows(&self, nodes: &[&AgentNode]) -> Vec<AgentRow> {
+        let busy = self.tree.busy_counts();
+        nodes
+            .iter()
+            .map(|node| self.row(node, busy.get(&node.id).copied().unwrap_or(0)))
+            .collect()
     }
 
-    /// The same row with the parent's busy-child count supplied: the pane has
-    /// already built them all in one [`super::tree::AgentTree::busy_counts`]
-    /// walk, so it does not ask the tree once per row (finding R29).
+    /// One row, with the parent's busy-child count supplied: [`Self::rows`] has
+    /// already built them all in one walk, so this does not ask the tree for
+    /// them (finding R29).
     fn row(&self, node: &AgentNode, waiting: usize) -> AgentRow {
         // Two facts, two marks: `glyph · id` is this agent's own phase, and
         // `⏸N` counts the children that are working. The old row derived the
