@@ -525,10 +525,18 @@ fn describe(config: &Config, approved: bool) -> Vec<(String, String)> {
         Some(key) => format!("{} (masked)", mask_key(key)),
         None => "(none)".to_string(),
     };
-    // The model row is the facts line's label, not the raw id: an id an
-    // endpoint chose (adopted from `/v1/models`, or restored from the session)
-    // can carry a control sequence, and this line reaches a terminal.
-    let model = config.label();
+    // The model row is the id a request carries, **defanged**: an id an endpoint
+    // chose (adopted from `/v1/models`, or restored from the session) can carry
+    // a control sequence, and this line reaches a terminal. It is not
+    // [`Config::label`]: that is the facts line's whole `model @ endpoint`, and
+    // this dump already has an `endpoint` row of its own. The word for an unset
+    // model is the one the label uses, and the defanging is the same door
+    // (`mush_core::text::sanitize`) every terminal-bound string goes through.
+    let model = if config.model.is_empty() {
+        "no model".to_string()
+    } else {
+        mush_core::text::sanitize(&config.model)
+    };
     let window = if config.context_explicit {
         "stated"
     } else {
@@ -1060,10 +1068,9 @@ mod tests {
         };
         assert_eq!(field("endpoint"), "http://host:1");
         assert_eq!(field("provider"), "custom");
-        // The model row is the facts line's label, defanged, not the raw id:
-        // `Config::label` is the one form an endpoint-chosen name is painted in.
-        assert_eq!(field("model"), cfg.label());
-        assert_eq!(field("model"), "deepseek-v4-pro @ http://host:1");
+        // The id itself, not the facts line's `model @ endpoint`: the endpoint
+        // is a row of its own two lines above.
+        assert_eq!(field("model"), "deepseek-v4-pro");
         assert_eq!(field("window"), "64000 tokens (stated)");
         assert_eq!(field("temperature"), "0.0", "0 is a value, not an absence");
         assert_eq!(field("reasoning"), "max (stated)");
@@ -1087,7 +1094,7 @@ mod tests {
                 .map(|(_, value)| value.clone())
                 .unwrap()
         };
-        assert_eq!(field("model"), "no model @ http://host:1");
+        assert_eq!(field("model"), "no model");
         assert_eq!(
             field("window"),
             "8192 tokens (assumed from the model or the provider)"
@@ -1123,8 +1130,9 @@ mod tests {
 
     /// An id an endpoint chose — adopted from `/v1/models`, or restored from
     /// the session — must not rename the terminal through `--print-config`.
-    /// The model row is the facts line's label, whose model half is the defanged
-    /// form; the test is the same shape the config layer's own label test uses.
+    /// The row carries the id itself, defanged by the same door the facts line
+    /// and every other terminal-bound string goes through (finding §4 of the
+    /// contract audit).
     #[test]
     fn describe_defangs_the_model_an_endpoint_named() {
         let hostile = "boom\rREST \x1b]0;PWNED\x07\x1b[2J\x1b[Hmock";
@@ -1137,7 +1145,10 @@ mod tests {
             .unwrap();
         assert!(!model.contains('\x1b'), "{model:?}");
         assert!(!model.contains('\r'), "{model:?}");
-        assert_eq!(model, cfg.label());
+        assert_eq!(
+            model, "boom␍REST mock",
+            "the id, minus what a terminal obeys"
+        );
     }
 
     /// The session the shipped DeepSeek defaults describe, as `--print-config`
