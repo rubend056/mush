@@ -1255,3 +1255,96 @@ what was true when they were measured — this section is what supersedes them.
 `--print-config` is the surface that makes the small-window case honest: for the
 built-in 8 192 the row reads `1024 tokens as max_tokens`, and the numbers above
 come from exactly that command.
+
+## 8.31 A window that says whose it is (`aaec739`, `mush/100`)
+
+The human's feature, approved mid-flight and landed as one branch: two mush
+windows on two workspaces were indistinguishable — same borders, same focus
+badge, same selected row, same eight colours — and the screen held no fact that
+could fix it, because every colour was a constant opinion rather than a
+derivation. `crates/mush/src/theme.rs` (new, 143 production lines) is that fact.
+
+**The decision.** `FNV-1a 64` of the workspace's canonical path, modulo thirty,
+indexes a table of named hues. The hash is written out rather than taken from
+`DefaultHasher`, whose output is documented as unstable across Rust releases: a
+workspace whose colour changed when mush was rebuilt is the very confusion the
+hue exists to prevent. The path is canonicalized first, so `cd work` and `cd
+work/.` are one window in one colour, and hashed as typed when it does not
+resolve, because `--print-config` describes a workspace that is allowed not to
+exist yet.
+
+**The palette is spaced perceptually, not by name.** Thirty hues sampled around
+the CIELAB hue circle with alternating lightness, every one in the L\* 60–85
+band (so the `Color::Black` text mush paints on the badge and the selected rows
+still reads), minimum pairwise ΔE2000 ≈ 11.8 — a collision is rare *and* two
+windows are told apart at a glance. The tests hold the ends a test can hold: a
+lightness band computed in the test's own arithmetic, an RGB-distance floor, and
+300 paths reaching all thirty buckets.
+
+**Chrome wears the hue; content does not.** Seven sites in `ui.rs` — the focused
+borders, the picker's frame and its selected row, the message prompt, the bar's
+badge, the selected agent row, an activity line — paint `Theme::accent()`. The
+alert red, the notice yellow, the dim gray and the body gray stay fixed: what
+happened reads the same in every workspace, only *whose window this is* changes.
+`Theme::default()` is exactly the old fixed palette, which is what keeps every
+text-reading test painting what it always painted — and `painted_with` plus
+`a_themed_frame_repaints_only_the_chrome` (diffs a themed frame against a plain
+one: text identical, every changed cell wore `Cyan` before and the hue after, the
+bar's badge included) is what proves the threading cannot quietly fall out.
+
+**The form is the terminal's answer.** `COLORTERM=truecolor`/`24bit`, or a `TERM`
+naming a direct-colour mode, gets the hue's own bytes; anything else gets the
+nearest of the terminal's 256, searched over the 6×6×6 cube and the gray ramp
+(the first sixteen entries are the terminal's own palette, chosen by name) —
+computed from the two standard formulas rather than tabled as 240 rows, and
+pinned by hand twice (teal → 37, and the whole table checked against a palette
+rebuilt in the test's own terms). The `Color` variant *is* the form, so nothing
+can describe a window as truecolor while holding an index.
+
+**`MUSH_THEME` overrules it, and a typo costs a message.** A hue's name, `256`
+(demand the indexed form even on a truecolor terminal), `off` (the fixed palette
+of every version before this one), `auto` (the unset spelling). An unknown value
+is a startup error naming the value and listing every spelling that works, built
+from the table. The three variables are read once, at the edge, by one
+`EnvText::read()` — the same house rule §8.29's C1 enforced for the other
+`MUSH_*` readers — and everything below it is a pure function of that value.
+
+**`--print-config` gained the row, and it is true for the terminal it ran on**:
+`theme  olive (truecolor, from the workspace path)`, or `(indexed, …)`, or
+`(…, MUSH_THEME)`, or `off (MUSH_THEME)`. The form word is the accent's own
+variant, so the sentence cannot disagree with what a frame will paint. Verified
+live on the merged tree: three workspaces → `apricot`, `amber`, `fawn`; each of
+them `(indexed, …)` with no `COLORTERM`; `MUSH_THEME=teal` → `teal (truecolor,
+MUSH_THEME)`; `MUSH_THEME=256` on a truecolor terminal → `(indexed, …, 
+MUSH_THEME=256)`; `off` → `off (MUSH_THEME)`; `tale` → exit 1 with all thirty
+names; and `.mush/` is still not created by a dump.
+
+A real pty (34×110, `pty.fork`, the whole session killed with `killpg`) shows the
+bytes rather than the intent: `/tmp/mush-theme-pty` hashes to olive `#9AA845`,
+and the captures carry `ESC[38;2;154;168;69m` with `COLORTERM=truecolor`,
+`ESC[38;5;107m` without it (107 = `#87AF5F`, the cube entry nearest olive),
+`MUSH_THEME=off` with no `Rgb` anywhere, and `MUSH_THEME=teal` the teal bytes.
+One caveat the capture taught us: `ESC[38;5;6m` appears in *every* capture — the
+footer's `#0 you(rootagent)` is a `Color::Cyan` in `app/screen.rs`, not one of
+the seven accent sites.
+
+**What did not move, and is now a decision owed.** The *conversation's* colours:
+the cyan `you ›` and `brief ›` voices and the magenta `parent ›` in `app/chat.rs`,
+and the footer's cyan agent id in `app/screen.rs`. They are speech rather than
+chrome, and a voice whose colour changed per window would be one more thing to
+learn — but a themed window still shows fixed cyan sentences, so whether the
+voices should follow the hue is a ruling, recorded in §8.32.
+
+**Cost.** +19 tests (15 theme, 2 `ui.rs`, 1 `app`, 1 `main.rs`), mush 515 → 534,
+mush-core untouched at 128, fmt and clippy clean, all three smoke scenarios
+passing. The census at the merge: **48 920** total · **7 161** prod · **26 316**
+tests · **12 273** comments — against 47 831 / 7 061 / 25 698 / 11 971 at
+`ff315d8`. A feature that is mostly a palette and its guarantees costs 143
+production lines and 413 test lines in its own file, and 100 production lines
+net across the crate.
+
+One merge note, because it is the kind of thing that looks like a bug later: the
+branch was cut from `ff315d8` and `b87bb40` (the budget re-tune) landed before
+it, so `main.rs` conflicted — in exactly one test line, where the re-tune had
+added `let cap = plain.reply_cap();` above a `describe` call that the theme
+branch had changed to take a `Theme`. Both survived; no fix was lost.

@@ -378,9 +378,10 @@ are computed in `App`.
 └──────────────────────────────────────────────────────────────────┘
 ```
 
-The cursor row is the one wearing the pane's selection colour; there is no
-separate marker glyph, because the row's own `▶` already says which agent the
-chat pane is showing and two arrows beside each other said two things at once.
+The cursor row is the one wearing the pane's selection colour — which is now the
+workspace's own hue, below; there is no separate marker glyph, because the row's
+own `▶` already says which agent the chat pane is showing and two arrows beside
+each other said two things at once.
 
 The plumbing is a `mush-core/src/git.rs` (shell-outs like the worktree code, no
 new crates) exposing `status(dir)`, `branch(dir)`, `branch_stat(dir, base)` and a
@@ -447,6 +448,53 @@ message with one lifetime for all of them, `/forget` keeping a forgotten agent's
 lines invisibly, and a failure from twenty runs ago reading as the newest thing
 said — is gone.
 
+### One hue per workspace `[DECIDED]`
+
+Two mush windows on two workspaces were indistinguishable: same borders, same
+focus badge, same selected row, same eight colours. The screen knew *what*
+everything on it was and nothing about *whose* it was.
+
+- **The path is the identity.** `FNV-1a 64` of the workspace's canonical path —
+  written out in `theme.rs` rather than taken from `DefaultHasher`, whose output
+  is documented as unstable across Rust releases, because a colour that changed
+  when mush was rebuilt is the very confusion the hue prevents — indexes a table
+  of thirty hues. Canonicalizing first makes `cd work` and `cd work/.` one window
+  in one colour; a path that does not resolve (a `--print-config` on a workspace
+  that does not exist yet) is hashed as it was typed.
+- **Chrome wears the hue, content does not.** Seven sites take the accent: the
+  focused borders, the picker's frame and its selected row, the message prompt,
+  the bar's badge, the selected agent row, and an activity line. The alert red,
+  the notice yellow, the dim gray and the body gray stay fixed — *what happened*
+  reads the same in every window, and only *whose window this is* changes.
+- **The thirty are separated perceptually, not by name.** Sampled around the hue
+  circle with alternating lightness, all of them in the L\* 60–85 band where the
+  `Color::Black` text mush paints on the badge and the selected rows still reads,
+  and no two closer than ΔE2000 ≈ 11.8 — so two windows are told apart at a
+  glance rather than by comparing swatches. The names are lowercase, one word and
+  typeable (`MUSH_THEME=olive`), and a test forbids `auto`, `256` and `off` from
+  being names.
+- **The form follows the terminal.** `COLORTERM=truecolor`/`24bit` (or a `TERM`
+  that names a direct-colour mode) paints the hue's own bytes; anything else
+  paints the nearest entry of the terminal's 256 — searched over the 6×6×6 colour
+  cube and the gray ramp, since the first sixteen entries are the terminal's own
+  palette and are meant to be chosen by name. The `Color` variant *is* the form,
+  so a window described as truecolor cannot be holding an index.
+- **`MUSH_THEME` overrules all of it.** A hue's name, `256` to demand the indexed
+  form on a truecolor terminal, `off` for the fixed palette of every version
+  before this one, `auto` for unset. An unknown value is a startup error listing
+  every spelling that works — a typo costs a message, not a window in a colour
+  nobody asked for.
+- **`--print-config` says what the window would look like**: `theme  olive
+  (truecolor, from the workspace path)` — the hue, the form it will be painted
+  in, and the fact that chose it, so the dump a human compares two windows with
+  is the same fact the windows have.
+
+Left as it was: the colours of the *conversation* — the cyan `you ›` and
+`brief ›` voices, the magenta `parent ›`, and the footer's cyan agent id. Those
+are speech rather than chrome, and a voice whose colour changed per window would
+be one more thing to learn. The hue is not a theme system: there is no setting
+for the alert red, because a failure has to look the same wherever it is read.
+
 ---
 
 ## 5. Persistence: everything in `.mush/`
@@ -492,10 +540,12 @@ is rejected at startup by name, never sent and never quietly replaced by a
 default.
 
 `mush --print-config` prints what those layers resolved to — endpoint, provider,
-model, window and whether a human stated it, temperature, reasoning effort and
-thinking mode (each with whether a human stated it), the reply cap's size and the
-name it travels under, and the key masked — and exits 0 without opening the
-terminal or creating `.mush/`.
+what the stored session was (`none`, how much of a conversation it read, or that
+the file is there and *unreadable*), model, window and whether a human stated
+it, temperature, reasoning effort and thinking mode (each with whether a human
+stated it), the reply cap's size and the name it travels under, the key masked,
+`-y`, and the hue the window would wear — and exits 0 without opening the
+terminal, creating `.mush/` or taking the workspace lock.
 It is the honest view of the precedence, and what makes a hand-edited file
 debuggable. The other flags a human would type are `--temperature F`,
 `--reasoning-effort LEVEL` (`low`, `high` or `max`; also
@@ -1033,3 +1083,10 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
 - **A window a human states always beats a default.** `--context` / `MUSH_CONTEXT`
   / the home config's `context` win over what an endpoint advertises, a model
 table and the provider's own fallback, and are remembered in the session.
+- **A window says whose it is.** Each workspace hashes its canonical path to one
+  of thirty hues and the chrome wears it (§4.5); the *content* colours do not
+  move, because a failure has to read the same in every window. The hash is
+  written out — Rust's standard hasher is documented as unstable across releases
+  — so a workspace's colour survives a rebuild, and the path is canonicalized
+  first so it survives a change of spelling. `MUSH_THEME` overrules it, and
+  `--print-config` names the fact that produced the colour.
