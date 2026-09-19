@@ -3719,6 +3719,10 @@ mod tests {
             // Isolated, and its work never landed: the window keeps the row,
             // which is what leaves the mailbox alive to hear about its children.
             branch: Some("mush/1".into()),
+            // Hand-made: no worktree was ever created for it, so there is no
+            // fork revision to store (the branch above is a name in the books,
+            // not a checkout the sweep found).
+            fork: None,
             cmd: parent_tx,
         });
         let mailboxes: Vec<Receiver<AgentMsg>> = (2..=52)
@@ -3946,6 +3950,9 @@ mod tests {
             brief: "a parent".to_string(),
             depth: 1,
             branch: Some("mush/1".to_string()),
+            // No worktree was created, so no fork revision exists (see
+            // `finished_child_of`).
+            fork: None,
             cmd: parent_tx,
         });
         // The child, parked: a mailbox with nobody behind it is exactly what
@@ -3958,6 +3965,7 @@ mod tests {
             brief: "port the parser".to_string(),
             depth: 2,
             branch: None,
+            fork: None,
             cmd: tx,
         });
         app.tree.finish(AgentId(2), Some("did it".to_string()));
@@ -4903,6 +4911,8 @@ mod tests {
             brief: "a parent".to_string(),
             depth: 1,
             branch: None,
+            // Parked and hand-made: no worktree, so no fork revision.
+            fork: None,
             cmd: tx,
         });
         // The child whose row is on screen, and whose name the books have to
