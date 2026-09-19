@@ -22,7 +22,7 @@ mod ui;
 
 use std::error::Error;
 use std::io::{self, Stdout};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -450,25 +450,28 @@ fn help_text() -> String {
          \x20                      OpenAI's reasoning models require\n\
          \x20   -y, --yes          Pre-approve this session's work. Recorded only: mush asks\n\
          \x20                      nothing yet, so this changes no behaviour today\n\
-         \x20   --print-config     Print the resolved config (endpoint, provider, model, window\n\
-         \x20                      and whether it was stated, temperature, reasoning effort and\n\
-         \x20                      thinking mode, reply-cap size and name, key masked) and exit 0\n\n\
+         \x20   --print-config     Print the resolved config (endpoint, provider, the stored\n\
+         \x20                      session, model, window and whether it was stated,\n\
+         \x20                      temperature, reasoning effort and thinking mode, reply-cap\n\
+         \x20                      size and name, key masked, auto-approve and theme) and exit 0\n\n\
          KEYS:\n{keys}\n\n\
          COMMANDS (type in the chat):\n\
          {commands}\n\
          ATTACH (drive a running mush from another shell; newline-delimited JSON):\n\
          \x20   mush agents [DIR]      list the agents and their state\n\
          \x20   mush read [DIR] [--agent N] [--since N]\n\
-         \x20                        an agent's transcript lines\n\
-         \x20   mush focus [DIR] ID   focus that agent, as Enter on its row does\n\
-         \x20   mush edit [DIR] [--agent N] --base R [--send] TEXT\n\
-         \x20                       set the message box's draft, or send it as the human\n\
-         \x20                       (-- ends the options, for a directory named like one)\n\
+         \x20                         an agent's transcript lines\n\
+         \x20   mush focus ID [DIR]   focus that agent, as Enter on its row does\n\
+         \x20   mush edit [--agent N] --base R [--send] TEXT [DIR]\n\
+         \x20                         set the message box's draft, or send it as the human\n\
+         \x20                         (-- ends the options, for a directory named like one)\n\
          Endpoint, API key, model, and the request knobs live in\n\
          $MUSH_CONFIG or the platform config directory. That file is hand-editable,\n\
          every field is optional, and the one mush writes documents itself.\n\
-         --print-config shows what those layers resolved to. The conversation is\n\
-         stored in <DIRECTORY>/.mush/session.json.\n",
+         --print-config shows what those layers resolved to, and the theme the window\n\
+         would wear ($MUSH_THEME: a hue's name, or 256, off, auto; default: the hue\n\
+         this workspace's path hashes to). The conversation is stored in\n\
+         <DIRECTORY>/.mush/session.json.\n",
         env!("CARGO_PKG_VERSION"),
         mush_core::provider::names_hint(),
         mush_core::provider::DEFAULT_PROVIDER.name(),
@@ -505,17 +508,51 @@ fn unreadable_session_notice(
         ),
         // The copy could not be set aside either. That is the worse half of the
         // news and it is said second, because naming a backup that is not there
-        // would be the one lie this line must not tell.
-        Err(error) => format!("could not read {file} — {reason}; {error}"),
+        // would be the one lie this line must not tell. What it says instead is
+        // the consequence the human has to act on — the file is still at the
+        // path, and the next save writes over it — because a notice that
+        // stopped at the reason left the only copy looking safe (finding S3).
+        Err(error) => format!(
+            "could not read {file} — {reason}; {error} · starting a new conversation, \
+             and the next save will replace {file}, which is still there"
+        ),
     }
+}
+
+/// The layers `--print-config` describes, resolved for `dir`.
+///
+/// A read and nothing else: no `.mush/` is created, no lock is taken and no
+/// request is made, and a directory that does not exist yet is described as the
+/// fresh workspace it would be. The theme is resolved from the same directory
+/// argument, tolerating one that does not canonicalize yet, because the dump
+/// describes a workspace that is allowed not to exist.
+///
+/// The session is read as [`session::Stored`], not through `Session::load`
+/// — which answers `None` for a file that is *there and unusable* exactly as it
+/// does for no file at all. The two are different facts about the layer, and a
+/// dump that showed nothing for the first was showing a precedence chain with a
+/// link silently missing (finding B2).
+fn resolved_config(
+    dir: &Path,
+    overrides: &Overrides,
+    env: &theme::EnvText,
+) -> Result<(Config, session::Stored, theme::Theme), Box<dyn Error>> {
+    let stored = Session::read(dir);
+    let session = match &stored {
+        session::Stored::Loaded(session) => Some(session),
+        session::Stored::Absent | session::Stored::Unusable(_) => None,
+    };
+    let config = config::resolve(overrides, &UserConfig::load(), session)?;
+    let theme = theme::Theme::resolve(env, dir)?;
+    Ok((config, stored, theme))
 }
 
 /// `--print-config`: the resolved config and nothing else — no workspace, no
 /// `.mush/`, no request to an endpoint. This is what makes a hand-edited home
 /// file debuggable, and the only way to see the precedence chain rather than
 /// guess at it.
-fn print_config(config: &Config, theme: &theme::Theme) {
-    for (field, value) in describe(config, auto_approve(), theme) {
+fn print_config(config: &Config, stored: &session::Stored, theme: &theme::Theme) {
+    for (field, value) in describe(config, auto_approve(), stored, theme) {
         println!("{field:<13}{value}");
     }
 }
@@ -523,7 +560,33 @@ fn print_config(config: &Config, theme: &theme::Theme) {
 /// One `field  value` line per fact, in the order a human reads them. The
 /// values are what a request will carry, not what some file wished for; the
 /// window is the one fact whose *source* matters, so it is named.
-fn describe(config: &Config, approved: bool, theme: &theme::Theme) -> Vec<(String, String)> {
+fn describe(
+    config: &Config,
+    approved: bool,
+    stored: &session::Stored,
+    theme: &theme::Theme,
+) -> Vec<(String, String)> {
+    // The session is the workspace's own layer of the chain, and the dump says
+    // what it was rather than flattening "no file" and "a file mush cannot
+    // read" into the same silence (finding B2). The count is the
+    // conversation's, so a readable file also says how much of one it holds;
+    // the reason is *why* the file was refused, carried through for the human
+    // who has to fix it by hand. A reason is built from what a hand-edited
+    // file contained and reaches a terminal, so it goes through the same door
+    // the model id does.
+    let session_layer = match stored {
+        session::Stored::Absent => "none".to_string(),
+        session::Stored::Loaded(session) => {
+            let messages = session.messages.len();
+            format!(
+                "read ({messages} message{})",
+                if messages == 1 { "" } else { "s" }
+            )
+        }
+        session::Stored::Unusable(reason) => {
+            format!("unreadable — {}", mush_core::text::sanitize(reason))
+        }
+    };
     let key = match config.api_key.as_deref().filter(|key| !key.is_empty()) {
         Some(key) => format!("{} (masked)", mask_key(key)),
         None => "(none)".to_string(),
@@ -579,6 +642,9 @@ fn describe(config: &Config, approved: bool, theme: &theme::Theme) -> Vec<(Strin
     vec![
         ("endpoint".to_string(), config.base_url.clone()),
         ("provider".to_string(), config.provider.name().to_string()),
+        // Before the values it can supply: endpoint, provider, model and
+        // window may all have come from this layer.
+        ("session".to_string(), session_layer),
         ("model".to_string(), model),
         (
             "window".to_string(),
@@ -598,6 +664,39 @@ fn describe(config: &Config, approved: bool, theme: &theme::Theme) -> Vec<(Strin
         // the one the window would have, environment included.
         ("theme".to_string(), theme.describe()),
     ]
+}
+
+/// Open the workspace directory, naming it when it cannot be opened.
+///
+/// `Workspace::new` is a canonicalize, and the io error it returns alone says
+/// nothing a human can act on: `mush /typo` answered `No such file or
+/// directory (os error 2)`, with no path named and no advice, while the sibling
+/// case in [`run`] — a *file* where a directory was wanted — is careful to name
+/// both (finding B1).
+fn open_workspace(dir: &Path) -> Result<Workspace, String> {
+    Workspace::new(dir).map_err(|error| {
+        format!(
+            "cannot open the workspace directory {}: {error} — check the path, and create \
+             the directory first if it is not there yet",
+            dir.display()
+        )
+    })
+}
+
+/// Create the workspace's `.mush/` store, naming what could not be made.
+///
+/// An unwritable workspace answered with a bare `Permission denied (os error
+/// 13)`, the same defect as [`open_workspace`]'s (finding B1). The path is
+/// spelled workspace-relative, the one elision rule the startup messages share
+/// ([`Workspace::rel`], refactor R17).
+fn ensure_mush_dir(workspace: &Workspace) -> Result<(), String> {
+    session::ensure_mush_dir(workspace.root()).map_err(|error| {
+        format!(
+            "cannot create {}: {error} — mush keeps this workspace's conversation there, \
+             and it has to be a writable directory",
+            workspace.rel(&session::mushroom_dir(workspace.root()))
+        )
+    })
 }
 
 fn run() -> Result<(), Box<dyn Error>> {
@@ -638,26 +737,21 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     if args.print_config {
         // The resolved config, then out: no terminal is entered, no `.mush/` is
-        // created, and no request is made. The workspace's stored session is
-        // still read, because it is a layer of the precedence being shown.
-        //
-        // The theme is a fact about what the window would look like, so it is
-        // resolved here too — from the same directory argument, tolerating one
-        // that does not canonicalize yet, because this dump describes a
-        // workspace that may not exist.
-        let stored = Session::load(&dir);
-        let config = config::resolve(&overrides, &UserConfig::load(), stored.as_ref())?;
-        let theme = theme::Theme::resolve(&env, &dir)?;
-        print_config(&config, &theme);
+        // created, no lock is taken and no request is made — [`resolved_config`]
+        // is where the layers are read, and where a session file that cannot be
+        // read stays a fact about the layer rather than being flattened into
+        // absence (finding B2).
+        let (config, stored, theme) = resolved_config(&dir, &overrides, &env)?;
+        print_config(&config, &stored, &theme);
         return Ok(());
     }
 
-    let workspace = Workspace::new(&dir)?;
-    // One hue per workspace, from the canonical root `Workspace::new` just
+    let workspace = open_workspace(&dir)?;
+    // One hue per workspace, from the canonical root `open_workspace` just
     // resolved: two spellings of one directory are one window in one colour,
     // and the hue is handed to every frame below rather than re-derived.
     let theme = theme::Theme::resolve(&env, workspace.root())?;
-    session::ensure_mush_dir(workspace.root())?;
+    ensure_mush_dir(&workspace)?;
     // One mush per workspace, taken before anything is read or written: a
     // second process on this directory would write the same `session.json`, and
     // that write is a whole-file replace on a minute's debounce, so the two
@@ -900,6 +994,7 @@ fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mush_core::Message;
 
     #[test]
     fn cli_overrides_map_to_the_config_layer() {
@@ -1008,12 +1103,13 @@ mod tests {
     }
 
     /// The sentence a workspace whose session could not be read is told. It has
-    /// to name the file, the reason and where the only copy went — and it must
-    /// say *that* the copy could not be kept rather than name a backup that is
-    /// not there. The file is shown relative to the workspace by
-    /// [`Workspace::rel`], the one elision rule (refactor R17).
+    /// to name the file, the reason and where the only copy went — and when the
+    /// copy could not be set aside it must say *that* rather than name a backup
+    /// that is not there, plus what happens now to the copy still on disk. The
+    /// file is shown relative to the workspace by [`Workspace::rel`], the one
+    /// elision rule (refactor R17).
     #[test]
-    fn the_unreadable_session_notice_names_the_file_the_reason_and_the_backup() {
+    fn the_unreadable_session_notice_names_the_file_and_what_becomes_of_it() {
         let ws = scratch_workspace("unreadable-notice");
         let kept = Ok(ws.root().join(".mush/session.json.bak"));
         let notice = unreadable_session_notice(&ws, "expected value at line 1 column 2", kept);
@@ -1032,7 +1128,9 @@ mod tests {
 
         // The copy could not be set aside either. That is the worse half of the
         // news, and the line says it instead of pointing at a file that is not
-        // there.
+        // there — then says the consequence, which is the half the human has to
+        // act on: the conversation starts empty, the file is still where it was,
+        // and the next save writes over it (finding S3).
         let notice = unreadable_session_notice(
             &ws,
             "expected value at line 1 column 2",
@@ -1040,6 +1138,20 @@ mod tests {
         );
         assert!(notice.contains("cannot keep session.json"), "{notice}");
         assert!(!notice.contains("kept as"), "{notice}");
+        assert!(!notice.contains(".bak"), "no backup was written: {notice}");
+        assert!(notice.contains("starting a new conversation"), "{notice}");
+        assert!(
+            notice.contains("the next save will replace .mush/session.json"),
+            "{notice}"
+        );
+        assert!(
+            notice.contains("which is still there"),
+            "the file the move could not take is still where it was: {notice}"
+        );
+        assert!(
+            !notice.contains(&ws.root().display().to_string()),
+            "the same workspace-relative spelling as the `Ok` arm: {notice}"
+        );
         let _ = std::fs::remove_dir_all(ws.root());
     }
 
@@ -1050,6 +1162,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         Workspace::new(&dir).unwrap()
+    }
+
+    /// A directory mush cannot open names the directory and what to do about
+    /// it, instead of printing only the operating system's errno: `mush /typo`
+    /// used to answer `No such file or directory (os error 2)`, naming neither
+    /// the argument nor anything a human could do about it (finding B1). The
+    /// sibling case — a *file* where a directory was wanted — has named both
+    /// from the start.
+    #[test]
+    fn an_unopenable_workspace_names_the_directory() {
+        let dir = std::env::temp_dir().join(format!("mush-main-typo-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let error = open_workspace(&dir).unwrap_err();
+        assert!(error.contains(&dir.display().to_string()), "{error}");
+        assert!(error.contains("No such file or directory"), "{error}");
+        assert!(
+            error.contains("create the directory first"),
+            "the advice a human can act on: {error}"
+        );
+    }
+
+    /// `.mush/` that cannot be created names the path and what it is for: an
+    /// unwritable workspace used to answer with a second bare errno (finding
+    /// B1). A file standing where the directory belongs is the one failure
+    /// every machine can produce on purpose.
+    #[test]
+    fn a_store_that_cannot_be_created_names_the_path() {
+        let ws = scratch_workspace("store-blocked");
+        std::fs::write(ws.root().join(".mush"), "not a directory").unwrap();
+        let error = ensure_mush_dir(&ws).unwrap_err();
+        assert!(error.contains(".mush"), "{error}");
+        assert!(
+            error.contains("File exists"),
+            "the reason is carried through: {error}"
+        );
+        assert!(
+            error.contains("writable directory"),
+            "the advice a human can act on: {error}"
+        );
+        let _ = std::fs::remove_dir_all(ws.root());
     }
 
     /// A second positional is an error rather than a silent replacement
@@ -1087,7 +1239,12 @@ mod tests {
         cfg.reasoning_effort = Some(config::ReasoningEffort::Max);
         cfg.thinking = Some(config::ThinkingMode::Off);
 
-        let lines = describe(&cfg, true, &theme::Theme::default());
+        let lines = describe(
+            &cfg,
+            true,
+            &session::Stored::Absent,
+            &theme::Theme::default(),
+        );
         let field = |name: &str| {
             lines
                 .iter()
@@ -1116,7 +1273,12 @@ mod tests {
         // under the name every endpoint documents.
         let plain = Config::new("http://host:1", "", None);
         let cap = plain.reply_cap();
-        let plain = describe(&plain, false, &theme::Theme::default());
+        let plain = describe(
+            &plain,
+            false,
+            &session::Stored::Absent,
+            &theme::Theme::default(),
+        );
         let field = |name: &str| {
             plain
                 .iter()
@@ -1146,7 +1308,12 @@ mod tests {
         // the thinking mode are sent, and the line says whose they are.
         let mut preset = Config::new("https://api.deepseek.com", "deepseek-flash", None);
         preset.provider = config::Provider::DeepSeek;
-        let preset = describe(&preset, false, &theme::Theme::default());
+        let preset = describe(
+            &preset,
+            false,
+            &session::Stored::Absent,
+            &theme::Theme::default(),
+        );
         let field = |name: &str| {
             preset
                 .iter()
@@ -1166,7 +1333,7 @@ mod tests {
     fn describe_reports_the_theme_a_window_would_wear() {
         let cfg = Config::new("http://host:1", "m", None);
         let value = |theme: &theme::Theme| {
-            describe(&cfg, false, theme)
+            describe(&cfg, false, &session::Stored::Absent, theme)
                 .into_iter()
                 .find(|(field, _)| field == "theme")
                 .map(|(_, value)| value)
@@ -1207,7 +1374,12 @@ mod tests {
     fn describe_defangs_the_model_an_endpoint_named() {
         let hostile = "boom\rREST \x1b]0;PWNED\x07\x1b[2J\x1b[Hmock";
         let cfg = Config::new("http://x:1", hostile, None);
-        let lines = describe(&cfg, false, &theme::Theme::default());
+        let lines = describe(
+            &cfg,
+            false,
+            &session::Stored::Absent,
+            &theme::Theme::default(),
+        );
         let model = lines
             .iter()
             .find(|(field, _)| field == "model")
@@ -1233,7 +1405,12 @@ mod tests {
         config.rederive_context();
         assert!(!config.context_explicit, "a default, not a statement");
 
-        let lines = describe(&config, false, &theme::Theme::default());
+        let lines = describe(
+            &config,
+            false,
+            &session::Stored::Absent,
+            &theme::Theme::default(),
+        );
         let field = |name: &str| {
             lines
                 .iter()
@@ -1249,6 +1426,92 @@ mod tests {
             field("reply cap"),
             format!("{} tokens as max_tokens", config.reply_cap())
         );
+    }
+
+    /// The session is a layer of the precedence chain, and `--print-config`
+    /// says what that layer was: nothing there, a conversation read back (and
+    /// how much of one), or a file that is there and cannot be read. A dump
+    /// that showed nothing for the last case was showing a chain with a link
+    /// silently missing (finding B2).
+    #[test]
+    fn describe_reports_the_session_layer_it_read() {
+        let cfg = Config::new("http://host:1", "m", None);
+        let row = |stored: &session::Stored| {
+            describe(&cfg, false, stored, &theme::Theme::default())
+                .into_iter()
+                .find(|(field, _)| field == "session")
+                .map(|(_, value)| value)
+                .unwrap_or_else(|| panic!("no `session` row"))
+        };
+        assert_eq!(row(&session::Stored::Absent), "none");
+
+        let mut one = Session::default();
+        one.messages.push(Message::user("hello"));
+        assert_eq!(row(&session::Stored::Loaded(one)), "read (1 message)");
+
+        let mut two = Session::default();
+        two.messages.push(Message::user("hello"));
+        two.messages.push(Message::user("again"));
+        assert_eq!(row(&session::Stored::Loaded(two)), "read (2 messages)");
+
+        // The reason is the file's own — and it is made of what a hand-edited
+        // file contained, on its way to a terminal, so it goes through the
+        // same door the model id does.
+        let hostile = "expected value at line 1 column 2\r\x1b[2Jmock";
+        let row = row(&session::Stored::Unusable(hostile.to_string()));
+        assert!(
+            row.starts_with("unreadable — expected value at line 1 column 2"),
+            "{row:?}"
+        );
+        assert!(!row.contains('\x1b') && !row.contains('\r'), "{row:?}");
+    }
+
+    /// `--print-config` is a diagnostic: it reads the layers and writes
+    /// nothing. A workspace nothing has opened yet is described as the fresh
+    /// one it would be, with no `.mush/` appearing, and a session file it
+    /// cannot read is reported unreadable and left exactly where it is —
+    /// setting it aside is the *startup* path's job, not the dump's (finding
+    /// B2).
+    #[test]
+    fn describing_a_config_writes_nothing() {
+        let env = theme::EnvText {
+            theme: None,
+            colorterm: None,
+            term: None,
+        };
+
+        let missing =
+            std::env::temp_dir().join(format!("mush-main-dump-missing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&missing);
+        let (_, stored, _) = resolved_config(&missing, &Overrides::default(), &env).unwrap();
+        assert!(matches!(stored, session::Stored::Absent), "{stored:?}");
+        assert!(
+            !missing.exists(),
+            "the dump created the workspace it described"
+        );
+
+        let ws = scratch_workspace("dump-unreadable");
+        let file = session::session_path(ws.root());
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(&file, "{ not json").unwrap();
+        let (config, stored, theme) =
+            resolved_config(ws.root(), &Overrides::default(), &env).unwrap();
+        let row = describe(&config, false, &stored, &theme)
+            .into_iter()
+            .find(|(field, _)| field == "session")
+            .map(|(_, value)| value)
+            .expect("no `session` row");
+        assert!(row.starts_with("unreadable — "), "{row}");
+        assert!(
+            row.contains("line 1"),
+            "the reason says where the file broke: {row}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            "{ not json",
+            "the dump left the unreadable session exactly where it was"
+        );
+        let _ = std::fs::remove_dir_all(ws.root());
     }
 
     /// The full startup path with an unreachable endpoint must still produce a
@@ -1293,14 +1556,27 @@ mod tests {
         assert!(help.contains("COMMANDS (type in the chat):"));
     }
 
-    /// The `--help` text lists the attach subcommands, so a human learns they
-    /// exist from the one place every other surface is advertised.
+    /// The `--help` text lists the attach subcommands and the exact usage the
+    /// parser takes, so a human learns they exist and can copy a line that
+    /// works. The block used to put `[DIR]` first for `focus` and `edit` while
+    /// the parser read the *value* first, so following the help got an error
+    /// blaming the argument the human had just typed (finding A3).
     #[test]
-    fn the_help_lists_the_attach_subcommands() {
+    fn the_help_shows_each_attach_subcommand_the_way_it_parses() {
         let help = help_text();
-        for sub in ["mush agents", "mush read", "mush focus", "mush edit"] {
-            assert!(help.contains(sub), "`{sub}` is not in --help:\n{help}");
+        for usage in [
+            "mush agents [DIR]",
+            "mush read [DIR] [--agent N] [--since N]",
+            "mush focus ID [DIR]",
+            "mush edit [--agent N] --base R [--send] TEXT [DIR]",
+        ] {
+            assert!(help.contains(usage), "`{usage}` is not in --help:\n{help}");
         }
+        // The two orders the parser refuses are gone by name, because that is
+        // the state finding A3 found the block in — and the orders it does
+        // take are pinned by `the_attach_subcommands_parse`.
+        assert!(!help.contains("mush focus [DIR] ID"), "{help}");
+        assert!(!help.contains("mush edit [DIR]"), "{help}");
     }
 
     /// `--` ends the options, in a subcommand as it does for the TUI, so a
@@ -1366,6 +1642,18 @@ mod tests {
         );
         assert_eq!(
             parse(&["read", "--agent", "3", "--since", "12", "/w"]).unwrap(),
+            Some(Cli::Read {
+                dir: "/w".into(),
+                agent: 3,
+                since: 12
+            })
+        );
+        // `read` owns no positional of its own, so the directory may stand
+        // before its flags as `--help` prints it and as a human would type it:
+        // the one usage line the audit's fix did not have to move (finding A3),
+        // and the reason it can stay as it is.
+        assert_eq!(
+            parse(&["read", "/w", "--agent", "3", "--since", "12"]).unwrap(),
             Some(Cli::Read {
                 dir: "/w".into(),
                 agent: 3,
