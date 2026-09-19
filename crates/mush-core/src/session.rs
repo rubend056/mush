@@ -155,7 +155,7 @@ pub struct StoredNotice {
 #[derive(Default, Serialize, Deserialize)]
 pub struct Session {
     pub model: String,
-    /// Provider name as given by [`Provider::name`], i.e. a name
+    /// Provider name as given by [`Provider::name()`], i.e. a name
     /// `--provider` accepts (see `provider::PROVIDERS`).
     #[serde(default)]
     pub provider: String,

@@ -84,7 +84,7 @@ pub struct UserConfig {
     /// never written to the workspace.
     #[serde(default)]
     pub api_key: Option<String>,
-    /// Provider name as given by [`Provider::name`], i.e. a name
+    /// Provider name as given by [`Provider::name()`], i.e. a name
     /// `--provider` accepts (see `provider::PROVIDERS`).
     #[serde(default)]
     pub provider: String,

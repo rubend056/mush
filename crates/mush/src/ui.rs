@@ -1,5 +1,5 @@
 //! Painting. This module is deliberately dumb: it takes a [`Screen`] — a value
-//! [`App::screen`] derived every word of — and paints it, without reading any
+//! [`crate::app::App::screen`] derived every word of — and paints it, without reading any
 //! state. No state transitions and no derivation live here, which keeps the
 //! update logic testable and lets the draw sweep assert painted text instead of
 //! "does not panic" (refactor B17).

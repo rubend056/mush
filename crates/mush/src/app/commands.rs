@@ -27,8 +27,8 @@
 //! | `/models` | ignored | re-read the endpoint's model list |
 //! | `/compact` | ignored | fold the focused conversation into a summary |
 //! | `/notes` | ignored | read the notes the foot had no room for |
-//! | `/help` [`/?`] | ignored | list the keys and the commands |
-//! | `/quit` [`/q`] | ignored | leave mush |
+//! | `/help` (`/?`) | ignored | list the keys and the commands |
+//! | `/quit` (`/q`) | ignored | leave mush |
 //!
 //! Git is not a command surface: the tree names the branch and the worktree,
 //! and `git` itself is the tool for acting on them. The worktree commands mush
