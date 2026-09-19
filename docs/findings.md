@@ -22,23 +22,24 @@ landed in between (S5 in `README.md`/`docs/mush.md` §4; S8's (iii)).
 
 ## The open queue
 
-The row tables still owe four items; the structural queue in `docs/refactor.md`
-sits beside them. This is the one list: each row carries what the defect costs
-and where the fix belongs, and a closure is recorded on the row, never here.
+The row tables owe four items; the structural queue in `docs/refactor.md` sits
+beside them. This is the one list: each row carries what the defect costs and
+where the fix belongs, and a closure is recorded on the row, never here. §8.23
+closed three of the four it listed — H10 by `cc89598`, H16 by `8c1a860`, H17 by
+`fb012d1` — and opened two in their place:
 
-- **H10** — a `mush prune`; nothing reclaims a finished, merged worktree and
-  its branch. **The specimen arrived (§8.21):** `mush/2` and `mush/3` were this
-  session's own children's merged work, checkouts long gone, still named in
-  `git branch` — and still fatal to the next isolated spawn. The reclaim rule is
-  decided: merged-or-clean only, never an unmerged branch, and mush never
-  merges on its own; `MAX_WORKTREES = 70`, above the history window, so a spawn
-  is never refused for want of a slot.
 - **H12** — per-agent token accounting, so a run's cost is visible while it is
-  spent.
-- **H16** — a save re-serializes the whole conversation once a second, and
-  nothing bounds a transcript's stored size (§8.21).
-- **H17** — one counter for children and jobs, and the number an isolated spawn
-  burns when git refuses its worktree (§8.21).
+  spent. (Open, unchanged.)
+- **H16, residual** — the *file* is bounded; the per-second deep copy of every
+  transcript on the UI thread is not. An incremental save is still owed.
+- **H18** — a parent's own `control message`/`stop` to a *parked* child fails as
+  "agent #N is gone": parking ends the actor thread, and the parent's mailbox
+  send finds no receiver. The human's path (message, nudge, `/compact`) revives
+  it; the parent's does not, and before parking it did (§8.23).
+- **H19** — a reaped child's name stays in its parent's books
+  (`state.children`/`completed`), so `status` can list a row that is no longer on
+  screen. Deliberate in `ab54de3` — dropping it needs a "forget this child"
+  message — but it is the one visible inconsistency the window left (§8.23).
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -675,3 +676,64 @@ tests 22,705, comments 10,177. The deltas belong to the repository's own commits
 between those two points — this section added no Rust (its instruments are
 Python, which the census does not count), and the prod column is down because
 the wave's lines went to tests and comments, the trade §8.5 warns about.
+
+---
+
+## 8.23 The wave §8.21 opened: five landings, and the specs that were wrong (`fb012d1`..`cc89598`)
+
+The three questions — why the numbers skip, how long a child lives, why a 100 MB
+file is rewritten once a second — became five patches, each written in its own
+worktree and landed only after the suite had been run on the merged tree:
+
+| landing | what it closed |
+|---|---|
+| `fb012d1` | **H17.** Two id spaces (`AgentId`/`JobId`, one `Display` each), a number given back when a spawn fails before git could create anything, and a floor reserved for every `mush/<id>` git still names — checkout or not, which is the half P13 left. |
+| `91f17ac` | the job ceiling: `JOB_MAX_AGE` = 4 h of wall time, hardcoded, one sentence (`#c3 killed: it ran past the 4h ceiling · 4h00m · cargo run`) and the schema to match, because the schema is where a promise to the model lives. |
+| `8c1a860` | **H16.** `cap_transcript` bounds every stored transcript — 256 KiB a child, 32 MiB the root, whose cut is *marked* in the file and shown on load. Pure, idempotent, never splitting a call from its results. |
+| `ab54de3` | the last-50 window: `Chat::forget`, four steps in one place, and actor *parking*, so a finished child's thread ends while its row and its transcript stay. |
+| `cc89598` | **H10.** Reclamation: merged or clean removes; unmerged, dirty or unresolvable is kept and named; `-d` only, never `-D`; `MAX_WORKTREES = 70` refuses a spawn before an id is taken. |
+
+**Two specs were wrong and the code was right** — the most useful thing the wave
+produced, and the reason a brief is not a design:
+
+- *"The system prompt is regenerated, so a revived child still knows its task"*
+  was false. `prompt::subagent_prompt` takes no brief, and `agent::revive` seeds
+  `user(brief)` only when a transcript is empty — so trusting the prompt would
+  have handed a revived child nothing to do. The cut keeps the transcript's
+  opening segment instead, and the child cap honestly reads "256 KiB plus the
+  opening message".
+- *"No descendant with work in flight"* left the case that matters: a reaped row
+  with an unread reply or an unlanded branch below it strands both — nothing can
+  read a report whose row is gone. The predicate closes the walk over ancestors
+  (`kept_above`), counts a live job as work in flight (a `Shutdown` would kill it
+  through `kill_owned`, a command a human may be waiting on), and parks *leaves
+  only*, because a parent's mailbox is the channel its children's completions
+  travel on.
+
+**Disclosed, and now the queue's own:** H18 (a parent's steer or stop of a parked
+child fails as "gone") and H19 (a reaped child's name stays in its parent's
+books). Not rows, but recorded because a later wave should not have to
+rediscover them: a microscopic completion-versus-sweep race in reclamation
+(a completion sent but not yet in the tree, and the sweep takes the directory a
+wake is about to use); `git branch -d` measuring against the root checkout's HEAD,
+so a nested branch merged into an unmerged parent is removed with its branch kept
+— said out loud rather than hidden by `-D`; a no-commit run recorded as
+`Landed::Merged`, which reads as "merged into HEAD" (a third variant needs
+`StoredLanded`, in core); and one full-suite flake
+(`the_notes_popup_opens_on_the_head_of_the_newest_note`, seen once in ~5 runs
+with the reclamation patch, never reproduced alone or under 14x load, not tied to
+its diff) that the next wave should either freeze with a clock or catch.
+
+**Merge repair, recorded because it is the kind of thing a merge hides.**
+mush/16 and mush/17 each defined a `kept` on `AgentTree` — one a setter (this
+node's work was kept, and why), one a predicate (is this row exempt from the
+window) — and git merged them textually into one `impl`. The tree did not build
+until the setter became `mark_kept`/`mark_reclaimed` and the predicate kept its
+name: a verb and a question, apart at every call site. `cc89598` carries the
+repair, because the tree must build at every commit.
+
+**Census at `cc89598`:** total 46,557 (was 42,702 at `6fc7435`), **prod 7,127
+(+114)**, tests 24,882 (+2,177), comments 11,512 (+1,335). Read that the way §8.5
+asks: five patches, 3,855 lines, and 114 of them behaviour. The wave bought its
+closures with tests and prose — these are the wave's own numbers, and they say
+the next one should be judged on the prod column.
