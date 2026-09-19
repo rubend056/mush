@@ -210,6 +210,31 @@ fn ended_on_an_answer(messages: &[Message]) -> bool {
     )
 }
 
+/// What a restored row's phase and summary mean in the books' vocabulary: the
+/// outcome a parent's `status`/`wait` should report for a child the tree
+/// brought back (finding H25).
+///
+/// `None` for a phase with no result behind it: idle, or a run the tree still
+/// shows in flight. The `Done` fallback is the actor's own — a run that
+/// produced no words becomes `Outcome::Finished("(finished)")` at the actor
+/// boundary, and a row whose last run left no text is that same run seen from
+/// the UI.
+fn seeded_outcome(phase: &Phase, summary: Option<&str>) -> Option<agent::Outcome> {
+    match phase {
+        Phase::Done => Some(agent::Outcome::Finished(
+            summary.unwrap_or("(finished)").to_string(),
+        )),
+        Phase::Stopped => Some(agent::Outcome::Stopped),
+        Phase::CutOff => Some(agent::Outcome::CutOff),
+        Phase::Failed(error) => Some(agent::Outcome::Failed(error.clone())),
+        Phase::Idle
+        | Phase::Thinking
+        | Phase::Activity(_)
+        | Phase::Compacting(_)
+        | Phase::Cancelling => None,
+    }
+}
+
 /// What a cut-off agent's own pane says under its `⚠` row.
 ///
 /// The row is the mark; this is the sentence a human needs to act on it — that
@@ -678,7 +703,59 @@ impl App {
             let line = agent::Outcome::CutOff.line(id.0);
             self.chat.push_message(parent, Message::user(line));
         }
+        // The rows are back; the parents' books are not. Every parent restored
+        // above — the root included: its children came back from the file and
+        // its actor started empty — is handed the tree's rows now that every
+        // node is registered (finding H25).
+        self.seed_children();
         self.tree.repair_focus();
+    }
+
+    /// Write every parent's `children` books from the tree, once, after a
+    /// restore has put the rows back.
+    ///
+    /// A parent restored from a session is revived with an empty `ActorState`,
+    /// so `status` answered "no children and no jobs" and `control` refused
+    /// `no such child agent #N` about children whose rows are on screen
+    /// (finding H25). The books live in the actor, which is the only thing that
+    /// can be handed the tree's rows — so each row travels as an
+    /// [`AgentMsg::ChildBook`], the same door every other fact about a child
+    /// takes, and the actor's own book is written where it learns whose child
+    /// this is.
+    ///
+    /// One message per child, after the whole session is restored: a parent is
+    /// revived before its children are (the file is in spawn order), so there
+    /// is no moment earlier at which the tree could be asked for its rows. The
+    /// sends are not kept — a parent whose actor is somehow gone has no books
+    /// to write, and a send to nothing is the answer, not an error.
+    fn seed_children(&self) {
+        for node in self.tree.agents.iter() {
+            let Some(parent) = node.parent else {
+                // The root has no parent, and a leftover worktree found on disk
+                // is registered as a top-level row: neither is anybody's child.
+                continue;
+            };
+            let (Some(cmd), Some(tx)) = (
+                self.tree.agent_tx.get(&node.id),
+                self.tree.agent_tx.get(&parent),
+            ) else {
+                continue;
+            };
+            let _ = tx.send(AgentMsg::ChildBook {
+                id: node.id.0,
+                cmd: cmd.clone(),
+                outcome: seeded_outcome(&node.phase, node.summary.as_deref()),
+                // The row's `✉` mark: a result nobody has read comes back
+                // unread, so `wait` still hands it over exactly once.
+                read: !node.result_unread,
+                // A stored branch whose worktree is gone became the main
+                // checkout on the way in (`agent::live_branch`), i.e. the
+                // child now runs in a shared workspace like any child with no
+                // branch — the same fact `agent::spawn_tool` records at a
+                // spawn.
+                shared: node.branch.is_none(),
+            });
+        }
     }
 
     /// Re-read what the repository looks like: the main worktree's branch,
@@ -1865,6 +1942,24 @@ impl App {
             self.ws.root().to_path_buf(),
             spec,
         );
+        // The revival replaced the mailbox the tree holds for this child, and
+        // the parent's books still hold the dead one: without this its next
+        // `control` finds no actor and takes this same wake path again, every
+        // time, for the rest of the session — the message lands, which is why
+        // the stale sender went unnoticed (finding H22). The tree is the truth
+        // about which sender is live, so the parent is handed exactly the one
+        // just built. A parent with no actor of its own needs nothing: its
+        // books are gone with the thread, and a parent restored later is seeded
+        // from the tree ([`Self::seed_children`]).
+        if let Some(parent_tx) = node
+            .parent
+            .and_then(|parent| self.tree.agent_tx.get(&parent))
+        {
+            let _ = parent_tx.send(AgentMsg::ChildMailbox {
+                id: id.0,
+                cmd: tx.clone(),
+            });
+        }
         let taken = tx.send(refused).is_ok();
         self.tree.agent_tx.insert(id, tx);
         taken
@@ -2533,21 +2628,37 @@ impl App {
     /// "everything needs a cap, even a high one", run from `tick` because both
     /// are filters over the tree rather than events.
     ///
-    /// **The four steps, in one place, in this order.** Forgetting a child is
-    /// not dropping a node: it is four things that used to happen nowhere. The
+    /// **The five steps, in one place, in this order.** Forgetting a child is
+    /// not dropping a node: it is five things that used to happen nowhere. The
     /// actor has to be told to end — [`AgentMsg::Shutdown`] is the only thing
     /// that stops a thread, and its own arm ends the run it is in and kills the
     /// jobs the agent owns with it (`agent::absorb`, `drain_signals`); then the
-    /// tree drops the node and everything keyed by its id; then the
-    /// conversation drops the transcript, the voices, the revision an attach
-    /// client holds and the pane's reading position ([`Chat::forget`]); and
-    /// then the file is told, or the next save writes back the child this
-    /// forgot (`mark_session_dirty` — the write itself waits for the debounce,
-    /// so a reap costs no write).
+    /// child's parent is told to forget it — [`AgentMsg::ForgetChild`] drops the
+    /// name from the parent's own books, or `status` lists a row that is no
+    /// longer on screen (finding H19); then the tree drops the node and
+    /// everything keyed by its id; then the conversation drops the transcript,
+    /// the voices, the revision an attach client holds and the pane's reading
+    /// position ([`Chat::forget`]); and then the file is told, or the next save
+    /// writes back the child this forgot (`mark_session_dirty` — the write
+    /// itself waits for the debounce, so a reap costs no write).
+    ///
+    /// The forget step is a plain send into the parent's mailbox on purpose. A
+    /// parent whose actor is parked has no books left to correct — the send
+    /// finds no receiver and is dropped — and a parent whose session is
+    /// restored later re-derives its books from the tree, which no longer has
+    /// the child (`Self::seed_children`); neither is woken just to drop a name.
+    /// An idle parent that *is* live absorbs the command as book-keeping and
+    /// stays idle (`agent::absorb`), so this step starts no run anywhere. The
+    /// parent is read before `tree.reap` below, the last moment the node is
+    /// still there to say whose child it was.
     fn reap_history(&mut self) {
         for id in self.tree.past_history() {
+            let parent = self.tree.node(id).and_then(|node| node.parent);
             if let Some(tx) = self.tree.agent_tx.get(&id) {
                 let _ = tx.send(AgentMsg::Shutdown);
+            }
+            if let Some(tx) = parent.and_then(|parent| self.tree.agent_tx.get(&parent)) {
+                let _ = tx.send(AgentMsg::ForgetChild { id: id.0 });
             }
             self.tree.reap(&[id]);
             self.chat.forget(id);
@@ -3257,6 +3368,8 @@ mod tests {
     use crate::session_save;
     use crate::session_save::SessionSave;
 
+    use crate::model::fake::{tool_call, Asked, Scripted};
+
     /// Run a typed line the way a send does: through the pure parser, then the
     /// arms. A test that names a command string this way exercises both, so the
     /// parser cannot be right about an argument the executor reads differently
@@ -3348,6 +3461,40 @@ mod tests {
         app_root(&root, None, session_save::fake::Recorder::new()).0
     }
 
+    /// An `App` whose root actor answers from `scripted` instead of the network,
+    /// with the channel its events would travel on handed back.
+    ///
+    /// [`app_root`]'s root calls the real endpoint, which is what almost every
+    /// test wants: the root's *books* are the exception. They live in its actor
+    /// and only `status` and `control` read them, so the only way to see what
+    /// they say is to drive a run through that actor and read what the model was
+    /// handed (finding H25). The mailbox is the test's to reach through
+    /// `tree.agent_tx`, which is where a run is started from.
+    fn app_with_scripted_root(
+        root: &std::path::Path,
+        stored: Option<Session>,
+        scripted: Arc<Scripted>,
+    ) -> (App, Receiver<Msg>) {
+        let ws = Workspace::new(root).unwrap();
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let handle = agent::spawn_scripted(
+            cfg.clone(),
+            crate::events::fake::Recorder::new(),
+            root.to_path_buf(),
+            scripted,
+        );
+        let app = App::new(
+            ws,
+            ConfigCell::own(cfg),
+            stored,
+            handle,
+            tx,
+            session_save::fake::Recorder::new(),
+        );
+        (app, rx)
+    }
+
     /// An `App` with the UI channel kept, so a read that finishes on its own
     /// thread (`Msg::Git`) can be waited for instead of raced.
     fn app_and_rx(root: std::path::PathBuf) -> (App, Receiver<Msg>) {
@@ -3384,10 +3531,17 @@ mod tests {
     /// a parked one is exactly a mailbox with no receiver behind it — which is
     /// what the tests that want one drop.
     fn finished_child(app: &mut App, id: u64) -> Receiver<AgentMsg> {
+        finished_child_of(app, id, AgentId::ROOT)
+    }
+
+    /// The same child, under a parent of its own: a reap's forget goes to
+    /// whoever the *row* names, not to the root, and a test that wants to read
+    /// the message has to hold that parent's mailbox (finding H19).
+    fn finished_child_of(app: &mut App, id: u64, parent: AgentId) -> Receiver<AgentMsg> {
         let (tx, rx) = crossbeam_channel::unbounded::<AgentMsg>();
         app.tree.insert(Spawn {
             id: AgentId(id),
-            parent: AgentId::ROOT,
+            parent,
             brief: format!("task {id}"),
             depth: 1,
             branch: None,
@@ -3464,6 +3618,50 @@ mod tests {
             (2..=51).collect::<Vec<u64>>(),
             "reaping from the oldest end leaves the surviving numbers contiguous"
         );
+    }
+
+    /// The row goes and so does the name: a child the history window reaps is
+    /// dropped from *its parent's* books, or `status` lists a child whose row is
+    /// off the screen and `control` aims at a ghost (finding H19).
+    ///
+    /// The books live in the actor, so the tree can only ask — this is that
+    /// message, read off a parent whose mailbox the test holds. The child below
+    /// it is #2, the oldest of fifty-one: the same overflow the window's own
+    /// test walks.
+    #[test]
+    fn a_reaped_child_is_dropped_from_its_parents_books() {
+        let (mut app, _rx) = test_app("reap-forgets");
+        let (parent_tx, parent_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "a parent".into(),
+            depth: 1,
+            // Isolated, and its work never landed: the window keeps the row,
+            // which is what leaves the mailbox alive to hear about its children.
+            branch: Some("mush/1".into()),
+            cmd: parent_tx,
+        });
+        let mailboxes: Vec<Receiver<AgentMsg>> = (2..=52)
+            .map(|id| finished_child_of(&mut app, id, AgentId(1)))
+            .collect();
+
+        app.tick();
+
+        assert!(!app.tree.has(AgentId(2)), "the oldest child is reaped");
+        let told: Vec<AgentMsg> = parent_rx.try_iter().collect();
+        assert!(
+            told.iter()
+                .any(|msg| matches!(msg, AgentMsg::ForgetChild { id: 2 })),
+            "its parent is told which name to drop: {told:?}"
+        );
+        assert!(
+            !told
+                .iter()
+                .any(|msg| matches!(msg, AgentMsg::ForgetChild { id } if *id != 2)),
+            "and only the child that went: {told:?}"
+        );
+        drop(mailboxes);
     }
 
     /// A thread is the resource, not a node: the newest children keep theirs,
@@ -3604,10 +3802,14 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A command for a child the tree no longer has — the parent's books keep a
-    /// reaped child's name (finding H19), so its `control` can still be aimed at
-    /// one — starts nothing. The UI is a door to the agents that are here, not a
-    /// hand that invents one (finding H18).
+    /// A command for a child the tree no longer has starts nothing: the UI opens
+    /// doors to the agents that are here, and a message — however old — never
+    /// makes it invent one (finding H18).
+    ///
+    /// The command is one a *stale mailbox* delivered. The window's reap drops
+    /// the node, and the child's name goes from the parent's books with it
+    /// (`App::reap_history`, finding H19); a send made a moment before that is
+    /// still in flight, and this is the door it arrives at.
     #[test]
     fn a_command_for_a_child_the_tree_has_forgotten_wakes_nothing() {
         let (mut app, _rx) = test_app("parent-wake-forgotten");
@@ -3623,8 +3825,7 @@ mod tests {
         });
         app.tree.finish(AgentId(2), Some("did it".to_string()));
         // What the window does with a child nobody is listening to any more:
-        // the node and the mailbox go, and the id is left in the parent's own
-        // books (finding H19).
+        // the node and the mailbox go.
         app.tree.reap(&[AgentId(2)]);
 
         app.update(Msg::Agent {
@@ -3640,6 +3841,65 @@ mod tests {
         assert!(
             !app.tree.agent_tx.contains_key(&AgentId(2)),
             "and no actor behind the mailbox either"
+        );
+    }
+
+    /// Waking a parked child replaces its mailbox, and the *parent's* books hold
+    /// the sender the revival replaced: its next `control` found no actor and
+    /// took this same wake path again — every time, for the rest of the session,
+    /// while the message landed anyway (finding H22).
+    ///
+    /// The books are the actor's, so the tree is the only hand that can correct
+    /// them; this is it saying which sender is live, into the mailbox of the
+    /// parent the row names.
+    #[test]
+    fn a_revived_child_hands_its_parent_the_live_mailbox() {
+        let (mut app, _rx) = test_app("revive-mailbox");
+        // The parent, whose books are the ones being corrected: the test holds
+        // its mailbox, so the message is what it can read.
+        let (parent_tx, parent_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "a parent".to_string(),
+            depth: 1,
+            branch: Some("mush/1".to_string()),
+            cmd: parent_tx,
+        });
+        // The child, parked: a mailbox with nobody behind it is exactly what
+        // reclaiming a finished child's thread leaves.
+        let (tx, parked) = crossbeam_channel::unbounded::<AgentMsg>();
+        drop(parked);
+        app.tree.insert(Spawn {
+            id: AgentId(2),
+            parent: AgentId(1),
+            brief: "port the parser".to_string(),
+            depth: 2,
+            branch: None,
+            cmd: tx,
+        });
+        app.tree.finish(AgentId(2), Some("did it".to_string()));
+
+        assert!(
+            app.deliver_to_actor(AgentId(2), AgentMsg::Stop),
+            "the revival took the command"
+        );
+
+        let told: Vec<AgentMsg> = parent_rx.try_iter().collect();
+        let live = told
+            .iter()
+            .find_map(|msg| match msg {
+                AgentMsg::ChildMailbox { id: 2, cmd } => Some(cmd.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("the parent is handed the live mailbox: {told:?}"));
+        assert!(
+            live.send(AgentMsg::Stop).is_ok(),
+            "and it is the sender the revived actor is listening on"
+        );
+        assert!(
+            app.tree.agent_tx[&AgentId(2)].send(AgentMsg::Stop).is_ok(),
+            "the tree's own copy is the same live mailbox"
         );
     }
 
@@ -4365,6 +4625,93 @@ mod tests {
                 .send(AgentMsg::Nudge("one more thing".into()))
                 .is_ok(),
             "the restored actor must still be listening"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A parent restored from a stored session starts with empty books while its
+    /// children's rows are on screen: `status` answered "no children and no
+    /// jobs" and `control` refused `no such child agent #2` about the child the
+    /// human was looking at (finding H25).
+    ///
+    /// The books live in the actor, so the tree hands it every row as a message
+    /// (`App::seed_children`) — and the only way to read what they say is to ask
+    /// the parent. This drives a real run of the restored root whose first turn
+    /// makes both questions, and reads the answers off the request that carries
+    /// the two tool results back to the model.
+    #[test]
+    fn a_restored_parent_can_name_the_child_the_tree_shows() {
+        let root = repo("seed-books");
+        let scripted = Arc::new(
+            Scripted::new()
+                // The root's first turn: the two readers of its books.
+                .when(|asked: &Asked| asked.depth().is_none())
+                .calls(vec![
+                    tool_call(
+                        "c0",
+                        "control",
+                        serde_json::json!({ "id": "#2", "action": "stop" }),
+                    ),
+                    tool_call("c1", "status", serde_json::json!({})),
+                ])
+                // Anything after that has nothing left to answer.
+                .says("done"),
+        );
+        let stored = Session {
+            model: "test-model".into(),
+            provider: "custom".into(),
+            base_url: "http://127.0.0.1:1".into(),
+            context: None,
+            messages: vec![Message::user("the root task")],
+            agents: vec![session::AgentSession {
+                id: 2,
+                parent: Some(0),
+                depth: 1,
+                brief: "port the parser".into(),
+                title: None,
+                branch: None,
+                status: session::StoredStatus::Done,
+                landed: None,
+                leftover: false,
+                summary: Some("finished it".into()),
+                result_unread: true,
+                messages: vec![Message::user("port the parser")],
+            }],
+            notices: Vec::new(),
+        };
+        let (app, _rx) = app_with_scripted_root(&root, Some(stored), scripted.clone());
+
+        app.tree.agent_tx[&AgentId::ROOT]
+            .send(AgentMsg::Nudge("what is agent #2 doing?".into()))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let saw = |needle: &str| {
+            scripted
+                .asked()
+                .iter()
+                .any(|ask| ask.depth().is_none() && ask.saw(needle))
+        };
+        // The results of the two calls come back in the request after them.
+        while !saw("stopping agent #2") && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            saw("stopping agent #2"),
+            "the child on the screen is in its parent's books: {:?}",
+            scripted.asked().len()
+        );
+        assert!(
+            !saw("no such child agent"),
+            "and `control` does not refuse the child the human can see"
+        );
+        assert!(
+            saw("✉ #2 ✓ finished it"),
+            "`status` lists it by the row's own summary and unread mark: {:?}",
+            scripted
+                .asked()
+                .last()
+                .map(|ask| ask.messages.last().map(Message::text))
         );
         let _ = std::fs::remove_dir_all(&root);
     }
