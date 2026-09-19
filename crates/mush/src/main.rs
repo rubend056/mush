@@ -244,6 +244,34 @@ fn require_flag(command: &str, flag: &str) -> Result<(), String> {
     }
 }
 
+/// Refuse a flag given twice, by name, before its value is read.
+///
+/// The parser used to keep the last value and drop the first without a word —
+/// the same silent loss [`require_flag`] refuses for a flag outside its
+/// subcommand, and the rule every value mush cannot use follows: a value given
+/// and not used is reported, never ignored (finding A16's class, H26).
+fn require_once(
+    seen: &mut Vec<&'static str>,
+    command: &str,
+    flag: &'static str,
+) -> Result<(), String> {
+    if seen.contains(&flag) {
+        return Err(format!(
+            "`{flag}` was given twice for `mush {command}` (try --help)"
+        ));
+    }
+    seen.push(flag);
+    Ok(())
+}
+
+/// `focus`'s two ids, refused by name: the positional id used to win and the
+/// flag lose, silently, whatever order they came in (finding H26).
+fn two_agent_ids() -> String {
+    "`mush focus` takes one agent id: --agent and the positional id cannot both be given \
+     (try --help)"
+        .to_string()
+}
+
 impl Cli {
     /// Recognise a subcommand as the first argument, or `None` for the TUI's
     /// own parsing. A directory named like a subcommand is not opened this way
@@ -259,6 +287,9 @@ impl Cli {
         let mut since = 0usize;
         let mut base = 0u64;
         let mut send = false;
+        // Which flags have been given, so a second one is refused by name
+        // instead of silently replacing the first value.
+        let mut seen: Vec<&'static str> = Vec::new();
         let mut positional: Vec<String> = Vec::new();
         let mut args = argv[1..].iter();
         while let Some(arg) = args.next() {
@@ -280,18 +311,30 @@ impl Cli {
                 // read, so the refusal always blames the flag.
                 "--agent" => {
                     require_flag(name, "--agent")?;
+                    require_once(&mut seen, name, "--agent")?;
+                    // `focus` takes its id either way, never both: the
+                    // positional id and `--agent` are one id, and the flag
+                    // losing in silence is finding H26. Refused here, before
+                    // the flag's value is read, so `focus 1 --agent` (no number
+                    // at all) hears about the conflict, not the missing value.
+                    if name == "focus" && !positional.is_empty() {
+                        return Err(two_agent_ids());
+                    }
                     agent = Some(number(args.next(), "--agent")?);
                 }
                 "--since" => {
                     require_flag(name, "--since")?;
+                    require_once(&mut seen, name, "--since")?;
                     since = number(args.next(), "--since")? as usize;
                 }
                 "--base" => {
                     require_flag(name, "--base")?;
+                    require_once(&mut seen, name, "--base")?;
                     base = number(args.next(), "--base")?;
                 }
                 "--send" => {
                     require_flag(name, "--send")?;
+                    require_once(&mut seen, name, "--send")?;
                     send = true;
                 }
                 other if other.starts_with("--") => {
@@ -313,9 +356,14 @@ impl Cli {
             },
             "focus" => Cli::Focus {
                 dir: trailing_dir(&positional, 1)?,
-                agent: match positional.first() {
-                    Some(value) => parse_id(value, "focus")?,
-                    None => agent.ok_or("`mush focus` needs an agent id")?,
+                agent: match (positional.first(), agent) {
+                    // Two ids, whichever order they arrived in: the
+                    // positional used to win and the flag vanish (finding
+                    // H26).
+                    (Some(_), Some(_)) => return Err(two_agent_ids()),
+                    (Some(value), None) => parse_id(value, "focus")?,
+                    (None, Some(agent)) => agent,
+                    (None, None) => return Err("`mush focus` needs an agent id".to_string()),
                 },
             },
             "edit" => Cli::Edit {
@@ -510,7 +558,7 @@ fn help_text() -> String {
          \x20                         an agent's transcript lines\n\
          \x20   mush focus ID [DIR]   focus that agent, as Enter on its row does\n\
          \x20                         (--agent N instead of the id)\n\
-         \x20   mush edit [--agent N] --base R [--send] TEXT [DIR]\n\
+         \x20   mush edit [--agent N] [--base R] [--send] TEXT [DIR]\n\
          \x20                         set the message box's draft, or send it as the human\n\
          \x20                         (--base 0 unless given; -- ends the options, for a\n\
          \x20                         directory named like one)\n\
@@ -1617,7 +1665,7 @@ mod tests {
             "mush agents [DIR]",
             "mush read [DIR] [--agent N] [--since N]",
             "mush focus ID [DIR]",
-            "mush edit [--agent N] --base R [--send] TEXT [DIR]",
+            "mush edit [--agent N] [--base R] [--send] TEXT [DIR]",
         ] {
             assert!(help.contains(usage), "`{usage}` is not in --help:\n{help}");
         }
@@ -1794,6 +1842,83 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A flag given twice in one line is refused by name: the parser kept the
+    /// last value and dropped the first without a word, so `--agent 1 … --agent
+    /// 2` ran as agent 2 and the 1 was never mentioned again — a value given and
+    /// not used, which is the one thing this parser must not do (finding H26,
+    /// the rule `require_flag` already follows for a flag outside its
+    /// subcommand).
+    #[test]
+    fn a_repeated_flag_is_refused_by_name() {
+        let parse = |argv: &[&str]| {
+            Cli::detect(&argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        };
+        for (argv, flag) in [
+            (&["read", "--agent", "1", "--agent", "2"][..], "--agent"),
+            (&["read", "--since", "1", "--since", "2"][..], "--since"),
+            (
+                &["edit", "--base", "1", "--base", "2", "a draft"][..],
+                "--base",
+            ),
+            (&["edit", "--send", "--send", "a draft"][..], "--send"),
+        ] {
+            let error = parse(argv).expect_err(&format!("{argv:?} gives `{flag}` twice"));
+            for want in [flag, "--help"] {
+                assert!(
+                    error.contains(want),
+                    "the refusal must name `{want}`: {error}"
+                );
+            }
+        }
+        // The repeat is refused before the value is read, so a second flag with
+        // no value after it still hears about the repeat rather than the number
+        // it never got.
+        let error = parse(&["read", "--agent", "1", "--agent"]).unwrap_err();
+        assert!(error.contains("twice"), "{error}");
+    }
+
+    /// `focus` takes one agent id, and either spelling is that id. Giving both
+    /// used to be a silent choice — the positional id won and `--agent N`
+    /// vanished, so the flag and the value it carried were gone with no word
+    /// (finding H26).
+    #[test]
+    fn focus_refuses_two_agent_ids() {
+        let parse = |argv: &[&str]| {
+            Cli::detect(&argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        };
+        for argv in [
+            &["focus", "1", "--agent", "2"][..],
+            &["focus", "--agent", "2", "1"][..],
+            // No value at all after the flag: the two ids are what is wrong with
+            // this line, so the refusal names them rather than the number the
+            // flag is missing.
+            &["focus", "1", "--agent"][..],
+        ] {
+            let error = parse(argv).expect_err(&format!("{argv:?} names two agent ids"));
+            for want in ["focus", "--agent", "positional", "--help"] {
+                assert!(
+                    error.contains(want),
+                    "the refusal must name `{want}`: {error}"
+                );
+            }
+        }
+        // Either spelling alone is the one id it always was.
+        assert_eq!(
+            parse(&["focus", "2"]).unwrap(),
+            Some(Cli::Focus {
+                dir: ".".into(),
+                agent: 2
+            })
+        );
+        assert_eq!(
+            parse(&["focus", "--agent", "2"]).unwrap(),
+            Some(Cli::Focus {
+                dir: ".".into(),
+                agent: 2
+            })
+        );
     }
 
     /// The flags each subcommand takes, checked as a matrix: every one of the
