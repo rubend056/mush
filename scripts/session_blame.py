@@ -36,16 +36,27 @@ import os
 import sys
 
 # `Config::history_budget` is `(context_tokens - reserve) * 3` bytes
-# (crates/mush-core/src/config.rs:403) with `reserve = min(SCHEMA_TOKENS +
-# context/4 + 200, context/2)`, and a transcript folds at three quarters of the
-# budget (`transcript::compaction_trigger`, transcript.rs:46). Those three
+# (crates/mush-core/src/config.rs) with
+# `reserve = min(SCHEMA_TOKENS + reply_cap + MARGIN_TOKENS, context/2)` and
+# `reply_cap = min(MAX_REPLY_TOKENS, max(1024, context/8))`, and a transcript
+# folds at nine tenths of the budget (`transcript::compaction_trigger`). Those
 # numbers are what makes "each child stopped just short of its own ceiling"
 # visible, so this script derives them from the window it is told about rather
 # than comparing against one constant — a yardstick that does not name the
-# window it belongs to is the rumour this file exists to avoid.
+# window it belongs to is the rumour this file exists to avoid. The three moved
+# together on the human's numbers (see `docs/findings.md` §8.30): the reply's
+# share went from a quarter of the window to an eighth, the margin from 200
+# tokens to 5000, and the trigger from three quarters of the budget to nine
+# tenths. Change one there and one here, or this tool starts lying again —
+# which is why the constants it used are printed in `--json`, to be compared
+# against what `mush --print-config` reports.
 SCHEMA_TOKENS = 1200
-REPLY_SHARE_DIVISOR = 4
-MARGIN_TOKENS = 200
+REPLY_SHARE_DIVISOR = 8
+MAX_REPLY_TOKENS = 120_000
+REPLY_CAP_FLOOR = 1024
+MARGIN_TOKENS = 5_000
+TRIGGER_NUMERATOR = 9
+TRIGGER_DENOMINATOR = 10
 # `Config::DEFAULT_CONTEXT_TOKENS` (config.rs:23): what mush assumes when the
 # human stated no window *and* the endpoint advertised none. It is named here
 # only to be quoted in the message for "no window is known" — it is **not** a
@@ -121,10 +132,10 @@ def window_of(args, session):
 
 def budget_for(context_tokens):
     """(budget, trigger) bytes for a window, the way `Config` computes them."""
-    reserve = min(SCHEMA_TOKENS + context_tokens // REPLY_SHARE_DIVISOR + MARGIN_TOKENS,
-                  context_tokens // 2)
+    reply_cap = min(MAX_REPLY_TOKENS, max(REPLY_CAP_FLOOR, context_tokens // REPLY_SHARE_DIVISOR))
+    reserve = min(SCHEMA_TOKENS + reply_cap + MARGIN_TOKENS, context_tokens // 2)
     budget = max(0, context_tokens - reserve) * 3
-    return budget, budget * 3 // 4
+    return budget, budget * TRIGGER_NUMERATOR // TRIGGER_DENOMINATOR
 
 
 def human(n):
@@ -172,6 +183,15 @@ def main():
 
     tokens, window_source = window_of(args, d)
     data["window"] = {"tokens": tokens, "source": window_source}
+    # The formula this file mirrors, in the output: a number derived from a
+    # second copy of a rule is only trustworthy if the copy is visible.
+    data["formula"] = {"schema_tokens": SCHEMA_TOKENS,
+                       "reply_share_divisor": REPLY_SHARE_DIVISOR,
+                       "max_reply_tokens": MAX_REPLY_TOKENS,
+                       "reply_cap_floor": REPLY_CAP_FLOOR,
+                       "margin_tokens": MARGIN_TOKENS,
+                       "trigger": "%d/%d of the budget" % (TRIGGER_NUMERATOR,
+                                                            TRIGGER_DENOMINATOR)}
 
     if not args.json:
         print("session: %s" % data["path"])

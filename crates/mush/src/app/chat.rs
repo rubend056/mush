@@ -554,7 +554,7 @@ impl Chat {
             }
         };
         let bytes = self.system.weight() + transcript.iter().map(Message::weight).sum::<usize>();
-        bytes / 3
+        bytes / mush_core::config::BYTES_PER_TOKEN
     }
 
     /// Ctrl-N: the conversation is gone, the box and the scrollback with it.
@@ -2884,7 +2884,7 @@ mod tests {
         let idle = chat.used_tokens_for(AgentId::ROOT);
         assert_eq!(
             idle,
-            chat.system().weight() / 3,
+            chat.system().weight() / mush_core::config::BYTES_PER_TOKEN,
             "the system prompt alone, for a conversation with nothing said"
         );
 
@@ -2901,7 +2901,7 @@ mod tests {
         chat.replace_transcript(AgentId::ROOT, vec![summary.clone()]);
         assert_eq!(
             chat.used_tokens_for(AgentId::ROOT),
-            (chat.system().weight() + summary.weight()) / 3,
+            (chat.system().weight() + summary.weight()) / mush_core::config::BYTES_PER_TOKEN,
             "the meter reads what is there now"
         );
 
@@ -2910,7 +2910,7 @@ mod tests {
         chat.push_message(AgentId(1), Message::assistant("x".repeat(1000)));
         assert_eq!(
             chat.used_tokens_for(AgentId::ROOT),
-            (chat.system().weight() + summary.weight()) / 3
+            (chat.system().weight() + summary.weight()) / mush_core::config::BYTES_PER_TOKEN
         );
     }
 

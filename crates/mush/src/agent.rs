@@ -6956,16 +6956,21 @@ mod tests {
     }
 
     /// The cap a request carries is the config's, window and all: a run
-    /// budgeted against a 120k window asks for a quarter of it rather than the
-    /// 20_480 that cut a real run off mid-task, and the number travels under
-    /// the name the config chose. `Asked` records what the endpoint was really
-    /// sent, so this is the number a reply would be cut off at.
+    /// budgeted against a 120k window asks for the share of it the config
+    /// derives rather than the 20_480 that cut a real run off mid-task, and the
+    /// number travels under the name the config chose. `Asked` records what the
+    /// endpoint was really sent, so this is the number a reply would be cut off
+    /// at.
     #[test]
     fn a_request_carries_the_cap_its_window_derives() {
         let scripted = Arc::new(Scripted::new().says("done"));
         let mut cfg = Config::new("http://127.0.0.1:1", "test", None);
         cfg.provider = mush_core::config::Provider::DeepSeek;
         cfg.set_context(120_000);
+        // What the *config* derives, not a number spelled again: the arithmetic
+        // is `Config`'s and is pinned in its own tests, while what this test is
+        // for is that the request carries it (finding T2 §19's class).
+        let cap = cfg.reply_cap();
         let (actor, _events, _mailbox) =
             build_actor("reply-cap", scripted.clone(), ConfigHandle::own(cfg));
         let mut state = ActorState::default();
@@ -6974,9 +6979,10 @@ mod tests {
 
         run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
         let asked = scripted.asked();
+        assert_ne!(cap, 20_480, "not the fixed cap that cut a real run off");
         assert_eq!(
-            asked[0].max_tokens, 30_000,
-            "a quarter of the 120k window, not a fixed 20_480, under the field this config chose"
+            asked[0].max_tokens, cap,
+            "the window's own cap, under the field this config chose"
         );
         assert_eq!(
             asked[0].max_completion_tokens, None,

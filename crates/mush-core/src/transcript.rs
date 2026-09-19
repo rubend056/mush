@@ -32,8 +32,8 @@ changed, open issues, and the current state. This summary replaces the \
 conversation, so include every fact the task still depends on. Reply with \
 just the summary, as plain text, and end your turn: call no tool.";
 
-/// The history size at which compaction fires: three quarters of the budget,
-/// in bytes.
+/// The history size at which compaction fires: nine tenths of the budget, in
+/// bytes.
 ///
 /// `budget_bytes` is the same unit [`Message::weight`] counts and the same unit
 /// [`Config::history_budget`](crate::config::Config::history_budget) returns —
@@ -41,10 +41,16 @@ just the summary, as plain text, and end your turn: call no tool.";
 /// multiply saturates rather than wrapping, because nothing downstream can
 /// tell a budget that was never converted from one that was: `usize::MAX` from
 /// a caller that forgot the conversion (or a window a hostile endpoint
-/// advertised) would otherwise wrap `* 3` down to nearly nothing and mark a
+/// advertised) would otherwise wrap `* 9` down to nearly nothing and mark a
 /// two-message transcript as needing a fold.
+///
+/// Nine tenths rather than three quarters, re-tuned on the human's numbers: the
+/// fold replaces the conversation with a summary the model then works from, so
+/// it should happen as late as the request that asks for it still fits — the
+/// last tenth is the room that request needs for its own instruction
+/// (`docs/findings.md` §8.30).
 pub fn compaction_trigger(budget_bytes: usize) -> usize {
-    budget_bytes.saturating_mul(3) / 4
+    budget_bytes.saturating_mul(9) / 10
 }
 
 /// Approaching the context window: fold the conversation into a summary
@@ -247,13 +253,13 @@ mod tests {
         vec![Message::user("x".repeat(weight - "user".len()))]
     }
 
-    /// The trigger is computed, not written a second time: three quarters of
-    /// the budget, saturating.
+    /// The trigger is computed, not written a second time: nine tenths of the
+    /// budget, saturating.
     #[test]
-    fn the_trigger_is_three_quarters_of_the_budget() {
+    fn the_trigger_is_nine_tenths_of_the_budget() {
         assert_eq!(compaction_trigger(0), 0);
-        assert_eq!(compaction_trigger(1_000), 750);
-        assert_eq!(compaction_trigger(7_501), 5_625);
+        assert_eq!(compaction_trigger(1_000), 900);
+        assert_eq!(compaction_trigger(7_501), 6_750);
     }
 
     /// A budget that is not bytes at all — `usize::MAX`, what a caller that
@@ -262,14 +268,14 @@ mod tests {
     /// in a debug build, and in a release one it wrapped: at
     /// `6_148_914_691_236_517_206` three times the budget wraps to 2, so the
     /// old expression returned 0 and marked *every* transcript, however small,
-    /// as needing a fold. Saturating, the trigger stays a quarter of the
+    /// as needing a fold. Saturating, the trigger stays within a tenth of the
     /// budget and an ordinary transcript is nowhere near it.
     #[test]
     fn a_nonsense_budget_does_not_wrap_the_trigger_to_zero() {
-        assert_eq!(compaction_trigger(usize::MAX), usize::MAX / 4);
+        assert_eq!(compaction_trigger(usize::MAX), usize::MAX / 10);
         assert_eq!(
             compaction_trigger(6_148_914_691_236_517_206),
-            usize::MAX / 4
+            usize::MAX / 10
         );
         let messages = vec![Message::system("you are mush"), Message::user("task")];
         assert!(!needs_compaction(&messages, usize::MAX));

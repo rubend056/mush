@@ -444,7 +444,7 @@ fn help_text() -> String {
          \x20   --thinking MODE    on asks for the provider's thinking mode, off sends no `thinking`\n\
          \x20                      field at all (default: {}; $MUSH_THINKING)\n\
          \x20   --max-completion-tokens\n\
-         \x20                      Send the reply cap (a quarter of the window) as\n\
+         \x20                      Send the reply cap ({}) as\n\
          \x20                      `max_completion_tokens` instead of `max_tokens`, as\n\
          \x20                      OpenAI's reasoning models require\n\
          \x20   -y, --yes          Pre-approve this session's work. Recorded only: mush asks\n\
@@ -473,6 +473,7 @@ fn help_text() -> String {
         mush_core::provider::DEFAULT_PROVIDER.name(),
         mush_core::provider::effort_default_hint(),
         mush_core::provider::thinking_default_hint(),
+        mush_core::config::REPLY_SHARE_WORDS,
     )
 }
 
@@ -1084,8 +1085,8 @@ mod tests {
         assert_eq!(field("thinking"), "off (stated)");
         assert_eq!(
             field("reply cap"),
-            "16000 tokens as max_completion_tokens",
-            "a quarter of the stated 64k window"
+            format!("{} tokens as max_completion_tokens", cfg.reply_cap()),
+            "the cap the config derives, under the name it chose"
         );
         assert_eq!(field("api key"), "sk-1…7890 (masked)");
         assert_eq!(field("auto-approve"), "yes (-y recorded; nothing asks yet)");
@@ -1093,6 +1094,7 @@ mod tests {
         // An unresolved window says so, and a default request samples at 1.0
         // under the name every endpoint documents.
         let plain = Config::new("http://host:1", "", None);
+        let cap = plain.reply_cap();
         let plain = describe(&plain, false);
         let field = |name: &str| {
             plain
@@ -1113,8 +1115,8 @@ mod tests {
         assert_eq!(field("thinking"), "off (the provider's default)");
         assert_eq!(
             field("reply cap"),
-            "2048 tokens as max_tokens",
-            "an 8192-token window affords 2048"
+            format!("{} tokens as max_tokens", cap),
+            "an 8192-token window affords the floor, and the row says which number that is"
         );
         assert_eq!(field("api key"), "(none)");
         assert_eq!(field("auto-approve"), "no");
@@ -1182,7 +1184,10 @@ mod tests {
             field("window"),
             "120000 tokens (assumed from the model or the provider)"
         );
-        assert_eq!(field("reply cap"), "30000 tokens as max_tokens");
+        assert_eq!(
+            field("reply cap"),
+            format!("{} tokens as max_tokens", config.reply_cap())
+        );
     }
 
     /// The full startup path with an unreachable endpoint must still produce a

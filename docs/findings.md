@@ -988,7 +988,10 @@ child is pinned at whatever it reached: median 549 KiB, p90 768 KiB, largest
 817.3 KiB against a fold trigger of **820.9 KiB** (window 500k tokens → budget
 1.1 MiB → trigger ¾ of it). Every child stopped just short of its own trigger.
 
-**The bound that replaced the cap.** No byte heuristic is involved and none is
+**The bound that replaced the cap.** (Superseded by §8.30: the fold trigger is
+now nine tenths of a *larger* budget — this session's window gives ≈ 56 MiB
+rather than the 41 MiB derived below. The arithmetic and the lever are the
+same.) No byte heuristic is involved and none is
 needed: what the store can hold is
 
     CHILD_HISTORY (50) × the transcript's own fold trigger + the root's (folded, so under it)
@@ -1188,3 +1191,67 @@ human's call), T2 §17 (the attach `id` field, a wire contract), T3 §3
 repository — settle the promise before the code), T1 §3/§4 and T2 §18/§19 (each
 needs lines deleted in `prompt.rs`; §18/§19's *cap* halves are void since the
 revert). The hue is §8.30.
+
+---
+
+## 8.30 The context budget, re-tuned — and the number that lived in ten places
+
+The human's numbers, in their words: *"make the fold trigger at 90% of budget and
+the reserve be 1/8th of the window + schema + 5000 margin"*. Both are one line
+each in `crates/mush-core/src/config.rs`:
+
+- `REPLY_SHARE_DIVISOR` 4 → **8**: the reserve's window share *is* the reply cap
+  (`reply_cap` reads the same constant), so the two cannot disagree about what a
+  reply costs.
+- the margin 200 → **5 000** tokens: the room a *turn adds* between two requests,
+  because a tool result lands in the next prompt — a request that spent its whole
+  reply cap and then a tool result is the request that overflows.
+- `transcript::compaction_trigger` 3/4 → **9/10** of the budget: the fold
+  replaces the conversation with a summary the model then works from, so it
+  should happen as late as the request asking for it still fits.
+
+| window | reply cap | reserve | history budget | fold fires at | hard-drop at |
+|---|---|---|---|---|---|
+| 8 192 (default) | 1 024 (floor) | 4 096 (half-window cap) | 12 288 B = 50.0% | 11 059 B = **45.0%** | 50.0% |
+| 120 000 (DeepSeek) | 15 000 | 21 200 | 296 400 B = 82.3% | 266 760 B = **74.1%** | 82.3% |
+| 128 000 | 16 000 | 22 200 | 317 400 B = 82.7% | 285 660 B = **74.4%** | 82.7% |
+| 500 000 | 62 500 | 68 700 | 1 293 900 B = 86.3% | 1 164 510 B = **77.6%** | 86.3% |
+
+Against the old numbers (a quarter of the window, 200 margin, 3/4 trigger) the
+fold used to fire at 43.4% / 55.4% / 56.0% of the window. Two consequences worth
+stating, because they are the price of the same two lines:
+
+- **The reply cap drops**: 120 000 → 62 500 on a 500k window, 30 000 → 15 000 on
+  the shipped 120k preset. It is a ceiling, not a target, and it is *derivable*
+  from the window rather than fixed — but a run that wants one huge write in one
+  reply now has less room for it.
+- **The store's bound rises with the trigger** (§8.28's arithmetic: what the file
+  can hold is `CHILD_HISTORY × the fold trigger + the root`): 50 × 820.9 KiB ≈
+  41 MiB becomes 50 × 1.11 MiB ≈ **56 MiB** for the 500k window. The lever is
+  still `CHILD_HISTORY`, and the file the human is looking at is 13 MiB.
+
+**The number lived in ten places, and that is the finding.** Changing the share
+touched, in one go: the constant; two product strings (`--help`, and the home
+config's own field help, which is written into the human's file); a test in
+`agent.rs`; two tests in `main.rs`; two tests in `config.rs`; the manual twice;
+and `scripts/session_blame.py`'s hardcoded mirror of the formula — ten edits for
+one decision, nine of which were *restatements*. What it is now:
+
+| home | before | after |
+|---|---|---|
+| the number | `REPLY_SHARE_DIVISOR` | unchanged, one constant |
+| the words ("an eighth of the window") | typed into `--help` and `userconfig.rs` | `pub const REPLY_SHARE_WORDS` beside the divisor, interpolated by both |
+| the cap's arithmetic | `request_reserve` re-derived `window / DIVISOR` while `reply_cap` added a 1 024 floor of its own | the reserve reads `reply_cap()` itself |
+| tests that name a cap | 3 literals in 3 files | derive from `cfg.reply_cap()`; the arithmetic is pinned in `config.rs`, which is where the constant lives |
+| the `bytes / 3` heuristic (T2 §19's code half) | spelled in `config.rs` (×3) and `app/chat.rs` (÷3, three test expressions too) | `pub const BYTES_PER_TOKEN`, read by both |
+| the manual | three tenths/quarters spelled out | the rule, the numbers once, and a pointer at `mush --print-config` |
+| the diagnostic script | a silent mirror | still a mirror (a separate program cannot import a Rust const) — but it prints the constants it used in `--json`, to be compared against `--print-config` |
+
+What is *left* deliberately: `prompt.rs` still multiplies by 3 in one test
+expression, and that file is the human's; `docs/refactor.md`'s ledger rows and
+§8.28's measurements keep their historical numbers, because they are records of
+what was true when they were measured — this section is what supersedes them.
+
+`--print-config` is the surface that makes the small-window case honest: for the
+built-in 8 192 the row reads `1024 tokens as max_tokens`, and the numbers above
+come from exactly that command.

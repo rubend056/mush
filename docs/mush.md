@@ -180,13 +180,18 @@ before the request goes out.
 ### History budget
 
 Small local models have small contexts (the default endpoint reports 8 K). Every
-request reserves room for the tool schemas, the reply, and a margin
-(`Config::SCHEMA_TOKENS`; a prompt test keeps the schemas inside it). Before
-each request the agent trims the oldest turns until the conversation fits, always
-cutting at a **user** message boundary so assistant/tool pairs stay valid.
+request reserves room for the tool schemas, the reply, and a margin —
+`Config::SCHEMA_TOKENS` (a prompt test keeps the schemas inside it),
+`REPLY_SHARE_WORDS` of the window (floored at 1 024 and capped at 120 000), and
+5 000 tokens for whatever a turn's tool result adds before the next request. The
+three numbers live in `crates/mush-core/src/config.rs`, and
+`mush --print-config` prints what they resolve to for the window in front of
+you. Before each request the agent trims the oldest turns until the conversation
+fits, always cutting at a **user** message boundary so assistant/tool pairs stay
+valid.
 
 Trimming drops information, so it is the fallback, not the first move: once the
-transcript passes three quarters of the budget the agent asks the model to
+transcript passes nine tenths of the budget the agent asks the model to
 summarize everything important and continues from `system + summary`. That is
 what lets a long task survive a small context window.
 
@@ -462,8 +467,9 @@ That file is meant to be hand-edited, and it documents itself. Every field is
 optional — `api_key`, `provider`, `base_url`, `model`, `context` (a stated
 window; the built-in default is 120 000 for DeepSeek and 8 192 for a custom
 endpoint, spelled from the provider table), `temperature`, `max_completion_tokens`
-(`true` sends the reply cap — a quarter of the window, floored at 1 024 and
-capped at 120 000 — as `max_completion_tokens`), `reasoning_effort` (`"low"`,
+(`true` sends the reply cap — an eighth of the window, floored at 1 024 and
+capped at 120 000, and `--print-config` prints the number this window affords —
+as `max_completion_tokens`), `reasoning_effort` (`"low"`,
 `"high"` or `"max"` — exactly the values DeepSeek's OpenAI format documents), and
 `thinking` (`true` asks for the provider's thinking mode, `false` sends no
 `thinking` field and leaves the model's own default) — and the file mush writes

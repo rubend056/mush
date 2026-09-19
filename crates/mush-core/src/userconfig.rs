@@ -55,7 +55,10 @@ fn comment() -> Vec<String> {
             crate::provider::context_default_hint()
         ),
         "temperature: 0.0-2.0, sent with every request; 1.0 is the model's own choice, and the default.".to_string(),
-        "max_completion_tokens: true sends the reply cap — a quarter of the window, at most — as max_completion_tokens; OpenAI's reasoning models reject max_tokens.".to_string(),
+        format!(
+            "max_completion_tokens: true sends the reply cap — {}, at most — as max_completion_tokens; OpenAI's reasoning models reject max_tokens.",
+            crate::config::REPLY_SHARE_WORDS
+        ),
         format!(
             "reasoning_effort: \"low\", \"high\" or \"max\" — exactly what the DeepSeek OpenAI format documents. A value here reaches any endpoint; the provider's own default is {}.",
             crate::provider::effort_default_hint()

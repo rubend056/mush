@@ -53,10 +53,30 @@ pub const MAX_REPLY_TOKENS: u32 = 120_000;
 const _: () = assert!(MAX_REPLY_TOKENS < 393_216);
 
 /// The share of the window one reply may use, as a divisor: `window / this`.
-/// `Config::reply_cap` asks for this share and `Config::request_reserve` keeps
-/// room for it, so the cap a request carries and the budget that has to hold it
-/// cannot disagree about what one reply costs.
-const REPLY_SHARE_DIVISOR: usize = 4;
+/// `Config::reply_cap` asks for this share, and `Config::request_reserve`
+/// reserves exactly what `reply_cap` may ask for, so the cap a request carries
+/// and the budget that has to hold it cannot disagree about what one reply
+/// costs.
+///
+/// An eighth rather than a quarter, re-tuned on the human's numbers: the
+/// reply cap is a ceiling a run rarely reaches, while the history the reserve
+/// was holding back is what a long conversation actually needs. The share is
+/// one number, read by the cap and by the reserve, so the two cannot disagree
+/// about what a reply costs (see `docs/findings.md` §8.30).
+const REPLY_SHARE_DIVISOR: usize = 8;
+
+/// [`REPLY_SHARE_DIVISOR`] in words, for the two strings a *human* reads (the
+/// `--help` line and the home config's own field help): one phrase, in the one
+/// file that owns the number, interpolated rather than retyped (finding T2 §19
+/// is the same class — a fact spelled wherever it is needed).
+pub const REPLY_SHARE_WORDS: &str = "an eighth of the window";
+
+/// The bytes-per-token the budget heuristic uses. The conversion is a *guess*
+/// both ways — `Config::history_budget` turns a window's tokens into the bytes
+/// `Message::weight` counts, and the UI's context meter turns those bytes back
+/// into tokens — so it lives once, here, where the guess is documented. The
+/// endpoint's own `usage` is the only place a real count comes from.
+pub const BYTES_PER_TOKEN: usize = 3;
 
 /// Keep a window inside the range mush can work with, whatever its source.
 fn clamp_context(tokens: usize) -> usize {
@@ -475,21 +495,29 @@ impl Config {
     pub fn history_budget(&self) -> usize {
         self.context_tokens
             .saturating_sub(self.request_reserve())
-            .saturating_mul(3)
+            .saturating_mul(BYTES_PER_TOKEN)
     }
 
     /// The tokens every request pays besides history: the tool schemas, the
-    /// reply (the same share of the window [`Config::reply_cap`] may ask for)
-    /// and a margin. It can never be more than half the window, so a window too
-    /// small for its own schemas still has a budget rather than none (the shape
-    /// of finding A4).
+    /// reply [`Config::reply_cap`] may ask for, and a margin. It can never be
+    /// more than half the window, so a window too small for its own schemas
+    /// still has a budget rather than none (the shape of finding A4).
+    ///
+    /// The reply is read from `reply_cap` itself rather than from the share it
+    /// is derived from: the cap has a floor and a ceiling of its own, and a
+    /// reserve that counted the raw share would leave the floor uncovered on a
+    /// small window and over-reserve on a huge one.
+    ///
+    /// The margin is the room a turn *adds* between two requests: a tool
+    /// result lands in the next prompt, and a request that spent its whole
+    /// reply cap and then a tool result is the request that overflows. It was
+    /// 200 tokens when the tools were few and their results were not.
     fn request_reserve(&self) -> usize {
-        const MARGIN_TOKENS: usize = 200;
-        (SCHEMA_TOKENS + self.context_tokens / REPLY_SHARE_DIVISOR + MARGIN_TOKENS)
-            .min(self.context_tokens / 2)
+        const MARGIN_TOKENS: usize = 5_000;
+        (SCHEMA_TOKENS + self.reply_cap() as usize + MARGIN_TOKENS).min(self.context_tokens / 2)
     }
 
-    /// The tokens one reply may be asked for: a quarter of the window, floored
+    /// The tokens one reply may be asked for: [`REPLY_SHARE_WORDS`], floored
     /// at 1_024 so a request always asks for *some* reply, and capped by
     /// [`MAX_REPLY_TOKENS`]. Asking for more than the window can hold is how a
     /// reply arrives cut off, and asking past what the endpoint accepts is a
@@ -1419,8 +1447,9 @@ mod tests {
 
     #[test]
     fn history_budget_fits_the_context_window() {
-        // 8192 tokens: the full reserve (1200 schemas + 2048 reply — a quarter
-        // of the window — + 200 margin) leaves 14_232 bytes of history. The
+        // 8192 tokens: the reserve is capped at half the window (the margin
+        // below is 5_000, which alone is more than half of an 8k window), so
+        // history gets the other half — 12_288 bytes. The schema line of the
         // reserve has moved with every contract change, test and comment
         // together: 1100 (delegation), 1220 (`cd`), 1700 (the machine's three
         // tools), 1750 (what the waits hand over, H15), 1700 when the dedup
@@ -1428,17 +1457,17 @@ mod tests {
         // tools took the shell's work off the schema list. See SCHEMA_TOKENS.
         let small = Config::new("http://x:1", "m", None);
         assert_eq!(small.context_tokens, DEFAULT_CONTEXT_TOKENS);
-        assert_eq!(small.history_budget(), 14_232);
+        assert_eq!(small.history_budget(), 12_288);
 
         // A big window leaves a much larger budget, and the reply's share of it
-        // grows with the window: 128k reserves 32k for one reply.
+        // grows with the window: 128k reserves 16k for one reply.
         let big = Config {
             context_tokens: 128_000,
             temperature: DEFAULT_TEMPERATURE,
             max_completion_tokens: false,
             ..small.clone()
         };
-        assert_eq!(big.history_budget(), 283_800);
+        assert_eq!(big.history_budget(), 317_400);
 
         // A tiny window shrinks the reserve to half the window instead of
         // ignoring it: history still gets 1536 bytes, and the cap — which has
@@ -1494,12 +1523,16 @@ mod tests {
             cfg.set_context(tokens);
             cfg
         };
-        assert_eq!(window(8_192).reply_cap(), 2_048, "a quarter of 8k");
-        assert_eq!(window(120_000).reply_cap(), 30_000, "a quarter of 120k");
+        assert_eq!(window(8_192).reply_cap(), 1_024, "the floor binds at 8k");
         assert_eq!(
-            window(500_000).reply_cap(),
+            window(120_000).reply_cap(),
+            (120_000 / REPLY_SHARE_DIVISOR) as u32,
+            "in the middle of the range the cap *is* the share"
+        );
+        assert_eq!(
+            window(2_000_000).reply_cap(),
             MAX_REPLY_TOKENS,
-            "a big window keeps the ceiling"
+            "a window big enough to ask for more than the endpoint accepts keeps the ceiling"
         );
         assert_eq!(MAX_REPLY_TOKENS, 120_000, "the human's number");
         // Never zero, however tiny the window: a request for no reply is not a
