@@ -267,8 +267,9 @@ pub fn keep_unreadable(root: &Path) -> Result<PathBuf, String> {
 
 impl Session {
     /// Read what the workspace stores, distinguishing *absent* from
-    /// *unreadable* (see [`Stored`]). Callers that only need the conversation —
-    /// the config precedence, a test — want [`Self::load`].
+    /// *unreadable* (see [`Stored`]). A caller that only wants the conversation,
+    /// and has nothing to say about which of the two it read, wants
+    /// [`Self::load`].
     pub fn read(root: &Path) -> Stored {
         let bytes = match fs::read(session_path(root)) {
             Ok(bytes) => bytes,
@@ -286,10 +287,10 @@ impl Session {
     }
 
     /// The conversation, or `None` when there is none *or* when the one there
-    /// is cannot be used. `None` is the truth for the layers that only want the
-    /// stored endpoint selection, and it is why [`Self::read`] exists: the two
-    /// cases must not be indistinguishable to the caller that overwrites the
-    /// file.
+    /// is cannot be used. It is the shorthand for a caller that only wants the
+    /// conversation and has nothing to say about which of the two it read; and
+    /// it is why [`Self::read`] exists: the two cases must not be
+    /// indistinguishable to the caller that overwrites the file.
     pub fn load(root: &Path) -> Option<Self> {
         match Self::read(root) {
             Stored::Loaded(session) => Some(session),
