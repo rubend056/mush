@@ -365,6 +365,16 @@ pub struct AgentNode {
     /// Set in a stored session whose work was landed by hand; nothing in this
     /// session sets it.
     pub landed: Option<Landed>,
+    /// Why mush looked at this agent's worktree and left it alone: its branch is
+    /// not merged into the base it was forked from, or its checkout has
+    /// uncommitted work in it. Set by the sweep that reclaims landed worktrees
+    /// (`git::reclaim`), and read by the row — a human who expected a merged
+    /// worktree to go learns here why it did not instead of finding nothing
+    /// said (finding H10).
+    ///
+    /// Never stored: it is what git says right now, and a stored copy would be
+    /// the half of the pair that cannot be re-derived.
+    pub kept: Option<String>,
     /// The agent's last run ended and its parent has not read the result yet.
     ///
     /// It is a *mirror* of the actor's own `delivered` set — the one owner of
@@ -625,6 +635,7 @@ impl AgentTree {
             // The root has no parent, so there is nobody to read its result.
             result_unread: false,
             landed: None,
+            kept: None,
         });
         tree
     }
@@ -694,6 +705,8 @@ impl AgentTree {
             summary: None,
             leftover: false,
             landed: None,
+            // Nothing has swept this agent's worktree yet.
+            kept: None,
             title: None,
             // Its run has not produced anything yet: there is no result to read.
             result_unread: false,
@@ -723,6 +736,10 @@ impl AgentTree {
             summary: node.summary,
             leftover: node.leftover,
             landed: node.landed,
+            // A sweep runs on the next git read, not on registration: a row for
+            // a worktree found on disk says where the work is until git has
+            // been asked, and mush does not shell out while painting.
+            kept: None,
             // The stored file is where this fact survives a restart: a result
             // its parent had not read comes back wearing `✉` (finding H1). A
             // node registered from something other than the session file
@@ -738,6 +755,37 @@ impl AgentTree {
     pub fn named(&mut self, id: AgentId, title: String) {
         if let Some(node) = self.node_mut(id) {
             node.title = Some(title);
+        }
+    }
+
+    /// Mush's own sweep took this agent's worktree and branch: the work is in the
+    /// base the branch was forked from (or the run never committed anything), so
+    /// the row says where it went instead of offering a `git diff` against a
+    /// branch and a checkout that are both gone (finding U13, H10).
+    ///
+    /// The branch goes with the checkout. A name git no longer has is a diff
+    /// that cannot work, the refresh stops asking about an id whose work is
+    /// settled, and `landed` alone is what `App::worktree_gone` reads before
+    /// refusing a nudge that would recreate the reclaimed path as a plain
+    /// directory (finding S1). `landed` is stored, so a restart comes back with
+    /// the same row rather than reviving an agent whose worktree is gone.
+    pub fn mark_reclaimed(&mut self, id: AgentId) {
+        if let Some(node) = self.node_mut(id) {
+            node.landed = Some(Landed::Merged);
+            node.branch = None;
+            node.kept = None;
+        }
+    }
+
+    /// What the last reclamation sweep found at this agent's worktree: the reason
+    /// it was left alone, or `None` when there was nothing there to hold.
+    ///
+    /// One answer per node, replaced by the next sweep: the reason is a fact
+    /// about git *now*, and a node must not keep yesterday's wording — or keep
+    /// saying why a checkout that is no longer there was kept.
+    pub fn mark_kept(&mut self, id: AgentId, why: Option<String>) {
+        if let Some(node) = self.node_mut(id) {
+            node.kept = why;
         }
     }
 
@@ -770,6 +818,10 @@ impl AgentTree {
             // P7). What the merge did is in the transcript, where history
             // lives.
             node.landed = None;
+            // The same for the sweep's verdict: it described a worktree this
+            // run is about to change, and the next read of git will have a new
+            // one.
+            node.kept = None;
         }
     }
 

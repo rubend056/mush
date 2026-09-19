@@ -945,21 +945,32 @@ fn unread_footer(app: &App, node: &AgentNode) -> String {
 /// promise can be asserted: a landed worktree must not name a `git diff` that
 /// can no longer work, and its landing must be spelled in [`Landed::past`]'s
 /// own word, which the row's own prose is painted around.
+///
+/// A worktree the sweep looked at and left is a third answer, and it is said
+/// rather than implied: the row still names the worktree and the branch, and the
+/// reason they are still there — a human who expected a merged worktree to be
+/// reclaimed learns here why it was not (finding H10).
 fn agent_detail(node: &AgentNode) -> Vec<String> {
     match node.landed {
         Some(Landed::Merged) => vec!["merged into HEAD".to_string()],
         Some(Landed::Discarded) => vec!["discarded — its work is gone".to_string()],
-        None => match &node.branch {
-            // This is the one place on screen that says an isolated agent
-            // exists at all, and the git command that reads its work.
-            Some(branch) => vec![
-                // The worktree path comes from core like every other one: the
-                // row must name the directory a `git worktree remove` takes.
-                git::worktree_rel(node.id.0),
-                format!("git diff HEAD...{branch}"),
-            ],
-            None => Vec::new(),
-        },
+        None => {
+            let mut detail = match &node.branch {
+                // This is the one place on screen that says an isolated agent
+                // exists at all, and the git command that reads its work.
+                Some(branch) => vec![
+                    // The worktree path comes from core like every other one: the
+                    // row must name the directory a `git worktree remove` takes.
+                    git::worktree_rel(node.id.0),
+                    format!("git diff HEAD...{branch}"),
+                ],
+                None => Vec::new(),
+            };
+            if let Some(why) = &node.kept {
+                detail.push(format!("kept — {why}"));
+            }
+            detail
+        }
     }
 }
 
@@ -1142,6 +1153,7 @@ mod tests {
             summary: None,
             leftover: false,
             landed: None,
+            kept: None,
             result_unread: false,
         }
     }
@@ -1235,6 +1247,27 @@ mod tests {
             text,
             format!("{} · git diff HEAD...mush/9", git::worktree_rel(open.id.0))
         );
+    }
+
+    /// A worktree the sweep left alone says *why* it is still there, and keeps
+    /// saying where it is: the reason is a refusal to reclaim, not a landing,
+    /// so the `git diff` a human lands the work with must still be on the row
+    /// (finding H10).
+    #[test]
+    fn a_kept_worktree_says_why_it_is_still_there() {
+        let mut open = node(Phase::Done, 1);
+        open.branch = Some("mush/9".to_string());
+        open.kept = Some("mush/9 has 2 commits nobody merged into HEAD".to_string());
+
+        let text = agent_detail(&open).join(" · ");
+        assert!(text.contains("kept — mush/9 has 2 commits"), "{text:?}");
+        assert!(text.contains("git diff HEAD...mush/9"), "{text:?}");
+
+        // A landed node has no worktree to explain, and its landing is the
+        // whole of what the row says about where the work went.
+        open.landed = Some(Landed::Merged);
+        let text = agent_detail(&open).join(" · ");
+        assert_eq!(text, "merged into HEAD");
     }
 
     /// The floor notice must never name a size the program does not need: the

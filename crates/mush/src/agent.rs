@@ -557,6 +557,17 @@ pub enum AgentEvent {
     /// The run was stopped by a request (a Stop, Ctrl-C, Ctrl-N). The actor is
     /// still alive, so the row goes quiet instead of claiming a failure.
     Stopped,
+    /// Mush's own sweep took this agent's worktree: its branch is in the base
+    /// the run was forked from (or the run never committed anything), so the
+    /// checkout and the branch are gone.
+    ///
+    /// The row has to hear it — `git::reclaim` is the only thing in production
+    /// that removes a worktree, and a row still naming `.mush/wt/<id>` and
+    /// `git diff HEAD...mush/<id>` after both are gone is offering two commands
+    /// that cannot run (finding U13, H10). Emitted by the actor whose run ended,
+    /// because that actor is the only one that knows *when* the worktree became
+    /// free.
+    Reclaimed,
     /// The parent has read a child's result: the line is in its transcript now,
     /// wherever it came from — the fold at a message boundary, the wake-up a
     /// napping parent got, or a `wait` that asked for it.
@@ -837,6 +848,15 @@ struct Actor {
     /// The isolated worktree branch this agent works on, if any; children
     /// branch from it so nested work is not lost.
     branch: Option<String>,
+    /// The commit id this agent's worktree was forked from: `spawn_tool`
+    /// resolves the caller's `base` to a revision before `worktree_add` sees it,
+    /// and stores that revision here. It is what the run-end sweep measures the
+    /// branch against — "nothing was committed by this run" is exactly "the
+    /// branch adds no commit of its own to this base" (finding H10). `None` for
+    /// an agent with no worktree, and for one revived from a stored session — a
+    /// base is not in the file, and the sweep then reads the root's `HEAD`,
+    /// which keeps more than it should rather than less.
+    base: Option<String>,
     /// The task this agent was given (empty for the root). Used as the commit
     /// subject when an isolated agent's run ends.
     brief: String,
@@ -953,6 +973,7 @@ fn root_actor(
         depth: 0,
         ws,
         branch: None,
+        base: None,
         brief: String::new(),
         my_tx: cmd_tx.clone(),
         parent_tx: dead_tx,
@@ -1064,6 +1085,10 @@ pub fn revive(
         depth,
         ws,
         branch,
+        // A revived agent's base is not in the stored session, and the sweep
+        // then measures against the root's `HEAD`: that keeps more than it
+        // should rather than less, which is the only way this patch may err.
+        base: None,
         brief: brief.clone(),
         my_tx: cmd_tx.clone(),
         // Its completions go where the caller said they belong: to the dead
@@ -1176,6 +1201,17 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         });
         if let Some(line) = work.as_ref().and_then(Work::status_line) {
             actor.ctx.emit(actor.id, AgentEvent::Status(line));
+        }
+        // …and the run's own worktree, swept now that the run is finished with
+        // it: a branch that adds nothing to the base this run was forked from —
+        // nothing was committed, or the human merged it while the run was still
+        // going — has no work to keep, so its checkout and its branch go. Most of
+        // H10's residue is never made because of this line: without it, every
+        // isolated run that changed nothing leaves a worktree behind for good.
+        // Anything unmerged or dirty is left alone, and the sweep says so
+        // instead of doing it.
+        if reclaim_own_worktree(&actor, &state) {
+            actor.ctx.emit(actor.id, AgentEvent::Reclaimed);
         }
         // This run is over, and this is its number: a parent that hears the
         // same run again has heard this report twice, while a run after it is
@@ -1531,6 +1567,34 @@ fn absorb(
             }
         }
     }
+}
+
+/// Sweep the worktree an isolated run has just finished in, and answer whether
+/// mush took it — which is the fact the UI needs to mark the row landed, so the
+/// row stops offering a `git diff` against a directory that is gone and a branch
+/// that is gone with it (finding U13, H10).
+///
+/// The run's own end is the one place the base is known *exactly*: it is the
+/// revision `worktree_add` was handed at the spawn, so "this run committed
+/// nothing" is the same git fact as "the branch adds no commit to its base" and
+/// not a memory of what the commit step thought. A revived agent has no base in
+/// its stored session, and the root's `HEAD` is the conservative answer there:
+/// it keeps a worktree more often than it takes one, which is the only way this
+/// may err.
+///
+/// An actor that still has work of its own out — a child that will wake it, or a
+/// job whose report does — keeps its worktree: that wake starts a run *in this
+/// directory*, and a run in a directory that is gone recreates it as a plain
+/// path no surface can see (finding S1). The next run's end sweeps it instead.
+fn reclaim_own_worktree(actor: &Actor, state: &ActorState) -> bool {
+    if actor.branch.is_none() || !state.running.is_empty() || !state.running_jobs.is_empty() {
+        return false;
+    }
+    let base = actor.base.clone().unwrap_or_else(|| "HEAD".to_string());
+    matches!(
+        git::reclaim(&actor.ctx.root, actor.id, &base),
+        git::Reclaimed::Removed { .. }
+    )
 }
 
 /// Whether this actor is an isolated agent whose worktree has been reclaimed
@@ -2714,6 +2778,36 @@ fn exec_tool(
     answer.map_err(ToolError::Failed)
 }
 
+/// The refusal a spawn gets when the repository already holds `MAX_WORKTREES`
+/// worktrees that no sweep will take: which ones, where they are, and the
+/// commands that clear one. Named rather than counted — a number a human cannot
+/// act on is exactly what this check exists to replace (finding H17).
+fn too_many_worktrees(held: &[u64]) -> String {
+    /// How many worktrees the refusal names before it counts the rest: the four
+    /// fit a tool result's line, and the model needs the shape, not the roster.
+    const NAMED: usize = 4;
+    let named = held
+        .iter()
+        .take(NAMED)
+        .map(|id| format!("#{id} ({})", git::worktree_rel(*id)))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let rest = held.len().saturating_sub(NAMED);
+    let more = if rest > 0 {
+        format!(" and {rest} more")
+    } else {
+        String::new()
+    };
+    format!(
+        "cannot spawn: {} isolated worktrees already exist and none of them is landable \
+         (the limit is {}) — each holds an unmerged branch or uncommitted work: {named}{more}. \
+         Land or drop one first: merge or delete its branch, then \
+         `git worktree remove --force .mush/wt/<id>` and `git branch -d mush/<id>`.",
+        held.len(),
+        git::MAX_WORKTREES
+    )
+}
+
 fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<String, String> {
     let ctx = &actor.ctx;
     let (parent, depth) = (actor.id, actor.depth);
@@ -2776,6 +2870,21 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
                  may run at a time. Pass base=<branch or commit> to give a sibling its own worktree, or \
                  wait for it first."
             ));
+        }
+    }
+
+    // The cap on what a run leaves on disk, checked here — before the id is
+    // taken and before `worktree add` runs. Today's failure is git's own, a
+    // fatal a moment later with the number already spent and a gap on the screen
+    // that nothing explains (finding H17); this is the same refusal, planned,
+    // naming what to clear. Only an isolated spawn pays it (a shared child makes
+    // no worktree), and it counts what no sweep will take, so a worktree whose
+    // work is merged — one that is leaving on its own — never refuses anyone
+    // (finding H10).
+    if isolated {
+        let held = git::unlandable(&ctx.root);
+        if held.len() >= git::MAX_WORKTREES {
+            return Err(too_many_worktrees(&held));
         }
     }
 
@@ -2859,6 +2968,10 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         depth: depth + 1,
         ws: child_ws,
         branch,
+        // The base this worktree was forked from, as `worktree_add` got it: the
+        // run's own end measures the branch against this, so "this run committed
+        // nothing" is a git fact and not a memory (finding H10).
+        base: base.clone(),
         brief: brief.clone(),
         my_tx: cmd_tx.clone(),
         parent_tx: actor.my_tx.clone(),
@@ -5663,6 +5776,7 @@ mod tests {
             depth: 0,
             ws: Workspace::new(&root).unwrap(),
             branch: None,
+            base: None,
             brief: String::new(),
             my_tx: my_tx.clone(),
             parent_tx: dead_tx,
@@ -8314,6 +8428,250 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A run that committed nothing leaves nothing on disk. The worktree and the
+    /// branch are reclaimed at the run's own end, and the UI is told — the row
+    /// must stop naming `.mush/wt/<id>` and `git diff HEAD...mush/<id>`, both of
+    /// which are gone (finding H10, U13). Without this, every isolated run that
+    /// changed nothing left a worktree behind for good, and its branch was what
+    /// the next `worktree add -b mush/<id>` died on.
+    #[test]
+    fn a_run_that_committed_nothing_leaves_no_worktree_behind() {
+        let root = init_git_repo("clean-run");
+        let scripted = Arc::new(
+            Scripted::new()
+                // The child: asked, answered, nothing written and nothing run.
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .says("nothing to do — b.txt is already there")
+                .when(|asked: &Asked| asked.saw("#1 done"))
+                .says("child finished")
+                .when(|asked: &Asked| asked.saw("spawned agent"))
+                .calls(vec![tool_call("c1", "wait", json!({}))])
+                .calls(vec![tool_call(
+                    "c0",
+                    "spawn_agent",
+                    json!({
+                        "brief": "check whether b.txt exists in the repository",
+                        "base": "main"
+                    }),
+                )]),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user("delegate a look at the repository".to_string()),
+            ]))
+            .unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 2),
+            "the child and the woken root must each finish: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+
+        assert!(
+            !git::worktree_path(&root, 1).exists(),
+            "the run committed nothing, so its worktree is gone"
+        );
+        assert_eq!(
+            git_rev_parse(&root, "mush/1"),
+            None,
+            "and the branch with it: the name is free for the next child"
+        );
+        assert!(
+            events
+                .events()
+                .iter()
+                .any(|(id, event)| id.0 == 1 && matches!(event, AgentEvent::Reclaimed)),
+            "the row is told, or it keeps offering two commands that cannot run"
+        );
+        // Nothing was written anywhere: the root's own checkout is untouched.
+        assert_eq!(
+            git::run(&root, &["status", "--porcelain"]).unwrap_or_default(),
+            "",
+            "a run that changed nothing changed nothing"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The other half, at the same call site: a run that *did* commit keeps its
+    /// worktree and its branch, and no reclamation is reported. The sweep is not
+    /// a cleanup of everything a run leaves — it is the one case where there is
+    /// provably nothing to keep (finding H10).
+    #[test]
+    fn a_run_that_committed_keeps_its_worktree_and_says_nothing_was_reclaimed() {
+        let root = init_git_repo("kept-run");
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .calls(vec![tool_call(
+                    "c1",
+                    "run_command",
+                    json!({ "command": "printf 'kept work' > kept.txt" }),
+                )])
+                .when(|asked: &Asked| asked.depth() == Some(1) && asked.saw("kept.txt"))
+                .says("wrote kept.txt in my worktree")
+                .when(|asked: &Asked| asked.saw("#1 done"))
+                .says("child finished")
+                .when(|asked: &Asked| asked.saw("spawned agent"))
+                .calls(vec![tool_call("c2", "wait", json!({}))])
+                .calls(vec![tool_call(
+                    "c0",
+                    "spawn_agent",
+                    json!({
+                        "brief": "create a file called kept.txt containing exactly: kept work",
+                        "base": "main"
+                    }),
+                )]),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user("delegate a file".to_string()),
+            ]))
+            .unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 2),
+            "the child and the woken root must each finish: {seen:?}"
+        );
+
+        assert_eq!(
+            fs::read_to_string(root.join(".mush/wt/1/kept.txt"))
+                .ok()
+                .as_deref(),
+            Some("kept work"),
+            "unmerged work stays exactly where the run left it"
+        );
+        assert!(
+            git_rev_parse(&root, "mush/1").is_some(),
+            "and its branch stays readable — the human lands the work with it"
+        );
+        assert!(
+            !events
+                .events()
+                .iter()
+                .any(|(_, event)| matches!(event, AgentEvent::Reclaimed)),
+            "nothing was reclaimed, so nothing says it was"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The cap is a refusal *before* anything is created. With `MAX_WORKTREES`
+    /// worktrees that no sweep will take, an isolated spawn is refused by name —
+    /// the ids, the paths and the commands that clear one — and the number it
+    /// would have drawn is not spent, so the retry after a human clears one is
+    /// consecutive (finding H17, H10). The failure this replaces is git's own,
+    /// after the fact: a fatal `worktree add` with the id already burned.
+    #[test]
+    fn the_worktree_cap_refuses_a_spawn_before_the_id_is_taken() {
+        let root = init_git_repo("cap");
+        // Every worktree holds an uncommitted file, which is the cheapest way to
+        // be unlandable — the sweep will not take them and the cap counts them.
+        for id in 1..=git::MAX_WORKTREES as u64 {
+            let path = git::worktree_path(&root, id);
+            git::run(
+                &root,
+                &[
+                    "worktree",
+                    "add",
+                    "-q",
+                    "-b",
+                    &git::branch_name(id),
+                    path.to_str().unwrap(),
+                    "HEAD",
+                ],
+            )
+            .expect("the repository can hold this worktree");
+            fs::write(path.join("uncommitted.txt"), "not committed\n").unwrap();
+        }
+        // The refusal rule comes first and is the only one with a matcher: the
+        // catch-all spawn rule answers the run's opening call, and the refusal
+        // text in the transcript is what the *second* call is answered with.
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.saw("none of them is landable"))
+                .says("the spawn was refused")
+                .calls(vec![tool_call(
+                    "c0",
+                    "spawn_agent",
+                    json!({ "brief": "create a file called cap.txt", "base": "main" }),
+                )]),
+        );
+        let events = Recorder::new();
+        let handle = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        );
+        handle
+            .tx
+            .send(AgentMsg::Run(vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user("spawn an isolated child".to_string()),
+            ]))
+            .unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the root's run must end: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+
+        let refusal = events
+            .events()
+            .into_iter()
+            .find_map(|(_, event)| match event {
+                AgentEvent::Message(message)
+                    if message.text().contains("none of them is landable") =>
+                {
+                    Some(message.text().to_string())
+                }
+                _ => None,
+            })
+            .expect("the refusal reaches the model as a tool result");
+        assert!(
+            refusal.contains(&format!("{} isolated worktrees", git::MAX_WORKTREES)),
+            "the count and the limit are both in it: {refusal}"
+        );
+        assert!(refusal.contains("#1 (.mush/wt/1)"), "{refusal}");
+        assert!(refusal.contains("git worktree remove --force"), "{refusal}");
+        assert!(refusal.contains("git branch -d mush/<id>"), "{refusal}");
+
+        assert!(
+            !events
+                .events()
+                .iter()
+                .any(|(_, event)| matches!(event, AgentEvent::Spawned { .. })),
+            "no child was created"
+        );
+        assert_eq!(
+            handle.ids.agents_floor(),
+            1,
+            "and the number the refusal saved is still there for the next spawn"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A tree whose isolated child has finished its first run, left `iso.txt` on
     /// `mush/1`, and is now idle — the state a hand-run merge or discard starts
     /// from.
@@ -8673,27 +9031,30 @@ mod tests {
             "the grandchild must write its own worktree"
         );
         // Nested worktree, now with real history: the grandchild's branch
-        // carries its work and is based on the child's branch, which — because
-        // the child only delegated — still sits at the branch point. And the
-        // child's worktree must NOT contain the grandchild's file.
+        // carries its work.
         let grandchild_files =
             git::run(&root, &["diff", "--name-only", "HEAD...mush/2"]).unwrap_or_default();
         assert!(
             grandchild_files.contains("deep.txt"),
             "mush/2 must carry the grandchild's work, got {grandchild_files:?}"
         );
+        // The child only delegated, so *its* run committed nothing: its own
+        // worktree and branch are reclaimed at the run's end (finding H10). The
+        // grandchild's branch was forked from the commit `mush/1` stood at, so
+        // its work is untouched by the reclamation — and the root's HEAD does
+        // not move.
+        assert!(
+            !root.join(".mush/wt/1").exists(),
+            "a run that committed nothing leaves no worktree behind"
+        );
         assert_eq!(
-            git_rev_parse(&root, "mush/1").as_deref(),
-            git_rev_parse(&root, "HEAD").as_deref(),
-            "the child delegated, so its own branch stays at the branch point"
+            git_rev_parse(&root, "mush/1"),
+            None,
+            "and no branch either: the name went with the worktree"
         );
         assert!(
-            git::run(&root, &["merge-base", "--is-ancestor", "mush/1", "mush/2"]).is_ok(),
-            "mush/2 must be based on mush/1 (nested, not re-rooted)"
-        );
-        assert!(
-            !root.join(".mush/wt/1/deep.txt").exists(),
-            "the child's worktree must stay clean of grandchild work"
+            root.join(".mush/wt/2/deep.txt").exists(),
+            "while the grandchild's own worktree is untouched"
         );
         let _ = fs::remove_dir_all(&root);
     }

@@ -31,7 +31,7 @@ pub use tree::{
 // id-taking modules do not each learn a new one.
 pub use crate::ids::AgentId;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -69,6 +69,13 @@ pub enum Msg {
     Git {
         stats: HashMap<AgentId, git::Stat>,
         status: Option<git::RepoStatus>,
+        /// What a sweep found at the worktree of every agent that is *at rest*
+        /// and has a branch: the decision, not the deed. The read happens off
+        /// the UI thread because git is subprocesses; the removal it may lead to
+        /// happens on the thread that owns the tree, because only there can
+        /// "this node is not running" and the removal be one decision
+        /// (finding H10).
+        sweep: Vec<(AgentId, git::Reclaimable)>,
     },
     /// An event from an agent actor. `conversation` identifies the tree that
     /// sent it, so an actor left over from Ctrl-N cannot write into the new
@@ -691,20 +698,42 @@ impl App {
         // Resolved here: the tree is UI state, and the worker must not touch it.
         // A nested agent forked from its parent's branch, so that is what its
         // work is measured against; a top-level one forked from HEAD.
-        let branches: Vec<(AgentId, String, String)> = self
-            .tree
-            .agents
-            .iter()
-            .filter_map(|node| {
-                let branch = node.branch.clone()?;
-                let base = node
-                    .parent
-                    .and_then(|parent| self.tree.node(parent))
-                    .and_then(|parent| parent.branch.clone())
-                    .unwrap_or_else(|| "HEAD".to_string());
-                Some((node.id, base, branch))
-            })
-            .collect();
+        //
+        // The same walk yields the worktrees a sweep may take, and it takes only
+        // the ones *at rest*: a worktree whose agent is running — or whose job is
+        // — is being used right now, whatever git says about its branch, and the
+        // read must not even propose it (finding H10).
+        let mut branches: Vec<(AgentId, String, String)> = Vec::new();
+        let mut sweep: Vec<(AgentId, String)> = Vec::new();
+        // A worktree may only be swept while nothing of its agent's own is out: a
+        // child that is still working, or a result the agent has not read yet,
+        // wakes its actor into a fresh run *in that directory* — and a run in a
+        // directory that is gone recreates it as a plain path no surface can see
+        // (finding S1). One walk over the children, because both answers are set
+        // by them.
+        let mut waking: HashSet<AgentId> = HashSet::new();
+        for node in self.tree.agents.iter() {
+            if !node.phase.is_busy() && !node.result_unread {
+                continue;
+            }
+            if let Some(parent) = node.parent {
+                waking.insert(parent);
+            }
+        }
+        for node in self.tree.agents.iter() {
+            let Some(branch) = node.branch.clone() else {
+                continue;
+            };
+            let base = node
+                .parent
+                .and_then(|parent| self.tree.node(parent))
+                .and_then(|parent| parent.branch.clone())
+                .unwrap_or_else(|| "HEAD".to_string());
+            if !self.in_flight(node) && !waking.contains(&node.id) {
+                sweep.push((node.id, base.clone()));
+            }
+            branches.push((node.id, base, branch));
+        }
         let tx = self.ui_tx.clone();
         std::thread::spawn(move || {
             let mut stats = HashMap::new();
@@ -713,13 +742,31 @@ impl App {
                     stats.insert(id, stat);
                 }
             }
+            // One answer per at-rest worktree, read here and acted on there:
+            // this thread never removes anything.
+            let sweep = sweep
+                .into_iter()
+                .map(|(id, base)| {
+                    let found = git::reclaimable(&root, id.0, &base);
+                    (id, found)
+                })
+                .collect();
             let status = git::status(&root);
-            let _ = tx.send(Msg::Git { stats, status });
+            let _ = tx.send(Msg::Git {
+                stats,
+                status,
+                sweep,
+            });
         });
     }
 
     /// Adopt a repository read that finished on its own thread.
-    fn adopt_git(&mut self, stats: HashMap<AgentId, git::Stat>, status: Option<git::RepoStatus>) {
+    fn adopt_git(
+        &mut self,
+        stats: HashMap<AgentId, git::Stat>,
+        status: Option<git::RepoStatus>,
+        sweep: Vec<(AgentId, git::Reclaimable)>,
+    ) {
         // A reap can land between the read and this adoption (a leftover whose
         // checkout went away, say), and the row title sums every entry: a
         // stat for an id with no node would be counted as a ghost. The tree
@@ -732,7 +779,77 @@ impl App {
         self.git = status;
         self.git_at = Some(Instant::now());
         self.git_in_flight = false;
+        self.sweep_worktrees(sweep);
         self.dirty_screen = true;
+    }
+
+    /// Act on what the read found at each at-rest agent's worktree: take the ones
+    /// whose work is already in their base, and say in the row why the others
+    /// stay.
+    ///
+    /// This is where a hand merge becomes visible without a restart: the sweep
+    /// runs on every git read, the read runs every couple of seconds while
+    /// anything is working, and the row is marked `merged` (finding H10).
+    ///
+    /// The removal happens *here*, on the thread that owns the tree, and only
+    /// after asking the tree again: the read above is a snapshot, and a node that
+    /// started running since it was taken must not have its worktree pulled out
+    /// from under its agent — the agent's file tools resolve their directory from
+    /// the workspace it was spawned with, so a run would recreate the path as a
+    /// plain directory no surface can see (finding S1). `git::reclaim` decides a
+    /// second time from git facts, so a worktree that went dirty in the meantime
+    /// is kept rather than destroyed.
+    fn sweep_worktrees(&mut self, sweep: Vec<(AgentId, git::Reclaimable)>) {
+        for (id, found) in sweep {
+            // A node can be gone by now (a reap, a new conversation): the tree
+            // owns which ids exist, and a sweep for a ghost must do nothing.
+            if !self.tree.has(id) {
+                continue;
+            }
+            match found {
+                git::Reclaimable::Nothing => self.tree.mark_kept(id, None),
+                git::Reclaimable::Kept(why) => self.tree.mark_kept(id, Some(why)),
+                git::Reclaimable::Landable => {
+                    if self.in_flight_id(id) {
+                        continue;
+                    }
+                    let base = self.fork_base(id);
+                    let root = self.ws.root().to_path_buf();
+                    match git::reclaim(&root, id.0, &base) {
+                        git::Reclaimed::Removed { .. } => {
+                            self.tree.mark_reclaimed(id);
+                            // `landed` is what a restart shows, so it goes in the
+                            // same file the tree does.
+                            self.mark_session_dirty();
+                        }
+                        git::Reclaimed::Kept(why) => self.tree.mark_kept(id, Some(why)),
+                        git::Reclaimed::Nothing => self.tree.mark_kept(id, None),
+                    }
+                }
+            }
+        }
+    }
+
+    /// Whether agent `id` has work in flight: its own run, or a job of its own.
+    /// The tree is the only thing that knows, so the question is asked here
+    /// before a directory is taken away.
+    fn in_flight_id(&self, id: AgentId) -> bool {
+        self.tree
+            .node(id)
+            .map(|node| self.in_flight(node))
+            .unwrap_or(true)
+    }
+
+    /// The ref an agent's branch was forked from: its parent's branch, or `HEAD`
+    /// for a child of the root — the same derivation the git read used, asked
+    /// again at the moment the removal happens.
+    fn fork_base(&self, id: AgentId) -> String {
+        self.tree
+            .node(id)
+            .and_then(|node| node.parent)
+            .and_then(|parent| self.tree.node(parent))
+            .and_then(|parent| parent.branch.clone())
+            .unwrap_or_else(|| "HEAD".to_string())
     }
 
     /// The window in tokens, for the meter. The number is the conversation's,
@@ -752,12 +869,51 @@ impl App {
 
     /// Register git worktrees left over from earlier sessions (`mush/<id>`
     /// branches) as finished tree nodes, so a leftover's branch is on its row
-    /// after a restart. A registry entry whose checkout is gone is not
-    /// work on disk and gets no row — `rm -rf .mush` leaves git naming those
-    /// until they are pruned (finding P13) — but its id is still reserved: the
-    /// branch outlives the directory (see the loop below).
+    /// after a restart — and reclaim the ones whose work is already in the main
+    /// checkout *first*, so a merged branch is not a row and not a name the next
+    /// isolated spawn dies on (finding H10).
+    ///
+    /// A registry entry whose checkout is gone is not work on disk and gets no
+    /// row — `rm -rf .mush` leaves git naming those until they are pruned
+    /// (finding P13) — but its id is still reserved: the branch outlives the
+    /// directory (see the loop below).
     pub fn discover_worktrees(&mut self) {
         let root = self.ws.root().to_path_buf();
+        // Git's registry outlives the directory, and an entry pointing at a
+        // directory nobody has is not a worktree: prune before anything reads
+        // the list, so the sweep and the rows both see the repository as it is.
+        // A merge by hand while the checkout was gone leaves *only* that entry
+        // between a merged branch and reclaiming it.
+        let _ = git::run(&root, &["worktree", "prune"]);
+        // Every `mush/<id>` the repository still names — checkout or not — is
+        // reclaimed before anything is registered. A branch whose work is
+        // already in the main checkout is H10's specimen: `mush/2` and `mush/3`
+        // were merged child work whose checkouts were long gone, and the next
+        // isolated spawn died on `a branch named 'mush/2' already exists`. A
+        // branch the sweep will not take is left exactly where it was and says
+        // why, and its number stays spent below.
+        for id in git::isolated_ids(&root).unwrap_or_default() {
+            match git::reclaim(&root, id, "HEAD") {
+                git::Reclaimed::Removed { branch_kept } => {
+                    self.tree.mark_reclaimed(AgentId(id));
+                    // A ref git would not delete still holds the name — `-d` is
+                    // the only deletion mush runs, and it deletes what it can
+                    // certify — so the number is spent anyway, exactly as the
+                    // residue loop below treats a live `mush/<id>`.
+                    if branch_kept.is_some() {
+                        self.tree.reserve_agents(id + 1);
+                    }
+                }
+                git::Reclaimed::Kept(why) => {
+                    // Kept work is not a reason to hand the number out again.
+                    self.tree.reserve_agents(id + 1);
+                    // A restored agent has a row already; a leftover's is
+                    // registered below, and the next git read fills its line in.
+                    self.tree.mark_kept(AgentId(id), Some(why));
+                }
+                git::Reclaimed::Nothing => {}
+            }
+        }
         // `None` means git could not answer (no binary, not a repository). The
         // tree then keeps the leftovers it already knows about: dropping them
         // on a failed read would look like the work had been reclaimed.
@@ -849,7 +1005,11 @@ impl App {
     pub fn update(&mut self, msg: Msg) {
         match msg {
             Msg::Models { endpoint, models } => self.adopt_models(endpoint, models),
-            Msg::Git { stats, status } => self.adopt_git(stats, status),
+            Msg::Git {
+                stats,
+                status,
+                sweep,
+            } => self.adopt_git(stats, status, sweep),
             Msg::Paste(text) => {
                 // A paste is something the human wants to say, so it lands in
                 // the message box whichever pane has focus. An open picker is
@@ -1038,6 +1198,17 @@ impl App {
                 // mark: a row that guessed itself clear would be claiming a
                 // reading that never happened (finding H4).
                 self.tree.result_read(AgentId(child));
+            }
+            AgentEvent::Reclaimed => {
+                // The actor's own run end swept its worktree: the checkout and
+                // the branch are gone, so the row stops offering a `git diff`
+                // against either and says where the work is instead — the base
+                // the run was forked from (finding U13, H10). A row still
+                // offering `.mush/wt/<id>` after this would be offering a path
+                // nothing can run in.
+                self.tree.mark_reclaimed(id);
+                // `landed` is what a restart shows, so it is stored.
+                self.mark_session_dirty();
             }
             AgentEvent::Stopped => {
                 // Stopped is not failed and not done: the run produced nothing,
@@ -9337,6 +9508,11 @@ mod tests {
     /// Leftover worktrees keep their ids, and the tree's counter is raised
     /// above them, so the next spawned child cannot collide (finding B1); a
     /// reaped leftover releases the focus (finding B11).
+    ///
+    /// The leftover's work is unmerged on purpose: a `mush/<id>` whose branch is
+    /// already in HEAD is reclaimed by the same pass, so it is a row that never
+    /// gets registered and a number that is free again (finding H10) —
+    /// `a_merged_residue_is_reclaimed_by_the_startup_pass` is that half.
     #[test]
     fn leftover_worktrees_raise_the_id_floor_and_release_the_focus() {
         use std::fs;
@@ -9361,6 +9537,15 @@ mod tests {
         git(&["add", "-A"]);
         git(&["commit", "-qm", "init"]);
         git(&["worktree", "add", "-q", "-b", "mush/7", ".mush/wt/7"]);
+        // The leftover carries work nobody merged: one in HEAD would be residue
+        // the startup pass reclaims, not a leftover (finding H10).
+        fs::write(root.join(".mush/wt/7/work.txt"), "the leftover's work\n").unwrap();
+        git::run(&root.join(".mush/wt/7"), &["add", "-A"]).unwrap();
+        git::run(
+            &root.join(".mush/wt/7"),
+            &["commit", "-qm", "leftover work"],
+        )
+        .unwrap();
 
         let (mut app, _rx) = app_root(&root, None, session_save::fake::Recorder::new());
 
@@ -9389,10 +9574,13 @@ mod tests {
     }
 
     /// A `mush/<id>` branch whose checkout is gone is not work on disk — no row,
-    /// as `the_roster_does_not_report_a_dead_worktree` says — but it is still
-    /// fatal to the next `git worktree add -b mush/<id>`, because the branch ref
-    /// outlives the directory git registered it against. So the residue raises
-    /// the id floor: the number is spent, the row would be a lie.
+    /// as `the_roster_does_not_report_a_dead_worktree` says — but while its work
+    /// is unmerged it is still fatal to the next `git worktree add -b mush/<id>`,
+    /// because the branch ref outlives the directory git registered it against.
+    /// So the residue raises the id floor: the number is spent, the row would be
+    /// a lie. (The *merged* residue — H10's specimen — is reclaimed by the same
+    /// pass, and `a_merged_residue_is_reclaimed_by_the_startup_pass` is that
+    /// half.)
     #[test]
     fn a_dir_less_branch_raises_the_id_floor_without_a_row() {
         use std::fs;
@@ -9417,6 +9605,12 @@ mod tests {
         git(&["add", "-A"]);
         git(&["commit", "-qm", "init"]);
         git(&["worktree", "add", "-q", "-b", "mush/7", ".mush/wt/7"]);
+        // Unmerged work, so the residue the startup pass keeps is the *kept*
+        // half of the rule: a `mush/<id>` in HEAD is reclaimed and its number
+        // handed back (finding H10).
+        fs::write(root.join(".mush/wt/7/work.txt"), "unmerged residue\n").unwrap();
+        git::run(&root.join(".mush/wt/7"), &["add", "-A"]).unwrap();
+        git::run(&root.join(".mush/wt/7"), &["commit", "-qm", "residue"]).unwrap();
         // The directory goes by hand, as `rm -rf .mush` leaves it: git's entry
         // and the branch stay, and the next `worktree add -b mush/7` refuses.
         fs::remove_dir_all(root.join(".mush/wt/7")).unwrap();
@@ -9442,6 +9636,154 @@ mod tests {
             "but its id is not handed to the next child"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// H10's specimen, replayed. `mush/7` was merged by a human and its checkout
+    /// is gone: git still names the branch, and before this patch the next
+    /// isolated spawn died on `a branch named 'mush/7' already exists`. The
+    /// startup pass deletes it, and the name it was holding is usable again —
+    /// which is the whole point, so the test's last word is that spawn's own
+    /// first command.
+    #[test]
+    fn a_merged_residue_is_reclaimed_by_the_startup_pass() {
+        use std::fs;
+
+        let root = repo("reclaim-residue");
+        git(
+            &root,
+            &["worktree", "add", "-q", "-b", "mush/7", ".mush/wt/7"],
+        );
+        let worktree = root.join(".mush/wt/7");
+        fs::write(worktree.join("work.txt"), "merged work\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-qm", "mush #7: work"]);
+        git(&root, &["merge", "--no-edit", "mush/7"]);
+        // The checkout goes by hand, as it did for the specimen: git keeps the
+        // registry entry and the branch.
+        fs::remove_dir_all(&worktree).unwrap();
+        assert!(
+            git_of(&root, &["rev-parse", "--verify", "refs/heads/mush/7"]).is_ok(),
+            "the branch is what git still names"
+        );
+
+        let (app, _rx) = app_root(&root, None, session_save::fake::Recorder::new());
+
+        assert!(
+            !app.tree.agents.iter().any(|node| node.id == AgentId(7)),
+            "merged work is not a leftover row: it is in HEAD"
+        );
+        assert!(
+            git_of(&root, &["rev-parse", "--verify", "refs/heads/mush/7"]).is_err(),
+            "and the branch is gone"
+        );
+        assert!(
+            app.tree.handles().ids.agents_floor() < 8,
+            "the number went with it, so nothing is reserved for #7 any more"
+        );
+        // The failure this reclamation exists to end: the name is free again.
+        let spawned = git_of(
+            &root,
+            &["worktree", "add", "-q", "-b", "mush/7", ".mush/wt/7"],
+        );
+        assert!(
+            spawned.is_ok(),
+            "the name the next isolated spawn needs must be free: {spawned:?}"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The periodic read is what notices a hand merge without a restart: within
+    /// one git read of the merge, the row says the work landed, the checkout is
+    /// gone, and — because mush took the branch with it — nothing offers a
+    /// `git diff` against either any more (finding H10). Before the merge the
+    /// same read says *why* the worktree is still there, which is the other half
+    /// of the rule.
+    #[test]
+    fn a_hand_merge_is_marked_landed_by_the_next_git_read() {
+        use std::fs;
+
+        let root = repo("reclaim-refresh");
+        let (mut app, rx) = app_and_rx(root.clone());
+        wait_git(&mut app, &rx);
+        // An isolated child of the root, at rest: its worktree exists, its work
+        // is on a branch nobody has merged.
+        let conversation = app.tree.conversation();
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Spawned {
+                child: 1,
+                parent: 0,
+                brief: "build the thing".to_string(),
+                depth: 1,
+                branch: Some("mush/1".to_string()),
+                title: None,
+                cmd: crossbeam_channel::unbounded().0,
+            },
+        });
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId(1),
+            event: AgentEvent::Done,
+        });
+        git(
+            &root,
+            &["worktree", "add", "-q", "-b", "mush/1", ".mush/wt/1"],
+        );
+        let worktree = root.join(".mush/wt/1");
+        fs::write(worktree.join("work.txt"), "the child's work\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-qm", "mush #1: work"]);
+
+        app.refresh_git();
+        wait_git(&mut app, &rx);
+        let child = app.tree.node(AgentId(1)).expect("the child is in the tree");
+        assert!(
+            child
+                .kept
+                .as_deref()
+                .is_some_and(|why| why.contains("mush/1")),
+            "an unmerged worktree is kept, and the row says why: {:?}",
+            child.kept
+        );
+        assert!(
+            worktree.exists(),
+            "and it is still on disk — the sweep kept its hands off"
+        );
+
+        // The human merges by hand: the work is in HEAD, and the next read is
+        // the only thing that has to notice.
+        git(&root, &["merge", "--no-edit", "mush/1"]);
+        app.refresh_git();
+        wait_git(&mut app, &rx);
+
+        let child = app.tree.node(AgentId(1)).expect("the child is still here");
+        assert_eq!(
+            child.landed,
+            Some(Landed::Merged),
+            "the row says where the work went"
+        );
+        assert_eq!(
+            child.branch, None,
+            "and the branch it named is gone with the checkout"
+        );
+        assert_eq!(child.kept, None, "nothing is left to say about it");
+        assert!(!worktree.exists(), "the checkout is reclaimed");
+        assert!(
+            git_of(&root, &["rev-parse", "--verify", "refs/heads/mush/1"]).is_err(),
+            "and so is the branch, so no row can offer a diff against it"
+        );
+        // A landed agent is not one to send work to: the path it was spawned
+        // with is gone, and a run there would recreate it as a plain directory
+        // no surface can see (finding S1).
+        assert!(app.worktree_gone(AgentId(1)).is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// `git::run`'s answer, as the shape a test asserts on rather than an
+    /// `unwrap` that hides git's own words.
+    fn git_of(root: &std::path::Path, args: &[&str]) -> Result<String, String> {
+        mush_core::git::run(root, args)
     }
 
     // ------------------------------------------------------------- attach (M3)
