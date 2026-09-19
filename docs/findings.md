@@ -46,6 +46,14 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   (`state.children`/`completed`), so `status` can list a row that is no longer on
   screen. Deliberate in `ab54de3` — dropping it needs a "forget this child"
   message — but it is the one visible inconsistency the window left (§8.23).
+- **H20** — the sentences the model is told that are **not** true, where the fix
+  is wording in `crates/mush-core/src/prompt.rs` (§8.27 items 2, 5, 9, and the
+  `status` schema's "title" in item 1). The human owns that file, so the four are
+  recorded rather than edited: `wait`'s 600 s cap and its early release, what a
+  job's result actually is (its one line, not its window), the 120 s kill when
+  the job budget is full and the 8 MiB output ceiling, and the title a running
+  child does not have. The code half of items 1, 3, 4, 6, 7, 8 landed with §8.27;
+  item 10 with `mush/88`.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -805,3 +813,148 @@ process (a short retry on the lock) rather than panic. **Fixed** by `c5694f1`
 (merged `7e0440f`): the test now waits for the git read whose answer it asserts
 on, instead of racing the background thread — found independently while the B27
 branch was adding a test of its own.
+
+---
+
+## 8.26 The simplification wave: three landings, and what the class bought
+
+`docs/simplification-review.md` is the output of six blind, read-only readers
+hunting one class — two mechanisms answering one question. This wave implemented
+the items whose files were free, as three branches with disjoint file sets, each
+verified here before merge (whole-workspace `cargo test`, `cargo fmt --check`,
+`cargo clippy --all-targets -- -D warnings`, both smoke scenarios) and again on
+the merged tree.
+
+**`929128e` (merged `f989c3a`) — one in-flight predicate, one busy count, one
+refusal.** "This agent has work in flight" had four spellings (`kept`,
+`may_park`, `App::in_flight`, `cancel_cursor_row`); one `AgentTree::in_flight`
+owns it now, and the `jobs_live` pre-checks stay as a documented *cost filter*,
+not a second rule that can drift. `Stopped`'s `Heard`/`Gone` arms had no
+production reader (`cancel_requested` returns `bool`: true means the mailbox was
+dead with a run in flight, i.e. cut off), and `impl Display for CommandError`
+had no production caller.
+
+The drift the reader predicted was **real**: `deliver` answered a client's
+refused message *after* committing it to the root's transcript and flushing the
+session, so words that never ran were in the conversation the next run would
+read. `deliver` now refuses without touching the transcript, the box or the
+revision, and the human's own key is the one caller that puts the words back in
+the box (`a_refused_attach_send_leaves_the_root_transcript_unchanged`).
+
+One edit was left over by the branch and done at merge time (`a70657e`):
+`busy_children` had lost its last production caller, and `agent_row`'s only
+caller was the attach roster — a loop over every row — so asking per row rebuilt
+the whole busy map once per node: the quadratic R29 had removed from the frame
+had moved to the roster. `App::rows(nodes)` is now the one row builder the pane
+and the roster share, and the wrapper and `agent_row` are gone.
+
+**`adb8a24` (merged `2c6b53f`) — the registry's dead arms, one bounded status.**
+The `Refused::Machine` arm for "you hold the machine" (every `Held` is built by a
+*not-you* test), `finish`'s impossible `None` (and the `0s` line its fallback
+would have invented), `label(id)`'s callers inside the module, the `0..8`
+fixed-point cap in `window_line` whose arithmetic is its own bound, and
+`input.rs`'s `(lines, 0, 0)` fallback, whose row could never be missing.
+`Record`'s `live`/`line`/`tail` are one `State` now, so the fourth combination is
+unrepresentable and the two readers that defended it are gone.
+
+Two items are worth more than their line count. `status`'s headline carried the
+command **whole** on top of a window bounded on its own terms — a 2 KB script is
+an ordinary `run_command` — so every headline now cuts to
+`STATUS_COMMAND_COLUMNS`, and a test drives a 2 KB command through both the
+running and the ended form. And the agent counter and the lost-number pool are
+one `Agents` under one lock (T1 §13): the guard they replaced was unreachable,
+and the window it was written against — a number the repository has just named,
+drawn out of the pool between two locks — is closed by the lock rather than by
+the guard.
+
+**`bcdd127` (merged `e7f02de`) — a real bug, then eight mechanisms.** The `/model`
+popup marked the row the *cursor* sat on instead of the row being painted (the
+comparison read `items[picker.cursor]` inside the loop over the window), so every
+visible row wore `•` while the picker opened on the current model and **none** did
+after one `j`. A blind reader found that without running anything; a frame-paint
+test through `ui::draw` into a `TestBackend` pins it now. With it: `elide`'s
+`min_kept` and its `kept == 0` arm (both returned the floor), `PickerPane`'s
+`show_hint` and the empty-popup early return (the painter's own `Block::inner`
+already answers it), four keys pinned by two tests each plus the help-copy
+asserts, `Rank`'s unused `PartialOrd`/`Ord`, `notes_report`'s mark re-derived and
+its lead measured in bytes rather than columns, `Reading::Holding`'s validity rule
+spelled three times (one `held(len)`), and the three "which pane has the
+keyboard" fields, now `Panes.focus`.
+
+It still parses `" · "` to read a model row's id. That reader dies with the
+review's Tier 3 §7 (the picker's item string is a data format with three
+readers), which is unstarted.
+
+**Refused, deliberately — each one a decision rather than a deletion:**
+
+- `StoredStatus::Running`: deleting it would store `cut_off` for a run that is
+  live and break old files' deserialization (§8.23's ruling, unchanged).
+- `-y`/`--yes`/`AUTO_APPROVE`: its only reader prints back that it was given.
+  Deleting it turns `mush -y` into an unknown option — the human's call.
+- the attach `id` field: one response per request makes correlation invisible *in
+  tree*, which is not the same as unused. Out-of-tree clients are the question.
+- `worktree_add`'s `.git` probe (Tier 3 §3): `git worktree add` checks out the
+  **repository** root, so a workspace that is a subdirectory of a repository
+  would give a child a different cwd from its parent's. That is a promise to
+  settle before code, not a one-line fix.
+- the `agent.rs` halves of T1 §9/§11/§12 (`label`, the 10 ms literal, 60 vs 40):
+  the file belonged to another branch; they are in flight with §8.27.
+
+**Census** (`scripts/census.py`, method in §8.5). At `491113a`: total 46,472 ·
+**prod 7,245** · tests 24,716 · comments 11,490. On the merged tree: total
+46,591 · **prod 7,127** · tests 24,836 · comments 11,600. 118 lines out of
+production, 120 lines of harness in — which is the honest shape of this wave:
+two of the three branches are net deletions of production code, and the harness
+grew by the tests that pin the two real bugs (the `/model` bullet, the refusal
+that used to land in the transcript).
+
+The contract audit that ran beside the wave — what the model is *told* versus
+what happens to it — is §8.27.
+
+---
+
+## 8.27 The contract audit: what the model is told, and what happens to it
+
+One blind, read-only reader (`mush/78`, no `docs/`, no commits, no second
+worktree) went over the model-facing surface: the root and subagent system
+prompts, every tool schema, and every line a tool hands back — `run_command`'s
+output and detach line, the `edit_file` confirmation, `spawn_agent`'s return,
+`status`'s listing, `control`'s replies, `wait`'s digest and its release rule,
+job finish and kill lines, the refusals, the error sentences a parent receives
+when a child finishes — and asked of each: is this true, and is the limit the
+model is told about the limit that is enforced? Both directions. It ran nothing,
+so its "what a model does with it" is reasoning from code, not observation; the
+mismatches below are code facts.
+
+| # | what is false | disposition |
+|---|---|---|
+| 1 | `status` promises "each child's state and title or branch" while a running child prints only `#3 ◐ running` — no title (it lives in the UI tree) and no branch | 🔄 `mush/87`: print the branch when mush can name it (an isolated child's is `mush/<id>`); no title source invented. The schema sentence is `prompt.rs` |
+| 2 | `wait` "blocks until everything you own has finished" — it gives up at 600 s and any message ends it early, and the context says neither | ⬜ the human's file (`prompt.rs`): name the cap, the timeout sentence and the early release |
+| 3 | `edit_file`'s description offers a top-level `replace_all`; only `edits[].replace_all` is read, so the refusal tells the model to set the flag it just set | 🔄 `mush/87`, fixed in code: the single-pair path honours a top-level `replace_all` |
+| 4 | **`exclusive=true` is not exclusive against its own owner.** `machine_free_for` answers `Ok` for the holder, `take_machine` then overwrites the record that names the exclusive job with a `(agent, command, None)`, and that call's release frees the machine while the job still runs — so a sibling's benchmark is admitted beside it. The promise ("Siblings are refused, not interleaved") silently stops holding | 🔄 `mush/87`: refuse an exclusive call from the current holder (the sentence for it exists but was unreachable), and let an exempt non-exclusive call leave the record alone |
+| 5 | a job's result is not handed over "in full": `wait`'s digest carries the job's one-line report, whose output is `preview_tail`'s last 400 chars of a 2 KB window | ⬜ the human's file (`prompt.rs`): say what a job's result is |
+| 6 | "you are told when it finishes" — a job killed by the 4 h ceiling, the 8 MiB output limit or a stop is written to the transcript but does not wake its owner (`is_news()` is true only for `Exited`) | 🔄 `mush/87`: a job mush *killed* is news; a `Stopped` outcome still does not restart a run |
+| 7 | the root is told "this call queued and the lock was still held" when its refusal is immediate — no queue, no 30 s | 🔄 `mush/87`: a second sentence for the exempt caller |
+| 8 | `control message` replies "it was at rest, so this resumes it" — but if the child's worktree is gone the child drops the steer on the floor, and the parent then waits 600 s for a result that cannot arrive. The human's own path refuses the same message up front | 🔄 `mush/87`: the parent's path must refuse it the same way |
+| 9 | "A command that outlives 60s detaches by itself" holds only while the job budget has room (otherwise it is killed at 120 s), and a job also dies past 8 MiB — a ceiling no prompt or schema states | ⬜ the human's file (`prompt.rs`): the budget's consequence, and the output ceiling beside "4h" |
+| 10 | turns leave the context with no marker: `needs_compaction` fires only while the history still fits, and past the whole budget `trim_history` drains the oldest turns silently | 🔄 `mush/88`: one line in the request saying the oldest turns were dropped |
+
+**What it checked and found consistent** — worth as much as the list above,
+because these are the promises that hold: the root and every subagent share one
+`RULES`/`MACHINE` block by construction; `edit_file`'s missing/ambiguous arms
+match its words; a batch lands all-or-nothing; `detach`'s 60 s and the 4 h
+ceiling are the constants they are described as; `exclusive`'s sibling story is
+true for siblings (item 4 is about the holder's own second call); `spawn_agent`'s
+return is the sentence that was shipped; `base`, the shared-child guard, and the
+depth/agent/worktree refusals each name their limit; the foreground result keeps
+the head and a job's window keeps the tail, and each says so; `status`'s job half
+matches `status_for`; `control`'s target spelling accepts what `status` prints;
+and a child's finish folds in and starts the parent's run, exactly as
+"Ending your turn while children still run is fine" promises.
+
+**Left standing, on purpose:** the prompt's "Never touch paths outside the
+workspace" is an instruction, not a boundary — only `edit_file` enforces it, and
+`run_command` is an unsandboxed shell; and `RUNAWAY_TURNS = 200` exists although
+the prompt says a run "runs until it stops calling tools" (the guard announces
+itself in a wrap-up turn, so the two sentences are not the same sentence). Both
+are decisions, not drift.
