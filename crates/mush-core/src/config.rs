@@ -778,12 +778,10 @@ mod tests {
 
     fn stored(provider: &str, base_url: &str, model: &str) -> Session {
         Session {
-            root: String::new(),
             model: model.into(),
             provider: provider.into(),
             base_url: base_url.into(),
             context: None,
-            updated: 0,
             messages: Vec::new(),
             agents: Vec::new(),
             notices: Vec::new(),

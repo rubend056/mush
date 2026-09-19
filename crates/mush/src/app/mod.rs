@@ -2606,7 +2606,6 @@ impl App {
             })
             .collect();
         Session {
-            root: self.ws.root_str(),
             model: self.cfg().model.clone(),
             provider: self.cfg().provider.name().to_string(),
             base_url: self.cfg().base_url.clone(),
@@ -2616,7 +2615,6 @@ impl App {
                 .cfg()
                 .context_explicit
                 .then_some(self.cfg().context_tokens),
-            updated: session::now_secs(),
             messages: self.chat.transcript(AgentId::ROOT).to_vec(),
             agents,
             // A failure is the one line worth coming back to; a command's answer
@@ -4074,12 +4072,10 @@ mod tests {
     fn a_stored_conversation_restores_its_agents_with_a_live_mailbox() {
         let root = repo("restore");
         let stored = Session {
-            root: root.display().to_string(),
             model: "test-model".into(),
             provider: "custom".into(),
             base_url: "http://127.0.0.1:1".into(),
             context: None,
-            updated: 0,
             messages: vec![Message::user("the root task")],
             agents: vec![session::AgentSession {
                 id: 2,
@@ -4139,18 +4135,12 @@ mod tests {
     }
 
     /// A stored conversation with one agent, for the restore path.
-    fn stored_with_agent(
-        root: &std::path::Path,
-        status: session::StoredStatus,
-        messages: Vec<Message>,
-    ) -> Session {
+    fn stored_with_agent(status: session::StoredStatus, messages: Vec<Message>) -> Session {
         Session {
-            root: root.display().to_string(),
             model: "test-model".into(),
             provider: "custom".into(),
             base_url: "http://127.0.0.1:1".into(),
             context: None,
-            updated: 0,
             messages: vec![Message::user("the root task")],
             agents: vec![session::AgentSession {
                 id: 2,
@@ -4177,7 +4167,6 @@ mod tests {
     fn a_nudge_to_a_landed_agent_names_how_it_landed() {
         let root = dir("landed-refusal");
         let mut stored = stored_with_agent(
-            &root,
             session::StoredStatus::Done,
             vec![Message::user("port the parser")],
         );
@@ -4207,7 +4196,6 @@ mod tests {
     fn a_restored_branch_whose_worktree_is_gone_is_dropped() {
         let root = dir("restore-dead-branch");
         let mut stored = stored_with_agent(
-            &root,
             session::StoredStatus::Idle,
             vec![Message::user("port the parser")],
         );
@@ -4257,7 +4245,6 @@ mod tests {
     fn a_restored_agent_comes_back_at_rest() {
         let root = repo("restore-at-rest");
         let stored = stored_with_agent(
-            &root,
             session::StoredStatus::Done,
             vec![Message::user("port the parser"), Message::assistant("done")],
         );
@@ -4302,7 +4289,6 @@ mod tests {
         let refusal = "model returned HTTP 400: The `reasoning_content` in the thinking \
                        mode must be passed back to the API.";
         let stored = stored_with_agent(
-            &root,
             session::StoredStatus::Failed(refusal.to_string()),
             vec![Message::user("port the parser"), Message::assistant("done")],
         );
@@ -4329,7 +4315,6 @@ mod tests {
     fn a_failure_that_left_the_transcript_mid_task_is_still_a_failure() {
         let root = repo("restore-mid-task");
         let stored = stored_with_agent(
-            &root,
             session::StoredStatus::Failed("the endpoint stopped responding".into()),
             vec![
                 Message::user("port the parser"),
