@@ -719,34 +719,33 @@ impl App {
         self.tree.repair_focus();
     }
 
-    /// Write every parent's `children` books from the tree, once, after a
-    /// restore has put the rows back.
+    /// Write one parent's books from the tree: one [`AgentMsg::ChildBook`] per
+    /// row whose parent it is.
     ///
-    /// A parent restored from a session is revived with an empty `ActorState`,
-    /// so `status` answered "no children and no jobs" and `control` refused
-    /// `no such child agent #N` about children whose rows are on screen
-    /// (finding H25). The books live in the actor, which is the only thing that
-    /// can be handed the tree's rows — so each row travels as an
-    /// [`AgentMsg::ChildBook`], the same door every other fact about a child
-    /// takes, and the actor's own book is written where it learns whose child
-    /// this is.
+    /// A revived parent is built with an empty `ActorState` — `agent::revive`
+    /// replays the transcript and nothing else — so `status` answered "no
+    /// children and no jobs" and `control` refused `no such child agent #N`
+    /// about children whose rows are on screen (finding H25). The books live in
+    /// the actor and the rows in the UI, so the UI is the hand that writes them,
+    /// through the same door every other fact about a child takes: the parent's
+    /// own book is written where it learns whose child this is.
     ///
-    /// One message per child, after the whole session is restored: a parent is
-    /// revived before its children are (the file is in spawn order), so there
-    /// is no moment earlier at which the tree could be asked for its rows. The
-    /// sends are not kept — a parent whose actor is somehow gone has no books
-    /// to write, and a send to nothing is the answer, not an error.
-    fn seed_children(&self) {
+    /// Two moments build a parent's actor under rows that already exist, and
+    /// both write the books with this: a session restore, after every row is
+    /// back ([`Self::seed_children`]), and the wake of a parked child, whose
+    /// revival replaces the actor its books were in ([`Self::deliver_to_actor`]).
+    ///
+    /// A row with no mailbox of its own is skipped: a leftover worktree found
+    /// on disk was never given an actor, so there is no sender to hand over —
+    /// the same absence `control` reads as "no actor" (finding H18). A send into
+    /// a mailbox with no actor behind it is not kept either: that parent has no
+    /// books left to write, so the answer *is* the answer, not an error.
+    fn seed_parent(&self, parent: AgentId, tx: &Sender<AgentMsg>) {
         for node in self.tree.agents.iter() {
-            let Some(parent) = node.parent else {
-                // The root has no parent, and a leftover worktree found on disk
-                // is registered as a top-level row: neither is anybody's child.
+            if node.parent != Some(parent) {
                 continue;
-            };
-            let (Some(cmd), Some(tx)) = (
-                self.tree.agent_tx.get(&node.id),
-                self.tree.agent_tx.get(&parent),
-            ) else {
+            }
+            let Some(cmd) = self.tree.agent_tx.get(&node.id) else {
                 continue;
             };
             let _ = tx.send(AgentMsg::ChildBook {
@@ -763,6 +762,19 @@ impl App {
                 // spawn.
                 shared: node.branch.is_none(),
             });
+        }
+    }
+
+    /// Write every parent's books from the tree, once, after a restore has put
+    /// the rows back.
+    ///
+    /// One message per child, and not one moment earlier: a parent is revived
+    /// before its children are (the file is in spawn order), so there is no
+    /// point during the restore at which the tree holds the rows its books need
+    /// — the root included, whose children came back from the file too.
+    fn seed_children(&self) {
+        for (parent, tx) in self.tree.agent_tx.iter() {
+            self.seed_parent(*parent, tx);
         }
     }
 
@@ -1968,6 +1980,13 @@ impl App {
                 cmd: tx.clone(),
             });
         }
+        // The revived actor's own books start empty, and its children's rows are
+        // on screen: they are written here, *before* the command that wakes it,
+        // or a `status` in the run those words start answers "no children and
+        // no jobs" about a child the human can see (finding H25). The send above
+        // is to the parent; this one is to the actor itself, and the send below
+        // is the run — so the order that matters is this one coming first.
+        self.seed_parent(id, &tx);
         let taken = tx.send(refused).is_ok();
         self.tree.agent_tx.insert(id, tx);
         taken
@@ -3456,8 +3475,21 @@ mod tests {
         stored: Option<Session>,
         save: Arc<dyn SessionSave>,
     ) -> (App, Receiver<Msg>) {
+        app_root_at(root, stored, save, "http://127.0.0.1:1")
+    }
+
+    /// The same fixture with the endpoint named, for the one thing an actor's
+    /// *books* cannot be read without: they live in the actor and come out
+    /// through a tool result, so a test that wants to see them runs a loopback
+    /// endpoint of its own ([`status_endpoint`]) and hands its URL over here.
+    fn app_root_at(
+        root: &std::path::Path,
+        stored: Option<Session>,
+        save: Arc<dyn SessionSave>,
+        base_url: &str,
+    ) -> (App, Receiver<Msg>) {
         let ws = Workspace::new(root).unwrap();
-        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let cfg = Config::new(base_url, "test-model", None);
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
         let cell = ConfigCell::own(cfg);
         let handle = spawn(cell.handle(), tx.clone(), root.to_path_buf());
@@ -4720,6 +4752,161 @@ mod tests {
                 .asked()
                 .last()
                 .map(|ask| ask.messages.last().map(Message::text))
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A loopback endpoint that answers one run: the first request gets a
+    /// `status` call, the second a plain "done".
+    ///
+    /// Nothing else can read a parent's books out loud. They live in the actor,
+    /// the only reader is a tool, and `agent::revive` builds the revived actor
+    /// its own `HttpModel` from the cell — so the URL is the one hand a test has
+    /// on it, and this is the smallest endpoint that gets a `status` out of it
+    /// (finding H25). The answers go out in request order across connections,
+    /// because the client keeps one connection alive and reuses it; anything
+    /// past the second reply gets "done" again, so a stray retry ends the run
+    /// rather than hanging it.
+    fn status_endpoint() -> u16 {
+        use std::net::TcpListener;
+
+        let answers = [
+            r#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"c0","type":"function","function":{"name":"status","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
+            r#"{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
+        ];
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        /// Answer requests on one connection until the client stops writing.
+        fn answer(connection: std::net::TcpStream, answers: &[&str; 2], served: &mut usize) {
+            use std::io::{BufRead, BufReader, Read, Write};
+
+            let mut connection = BufReader::new(connection);
+            loop {
+                // The head, then exactly the body its `Content-Length`
+                // promises: the shape `http::write_request` writes.
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    // A read that ends, or fails, is this connection's end —
+                    // the client went away, or let it go.
+                    if connection.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.strip_prefix("Content-Length: ") {
+                        length = value.parse().unwrap_or(0);
+                    }
+                }
+                let mut body = vec![0u8; length];
+                if connection.read_exact(&mut body).is_err() {
+                    return;
+                }
+                let answer = answers.get(*served).unwrap_or(&answers[1]);
+                *served += 1;
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{answer}",
+                    answer.len()
+                );
+                let out = connection.get_mut();
+                if out.write_all(reply.as_bytes()).is_err() || out.flush().is_err() {
+                    return;
+                }
+            }
+        }
+
+        std::thread::spawn(move || {
+            let mut served = 0usize;
+            loop {
+                let Ok((connection, _)) = listener.accept() else {
+                    return;
+                };
+                answer(connection, &answers, &mut served);
+            }
+        });
+        port
+    }
+
+    /// The wake path, not just the restore path: a parent whose actor was parked
+    /// (a mailbox with no receiver behind it) is revived when a message arrives,
+    /// and `agent::revive` starts it with an empty `ActorState` like any other.
+    /// The rows its children have on screen have to be handed over *before* the
+    /// words that wake it, or the run those words start answers "no children and
+    /// no jobs" about a child the human can see (finding H25).
+    ///
+    /// The revived actor's model is the cell's, not a scripted one, so the
+    /// endpoint above is what makes its first turn call `status` — and that tool
+    /// result is where the books' words arrive.
+    #[test]
+    fn a_woken_parent_can_name_the_child_the_tree_shows() {
+        let root = repo("wake-books");
+        let port = status_endpoint();
+        let (mut app, rx) = app_root_at(
+            &root,
+            None,
+            session_save::fake::Recorder::new(),
+            &format!("http://127.0.0.1:{port}"),
+        );
+        // The parent, parked: the tree holds its mailbox and nobody holds the
+        // receiver, which is what reclaiming a finished child's thread leaves.
+        let (tx, parked) = crossbeam_channel::unbounded::<AgentMsg>();
+        drop(parked);
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "a parent".to_string(),
+            depth: 1,
+            branch: None,
+            cmd: tx,
+        });
+        // The child whose row is on screen, and whose name the books have to
+        // carry: finished, its result read, which is exactly what `status`
+        // lists as `#2 ✓ did 2`.
+        let _child = finished_child_of(&mut app, 2, AgentId(1));
+
+        assert!(
+            app.deliver_to_actor(
+                AgentId(1),
+                AgentMsg::Nudge("what is agent #2 doing?".into())
+            ),
+            "the parked parent's mailbox takes the words that wake it"
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut listing = String::new();
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(msg) => {
+                    if let Msg::Agent {
+                        id,
+                        event: AgentEvent::Message(message),
+                        ..
+                    } = &msg
+                    {
+                        if *id == AgentId(1) && message.role == "tool" {
+                            listing = message.text().to_string();
+                        }
+                    }
+                    app.update(msg);
+                    if !listing.is_empty() {
+                        break;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        assert!(
+            listing.contains("#2 ✓ did 2"),
+            "the child on the screen is in the woken parent's books: {listing:?}"
+        );
+        assert!(
+            !listing.contains("no children and no jobs"),
+            "and the books are not the empty ones a revival starts with"
         );
         let _ = std::fs::remove_dir_all(&root);
     }

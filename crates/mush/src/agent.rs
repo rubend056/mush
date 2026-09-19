@@ -802,8 +802,11 @@ struct ActorState {
     /// report still travelling from one of them cannot re-open books the reap
     /// closed (`AgentMsg::ForgetChild`). The ids are never reused (`crate::ids`
     /// hands out one number per agent), so the memory cannot name a *new* child
-    /// by mistake. It is one `u64` per forgotten child and never cleared: a
-    /// report can be in flight for as long as an actor lives.
+    /// by mistake. One `u64` per forgotten child, held until the tree hands the
+    /// row *back* ([`note_child_book`]): a row can only be handed
+    /// over for a node that exists, so it is proof the forget has gone stale,
+    /// and the tombstone goes with the books it closed. Until then nothing
+    /// clears it — a report can be in flight for as long as an actor lives.
     forgotten: HashSet<u64>,
     /// How each child's last finished run left its worktree, keyed by the run
     /// that left it: the branch, and whether the work is committed. A listing
@@ -2783,6 +2786,15 @@ fn note_completion(state: &mut ActorState, id: u64, run: u64, outcome: Outcome) 
 /// way, which is why the stale sender was easy to leave; the book is written
 /// here, where the mailbox changes hands, and nowhere else.
 fn note_mailbox(state: &mut ActorState, id: u64, cmd: Sender<AgentMsg>) {
+    // A child the tree has dropped has no row a mailbox could belong to, and
+    // the tombstone is the last word about it: writing the book back would put
+    // a name into `status` with nothing on screen behind it, and hand `control`
+    // an actor nobody can see. The rule the other books of a child follow
+    // (`note_running`, `note_work`, `record_child`) belongs on this one too;
+    // only `note_child_book` clears a tombstone, by handing the row back.
+    if state.is_forgotten(id) {
+        return;
+    }
     state.children.insert(id, cmd);
 }
 
@@ -4022,7 +4034,7 @@ enum Ended {
     /// from neither (finding B6).
     Signalled(i32),
     /// The platform's status named neither an exit code nor a signal
-    /// ([`machine::End::Unknown`]). A state of its own, not the `-1` sentinel
+    /// ([`End::Unknown`]). A state of its own, not the `-1` sentinel
     /// that read as a real exit code (finding H26); no child mush starts
     /// produces such a status, and a seam that is handed one says so rather than
     /// naming a number nothing returned.
@@ -5712,6 +5724,62 @@ mod tests {
             !fold_completions(&actor, &mut state, &mut messages),
             "and a report delivered once is not delivered again"
         );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A mailbox handed over for a child the tree has already dropped keeps no
+    /// book: the tombstone is the last word, and the one thing that clears it
+    /// is the tree handing the row back (finding H19).
+    ///
+    /// The other three books a revival can touch are guarded the same way
+    /// (`note_running`, `note_work`, `record_child`); a `ChildMailbox` that
+    /// slipped past its tombstone would name a child in `status` with no row
+    /// on screen to point at, which is exactly what the reap emptied the books
+    /// to prevent.
+    #[test]
+    fn a_forgotten_child_handed_a_mailbox_keeps_no_book() {
+        let (actor, _mailbox) = test_actor("forget-mailbox");
+        let mut state = ActorState::default();
+        let (dead, dead_rx) = crossbeam_channel::unbounded();
+        drop(dead_rx);
+        state.children.insert(1, dead);
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ForgetChild { id: 1 },
+        );
+        assert_eq!(
+            status_tool(&actor, &state).unwrap(),
+            "no children and no jobs",
+            "the row is off the screen and the book is closed"
+        );
+
+        // The revive was already in flight when the row went: the tree swapped
+        // the child's mailbox and told the parent which sender is live.
+        let (live, live_rx) = crossbeam_channel::unbounded();
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ChildMailbox { id: 1, cmd: live },
+        );
+
+        assert!(
+            state.children.is_empty(),
+            "no book for a forgotten child: {:?}",
+            state.children.keys()
+        );
+        assert_eq!(
+            status_tool(&actor, &state).unwrap(),
+            "no children and no jobs",
+            "so the listing still names nothing the tree has dropped"
+        );
+        assert!(
+            state.is_forgotten(1),
+            "and the tombstone stands: only the row handed back clears one"
+        );
+        drop(live_rx);
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
