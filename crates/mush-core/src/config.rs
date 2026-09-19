@@ -195,48 +195,102 @@ pub struct Overrides {
 }
 
 impl Overrides {
-    /// The environment layer: `MUSH_URL`, `MUSH_MODEL`, `MUSH_PROVIDER`,
-    /// `MUSH_API_KEY`, `MUSH_CONTEXT`, `MUSH_REASONING_EFFORT`, `MUSH_THINKING`.
-    /// Empty variables count as unset. The temperature and the reply cap's name
-    /// have no environment spelling: they are stated on a command line or in
-    /// the home config. A malformed `MUSH_CONTEXT` (or effort, or thinking
-    /// mode) is ignored here; [`Self::from_env_checked`] is the form startup
-    /// uses, so it is reported instead.
+    /// The environment layer, read leniently: `MUSH_URL`, `MUSH_MODEL`,
+    /// `MUSH_PROVIDER`, `MUSH_API_KEY`, `MUSH_CONTEXT`,
+    /// `MUSH_REASONING_EFFORT`, `MUSH_THINKING`. Empty variables count as
+    /// unset. A malformed value is dropped here rather than reported, because
+    /// this reader is for the callers with no human to answer —
+    /// [`Config::from_env`], and the live-endpoint test — while
+    /// [`Self::from_env_checked`] is the form startup uses, so a typo costs a
+    /// message instead of a window or a knob nobody asked for. The temperature
+    /// and the reply cap's name have no environment spelling: they are stated
+    /// on a command line or in the home config.
     pub fn from_env() -> Self {
+        let text = EnvText::read();
+        Self {
+            url: text.url,
+            model: text.model,
+            provider: text.provider,
+            api_key: text.api_key,
+            context: text
+                .context
+                .and_then(|value| parse_context_env(&value).ok()),
+            // No environment spelling for these two: see the doc comment.
+            temperature: None,
+            max_completion_tokens: None,
+            reasoning_effort: text
+                .reasoning_effort
+                .and_then(|value| ReasoningEffort::parse(&value).ok()),
+            thinking: text
+                .thinking
+                .and_then(|value| ThinkingMode::parse(&value).ok()),
+        }
+    }
+
+    /// The environment layer, read for startup: the same seven variables as
+    /// [`Self::from_env`] and the same one read of them, but a value that does
+    /// not parse is an error naming its variable rather than a silent drop.
+    /// The provider is validated first, then the context, the effort and the
+    /// thinking mode, so the first typo in that order is the one reported.
+    pub fn from_env_checked() -> Result<Self, String> {
+        let text = EnvText::read();
+        // The provider first: a key meant for somewhere else must not be sent
+        // to the default endpoint (finding A17).
+        let provider = match text.provider {
+            Some(name) => {
+                parse_provider_env(&name)?;
+                Some(name)
+            }
+            None => None,
+        };
+        Ok(Self {
+            url: text.url,
+            model: text.model,
+            provider,
+            api_key: text.api_key,
+            context: text
+                .context
+                .map(|value| parse_context_env(&value))
+                .transpose()?,
+            temperature: None,
+            max_completion_tokens: None,
+            reasoning_effort: text
+                .reasoning_effort
+                .map(|value| parse_effort_env(&value))
+                .transpose()?,
+            thinking: text
+                .thinking
+                .map(|value| parse_thinking_env(&value))
+                .transpose()?,
+        })
+    }
+}
+
+/// The environment as it was read: every `MUSH_*` variable this module knows,
+/// each spelled and read exactly once. The two readers above parse these
+/// fields with their own policy, so the list of names lives here, in one
+/// place, and neither reader can drift into a variable the other does not see.
+struct EnvText {
+    url: Option<String>,
+    model: Option<String>,
+    provider: Option<String>,
+    api_key: Option<String>,
+    context: Option<String>,
+    reasoning_effort: Option<String>,
+    thinking: Option<String>,
+}
+
+impl EnvText {
+    fn read() -> Self {
         Self {
             url: env_nonempty("MUSH_URL"),
             model: env_nonempty("MUSH_MODEL"),
             provider: env_nonempty("MUSH_PROVIDER"),
             api_key: env_nonempty("MUSH_API_KEY"),
-            context: env_nonempty("MUSH_CONTEXT").and_then(|value| parse_context_env(&value).ok()),
-            // No environment spelling for these two: see the doc comment.
-            temperature: None,
-            max_completion_tokens: None,
-            reasoning_effort: env_nonempty("MUSH_REASONING_EFFORT")
-                .and_then(|value| ReasoningEffort::parse(&value).ok()),
-            thinking: env_nonempty("MUSH_THINKING")
-                .and_then(|value| ThinkingMode::parse(&value).ok()),
+            context: env_nonempty("MUSH_CONTEXT"),
+            reasoning_effort: env_nonempty("MUSH_REASONING_EFFORT"),
+            thinking: env_nonempty("MUSH_THINKING"),
         }
-    }
-
-    /// [`Self::from_env`] with a malformed `MUSH_CONTEXT`, `MUSH_REASONING_EFFORT`
-    /// or `MUSH_THINKING` reported instead of silently dropped, so a typo costs
-    /// a message at startup rather than a window or a knob nobody asked for.
-    pub fn from_env_checked() -> Result<Self, String> {
-        let mut overrides = Self::from_env();
-        if let Some(name) = overrides.provider.as_deref() {
-            parse_provider_env(name)?;
-        }
-        overrides.context = env_nonempty("MUSH_CONTEXT")
-            .map(|value| parse_context_env(&value))
-            .transpose()?;
-        overrides.reasoning_effort = env_nonempty("MUSH_REASONING_EFFORT")
-            .map(|value| parse_effort_env(&value))
-            .transpose()?;
-        overrides.thinking = env_nonempty("MUSH_THINKING")
-            .map(|value| parse_thinking_env(&value))
-            .transpose()?;
-        Ok(overrides)
     }
 }
 
@@ -304,8 +358,25 @@ pub const SCHEMA_TOKENS: usize = 1_200;
 
 impl Config {
     /// Built-in defaults with the `MUSH_*` environment applied.
+    ///
+    /// Leniently: a malformed value is dropped, because this constructor has
+    /// no human to report to. [`resolve`] is the startup path — it reads the
+    /// same environment once, through [`Overrides::from_env_checked`], and
+    /// reports the typo the two readers would otherwise disagree about.
     pub fn from_env() -> Self {
-        let env = Overrides::from_env();
+        Self::from_env_layer(&Overrides::from_env())
+    }
+
+    /// Built-in defaults with one environment layer applied — the base
+    /// [`resolve`] starts from. Every variable the environment can state is
+    /// taken from the layer, so the lenient and the checked read cannot be
+    /// applied to different ends; `resolve` hands this the one checked read it
+    /// also passes to [`resolve_with`], so no value is read or parsed twice.
+    ///
+    /// The two request knobs with no `MUSH_*` spelling — the temperature and
+    /// the reply cap's name — keep their defaults: the command line and the
+    /// home config are their only sources (see [`Overrides`]).
+    fn from_env_layer(env: &Overrides) -> Self {
         let provider = env
             .provider
             .as_deref()
@@ -320,16 +391,17 @@ impl Config {
         Self {
             provider,
             base_url,
-            model: env.model.unwrap_or_default(),
-            api_key: env.api_key,
+            model: env.model.clone().unwrap_or_default(),
+            api_key: env.api_key.clone(),
             context_tokens: context.unwrap_or(DEFAULT_CONTEXT_TOKENS),
             context_explicit: context.is_some(),
             temperature: DEFAULT_TEMPERATURE,
             max_completion_tokens: false,
-            // The `MUSH_*` values are already in `env`; `resolve` applies them
-            // over this base like every other layer.
-            reasoning_effort: None,
-            thinking: None,
+            // A stated effort or thinking mode is sent wherever the human
+            // pointed mush; unstated leaves the provider's own documented
+            // default to apply.
+            reasoning_effort: env.reasoning_effort,
+            thinking: env.thinking,
         }
     }
 
@@ -557,15 +629,21 @@ impl Config {
 /// built-in defaults**. The API key comes from the environment or the home
 /// config, never from the session — that file is workspace-local.
 ///
+/// The environment is read here, exactly once, with one policy
+/// ([`Overrides::from_env_checked`]): that single read is both the base config
+/// [`resolve_with`] starts from and the environment layer it ranks against the
+/// flags, so no variable is read twice or parsed under two policies.
+///
 /// Returns an error for an unknown provider name on the command line, and for a
-/// `MUSH_CONTEXT` that is not a token count.
+/// `MUSH_CONTEXT`, `MUSH_REASONING_EFFORT`, `MUSH_THINKING` or `MUSH_PROVIDER`
+/// that does not parse.
 pub fn resolve(
     cli: &Overrides,
     home: &UserConfig,
     session: Option<&Session>,
 ) -> Result<Config, String> {
     let env = Overrides::from_env_checked()?;
-    resolve_with(Config::from_env(), cli, &env, home, session)
+    resolve_with(Config::from_env_layer(&env), cli, &env, home, session)
 }
 
 /// The pure half of [`resolve`]: apply the layers to an already-built base
@@ -602,10 +680,10 @@ pub fn resolve_with(
     if let Some(context) = cli.context.filter(|n| *n > 0) {
         config.set_context(context);
     }
-    if let Some(temperature) = cli.temperature.or(env.temperature) {
+    if let Some(temperature) = cli.temperature {
         config.temperature = temperature;
     }
-    if let Some(max_completion_tokens) = cli.max_completion_tokens.or(env.max_completion_tokens) {
+    if let Some(max_completion_tokens) = cli.max_completion_tokens {
         config.max_completion_tokens = max_completion_tokens;
     }
     if let Some(effort) = cli.reasoning_effort.or(env.reasoning_effort) {
@@ -620,8 +698,11 @@ pub fn resolve_with(
     let url_given = cli.url.is_some() || env.url.is_some();
     let provider_given = cli.provider.is_some() || env.provider.is_some();
     let model_given = cli.model.is_some() || env.model.is_some();
-    let temperature_given = cli.temperature.is_some() || env.temperature.is_some();
-    let cap_given = cli.max_completion_tokens.is_some() || env.max_completion_tokens.is_some();
+    // The temperature and the reply cap's name have no `MUSH_*` spelling, so
+    // no environment layer can state them (`Overrides::from_env` leaves both
+    // unset): the flag is the only layer above the home config.
+    let temperature_given = cli.temperature.is_some();
+    let cap_given = cli.max_completion_tokens.is_some();
     let effort_given = cli.reasoning_effort.is_some() || env.reasoning_effort.is_some();
     let thinking_given = cli.thinking.is_some() || env.thinking.is_some();
 
@@ -982,9 +1063,41 @@ mod tests {
         );
     }
 
+    /// The base `resolve` starts from is the environment layer applied to
+    /// built-in defaults — the whole layer, so nothing has to be re-read to
+    /// complete it — except the two knobs the environment cannot state
+    /// (`temperature`, the reply cap's name), which keep their defaults
+    /// however a hand-built layer carries them.
+    #[test]
+    fn the_environment_base_is_one_layer_over_the_defaults() {
+        let env = Overrides {
+            url: Some("http://env:2/".into()),
+            model: Some("env-model".into()),
+            provider: Some("deepseek".into()),
+            api_key: Some("sk-env".into()),
+            context: Some(9_000),
+            temperature: Some(0.5),
+            max_completion_tokens: Some(true),
+            reasoning_effort: Some(ReasoningEffort::Max),
+            thinking: Some(ThinkingMode::On),
+        };
+        let base = Config::from_env_layer(&env);
+        assert_eq!(base.base_url, "http://env:2");
+        assert_eq!(base.model, "env-model");
+        assert_eq!(base.provider, Provider::DeepSeek);
+        assert_eq!(base.api_key.as_deref(), Some("sk-env"));
+        assert_eq!(base.context_tokens, 9_000);
+        assert!(base.context_explicit);
+        assert_eq!(base.reasoning_effort, Some(ReasoningEffort::Max));
+        assert_eq!(base.thinking, Some(ThinkingMode::On));
+        assert_eq!(base.temperature(), DEFAULT_TEMPERATURE);
+        assert!(!base.uses_max_completion_tokens());
+    }
+
     /// The temperature and the reply cap's name are stated, not guessed: the
-    /// command line is the top layer, the environment the next one down, and a
-    /// statement below them is filled in only when nothing above said anything.
+    /// command line states them, the home config fills what it left alone, and
+    /// the environment cannot state them at all — no `MUSH_*` spelling exists,
+    /// so `Overrides::from_env` leaves both unset.
     #[test]
     fn the_command_line_states_the_temperature_and_the_cap_name() {
         let config = resolve_with(
@@ -1002,7 +1115,10 @@ mod tests {
         assert_eq!(config.temperature(), 0.2);
         assert!(config.uses_max_completion_tokens());
 
-        // The environment is below the flag: it fills what the flag left alone.
+        // An environment layer that carries one of the two is not read: there
+        // is no `MUSH_*` that could have built it, so its presence is not a
+        // statement the layering can honour, and the silence above the home
+        // config stays silence.
         let from_env = resolve_with(
             Config::new("http://base:0", "m", None),
             &Overrides::default(),
@@ -1015,8 +1131,8 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(from_env.temperature(), 0.5);
-        assert!(from_env.uses_max_completion_tokens());
+        assert_eq!(from_env.temperature(), DEFAULT_TEMPERATURE);
+        assert!(!from_env.uses_max_completion_tokens());
 
         // Nobody stated anything: the documented defaults stay.
         let untouched = resolve_with(
