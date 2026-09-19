@@ -292,27 +292,6 @@ fn is_filler(word: &str) -> bool {
     FILLER.contains(&bare_word(word).to_ascii_lowercase().as_str())
 }
 
-/// What asking an agent to stop actually did.
-///
-/// A Stop is not one thing: it can land, it can find nothing to stop, or it can
-/// find nobody to ask. The third is the one worth a value of its own — the human
-/// asked for a stop, and got a run that was cut off instead, which is a different
-/// fact about the agent, a different mark on its row, and a thing its parent has
-/// to be told (finding H2).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Stopped {
-    /// The actor heard the Stop. The run it was aimed at will end and say so
-    /// itself; an agent that was not working keeps the phase it had.
-    Heard,
-    /// The mailbox is dead and nothing was in flight: there is nothing to stop
-    /// and nothing to say. The row is left exactly as it was.
-    Gone,
-    /// The mailbox is dead with a run in flight. The run died where it stood and
-    /// committed nothing, so the row wears `⚠` — the one case where the honest
-    /// answer to Ctrl-C is not "stopped".
-    CutOff,
-}
-
 /// Where an isolated agent's work ended up, once the human landed it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Landed {
@@ -675,6 +654,27 @@ impl AgentTree {
         self.jobs.running()
     }
 
+    /// Whether this agent has work in flight: its own run, or a job of its own.
+    ///
+    /// The one per-node derivation of the fact. Four places used to spell it —
+    /// the reaper's keep, the parker's hold, the bar's `busy` count and `c` on
+    /// a row — and they could only ever drift apart. It is read from the
+    /// registry, so a run that ended while its `cargo bench` still runs is not
+    /// idle on the machine.
+    pub fn in_flight(&self, node: &AgentNode) -> bool {
+        self.in_flight_with(node, self.live_job_count() > 0)
+    }
+
+    /// [`Self::in_flight`] with "is there any job at all" already derived, for
+    /// the two walks that ask it once per node.
+    ///
+    /// The `jobs_live` pre-check is a **cost filter, not a second rule**: with
+    /// an empty registry the per-node lookup can only return nothing, so the
+    /// filter only saves taking the registry's lock once per node per frame.
+    fn in_flight_with(&self, node: &AgentNode, jobs_live: bool) -> bool {
+        node.phase.is_busy() || (jobs_live && !self.live_jobs(node.id).is_empty())
+    }
+
     /// Keep the agent counter above `floor`. A leftover worktree or a restored
     /// agent holds an id the counter has never seen, so the next spawn has to
     /// start above it or two nodes share one (finding B1).
@@ -997,10 +997,12 @@ impl AgentTree {
 
     /// A Stop was asked for: flip the flag the in-flight model call polls and
     /// leave a Stop in the mailbox for everything else (a parked wait, a shell
-    /// command, the next message boundary). Returns whether the actor was
-    /// still there to hear it — a cancel that cannot land is a gone actor, and
+    /// command, the next message boundary). Returns whether the run was *cut
+    /// off* rather than stopped — a cancel that cannot land is a gone actor, and
     /// the row says so instead of showing work that can never finish
-    /// (finding B6).
+    /// (finding B6). A Stop that lands needs no value of its own: the row's
+    /// `⊘ cancelling…` says it, and a Stop on an agent with nothing in flight
+    /// leaves the row exactly as it was, so there is nothing to say either way.
     ///
     /// Only a run *in flight* is marked `⊘ cancelling…`. An agent that is
     /// idle, done, failed or already stopped has nothing to cancel: the actor
@@ -1014,9 +1016,9 @@ impl AgentTree {
     /// all: the human asked, but there was nobody left to ask, and the row says
     /// `⚠` — the run died where it stood and committed nothing — rather than
     /// `⊘`, whose whole meaning is "the actor is alive and a message resumes
-    /// it" (finding H2). The caller reads [`Stopped::CutOff`] and tells the
-    /// agent's parent, which is waiting for a result that will never come.
-    pub fn cancel_requested(&mut self, id: AgentId) -> Stopped {
+    /// it" (finding H2). `true` is that case, and it tells the caller to tell
+    /// the agent's parent, which is waiting for a result that will never come.
+    pub fn cancel_requested(&mut self, id: AgentId) -> bool {
         if let Some(flag) = self.agent_cancel.get(&id) {
             flag.store(true, Ordering::SeqCst);
         }
@@ -1025,7 +1027,7 @@ impl AgentTree {
             .get(&id)
             .map(|tx| tx.send(AgentMsg::Stop).is_ok())
             .unwrap_or(false);
-        let mut stopped = Stopped::Gone;
+        let mut cut_off = false;
         if let Some(node) = self.node_mut(id) {
             if node.phase.is_busy() {
                 // Say so immediately: the actor may be mid-request, and a row
@@ -1036,7 +1038,7 @@ impl AgentTree {
                     // Nothing will ever answer, so the work it was showing can
                     // never finish — and what it *was* is the other thing the
                     // row has to say: it was cut off, not stopped.
-                    stopped = Stopped::CutOff;
+                    cut_off = true;
                     Phase::CutOff
                 };
                 node.since = Instant::now();
@@ -1044,11 +1046,7 @@ impl AgentTree {
             // Otherwise the phase, and its clock, are left exactly as they
             // were: a Stop is not news about an agent that was not working.
         }
-        if heard {
-            Stopped::Heard
-        } else {
-            stopped
-        }
+        cut_off
     }
 
     /// Retire `⊘` marks whose acknowledgement will never arrive, so a row
@@ -1181,9 +1179,10 @@ impl AgentTree {
     ///
     /// Everything it asks is "can news still arrive here", and kept is always
     /// the safe answer: the root and the agent whose transcript the human is
-    /// reading ([`Self::focused`], whose pane a reap would blank); a run in
-    /// flight, which has a result coming; a job of its own, which a `Shutdown`
-    /// would kill (`kill_owned`, `agent::absorb`); a result its parent's model
+    /// reading ([`Self::focused`], whose pane a reap would blank); work in
+    /// flight, which has a result coming ([`Self::in_flight`]) — a job of its
+    /// own included, which a `Shutdown` would kill (`kill_owned`,
+    /// `agent::absorb`); a result its parent's model
     /// has not been handed (`✉`, [`Self::result_read`], finding H4); and an
     /// isolated agent whose work was never landed, whose row is the only thing
     /// that names `mush/<id>` — a branch a human may still have to look at.
@@ -1193,11 +1192,9 @@ impl AgentTree {
     /// so that a spawn can never be refused for want of a slot (§8.21); the row
     /// is planted on the worktree, not the other way round.
     fn kept(&self, node: &AgentNode, jobs_live: bool) -> bool {
-        let job_running = jobs_live && !self.live_jobs(node.id).is_empty();
         node.id == AgentId::ROOT
             || node.id == self.focused
-            || node.phase.is_busy()
-            || job_running
+            || self.in_flight_with(node, jobs_live)
             || node.result_unread
             || (node.branch.is_some() && node.landed.is_none())
     }
@@ -1306,7 +1303,6 @@ impl AgentTree {
         // the transcript like any other, and a message brings the actor back to
         // it.
         let result_read = !node.result_unread || past_window;
-        let job_running = jobs_live && !self.live_jobs(node.id).is_empty();
         // The one agent whose thread is never reclaimed: the pane the human is
         // reading is the child they are most likely to type at this moment, and
         // this window runs on a tick — a phase can be one message stale, so a
@@ -1314,8 +1310,7 @@ impl AgentTree {
         // The reaper excludes it for the same reason (`Self::kept`).
         let focused = node.id == self.focused;
         !focused
-            && !node.phase.is_busy()
-            && !job_running
+            && !self.in_flight_with(node, jobs_live)
             && !readers.contains(&node.id)
             && result_read
     }
@@ -1431,10 +1426,9 @@ impl AgentTree {
     }
 
     /// The per-parent count of children whose run is in flight, derived in one
-    /// walk. [`Self::busy_children`] scans the whole tree per call, and a frame
-    /// asked it once per row, which is quadratic in the tree the pane paints;
-    /// the pane builds this map once and looks a row up in it. A derivation,
-    /// not a stored fact, dropped with the frame (finding R29).
+    /// walk. The pane builds this map once and looks each row up in it, and the
+    /// title's `M waiting` and [`Self::napping`] read the same entries. A
+    /// derivation, not a stored fact, dropped with the frame (finding R29).
     pub fn busy_counts(&self) -> HashMap<AgentId, usize> {
         let mut busy: HashMap<AgentId, usize> = HashMap::new();
         for node in &self.agents {
@@ -1473,7 +1467,7 @@ impl AgentTree {
     /// owed a read — which is the question a human arrives with ("did #2 see
     /// #6?"), and the only half of it that survives a short pane showing a
     /// window of a big tree (finding H4). Derived from the nodes on every call,
-    /// like [`Self::busy_children`], so the two ends cannot disagree.
+    /// so the two ends cannot disagree.
     pub fn unread_children(&self, id: AgentId) -> Vec<AgentId> {
         self.agents
             .iter()
@@ -1482,18 +1476,14 @@ impl AgentTree {
             .collect()
     }
 
-    /// How many of `id`'s own children have work in flight.
+    /// How many of `id`'s own children have work in flight: the single-node
+    /// entry into [`Self::busy_counts`], the one derivation, for the caller
+    /// that has no map in hand (the roster's row, `screen.rs`'s `agent_row`).
     ///
-    /// One derivation, read by the row's `⏸N` mark and by the title's count,
-    /// because "this agent has children working" is one fact and two copies of
-    /// it are two things that can disagree (finding U1). It is about the
-    /// children, never about the parent's own phase: a working agent whose
-    /// children work is still working.
+    /// It is about the children, never about the parent's own phase: a working
+    /// agent whose children work is still working (finding U1).
     pub fn busy_children(&self, id: AgentId) -> usize {
-        self.agents
-            .iter()
-            .filter(|node| node.parent == Some(id) && node.phase.is_busy())
-            .count()
+        self.busy_counts().get(&id).copied().unwrap_or(0)
     }
 
     /// Show one agent's transcript, if it is in the tree.
@@ -2018,30 +2008,6 @@ mod tests {
         assert_eq!(tree.roster(), Roster::default());
     }
 
-    /// The busy map a pane looks a row up in is the same fact as
-    /// `busy_children` asked one id at a time: every node's count matches, so
-    /// the `⏸N` mark cannot drift from the tree it was derived from (finding
-    /// R29).
-    #[test]
-    fn the_busy_map_agrees_with_the_per_id_scan() {
-        let mut tree = AgentTree::bare();
-        let _a = spawn(&mut tree, 1, 0, 1);
-        let _b = spawn(&mut tree, 2, 0, 1);
-        let _c = spawn(&mut tree, 3, 1, 2);
-        let _d = spawn(&mut tree, 4, 3, 3);
-        // #1 is at rest under a working #3: one napping parent, one working.
-        tree.idle(AgentId(1));
-        let busy = tree.busy_counts();
-        for node in tree.rows() {
-            assert_eq!(
-                busy.get(&node.id).copied().unwrap_or(0),
-                tree.busy_children(node.id),
-                "the map and the scan disagree about #{}",
-                node.id
-            );
-        }
-    }
-
     /// Rows come out in tree order, not in the order the agents were spawned
     /// (finding U4).
     #[test]
@@ -2505,18 +2471,13 @@ mod tests {
         let (opened, rx) = child(&mut tree, 1);
         let id = opened.id;
 
-        assert_eq!(
-            tree.cancel_requested(id),
-            Stopped::Heard,
-            "a live mailbox hears the Stop"
-        );
+        assert!(!tree.cancel_requested(id), "a live mailbox hears the Stop");
         assert!(matches!(rx.try_recv(), Ok(AgentMsg::Stop)));
         assert_eq!(tree.node(id).unwrap().phase, Phase::Cancelling);
 
         tree.agent_tx.remove(&id);
-        assert_eq!(
+        assert!(
             tree.cancel_requested(id),
-            Stopped::CutOff,
             "a dead mailbox with a run in flight is not a stop"
         );
         assert_eq!(tree.node(id).unwrap().phase, Phase::CutOff);
@@ -2532,7 +2493,10 @@ mod tests {
         tree.stopped(id);
         tree.agent_tx.remove(&id);
 
-        assert_eq!(tree.cancel_requested(id), Stopped::Gone);
+        assert!(
+            !tree.cancel_requested(id),
+            "a dead mailbox with nothing in flight is not a cut-off"
+        );
         assert_eq!(tree.node(id).unwrap().phase, Phase::Stopped);
     }
 
@@ -2549,11 +2513,7 @@ mod tests {
         let id = opened.id;
 
         tree.fail(id, "no route".into());
-        assert_eq!(
-            tree.cancel_requested(id),
-            Stopped::Heard,
-            "the mailbox is alive"
-        );
+        assert!(!tree.cancel_requested(id), "the mailbox is alive");
         assert_eq!(
             tree.node(id).unwrap().phase,
             Phase::Failed("no route".into()),
@@ -2588,11 +2548,7 @@ mod tests {
         let (opened, rx) = child(&mut tree, 1);
         let id = opened.id;
 
-        assert_eq!(
-            tree.cancel_requested(id),
-            Stopped::Heard,
-            "a run is in flight"
-        );
+        assert!(!tree.cancel_requested(id), "a run is in flight");
         assert_eq!(tree.node(id).unwrap().phase, Phase::Cancelling);
         assert!(tree.busy(), "and the run is still on");
         assert!(matches!(rx.try_recv(), Ok(AgentMsg::Stop)));

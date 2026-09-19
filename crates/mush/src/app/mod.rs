@@ -22,9 +22,7 @@ mod tree;
 pub use chat::{Chat, Pane, Rank};
 pub use screen::{AgentRow, AgentsPane, BarPane, ChatPane, PickerPane, Screen};
 pub use settings::{ConfigCell, ConfigHandle, WindowSource};
-pub use tree::{
-    AgentNode, AgentTree, Compacting, ConversationId, Existing, Landed, Phase, Spawn, Stopped,
-};
+pub use tree::{AgentNode, AgentTree, Compacting, ConversationId, Existing, Landed, Phase, Spawn};
 
 // The id types live in their own module (two spaces, two newtypes); they keep
 // the `crate::app::` path they had when `tree` defined them, so the many
@@ -1289,11 +1287,12 @@ impl App {
     }
 
     /// Whether one agent has work in flight: its own run, or one of its jobs.
-    /// The one per-node derivation behind [`Self::busy`] and
-    /// [`Self::working_agents`]. [`AgentTree::busy`] stays agent-only, with no
-    /// opinion about jobs.
+    /// The tree owns the nodes and the job registry, so the question is asked
+    /// there ([`AgentTree::in_flight`]); this is the app-side spelling behind
+    /// [`Self::busy`] and [`Self::working_agents`]. [`AgentTree::busy`] stays
+    /// agent-only, with no opinion about jobs.
     fn in_flight(&self, node: &AgentNode) -> bool {
-        node.phase.is_busy() || !self.tree.live_jobs(node.id).is_empty()
+        self.tree.in_flight(node)
     }
 
     /// The jobs `id` has running, read from the one registry that holds them.
@@ -1471,7 +1470,7 @@ impl App {
     /// (finding U11, refactor R8). This is the sentence that lets them keep
     /// typing.
     ///
-    /// The count is the root's *own* busy children — [`AgentTree::busy_children`] —
+    /// The count is the root's *own* busy children — [`AgentTree::busy_counts`] —
     /// the same derivation the row's `⏸N` mark and the title's `M waiting`
     /// read, and not every busy node in the tree. The sentence is a promise
     /// about when the root resumes, and it resumes when its children finish: a
@@ -1499,7 +1498,15 @@ impl App {
         if !self.tree.napping(AgentId::ROOT) {
             return None;
         }
-        let waiting = self.tree.busy_children(AgentId::ROOT);
+        // The count is the root's own busy children, read from the same map the
+        // rows' `⏸N` marks and the title's buckets are built from: one
+        // derivation, so a count and a mark cannot disagree (finding U1).
+        let waiting = self
+            .tree
+            .busy_counts()
+            .get(&AgentId::ROOT)
+            .copied()
+            .unwrap_or(0);
         // Through the door like every other bar string: the sentence is numbers
         // and fixed words *today*, and the bar's documented invariant is that
         // nothing reaches it unsanitized (finding V6).
@@ -1557,9 +1564,15 @@ impl App {
             Ok(command) => self.apply_command(command),
             // No slash: the human is talking to an agent. A message that does
             // not land is said on the bar by `deliver` itself; the human's own
-            // key has no client to answer with a refusal.
+            // key has no client to answer with a refusal. The refusal changes
+            // nothing in the box either, so the words go back where they were:
+            // a message that cannot be sent is not something the human should
+            // have to retype.
             Err(CommandError::NotACommand) => {
-                let _ = self.deliver(text);
+                let words = text.clone();
+                if self.deliver(text).is_err() {
+                    self.chat.insert(&words);
+                }
             }
             // A command that exists but whose argument does not read. The line
             // was spelled beside the rule that rejected it, and the bar is
@@ -1608,38 +1621,26 @@ impl App {
     /// A typed message, from the human to the focused agent.
     ///
     /// `Err(line)` is a message that did **not** land, with the line the human's
-    /// bar says as the reason — a dead mailbox or a gone root, which the human
-    /// reads as a failure and which an attach client must answer with a refusal
-    /// instead of an `Ok` revision (`attach_edit`). The human's own path ignores
-    /// the return: the notice, the bar line and the dirty mark below are what
-    /// the human gets.
+    /// bar says as the reason — a dead mailbox or a gone root. A refusal changes
+    /// nothing: not the transcript, not the message box, not the revision — so
+    /// an attach client can be answered with the refusal instead of an `Ok`
+    /// revision, and the human's caller puts the words back in the box. It used
+    /// to answer a client's message *after* committing it to the root's
+    /// transcript, so a message that never ran was in the conversation the next
+    /// run would read (Tier 3 §2).
     fn deliver(&mut self, text: String) -> Result<(), String> {
         // A request without a model is a guaranteed refusal from the endpoint,
         // and since discovery runs after the first frame this state is
         // reachable for as long as one fetch takes (finding A9). Saying so is
         // better than the endpoint's own complaint about an empty model id —
-        // and the words go back in the box, because a message that cannot be
-        // sent is not something the human should have to retype.
+        // and the caller owns the box the words go back in.
         if self.cfg().model.is_empty() {
             let line = "no model yet — /model picks one, /url points mush at an endpoint";
-            self.chat.insert(&text);
             self.fail(line);
             return Err(line.to_string());
         }
         let target = self.tree.focused;
         if target == AgentId::ROOT {
-            // The human's words belong in the transcript they can see, whether
-            // the root is starting a run or already in one.
-            //
-            // Sending does not send the pane to the bottom either: the human
-            // chose where to read, and the key that puts a pane back at the
-            // newest line is the one they press (finding U3).
-            self.chat
-                .push_message(AgentId::ROOT, Message::user(text.clone()));
-            // The human's own words are the one thing worth blocking on: the
-            // run they start may take minutes, and a crash in it must not lose
-            // the request. This is one write per turn, not one per response.
-            self.flush_session();
             // The root's own phase, not the tree's: a napping orchestrator is idle, and
             // idle, and its next message starts a run rather than nudging a
             // conversation that is not in flight.
@@ -1659,14 +1660,34 @@ impl App {
                     .map(|tx| tx.send(AgentMsg::Nudge(text.clone())).is_ok())
                     .unwrap_or(false);
                 if alive {
+                    self.chat.expect_human(&text);
+                    self.chat
+                        .push_message(AgentId::ROOT, Message::user(text.clone()));
+                    self.flush_session();
                     self.say("noted — folded in as the agent continues");
                     return Ok(());
                 }
                 self.tree.idle(AgentId::ROOT);
             }
-            let messages = self.chat.conversation();
+            // The human's words belong in the transcript they can see, and the
+            // run carries them in the conversation itself: the messages are
+            // built *with* the words and the transcript is only committed once
+            // the send landed, so a refused message leaves it exactly as it was.
+            //
+            // Sending does not send the pane to the bottom either: the human
+            // chose where to read, and the key that puts a pane back at the
+            // newest line is the one they press (finding U3).
+            let mut messages = self.chat.conversation();
+            messages.push(Message::user(text.clone()));
             match self.tree.agent_tx.get(&AgentId::ROOT) {
                 Some(tx) if tx.send(AgentMsg::Run(messages)).is_ok() => {
+                    self.chat.expect_human(&text);
+                    self.chat.push_message(AgentId::ROOT, Message::user(text));
+                    // The human's own words are the one thing worth blocking on:
+                    // the run they start may take minutes, and a crash in it
+                    // must not lose the request. This is one write per turn, not
+                    // one per response.
+                    self.flush_session();
                     // The run starts now as far as the human is concerned; the
                     // actor's `Running` event will agree with this, and brings
                     // the run's cancel flag with it.
@@ -1684,9 +1705,8 @@ impl App {
             // directory from the workspace it was spawned with, so a run would
             // recreate the reclaimed path as a plain directory where no surface
             // — not `git status`, not `git diff`, not `git merge` — could see the
-            // work (finding S1). The words stay in the box and nothing runs.
+            // work (finding S1). The words stay out of the box and nothing runs.
             if let Some(line) = self.worktree_gone(target) {
-                self.chat.insert(&text);
                 self.fail(&line);
                 return Err(line);
             }
@@ -1698,30 +1718,29 @@ impl App {
             // leaving a lie on the row (finding B10).
             let previous = self.tree.nudge(target);
             let delivered = self.deliver_to_actor(target, AgentMsg::Nudge(text.clone()));
+            if !delivered {
+                let line = agent::gone(target);
+                self.tree.nudge_failed(target, previous);
+                self.fail(&line);
+                return Err(line);
+            }
             // The human's line lands in the pane on the same turn, and *after*
             // the send: a revived actor's first event cannot be applied until
             // this `update` returns, so the answer can never be painted above
             // the question that asked for it.
+            self.chat.expect_human(&text);
             self.chat.push_message(target, Message::user(text));
-            let outcome = if delivered {
-                // The human resumed a child its parent may believe is at
-                // rest: the parent's books decide its waits and the
-                // one-shared-child guard, so they are told (audit row 1).
-                self.tell_parent_running(target);
-                Ok(())
-            } else {
-                let line = agent::gone(target);
-                self.tree.nudge_failed(target, previous);
-                self.fail(&line);
-                Err(line)
-            };
+            // The human resumed a child its parent may believe is at rest: the
+            // parent's books decide its waits and the one-shared-child guard, so
+            // they are told (audit row 1).
+            self.tell_parent_running(target);
             // The human's own words are written before this returns, to a child
             // as on the root: the turn they asked for may take minutes, and a
             // crash must not lose the request to the debounce. The phase above
             // is settled first, so the snapshot stores the line and not a
             // `thinking…` that never ran.
             self.flush_session();
-            outcome
+            Ok(())
         }
     }
 
@@ -1973,17 +1992,6 @@ impl App {
             return attach::Reply::Err(attach::ReplyError::conflict(revision));
         }
         if send {
-            // The two refusals a typed message has, said back to the client
-            // rather than into the human's box: the words are the client's,
-            // and a request that could not run must not land as a draft.
-            if self.cfg().model.is_empty() {
-                return attach::Reply::Err(attach::ReplyError::bad_request(
-                    "no model yet — the message was not sent",
-                ));
-            }
-            if let Some(line) = self.worktree_gone(id) {
-                return attach::Reply::Err(attach::ReplyError::bad_request(line));
-            }
             // A client's words are a *message*, not a command: `/quit` typed
             // here would be text an agent reads, where the same words at the
             // human's keyboard would leave mush. Saying that is the
@@ -1998,14 +2006,13 @@ impl App {
             // The same path a typed message takes: `deliver` sends to the
             // focused agent, so aim it there for the turn. The keyboard focus
             // is put back, because an external client steering an agent must
-            // not move the human's pane. A message that did not land is a
-            // refusal, not the `Ok` revision the client used to be handed: the
-            // human's bar already says the agent is gone, and the client that
-            // sent the words into that dead mailbox is the one party who could
-            // not see it (findings §6).
+            // not move the human's pane. `deliver` owns the refusals — no
+            // model, a gone worktree, a dead mailbox — and makes none of them
+            // leave a mark: a message that did not land is a refusal, not the
+            // `Ok` revision the client used to be handed, and not a line in a
+            // transcript no run will read (findings §6, Tier 2 §3).
             let previous = self.tree.focused;
             self.tree.focused = id;
-            self.chat.expect_human(text);
             let delivered = self.deliver(text.to_string());
             self.tree.focused = previous;
             if let Err(line) = delivered {
@@ -2892,7 +2899,9 @@ impl App {
     /// "stopped" claims an actor that a message resumes and there is none
     /// (finding H2).
     fn stop_one(&mut self, id: AgentId) {
-        if self.tree.cancel_requested(id) == Stopped::CutOff {
+        // `true` is the one case that is not a stop: the mailbox was dead with a
+        // run in flight, so the row and the parent must hear it.
+        if self.tree.cancel_requested(id) {
             self.report_cut_off(id);
         }
     }
@@ -3057,8 +3066,7 @@ impl App {
         // is not idle on the machine, and the key is aimed at the work — so
         // answering "not running" here, while Ctrl-C stops the very same job,
         // made the two paths disagree about the same agent.
-        let working = self.tree.node(id).is_some_and(|node| node.phase.is_busy())
-            || !self.tree.live_jobs(id).is_empty();
+        let working = self.tree.node(id).is_some_and(|node| self.in_flight(node));
         if !working {
             self.say(format!("agent {id} is not running"));
             return;
@@ -3146,7 +3154,7 @@ mod tests {
     /// (finding B2).
     fn run(app: &mut App, line: &str) {
         let command = commands::parse_command(line)
-            .unwrap_or_else(|error| panic!("`{line}` is not a command: {error}"));
+            .unwrap_or_else(|error| panic!("`{line}` is not a command: {error:?}"));
         app.apply_command(command);
     }
 
@@ -10097,6 +10105,48 @@ mod tests {
             !app.tree.node(AgentId::ROOT).unwrap().phase.is_busy(),
             "no run was started"
         );
+    }
+
+    /// A refusal changes nothing: a client's message that could not run is not
+    /// committed to the root's transcript, and the human's box is not handed a
+    /// draft nobody wrote. The refusal used to be answered *after* `deliver`
+    /// had pushed the message and flushed the session, so words that never ran
+    /// were in the conversation the next run would read (Tier 3 §2).
+    #[test]
+    fn a_refused_attach_send_leaves_the_root_transcript_unchanged() {
+        let (mut app, _rx) = test_app("attach-refused-root");
+        // The root's mailbox is gone, which is the one way `deliver` can refuse
+        // a root message: `Ctrl-N` restarts it.
+        app.tree.agent_tx.remove(&AgentId::ROOT);
+        let revision = app.chat.revision(AgentId::ROOT);
+        let error = attach_err(app.handle_attach(
+            "a client",
+            &attach_request(
+                4,
+                attach::Op::Edit {
+                    agent: 0,
+                    base: revision,
+                    text: "anyone home?".to_string(),
+                    send: true,
+                },
+            ),
+        ));
+        assert_eq!(error.kind, "bad_request");
+        assert_eq!(
+            error.message.as_deref(),
+            Some("root agent is gone — Ctrl-N restarts it"),
+            "the client is told why"
+        );
+        assert!(
+            app.chat.transcript(AgentId::ROOT).is_empty(),
+            "the refused words are not in the transcript"
+        );
+        assert_eq!(
+            app.chat.input().text(),
+            "",
+            "and not in the human's box either"
+        );
+        assert_eq!(app.chat.revision(AgentId::ROOT), revision, "nothing moved");
     }
 
     /// A branch whose worktree is gone is not a place a client can read files

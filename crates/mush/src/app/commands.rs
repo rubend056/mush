@@ -38,8 +38,6 @@
 //! Anything else is an error value: an unknown slash, or a real command whose
 //! argument does not read.
 
-use std::fmt;
-
 /// A command, with its arguments read the way the executor will use them.
 ///
 /// Arguments are typed rather than passed as text: `/url` with no argument is
@@ -75,16 +73,6 @@ pub enum CommandError {
     /// the whole line to show a human, spelled with the command that produced
     /// it, so the usage text lives beside the rule rather than in the arm.
     Usage(String),
-}
-
-impl fmt::Display for CommandError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            CommandError::NotACommand => write!(f, "not a command"),
-            CommandError::Unknown(name) => write!(f, "unknown command: {name}"),
-            CommandError::Usage(line) => write!(f, "{line}"),
-        }
-    }
 }
 
 /// One slash command: how it is spelled, what it takes, and the line of help.
@@ -306,7 +294,7 @@ mod tests {
         for spec in COMMANDS {
             let line = typed(spec);
             parse_command(&line).unwrap_or_else(|error| {
-                panic!("`{line}` is in the table but does not parse: {error}")
+                panic!("`{line}` is in the table but does not parse: {error:?}")
             });
         }
     }
