@@ -541,9 +541,14 @@ const STALE_CANCEL: Duration = Duration::from_secs(10);
 /// never push an older, droppable one out of the window.
 ///
 /// **No archive.** The reaped transcript is *gone*, not written anywhere: an
-/// archive would be one more lifetime to reason about, and the stored copy of
-/// each transcript is already capped at 256 KiB, so dropping a row drops at
-/// most that from the next save (the human's decision, §8.21).
+/// archive would be one more lifetime to reason about, and what bounds a stored
+/// transcript is the request-side fold rather than any byte cut — a conversation
+/// is folded at nine tenths of its history budget
+/// (`mush_core::transcript::compaction_trigger`), and a *child's* is folded only
+/// while it runs, so a finished child sits frozen at whatever it reached. The
+/// file's bound is `CHILD_HISTORY × that fold trigger + the root`, and dropping
+/// a row drops one child's frozen transcript from the next save (the human's
+/// decision, §8.21).
 pub const CHILD_HISTORY: usize = 50;
 
 /// How many of the newest children keep their actor thread.
