@@ -1426,9 +1426,10 @@ impl AgentTree {
     }
 
     /// The per-parent count of children whose run is in flight, derived in one
-    /// walk. The pane builds this map once and looks each row up in it, and the
-    /// title's `M waiting` and [`Self::napping`] read the same entries. A
-    /// derivation, not a stored fact, dropped with the frame (finding R29).
+    /// walk. [`crate::app::App::rows`] builds this map once per pane or roster
+    /// and looks every row up in it, and the title's `M waiting` and [`Self::napping`]
+    /// read the same entries. A derivation, not a stored fact, dropped with the
+    /// frame (finding R29).
     pub fn busy_counts(&self) -> HashMap<AgentId, usize> {
         let mut busy: HashMap<AgentId, usize> = HashMap::new();
         for node in &self.agents {
@@ -1474,16 +1475,6 @@ impl AgentTree {
             .filter(|node| node.parent == Some(id) && node.result_unread)
             .map(|node| node.id)
             .collect()
-    }
-
-    /// How many of `id`'s own children have work in flight: the single-node
-    /// entry into [`Self::busy_counts`], the one derivation, for the caller
-    /// that has no map in hand (the roster's row, `screen.rs`'s `agent_row`).
-    ///
-    /// It is about the children, never about the parent's own phase: a working
-    /// agent whose children work is still working (finding U1).
-    pub fn busy_children(&self, id: AgentId) -> usize {
-        self.busy_counts().get(&id).copied().unwrap_or(0)
     }
 
     /// Show one agent's transcript, if it is in the tree.

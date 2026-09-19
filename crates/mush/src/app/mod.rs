@@ -1894,18 +1894,18 @@ impl App {
     /// session file, so a client can see the whole tree — phases, parents,
     /// working children — without a copy that lags it (M3 / H1).
     ///
-    /// Each entry is [`App::agent_row`] — the one derivation of what a row
+    /// Each entry is a row from [`App::rows`] — the one derivation of what a row
     /// says — plus what a row cannot carry: where the node hangs, its phase's
     /// machine name, its raw branch and worktree, the summary, and the
     /// revision a client edits against. Deriving the row again here is how a
     /// roster starts claiming things the pane does not say (finding R21).
     fn attach_agents(&self) -> attach::Reply {
-        let agents: Vec<serde_json::Value> = self
-            .tree
-            .rows()
+        let nodes = self.tree.rows();
+        let rows = self.rows(&nodes);
+        let agents: Vec<serde_json::Value> = nodes
             .iter()
-            .map(|node| {
-                let row = self.agent_row(node);
+            .zip(rows)
+            .map(|(node, row)| {
                 serde_json::json!({
                     "id": row.id.0,
                     "parent": node.parent.map(|parent| parent.0),
@@ -9129,7 +9129,11 @@ mod tests {
         app.tree.activity(AgentId(2), "read_file deep.txt 2s");
         assert_eq!(
             (
-                app.tree.busy_children(AgentId::ROOT),
+                app.tree
+                    .busy_counts()
+                    .get(&AgentId::ROOT)
+                    .copied()
+                    .unwrap_or(0),
                 app.tree.roster().working
             ),
             (1, 2),
