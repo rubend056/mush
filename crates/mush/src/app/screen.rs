@@ -602,17 +602,19 @@ impl App {
                 // The row being painted, not the row the cursor sits on: read
                 // from the cursor, every visible row wore `• ` while the picker
                 // opened on the current model and none did after one `j`
-                // (Tier 3 §1).
-                PickerKind::Model => item.split(" · ").next().unwrap_or(item) == self.cfg().model,
-                PickerKind::Provider => item == self.cfg().provider.name(),
+                // (Tier 3 §1). And the id is the row's own field, not a parse
+                // of its label — a model id containing the separator is still
+                // one id (Tier 3 §7).
+                PickerKind::Model => item.id.as_deref() == Some(self.cfg().model.as_str()),
+                PickerKind::Provider => item.id.as_deref() == Some(self.cfg().provider.name()),
                 // Nothing in this list is a choice, so nothing is marked as
                 // one.
                 PickerKind::Notes | PickerKind::Help => false,
             };
             let label = if current {
-                format!("• {item}")
+                format!("• {}", item.label)
             } else {
-                format!("  {item}")
+                format!("  {}", item.label)
             };
             // A model id comes from the endpoint and a note can carry a
             // failure's own words, so the row is defanged where it is painted

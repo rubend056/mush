@@ -112,12 +112,28 @@ pub enum PickerKind {
     Help,
 }
 
+/// One row of a `Picker`: what it stands for, and what it says.
+///
+/// The two are separate fields because the label is built *from* the id and
+/// other facts: a model row reads `{id} · {tokens}`. Reading the id back out of
+/// that label made both the bullet and the pick take the text before the first
+/// separator, so one model id containing `" · "` was drawn as one thing and
+/// chosen as another (Tier 3 §7).
+///
+/// `id` is the machine value — a model id, a provider name — and `None` for a
+/// list that is not a choice (`Notes`, `Help`).
+#[derive(Clone, Debug)]
+pub struct PickerItem {
+    pub id: Option<String>,
+    pub label: String,
+}
+
 /// A small modal list that grabs the keyboard until Enter or Esc: the models,
 /// the providers, and the notes mush wrote about the focused agent. Drawn as a
 /// centered popup by `ui::draw_picker`.
 pub struct Picker {
     pub kind: PickerKind,
-    pub items: Vec<String>,
+    pub items: Vec<PickerItem>,
     pub cursor: usize,
 }
 
@@ -2184,9 +2200,15 @@ impl App {
         let items = self
             .models
             .iter()
-            .map(|model| match model.context {
-                Some(tokens) => format!("{} · {}", model.id, tokens_label(tokens)),
-                None => model.id.clone(),
+            .map(|model| {
+                let label = match model.context {
+                    Some(tokens) => format!("{} · {}", model.id, tokens_label(tokens)),
+                    None => model.id.clone(),
+                };
+                PickerItem {
+                    id: Some(model.id.clone()),
+                    label,
+                }
             })
             .collect();
         self.picker = Some(Picker {
@@ -2220,7 +2242,14 @@ impl App {
         }
         self.picker = Some(Picker {
             kind: PickerKind::Notes,
-            items: notes.rows,
+            items: notes
+                .rows
+                .into_iter()
+                .map(|row| PickerItem {
+                    id: None,
+                    label: row,
+                })
+                .collect(),
             cursor: notes.newest,
         });
     }
@@ -2234,7 +2263,13 @@ impl App {
     /// to the width it is painted at, scrollable, and opened at the top.
     fn open_help_picker(&mut self) {
         let width = screen::picker_text_width(self.term_width);
-        let items = help_notice(width).lines().map(str::to_string).collect();
+        let items = help_notice(width)
+            .lines()
+            .map(|line| PickerItem {
+                id: None,
+                label: line.to_string(),
+            })
+            .collect();
         self.picker = Some(Picker {
             kind: PickerKind::Help,
             items,
@@ -2243,10 +2278,16 @@ impl App {
     }
 
     fn open_provider_picker(&mut self) {
-        let items: Vec<String> = Provider::ALL.iter().map(|p| p.name().to_string()).collect();
+        let items: Vec<PickerItem> = Provider::ALL
+            .iter()
+            .map(|provider| PickerItem {
+                id: Some(provider.name().to_string()),
+                label: provider.name().to_string(),
+            })
+            .collect();
         let cursor = items
             .iter()
-            .position(|name| Provider::parse(name) == Some(self.cfg().provider))
+            .position(|item| item.id.as_deref() == Some(self.cfg().provider.name()))
             .unwrap_or(0);
         self.picker = Some(Picker {
             kind: PickerKind::Provider,
@@ -2305,12 +2346,17 @@ impl App {
         });
     }
 
-    fn pick(&mut self, kind: PickerKind, item: &str) {
+    /// Apply the row `Enter` landed on. The row carries its own id, so nothing
+    /// here reads a display string back into a value: the picker's label is
+    /// `{id} · {tokens}` for a model, and parsing it picked the half before the
+    /// first separator for any id that contained one (Tier 3 §7). A row with no
+    /// id is a reading (`Notes`, `Help`), and `Enter` on it changes nothing.
+    fn pick(&mut self, kind: PickerKind, item: &PickerItem) {
+        let Some(id) = item.id.as_deref() else {
+            return;
+        };
         match kind {
             PickerKind::Model => {
-                // The picker labels models with their window; the id is the
-                // part before the separator.
-                let id = item.split(" · ").next().unwrap_or(item);
                 // A new model means a new documented window, unless the human
                 // stated one (finding A5).
                 self.cell.edit(|cfg| cfg.set_model(id));
@@ -2322,7 +2368,7 @@ impl App {
                     self.context_label()
                 ));
             }
-            PickerKind::Provider => self.apply_provider(item),
+            PickerKind::Provider => self.apply_provider(id),
             // Nothing to apply: the list is a reading, and `key_picker` closes it
             // on Enter exactly as it does on Esc.
             PickerKind::Notes | PickerKind::Help => {}
@@ -3157,6 +3203,13 @@ mod tests {
     /// The transient line the bar would show, or the empty string.
     fn text_of(app: &App) -> &str {
         app.status_line().map(|(text, _)| text).unwrap_or("")
+    }
+
+    /// What a picker's rows say, for a test that reads the list as the human
+    /// does. The ids behind the labels are what `pick` reads, and a test that
+    /// asserts on the *pick* compares those instead.
+    fn labels(items: &[PickerItem]) -> Vec<&str> {
+        items.iter().map(|item| item.label.as_str()).collect()
     }
 
     /// Pretend a status line was written `seconds` ago.
@@ -5884,7 +5937,7 @@ mod tests {
             "every note, not only the held-back ones"
         );
         assert_eq!(
-            picker.items[0], "0s · note 0",
+            picker.items[0].label, "0s · note 0",
             "oldest first, like the pane"
         );
         assert_eq!(picker.cursor, 4, "the cursor opens on the newest");
@@ -5914,23 +5967,23 @@ mod tests {
         assert!(
             picker.items.len() > 3,
             "the newest note wraps, which is the case this is about: {:?}",
-            picker.items
+            labels(&picker.items)
         );
         assert!(
             picker.cursor < picker.items.len() - 1,
             "the cursor is not on the last row, which is mid-sentence: {:?}",
-            picker.items
+            labels(&picker.items)
         );
         assert_eq!(
-            picker.items[picker.cursor], "0s · the run failed while folding the",
+            picker.items[picker.cursor].label, "0s · the run failed while folding the",
             "it opens on the head of the newest note, stamp included"
         );
         assert!(
             picker.items[..picker.cursor]
                 .iter()
-                .any(|row| row.contains("opened notes.txt")),
+                .any(|row| row.label.contains("opened notes.txt")),
             "and the older note is above it, not scrolled away: {:?}",
-            picker.items
+            labels(&picker.items)
         );
         let title = picker.title();
         assert!(
@@ -6150,6 +6203,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).unwrap();
         app_root(&root, None, session_save::fake::Recorder::new())
+    }
+
+    /// Point the home-config *write* at a throwaway file, once per test binary.
+    ///
+    /// `pick` persists what the human picked (`persist_user_config`), and the
+    /// two picker tests below are the only places in this suite that press
+    /// `Enter` on a row: without this they would rewrite the human's own
+    /// `~/.config/mush/config.json` with a fixture's endpoint and model.
+    /// `MUSH_CONFIG` is the override `mush_core::userconfig` documents for
+    /// exactly this, and nothing else here reads the home config.
+    fn isolate_user_config() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let path = std::env::temp_dir().join(format!(
+                "mush-user-config-{}/config.json",
+                std::process::id()
+            ));
+            std::env::set_var("MUSH_CONFIG", path);
+        });
     }
 
     /// Ctrl-N must do what Ctrl-N does: a cleared chat with a live root, not
@@ -6578,6 +6650,93 @@ mod tests {
         assert_eq!(app.cfg().model, "mine", "a stated model wins over the list");
     }
 
+    /// A model id is data, not a format: an id that carries the picker's own
+    /// `" · "` separator is one id. The row says `{id} · {tokens}` for a human
+    /// to read, `Enter` takes what the row stands for, and the bullet marks
+    /// that same row — reading the id back out of the label made the pick the
+    /// text before the first separator, i.e. `weird` (Tier 3 §7).
+    #[test]
+    fn a_model_id_carrying_the_separator_is_still_the_model_that_is_picked() {
+        isolate_user_config();
+        let (mut app, _rx) = test_app("model-id-separator");
+        app.models = vec![
+            http::Model {
+                id: "weird · model".to_string(),
+                context: Some(500_000),
+            },
+            http::Model {
+                id: "plain".to_string(),
+                context: None,
+            },
+        ];
+        app.open_model_picker();
+
+        // The row a human reads: the whole id, then the window it advertises.
+        let rows = screen(&mut app, 80, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("weird · model · 500k")),
+            "the row carries the id and its window: {rows:?}"
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.picker.is_none(), "the pick closed the list");
+        assert_eq!(
+            app.cfg().model,
+            "weird · model",
+            "the separator is part of the id, not the end of it"
+        );
+        assert!(
+            text_of(&app).starts_with("model: weird · model @ "),
+            "and the bar names the model that was picked: {}",
+            text_of(&app)
+        );
+
+        // The bullet follows the same id rather than a parse of the label, and
+        // it follows the row rather than the cursor: `plain` is where the
+        // cursor is put, and it is still `weird · model` that is marked.
+        app.open_model_picker();
+        app.move_picker(1);
+        let rows = screen(&mut app, 80, 24);
+        let marked: Vec<&String> = rows.iter().filter(|row| row.contains('•')).collect();
+        assert_eq!(marked.len(), 1, "exactly one row is marked: {rows:?}");
+        assert!(
+            marked[0].contains("weird · model"),
+            "and it is the model in use: {marked:?}"
+        );
+    }
+
+    /// The provider list is a choice the same way: a row stands for the name it
+    /// wears, the list opens on the provider in use (both read the row's id),
+    /// and `Enter` applies that name — nothing about the endpoint in use
+    /// changes when the row picked is the one already there.
+    #[test]
+    fn the_provider_picker_picks_the_name_its_row_stands_for() {
+        isolate_user_config();
+        let (mut app, _rx) = test_app("provider-picker");
+
+        run(&mut app, "/provider");
+
+        let picker = app.picker.as_ref().expect("the provider list opened");
+        assert_eq!(picker.kind, PickerKind::Provider);
+        assert_eq!(
+            picker.items[picker.cursor].id.as_deref(),
+            Some(app.cfg().provider.name()),
+            "the cursor opens on the provider in use: {:?}",
+            labels(&picker.items)
+        );
+
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+
+        assert!(app.picker.is_none(), "the pick closed the list");
+        assert_eq!(app.cfg().provider, Provider::Custom);
+        assert!(
+            text_of(&app).starts_with("provider: custom · "),
+            "and the bar names the provider that was picked: {}",
+            text_of(&app)
+        );
+    }
+
     /// A list fetched from the endpoint the human has since left must not land:
     /// the picker, and the model it would name, are about the endpoint in use.
     #[test]
@@ -6836,12 +6995,8 @@ mod tests {
     fn help_advertises_compact() {
         let (mut app, _rx) = test_app("compact-help");
         run(&mut app, "/help");
-        let help = app
-            .picker
-            .as_ref()
-            .expect("help opens a list")
-            .items
-            .join("\n");
+        let picker = app.picker.as_ref().expect("help opens a list");
+        let help = labels(&picker.items).join("\n");
         assert!(help.contains("/compact"), "{help}");
     }
 
@@ -6858,9 +7013,12 @@ mod tests {
         assert_eq!(picker.kind, PickerKind::Help);
         assert_eq!(picker.cursor, 0, "help opens at its head");
         assert!(
-            picker.items.iter().any(|row| row.contains("mush keys")),
+            picker
+                .items
+                .iter()
+                .any(|row| row.label.contains("mush keys")),
             "the list carries the keys: {}",
-            picker.items.join("\n")
+            labels(&picker.items).join("\n")
         );
         let rows = screen(&mut app, 120, 32);
         assert!(
@@ -7067,12 +7225,8 @@ mod tests {
         // not a missing binding.
         app.set_term_size(200, 50);
         run(&mut app, "/help");
-        let help = app
-            .picker
-            .as_ref()
-            .expect("help opens a list")
-            .items
-            .join("\n");
+        let picker = app.picker.as_ref().expect("help opens a list");
+        let help = labels(&picker.items).join("\n");
         for want in [
             "j / k, ↑ / ↓",
             "show the selected agent's transcript",
