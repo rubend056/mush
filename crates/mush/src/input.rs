@@ -112,15 +112,14 @@ impl Input {
             let (text, _) = window_line(self.line(index), 0, width);
             lines.push(text);
         }
-        // The window is re-run per line around the cursor's own column so the
-        // cursor stays visible on a line wider than the box.
+        // The window is re-run around the cursor's own column so the cursor
+        // stays visible on a line wider than the box. Its row is always one of
+        // the painted ones: `first` is the cursor's line or above it, and there
+        // is a row for every line from `first` up to the box's height.
         let cursor_row = cursor_line - first;
-        if let Some(text) = lines.get_mut(cursor_row) {
-            let (windowed, column) = window_line(self.line(cursor_line), cursor_col, width);
-            *text = windowed;
-            return (lines, cursor_row, column);
-        }
-        (lines, 0, 0)
+        let (windowed, column) = window_line(self.line(cursor_line), cursor_col, width);
+        lines[cursor_row] = windowed;
+        (lines, cursor_row, column)
     }
 
     /// Grapheme index where one line starts.
@@ -165,10 +164,16 @@ fn window_line(text: &str, cursor_col: usize, width: usize) -> (String, usize) {
     let total = UnicodeWidthStr::width(text);
 
     // Fixed point: the markers depend on `skip`, and `skip` depends on how many
-    // columns the markers leave. Each pass either settles or moves `skip` right,
-    // and a rightward move cannot repeat.
+    // columns the markers leave. Each pass either breaks or moves `skip`
+    // strictly right (that is the `next <= skip` guard below), and a pass that
+    // moves is followed by one that breaks: a trailing mark only ever turns off
+    // as `skip` grows, so the value it moved to is already the one the test
+    // accepts. The one exception — a *first* pass that moves with no trailing
+    // mark — is followed by a move and then a break. Three passes at most, so
+    // the loop is its own bound: a `0..8` cap said nothing the arithmetic does
+    // not.
     let mut skip = 0usize;
-    for _ in 0..8 {
+    loop {
         let base = width - usize::from(skip > 0);
         let trailing = total > skip + base;
         let avail = base - usize::from(trailing);

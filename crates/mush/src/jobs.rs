@@ -98,9 +98,24 @@ const JOB_HISTORY: usize = 8;
 /// a status for being old.
 pub const STATUS_WINDOW: usize = 6_000;
 
+/// How much of a job's command a job's line carries, in columns.
+///
+/// A `run_command` is uncapped upstream — a 2 KB script is an ordinary call —
+/// while `status` is the one tool result bounded on its own terms
+/// ([`STATUS_WINDOW`]), and every headline in it carries the command: a headline
+/// that spelled one whole would put an unbounded line on top of a bounded
+/// window, however many jobs there are. The line lands in the transcript too, so
+/// it is cut where it is built, exactly as a refusal sentence cuts the command
+/// it names ([`REFUSAL_COMMAND_COLUMNS`]).
+const STATUS_COMMAND_COLUMNS: usize = 60;
+
 /// How often a running command is polled. Ten milliseconds is the latency
 /// between a `Stop` and a process group dying, and costs nothing while idle.
-const POLL: Duration = Duration::from_millis(10);
+///
+/// One rule with two watchers — a job's own thread here and the foreground
+/// watcher in `agent.rs` — so it is crate-visible: that other spelling of this
+/// cadence is still a bare literal to move here.
+pub(crate) const POLL: Duration = Duration::from_millis(10);
 
 /// Hard ceiling on what one command may write to its scratch files before mush
 /// stops it. The disk is shared by every agent, and a command that gets here is
@@ -128,10 +143,13 @@ pub const JOB_MAX_AGE: Duration = Duration::from_secs(4 * 60 * 60);
 /// the part it needs is the start (finding H13).
 const REFUSAL_COMMAND_COLUMNS: usize = 60;
 
-/// `#c2` — a job's name, as the model and the human both read it. The `c` is
-/// what tells a command's id from an agent's at a glance, and it lives in
-/// [`JobId`]'s `Display`; this is that spelling under a verb a call site can
-/// read (`label(id)`), so nothing formats a `#c` by hand.
+/// `#c2` — a job's name, as the model and the human both read it.
+///
+/// The `c` that tells a command's id from an agent's lives in [`JobId`]'s
+/// `Display`, which every site in this module formats through: `{id}` is the
+/// whole spelling. The two callers left in `agent.rs` spell the name through
+/// this function instead — `JobId`'s own `Display` is all it forwards to, so
+/// they can do the same without changing a byte.
 pub fn label(id: JobId) -> String {
     id.to_string()
 }
@@ -224,20 +242,21 @@ impl JobOutcome {
     /// The one line a job is reported in: `#c2 done: exit 0 · 3m12s · cargo
     /// test — test result: ok.`. Kept here so the transcript line, the bar and
     /// `status` say the same thing about the same job.
+    ///
+    /// The command is cut to [`STATUS_COMMAND_COLUMNS`] here, where the line is
+    /// built: `status` prints this line for a job that has ended, and the
+    /// command it names is uncapped upstream.
     pub fn line(&self, id: JobId, command: &str, age: Duration, tail: &str) -> String {
+        let command = truncate(command, STATUS_COMMAND_COLUMNS);
         let head = match self {
-            JobOutcome::Exited(code) => {
-                format!("{} done: exit {code} · {}", label(id), short_age(age))
-            }
-            JobOutcome::Stopped => format!("{} stopped after {}", label(id), short_age(age)),
+            JobOutcome::Exited(code) => format!("{id} done: exit {code} · {}", short_age(age)),
+            JobOutcome::Stopped => format!("{id} stopped after {}", short_age(age)),
             JobOutcome::TooMuchOutput => format!(
-                "{} killed: it wrote past {CMD_OUTPUT_LIMIT} bytes · {}",
-                label(id),
+                "{id} killed: it wrote past {CMD_OUTPUT_LIMIT} bytes · {}",
                 short_age(age)
             ),
             JobOutcome::RanTooLong => format!(
-                "{} killed: it ran past the {}h ceiling · {}",
-                label(id),
+                "{id} killed: it ran past the {}h ceiling · {}",
                 JOB_MAX_AGE.as_secs() / 3600,
                 short_age(age)
             ),
@@ -272,22 +291,33 @@ pub fn preview_tail(tail: &str) -> String {
 }
 
 /// One job as the registry holds it.
+#[derive(Clone)]
 struct Record {
     id: JobId,
     owner: u64,
     command: String,
     started: Instant,
-    /// How to reach it while it runs; `None` once it has ended.
-    live: Option<Live>,
-    /// The line its owner reads. `None` until it ends.
-    line: Option<String>,
-    /// The end of what it wrote: read live while it runs, captured as it ends.
-    tail: String,
+    /// What it is: running, or what it left behind. One field, because it is one
+    /// fact — a record that has ended has the line its owner reads and the window
+    /// it kept, and one that is running has neither yet. As three fields
+    /// (`live`, `line`, `tail`) kept in step by `finish` alone, that left a
+    /// fourth combination nothing could build and two readers worded to defend.
+    state: State,
+}
+
+/// The two states a record has, as the two things it can be.
+#[derive(Clone)]
+enum State {
+    /// Still running: reached through this handle, which is how `status` reads
+    /// a window that is being written now.
+    Running(Live),
+    /// Ended: the line its owner reads, and the end of what it wrote.
+    Ended { line: String, tail: String },
 }
 
 impl Record {
     fn running(&self) -> bool {
-        self.live.is_some()
+        matches!(self.state, State::Running(_))
     }
 }
 
@@ -380,18 +410,15 @@ impl Live {
 ///
 /// It is not a job. It has no id, no line, no output window and no place in the
 /// machine-wide budget: the model is the one waiting for its result, and the
-/// transcript is where that result is read. What it has is a slot that a kill
-/// can find.
+/// transcript is where that result is read. What it has is an entry in the
+/// registry's foreground map, which is what a kill can find.
 pub struct Foreground {
     registry: Arc<Registry>,
-    /// Which slot this call holds. Slots are never reused, so a stale release
-    /// cannot free somebody else's command.
-    slot: u64,
-    /// The agent whose command this is — the same value the registry's
-    /// `foregrounds` map records against the slot. It is carried here so
-    /// [`Launch::held`] reads the owner off the handle instead of being told it
-    /// a second time: two statements of one owner is how a job comes to be
-    /// recorded against an agent that did not start it (refactor R20).
+    /// The agent whose command this is — the key the registry's `foregrounds`
+    /// map records it under. It is carried here so [`Launch::held`] reads the
+    /// owner off the handle instead of being told it a second time: two
+    /// statements of one owner is how a job comes to be recorded against an
+    /// agent that did not start it (refactor R20).
     owner: u64,
     live: Live,
 }
@@ -406,17 +433,17 @@ impl Foreground {
 }
 
 impl Drop for Foreground {
-    /// The call is over: the slot goes.
+    /// The call is over: its entry in the foreground map goes.
     ///
     /// Nothing is killed here, on purpose. Every path that ends the call early
     /// kills the command itself (`wait_bounded` does, before it returns), and a
     /// command that ended by itself must not be signalled afterwards: its
     /// process group id is free to be handed to somebody else's process, and a
     /// `kill -9 -pgid` that landed there would kill work mush never started.
-    /// What keeps a *running* command from escaping is that the slot is
+    /// What keeps a *running* command from escaping is that the entry is
     /// registered for the whole of the call, not this drop.
     fn drop(&mut self) {
-        self.registry.forget_foreground(self.slot);
+        self.registry.forget_foreground(self.owner);
     }
 }
 
@@ -467,19 +494,25 @@ pub enum Refused {
 impl Refused {
     /// What the model is told, in words that let it act: who to wait for, or
     /// what to stop.
-    pub fn message(&self, asker: u64) -> String {
+    ///
+    /// The asker is not read: every [`Held`] is built by a *not-you* test (see
+    /// the arm below), so no refusal is ever about the asker's own lock. The
+    /// parameter is still in the signature for `agent.rs`'s call sites, which
+    /// pass it.
+    pub fn message(&self, _asker: u64) -> String {
         match self {
-            Refused::Machine(held) if held.agent == asker => format!(
-                "you hold the machine with an exclusive command ({}); wait for it \
-                 (wait) or stop it (control stop) before starting another",
-                held.command
-            ),
-            // A sibling's lock. The one thing this must not read as is "try
-            // again now": retrying the identical call is what mush's own loop
-            // guard counts, and it killed two agents that only met a locked
-            // machine (finding H13). Who holds it, what they are running, and
-            // what to do instead — and no tool can wait on another agent's job,
-            // so `wait` must not be offered (audit row 5).
+            // A sibling's lock — always a sibling's. The two places that build a
+            // `Held` are `machine_free_for`, which answers `Ok` for the holder,
+            // and `launch`, which refuses only a holder that is *not* the owner,
+            // so `held.agent` is never the asker and "you hold the machine" is a
+            // sentence no state can ask for. This is the whole word list.
+            //
+            // The one thing it must not read as is "try again now": retrying
+            // the identical call is what mush's own loop guard counts, and it
+            // killed two agents that only met a locked machine (finding H13).
+            // Who holds it, what they are running, and what to do instead — and
+            // no tool can wait on another agent's job, so `wait` must not be
+            // offered (audit row 5).
             Refused::Machine(held) => format!(
                 "#{} holds the machine with an exclusive command ({}); this call queued and the lock \
                  was still held — do not retry in a loop; do other work and try once after it finishes \
@@ -508,8 +541,9 @@ pub struct Launch {
     /// holding (finding S4): either way this is the process group the registry
     /// watches from here on. A foreground command is handed over, never
     /// re-spawned and never unheld, so the process group is in the registry's
-    /// reach every moment of its life — the slot it holds goes when
-    /// [`Registry::launch`] has written the job's record, not on the way in.
+    /// reach every moment of its life — its entry in the foreground map goes
+    /// when [`Registry::launch`] has written the job's record, not on the way
+    /// in.
     source: Source,
     /// Where the completion lands: the owner's own mailbox, exactly as a child's
     /// completion does.
@@ -521,7 +555,7 @@ enum Source {
     /// Started by the caller and handed over now — what `detach: true` does.
     Started(Box<dyn Job>),
     /// Held by a `Foreground` the caller has finished with: the command keeps
-    /// running, and the slot it held becomes this job's record.
+    /// running, and the hold it carried becomes this job's record.
     Held(Foreground),
 }
 
@@ -546,7 +580,7 @@ impl Launch {
     /// A command a tool call was holding and has outlived `CMD_DETACH_AFTER`
     /// for: the same process group, watched from now on as a job. The hold is
     /// released once the job's record exists: there is no moment where it is in
-    /// neither the foreground slot nor the job list, so a kill that lands in
+    /// neither the foreground map nor the job list, so a kill that lands in
     /// this window still reaches it.
     ///
     /// The owner is the held command's own ([`Foreground::owner`]), not a
@@ -570,11 +604,11 @@ impl Launch {
 
 impl Source {
     /// The registry's grip on the process group this launch is about, and the
-    /// foreground slot that still holds it, if any.
+    /// foreground hold that still has it, if any.
     ///
-    /// A held command's slot is *not* released here. It goes when the job's
+    /// A held command's entry is *not* released here. It goes when the job's
     /// record exists ([`Registry::launch`]), because this runs before the
-    /// registry lock is taken: a slot freed on the way in would leave a window
+    /// registry lock is taken: an entry freed on the way in would leave a window
     /// in which the command is in neither map, and a `kill_all` there would
     /// miss the very process group it exists to kill (finding S4).
     fn into_live(self) -> (Live, Option<Foreground>) {
@@ -604,14 +638,11 @@ struct Inner {
     /// The agent holding the machine, its command, and the job holding it while
     /// that job runs.
     holder: Option<(u64, String, Option<JobId>)>,
-    /// The commands running as tool calls, keyed by slot and owned by the agent
-    /// that started each: what [`Registry::kill_all`] and
-    /// [`Registry::kill_owned`] reach beyond the job list. In slot order, one
-    /// per agent that is running a command, so a handful at most.
-    foregrounds: BTreeMap<u64, (u64, Live)>,
-    /// The next foreground slot. It never repeats: a release from a dropped
-    /// handle cannot free a later command's slot.
-    next_slot: u64,
+    /// The commands running as tool calls, keyed by the agent that started
+    /// each: what [`Registry::kill_all`] and [`Registry::kill_owned`] reach
+    /// beyond the job list. In agent order, one per agent that is running a
+    /// command, so a handful at most.
+    foregrounds: BTreeMap<u64, Live>,
 }
 
 impl Registry {
@@ -679,36 +710,40 @@ impl Registry {
     ///
     /// The handle returned *is* the tool call's grip: while it lives, the
     /// process group is in the registry; when it is dropped, the call is over
-    /// and the slot goes. Nothing here is admission — a foreground command is
+    /// and its entry goes. Nothing here is admission — a foreground command is
     /// not a job, does not spend the machine-wide budget, and is not refused —
     /// because the command is already running when this is called.
+    ///
+    /// The map is keyed by owner because an agent holds at most one command at
+    /// a time: a tool batch is a `for` loop over its calls, and `run_shell` in
+    /// `agent.rs` has one caller, so the owner is the whole identity and a
+    /// release always belongs to the command it finds. Slots — a second
+    /// identity beside the key, never reused — existed to police a stale
+    /// release, which needs two overlapping commands from one agent.
     pub fn hold(self: &Arc<Self>, owner: u64, job: Box<dyn Job>) -> Foreground {
         let live = Live::new(job);
-        let slot = {
-            let mut inner = self.inner();
-            let slot = inner.next_slot;
-            inner.next_slot += 1;
-            inner.foregrounds.insert(slot, (owner, live.clone()));
-            slot
-        };
+        self.inner().foregrounds.insert(owner, live.clone());
         Foreground {
             registry: Arc::clone(self),
-            slot,
             owner,
             live,
         }
     }
 
-    /// The slot a finished tool call held. Idempotent: the handover releases it
-    /// and the handle's own `Drop` releases it again.
-    fn forget_foreground(&self, slot: u64) {
-        self.inner().foregrounds.remove(&slot);
+    /// The command a finished tool call held. Idempotent: the handover releases
+    /// it and the handle's own `Drop` releases it again.
+    fn forget_foreground(&self, owner: u64) {
+        self.inner().foregrounds.remove(&owner);
     }
 
     /// Every command running as a tool call, as `(owner, live)` pairs — a copy,
     /// so nothing is killed or read while the registry's own lock is held.
     fn foregrounds(&self) -> Vec<(u64, Live)> {
-        self.inner().foregrounds.values().cloned().collect()
+        self.inner()
+            .foregrounds
+            .iter()
+            .map(|(owner, live)| (*owner, live.clone()))
+            .collect()
     }
 
     /// Whether this agent is still holding a command as a tool call. Test-only:
@@ -716,9 +751,7 @@ impl Registry {
     /// question about the call the model is waiting on.
     #[cfg(test)]
     pub fn holding_foreground(&self, owner: u64) -> bool {
-        self.foregrounds()
-            .iter()
-            .any(|(holder, _)| *holder == owner)
+        self.inner().foregrounds.contains_key(&owner)
     }
 
     /// How many jobs are alive right now — the number the budget is about, and
@@ -847,9 +880,7 @@ impl Registry {
                             owner,
                             command: command.clone(),
                             started: self.clock.now(),
-                            live: Some(live.clone()),
-                            line: None,
-                            tail: String::new(),
+                            state: State::Running(live.clone()),
                         },
                     );
                     Ok(id)
@@ -868,7 +899,7 @@ impl Registry {
             }
         };
         // The job's record exists, so the job list is what names this command
-        // from here on: the slot a foreground call was holding can go. Not
+        // from here on: the hold a foreground call was carrying can go. Not
         // before — the window in between is one a `kill_all` falls into.
         drop(held);
         let registry = Arc::clone(self);
@@ -898,20 +929,19 @@ impl Registry {
     pub fn stop(&self, owner: u64, id: JobId) -> Result<String, String> {
         let record = self.jobs().into_iter().find(|record| record.id == id);
         match record {
-            None => Err(format!("no such job {} — status lists yours", label(id))),
-            Some(record) if record.owner != owner => Err(format!(
-                "job {} belongs to agent #{}",
-                label(id),
-                record.owner
-            )),
-            Some(record) => match record.live {
-                Some(live) => {
+            None => Err(format!("no such job {id} — status lists yours")),
+            Some(record) if record.owner != owner => {
+                Err(format!("job {id} belongs to agent #{}", record.owner))
+            }
+            Some(record) => match &record.state {
+                State::Running(live) => {
                     live.kill();
-                    Ok(format!("stopping job {}", label(id)))
+                    Ok(format!("stopping job {id}"))
                 }
-                None => Ok(record
-                    .line
-                    .unwrap_or_else(|| format!("{} already ended", label(id)))),
+                // A job that ended has the line its owner reads, and that line
+                // *is* the answer; there is no second sentence to invent for a
+                // state the record cannot be in.
+                State::Ended { line, .. } => Ok(line.clone()),
             },
         }
     }
@@ -948,7 +978,7 @@ impl Registry {
         }
         for record in self.jobs() {
             if owner.map_or(true, |owner| owner == record.owner) {
-                if let Some(live) = record.live {
+                if let State::Running(live) = &record.state {
                     live.kill();
                 }
             }
@@ -956,9 +986,10 @@ impl Registry {
     }
 
     /// Bounded on its own terms, windows first: they share [`STATUS_WINDOW`], so
-    /// a status spends the same budget on one job or on sixteen. Each job's
-    /// headline is the one line that is not cut — half a command is a job that
-    /// cannot be told from the next one in the list it is choosing between.
+    /// a status spends the same budget on one job or on sixteen. Each job keeps
+    /// its headline — what the model chooses between — and the command in it is
+    /// cut to [`STATUS_COMMAND_COLUMNS`], because a command is uncapped upstream
+    /// and a headline is not a place to spend a 2 KB script.
     ///
     /// The jobs `owner` should know about: what is running, and what recently
     /// ended. One line each with the window under it — read live from the
@@ -988,23 +1019,23 @@ impl Registry {
         // window it always did and sixteen get a slice each.
         let per_job = (STATUS_WINDOW / mine.len()).min(JOB_TAIL);
         for record in mine {
-            let tail = match &record.live {
-                Some(live) => live.tail(per_job),
-                None => tail_for_model(&record.tail, per_job),
-            };
-            let head = match (&record.live, &record.line) {
-                (Some(_), _) => {
+            let (head, tail) = match &record.state {
+                State::Running(live) => {
                     let holds = matches!(&held, Some((_, _, Some(job))) if *job == record.id);
-                    format!(
-                        "{} running {}{} · {}",
-                        label(record.id),
-                        short_age(now.saturating_duration_since(record.started)),
-                        if holds { " · holds the machine" } else { "" },
-                        record.command
+                    (
+                        format!(
+                            "{} running {}{} · {}",
+                            record.id,
+                            short_age(now.saturating_duration_since(record.started)),
+                            if holds { " · holds the machine" } else { "" },
+                            truncate(&record.command, STATUS_COMMAND_COLUMNS)
+                        ),
+                        live.tail(per_job),
                     )
                 }
-                (None, Some(line)) => line.clone(),
-                (None, None) => format!("{} ended · {}", label(record.id), record.command),
+                // The line a job ended with carries its outcome, its age and its
+                // cut command, so it is the headline as it stands.
+                State::Ended { line, tail } => (line.clone(), tail_for_model(tail, per_job)),
             };
             lines.push(head);
             if !tail.is_empty() {
@@ -1022,37 +1053,23 @@ impl Registry {
     /// own lock is held. The watch thread takes the handle lock before this one,
     /// and holding both in the other order would deadlock.
     fn jobs(&self) -> Vec<Record> {
-        let inner = self.inner();
-        inner
-            .jobs
-            .values()
-            .map(|record| Record {
-                id: record.id,
-                owner: record.owner,
-                command: record.command.clone(),
-                started: record.started,
-                live: record.live.clone(),
-                line: record.line.clone(),
-                tail: record.tail.clone(),
-            })
-            .collect()
+        self.inner().jobs.values().cloned().collect()
     }
 
-    /// A job has ended: keep its line and its window, release the machine if it
-    /// was the holder, and forget the oldest ended job if there are too many.
-    /// Called from the job's own thread, which is also what tells the owner.
-    fn finish(&self, id: JobId, outcome: &JobOutcome, tail: String) -> Option<String> {
+    /// A job has ended: keep the line its owner reads and the window it kept,
+    /// release the machine if it was the holder, and forget the oldest ended job
+    /// if there are too many.
+    ///
+    /// Called from the job's own thread, which holds the job's own `Live` and is
+    /// the only thing that ends its record — the one caller, so there is no "no
+    /// such job" to report and no line to invent for one. The line is built
+    /// before this, by the thread that watched the job end.
+    fn finish(&self, id: JobId, line: String, tail: String) {
         let mut inner = self.inner();
-        let (started, command) = {
-            let record = inner.jobs.get(&id)?;
-            (record.started, record.command.clone())
-        };
-        let age = self.clock.now().saturating_duration_since(started);
-        let line = outcome.line(id, &command, age, &tail);
+        // `watch` is the only caller, and only a record that has already ended
+        // is ever forgotten — here, just below.
         if let Some(record) = inner.jobs.get_mut(&id) {
-            record.live = None;
-            record.tail = tail;
-            record.line = Some(line.clone());
+            record.state = State::Ended { line, tail };
         }
         if matches!(&inner.holder, Some((_, _, Some(job))) if *job == id) {
             inner.holder = None;
@@ -1076,7 +1093,6 @@ impl Registry {
                 None => break,
             }
         }
-        Some(line)
     }
 }
 
@@ -1195,9 +1211,13 @@ fn watch(
             format!("{tail}\n{note}")
         };
     }
-    let line = registry
-        .finish(id, &outcome, tail.clone())
-        .unwrap_or_else(|| outcome.line(id, &command, Duration::ZERO, &tail));
+    // The line is built here, by the thread that watched the job end, from the
+    // command and the moment it was handed: nothing has to come back out of the
+    // record it ends, so `finish` has no case where there is no record to report
+    // — the old fallback for one of those spelled the age as `0s`.
+    let age = registry.clock.now().saturating_duration_since(started);
+    let line = outcome.line(id, &command, age, &tail);
+    registry.finish(id, line.clone(), tail);
     registry.events.emit(
         AgentId(owner),
         AgentEvent::JobDone {
@@ -1245,6 +1265,17 @@ mod tests {
     use crate::machine::fake::{Script, Scripted as ScriptedMachine};
     use crate::machine::{Machine, ShellCommand};
     use mush_core::tools::ToolName;
+
+    /// The fixed part of a status headline — the id, the state (or the outcome),
+    /// the age and the separators — with room to spare.
+    const HEADLINE_FURNITURE: usize = 64;
+
+    /// The most one status headline can be, from the code's own numbers: the cut
+    /// command (`STATUS_COMMAND_COLUMNS`), that furniture, and — on a job that
+    /// has ended — the one-line tail `preview_tail` keeps (`JOB_LINE_TAIL`).
+    fn headline_bound() -> usize {
+        STATUS_COMMAND_COLUMNS + HEADLINE_FURNITURE + JOB_LINE_TAIL
+    }
 
     /// A registry over a scripted machine and an advanceable clock, so a job's
     /// whole life is asserted without a subprocess and without waiting.
@@ -1589,23 +1620,21 @@ mod tests {
 
         let status = registry.status_for(7).expect("the jobs are listed");
         for id in 1..=2 * MAX_JOBS as u64 {
+            let name = JobId(id).to_string();
             assert!(
-                status.contains(&label(JobId(id))),
-                "{} is missing from a {}-byte status",
-                label(JobId(id)),
+                status.contains(&name),
+                "{name} is missing from a {}-byte status",
                 status.len()
             );
         }
         // The windows share `STATUS_WINDOW` — sixteen jobs together are bounded
-        // by that one budget, not by sixteen `JOB_TAIL`s — and what rides on
-        // top of it is furniture: one headline per job and, on a window that
-        // was cut, `tail_for_model`'s marker and the two-space indent its lines
-        // wear. This is the bound the test used to miss: it asserted `CMD_CAP`
-        // (16 000), so a status that had gone back to 16 KB passed.
-        let furniture = (MAX_JOBS + JOB_HISTORY) * 256;
+        // by that one budget, not by sixteen `JOB_TAIL`s — and what rides on top
+        // of it is one bounded headline per job. This is the bound the test used
+        // to miss: it padded with 256 bytes a job, which a command of any size
+        // could spend with the assertion none the wiser.
         assert!(
-            status.len() <= STATUS_WINDOW + furniture,
-            "one status must stay inside the window it spends, plus a line per job: {} bytes",
+            status.len() <= STATUS_WINDOW + (MAX_JOBS + JOB_HISTORY) * headline_bound(),
+            "one status must stay inside the window it spends, plus one bounded headline a job: {} bytes",
             status.len()
         );
         assert!(
@@ -1627,6 +1656,64 @@ mod tests {
             status.len()
         );
         lone.kill_all();
+    }
+
+    /// A command is uncapped upstream — a `run_command` may carry a 2 KB script
+    /// — and a status headline used to name one whole, on top of
+    /// `STATUS_WINDOW`: the bound above was only kept by padding with 256 bytes
+    /// a job. The headline cuts the command, like every other line the model
+    /// reads that names one.
+    #[test]
+    fn a_long_command_stays_outside_a_status_headline() {
+        let long = format!("cargo bench --profile release -- {}", "x".repeat(2000));
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::exits(0).says("done"))
+                .runs(Script::hangs()),
+        );
+        let (registry, _events, _clock) = registry();
+        let start = |command: &str| {
+            let job = machine
+                .spawn(&ShellCommand {
+                    command,
+                    root: Path::new("/tmp"),
+                })
+                .unwrap();
+            let (tx, rx) = crossbeam_channel::unbounded();
+            let id = registry
+                .launch(Launch::started(7, command.to_string(), false, tx, job))
+                .unwrap();
+            (id, rx)
+        };
+        // One that has ended and one still running: both are headlines in the
+        // same status, and both used to carry the whole command.
+        let (ended, mailbox) = start(&long);
+        assert!(matches!(
+            mailbox.recv_timeout(Duration::from_secs(5)),
+            Ok(AgentMsg::CommandDone { .. })
+        ));
+        let (running, _mailbox) = start(&long);
+
+        let status = registry.status_for(7).expect("both jobs are listed");
+        assert!(status.contains(&running.to_string()), "{status}");
+        assert!(status.contains(&ended.to_string()), "{status}");
+        assert!(
+            !status.contains(&"x".repeat(STATUS_COMMAND_COLUMNS)),
+            "the command is cut, not carried: {} bytes",
+            status.len()
+        );
+        // The rule the code keeps, per line: a headline is the fixed furniture
+        // (id, state, age, separators) plus the cut command and, on a job that
+        // has ended, the one-line tail. A whole command breaks it, which is why
+        // this is asserted on the lines and not only on the total.
+        for line in status.lines().filter(|line| !line.starts_with("  ")) {
+            assert!(
+                line.len() <= headline_bound(),
+                "a headline stays bounded: {} bytes: {line}",
+                line.len()
+            );
+        }
+        registry.kill_all();
     }
 
     /// A command running as a *tool call* is held where the same kills reach it
@@ -1669,7 +1756,7 @@ mod tests {
         // Quitting stops everything, wherever the command was spawned.
         registry.kill_all();
         assert_eq!(machine.kills(), 2, "quitting killed the other one too");
-        // The call is over: the slots go, so a later quit cannot find them.
+        // The call is over: the entries go, so a later quit cannot find them.
         drop(mine);
         drop(other);
         assert!(!registry.holding_foreground(7) && !registry.holding_foreground(8));
@@ -1683,7 +1770,7 @@ mod tests {
 
     /// A tool call that outlives `CMD_DETACH_AFTER` becomes the job of the agent
     /// that held it: the owner comes off the handle the registry wrote it into,
-    /// not off a second parameter, so the record and the slot cannot name two
+    /// not off a second parameter, so the record and the hold cannot name two
     /// agents (refactor R20).
     #[test]
     fn a_handed_over_command_belongs_to_the_agent_that_held_it() {
@@ -1716,7 +1803,7 @@ mod tests {
         assert!(registry.live_for(8).is_empty(), "and nobody else does");
         assert!(
             !registry.holding_foreground(7),
-            "the job's record names it from here on, so the slot is gone"
+            "the job's record names it from here on, so the hold is gone"
         );
         registry.kill_all();
     }
