@@ -446,6 +446,16 @@ impl Outcome {
 /// (`App::report_cut_off`).
 pub(crate) const CUT_OFF_RUN: u64 = u64::MAX;
 
+/// The run number the books use for a result no actor in this process can
+/// report: `ActorState::runs` starts at 0 and is incremented where a run ends,
+/// so the first report any actor makes is 1 and 0 is nobody's run. Identity,
+/// not arithmetic, exactly as [`CUT_OFF_RUN`] is at the other end of the
+/// range: the books of a parked child are moved to it (`note_parked`), and a
+/// row seeded from the tree (`AgentMsg::ChildBook`) is recorded under it — in
+/// both cases the report is real, and the number must be one no actor will
+/// ever claim, so the next run the child takes is news rather than a replay.
+const NO_RUN: u64 = 0;
+
 /// Commands sent into an agent actor's mailbox.
 ///
 /// `Clone` and `Debug` because one travels *back* out of an actor: a parent
@@ -507,6 +517,33 @@ pub enum AgentMsg {
     /// shared-workspace guard would miss a sibling that is working (audit of the
     /// prompt vs behaviour, row 1).
     ChildRunning { id: u64 },
+    /// A child's live mailbox, handed to a parent whose books hold the sender a
+    /// revival replaced. `agent::revive` builds a *new* mailbox every time a
+    /// parked child is woken, and the tree swaps it in — the parent's
+    /// `children` book is the only copy of the old one, and without this it
+    /// stays there for the rest of the session, so every later `control` from
+    /// that parent finds no actor and takes the wake path again (finding H22).
+    /// The message lands either way, which is why the stale sender was easy to
+    /// leave; the honest book is written here.
+    ChildMailbox { id: u64, cmd: Sender<AgentMsg> },
+    /// A row the tree holds for a child this parent's books do not name: a
+    /// parent restored from a stored session is revived with empty books while
+    /// its children's rows are on screen, so `status` answered "no children"
+    /// and `control` refused a child the human could see (finding H25). The
+    /// books live in the actor, so the tree's row travels as a message; the
+    /// outcome (when the tree has one) is recorded under a run no actor can
+    /// report, and `read` is the row's `✉` mark.
+    ChildBook {
+        id: u64,
+        cmd: Sender<AgentMsg>,
+        outcome: Option<Outcome>,
+        read: bool,
+        shared: bool,
+    },
+    /// The tree has forgotten this child — the history window's reap — so the
+    /// parent drops it from its books: `status` cannot list a row that is not
+    /// on screen and `control` cannot aim at a ghost (finding H19).
+    ForgetChild { id: u64 },
     /// A child whose actor thread the UI reclaimed: its node, id and transcript
     /// stayed exactly where they were (`App::park_history`), and the thread that
     /// knew them is gone.
@@ -771,6 +808,16 @@ struct ActorState {
     /// one-shared-child rule is about: an isolated sibling edits its own tree
     /// and conflicts with nothing here (audit row 7).
     shared: HashSet<u64>,
+    /// The children the history window has reaped: their ids, remembered so a
+    /// report still travelling from one of them cannot re-open books the reap
+    /// closed (`AgentMsg::ForgetChild`). The ids are never reused (`crate::ids`
+    /// hands out one number per agent), so the memory cannot name a *new* child
+    /// by mistake. One `u64` per forgotten child, held until the tree hands the
+    /// row *back* ([`note_child_book`]): a row can only be handed
+    /// over for a node that exists, so it is proof the forget has gone stale,
+    /// and the tombstone goes with the books it closed. Until then nothing
+    /// clears it — a report can be in flight for as long as an actor lives.
+    forgotten: HashSet<u64>,
     /// How each child's last finished run left its worktree, keyed by the run
     /// that left it: the branch, and whether the work is committed. A listing
     /// fact (`status`), never a delivery: reading it marks nothing, and
@@ -839,6 +886,20 @@ impl ActorState {
         }
     }
 
+    /// Whether the tree has forgotten `id` — a child the history window reaped
+    /// (`AgentMsg::ForgetChild`).
+    ///
+    /// `children` is the book that names this parent's children; this is the
+    /// memory that the book was *closed* for an id, so the once-only delivery
+    /// rule has an other end: the same run reported twice is swallowed by
+    /// `delivered` (`docs/findings.md` B24), while a report from a forgotten
+    /// child is not delivered at all — there is no row it could be read
+    /// against, and folding it would put a line about a child nobody can see
+    /// into the parent's transcript.
+    fn is_forgotten(&self, id: u64) -> bool {
+        self.forgotten.contains(&id)
+    }
+
     /// Record a child's completion and say whether its line is *fresh* — one
     /// the model has not read yet: `(line, fresh)`. The record is kept either
     /// way (it is what makes a *later* run newsworthy), and a fresh line is
@@ -850,7 +911,10 @@ impl ActorState {
     /// the model a line it has answered (`docs/findings.md` B24).
     fn record_child(&mut self, id: u64, run: u64, outcome: Outcome) -> (String, bool) {
         let line = note_completion(self, id, run, outcome);
-        if self.delivered.get(&id) == Some(&run) {
+        // A report from a child the tree has forgotten is not a delivery: there
+        // is no row it could be read against (`is_forgotten`), and delivering
+        // it would re-open a book the reap just closed.
+        if self.is_forgotten(id) || self.delivered.get(&id) == Some(&run) {
             return (line, false);
         }
         self.delivered.insert(id, run);
@@ -1603,7 +1667,34 @@ fn absorb(
         // A child the human resumed begins a run: the parent's books follow,
         // and nothing else happens — no line, no wake (audit row 1).
         AgentMsg::ChildRunning { id } => {
-            state.running.insert(id);
+            note_running(state, id);
+            Fold::Idle
+        }
+        // The mailbox of a child the parent already knows is live again: the
+        // book is refreshed, nothing is delivered and no run is started — a
+        // book-keeping command, so an idle parent stays idle (finding H22).
+        AgentMsg::ChildMailbox { id, cmd } => {
+            note_mailbox(state, id, cmd);
+            Fold::Idle
+        }
+        // The row of a child the books have never held: seeded where the actor
+        // learns who its children are, so `status` and `control` agree with
+        // the rows on screen instead of assuming empty books (finding H25).
+        AgentMsg::ChildBook {
+            id,
+            cmd,
+            outcome,
+            read,
+            shared,
+        } => {
+            note_child_book(state, id, cmd, outcome, read, shared);
+            Fold::Idle
+        }
+        // The history window has forgotten this child: its row is off the
+        // screen, so the books that name it go too (finding H19). Nothing is
+        // folded and nothing ends: this is a book-keeping command.
+        AgentMsg::ForgetChild { id } => {
+            forget_child(state, id);
             Fold::Idle
         }
         AgentMsg::CommandDone { id, line, news } => {
@@ -2574,9 +2665,22 @@ fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
             AgentMsg::ChildParked { id } => note_parked(state, id),
             // A child the human resumed. Nothing to fold: the parent's book of
             // what is running is the whole point (audit row 1).
-            AgentMsg::ChildRunning { id } => {
-                state.running.insert(id);
-            }
+            AgentMsg::ChildRunning { id } => note_running(state, id),
+            // A book-keeping command, honoured mid-run like `ChildParked`: the
+            // parent's mailbox for a live child, or a row seeded from the tree,
+            // or a child the tree has forgotten. None of the three is work to
+            // fold, and none of them may wait for a message boundary — the
+            // books are what a `wait`/`control` inside this same run reads
+            // (`run_loop`'s boundaries drain this queue first).
+            AgentMsg::ChildMailbox { id, cmd } => note_mailbox(state, id, cmd),
+            AgentMsg::ChildBook {
+                id,
+                cmd,
+                outcome,
+                read,
+                shared,
+            } => note_child_book(state, id, cmd, outcome, read, shared),
+            AgentMsg::ForgetChild { id } => forget_child(state, id),
             AgentMsg::CommandDone { id, line, news } => {
                 note_job(state, id, line, news);
             }
@@ -2646,9 +2750,19 @@ fn drain_mailbox(
             AgentMsg::ChildParked { id } => note_parked(state, id),
             // A child the human resumed: the parent's books say it is running
             // again, and nothing enters the transcript (audit row 1).
-            AgentMsg::ChildRunning { id } => {
-                state.running.insert(id);
-            }
+            AgentMsg::ChildRunning { id } => note_running(state, id),
+            // The three book-keeping commands, at a message boundary as in the
+            // idle drain: none of them is a line for the transcript (findings
+            // H19, H22, H25).
+            AgentMsg::ChildMailbox { id, cmd } => note_mailbox(state, id, cmd),
+            AgentMsg::ChildBook {
+                id,
+                cmd,
+                outcome,
+                read,
+                shared,
+            } => note_child_book(state, id, cmd, outcome, read, shared),
+            AgentMsg::ForgetChild { id } => forget_child(state, id),
             // A job's report is folded into the transcript as a user message:
             // the model reads `#c2 done: exit 0 · …` in the next request, and
             // the line is marked delivered so it is never injected twice. A
@@ -2684,11 +2798,124 @@ fn drain_mailbox(
 /// audit row 1).
 fn note_completion(state: &mut ActorState, id: u64, run: u64, outcome: Outcome) -> String {
     let line = outcome.line(id);
+    // A report from a child the history window has forgotten is not this
+    // parent's news (`AgentMsg::ForgetChild`): recording it would re-open a
+    // book no reader can reach and arm a fold the tree has no row for.
+    if state.is_forgotten(id) {
+        return line;
+    }
     if state.completed.get(&id).map(|completion| completion.run) != Some(run) {
         state.running.remove(&id);
         state.completed.insert(id, Completion { run, outcome });
     }
     line
+}
+
+/// Write a child's live mailbox into the parent's books (finding H22).
+///
+/// A revival builds the child a fresh `Sender<AgentMsg>` and the tree swaps it
+/// in (`App::deliver_to_actor`); the parent's `ActorState::children` still holds
+/// the dead one, so its next `control` finds no actor and takes the wake path
+/// again — and again, for the rest of the session. The message lands either
+/// way, which is why the stale sender was easy to leave; the book is written
+/// here, where the mailbox changes hands, and nowhere else.
+fn note_mailbox(state: &mut ActorState, id: u64, cmd: Sender<AgentMsg>) {
+    // A child the tree has dropped has no row a mailbox could belong to, and
+    // the tombstone is the last word about it: writing the book back would put
+    // a name into `status` with nothing on screen behind it, and hand `control`
+    // an actor nobody can see. The rule the other books of a child follow
+    // (`note_running`, `note_work`, `record_child`) belongs on this one too;
+    // only `note_child_book` clears a tombstone, by handing the row back.
+    if state.is_forgotten(id) {
+        return;
+    }
+    state.children.insert(id, cmd);
+}
+
+/// Seed a child's books from the row the tree holds for it (finding H25).
+///
+/// A parent restored from a stored session is revived with an empty
+/// `ActorState` while its children's rows are on screen: `status` answered "no
+/// children and no jobs" and `control` refused a child the human could see.
+/// The books live in the actor and the rows in the UI, so the UI hands the row
+/// over — which is why this is a message, and not a second read of the tree
+/// from inside the actor.
+///
+/// The outcome is recorded under [`NO_RUN`]: the run the tree's row reports is
+/// one no actor in this process has numbered, and the child's next report must
+/// not be swallowed as a run the books have already read (`note_parked` makes
+/// the same move for the same reason). `read` is whether the row's result has
+/// already been read — the `✉` is the mark that it has *not* — so an unread
+/// result stays unread and a `wait` hands it over exactly once.
+fn note_child_book(
+    state: &mut ActorState,
+    id: u64,
+    cmd: Sender<AgentMsg>,
+    outcome: Option<Outcome>,
+    read: bool,
+    shared: bool,
+) {
+    state.children.insert(id, cmd);
+    // The tree naming the child is the one proof that an earlier forget is
+    // stale — a row can only be handed over for a node that exists — so the
+    // tombstone goes with the books it closed.
+    state.forgotten.remove(&id);
+    // A child with no branch of its own runs in its parent's workspace: the
+    // one-shared-child rule and `control`'s worktree check both read this book.
+    if shared {
+        state.shared.insert(id);
+    }
+    if let Some(outcome) = outcome {
+        note_completion(state, id, NO_RUN, outcome);
+        if read {
+            state.delivered.insert(id, NO_RUN);
+        }
+    }
+}
+
+/// Drop a child from the parent's books: the history window has forgotten it
+/// (`App::reap_history`), so its row is off the screen and nothing about it may
+/// be named again (finding H19).
+///
+/// The books are the actor's, so the UI can only *ask*: the message is sent
+/// into the parent's mailbox, and a send that finds no actor is dropped on the
+/// floor. That is the intended answer — a dormant parent has no books left to
+/// correct — and it is why a parent whose session is restored later re-derives
+/// them from the tree (`note_child_book`) rather than trusting a name that
+/// outlived its row.
+///
+/// `children` goes first, because it is the book that says whose reports are
+/// news. The id then goes into `forgotten`, which is what keeps it so: a
+/// forgotten child must not be able to re-deliver anything, and after this
+/// there is no book left to deliver into *and* no report of its that any road
+/// will accept. Every other per-child book follows, so no listing (`work`,
+/// `completed`), no wait (`running`) and no shared-workspace guard (`shared`)
+/// can read a child the tree has dropped.
+fn forget_child(state: &mut ActorState, id: u64) {
+    state.children.remove(&id);
+    state.forgotten.insert(id);
+    state.completed.remove(&id);
+    state.delivered.remove(&id);
+    state.running.remove(&id);
+    state.shared.remove(&id);
+    state.work.remove(&id);
+}
+
+/// A child the human resumed begins a run: the parent's books say it is
+/// running, and nothing enters the transcript (audit row 1).
+///
+/// A resume sent before the reap and drained after it would otherwise write a
+/// running entry back into books the tree has closed — the one book with no
+/// row to list it under, since `status`, `wait` and the shared-workspace guard
+/// all read `running` *through* `children` or `shared`, which
+/// [`forget_child`] has emptied. `reclaim_own_worktree` is the exception: it
+/// counts the set itself, so the ghost would pin this actor's worktree for the
+/// rest of the session.
+fn note_running(state: &mut ActorState, id: u64) {
+    if state.is_forgotten(id) {
+        return;
+    }
+    state.running.insert(id);
 }
 
 /// The books of a child whose actor thread was parked and replaced.
@@ -2708,9 +2935,7 @@ fn note_completion(state: &mut ActorState, id: u64, run: u64, outcome: Outcome) 
 /// pair (outcome, delivered) moves together, so the fact that the parent has
 /// seen this result is exactly as true as it was a moment ago.
 fn note_parked(state: &mut ActorState, id: u64) {
-    // A run number no actor reports: `ActorState::runs` starts at 0 and is
-    // incremented before the report, so the first run is always 1.
-    const NO_RUN: u64 = 0;
+    // A run number no actor reports: see [`NO_RUN`].
     if let Some(completion) = state.completed.get_mut(&id) {
         completion.run = NO_RUN;
     }
@@ -2735,6 +2960,12 @@ fn note_parked(state: &mut ActorState, id: u64) {
 /// fact survives: a `Work` is never delivered (nothing reads it as a result),
 /// so this is a plain latest-value book (finding H1).
 fn note_work(state: &mut ActorState, id: u64, run: u64, work: Work) {
+    // A worktree fact for a forgotten child has no row to be listed under
+    // (`AgentMsg::ForgetChild`), and the entry would sit there for the life of
+    // the actor.
+    if state.is_forgotten(id) {
+        return;
+    }
     match state.work.get(&id) {
         Some((known, _)) if *known > run => {}
         _ => {
@@ -3849,6 +4080,12 @@ enum Ended {
     /// number no command returns, and it told a crash and an OOM kill apart
     /// from neither (finding B6).
     Signalled(i32),
+    /// The platform's status named neither an exit code nor a signal
+    /// ([`End::Unknown`]). A state of its own, not the `-1` sentinel
+    /// that read as a real exit code (finding H26); no child mush starts
+    /// produces such a status, and a seam that is handed one says so rather than
+    /// naming a number nothing returned.
+    Unknown,
     /// mush stopped it. The reason is [`jobs::Stopped`]'s, not a second copy of
     /// the same three variants: the watcher already decides between them with
     /// `jobs::stopping`, and a fourth reason added there must reach the model's
@@ -3947,6 +4184,12 @@ fn end_note(ended: &Ended, timeout: Duration, detachable: bool, cap: usize) -> S
         // `[exit -1]` was this arm's spelling for a `SIGSEGV` and for an OOM
         // kill alike, and it read as the command's own doing (finding B6).
         Ended::Signalled(signal) => format!("[killed by signal {signal}]"),
+        // Neither a code nor a signal: the state names what is unknown rather
+        // than the `-1` sentinel, which read as a code a command can return
+        // (finding H26). No child mush starts ends this way — `machine::ended`
+        // reads an exit or a death by signal from the statuses `wait` produces —
+        // and the arm is honest anyway.
+        Ended::Unknown => "[no exit status: neither an exit code nor a signal]".to_string(),
         Ended::Stopped(jobs::Stopped::TimedOut) => {
             let mut note = format!("[timed out after {}s", timeout.as_secs());
             // The one case where "a long command detaches by itself" cannot
@@ -4047,6 +4290,7 @@ fn wait_bounded(
         match job.poll() {
             Ok(Some(End::Exited(code))) => return Ok(Ended::Exited(code)),
             Ok(Some(End::Signalled(signal))) => return Ok(Ended::Signalled(signal)),
+            Ok(Some(End::Unknown)) => return Ok(Ended::Unknown),
             Ok(None) => {}
             Err(error) => {
                 // Never leave a running process behind on an error path.
@@ -5310,6 +5554,319 @@ mod tests {
             state.outcome(1).is_some(),
             "and the listing still names the child by its last outcome"
         );
+    }
+
+    /// The history window reaped a child: its row is off the screen and the
+    /// tree has forgotten its id, so the parent's books have to let go of it
+    /// too — `status` listed a row nobody could see and `control` aimed at a
+    /// ghost (finding H19).
+    ///
+    /// Every per-child book goes, and a report already in flight when the row
+    /// went is swallowed rather than writing one back: the books are the only
+    /// place an id can be named, and after this there is none.
+    #[test]
+    fn forgetting_a_child_drops_its_books_and_swallows_a_late_report() {
+        let (actor, _mailbox) = test_actor("forget-books");
+        let mut state = ActorState::default();
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+        state.shared.insert(1);
+        state.running.insert(1);
+        note_completion(
+            &mut state,
+            1,
+            1,
+            Outcome::Finished("wrote the lexer".into()),
+        );
+        note_work(
+            &mut state,
+            1,
+            1,
+            Work::Clean {
+                branch: "mush/1".into(),
+            },
+        );
+        assert!(
+            status_tool(&actor, &state).unwrap().contains("#1 ✓"),
+            "a child with books reads as one"
+        );
+
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ForgetChild { id: 1 },
+        );
+
+        assert_eq!(
+            status_tool(&actor, &state).unwrap(),
+            "no children and no jobs",
+            "the listing names nothing the tree has dropped"
+        );
+        assert!(
+            state.children.is_empty()
+                && state.completed.is_empty()
+                && state.delivered.is_empty()
+                && state.running.is_empty()
+                && state.shared.is_empty()
+                && state.work.is_empty(),
+            "every book that is keyed by a child id goes with the row"
+        );
+
+        // The report was already on its way: it is not news, and it cannot
+        // re-open the child it names.
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ChildDone {
+                id: 1,
+                run: 1,
+                outcome: Outcome::Finished("and the parser".into()),
+            },
+        );
+        assert!(state.completed.is_empty(), "no book for a forgotten child");
+        let mut messages = vec![Message::system("you are mush")];
+        assert!(
+            !fold_completions(&actor, &mut state, &mut messages),
+            "and nothing to fold"
+        );
+        assert_eq!(messages.len(), 1, "no line for a child nobody can see");
+
+        // Nor does the run that started just before the reap come back:
+        // `reclaim_own_worktree` counts `running` itself rather than reading it
+        // through a book a forget empties, so a ghost entry would pin this
+        // actor's worktree for the rest of the session.
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ChildRunning { id: 1 },
+        );
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::Work {
+                id: 1,
+                run: 1,
+                work: Work::Clean {
+                    branch: "mush/1".into(),
+                },
+            },
+        );
+        assert!(
+            state.running.is_empty() && state.work.is_empty(),
+            "the tree has no row to list either fact under"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A forget is not permanent: the tree is the truth about which rows exist,
+    /// so a row handed over afterwards is proof the earlier forget is stale and
+    /// the child is bookable again — otherwise a reap that outran a restore
+    /// would leave the parent unable to name a child it can see (findings H19,
+    /// H25).
+    #[test]
+    fn a_row_handed_over_after_a_forget_reopens_the_child() {
+        let (actor, _mailbox) = test_actor("forget-then-row");
+        let mut state = ActorState::default();
+        let (dead, dead_rx) = crossbeam_channel::unbounded();
+        drop(dead_rx);
+        state.children.insert(1, dead);
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ForgetChild { id: 1 },
+        );
+        assert_eq!(
+            status_tool(&actor, &state).unwrap(),
+            "no children and no jobs"
+        );
+
+        let (live, live_rx) = crossbeam_channel::unbounded();
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ChildBook {
+                id: 1,
+                cmd: live,
+                outcome: Some(Outcome::Finished("wrote the lexer".into())),
+                read: true,
+                shared: true,
+            },
+        );
+
+        let lines = status_tool(&actor, &state).unwrap();
+        assert!(
+            lines.contains("#1 ✓ wrote the lexer"),
+            "the row is on screen, so it is in the books: {lines}"
+        );
+        assert!(
+            state.shared.contains(&1),
+            "and the books know it runs in this workspace"
+        );
+        let sent = message_agent(&actor, &mut state, &json!({ "text": "more" }), 1).unwrap();
+        assert!(sent.contains("messaged agent #1"), "{sent}");
+        assert!(
+            matches!(live_rx.try_recv(), Ok(AgentMsg::Steer(text)) if text == "more"),
+            "the row's mailbox is the live one"
+        );
+
+        // The tombstone goes with the closed books, not with the id: the child
+        // is bookable again, so a run of it that starts, reports and works is
+        // recorded rather than swallowed as a report of something the tree has
+        // already dropped.
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ChildRunning { id: 1 },
+        );
+        assert!(
+            state.running.contains(&1),
+            "the run just started is booked as started: {:?}",
+            state.running
+        );
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::Work {
+                id: 1,
+                run: 2,
+                work: Work::Clean {
+                    branch: "mush/1".into(),
+                },
+            },
+        );
+        let mut folded = Vec::new();
+        absorb(
+            &actor,
+            &mut state,
+            &mut folded,
+            AgentMsg::ChildDone {
+                id: 1,
+                run: 2,
+                outcome: Outcome::Finished("and the parser".into()),
+            },
+        );
+        let mut messages = vec![Message::system("you are mush")];
+        assert!(
+            state.work.contains_key(&1),
+            "a live row's work is listed again: {:?}",
+            state.work.keys()
+        );
+        assert!(
+            state.completed.get(&1).map(|done| done.run) == Some(2),
+            "and its report is recorded rather than swallowed as the tree's"
+        );
+        assert!(
+            folded.iter().any(|m| m.text().contains("and the parser")),
+            "the line reaches the transcript: {folded:?}"
+        );
+        assert!(
+            !fold_completions(&actor, &mut state, &mut messages),
+            "and a report delivered once is not delivered again"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A mailbox handed over for a child the tree has already dropped keeps no
+    /// book: the tombstone is the last word, and the one thing that clears it
+    /// is the tree handing the row back (finding H19).
+    ///
+    /// The other three books a revival can touch are guarded the same way
+    /// (`note_running`, `note_work`, `record_child`); a `ChildMailbox` that
+    /// slipped past its tombstone would name a child in `status` with no row
+    /// on screen to point at, which is exactly what the reap emptied the books
+    /// to prevent.
+    #[test]
+    fn a_forgotten_child_handed_a_mailbox_keeps_no_book() {
+        let (actor, _mailbox) = test_actor("forget-mailbox");
+        let mut state = ActorState::default();
+        let (dead, dead_rx) = crossbeam_channel::unbounded();
+        drop(dead_rx);
+        state.children.insert(1, dead);
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ForgetChild { id: 1 },
+        );
+        assert_eq!(
+            status_tool(&actor, &state).unwrap(),
+            "no children and no jobs",
+            "the row is off the screen and the book is closed"
+        );
+
+        // The revive was already in flight when the row went: the tree swapped
+        // the child's mailbox and told the parent which sender is live.
+        let (live, live_rx) = crossbeam_channel::unbounded();
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ChildMailbox { id: 1, cmd: live },
+        );
+
+        assert!(
+            state.children.is_empty(),
+            "no book for a forgotten child: {:?}",
+            state.children.keys()
+        );
+        assert_eq!(
+            status_tool(&actor, &state).unwrap(),
+            "no children and no jobs",
+            "so the listing still names nothing the tree has dropped"
+        );
+        assert!(
+            state.is_forgotten(1),
+            "and the tombstone stands: only the row handed back clears one"
+        );
+        drop(live_rx);
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The actor thread of a parked child is replaced when a parent's `control`
+    /// wakes it, and the revival builds a *new* mailbox. The parent's `children`
+    /// book kept the dead sender, so its next message found no actor and took
+    /// the wake path again — every time, for the rest of the session, while the
+    /// message landed anyway (finding H22). `ChildMailbox` is the tree saying
+    /// which sender is live, and the reply tells the parent which half of the
+    /// `messaged` contract it got.
+    #[test]
+    fn a_revived_childs_mailbox_replaces_the_dead_one_in_the_parents_books() {
+        let (actor, _mailbox) = test_actor("child-mailbox");
+        let mut state = ActorState::default();
+        let (dead, dead_rx) = crossbeam_channel::unbounded();
+        drop(dead_rx);
+        state.children.insert(1, dead);
+        // A shared child has no worktree of its own, so this parent's own
+        // workspace is where its runs write — which is still there.
+        state.shared.insert(1);
+        state.running.insert(1);
+
+        let (live, live_rx) = crossbeam_channel::unbounded();
+        absorb(
+            &actor,
+            &mut state,
+            &mut Vec::new(),
+            AgentMsg::ChildMailbox { id: 1, cmd: live },
+        );
+
+        let said = message_agent(&actor, &mut state, &json!({ "text": "keep going" }), 1).unwrap();
+        assert!(
+            said.starts_with("messaged agent #1 — it is mid-run"),
+            "the words reached the live actor rather than the park path: {said}"
+        );
+        assert!(
+            matches!(live_rx.try_recv(), Ok(AgentMsg::Steer(text)) if text == "keep going"),
+            "the live mailbox is the one the books hold"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// The batch the human saw: three children failed while the parent worked,
@@ -8150,10 +8707,11 @@ mod tests {
         }
 
         // And every arm of the table has its own sentence: the three ways the
-        // watcher stops a command, an exit, the signal that killed it, and the
-        // end that is not one — a command handed to the job registry, which
+        // watcher stops a command, an exit, the signal that killed it, the end
+        // that is not one — a command handed to the job registry, which
         // `run_shell` returns from before it builds a report, so no run reads it
-        // (refactor R15).
+        // — and the nameless end a platform with no exit status produces, which
+        // no unix child can (refactor R15, finding H26).
         let notes = vec![
             end_note(&Ended::Exited(0), minute, true, mush_core::CMD_CAP),
             end_note(&Ended::Signalled(9), minute, true, mush_core::CMD_CAP),
@@ -8182,6 +8740,7 @@ mod tests {
                 mush_core::CMD_CAP,
             ),
             end_note(&Ended::Detached, minute, true, mush_core::CMD_CAP),
+            end_note(&Ended::Unknown, minute, true, mush_core::CMD_CAP),
         ];
         let mut unique = notes.clone();
         unique.sort();
@@ -8208,6 +8767,10 @@ mod tests {
             notes[6].contains("registry"),
             "a detached command is not a timed-out one: {}",
             notes[6]
+        );
+        assert_eq!(
+            notes[7], "[no exit status: neither an exit code nor a signal]",
+            "an end with no status says so instead of naming a code nothing returns"
         );
         // The timeout's sentence says why it could not detach when the budget
         // was the reason.

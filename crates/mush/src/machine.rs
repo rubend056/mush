@@ -48,6 +48,13 @@ pub enum End {
     Exited(i32),
     /// A signal killed it, and this is the signal's number.
     Signalled(i32),
+    /// The status names neither an exit code nor a signal. A state of its own
+    /// rather than a sentinel code: `-1` was the old spelling and it reads as a
+    /// real exit code, one a reader could act on (finding H26). A stopped wait
+    /// status with no stop signal is one such status — `code` and `signal` both
+    /// answer `None` for it — and what this buys is that the machine says so
+    /// instead of naming a number nothing returned.
+    Unknown,
 }
 
 /// One command that has started, as the watcher sees it.
@@ -133,10 +140,15 @@ fn ended(status: ExitStatus) -> End {
             return End::Signalled(signal);
         }
     }
-    // Neither an exit code nor a signal: no unix child produces one, so this is
-    // the old spelling kept as the last resort for a status that cannot happen
-    // — not the name for a signal death, which is the arm above.
-    End::Exited(status.code().unwrap_or(-1))
+    // Neither an exit code nor a signal — the `-1` that used to stand here read
+    // as a code a command could have returned. Every child `mush` starts ends
+    // one of two ways (an exit, or a death by signal), but this seam takes any
+    // status a platform can produce, and a stopped status with no stop signal is
+    // one that names neither: the honest answer is a state that says unknown.
+    match status.code() {
+        Some(code) => End::Exited(code),
+        None => End::Unknown,
+    }
 }
 
 impl Job for Running {
@@ -449,5 +461,26 @@ mod tests {
         assert_eq!(ended(ExitStatus::from_raw(0)), End::Exited(0));
         assert_eq!(ended(ExitStatus::from_raw(9)), End::Signalled(9));
         assert_eq!(ended(ExitStatus::from_raw(11)), End::Signalled(11));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_status_that_names_no_end_is_not_read_as_a_code() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        // A stopped wait status with no stop signal (`WIFSTOPPED` with
+        // `WSTOPSIG` zero) is the one status that is neither: `code()` and
+        // `signal()` both answer `None` for it. The old last resort spelled it
+        // `Exited(-1)` — a code no command returns and one a reader could act on
+        // — and its own state is the whole point (finding H26).
+        let nameless = ExitStatus::from_raw(0x7f);
+        assert_eq!(nameless.code(), None);
+        assert_eq!(nameless.signal(), None);
+        assert_eq!(ended(nameless), End::Unknown);
+        assert!(
+            !matches!(ended(nameless), End::Exited(_)),
+            "an unknown end is not an exit code spelled -1"
+        );
     }
 }
