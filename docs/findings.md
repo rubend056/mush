@@ -649,9 +649,12 @@ cost — the cost is the *size of what each save carries*.
   gone.
 - `MAX_WORKTREES = 70` — above the 50-child window, so reaping history can
   never be what refuses a spawn.
-- Jobs: a 4-hour ceiling and 200 concurrent, with the per-command output budget
-  made shared rather than per-job (200 x `CMD_OUTPUT_LIMIT` = 8 MiB would
-  otherwise be a legal 1.6 GiB of scratch).
+- Jobs: **the concurrency cap stays at 8**, plus a 4-hour age ceiling. The
+  human's first answer was 200 concurrent; the arithmetic killed it — scratch is
+  8 MiB per command (`CMD_OUTPUT_LIMIT`), so 200 jobs is a legal 1.6 GiB of
+  `/tmp`, where 8 jobs beside at most 16 foreground commands is about 192 MiB.
+  *Everything needs a cap, even a high one* — but the cap has to bound the thing
+  it multiplies.
 - Worktree reclamation is automatic **merged-or-clean only**: an unmerged or
   dirty branch is kept and named, and mush never merges anything itself.
 
