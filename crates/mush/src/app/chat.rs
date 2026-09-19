@@ -54,7 +54,8 @@ use mush_core::text::{truncate, wrap_text, wrap_text_capped};
 use crate::agent::summarize_args;
 use crate::app::keys::ChatKey;
 use crate::app::short_age;
-use crate::app::tree::{AgentId, Compacting};
+use crate::app::tree::Compacting;
+use crate::ids::AgentId;
 use crate::input::Input;
 use crate::ui::dim;
 
@@ -916,7 +917,7 @@ impl Chat {
         let mut title = if pane.agent == AgentId::ROOT {
             " mush ".to_string()
         } else {
-            format!(" agent #{} ", pane.agent)
+            format!(" agent {} ", pane.agent)
         };
         // A pane with no row to spare for the foot's own count line is the case
         // the title exists for: wherever the human looks, the pane says how
@@ -972,7 +973,7 @@ impl Chat {
                 ]
             } else {
                 vec![format!(
-                    "Agent #{} has no messages yet — typing here sends it a nudge.",
+                    "Agent {} has no messages yet — typing here sends it a nudge.",
                     pane.agent
                 )]
             };

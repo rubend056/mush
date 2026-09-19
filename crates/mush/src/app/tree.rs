@@ -9,7 +9,6 @@
 //! said is not here: that is the conversation, and it lives in [`super::chat`].
 
 use std::collections::HashMap;
-use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -23,27 +22,8 @@ use mush_core::text::truncate;
 use mush_core::tools::ToolName;
 
 use crate::agent::{AgentMsg, RootHandle, TreeHandles};
+use crate::ids::{AgentId, Ids};
 use crate::jobs::{self, JobView};
-
-/// Which agent, in the tree.
-///
-/// Ids used to be bare `u64`s, shared with branch names (`mush/7`) and with the
-/// conversation tag, so `Msg::Agent` took two indistinguishable numbers and
-/// `discover_worktrees` could hand a fresh child an id a leftover already held
-/// (finding B1). With a newtype the two cannot be swapped by accident.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct AgentId(pub u64);
-
-impl AgentId {
-    /// The root agent: the one whose transcript is the chat.
-    pub const ROOT: AgentId = AgentId(0);
-}
-
-impl fmt::Display for AgentId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.0)
-    }
-}
 
 /// Which conversation an agent tree belongs to. One per Ctrl-N, so an event
 /// from an actor left over from the previous chat can be recognised as stale.
@@ -529,11 +509,12 @@ pub struct AgentTree {
     /// Each isolated agent's own work, measured on its branch. Refreshed by
     /// events, never computed while painting.
     pub agent_stats: HashMap<AgentId, git::Stat>,
-    /// The tree's id counter, shared with the actors. Leftover worktrees are
+    /// The tree's id counters, shared with the actors. Leftover worktrees are
     /// registered under their own ids, so the next spawn must start above them
     /// or two nodes share an id and every id-keyed lookup hits the wrong one
-    /// (finding B1).
-    ids: Arc<AtomicU64>,
+    /// (finding B1). A value rather than an `Arc<AtomicU64>`: [`Ids`] owns its
+    /// own sharing, and knows the agent counter from the job one.
+    ids: Ids,
     /// The tree-wide running count, shared with the actors so an agent revived
     /// from a stored session is counted against the ceiling like any other.
     live: Arc<AtomicU64>,
@@ -573,7 +554,7 @@ impl AgentTree {
         std::mem::forget(rx);
         Self::with_root(
             ConversationId(1),
-            Arc::new(AtomicU64::new(1)),
+            Ids::default(),
             Arc::new(AtomicU64::new(0)),
             jobs::Registry::bare(),
             tx,
@@ -582,7 +563,7 @@ impl AgentTree {
 
     fn with_root(
         conversation: ConversationId,
-        ids: Arc<AtomicU64>,
+        ids: Ids,
         live: Arc<AtomicU64>,
         jobs: Arc<jobs::Registry>,
         tx: Sender<AgentMsg>,
@@ -654,11 +635,11 @@ impl AgentTree {
         self.jobs.running()
     }
 
-    /// Keep the id counter above `floor`. A leftover worktree or a restored
+    /// Keep the agent counter above `floor`. A leftover worktree or a restored
     /// agent holds an id the counter has never seen, so the next spawn has to
     /// start above it or two nodes share one (finding B1).
-    pub fn reserve_ids(&mut self, floor: u64) {
-        self.ids.fetch_max(floor, Ordering::SeqCst);
+    pub fn reserve_agents(&mut self, floor: u64) {
+        self.ids.reserve_agents(floor);
     }
 
     /// A child actor now exists. It is thinking (its parent just started it),
@@ -1927,14 +1908,14 @@ mod tests {
         assert_eq!(node.summary.as_deref(), Some("found on startup"));
 
         assert!(
-            tree.handles().ids.load(Ordering::SeqCst) < 8,
+            tree.handles().ids.agents_floor() < 8,
             "registering a node does not move the counter"
         );
-        tree.reserve_ids(8);
-        assert!(tree.handles().ids.load(Ordering::SeqCst) >= 8);
+        tree.reserve_agents(8);
+        assert!(tree.handles().ids.agents_floor() >= 8);
         assert_ne!(
-            tree.handles().ids.fetch_add(1, Ordering::SeqCst),
-            7,
+            tree.handles().ids.next_agent(),
+            AgentId(7),
             "the next spawn must not reuse the leftover's id"
         );
     }

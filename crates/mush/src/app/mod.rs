@@ -23,9 +23,13 @@ pub use chat::{Chat, Pane, Rank};
 pub use screen::{AgentRow, AgentsPane, BarPane, ChatPane, PickerPane, Screen};
 pub use settings::{ConfigCell, ConfigHandle, WindowSource};
 pub use tree::{
-    AgentId, AgentNode, AgentTree, Compacting, ConversationId, Existing, Landed, Phase, Spawn,
-    Stopped,
+    AgentNode, AgentTree, Compacting, ConversationId, Existing, Landed, Phase, Spawn, Stopped,
 };
+
+// The id types live in their own module (two spaces, two newtypes); they keep
+// the `crate::app::` path they had when `tree` defined them, so the many
+// id-taking modules do not each learn a new one.
+pub use crate::ids::AgentId;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -506,7 +510,7 @@ impl App {
         for agent in stored {
             // Keep the counter above every restored id, or the next spawn hands
             // a live child an id a restored agent already holds (finding B1).
-            self.tree.reserve_ids(agent.id + 1);
+            self.tree.reserve_agents(agent.id + 1);
             let (phase, summary) = match &agent.status {
                 session::StoredStatus::Done => (Phase::Done, agent.summary.clone()),
                 session::StoredStatus::Stopped => (Phase::Stopped, agent.summary.clone()),
@@ -700,7 +704,8 @@ impl App {
     /// branches) as finished tree nodes, so a leftover's branch is on its row
     /// after a restart. A registry entry whose checkout is gone is not
     /// work on disk and gets no row — `rm -rf .mush` leaves git naming those
-    /// until they are pruned (finding P13).
+    /// until they are pruned (finding P13) — but its id is still reserved: the
+    /// branch outlives the directory (see the loop below).
     pub fn discover_worktrees(&mut self) {
         let root = self.ws.root().to_path_buf();
         // `None` means git could not answer (no binary, not a repository). The
@@ -726,22 +731,27 @@ impl App {
             .collect();
         self.tree.reap(&gone);
         for worktree in worktrees {
+            let Some(id) = worktree.id else {
+                continue;
+            };
+            // Every id the repository still names raises the floor, checkout or
+            // not — this is the branch half of the invariant in [`crate::ids`].
+            // A `mush/<id>` branch whose directory was removed survives as a
+            // branch, so the next `git worktree add -b mush/<id>` fails on it
+            // even though `on_disk` says there is nothing here; leaving the
+            // number free spends a spawn on a name git will keep refusing
+            // (finding B1, P13). No row is registered for the residue below:
+            // reserving a number claims nothing about work.
+            self.tree.reserve_agents(id + 1);
             // A dead registry entry is git's residue, not a worktree: a row for
             // it would claim a directory that is not there (finding P13).
             if !worktree.on_disk() {
                 continue;
             }
-            let Some(id) = worktree.id else {
-                continue;
-            };
             if self.tree.has(AgentId(id)) {
                 continue;
             }
             let full = git::branch_name(id);
-            // Keep the tree's counter above every registered id, or the next
-            // `spawn_agent` hands a live child an id a leftover already holds
-            // (finding B1).
-            self.tree.reserve_ids(id + 1);
             // The commit mush made for this worktree names the task and how the
             // run ended, so a leftover is shown as the work it is instead of an
             // anonymous placeholder. A branch the human committed to by hand
@@ -983,7 +993,7 @@ impl App {
                 // Only the agent the human is looking at needs the bar; a
                 // stop they did not ask for still shows as ⊘ on its row.
                 if id == self.tree.focused {
-                    self.say(format!("agent #{id} stopped — send a message to resume it"));
+                    self.say(format!("agent {id} stopped — send a message to resume it"));
                 }
             }
             AgentEvent::Error(error) => {
@@ -1001,7 +1011,7 @@ impl App {
                     // `Failed` fell back to the idle hint, so the newest thing
                     // that had happened could be a crash under a line
                     // advertising Ctrl-P.
-                    format!("agent #{id} failed — {error}")
+                    format!("agent {id} failed — {error}")
                 });
                 // The durable half too: the row's `✗` is derived and dies with
                 // the next run, while the notice is tagged, stamped and written
@@ -1150,7 +1160,7 @@ impl App {
         if id == self.tree.focused {
             self.say(text);
         } else {
-            self.say(format!("agent #{id}: {text}"));
+            self.say(format!("agent {id}: {text}"));
         }
     }
 
@@ -1295,7 +1305,7 @@ impl App {
             .and_then(|node| node.phase.compacting())
         {
             return Some(format!(
-                "{} #{focused} · keep typing — your message is answered after the fold",
+                "{} {focused} · keep typing — your message is answered after the fold",
                 kind.verb()
             ));
         }
@@ -1395,14 +1405,14 @@ impl App {
         let node = self.tree.node(id)?;
         if let Some(landed) = node.landed {
             return Some(format!(
-                "agent #{id} was {} — its worktree is gone; \
+                "agent {id} was {} — its worktree is gone; \
                  spawn a fresh agent or work in the root",
                 landed.past()
             ));
         }
         if node.branch.is_some() && !git::worktree_path(self.ws.root(), id.0).exists() {
             return Some(format!(
-                "agent #{id}'s worktree is gone — spawn a fresh agent or work in the root"
+                "agent {id}'s worktree is gone — spawn a fresh agent or work in the root"
             ));
         }
         None
@@ -1580,7 +1590,7 @@ impl App {
     fn attach_read(&self, agent: u64, since: usize) -> attach::Reply {
         let id = AgentId(agent);
         if !self.tree.has(id) {
-            return attach::Reply::Err(attach::ReplyError::bad_request(format!("no agent #{id}")));
+            return attach::Reply::Err(attach::ReplyError::bad_request(format!("no agent {id}")));
         }
         let lines: Vec<serde_json::Value> = self
             .chat
@@ -1679,7 +1689,7 @@ impl App {
         // was a second answer that agrees only while `rows()` paints every node
         // (refactor R24).
         if !self.tree.point_cursor_at(id) {
-            return attach::Reply::Err(attach::ReplyError::bad_request(format!("no agent #{id}")));
+            return attach::Reply::Err(attach::ReplyError::bad_request(format!("no agent {id}")));
         }
         self.focus_cursor_row();
         attach::Reply::Ok(serde_json::json!({}))
@@ -1699,7 +1709,7 @@ impl App {
     ) -> attach::Reply {
         let id = AgentId(agent);
         if !self.tree.has(id) {
-            return attach::Reply::Err(attach::ReplyError::bad_request(format!("no agent #{id}")));
+            return attach::Reply::Err(attach::ReplyError::bad_request(format!("no agent {id}")));
         }
         let revision = self.chat.revision(id);
         if revision != base {
@@ -1746,7 +1756,7 @@ impl App {
             }
         } else {
             self.chat.set_draft(id, text);
-            self.say(format!("{from}: set the draft for #{id}"));
+            self.say(format!("{from}: set the draft for {id}"));
         }
         attach::Reply::Ok(serde_json::json!({ "revision": self.chat.revision(id) }))
     }
@@ -1943,7 +1953,7 @@ impl App {
         let width = screen::picker_text_width(self.term_width);
         let notes = self.chat.notes_report(agent, session::now_secs(), width);
         if notes.rows.is_empty() {
-            self.say(format!("nothing written about #{agent} yet"));
+            self.say(format!("nothing written about {agent} yet"));
             return;
         }
         self.picker = Some(Picker {
@@ -2088,7 +2098,7 @@ impl App {
                 // verb (refactor R8): a run in flight turns this request into a
                 // `Parked` fold a moment later, whose row says `folding at the
                 // next step…`.
-                self.say(format!("{} #{target}…", Compacting::Requested.verb()));
+                self.say(format!("{} {target}…", Compacting::Requested.verb()));
             }
             _ => self.fail(agent::gone(target)),
         }
@@ -2404,7 +2414,7 @@ impl App {
                 1 => " + 1 job".to_string(),
                 count => format!(" + {count} jobs"),
             };
-            items.push(format!("#{id} {}{jobs}", node.phase.doing()));
+            items.push(format!("{id} {}{jobs}", node.phase.doing()));
         }
         let stray = self
             .tree
@@ -2521,7 +2531,7 @@ impl App {
         }
         let list = ids
             .iter()
-            .map(|id| format!("#{id}"))
+            .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(", ");
         self.say(format!("stopped {} agents ({list})", ids.len()));
@@ -2569,7 +2579,7 @@ impl App {
         self.mark_session_dirty();
         if id == self.tree.focused {
             self.say(format!(
-                "agent #{id} was already gone — its run was cut off, nothing committed"
+                "agent {id} was already gone — its run was cut off, nothing committed"
             ));
         }
         let Some(parent) = self.tree.node(id).and_then(|node| node.parent) else {
@@ -2676,7 +2686,7 @@ impl App {
                 .node(id)
                 .map(|node| node.brief.clone())
                 .unwrap_or_default();
-            self.say(format!("agent #{id}: {brief}"));
+            self.say(format!("agent {id}: {brief}"));
             // A focus change is a read-the-bar moment; refresh the git line so
             // it is current when the human looks (finding P8).
             self.refresh_git();
@@ -2703,7 +2713,7 @@ impl App {
         let working = self.tree.node(id).is_some_and(|node| node.phase.is_busy())
             || !self.tree.live_jobs(id).is_empty();
         if !working {
-            self.say(format!("agent #{id} is not running"));
+            self.say(format!("agent {id} is not running"));
             return;
         }
         // The row's own `⊘` is the feedback; the bar shows what the tree as a
@@ -2769,6 +2779,7 @@ impl Drop for App {
 mod tests {
     use super::*;
     use crate::attach;
+    use crate::ids::JobId;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use crossbeam_channel::Receiver;
@@ -6663,9 +6674,7 @@ mod tests {
         app.tree.cursor_top();
         let top_view = screen(&mut app, 80, 24);
         assert!(
-            !top_view
-                .iter()
-                .any(|row| row.contains(&format!("#{bottom}"))),
+            !top_view.iter().any(|row| row.contains(&bottom.to_string())),
             "the bottom row is outside the pane's window at the top of the list:\n{}",
             top_view.join("\n")
         );
@@ -6680,7 +6689,7 @@ mod tests {
         // highlight alone — no marker beside it.
         let named: Vec<&String> = rows
             .iter()
-            .filter(|row| row.contains(&format!("#{bottom}")))
+            .filter(|row| row.contains(&bottom.to_string()))
             .collect();
         assert!(
             !named.is_empty(),
@@ -6695,7 +6704,7 @@ mod tests {
             rows.join("\n")
         );
         assert!(
-            rows[selected[0]].contains(&format!("#{bottom}")),
+            rows[selected[0]].contains(&bottom.to_string()),
             "and it is the row the pane paints as selected:\n{}",
             rows.join("\n")
         );
@@ -7644,7 +7653,7 @@ mod tests {
         jobbed.on_agent(
             AgentId::ROOT,
             AgentEvent::JobStarted {
-                job: 1,
+                job: JobId(1),
                 command: "cargo build --release".to_string(),
             },
         );
@@ -8855,7 +8864,7 @@ mod tests {
             "the leftover is registered"
         );
         assert!(
-            app.tree.handles().ids.load(Ordering::SeqCst) >= 8,
+            app.tree.handles().ids.agents_floor() >= 8,
             "the next spawn must not reuse #7"
         );
 
@@ -8870,6 +8879,62 @@ mod tests {
             app.tree.focused,
             AgentId::ROOT,
             "focus cannot point at a ghost"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A `mush/<id>` branch whose checkout is gone is not work on disk — no row,
+    /// as `the_roster_does_not_report_a_dead_worktree` says — but it is still
+    /// fatal to the next `git worktree add -b mush/<id>`, because the branch ref
+    /// outlives the directory git registered it against. So the residue raises
+    /// the id floor: the number is spent, the row would be a lie.
+    #[test]
+    fn a_dir_less_branch_raises_the_id_floor_without_a_row() {
+        use std::fs;
+        use std::process::Command;
+
+        let root = std::env::temp_dir().join(format!("mush-app-residue-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let git = |args: &[&str]| {
+            let status = Command::new("git")
+                .arg("-C")
+                .arg(&root)
+                .args(args)
+                .status()
+                .unwrap();
+            assert!(status.success(), "git {args:?} failed");
+        };
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(root.join("a.txt"), "one\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "init"]);
+        git(&["worktree", "add", "-q", "-b", "mush/7", ".mush/wt/7"]);
+        // The directory goes by hand, as `rm -rf .mush` leaves it: git's entry
+        // and the branch stay, and the next `worktree add -b mush/7` refuses.
+        fs::remove_dir_all(root.join(".mush/wt/7")).unwrap();
+        let named = git::worktrees(&root).expect("git answers");
+        let residue = named
+            .iter()
+            .find(|worktree| worktree.id == Some(7))
+            .expect("discovery still sees the entry and its branch");
+        assert!(!residue.on_disk(), "but the checkout is what is gone");
+        assert!(
+            git::run(&root, &["rev-parse", "--verify", "refs/heads/mush/7"]).is_ok(),
+            "and the branch is still there, which is what the next add collides with"
+        );
+
+        let (app, _rx) = app_root(&root, None, session_save::fake::Recorder::new());
+
+        assert!(
+            !app.tree.agents.iter().any(|node| node.id == AgentId(7)),
+            "the residue gets no row"
+        );
+        assert!(
+            app.tree.handles().ids.agents_floor() >= 8,
+            "but its id is not handed to the next child"
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -9125,7 +9190,7 @@ mod tests {
             ),
         ));
         assert_eq!(error.kind, "bad_request", "the sender is told: {error:?}");
-        assert_eq!(error.message, Some(agent::gone(1)));
+        assert_eq!(error.message, Some(agent::gone(AgentId(1))));
 
         assert_eq!(
             text_of(&app),

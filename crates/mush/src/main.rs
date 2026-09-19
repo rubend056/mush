@@ -10,6 +10,7 @@ mod attach;
 mod clock;
 mod events;
 mod http;
+mod ids;
 mod input;
 mod jobs;
 mod machine;

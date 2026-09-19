@@ -30,11 +30,10 @@ use mush_core::transcript::{
 };
 use mush_core::{prompt, tools, Config, Message, Workspace, CMD_TIMEOUT_SECS};
 
-use crate::app::{
-    tokens_label, AgentId, Compacting, ConfigHandle, ConversationId, Msg, WindowSource,
-};
+use crate::app::{tokens_label, Compacting, ConfigHandle, ConversationId, Msg, WindowSource};
 use crate::clock;
 use crate::events::{Events, Ui};
+use crate::ids::{AgentId, Ids, JobId};
 use crate::jobs::{self, Refused};
 use crate::machine::{Job, Machine, Shell, ShellCommand};
 use crate::model::{retrying, HttpModel, ModelClient, ModelError};
@@ -505,8 +504,9 @@ pub enum AgentMsg {
     /// A job this agent started ended. `line` is the report its owner reads,
     /// rendered once by the registry; `news` says whether it is worth waking a
     /// napping agent for (`ChildDone` and `Outcome::is_news` again: a job mush
-    /// killed is the human's doing, not a result).
-    CommandDone { id: u64, line: String, news: bool },
+    /// killed is the human's doing, not a result). A [`JobId`], so a job's
+    /// report can never be filed against a child's id.
+    CommandDone { id: JobId, line: String, news: bool },
 }
 
 /// Events streamed to the UI thread, tagged with the emitting agent's id.
@@ -560,15 +560,17 @@ pub enum AgentEvent {
     Error(String),
     /// A job this agent started began running in the background. The registry
     /// is where a job lives; this is only what tells the screen to look at it.
+    /// The id is a [`JobId`], the type half of the separation `control`'s
+    /// `#2`/`#c2` grammar states in words.
     JobStarted {
-        job: u64,
+        job: JobId,
         command: String,
     },
     /// A job ended, with the line its owner reads (`#c2 done: exit 0 · 3m12s ·
     /// cargo test — …`). Emitted by the job's own thread, so a job that ends
     /// while its owner naps still updates the screen.
     JobDone {
-        job: u64,
+        job: JobId,
         line: String,
     },
     /// The window the endpoint itself named when it rejected a request; the UI
@@ -645,7 +647,10 @@ pub struct AgentCtx {
     pub clock: Arc<dyn clock::Clock>,
     /// The main workspace root; agents whose root differs are isolated.
     pub root: PathBuf,
-    pub ids: Arc<AtomicU64>,
+    /// The conversation's two id counters. A value, not an `Arc<AtomicU64>`:
+    /// [`Ids`] is itself the shared handle (its own clones hand out the same
+    /// numbers), and this is the type that knows a job id from an agent id.
+    pub ids: Ids,
     pub live: Arc<AtomicU64>,
 }
 
@@ -692,10 +697,11 @@ struct ActorState {
     /// child's: delivered once, folded into the transcript, never twice. The
     /// mark is the bare id, not a run: a job ends once, under an id nothing else
     /// reuses, so a report recorded again is the *same* report and there is no
-    /// newer one to re-arm for (`docs/findings.md` B24).
-    running_jobs: HashSet<u64>,
-    done_jobs: HashMap<u64, JobReport>,
-    delivered_jobs: HashSet<u64>,
+    /// newer one to re-arm for (`docs/findings.md` B24). Keyed by [`JobId`] so
+    /// no code path can hand one of these books a child's number.
+    running_jobs: HashSet<JobId>,
+    done_jobs: HashMap<JobId, JobReport>,
+    delivered_jobs: HashSet<JobId>,
     /// How many runs this actor has finished — the identity a parent records on
     /// `ChildDone { run, .. }`. It counts runs, not turns, and is incremented
     /// where the run's outcome is decided.
@@ -795,7 +801,7 @@ impl ActorState {
     /// line when the model has not read it, or `None` when it has — a report
     /// recorded again is the *same* report, and folding it again would repeat a
     /// line the model has answered (`docs/findings.md` B24).
-    fn record_job(&mut self, id: u64, line: String, news: bool) -> Option<String> {
+    fn record_job(&mut self, id: JobId, line: String, news: bool) -> Option<String> {
         let line = note_job(self, id, line, news);
         self.delivered_jobs.insert(id).then_some(line)
     }
@@ -830,13 +836,13 @@ struct Actor {
     rx: Receiver<AgentMsg>,
 }
 
-/// The handles every actor in one tree shares: the id counter it draws from,
+/// The handles every actor in one tree shares: the id counters it draws from,
 /// the running-agent count it respects, and the job registry it starts commands
 /// in. They travel together, because an agent given two of the three is living
 /// in a tree of its own — ids that collide, or a job nobody else can see.
 #[derive(Clone)]
 pub struct TreeHandles {
-    pub ids: Arc<AtomicU64>,
+    pub ids: Ids,
     pub live: Arc<AtomicU64>,
     pub jobs: Arc<jobs::Registry>,
 }
@@ -850,9 +856,9 @@ pub struct RootHandle {
     pub cfg: ConfigHandle,
     /// Identifies this conversation in events; see `agent::next_conversation`.
     pub conversation: u64,
-    /// The tree's id counter, so the UI can raise its floor to the highest id
-    /// a leftover worktree already occupies (finding B1).
-    pub ids: Arc<AtomicU64>,
+    /// The tree's id counters, so the UI can raise the floor above the highest
+    /// id a leftover worktree already occupies (finding B1).
+    pub ids: Ids,
     /// The tree-wide count of running agents, shared so a revived agent is
     /// counted against `MAX_AGENTS` like any other.
     pub live: Arc<AtomicU64>,
@@ -908,7 +914,7 @@ fn root_actor(
 ) -> RootHandle {
     // Root agent is id 0; children start at 1. The UI holds a clone so it can
     // raise the floor above leftover worktree ids.
-    let ids = Arc::new(AtomicU64::new(1));
+    let ids = Ids::default();
     let live = Arc::new(AtomicU64::new(0));
     let clock = Arc::new(clock::System);
     let registry = jobs::Registry::new(clock.clone(), events.clone(), ids.clone());
@@ -1374,7 +1380,7 @@ fn absorb(
             // The same question for jobs, answered on the line itself: it
             // carries the job's id, its exit status, its command and its tail,
             // so a transcript that holds it is a transcript that has read it.
-            let announced_jobs: Vec<u64> = state
+            let announced_jobs: Vec<JobId> = state
                 .done_jobs
                 .iter()
                 .filter(|(_, report)| {
@@ -2505,7 +2511,7 @@ fn note_work(state: &mut ActorState, id: u64, run: u64, work: Work) {
 /// so a report recorded again is the *same* report: the delivery mark stands,
 /// and it is not cleared here. Clearing it unconditionally is what let a job's
 /// line fold twice (`docs/findings.md` B24, `note_completion`'s twin).
-fn note_job(state: &mut ActorState, id: u64, line: String, news: bool) -> String {
+fn note_job(state: &mut ActorState, id: JobId, line: String, news: bool) -> String {
     state.running_jobs.remove(&id);
     state.done_jobs.insert(
         id,
@@ -2550,7 +2556,7 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
     // Jobs first: they are the newest actors, and a job's line is only news if
     // the job ended on its own — one mush killed is the human's or the model's
     // own doing, and its line waits for the next run instead of paying for one.
-    let jobs: Vec<(u64, String, bool)> = state
+    let jobs: Vec<(JobId, String, bool)> = state
         .done_jobs
         .iter()
         .filter(|(job, _)| !state.delivered_jobs.contains(job))
@@ -2690,17 +2696,27 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         }
     }
 
-    let id = ctx.ids.fetch_add(1, Ordering::SeqCst);
+    let id = ctx.ids.next_agent();
     let (child_ws, branch) = match named {
         // A worktree on `mush/<id>`, forked from the base. A base is a promise
         // about history: if git cannot make the worktree, the delegation fails
         // rather than running the brief in the wrong tree (finding H7).
-        Some(name) => match git::worktree_add(&ctx.root, id, base.as_deref()) {
+        //
+        // git is the line `lose_agent` stops at: its refusal means no worktree
+        // and no branch was made, so the number is handed back and the retry
+        // after a bad `base` is consecutive. A failure *after* this arm —
+        // `Workspace::new` — leaves the worktree git just made, so the number
+        // stays spent: the invariant is "reusable only if nothing was created",
+        // and a `mush/<id>` branch is something.
+        Some(name) => match git::worktree_add(&ctx.root, id.0, base.as_deref()) {
             Ok((path, branch)) => match Workspace::new(&path) {
                 Ok(child_ws) => (child_ws, Some(branch)),
                 Err(error) => return Err(format!("cannot start from `{name}`: {error}")),
             },
-            Err(reason) => return Err(format!("cannot start from `{name}`: {reason}")),
+            Err(reason) => {
+                ctx.ids.lose_agent(id);
+                return Err(format!("cannot start from `{name}`: {reason}"));
+            }
         },
         None => (actor.ws.clone(), None),
     };
@@ -2715,7 +2731,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         .unwrap_or_default();
     let at = branch
         .as_ref()
-        .and_then(|_| git::resolve(&git::worktree_path(&ctx.root, id), "HEAD"))
+        .and_then(|_| git::resolve(&git::worktree_path(&ctx.root, id.0), "HEAD"))
         .map(|sha| format!(" at {}", short_revision(&sha)))
         .unwrap_or_default();
     // A child with no base runs in this workspace: it is one of the children
@@ -2728,7 +2744,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     ctx.emit(
         parent,
         AgentEvent::Spawned {
-            child: id,
+            child: id.0,
             parent,
             brief: brief.clone(),
             depth: depth + 1,
@@ -2756,7 +2772,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // mailbox is where this child reports its completion.
     let child = Actor {
         ctx: ctx.clone(),
-        id,
+        id: id.0,
         depth: depth + 1,
         ws: child_ws,
         branch,
@@ -2767,12 +2783,12 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     };
     start(child, initial, true);
 
-    state.children.insert(id, cmd_tx);
-    state.running.insert(id);
+    state.children.insert(id.0, cmd_tx);
+    state.running.insert(id.0);
     // Which children share this workspace: the ones the one-shared-child rule
     // is about.
     if shares_workspace {
-        state.shared.insert(id);
+        state.shared.insert(id.0);
     }
     // A run is bounded by progress, not by a turn count: it ends when the model
     // stops calling tools, and is cut short only if it starts looping
@@ -2780,7 +2796,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // guard far past any real task, so this is not a budget to size a brief
     // against any more.
     Ok(format!(
-        "spawned agent #{id}{on}{at} · runs until it stops calling tools · wait returns its summary"
+        "spawned agent {id}{on}{at} · runs until it stops calling tools · wait returns its summary"
     ))
 }
 
@@ -2906,7 +2922,7 @@ fn in_flight(state: &ActorState) -> Vec<String> {
         .collect();
     children.sort_unstable();
     out.extend(children.into_iter().map(|id| format!("#{id}")));
-    let mut jobs: Vec<u64> = state.running_jobs.iter().copied().collect();
+    let mut jobs: Vec<JobId> = state.running_jobs.iter().copied().collect();
     jobs.sort_unstable();
     out.extend(jobs.into_iter().map(jobs::label));
     out
@@ -2955,7 +2971,7 @@ fn wait_digest(actor: &Actor, state: &mut ActorState, fresh_only: bool) -> Vec<S
             out.push(already_read(&digest));
         }
     }
-    let mut jobs: Vec<u64> = state.done_jobs.keys().copied().collect();
+    let mut jobs: Vec<JobId> = state.done_jobs.keys().copied().collect();
     jobs.sort_unstable();
     for id in jobs {
         if let Some(report) = state.done_jobs.get(&id).cloned() {
@@ -3056,7 +3072,7 @@ fn control_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<S
 /// A `control` target, parsed from what `status` printed.
 enum Target {
     Agent(u64),
-    Job(u64),
+    Job(JobId),
 }
 
 /// Read `control`'s `id`: `#c2`/`c2` names a job, `#2`/`2` a child agent. The
@@ -3065,7 +3081,7 @@ enum Target {
 fn parse_target(raw: &str) -> Result<Target, String> {
     let text = raw.trim().trim_start_matches('#');
     match text.strip_prefix('c') {
-        Some(digits) => digits.parse::<u64>().map(Target::Job),
+        Some(digits) => digits.parse::<u64>().map(|id| Target::Job(JobId(id))),
         None => text.parse::<u64>().map(Target::Agent),
     }
     .map_err(|_| {
@@ -3074,9 +3090,10 @@ fn parse_target(raw: &str) -> Result<Target, String> {
 }
 
 /// The actor a message was aimed at no longer answers: the mailboxes, the UI
-/// and a nudge all reach the same dead end and the same words.
-pub(crate) fn gone(id: impl std::fmt::Display) -> String {
-    format!("agent #{id} is gone")
+/// and a nudge all reach the same dead end and the same words. Takes the typed
+/// id, so the sentence's `#` comes from [`AgentId`]'s `Display` alone.
+pub(crate) fn gone(id: AgentId) -> String {
+    format!("agent {id} is gone")
 }
 
 /// Stop a child this agent owns. Stopping is not finishing: the child keeps its
@@ -3089,7 +3106,7 @@ fn stop_agent(state: &mut ActorState, id: u64) -> Result<String, String> {
     // have the model wait on a result that can never arrive.
     cmd.send(AgentMsg::Stop)
         .map(|_| format!("stopping agent #{id}"))
-        .map_err(|_| gone(id))
+        .map_err(|_| gone(AgentId(id)))
 }
 
 /// Message a child this agent owns. The words resume an idle child, so the
@@ -3119,7 +3136,7 @@ fn message_agent(state: &mut ActorState, args: &Value, id: u64) -> Result<String
         Ok(()) => Ok(format!(
             "messaged agent #{id} — it is mid-run, so it reads this at its next step"
         )),
-        Err(_) => Err(gone(id)),
+        Err(_) => Err(gone(AgentId(id))),
     }
 }
 
@@ -3365,7 +3382,7 @@ fn detach_now(
     actor: &Actor,
     registry: &Arc<jobs::Registry>,
     launch: jobs::Launch,
-) -> Result<u64, ToolError> {
+) -> Result<JobId, ToolError> {
     let command = launch.command.clone();
     // A launch can be refused after the checks above — a sibling may have
     // taken the lock in between — and that is the machine saying "not now",
@@ -3387,7 +3404,7 @@ fn detach_now(
 /// The answer a detach gives the model, in the words the spec uses. The job's
 /// id is in it because every later tool call about it (status, stop, wait) needs
 /// the id, and the model has nothing else to go on.
-fn detached_line(id: u64) -> String {
+fn detached_line(id: JobId) -> String {
     format!(
         "[still running — detached as {}; you will be told when it finishes]",
         jobs::label(id)
@@ -4528,7 +4545,7 @@ mod tests {
     fn a_job_report_is_delivered_once_across_an_idle_run() {
         let (actor, events, _mailbox) = recording_actor("once-job");
         let mut state = ActorState::default();
-        state.running_jobs.insert(1);
+        state.running_jobs.insert(JobId(1));
         let mut messages = vec![Message::system("you are mush")];
         let line = "#c1 done: exit 0 · 3m12s · cargo test — test result: ok";
 
@@ -4537,7 +4554,7 @@ mod tests {
             &mut state,
             &mut messages,
             AgentMsg::CommandDone {
-                id: 1,
+                id: JobId(1),
                 line: line.into(),
                 news: true,
             },
@@ -4977,11 +4994,11 @@ mod tests {
     fn a_job_report_recorded_again_is_not_folded_twice() {
         let (actor, _events, mailbox) = recording_actor("re-reported-job");
         let mut state = ActorState::default();
-        state.running_jobs.insert(1);
+        state.running_jobs.insert(JobId(1));
         let mut messages = vec![Message::system("you are mush")];
         let line = "#c1 done: exit 0 · 3m12s · cargo test — test result: ok";
         let report = || AgentMsg::CommandDone {
-            id: 1,
+            id: JobId(1),
             line: line.into(),
             news: true,
         };
@@ -5022,12 +5039,12 @@ mod tests {
     fn a_job_report_folded_mid_run_reaches_the_ui() {
         let (actor, events, mailbox) = recording_actor("mid-run-job");
         let mut state = ActorState::default();
-        state.running_jobs.insert(1);
+        state.running_jobs.insert(JobId(1));
         let mut messages = vec![Message::system("you are mush")];
         let line = "#c1 stopped after 1s · npm run dev";
         mailbox
             .send(AgentMsg::CommandDone {
-                id: 1,
+                id: JobId(1),
                 line: line.into(),
                 news: false,
             })
@@ -5036,7 +5053,7 @@ mod tests {
         drain_mailbox(&actor, &AtomicBool::new(false), &mut messages, &mut state);
 
         assert_eq!(messages.last().unwrap().text(), line);
-        assert!(state.delivered_jobs.contains(&1));
+        assert!(state.delivered_jobs.contains(&JobId(1)));
         let ui = ui_copy(&events);
         assert!(
             ui.iter().any(|message| message.text() == line),
@@ -5484,7 +5501,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         let recorder = Recorder::new();
-        let ids = Arc::new(AtomicU64::new(1));
+        let ids = Ids::default();
         // The tree's one registry, over the same scripted machine and clock:
         // a job a test starts is watched in process, and its events land in the
         // same recording sink as the actor's.
@@ -6736,7 +6753,7 @@ mod tests {
         );
         assert_eq!(actor.ctx.registry.running(), 1, "and it is a live job");
         assert!(
-            state.running_jobs.contains(&1),
+            state.running_jobs.contains(&JobId(1)),
             "the owner's books know about it"
         );
         assert!(
@@ -6747,11 +6764,11 @@ mod tests {
 
         // And its end lands in the owner's own mailbox, once, saying it was
         // stopped rather than blamed on an exit code.
-        let stopped = actor.ctx.registry.stop(actor.id, 1).unwrap();
+        let stopped = actor.ctx.registry.stop(actor.id, JobId(1)).unwrap();
         assert_eq!(stopped, "stopping job #c1");
         match actor.rx.recv_timeout(Duration::from_secs(5)) {
             Ok(AgentMsg::CommandDone { id, line, news }) => {
-                assert_eq!(id, 1);
+                assert_eq!(id, JobId(1));
                 assert!(!news, "a job mush killed wakes nobody: {line}");
                 assert!(line.contains("stopped after"), "{line}");
                 assert!(line.contains("cargo build"), "{line}");
@@ -6787,7 +6804,7 @@ mod tests {
         assert!(report.contains("detached as #c1"), "{report}");
         assert_eq!(
             actor.ctx.registry.held(),
-            Some((7, "cargo bench".to_string(), Some(1))),
+            Some((7, "cargo bench".to_string(), Some(JobId(1)))),
             "the job holds the machine, not just its first sixty seconds"
         );
 
@@ -6803,11 +6820,11 @@ mod tests {
 
         // And the job gives it up when it ends, not before.
         assert_eq!(
-            actor.ctx.registry.stop(actor.id, 1).unwrap(),
+            actor.ctx.registry.stop(actor.id, JobId(1)).unwrap(),
             "stopping job #c1"
         );
         match actor.rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(AgentMsg::CommandDone { id, .. }) => assert_eq!(id, 1),
+            Ok(AgentMsg::CommandDone { id, .. }) => assert_eq!(id, JobId(1)),
             _ => panic!("the job must report its own end"),
         }
         assert!(
@@ -7398,8 +7415,8 @@ mod tests {
     fn a_job_completion_wakes_a_napping_owner_only_when_it_is_a_result() {
         let (actor, _mailbox) = test_actor("job-wake");
         let mut state = ActorState::default();
-        state.running_jobs.insert(1);
-        state.running_jobs.insert(2);
+        state.running_jobs.insert(JobId(1));
+        state.running_jobs.insert(JobId(2));
         let mut messages = vec![Message::system("you are mush")];
 
         let folded = absorb(
@@ -7407,7 +7424,7 @@ mod tests {
             &mut state,
             &mut messages,
             AgentMsg::CommandDone {
-                id: 1,
+                id: JobId(1),
                 line: "#c1 done: exit 0 · 3m12s · cargo test — test result: ok".into(),
                 news: true,
             },
@@ -7417,15 +7434,21 @@ mod tests {
             messages.last().unwrap().text(),
             "#c1 done: exit 0 · 3m12s · cargo test — test result: ok"
         );
-        assert!(state.delivered_jobs.contains(&1), "and it counts as read");
-        assert!(!state.running_jobs.contains(&1), "and as no longer running");
+        assert!(
+            state.delivered_jobs.contains(&JobId(1)),
+            "and it counts as read"
+        );
+        assert!(
+            !state.running_jobs.contains(&JobId(1)),
+            "and as no longer running"
+        );
 
         let folded = absorb(
             &actor,
             &mut state,
             &mut messages,
             AgentMsg::CommandDone {
-                id: 2,
+                id: JobId(2),
                 line: "#c2 stopped after 4s · npm run dev".into(),
                 news: false,
             },
@@ -7472,17 +7495,17 @@ mod tests {
 
         // A job's report travels the same road, and is news only when the job
         // ended on its own.
-        state.running_jobs.insert(2);
+        state.running_jobs.insert(JobId(2));
         state.done_jobs.insert(
-            2,
+            JobId(2),
             JobReport {
                 line: "#c2 done: exit 0 · 12s · npm test — ok".into(),
                 news: true,
             },
         );
-        state.running_jobs.insert(3);
+        state.running_jobs.insert(JobId(3));
         state.done_jobs.insert(
-            3,
+            JobId(3),
             JobReport {
                 line: "#c3 stopped after 1s · npm run dev".into(),
                 news: false,
@@ -7501,7 +7524,9 @@ mod tests {
             folded.contains(&"#c3 stopped after 1s · npm run dev"),
             "and so is the kill, without a turn being paid for it: {folded:?}"
         );
-        assert!(state.delivered_jobs.contains(&2) && state.delivered_jobs.contains(&3));
+        assert!(
+            state.delivered_jobs.contains(&JobId(2)) && state.delivered_jobs.contains(&JobId(3))
+        );
 
         // Delivered once: the next boundary has nothing new to say, and the
         // human's parked words are still parked.
@@ -8357,6 +8382,65 @@ mod tests {
         };
         assert!(error.contains("cannot start from `main`"), "{error}");
         assert!(state.children.is_empty(), "nothing may be spawned");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A spawn refused *before* git could create anything gives its number back,
+    /// so the next child is consecutive rather than one past a hole. The invariant
+    /// (`crate::ids`) draws the line at the worktree: here `git worktree add`
+    /// failed, so no branch and no directory exist and #1 is free; a failure
+    /// after that line — `Workspace::new` over a worktree git did make — must
+    /// *not* hand the number back, or the next `add -b mush/1` would meet the
+    /// branch the refused spawn left.
+    #[test]
+    fn a_failed_isolated_spawn_leaves_the_next_childs_id_consecutive() {
+        let (actor, _mailbox) = scripted_tools_actor(
+            "spawn-id-burned",
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let root = actor.ctx.root.clone();
+        git_in(&root, &["init", "-q", "-b", "main"]);
+        git_in(&root, &["config", "user.email", "t@t"]);
+        git_in(&root, &["config", "user.name", "t"]);
+        fs::write(root.join("base.txt"), "base\n").unwrap();
+        git_in(&root, &["add", "-A"]);
+        git_in(&root, &["commit", "-qm", "init"]);
+        // The one thing `git worktree add` refuses: the path is taken.
+        fs::create_dir_all(root.join(".mush/wt/1")).unwrap();
+        fs::write(root.join(".mush/wt/1/in the way.txt"), "mine\n").unwrap();
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+
+        let error = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "do the thing", "base": "main" }),
+            &cancel,
+        )
+        .unwrap_err();
+        let ToolError::Failed(error) = error else {
+            panic!("a worktree that cannot be made is a failed call");
+        };
+        assert!(error.contains("cannot start from `main`"), "{error}");
+        assert!(state.children.is_empty(), "nothing was spawned");
+
+        // The number came back: a shared child needs no git and takes #1. A
+        // consumed id would make this reply say `#2`.
+        let reply = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "second" }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(
+            reply.contains("spawned agent #1"),
+            "the refused spawn's id is handed back: {reply}"
+        );
+        assert!(state.children.contains_key(&1), "and the child owns it");
         let _ = fs::remove_dir_all(&root);
     }
 
