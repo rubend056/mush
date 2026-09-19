@@ -1341,7 +1341,7 @@ mod tests {
         let screen = app.screen(Rect::new(0, 0, width, height));
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| crate::ui::draw(frame, &screen))
+            .draw(|frame| crate::ui::draw(frame, &screen, &crate::theme::Theme::default()))
             .unwrap();
         let buffer = terminal.backend().buffer();
         let marked: Vec<String> = (0..height)

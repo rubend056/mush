@@ -3950,12 +3950,26 @@ mod tests {
     /// `TestBackend`. The `Screen` and the painted buffer are handed back
     /// together, because the tests read both: the derived words and the cells
     /// they reached — including the ones `screen` trims away (finding R28).
+    ///
+    /// The fixed palette, because the tests that read text do not care about
+    /// hues and must keep reading what mush painted before them.
     fn painted(app: &mut App, width: u16, height: u16) -> (Screen, Buffer) {
+        painted_with(app, width, height, &crate::theme::Theme::default())
+    }
+
+    /// [`painted`] with a theme handed in, for the test that reads what a hue
+    /// reaches.
+    fn painted_with(
+        app: &mut App,
+        width: u16,
+        height: u16,
+        theme: &crate::theme::Theme,
+    ) -> (Screen, Buffer) {
         app.set_term_size(width, height);
         let screen = app.screen(Rect::new(0, 0, width, height));
         let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
         terminal
-            .draw(|frame| crate::ui::draw(frame, &screen))
+            .draw(|frame| crate::ui::draw(frame, &screen, theme))
             .unwrap();
         (screen, terminal.backend().buffer().clone())
     }
@@ -5467,14 +5481,16 @@ mod tests {
         terminal
             .draw(|f| {
                 let screen = app.screen(area);
-                crate::ui::draw(f, &screen)
+                crate::ui::draw(f, &screen, &crate::theme::Theme::default())
             })
             .unwrap();
         const FRAMES: u32 = 30;
         let start = Instant::now();
         for _ in 0..FRAMES {
             let screen = app.screen(area);
-            terminal.draw(|f| crate::ui::draw(f, &screen)).unwrap();
+            terminal
+                .draw(|f| crate::ui::draw(f, &screen, &crate::theme::Theme::default()))
+                .unwrap();
         }
         let per_frame = start.elapsed() / FRAMES;
         eprintln!("measured: {per_frame:?} per frame");
@@ -7336,6 +7352,63 @@ mod tests {
             Some(AgentId::ROOT),
             "the parent link, not the row above"
         );
+    }
+
+    /// The workspace's hue reaches a real frame and *only* the chrome:
+    /// comparing a frame painted with a themed `Theme` against the same frame
+    /// painted with the fixed palette, every cell keeps its text, and every
+    /// cell whose colour changed is a cell that wore the accent before. The
+    /// threading cannot quietly fall back to the fixed palette at one site,
+    /// and the hue cannot bleed into the reds, yellows and grays that are
+    /// content.
+    #[test]
+    fn a_themed_frame_repaints_only_the_chrome() {
+        use ratatui::style::Color;
+
+        let (mut app, _rx) = test_app("theme-chrome");
+        app.focus = Focus::Chat;
+        let env = crate::theme::EnvText {
+            theme: None,
+            colorterm: Some("truecolor".to_string()),
+            term: None,
+        };
+        let theme = crate::theme::Theme::resolve(&env, std::path::Path::new("/work")).unwrap();
+        let hue = theme.hue().expect("a truecolor terminal gets a hue");
+        let accent = Color::Rgb(hue.rgb.0, hue.rgb.1, hue.rgb.2);
+
+        let (width, height) = (100u16, 30u16);
+        let (_, plain) = painted_with(&mut app, width, height, &crate::theme::Theme::default());
+        let (_, themed) = painted_with(&mut app, width, height, &theme);
+        let mut repainted = 0;
+        let mut badge = false;
+        for y in 0..height {
+            for x in 0..width {
+                let before = plain[(x, y)].style();
+                let after = themed[(x, y)].style();
+                assert_eq!(
+                    plain[(x, y)].symbol(),
+                    themed[(x, y)].symbol(),
+                    "({x}, {y}) text moved with the colour"
+                );
+                if before == after {
+                    continue;
+                }
+                repainted += 1;
+                assert!(
+                    [before.fg, before.bg].contains(&Some(Color::Cyan)),
+                    "({x}, {y}) changed without wearing the accent: {before:?} -> {after:?}"
+                );
+                assert!(
+                    [after.fg, after.bg].contains(&Some(accent)),
+                    "({x}, {y}) lost the accent: {before:?} -> {after:?}"
+                );
+                if y >= height - super::screen::bar_rows(height) {
+                    badge = true;
+                }
+            }
+        }
+        assert!(repainted > 0, "the hue reached nothing");
+        assert!(badge, "the bar's badge did not wear the hue");
     }
 
     /// `PgUp`/`PgDn` in the agents pane move the cursor a whole page, stop at
