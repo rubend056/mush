@@ -95,6 +95,11 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   (`machine::ended`'s last resort, unreachable for a unix child); and `edit`'s
   pinned usage line leaves `--base R` unbracketed although the parser defaults it
   to 0.
+- **H27** — `App::fork_base` falls back to `"HEAD"` when a parent's branch is
+  gone, so a nested child's reclamation is measured against the root's tip rather
+  than the branch its work actually went into. Found while landing §8.33. It errs
+  toward keeping — a branch that is not an ancestor of `HEAD` is left alone and
+  the row says why — so it is a row and not a defect.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -588,8 +593,8 @@ The Context *meter* stays on screen; only its setter and reporter went.
 
 The screen did not lose facts with the commands: a row's footer names
 `.mush/wt/<id>` and `git diff HEAD...mush/<branch>` (git's own spellings, no
-mush wrapper), and the landed story (`merged into HEAD` / `discarded`) is
-stored in the session. Discovery is automatic, so `rm -rf .mush` cannot
+mush wrapper), and the landed story (`merged` / `nothing committed` /
+`discarded`) is stored in the session. Discovery is automatic, so `rm -rf .mush` cannot
 resurrect a row. Nineteen tests died with the commands they pinned (456 →
 437, 3 ignored; mush-core 108 after its prune test went too).
 
@@ -774,8 +779,8 @@ rediscover them: a microscopic completion-versus-sweep race in reclamation
 wake is about to use); `git branch -d` measuring against the root checkout's HEAD,
 so a nested branch merged into an unmerged parent is removed with its branch kept
 — said out loud rather than hidden by `-D`; a no-commit run recorded as
-`Landed::Merged`, which reads as "merged into HEAD" (a third variant needs
-`StoredLanded`, in core); and one full-suite flake
+`Landed::Merged`, which reads as "merged into HEAD" (the third variant that needs
+`StoredLanded`, in core, is §8.33's landing, `mush/122`); and one full-suite flake
 (`the_notes_popup_opens_on_the_head_of_the_newest_note`, seen once in ~5 runs
 with the reclamation patch, never reproduced alone or under 14x load, not tied to
 its diff) that the next wave should either freeze with a clock or catch.
@@ -1496,4 +1501,91 @@ docstring claims they are, hand-checks `app/mod.rs` end to end, and re-measures
 the four refs this record quotes. Every census figure in this file and in
 `docs/refactor.md` has now been re-run with the fixed script at `1f324bd`;
 figures printed before the fix are not comparable with the ones after it.
+
+---
+
+## 8.33 A removal says which nothing the branch was (A4, `mush/122`)
+
+The row a reclaimed agent wears said **merged into HEAD** whatever had happened,
+and both halves of that were wrong. A read-only child — one that ran, read and
+committed nothing — wore it, so mush claimed a merge nobody performed. A nested
+child whose branch went into its *parent's* branch wore it too, naming a ref its
+work was never in. The finding (A4, with C2 folded into it: the row's sentence
+against `Landed::past()`'s one word) was put to the human with the rest of the
+surface audit, and the ruling was to fix it in the git layer rather than in the
+wording: the row was not mis-worded, it was told the wrong fact.
+
+**One test was answering two questions.** `reclaimable` asked
+`ahead_of(branch, base) == 0` — “the branch adds nothing to the base” — and every
+surface read that as “merged”. The predicate was right; the reading collapsed
+three states into one. Two questions tell them apart:
+
+- **Is the branch's work in the base's current tip?** The base stays a **name**
+  (the caller's `base`, or `HEAD` for a child of the root), resolved at reclaim
+  time: a merge made by hand while the run was going moves the base's tip onto
+  the branch's work, and only re-resolving the name can see it. Handing over the
+  revision `worktree_add` was given would make a merged branch look *ahead* of
+  its base, and mush would stop reclaiming merged work.
+- **Did the run commit anything of its own?** The **fork revision** — the commit
+  the worktree was created at. `spawn_tool` already resolved it for the spawn
+  reply's `at <sha>`; it is resolved once and carried now, on the actor
+  (`Actor::fork`) and on the node (`AgentNode::fork`), because both removal paths
+  need it.
+
+`git::Landing { Merged, NothingCommitted }` is the second answer's home, carried
+by `Reclaimable::Landable(Landing)` and `Reclaimed::Removed { branch_kept,
+landing }`, and `Landed` (the row) and `StoredLanded` (the session file) gained
+the third variant, so a restart paints the same row. Both removal paths carry the
+answer to the row: `agent::reclaim_own_worktree` → `AgentEvent::Reclaimed
+{ landing }`, and `App::sweep_worktrees`, which re-asks `git::reclaim` at the
+moment it removes — base name and fork revision both re-read, because the
+decision was a snapshot.
+
+**Where the fork is unknown, mush keeps the answer it has always given, and says
+why.** A revived agent and a leftover found on disk have no fork revision — the
+session file never held one — and `App::discover_worktrees` sweeps against
+`HEAD`. There the two states are the same git shape, and “nothing committed”
+would be a guess; it is the guess that costs most, because it erases a real run's
+work from the row, so those paths answer `Merged` and the rustdoc says so.
+Removal safety is otherwise untouched: uncommitted work is never removed,
+`Some(non-zero)` and a git refusal stay `Kept`, and a **squash** or cherry-pick
+still looks unmerged to git, so the branch is kept and the row says why.
+
+**The word, per surface.** `Landed::past()` stays one spelling, for the
+participles a sentence can use — `merged`, `discarded` — and gained `nothing
+committed`. The row paints the bare word now (`screen::agent_detail`), not a
+sentence: the row has no base fact at all, which is what made “into HEAD” false
+even for a merge. The nudge refusal cannot say “was nothing committed”, so that
+landing's refusal is worded around the fact instead (“agent #2 committed nothing
+— its worktree is gone”), still claiming no merge; `Landed::past()`'s doc records
+the split rather than bending the word to the refusal's grammar. A third surface
+the brief had not named was wrong the same way and is fixed with them:
+`agent::worktree_gone_line` now names all three endings.
+
+The second commit in the same landing is the other half of §8.32's record
+correction: the two doc comments that still asserted the reverted 256 KiB cap
+(`app/tree.rs`, `app/chat.rs`) now say what bounds a stored transcript — the fold
+at nine tenths of the history budget, a finished child's frozen at the size it
+reached, and the file at `CHILD_HISTORY × that fold trigger + the root`.
+
+**Verification.** `a_merged_row_does_not_claim_head` fails on `af6ba05` with
+`left: "merged into HEAD"`, `right: "merged"`. The landing's tests pin the three
+`StoredLanded` values through the nudge refusal; a base that moved on after the
+spawn (still `nothing committed`); a read-only child swept as `nothing committed`
+with its worktree *and* branch gone; and a real parent/child branch pair whose
+nested merge is painted with no “HEAD” in the line. `cargo test` 554 + 132 (from
+550 + 130), fmt and clippy clean, three smoke scenarios pass.
+
+**Residuals, named rather than papered over.** `App::fork_base` falls back to
+`"HEAD"` when a parent's branch is gone, so a nested child's reclamation is
+measured against the root's tip rather than the branch its work went into (H27;
+it errs toward keeping). And §8.26's “two of the three branches are net deletions”
+is all three (−26, −35, −34) once §8.32's re-run is applied — corrected above,
+not left as a claim the numbers no longer support.
+
+**Census at the merge** (`3c33cc6`): total 50,617 · **prod 12,688** · tests
+21,836 · comments 12,887. Of that 612-line wave, 70 lines are production
+(12,618 → 12,688) and 297 are test code: the fix is one new enum (`git::Landing`)
+and a third variant in the two that mirror it, and most of the diff is the prose
+that says which fact each surface now has.
 
