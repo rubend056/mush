@@ -209,37 +209,6 @@ fn cut_off_notice() -> String {
         .to_string()
 }
 
-/// What a root transcript the cap cut says on the screen: the half of the
-/// record a human is actually looking at.
-///
-/// The durable half is [`Session::truncated`], which the file carries; this
-/// half exists because a pane that begins with the newest part of a
-/// conversation reads exactly like a conversation that began there, and the
-/// root is the human's own scrollback. Children get no line: their truncation
-/// is what lets a whole tree survive a restart, and a child's brief still opens
-/// the transcript it keeps.
-fn truncation_notice(dropped: session::Dropped) -> String {
-    format!(
-        "the stored conversation was cut at its cap — its oldest {} messages ({}) are not in the file",
-        dropped.messages,
-        size_label(dropped.bytes),
-    )
-}
-
-/// A byte count the way a notice wants it: whole units, because the cap is not
-/// a byte-exact ceiling and a decimal would claim a precision it does not have.
-fn size_label(bytes: usize) -> String {
-    const MIB: usize = 1024 * 1024;
-    const KIB: usize = 1024;
-    if bytes >= MIB {
-        format!("{} MiB", bytes / MIB)
-    } else if bytes >= KIB {
-        format!("{} KiB", bytes / KIB)
-    } else {
-        format!("{bytes} bytes")
-    }
-}
-
 /// `/help`: the key table, then the command table.
 ///
 /// Both tables are the same one source their CLI counterparts print —
@@ -320,13 +289,15 @@ const NOTHING_RUNNING: &str = "nothing running · Ctrl-Q quits · Ctrl-N starts 
 /// How long the session file may lag the conversation.
 ///
 /// The human reads the transcript, not the file, and the file is only read
-/// again by the *next* mush — so a second of staleness is invisible, while a
-/// write per streamed message is a lag on every tool result. A second is also
-/// what a crash costs: at most 1000 ms of streamed chat, and never the human's
-/// own message, a command that changed what is stored, or a compaction, all of
-/// which are written before they return (see `App::flush_session` and the marks
-/// in `on_agent`).
-const SESSION_DEBOUNCE: Duration = Duration::from_secs(1);
+/// again by the *next* mush. What the interval buys is the UI thread: a save
+/// rebuilds the snapshot — every live transcript, cloned, then handed to the
+/// writer — and that rebuild is what a long run would otherwise pay once a
+/// second. What it costs is the crash window: at most a minute of
+/// machine-generated conversation — streamed responses and tool results — is
+/// lost when the process dies, and nothing else, because the human's own turn,
+/// a fold, a new chat and quitting are all written before they return (see
+/// `App::flush_session` and its callers).
+const SESSION_DEBOUNCE: Duration = Duration::from_secs(60);
 
 /// How wide a job's handle may be: the same bound as an agent's title, for the
 /// same reason — a handle, whose full text is the report in the transcript.
@@ -486,14 +457,9 @@ impl App {
         session_save: Arc<dyn SessionSave>,
     ) -> Self {
         let system = Message::system(prompt::system_prompt(&ws.root_str()));
-        let (messages, stored_agents, stored_notices, truncated) = match stored {
-            Some(session) => (
-                session.messages,
-                session.agents,
-                session.notices,
-                session.truncated,
-            ),
-            None => (Vec::new(), Vec::new(), Vec::new(), None),
+        let (messages, stored_agents, stored_notices) = match stored {
+            Some(session) => (session.messages, session.agents, session.notices),
+            None => (Vec::new(), Vec::new(), Vec::new()),
         };
         let mut app = Self {
             ws,
@@ -525,14 +491,6 @@ impl App {
         // The failures come back before the agents do, because the agent that
         // went back to idle takes its line with it (see `restore_agents`).
         app.chat.restore_notices(stored_notices);
-        // A root the file cut is the transcript the human scrolls back through,
-        // and it does not begin where the conversation did. The marker is
-        // adopted so the next save cannot quietly drop the fact; the notice is
-        // the same fact said where the human is looking.
-        app.chat.set_root_dropped(truncated);
-        if let Some(dropped) = truncated {
-            app.chat.note_for(AgentId::ROOT, truncation_notice(dropped));
-        }
         app.restore_agents(stored_agents);
         app.discover_worktrees();
         app.refresh_git();
@@ -1745,7 +1703,7 @@ impl App {
             // this `update` returns, so the answer can never be painted above
             // the question that asked for it.
             self.chat.push_message(target, Message::user(text));
-            if delivered {
+            let outcome = if delivered {
                 // The human resumed a child its parent may believe is at
                 // rest: the parent's books decide its waits and the
                 // one-shared-child guard, so they are told (audit row 1).
@@ -1756,7 +1714,14 @@ impl App {
                 self.tree.nudge_failed(target, previous);
                 self.fail(&line);
                 Err(line)
-            }
+            };
+            // The human's own words are written before this returns, to a child
+            // as on the root: the turn they asked for may take minutes, and a
+            // crash must not lose the request to the debounce. The phase above
+            // is settled first, so the snapshot stores the line and not a
+            // `thinking…` that never ran.
+            self.flush_session();
+            outcome
         }
     }
 
@@ -2655,7 +2620,6 @@ impl App {
                 .then_some(self.cfg().context_tokens),
             updated: session::now_secs(),
             messages: self.chat.transcript(AgentId::ROOT).to_vec(),
-            truncated: self.chat.root_dropped(),
             agents,
             // A failure is the one line worth coming back to; a command's answer
             // is not (see `Chat::stored_notices`).
@@ -4119,7 +4083,6 @@ mod tests {
             context: None,
             updated: 0,
             messages: vec![Message::user("the root task")],
-            truncated: None,
             agents: vec![session::AgentSession {
                 id: 2,
                 parent: Some(0),
@@ -4177,46 +4140,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
-    /// A stored root the cap cut tells the human so: a pane that begins with
-    /// the newest part of a conversation reads exactly like a conversation that
-    /// began there, and the root is the human's own scrollback. The marker
-    /// rides back into the next save too, or one quiet write after the restart
-    /// would relabel the file as whole.
-    #[test]
-    fn a_truncated_stored_root_says_so_and_keeps_its_marker() {
-        let root = dir("truncated-root");
-        let marker = session::Dropped {
-            messages: 12,
-            bytes: 3 * 1024 * 1024,
-        };
-        let mut stored = stored_with_agent(
-            &root,
-            session::StoredStatus::Done,
-            vec![Message::user("port the parser")],
-        );
-        stored.truncated = Some(marker);
-        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
-
-        assert_eq!(app.chat.root_dropped(), Some(marker));
-        let lines: Vec<&str> = app
-            .chat
-            .notices_for(AgentId::ROOT)
-            .map(|notice| notice.text.as_str())
-            .collect();
-        assert!(
-            lines
-                .iter()
-                .any(|line| line.contains("12 messages") && line.contains("3 MiB")),
-            "the pane must say what the file no longer holds: {lines:?}"
-        );
-        assert_eq!(
-            app.session_snapshot().truncated,
-            Some(marker),
-            "and the save after the restart still marks the conversation as cut"
-        );
-        let _ = std::fs::remove_dir_all(&root);
-    }
-
     /// A stored conversation with one agent, for the restore path.
     fn stored_with_agent(
         root: &std::path::Path,
@@ -4231,7 +4154,6 @@ mod tests {
             context: None,
             updated: 0,
             messages: vec![Message::user("the root task")],
-            truncated: None,
             agents: vec![session::AgentSession {
                 id: 2,
                 parent: Some(0),
@@ -4678,7 +4600,7 @@ mod tests {
             "it did mark the conversation dirty, though"
         );
 
-        // A second on, the tick pays for all five at once — with the last of
+        // The debounce elapsed, the tick pays for all five at once — with the last of
         // them, which is the state a restart must resume from.
         age_session(&mut app, SESSION_DEBOUNCE);
         app.tick();
@@ -4690,6 +4612,15 @@ mod tests {
             app.session_dirty_at.is_none(),
             "and the file is current again"
         );
+    }
+
+    /// The debounce is a minute, and the number is the decision: a long run
+    /// pays one whole-snapshot rebuild per minute instead of one per second,
+    /// and a crash costs at most that minute of machine-generated chat. Pinned
+    /// here so a later tweak cannot quietly move the boundary the doc describes.
+    #[test]
+    fn the_session_debounce_is_a_minute() {
+        assert_eq!(SESSION_DEBOUNCE, Duration::from_secs(60));
     }
 
     /// The whole point of the debounce, end to end: a burst of root messages
@@ -4733,6 +4664,41 @@ mod tests {
         assert_eq!(
             stored.messages.last().map(|message| message.text()),
             Some("please port the parser")
+        );
+        drop(app);
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A turn typed at a child is the human's own words too, so it crosses the
+    /// same boundary the root's does: written before the send returns, not left
+    /// to the debounce. A crash a minute later must not bring the child back
+    /// having never been told the thing it was asked for.
+    #[test]
+    fn a_message_to_a_child_is_on_disk_before_the_send_returns() {
+        let root = dir("send-child");
+        let (mut app, _writer) = app_writing(&root);
+        let (child_tx, _child_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "lexer".to_string(),
+            depth: 1,
+            branch: None,
+            cmd: child_tx,
+        });
+        app.tree.focus(AgentId(1));
+        app.chat.insert("carry on with the lexer");
+        app.send_message();
+
+        let stored = Session::load(&root).expect("the send flushed it");
+        let child = stored
+            .agents
+            .iter()
+            .find(|agent| agent.id == 1)
+            .expect("the child is in the file");
+        assert_eq!(
+            child.messages.last().map(|message| message.text()),
+            Some("carry on with the lexer")
         );
         drop(app);
         let _ = std::fs::remove_dir_all(&root);
@@ -5089,7 +5055,7 @@ mod tests {
     }
 
     /// Quitting writes what the debounce had not: the exit flush is what makes
-    /// a crash cost a second of chat rather than everything since the last
+    /// a crash cost one debounce of chat rather than everything since the last
     /// boundary.
     #[test]
     fn quitting_writes_the_messages_the_debounce_had_not() {
