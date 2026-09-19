@@ -17,8 +17,12 @@
 //! The file is deliberately never unlinked, not even on a clean exit. Unlinking
 //! it is what makes a lock file racy: a third process that opens the path
 //! between the unlink and the next `open` gets a *new* inode, locks that, and
-//! two processes believe they hold the workspace. A six-byte file that is
-//! always there cannot be raced.
+//! two processes believe they hold the workspace. A file that is always there
+//! cannot be raced, and it holds one pid at most, so it never grows.
+//!
+//! A filesystem that cannot `flock` is refused, not ignored: a lock that
+//! silently does nothing is the silent damage this module exists to prevent,
+//! and the human is better told the workspace cannot be locked at all.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
