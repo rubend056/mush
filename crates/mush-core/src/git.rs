@@ -344,6 +344,32 @@ pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf,
     .map(|_| (path, branch))
 }
 
+/// Which of the two ways a branch adds nothing to its base: what one word,
+/// "merged", used to say about both, and the two stories that were really
+/// there — a run whose work landed, and a run that never committed at all.
+///
+/// The two are what the reclamation's two questions come to, and neither
+/// implies the other:
+///
+/// * [`Landing::Merged`] — the branch has commits of its own and the base now
+///   contains them (a human ran `git merge mush/<id>`, or a nested child's
+///   parent merged it), so the branch ref is redundant;
+/// * [`Landing::NothingCommitted`] — the branch *is* its fork revision: the
+///   worktree was created at that commit and the run never made another, so
+///   there is nothing for the base to contain. An ordinary read-only child.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Landing {
+    /// The branch's own commits are in the base: merging it put them there.
+    /// This is also — see [`reclaimable`] — the answer when the fork revision
+    /// is unknown: the branch adds nothing to the base, and without the fork
+    /// revision the two landings are the same git shape, so mush keeps the
+    /// answer it has always given rather than guessing the other one.
+    Merged,
+    /// The branch adds no commit of its own to the fork revision: there was
+    /// never anything to merge.
+    NothingCommitted,
+}
+
 /// What one look at the worktree of agent `id` found: the decision [`reclaim`]
 /// would make, read-only.
 ///
@@ -356,10 +382,10 @@ pub enum Reclaimable {
     /// Neither the checkout nor the branch is there: nothing to reclaim, and
     /// nothing to say.
     Nothing,
-    /// The branch adds nothing to its base (its work is merged, or the run
-    /// never committed) and the checkout has nothing uncommitted: [`reclaim`]
-    /// removes both.
-    Landable,
+    /// The branch adds nothing to its base — [`Landing`] says which of the two
+    /// ways, because "merged" was painted over both of them — and the checkout
+    /// has nothing uncommitted: [`reclaim`] removes both.
+    Landable(Landing),
     /// Work a removal could destroy. `why` names the branch or the checkout and
     /// the reason, in words a human can act on — the branch is the only thing
     /// that still says where the work is.
@@ -378,7 +404,12 @@ pub enum Reclaimed {
     /// branch leaves the ref behind. That residue costs nothing —
     /// [`isolated_ids`] still names it, so the id floor still reserves it — and
     /// forcing it away is exactly the deletion this rule exists to prevent.
-    Removed { branch_kept: Option<String> },
+    /// `landing` is which of the two nothings the branch was, so a caller's row
+    /// can say what actually happened to that work ([`Landing`]).
+    Removed {
+        branch_kept: Option<String>,
+        landing: Landing,
+    },
     /// Left alone, for the reason `why` names.
     Kept(String),
     /// Neither checkout nor branch: there was nothing to reclaim.
@@ -387,15 +418,28 @@ pub enum Reclaimed {
 
 /// Whether the worktree of agent `id` can be reclaimed right now, read-only.
 ///
-/// `base` is the ref the branch was forked from: the parent agent's branch, or
-/// `HEAD` for a child of the root. A branch that is an ancestor of its base adds
-/// nothing to it — merging it by hand makes it one, and a run that committed
-/// nothing never stopped being one — so that is the whole merge test, and it is
-/// deliberately the only one: a squashed or cherry-picked copy of the work
-/// leaves the branch a stranger to its base, and mush keeps it and says why
-/// rather than guessing. **An unmerged branch is never deleted**, and nothing
-/// here merges anything.
-pub fn reclaimable(root: &Path, id: u64, base: &str) -> Reclaimable {
+/// `base` is the *name* of the ref the branch was forked from — the parent
+/// agent's branch, or `HEAD` for a child of the root — and it stays a name
+/// because the first question is about the base *now*: a hand merge moves the
+/// base's tip onto the branch's work, and that is the state a sweep is looking
+/// for.
+///
+/// `fork` is the revision the worktree was created at, when the caller knows
+/// it. It answers the second question a removal needs and neither the base name
+/// nor the branch can: a branch with no commit of its own *is* its fork
+/// revision, so a base that moved on since the spawn leaves it an ancestor of
+/// the base for free — the same git shape as a merged branch, and the shape an
+/// ordinary read-only child has. With `fork`, the two are told apart
+/// ([`Landing`]); with `None` — a leftover discovered at startup, or an agent
+/// restored from a session that never stored a base — mush keeps the single
+/// answer it has always given rather than inventing a second one out of
+/// information it does not have.
+///
+/// The removal test errs on the conservative side elsewhere too: a squashed or
+/// cherry-picked copy of the work is not an ancestor of the base, so mush keeps
+/// the branch and says why rather than guessing that the work landed.
+/// **An unmerged branch is never deleted**, and nothing here merges anything.
+pub fn reclaimable(root: &Path, id: u64, base: &str, fork: Option<&str>) -> Reclaimable {
     // The base is a caller's name and may begin with `-`; resolving it to a
     // commit id is the one way a name is allowed near a command line
     // (`branch_stat` says the same about its two names).
@@ -404,13 +448,13 @@ pub fn reclaimable(root: &Path, id: u64, base: &str) -> Reclaimable {
             "{base} is not a revision mush can resolve — nothing can be shown merged into it"
         ));
     };
-    probe(root, id, base, &base_sha)
+    probe(root, id, base, &base_sha, fork)
 }
 
 /// The rule itself, with the base already resolved to a commit id: one home for
 /// it, and one process saved per worktree when a caller asks about many of them
 /// against one base ([`unlandable`]).
-fn probe(root: &Path, id: u64, base: &str, base_sha: &str) -> Reclaimable {
+fn probe(root: &Path, id: u64, base: &str, base_sha: &str, fork: Option<&str>) -> Reclaimable {
     let rel = worktree_rel(id);
     let branch = branch_name(id);
     let named = resolve(root, &branch).is_some();
@@ -454,12 +498,45 @@ fn probe(root: &Path, id: u64, base: &str, base_sha: &str) -> Reclaimable {
             }
         }
     }
-    Reclaimable::Landable
+    Reclaimable::Landable(landing(root, &branch, fork))
+}
+
+/// Which nothing the branch is: the second question, asked only once the first
+/// one said the branch may go.
+///
+/// The fork revision is the commit the worktree was created at (`worktree_add`
+/// put the new branch there, and its caller resolves it in the new checkout). A
+/// branch that still stands on it has no commit of its own and never gave the
+/// base anything to contain; a branch that carries anything else has commits
+/// the base now holds.
+///
+/// With no fork revision, the answer is [`Landing::Merged`]. The two states are
+/// the same shape to a base resolved from a name — a branch the base already
+/// contains — and the missing revision is the only thing that could tell them
+/// apart, so a "nothing committed" verdict would be a guess. It is the guess
+/// that costs most: it erases a real run's work from the row, and the restored
+/// agent and the leftover that reach this branch are exactly the cases where the
+/// branch may be the last record of that work. `Merged` keeps the answer mush
+/// has always given, which says only what git did measure: the base needs none
+/// of this branch.
+fn landing(root: &Path, branch: &str, fork: Option<&str>) -> Landing {
+    let Some(fork) = fork else {
+        return Landing::Merged;
+    };
+    match ahead_of(root, branch, fork) {
+        Some(0) => Landing::NothingCommitted,
+        // A commit of its own in a base the first question already said
+        // contains it. `None` — git refusing to answer the second question —
+        // lands here too: the branch may still go (the base needs none of it),
+        // and a refusal to prove "nothing was committed" is not proof of it.
+        _ => Landing::Merged,
+    }
 }
 
 /// How many commits `branch` carries that `base` does not: `0` is "everything
-/// this branch added is in the base", the only state mush reclaims. `None` is
-/// git refusing to answer, which is never a `0`.
+/// this branch added is in `base`", the one measurement both reclamation
+/// questions are built from. `None` is git refusing to answer, which is never a
+/// `0`.
 fn ahead_of(root: &Path, branch: &str, base_sha: &str) -> Option<u64> {
     // Resolved even though the caller built the name out of an id: `resolve` is
     // the one door a name goes through, and a branch spelled `-q` must not
@@ -475,8 +552,9 @@ fn ahead_of(root: &Path, branch: &str, base_sha: &str) -> Option<u64> {
 
 /// Reclaim the worktree of agent `id`: remove the checkout and delete the
 /// branch, but only when [`reclaimable`] says that removes no work — the branch
-/// is merged into `base` (or the run never committed), the checkout is clean,
-/// and nothing unmerged or dirty is ever touched.
+/// adds nothing to `base` (its work is merged, or the run never committed;
+/// [`Reclaimed::Removed`] says which), the checkout is clean, and nothing
+/// unmerged or dirty is ever touched.
 ///
 /// This is the one place mush removes a worktree or deletes a branch outside its
 /// own tests, so the two refusals it is built from are the whole of the
@@ -484,11 +562,11 @@ fn ahead_of(root: &Path, branch: &str, base_sha: &str) -> Option<u64> {
 /// lock-file bookkeeping, not for a dirty checkout — that case never gets here)
 /// and `git branch -d`, never `-D`, so a branch git will not certify as deleted
 /// is a branch mush leaves alone (finding H10).
-pub fn reclaim(root: &Path, id: u64, base: &str) -> Reclaimed {
-    match reclaimable(root, id, base) {
+pub fn reclaim(root: &Path, id: u64, base: &str, fork: Option<&str>) -> Reclaimed {
+    match reclaimable(root, id, base, fork) {
         Reclaimable::Nothing => Reclaimed::Nothing,
         Reclaimable::Kept(why) => Reclaimed::Kept(why),
-        Reclaimable::Landable => remove(root, id),
+        Reclaimable::Landable(landing) => remove(root, id, landing),
     }
 }
 
@@ -496,7 +574,7 @@ pub fn reclaim(root: &Path, id: u64, base: &str) -> Reclaimed {
 /// git refuses to delete a branch that is checked out anywhere, so the order is
 /// not a preference. A removal that fails leaves the branch alone — nothing
 /// happened, and the caller must not read it as `Removed`.
-fn remove(root: &Path, id: u64) -> Reclaimed {
+fn remove(root: &Path, id: u64, landing: Landing) -> Reclaimed {
     let rel = worktree_rel(id);
     if worktree_path(root, id).exists() {
         if let Err(error) = run(root, &["worktree", "remove", "--force", &rel]) {
@@ -514,7 +592,10 @@ fn remove(root: &Path, id: u64) -> Reclaimed {
     let branch_kept = run(root, &["branch", "-d", &branch])
         .is_err()
         .then_some(branch);
-    Reclaimed::Removed { branch_kept }
+    Reclaimed::Removed {
+        branch_kept,
+        landing,
+    }
 }
 
 /// Every agent id git still names with a `mush/<id>` branch, checkout or not,
@@ -553,7 +634,12 @@ pub fn unlandable(root: &Path) -> Vec<u64> {
         .iter()
         .filter(|worktree| worktree.on_disk())
         .filter_map(|worktree| worktree.id)
-        .filter(|id| matches!(probe(root, *id, "HEAD", &base_sha), Reclaimable::Kept(_)))
+        .filter(|id| {
+            matches!(
+                probe(root, *id, "HEAD", &base_sha, None),
+                Reclaimable::Kept(_)
+            )
+        })
         .collect();
     ids.sort_unstable();
     ids.dedup();
@@ -1000,10 +1086,12 @@ mod tests {
 
     /// A worktree for agent `id` on `mush/<id>` with one commit of its own —
     /// the state every reclaim test starts from, and the state a finished run
-    /// leaves behind.
-    fn isolated_worktree(dir: &Path, id: u64) {
+    /// leaves behind. Returns the fork revision, read the way `spawn_tool`
+    /// reads it: the new checkout's `HEAD`, before the run commits anything.
+    fn isolated_worktree(dir: &Path, id: u64) -> String {
         worktree_add(dir, id, Some("HEAD")).unwrap();
         let path = worktree_path(dir, id);
+        let fork = resolve(&path, "HEAD").expect("a fresh checkout has a HEAD");
         // The content is the id's: a worktree forked from a base that already
         // merged an earlier test's `work.txt` would otherwise be clean, and
         // `commit_all` would answer `None` — which is the *other* test's case.
@@ -1014,6 +1102,7 @@ mod tests {
                 .is_some(),
             "the run's work must really be committed"
         );
+        fork
     }
 
     /// Land `branch` in the main checkout, the way a human does it by hand.
@@ -1028,13 +1117,16 @@ mod tests {
     #[test]
     fn a_merged_worktree_and_branch_are_removed() {
         let dir = init_repo("reclaim-merged");
-        isolated_worktree(&dir, 1);
+        let fork = isolated_worktree(&dir, 1);
         merge_into_head(&dir, "mush/1");
         let landed = resolve(&dir, "HEAD").unwrap();
 
         assert_eq!(
-            reclaim(&dir, 1, "HEAD"),
-            Reclaimed::Removed { branch_kept: None }
+            reclaim(&dir, 1, "HEAD", Some(&fork)),
+            Reclaimed::Removed {
+                branch_kept: None,
+                landing: Landing::Merged,
+            }
         );
 
         assert!(!worktree_path(&dir, 1).exists(), "the checkout is gone");
@@ -1050,21 +1142,57 @@ mod tests {
     /// A run that committed nothing leaves a branch standing on its base: there
     /// is no work to keep, so the checkout and the branch go the way a merged
     /// one does. Without this, every isolated run that changed nothing leaves a
-    /// worktree behind for good.
+    /// worktree behind for good. The landing it reports is `NothingCommitted`,
+    /// because the fork revision says so — the branch never became more than
+    /// the commit the worktree was created at.
     #[test]
     fn a_clean_run_that_committed_nothing_is_reclaimed() {
         let dir = init_repo("reclaim-clean");
         worktree_add(&dir, 4, Some("HEAD")).unwrap();
-        // Nothing written and nothing committed: `mush/4` *is* its base, which
-        // is the second half of the merge test and the fact a run's own end
-        // knows before any of this is asked.
+        let fork = resolve(&worktree_path(&dir, 4), "HEAD").unwrap();
+        // Nothing written and nothing committed: `mush/4` *is* its fork
+        // revision, which is one half of the pair a `merged` word used to
+        // cover.
 
         assert_eq!(
-            reclaim(&dir, 4, "HEAD"),
-            Reclaimed::Removed { branch_kept: None }
+            reclaim(&dir, 4, "HEAD", Some(&fork)),
+            Reclaimed::Removed {
+                branch_kept: None,
+                landing: Landing::NothingCommitted,
+            }
         );
         assert!(!worktree_path(&dir, 4).exists());
         assert_eq!(resolve(&dir, "mush/4"), None);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A base *name* that moved on after the spawn: the branch never committed,
+    /// so it is an ancestor of the new base tip for free — the same git shape a
+    /// hand merge leaves — and only the fork revision tells the two apart. The
+    /// row's answer is "nothing committed", never "merged".
+    #[test]
+    fn a_base_that_moved_on_after_the_spawn_still_reads_nothing_committed() {
+        let dir = init_repo("reclaim-base-moved");
+        worktree_add(&dir, 4, Some("HEAD")).unwrap();
+        let fork = resolve(&worktree_path(&dir, 4), "HEAD").unwrap();
+        // The base moves on the way HEAD does under a session: a commit of the
+        // human's own, nothing the run ever did.
+        fs::write(dir.join("later.txt"), "the human's own work\n").unwrap();
+        assert!(commit_all(&dir, "the human's own work").unwrap().is_some());
+        assert_ne!(resolve(&dir, "HEAD").unwrap(), fork, "the base moved on");
+
+        assert_eq!(
+            reclaimable(&dir, 4, "HEAD", Some(&fork)),
+            Reclaimable::Landable(Landing::NothingCommitted),
+            "the branch is its fork revision; nobody merged anything"
+        );
+        // Without the fork revision the repository is the other shape, and mush
+        // keeps the answer it has always given rather than guessing (see
+        // `reclaimable`).
+        assert_eq!(
+            reclaimable(&dir, 4, "HEAD", None),
+            Reclaimable::Landable(Landing::Merged),
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1075,10 +1203,10 @@ mod tests {
     #[test]
     fn an_unmerged_branch_is_kept_and_named() {
         let dir = init_repo("reclaim-unmerged");
-        isolated_worktree(&dir, 2);
+        let fork = isolated_worktree(&dir, 2);
         let tip = resolve(&dir, "mush/2").unwrap();
 
-        match reclaim(&dir, 2, "HEAD") {
+        match reclaim(&dir, 2, "HEAD", Some(&fork)) {
             Reclaimed::Kept(why) => {
                 assert!(why.contains("mush/2"), "the refusal names it: {why}");
                 assert!(why.contains("1 commit"), "and what holds it: {why}");
@@ -1110,11 +1238,11 @@ mod tests {
     #[test]
     fn a_dirty_checkout_is_kept_even_when_its_branch_is_merged() {
         let dir = init_repo("reclaim-dirty");
-        isolated_worktree(&dir, 3);
+        let fork = isolated_worktree(&dir, 3);
         merge_into_head(&dir, "mush/3");
         fs::write(worktree_path(&dir, 3).join("work.txt"), "edited again\n").unwrap();
 
-        match reclaim(&dir, 3, "HEAD") {
+        match reclaim(&dir, 3, "HEAD", Some(&fork)) {
             Reclaimed::Kept(why) => {
                 assert!(why.contains(".mush/wt/3"), "it names the checkout: {why}");
                 assert!(why.contains("uncommitted path"), "and the reason: {why}");
@@ -1136,11 +1264,11 @@ mod tests {
     #[test]
     fn nothing_there_is_neither_removed_nor_kept() {
         let dir = init_repo("reclaim-nothing");
-        assert_eq!(reclaimable(&dir, 9, "HEAD"), Reclaimable::Nothing);
-        assert_eq!(reclaim(&dir, 9, "HEAD"), Reclaimed::Nothing);
+        assert_eq!(reclaimable(&dir, 9, "HEAD", None), Reclaimable::Nothing);
+        assert_eq!(reclaim(&dir, 9, "HEAD", None), Reclaimed::Nothing);
 
         worktree_add(&dir, 9, Some("HEAD")).unwrap();
-        match reclaim(&dir, 9, "no-such-base") {
+        match reclaim(&dir, 9, "no-such-base", None) {
             Reclaimed::Kept(why) => assert!(why.contains("no-such-base"), "{why}"),
             other => panic!("an unresolvable base must keep the worktree, got {other:?}"),
         }
@@ -1155,13 +1283,16 @@ mod tests {
     #[test]
     fn a_dir_less_merged_branch_is_deleted() {
         let dir = init_repo("reclaim-residue");
-        isolated_worktree(&dir, 5);
+        let fork = isolated_worktree(&dir, 5);
         merge_into_head(&dir, "mush/5");
         fs::remove_dir_all(worktree_path(&dir, 5)).unwrap();
 
         assert_eq!(
-            reclaim(&dir, 5, "HEAD"),
-            Reclaimed::Removed { branch_kept: None }
+            reclaim(&dir, 5, "HEAD", Some(&fork)),
+            Reclaimed::Removed {
+                branch_kept: None,
+                landing: Landing::Merged,
+            }
         );
         assert_eq!(resolve(&dir, "mush/5"), None, "the name is free again");
         assert!(
@@ -1176,10 +1307,10 @@ mod tests {
     #[test]
     fn a_dir_less_unmerged_branch_is_kept() {
         let dir = init_repo("reclaim-residue-unmerged");
-        isolated_worktree(&dir, 6);
+        let fork = isolated_worktree(&dir, 6);
         fs::remove_dir_all(worktree_path(&dir, 6)).unwrap();
 
-        match reclaim(&dir, 6, "HEAD") {
+        match reclaim(&dir, 6, "HEAD", Some(&fork)) {
             Reclaimed::Kept(why) => assert!(why.contains("mush/6"), "{why}"),
             other => panic!("an unmerged residue must be kept, got {other:?}"),
         }
@@ -1205,17 +1336,33 @@ mod tests {
         // The child, forked from the parent's branch and merged back into it.
         worktree_add(&dir, 10, Some("mush/9")).unwrap();
         let child = worktree_path(&dir, 10);
+        // The fork revision, read the way `spawn_tool` reads it: question 2 is
+        // about this revision, and question 1 is about `mush/9` — the parent's
+        // branch, never HEAD.
+        let fork = resolve(&child, "HEAD").unwrap();
         fs::write(child.join("child.txt"), "child\n").unwrap();
         commit_all(&child, "mush #10: child work").unwrap();
         git_in(&parent, &["merge", "--no-edit", "mush/10"]);
-        let base = resolve(&dir, "mush/9").unwrap();
 
-        match reclaim(&dir, 10, &base) {
-            Reclaimed::Removed { branch_kept } => assert_eq!(
-                branch_kept.as_deref(),
-                Some("mush/10"),
-                "the ref git would not delete is named, not forced"
-            ),
+        assert_eq!(
+            reclaimable(&dir, 10, "mush/9", Some(&fork)),
+            Reclaimable::Landable(Landing::Merged),
+            "a child's work merged into its parent's branch reads merged, and \
+             the base it is measured against is the parent's branch — not HEAD"
+        );
+
+        match reclaim(&dir, 10, "mush/9", Some(&fork)) {
+            Reclaimed::Removed {
+                branch_kept,
+                landing,
+            } => {
+                assert_eq!(
+                    branch_kept.as_deref(),
+                    Some("mush/10"),
+                    "the ref git would not delete is named, not forced"
+                );
+                assert_eq!(landing, Landing::Merged);
+            }
             other => panic!("the child's work is merged into its base, got {other:?}"),
         }
 

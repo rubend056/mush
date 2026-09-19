@@ -292,26 +292,57 @@ fn is_filler(word: &str) -> bool {
     FILLER.contains(&bare_word(word).to_ascii_lowercase().as_str())
 }
 
-/// Where an isolated agent's work ended up, once the human landed it.
+/// Where an isolated agent's work ended up, once mush's own sweep — or a
+/// human's landing by hand — settled the worktree and the branch it was on.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Landed {
-    /// Merged into the main branch; the worktree and the branch were reclaimed.
+    /// The branch's own commits are in the base it was forked from (its
+    /// parent's branch, or `HEAD` for a child of the root): the worktree and
+    /// the branch were reclaimed. The row must not name *which* base it went
+    /// into — a nested merge lands in the parent's branch, not in HEAD, and a
+    /// row that claimed HEAD about it was already one lie too many.
     Merged,
+    /// The run never committed: the fork revision it was created at is still
+    /// the branch's tip, so there was nothing to merge. The checkout and the
+    /// branch were reclaimed all the same, and a row that called this "merged"
+    /// was claiming work nobody ever did.
+    NothingCommitted,
     /// Thrown away on purpose; the worktree and the branch were reclaimed.
     Discarded,
+}
+
+impl From<git::Landing> for Landed {
+    /// git's own answer, in the tree's vocabulary: `Landed` also names a
+    /// discard, which no git fact produces, so the two enums are never the
+    /// same and the conversion happens at one door (a stored session's
+    /// `StoredLanded` is mapped in `app::mod`).
+    fn from(landing: git::Landing) -> Self {
+        match landing {
+            git::Landing::Merged => Landed::Merged,
+            git::Landing::NothingCommitted => Landed::NothingCommitted,
+        }
+    }
 }
 
 impl Landed {
     /// The past tense of what happened, as a word.
     ///
-    /// The one spelling of it, so the refusal that tells the human why a nudge
-    /// cannot run and the row that says where the work went cannot tell the
-    /// same story in two different words (refactor R12). It is the word and not
-    /// the sentence: each surface paints its own prose around it
-    /// (`app::screen::agent_detail` for the row).
+    /// The one spelling of the landing a *row* paints its prose around
+    /// (`app::screen::agent_detail`), so the row cannot re-spell what the sweep
+    /// recorded.
+    ///
+    /// The refusal that tells a human why a nudge cannot run reads the same
+    /// fact, but it is a sentence — "agent #2 was …" — and
+    /// [`Landed::NothingCommitted`] is not a state the agent entered: "was
+    /// nothing committed" is not English, so that landing's refusal is worded
+    /// around the fact instead of around this word (`App::worktree_gone`).
+    /// Making `past` a phrase that reads in both places would bend the row's
+    /// word to the refusal's grammar, and the row is the surface a human lands
+    /// their eyes on first (refactor R12).
     pub fn past(self) -> &'static str {
         match self {
             Landed::Merged => "merged",
+            Landed::NothingCommitted => "nothing committed",
             Landed::Discarded => "discarded",
         }
     }
@@ -334,6 +365,16 @@ pub struct AgentNode {
     pub phase: Phase,
     pub since: Instant,
     pub branch: Option<String>,
+    /// The commit this agent's worktree was created at, when this session made
+    /// it: the fork revision that tells a branch with no commit of its own from
+    /// a merged one (see [`git::Landing`]), and so the difference between the
+    /// rows "nothing committed" and "merged".
+    ///
+    /// `None` for a shared child (no worktree), and for a node adopted from a
+    /// session file or a leftover on disk, where no fork revision was ever
+    /// stored: the sweep then keeps the answer it has always given rather than
+    /// guessing (see [`git::reclaimable`]).
+    pub fork: Option<String>,
     /// The agent's result once it has one (a leftover worktree has one too).
     pub summary: Option<String>,
     /// Found on disk rather than spawned in this session. An explicit flag, not
@@ -435,6 +476,9 @@ pub struct Spawn {
     pub brief: String,
     pub depth: usize,
     pub branch: Option<String>,
+    /// The revision the new worktree was created at, read back from the fresh
+    /// checkout; `None` for a shared child.
+    pub fork: Option<String>,
     pub cmd: Sender<AgentMsg>,
 }
 
@@ -461,6 +505,11 @@ pub struct Existing {
     pub title: Option<String>,
     pub phase: Phase,
     pub branch: Option<String>,
+    /// The revision a worktree was forked at, when the adopting caller knows
+    /// one: `None` for a node restored from a session file or found on disk,
+    /// neither of which ever stored one, so the sweep keeps the answer it has
+    /// always given for it (see [`git::reclaimable`]).
+    pub fork: Option<String>,
     pub summary: Option<String>,
     pub leftover: bool,
     pub landed: Option<Landed>,
@@ -492,9 +541,14 @@ const STALE_CANCEL: Duration = Duration::from_secs(10);
 /// never push an older, droppable one out of the window.
 ///
 /// **No archive.** The reaped transcript is *gone*, not written anywhere: an
-/// archive would be one more lifetime to reason about, and the stored copy of
-/// each transcript is already capped at 256 KiB, so dropping a row drops at
-/// most that from the next save (the human's decision, §8.21).
+/// archive would be one more lifetime to reason about, and what bounds a stored
+/// transcript is the request-side fold rather than any byte cut — a conversation
+/// is folded at nine tenths of its history budget
+/// (`mush_core::transcript::compaction_trigger`), and a *child's* is folded only
+/// while it runs, so a finished child sits frozen at whatever it reached. The
+/// file's bound is `CHILD_HISTORY × that fold trigger + the root`, and dropping
+/// a row drops one child's frozen transcript from the next save (the human's
+/// decision, §8.21).
 pub const CHILD_HISTORY: usize = 50;
 
 /// How many of the newest children keep their actor thread.
@@ -608,6 +662,7 @@ impl AgentTree {
             phase: Phase::Idle,
             since: Instant::now(),
             branch: None,
+            fork: None,
             summary: None,
             leftover: false,
             title: None,
@@ -702,6 +757,7 @@ impl AgentTree {
             phase: Phase::Thinking,
             since: Instant::now(),
             branch: spawn.branch,
+            fork: spawn.fork,
             summary: None,
             leftover: false,
             landed: None,
@@ -733,6 +789,7 @@ impl AgentTree {
             phase: node.phase,
             since: Instant::now(),
             branch: node.branch,
+            fork: node.fork,
             summary: node.summary,
             leftover: node.leftover,
             landed: node.landed,
@@ -758,10 +815,11 @@ impl AgentTree {
         }
     }
 
-    /// Mush's own sweep took this agent's worktree and branch: the work is in the
-    /// base the branch was forked from (or the run never committed anything), so
-    /// the row says where it went instead of offering a `git diff` against a
-    /// branch and a checkout that are both gone (finding U13, H10).
+    /// Mush's own sweep took this agent's worktree and branch: `landed` is
+    /// which of the two it was — the branch's work is in the base it was forked
+    /// from, or the run never committed anything — so the row says where the
+    /// work went instead of offering a `git diff` against a branch and a
+    /// checkout that are both gone (finding U13, H10).
     ///
     /// The branch goes with the checkout. A name git no longer has is a diff
     /// that cannot work, the refresh stops asking about an id whose work is
@@ -769,9 +827,9 @@ impl AgentTree {
     /// refusing a nudge that would recreate the reclaimed path as a plain
     /// directory (finding S1). `landed` is stored, so a restart comes back with
     /// the same row rather than reviving an agent whose worktree is gone.
-    pub fn mark_reclaimed(&mut self, id: AgentId) {
+    pub fn mark_reclaimed(&mut self, id: AgentId, landed: Landed) {
         if let Some(node) = self.node_mut(id) {
-            node.landed = Some(Landed::Merged);
+            node.landed = Some(landed);
             node.branch = None;
             node.kept = None;
         }
@@ -813,10 +871,10 @@ impl AgentTree {
             // A landed agent that runs again is not a landed agent: its
             // worktree is gone (which is why the restored node dropped its
             // branch), so the new run happens in the main checkout, and a
-            // footer still saying `merged into HEAD` would be describing the
-            // run before this one while the row shows work in flight (finding
-            // P7). What the merge did is in the transcript, where history
-            // lives.
+            // footer still saying `merged` (or `nothing committed`) would be
+            // describing the run before this one while the row shows work in
+            // flight (finding P7). What the merge did is in the transcript,
+            // where history lives.
             node.landed = None;
             // The same for the sweep's verdict: it described a worktree this
             // run is about to change, and the next read of git will have a new
@@ -1592,6 +1650,7 @@ mod tests {
             brief: "lexer".to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd: tx,
         });
         (opened, rx)
@@ -1607,6 +1666,7 @@ mod tests {
             brief: format!("#{id}"),
             depth,
             branch: None,
+            fork: None,
             cmd: tx,
         });
         rx
@@ -1621,6 +1681,7 @@ mod tests {
             title: None,
             phase: Phase::Done,
             branch: Some(format!("mush/{id}")),
+            fork: None,
             summary: Some("found on startup".to_string()),
             leftover: true,
             landed: None,
@@ -1883,6 +1944,7 @@ mod tests {
             brief: brief.to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd: tx,
         });
         tree.node(opened.id).expect("the node was inserted").title()
@@ -1982,6 +2044,7 @@ mod tests {
             brief: "deep.txt".to_string(),
             depth: 2,
             branch: None,
+            fork: None,
             cmd: tx,
         });
         assert_eq!(
@@ -2318,6 +2381,7 @@ mod tests {
             brief: "port the parser".to_string(),
             depth: 1,
             branch: Some("mush/1".to_string()),
+            fork: None,
             cmd: tx,
         });
         tree.finish(AgentId(1), Some("did it".to_string()));

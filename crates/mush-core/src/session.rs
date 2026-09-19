@@ -77,11 +77,21 @@ pub enum StoredStatus {
     Failed(String),
 }
 
-/// Where an agent's isolated work went, once the human landed it.
+/// Where an agent's isolated work went, once mush's sweep settled it.
+///
+/// `NothingCommitted` is the third ending the sweep can prove: the branch never
+/// gained a commit of its own, so there was nothing to land. It is stored for
+/// the same reason the other two are — a restart paints `landed` on the row —
+/// and without it a no-commit run would come back reading "merged" (the
+/// disclosure in §8.23 of `docs/findings.md` that asks for this variant here).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum StoredLanded {
+    /// The branch's commits are in the base it was forked from.
     Merged,
+    /// The branch never gained a commit of its own.
+    NothingCommitted,
+    /// Thrown away on purpose.
     Discarded,
 }
 
@@ -551,6 +561,20 @@ mod tests {
         assert_eq!(loaded.notices[0].at, 1_700_000_000);
         assert!(loaded.notices[0].text.contains("could not compact"));
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The third landing has a name in the file, and it is the one the row and
+    /// the sweep read back: a no-commit run restored from a session must come
+    /// back as itself, not as `merged` (the row that claimed a merge nobody
+    /// performed).
+    #[test]
+    fn a_nothing_committed_landing_round_trips_by_name() {
+        let spelled = serde_json::to_string(&StoredLanded::NothingCommitted).unwrap();
+        assert_eq!(spelled, "\"nothing_committed\"");
+        assert_eq!(
+            serde_json::from_str::<StoredLanded>(&spelled).unwrap(),
+            StoredLanded::NothingCommitted
+        );
     }
 
     /// Old sessions have no context field; they must still load. So must the

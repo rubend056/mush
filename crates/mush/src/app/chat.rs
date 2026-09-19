@@ -598,9 +598,12 @@ impl Chat {
     /// together.
     ///
     /// **No archive** (§8.21): the transcript is dropped, not written anywhere,
-    /// because an archive is one more lifetime to reason about and the stored
-    /// copy of a child's transcript is already capped at 256 KiB — so dropping
-    /// the row drops at most that from the next save.
+    /// because an archive is one more lifetime to reason about and the file is
+    /// already bounded without it: a conversation is folded at nine tenths of
+    /// its history budget, a *finished* child's is never folded again (it sits
+    /// frozen at whatever it reached), and the file's bound is `CHILD_HISTORY ×
+    /// that fold trigger + the root`. So dropping the row drops one child's
+    /// frozen transcript from the next save.
     ///
     /// Every map in here is keyed by the agent's id, so every one of them goes
     /// with it: the transcript itself, the voices keyed by line index, the
