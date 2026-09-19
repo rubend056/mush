@@ -52,8 +52,10 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   recorded rather than edited: `wait`'s 600 s cap and its early release, what a
   job's result actually is (its one line, not its window), the 120 s kill when
   the job budget is full and the 8 MiB output ceiling, and the title a running
-  child does not have. The code half of items 1, 3, 4, 6, 7, 8 landed with §8.27;
-  item 10 with `mush/88`.
+  child does not have. The code half of items 1, 3, 4, 6, 7 and 8 landed in
+  `ff315d8` (`mush/87`), item 10 in `f34c4de` (`mush/88`) — see §8.29. A second
+  wording item the wave added: the `edit_file` schema declares `replace_all` only
+  inside `edits` items, though the code now honours a top-level one (item 3).
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -928,16 +930,16 @@ mismatches below are code facts.
 
 | # | what is false | disposition |
 |---|---|---|
-| 1 | `status` promises "each child's state and title or branch" while a running child prints only `#3 ◐ running` — no title (it lives in the UI tree) and no branch | 🔄 `mush/87`: print the branch when mush can name it (an isolated child's is `mush/<id>`); no title source invented. The schema sentence is `prompt.rs` |
+| 1 | `status` promises "each child's state and title or branch" while a running child prints only `#3 ◐ running` — no title (it lives in the UI tree) and no branch | ✅ `ff315d8` (`mush/87`): print the branch when mush can name it (an isolated child's is `mush/<id>`); no title source invented. The schema sentence is `prompt.rs` (H20) |
 | 2 | `wait` "blocks until everything you own has finished" — it gives up at 600 s and any message ends it early, and the context says neither | ⬜ the human's file (`prompt.rs`): name the cap, the timeout sentence and the early release |
-| 3 | `edit_file`'s description offers a top-level `replace_all`; only `edits[].replace_all` is read, so the refusal tells the model to set the flag it just set | 🔄 `mush/87`, fixed in code: the single-pair path honours a top-level `replace_all` |
-| 4 | **`exclusive=true` is not exclusive against its own owner.** `machine_free_for` answers `Ok` for the holder, `take_machine` then overwrites the record that names the exclusive job with a `(agent, command, None)`, and that call's release frees the machine while the job still runs — so a sibling's benchmark is admitted beside it. The promise ("Siblings are refused, not interleaved") silently stops holding | 🔄 `mush/87`: refuse an exclusive call from the current holder (the sentence for it exists but was unreachable), and let an exempt non-exclusive call leave the record alone |
+| 3 | `edit_file`'s description offers a top-level `replace_all`; only `edits[].replace_all` is read, so the refusal tells the model to set the flag it just set | ✅ `ff315d8` (`mush/87`), fixed in code: the single-pair path honours a top-level `replace_all`. The schema's `properties` are still `prompt.rs` (H20) |
+| 4 | **`exclusive=true` is not exclusive against its own owner.** `machine_free_for` answers `Ok` for the holder, `take_machine` then overwrites the record that names the exclusive job with a `(agent, command, None)`, and that call's release frees the machine while the job still runs — so a sibling's benchmark is admitted beside it. The promise ("Siblings are refused, not interleaved") silently stops holding | ✅ `ff315d8` (`mush/87`): `take_machine` refuses **any** existing holder (it is the record's only writer), and an exempt non-exclusive call leaves the record alone. The sentence for the holder's own second claim — deleted by `2c6b53f` as unreachable, which is what made the bug invisible — is back |
 | 5 | a job's result is not handed over "in full": `wait`'s digest carries the job's one-line report, whose output is `preview_tail`'s last 400 chars of a 2 KB window | ⬜ the human's file (`prompt.rs`): say what a job's result is |
-| 6 | "you are told when it finishes" — a job killed by the 4 h ceiling, the 8 MiB output limit or a stop is written to the transcript but does not wake its owner (`is_news()` is true only for `Exited`) | 🔄 `mush/87`: a job mush *killed* is news; a `Stopped` outcome still does not restart a run |
-| 7 | the root is told "this call queued and the lock was still held" when its refusal is immediate — no queue, no 30 s | 🔄 `mush/87`: a second sentence for the exempt caller |
-| 8 | `control message` replies "it was at rest, so this resumes it" — but if the child's worktree is gone the child drops the steer on the floor, and the parent then waits 600 s for a result that cannot arrive. The human's own path refuses the same message up front | 🔄 `mush/87`: the parent's path must refuse it the same way |
+| 6 | "you are told when it finishes" — a job killed by the 4 h ceiling, the 8 MiB output limit or a stop is written to the transcript but does not wake its owner (`is_news()` is true only for `Exited`) | ✅ `ff315d8` (`mush/87`): a job mush *killed* is news; a `Stopped` outcome still does not restart a run |
+| 7 | the root is told "this call queued and the lock was still held" when its refusal is immediate — no queue, no 30 s | ✅ `ff315d8` (`mush/87`): `Refused::root_message`, chosen by `machine_refusal` at all three sites |
+| 8 | `control message` replies "it was at rest, so this resumes it" — but if the child's worktree is gone the child drops the steer on the floor, and the parent then waits 600 s for a result that cannot arrive. The human's own path refuses the same message up front | ✅ `ff315d8` (`mush/87`): `message_agent` refuses up front, in the child's own words (`worktree_gone_line`) |
 | 9 | "A command that outlives 60s detaches by itself" holds only while the job budget has room (otherwise it is killed at 120 s), and a job also dies past 8 MiB — a ceiling no prompt or schema states | ⬜ the human's file (`prompt.rs`): the budget's consequence, and the output ceiling beside "4h" |
-| 10 | turns leave the context with no marker: `needs_compaction` fires only while the history still fits, and past the whole budget `trim_history` drains the oldest turns silently | 🔄 `mush/88`: one line in the request saying the oldest turns were dropped |
+| 10 | turns leave the context with no marker: `needs_compaction` fires only while the history still fits, and past the whole budget `trim_history` drains the oldest turns silently | ✅ `f34c4de` (`mush/88`): one line in the request saying the oldest turns were dropped |
 
 **What it checked and found consistent** — worth as much as the list above,
 because these are the promises that hold: the root and every subagent share one
@@ -1003,3 +1005,182 @@ the fold trigger, and read its percentile off the largest-first list (so the
 number printed as `p90` was the tenth percentile). It now derives
 `(budget, trigger)` from the window it is told about and prints both. A count
 without its method is a rumour — including when the count is the tool's own.
+
+---
+
+## 8.29 The contract wave: one real bug, three branches, and a workspace lock (`e7816a4`..`ff315d8`)
+
+§8.27's audit closed here, together with the leftovers of the six-auditor
+review, as three branches with disjoint file sets — each verified in its own
+worktree before merge (`cargo test`, `cargo fmt --check`, `cargo clippy
+--all-targets -- -D warnings`, the smoke scenarios) and again on the merged tree
+— plus one feature the human approved mid-flight and one script. The merged tree
+runs `515` mush tests and `128` mush-core tests, `0` failed, `4` ignored (the
+known-flaky git test passed), fmt and clippy clean, and all three smoke
+scenarios pass.
+
+**`ff315d8` (`mush/87`) — the lock that was not exclusive.** The audit's item 4
+was a real defect with a three-step mechanism: `machine_free_for` answers `Ok`
+for the holder, so an agent holding the machine could call `exclusive=true` again;
+`take_machine` then *overwrote* the holder record — erasing `Some(job)`, the name
+of the detached job the first claim had become — and the second call's own
+`release_machine` freed the machine while that job still ran, admitting the
+sibling benchmark the lock exists to refuse. The sentence for exactly this state
+("you hold the machine…") had been **deleted by `2c6b53f` as unreachable**, with
+the proof written into the comment: the only two builders of a `Held` were
+`machine_free_for` (which answers `Ok` for the holder) and `launch` (which refused
+only a *non-owner* holder). The comment was right about those two call sites and
+wrong about the third: `take_machine` was itself a builder, via its own
+overwrite. A comment that proves a state unreachable is evidence about the code,
+not about the machine — and the state came back the moment the record's writer
+changed. Now `take_machine` is the record's only writer and refuses **any**
+existing holder, `launch` refuses a second *job* claim even for the owner
+(`claimed.is_some()`) while the legitimate auto-detach handover — a foreground
+call giving its own `None` claim to the job it became — still passes, and an
+exempt non-exclusive call by the holder never touches the record. Three tests
+fail on the old hunk (`the_holder_cannot_claim_the_machine_itself_twice`,
+`a_second_exclusive_job_is_refused_even_for_its_owner`,
+`a_second_exclusive_call_from_the_holder_is_refused`); a fourth
+(`a_holder_runs_beside_its_own_exclusive_job_without_losing_it`) passes before and
+after and is labelled as the guard it is.
+
+The branch's other five items: `control message` to a child whose worktree is
+gone is refused up front in the child's own words (item 8 — the parent used to
+wait 600 s for a result a landed child could never produce); a job mush *killed*
+by the 4 h ceiling or the output limit is news and wakes its owner while
+`Stopped` still does not (item 6); `status` names a running child's branch
+`mush/<id>` and invents no title (item 1's code half); a top-level
+`replace_all` is honoured (item 3); and the root's immediate refusal no longer
+claims a queue it never sat in (item 7), through one `machine_refusal` chooser
+rather than three call sites picking their own words. Leftovers: `Asked.tools`
+(one reader, a restatement of `tool_schemas.len()`) gone; `beside_note` and both
+`Refused::Machine` arms cut a command at one bound; `wait_bounded` sleeps
+`jobs::POLL`; `TRUNCATION_INSTRUCTION` reaches the transcript through `push_line`.
+**Refused, and why:** `jobs::label` cannot be deleted — two of its five callers
+are in `app/mod.rs`, which this branch did not own — and `Held.agent`/`Record.owner`
+were not retyped to `AgentId` because the `u64` flows into `app/tree.rs`
+(`live_for(id.0)`, `hold(AgentId::ROOT.0, …)`) and `app/mod.rs`
+(`kill_owned(id.0)`), i.e. out of the branch.
+
+**`f34c4de` (`mush/88`) — the environment, read once.** `resolve` read the seven
+`MUSH_*` variables three times and parsed three of them under two policies
+(`Overrides::from_env` built the base leniently, `from_env_checked` re-read the
+same three strictly), and `Config::from_env`'s doc claimed two knobs its body
+never applied. One `EnvText::read` now names and reads each variable exactly
+once; the two readers parse those fields with their own policy, and `resolve`
+hands the *same* read to the base config and to `resolve_with`. The honest
+delta: `Config::from_env()` now applies `MUSH_REASONING_EFFORT`/`MUSH_THINKING`,
+the two knobs its doc always claimed — no shipping path calls it (`rg
+"Config::from_env"` finds one ignored live-endpoint test), and `resolve`'s
+`Config` is unchanged for every environment by construction. The identity reads
+of `env.temperature`/`env.max_completion_tokens` are gone (no environment
+spelling exists), and the test that planted one now pins that such a layer is
+*not* read. Item 10: `trim_history` dropped turns in silence, so a model
+contradicts a fact it "already read" with nothing to say why the fact is gone —
+one `DROPPED_TURNS_NOTE` line now travels in the request. Three details that
+matter: it is a **user** line (mush's other out-of-band notes are; an assistant
+line would be a fabricated turn, and a thinking endpoint refuses a replayed
+assistant turn with no `reasoning_content`); it is removed from the vec *before*
+the `user_indices` arithmetic and put back after, so the drain measures exactly
+the transcript it always measured; and it is counted against the budget from the
+first drop, so the line explaining the trim cannot be what pushes the request
+past the window. It cannot accumulate in `session.json`: the vec is the actor's
+working copy, while the stored copy is the UI's, fed only by emitted events.
+Four new tests, one of them for the transcript that fits (no note) and one for
+the shape that cannot be cut (no note either — a note is a fact about what
+happened, not a hedge). **Refused: items C4 and C5.** The review's `stored_bytes`
+`unwrap_or(0)` and `session.rs`'s `cost` helper were read at `eddaa0f`, and the
+byte cut that contained them was reverted by `de80f9c` (§8.25) — the functions
+are gone, so there is nothing to widen or delete. A review is a snapshot of a
+tree, and two of its five claims were about code that no longer existed.
+
+**`b847555` (`mush/93`) — a picker row carries its id.** `Picker::items` was
+`Vec<String>` of `{id} · {tokens}` labels, and *two* readers parsed the label
+back: the bullet in `screen.rs` compared the text before the first `" · "`, and
+`pick` did the same before applying the model. One model id containing the
+separator was therefore drawn as one thing and chosen as another. Items are
+`PickerItem { id, label }` now; the label string is byte-identical and still the
+only thing defanged, while `id` is data. Same class, reported and not fixed
+(`app/mod.rs` was this branch's file but the code is a test helper):
+`assert_window_counts` still recovers painted facts by parsing the painted
+frame — deliberately, since that is what it asserts.
+
+**`e7816a4` — one mush per workspace.** Two processes on one directory write the
+same `session.json`, and that write is a whole-file replace on a minute's
+debounce: the two conversations erased each other in turn, and whichever saved
+last is what survived a crash. The socket said *something* about a second process
+(`bind` fails against a live listener), but a failed attach is deliberately not
+fatal, so the second process started anyway and the damage was silent. The lock
+is `flock(2)`, exclusive and non-blocking, on `<root>/.mush/lock`, **deliberately
+never unlinked**: unlinking is what makes a lock file racy, since a third process
+opening the path in between gets a new inode and locks that. The kernel drops the
+lock when the process dies, so there is no stale-lock case, nothing to clean up
+after a `kill -9`, and no pid-reuse question; the pid is *written* inside only so
+the refusal can name who to quit. It is taken in the TUI path only — after
+`ensure_mush_dir`, before `Session::read`, so a refused start leaves the store as
+it found it — and the subcommands and `--print-config` return earlier by design,
+which is what makes the refusal's "ask it things with `mush agents`" true. The
+syscall comes from `rustix` rather than a hand-written `extern "C"`: the
+workspace forbids `unsafe`, and `File::try_lock` needs Rust 1.89 while the MSRV
+is 1.74 (`rustix` was already in the tree under `tempfile` and `rustls`).
+
+Evidence, on this machine, with the real binary: a second start exits `1` with
+`mush: another mush is already running in this workspace (pid 3541494) — quit it
+first, or ask it things with `mush agents`", and `.mush/` keeps exactly the
+files the running process made; `mush agents <dir>` still answers while the lock
+is held (0 agents, exit 0); `kill -9` on the holder's session leaves the file in
+place and the next start takes the lock and rewrites the pid. That last check is
+the one a pid file fails, which is the whole argument for `flock`. The scenario
+is permanent: `scripts/smoke.py --lock` needs no endpoint and asserts the exit
+code, that the refusal names the holder, that it points at `mush agents`, that a
+subcommand still reaches the running mush, and that the workspace reopens once
+the holder is gone.
+
+**`13f005d` — `session_blame.py`'s window is read, not assumed.** The script drew
+its budget and fold trigger against a hardcoded `128000` and called it "the window
+a session gets when nothing states one". Neither half was true: mush's built-in
+default is `8192`, and a window the endpoint advertises is what most workspaces
+actually run at — the store this was written for runs at `500000`, so every
+trigger the tool named was off by **4×** and the "each child stopped just short of
+its own ceiling" verdict was drawn against a line drawn in the wrong place. The
+window now comes from the first of: the third argument, the session file's own
+`context` field (the one mush stores when a human states a window), `MUSH_CONTEXT`
+in this shell, the home config (`MUSH_CONFIG`, mirrored from
+`userconfig::config_path`). Each answer names its source; with none of the four
+the sizes are still reported and the fold trigger is left unnamed rather than
+guessed; `--json` carries the tokens and the source together. The only constant
+left is `BUILT_IN_CONTEXT = 8192`, quoted in the message for "no window is known".
+
+**The census, before and after** (`git archive a003e36 crates | tar -x -C /tmp/x`
+then `python3 scripts/census.py /tmp/x`; §8.5's method):
+
+| | before (`a003e36`) | after (`ff315d8`) | Δ |
+|---|---|---|---|
+| total | 46,604 | 47,831 | +1,227 |
+| production | 7,056 | 7,061 | **+5** |
+| tests | 24,886 | 25,698 | +812 |
+| comments | 11,633 | 11,971 | +338 |
+| blank | 3,029 | 3,101 | +72 |
+
+The production column is the wave's most interesting number. A new module (the
+workspace lock, 32 production lines), a real concurrency fix, a rewritten
+environment reader and six model-facing corrections together cost **five** lines
+of production code, because every one of them came with deletions. 99.6% of what
+the wave added is harness and prose — which is the shape §8.5 was written to make
+visible, and the reason a wave is now planned around *what a claim costs to
+prove* rather than around a line budget.
+
+**Left after this wave.** The queue's open rows are unchanged in kind: H12
+(per-agent token accounting, and note that `mush_core::Usage` is decoded and
+`agent.rs`'s `RunUsage` already folds it per run — what is missing is a *live*
+count, not a source), H16 residual (the per-minute deep copy of every kept
+transcript), H18 (a parent's steer to a *parked* child still fails as "gone" —
+`ff315d8` fixed the adjacent worktree-gone case, not parking), H19 (a reaped
+child's name stays in its parent's books), and H20 (four sentences in the
+human's `prompt.rs`, plus the `edit_file` schema's `replace_all`). Of
+`docs/refactor.md`'s structural rows: T1 §7 (`-y`/`--yes`/`AUTO_APPROVE`, the
+human's call), T2 §17 (the attach `id` field, a wire contract), T3 §3
+(`worktree_add`'s `.git` probe refuses a workspace that is a subdirectory of a
+repository — settle the promise before the code), T1 §3/§4 and T2 §18/§19 (each
+needs lines deleted in `prompt.rs`; §18/§19's *cap* halves are void since the
+revert). The hue is §8.30.
