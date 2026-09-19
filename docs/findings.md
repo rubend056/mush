@@ -958,3 +958,48 @@ workspace" is an instruction, not a boundary — only `edit_file` enforces it, a
 the prompt says a run "runs until it stops calling tools" (the guard announces
 itself in a wrap-up turn, so the two sentences are not the same sentence). Both
 are decisions, not drift.
+
+---
+
+## 8.28 What bounds the file now, measured on a running mush
+
+The instrument is `scripts/inspect_run.py` (read-only: `/proc`, the state
+directory, the socket's inode — it never writes to the socket and never
+signals), and the attribution is `scripts/session_blame.py`. Both were pointed
+at the orchestrator's own session while it ran (pid 2660028, up 3.5 h, 27
+threads, RSS 116 MiB).
+
+**The write rate, before the minute.** That process is the *old* binary, built
+before §8.25's revert: `SESSION_DEBOUNCE` was one second there. Over eight
+seconds of `session.json` mtimes and `/proc/<pid>/io`: three rewrites of a
+13.9 MB file, each delta exactly the file's size, nothing in between —
+**~5 MB/s sustained, ~400 GB/day**, all of it the same bytes re-encoded. That is
+the cost the 60 s debounce and the reaping now divide: the same session would
+write ~0.23 MB/s, and a smaller file besides. It is also the honest reason the
+byte cap was ever proposed.
+
+**Where the bytes are.** 13.3 MiB on disk: 12.1 MiB of it in **23 children**
+(90%), 788 KiB in the root transcript, and indentation costs only 1.03× — the
+payload is long strings, so pretty-printing is not the problem. A child's
+transcript is folded while it runs and **never again once it finishes**, so each
+child is pinned at whatever it reached: median 549 KiB, p90 768 KiB, largest
+817.3 KiB against a fold trigger of **820.9 KiB** (window 500k tokens → budget
+1.1 MiB → trigger ¾ of it). Every child stopped just short of its own trigger.
+
+**The bound that replaced the cap.** No byte heuristic is involved and none is
+needed: what the store can hold is
+
+    CHILD_HISTORY (50) × the transcript's own fold trigger + the root's (folded, so under it)
+
+which for this session's window is 50 × 820.9 KiB + <820.9 KiB ≈ **41 MiB**, and
+for a 128k window ≈ 10 MiB. Both numbers move with the *model's window*, which is
+the one thing the model actually has to fit into — not with a magic constant. The
+lever is the one number behind reaping, `CHILD_HISTORY`, and the live tree (23
+children) is comfortably inside it.
+
+**A tool bug this measurement exposed, fixed in the same commit:**
+`session_blame.py` was comparing children against the *budget* while calling it
+the fold trigger, and read its percentile off the largest-first list (so the
+number printed as `p90` was the tenth percentile). It now derives
+`(budget, trigger)` from the window it is told about and prints both. A count
+without its method is a rumour — including when the count is the tool's own.
