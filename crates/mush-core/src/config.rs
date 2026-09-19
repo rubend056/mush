@@ -785,6 +785,7 @@ mod tests {
             context: None,
             updated: 0,
             messages: Vec::new(),
+            truncated: None,
             agents: Vec::new(),
             notices: Vec::new(),
         }

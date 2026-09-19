@@ -375,6 +375,13 @@ pub struct Chat {
     /// rather than in `App`, because every pane paints through this one
     /// transcript and the choice is about the reading, not about the frame.
     reasoning: bool,
+    /// What the file the root was loaded from said it had lost, if anything.
+    ///
+    /// It lives beside the transcript it describes: Ctrl-N and a fold replace
+    /// the root wholesale, and with it the only thing the marker was ever
+    /// about. A save reads it back so the first quiet write after a restart
+    /// cannot drop the marker and make a cut conversation look whole again.
+    root_dropped: Option<session::Dropped>,
 }
 
 impl Chat {
@@ -390,7 +397,21 @@ impl Chat {
             revisions: HashMap::new(),
             pending: None,
             reasoning: true,
+            root_dropped: None,
         }
+    }
+
+    /// What the stored root transcript lost to its cap, when the file it was
+    /// loaded from said so. `None` is a conversation stored whole.
+    pub fn root_dropped(&self) -> Option<session::Dropped> {
+        self.root_dropped
+    }
+
+    /// Adopt the marker of the session that was loaded (see
+    /// [`Self::root_dropped`]). `App::new` is the only caller with a file to
+    /// read it from.
+    pub fn set_root_dropped(&mut self, dropped: Option<session::Dropped>) {
+        self.root_dropped = dropped;
     }
 
     /// Whether a pane paints the model's reasoning above the turn it decided.
@@ -497,6 +518,10 @@ impl Chat {
         self.spoken.remove(&agent);
         self.pending = None;
         if agent == AgentId::ROOT {
+            // A fold leaves a new conversation shape, not the old one cut: the
+            // summary replaces what the marker was counting, so it goes with
+            // the transcript it described.
+            self.root_dropped = None;
             self.root = messages;
         } else {
             self.agents.insert(agent, messages);
@@ -549,6 +574,9 @@ impl Chat {
     /// they just asked for is a preference the UI forgot.
     pub fn clear(&mut self) {
         self.root.clear();
+        // The marker described a root that just went with the old chat. A new
+        // conversation is stored whole, and carrying it would label one as cut.
+        self.root_dropped = None;
         self.agents.clear();
         self.notices.clear();
         self.reading.clear();
@@ -2678,6 +2706,38 @@ mod tests {
             empty.revision(AgentId::ROOT) > zero,
             "even an empty conversation's token moves on"
         );
+    }
+
+    /// A truncation marker describes one root transcript, and it dies with it:
+    /// Ctrl-N and a fold both replace the root wholesale, and a fresh
+    /// conversation must not wear the old one's "this is cut" label. A child's
+    /// replacement is not the root's business.
+    #[test]
+    fn a_replaced_root_forgets_its_truncation_marker() {
+        let marker = session::Dropped {
+            messages: 12,
+            bytes: 3 * 1024 * 1024,
+        };
+        let mut chat = Chat::bare();
+        chat.set_root_dropped(Some(marker));
+        assert_eq!(chat.root_dropped(), Some(marker));
+
+        chat.replace_transcript(AgentId(2), vec![Message::user("a child line")]);
+        assert_eq!(
+            chat.root_dropped(),
+            Some(marker),
+            "a child's transcript cannot unmark the root"
+        );
+        chat.replace_transcript(AgentId::ROOT, vec![Message::user("a summary")]);
+        assert_eq!(
+            chat.root_dropped(),
+            None,
+            "a fold leaves a whole transcript"
+        );
+
+        chat.set_root_dropped(Some(marker));
+        chat.clear();
+        assert_eq!(chat.root_dropped(), None, "a new chat is stored whole");
     }
 
     /// Clearing is per agent, because a line about one conversation is not a

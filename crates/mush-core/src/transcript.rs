@@ -1,12 +1,15 @@
 //! The transcript algebra: the rules that decide the *shape* of a request.
 //!
 //! Pairing tool calls with their results, repairing arguments a model sent as
-//! something other than JSON, dropping the oldest turns to fit a budget, and
-//! deciding when a conversation should be folded into a summary. Nothing here
-//! calls a model or touches an actor — these are pure functions over
-//! `Message`s, which is why they live in core and not in the run loop that
-//! applies them.
+//! something other than JSON, dropping the oldest turns to fit a budget,
+//! cutting a stored copy to the bytes a file may carry, and deciding when a
+//! conversation should be folded into a summary. Nothing here calls a model or
+//! touches an actor — these are pure functions over `Message`s, which is why
+//! they live in core and not in the run loop that applies them.
 
+use std::collections::HashSet;
+
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::message::Message;
@@ -185,6 +188,133 @@ pub fn trim_history(messages: &mut Vec<Message>, budget: usize) {
         }
         messages.drain(2..keep_from);
     }
+}
+
+/// What a cap cut away, oldest first: how many messages, and the serialized
+/// bytes they cost.
+///
+/// The unit is what `serde_json` writes for a message — what the file actually
+/// pays — not [`Message::weight`], which is the token proxy the context budget
+/// counts. The two disagree by design: weight estimates what an endpoint will
+/// charge for re-sending a transcript, while a file pays for every character
+/// verbatim.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Dropped {
+    pub messages: usize,
+    pub bytes: usize,
+}
+
+/// Keep the newest segments of a transcript that fit `cap`, dropping whole
+/// ones out of the middle, and say what went.
+///
+/// A segment opens at a `user` message or at an `assistant` message: a tool
+/// result can only legally follow the assistant turn it answers, so a cut just
+/// before either opening can never fall between a call and its results — the
+/// pairing rules are [`repair_tool_pairs`]'s. The one shape that can still
+/// strand a result is the UI's, where the human typed while a tool batch ran
+/// and a steering line sits between a call and its answers; a result whose call
+/// went with the dropped middle goes with it.
+///
+/// The opening segment is never dropped, however small the cap: it is the brief
+/// a child was spawned with, or the human's first words on the root, and
+/// `agent::revive` only re-seeds a brief when the transcript is empty — losing
+/// it would leave a revived child knowing where it got to and not what it was
+/// asked to do. [`trim_history`] keeps the same minimum shape (system, task,
+/// newest turn). The newest segment survives too, even when it alone is over
+/// the cap, so the cap is a floor on what the middle gives up rather than a
+/// byte-exact ceiling.
+///
+/// Idempotent: capping what capping produced drops nothing further, so a save
+/// repeated on an unchanged conversation cannot keep shrinking it.
+pub fn cap_transcript(messages: &mut Vec<Message>, cap: usize) -> Dropped {
+    // Each message's cost, once: the greedy walk below asks for the same
+    // segment repeatedly, and re-serializing to answer it would make the cut
+    // quadratic in the transcript.
+    let cost: Vec<usize> = messages.iter().map(stored_bytes).collect();
+    let starts: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, message)| message.role == "user" || message.role == "assistant")
+        .map(|(index, _)| index)
+        .collect();
+    if starts.len() < 2 {
+        // One opening segment — perhaps with stranded results in front of it —
+        // is all there is: no newer segment exists to keep in its place, so the
+        // cap has nothing it could safely give up.
+        return Dropped::default();
+    }
+    // Everything before the second segment opens is the part that stays. It is
+    // normally one message, and it can only be longer if the transcript opens
+    // with results nobody ever answered.
+    let head_end = starts[1];
+    // From the newest segment backwards, keep every whole one that fits.
+    // `round > 1` is what protects the opening segment: `keep_from` can reach
+    // `starts[1]` and no further, and the messages before it are never in the
+    // drained range.
+    let newest = starts.len() - 1;
+    let mut keep_from = starts[newest];
+    let mut kept: usize = cost[keep_from..].iter().sum();
+    let mut round = newest;
+    while round > 1 {
+        let start = starts[round - 1];
+        let segment: usize = cost[start..keep_from].iter().sum();
+        if kept + segment > cap {
+            break;
+        }
+        kept += segment;
+        keep_from = start;
+        round -= 1;
+    }
+    let mut dropped = Dropped {
+        messages: keep_from - head_end,
+        bytes: cost[head_end..keep_from].iter().sum(),
+    };
+    if dropped.messages == 0 {
+        return dropped;
+    }
+    // A result whose call sat in the dropped middle is an orphan on the next
+    // request — the invalid shape [`repair_tool_pairs`] exists to clean up —
+    // because the UI's transcript can put the human's steering *inside* a tool
+    // batch. The cut owns the damage it does: an answer whose question is gone
+    // goes with it. A result whose call was never there at all is left alone;
+    // that orphan predates the cut and is not this function's to repair.
+    let dropped_calls: HashSet<String> = messages[head_end..keep_from]
+        .iter()
+        .flat_map(|message| message.tool_calls().iter().map(|call| call.id.clone()))
+        .collect();
+    messages.drain(head_end..keep_from);
+    if !dropped_calls.is_empty() {
+        let mut orphans = Dropped::default();
+        messages.retain(|message| {
+            let orphan = message.role == "tool"
+                && message
+                    .tool_call_id
+                    .as_deref()
+                    .is_some_and(|id| dropped_calls.contains(id));
+            if orphan {
+                orphans.messages += 1;
+                orphans.bytes += stored_bytes(message);
+            }
+            !orphan
+        });
+        dropped.messages += orphans.messages;
+        dropped.bytes += orphans.bytes;
+    }
+    dropped
+}
+
+/// What one message costs the stored file, in bytes.
+///
+/// Its own JSON, compactly: the pretty form the file is written in spends a few
+/// dozen bytes per message on indentation and newlines on top — measured at
+/// 1.03x of a real session, because the payload is long strings and not
+/// structure — and the message's own bytes are what the cap is about. Nothing
+/// here re-uses [`Message::weight`]: that number is a token estimate, and a
+/// stored tool result pays for its exact text.
+fn stored_bytes(message: &Message) -> usize {
+    serde_json::to_vec(message)
+        .map(|json| json.len())
+        .unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -441,5 +571,172 @@ mod tests {
         let calls = repaired.tool_calls();
         assert_eq!(calls[0].function.arguments, "{\"path\": \"ok.rs\"}");
         assert_eq!(calls[1].function.arguments, "{}");
+    }
+
+    /// A round: the user line that opens it and the assistant answer. The body
+    /// is sized so a cap can be aimed at whole rounds instead of at whatever
+    /// the JSON happens to weigh.
+    fn round(index: usize, bytes: usize) -> Vec<Message> {
+        vec![
+            Message::user(format!("ask {index} {}", "x".repeat(bytes))),
+            Message::assistant("ok"),
+        ]
+    }
+
+    /// What a slice of a transcript costs the file, counted the way the cap
+    /// counts.
+    fn cost(messages: &[Message]) -> usize {
+        messages.iter().map(stored_bytes).sum()
+    }
+
+    /// The cap keeps the newest segments and gives up the middle, so what the
+    /// model just did survives while the opening task stays where it was: the
+    /// stored transcript is the task and the newest work, not a stranger in the
+    /// middle of somebody else's conversation.
+    #[test]
+    fn a_cap_keeps_the_newest_segments_and_drops_the_middle() {
+        let mut messages: Vec<Message> = (0..5).flat_map(|i| round(i, 200)).collect();
+        // Room for the last two rounds exactly, so the third has to go whole
+        // rather than leaving an answer with no question above it.
+        let two = cost(&messages[6..]);
+        let middle = cost(&messages[1..6]);
+        let cut = cap_transcript(&mut messages, two);
+
+        assert_eq!(messages.len(), 5, "the task and the last two rounds");
+        assert!(
+            messages[0].text().starts_with("ask 0"),
+            "{}",
+            messages[0].text()
+        );
+        assert!(messages[1].text().starts_with("ask 3"));
+        assert!(messages[3].text().starts_with("ask 4"));
+        assert_eq!(messages.last().unwrap().text(), "ok");
+        assert_eq!(cut.messages, 5, "the middle went");
+        assert_eq!(cut.bytes, middle);
+    }
+
+    /// A cut between segments cannot separate a call from the results that
+    /// answer it: an assistant message opens the segment its results follow it
+    /// into, so both sides of the seam stay whole.
+    #[test]
+    fn a_cap_cut_keeps_a_call_and_its_results_together() {
+        let mut messages = vec![Message::user("the brief")];
+        for i in 0..4 {
+            let id = format!("call{i}");
+            messages.push(assistant_calling(&[&id]));
+            messages.push(Message::tool(id, format!("result {i}")));
+            messages.push(Message::assistant(format!("note {i}")));
+        }
+        // Room for the newest call-plus-result pair and the note after it.
+        let newest = cost(&messages[messages.len() - 3..]);
+        let cut = cap_transcript(&mut messages, newest);
+        assert!(cut.messages > 0, "the fixture must actually be cut");
+
+        assert_eq!(messages.len(), 4, "the brief and the newest pair");
+        assert_eq!(messages[0].text(), "the brief", "the task stays");
+        // Every call that survived has its answer, and every answer its call.
+        let calls: Vec<String> = messages
+            .iter()
+            .flat_map(|message| message.tool_calls().iter().map(|call| call.id.clone()))
+            .collect();
+        let answered: Vec<String> = messages
+            .iter()
+            .filter_map(|message| message.tool_call_id.clone())
+            .collect();
+        assert_eq!(calls, answered);
+        assert_eq!(calls, ["call3"]);
+    }
+
+    /// The UI lets the human type while a tool batch runs, so a stored
+    /// transcript can put a user line between a call and its results. Dropping
+    /// the segment with the call must take the answers with it, or the next
+    /// request carries an orphan result — the invalid shape
+    /// `repair_tool_pairs` exists to clean up.
+    #[test]
+    fn a_cut_through_an_interleaved_batch_takes_the_lost_calls_results_with_it() {
+        let mut messages = vec![
+            Message::user("the task"),
+            assistant_calling(&["x"]),
+            Message::user("steer"),
+            Message::tool("x", "result x"),
+            Message::assistant("done"),
+        ];
+        // Room for the newest segment and the steering that opens it, so the
+        // segment holding call `x` is the one that goes.
+        let newest = cost(&messages[2..]);
+        let cut = cap_transcript(&mut messages, newest);
+
+        assert_eq!(roles(&messages), ["user", "user", "assistant"]);
+        assert_eq!(messages[0].text(), "the task");
+        assert_eq!(messages[1].text(), "steer");
+        assert_eq!(messages[2].text(), "done");
+        assert_eq!(cut.messages, 2, "the call and its orphaned answer");
+    }
+
+    /// A result whose call was never in the transcript is not the cut's to
+    /// repair: the cap moves what it must and leaves the rest of the shape to
+    /// `repair_tool_pairs`, which is the door every adopted transcript comes
+    /// through.
+    #[test]
+    fn a_pre_existing_orphan_is_not_the_cut_s_to_remove() {
+        let mut messages = vec![
+            Message::tool("ghost", "answered nothing"),
+            Message::user("the task"),
+            Message::assistant("ok"),
+        ];
+        let newest = cost(&messages[1..]);
+        let cut = cap_transcript(&mut messages, newest);
+
+        assert_eq!(cut, Dropped::default());
+        assert_eq!(roles(&messages), ["tool", "user", "assistant"]);
+    }
+
+    /// Re-saving a truncated transcript must not keep shrinking it: the second
+    /// cut finds the newest segments already fitting the cap and gives up
+    /// nothing.
+    #[test]
+    fn capping_an_already_capped_transcript_changes_nothing() {
+        let mut messages: Vec<Message> = (0..6).flat_map(|i| round(i, 300)).collect();
+        let cap = cost(&messages[8..]);
+        let first = cap_transcript(&mut messages, cap);
+        assert!(first.messages > 0, "the fixture must actually be cut");
+        let once = serde_json::to_string(&messages).unwrap();
+
+        let again = cap_transcript(&mut messages, cap);
+        assert_eq!(again, Dropped::default(), "nothing left to drop");
+        assert_eq!(serde_json::to_string(&messages).unwrap(), once);
+    }
+
+    /// Nothing but tool results has no segment boundary a cut could take
+    /// without stranding one on its own, so it is stored whole however small
+    /// the cap.
+    #[test]
+    fn a_transcript_of_only_tool_results_is_never_cut() {
+        let mut messages = vec![
+            Message::tool("a", "result a"),
+            Message::tool("b", "result b"),
+        ];
+        let before = serde_json::to_string(&messages).unwrap();
+        let cut = cap_transcript(&mut messages, 1);
+
+        assert_eq!(cut, Dropped::default());
+        assert_eq!(serde_json::to_string(&messages).unwrap(), before);
+    }
+
+    /// The newest segment and the opening one are never dropped, even when the
+    /// newest alone is over the cap: a file that stores nothing the model just
+    /// said is worse than one a segment over its bound, and the opening message
+    /// is the task a revived child would otherwise have to guess at —
+    /// `agent::revive` only seeds a brief when the transcript is empty.
+    #[test]
+    fn the_newest_segment_and_the_task_survive_a_cap_they_exceed() {
+        let mut messages: Vec<Message> = (0..3).flat_map(|i| round(i, 200)).collect();
+        let cut = cap_transcript(&mut messages, 1);
+
+        assert_eq!(cut.messages, 4);
+        assert_eq!(messages.len(), 2);
+        assert!(messages[0].text().starts_with("ask 0"), "the task stays");
+        assert_eq!(messages[1].text(), "ok", "the newest answer stays");
+        assert!(cost(&messages) > 1, "over the cap rather than emptied");
     }
 }

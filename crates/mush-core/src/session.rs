@@ -10,9 +10,43 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use crate::message::Message;
+use crate::transcript::cap_transcript;
+pub use crate::transcript::Dropped;
 
 pub const MUSH_DIR: &str = ".mush";
 pub const SESSION_FILE: &str = "session.json";
+
+/// How much of one subagent's transcript a save may store, in serialized
+/// bytes.
+///
+/// A child's transcript is the largest thing in the file that grows without
+/// the human's hand on it — one measured child was 318.9 KiB after ~80
+/// messages, and the root of a run with a few hundred children reached ~100 MB
+/// — so this is what keeps a save's cost proportional to the conversation
+/// instead of to the number of children ever spawned. The brief opens the
+/// transcript and is the one message the cut keeps whatever the cap, and the
+/// system prompt is regenerated on the way back in, so a child revived from
+/// its newest 256 KiB still knows what it was asked to do and can be nudged
+/// onwards.
+///
+/// Counted in what the file pays (see [`Dropped`]), not in `Message::weight`,
+/// which is a token estimate for a different reader.
+pub const SESSION_AGENT_BYTES: usize = 256 * 1024;
+
+/// How much of the root transcript a save may store, in the same serialized
+/// bytes. Much higher than a child's because the root is the human's own words
+/// and mush's scrollback contract: this is a runaway guard, not a budget, and
+/// when it trips the file says so — [`Session::truncated`] is the marker a
+/// reader needs to tell a conversation that began at the beginning from one
+/// that was cut.
+pub const SESSION_ROOT_BYTES: usize = 32 * 1024 * 1024;
+
+/// One save reads both caps, so the ordering between them is a fact about the
+/// file, not a preference: a root guard anywhere near a child's budget would
+/// cut the human's own conversation down to what one subagent is allowed. A
+/// compile-time check because the numbers are constants and a runtime test
+/// could only restate them.
+const _: () = assert!(SESSION_ROOT_BYTES >= 64 * SESSION_AGENT_BYTES);
 
 /// A `.gitignore` that ignores everything, itself included.
 const SELF_IGNORE: &str = "*\n";
@@ -170,6 +204,18 @@ pub struct Session {
     pub context: Option<usize>,
     pub updated: u64,
     pub messages: Vec<Message>,
+    /// What capping the root transcript cut off its oldest end, if anything.
+    ///
+    /// Absent — the field is not written — is a conversation stored whole;
+    /// `Some` is a file that says on its face that what it holds is the newest
+    /// part of one. Without it a reader (and the next launch) could not tell a
+    /// conversation that began at the beginning from one cut at
+    /// [`SESSION_ROOT_BYTES`], which is the one thing a cap on the human's own
+    /// words must not do. Children carry no marker: their cap is what lets a
+    /// whole tree of them survive a restart at all, and a child whose oldest
+    /// turns are gone still has its brief and its newest work in hand.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<Dropped>,
     /// The subagents this conversation had, so their context outlives the
     /// process. Old sessions have none and still load.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -307,13 +353,54 @@ impl Session {
         }
     }
 
-    pub fn save(&self, root: &Path) -> std::io::Result<()> {
+    /// Write the conversation to `<root>/.mush/session.json`, bounding every
+    /// stored transcript first ([`SESSION_ROOT_BYTES`],
+    /// [`SESSION_AGENT_BYTES`]).
+    ///
+    /// Takes `self` by value because bounding drains what it writes: the
+    /// caller handed over a snapshot it will not read again (see
+    /// `session_save`'s writer), and cloning the newest part of every
+    /// transcript just to serialize it would make a save cost more than the
+    /// bytes it stores. The conversation in memory is untouched — the UI still
+    /// scrolls back through all of it, and only the copy on disk is cut.
+    pub fn save(mut self, root: &Path) -> std::io::Result<()> {
+        self.bound_stored();
         let path = session_path(root);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_vec_pretty(self).unwrap_or_else(|_| b"{}".to_vec());
+        let json = serde_json::to_vec_pretty(&self).unwrap_or_else(|_| b"{}".to_vec());
         crate::workspace::atomic_write(&path, &json)
+    }
+
+    /// Cut every stored transcript to the cap it ships with.
+    fn bound_stored(&mut self) {
+        self.bound_stored_at(SESSION_ROOT_BYTES, SESSION_AGENT_BYTES);
+    }
+
+    /// [`Self::bound_stored`] with caps a test can afford: the real root cap is
+    /// tens of MiB, and a test that had to build one to prove the rule would
+    /// cost more than the rule is worth. The cuts themselves are the same
+    /// function at either size.
+    ///
+    /// The root's marker accumulates, because the file it describes does: a
+    /// transcript loaded already cut only ever loses more, so what this save
+    /// cuts is counted on top of what the file already said. A marker that
+    /// survives a save dropping nothing is what keeps a restored conversation
+    /// marked as incomplete instead of letting one quiet write relabel it.
+    fn bound_stored_at(&mut self, root_cap: usize, agent_cap: usize) {
+        let cut = cap_transcript(&mut self.messages, root_cap);
+        self.truncated = match (self.truncated, cut.messages) {
+            (Some(earlier), _) => Some(Dropped {
+                messages: earlier.messages + cut.messages,
+                bytes: earlier.bytes + cut.bytes,
+            }),
+            (None, 0) => None,
+            (None, _) => Some(cut),
+        };
+        for agent in &mut self.agents {
+            cap_transcript(&mut agent.messages, agent_cap);
+        }
     }
 }
 
@@ -462,6 +549,7 @@ mod tests {
             context: None,
             updated: 0,
             messages: vec![Message::user(text)],
+            truncated: None,
             agents: Vec::new(),
             notices: Vec::new(),
         }
@@ -499,6 +587,7 @@ mod tests {
                     ..Message::assistant("hi")
                 },
             ],
+            truncated: None,
             agents: vec![AgentSession {
                 id: 3,
                 parent: Some(0),
@@ -576,6 +665,349 @@ mod tests {
             loaded.notices.is_empty(),
             "a session written before notices existed still loads"
         );
+        assert!(
+            loaded.truncated.is_none(),
+            "and one written before the cap existed is a whole conversation"
+        );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A round for a stored transcript, sized so a cap can be aimed at whole
+    /// segments instead of at whatever the JSON happens to weigh. The answer
+    /// carries a body of its own, like a real one: a fixture of two-byte
+    /// answers would spend a quarter of the pretty file on indentation and
+    /// make the bound below a test of `serde_json`'s formatting.
+    fn round(index: usize, bytes: usize) -> Vec<Message> {
+        vec![
+            Message::user(format!("ask {index} {}", "x".repeat(bytes))),
+            Message::assistant(format!("ok {}", "y".repeat(bytes / 4))),
+        ]
+    }
+
+    /// What a slice of a transcript costs the file, counted the way the cap
+    /// counts: one compact serialization per message.
+    fn cost(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .map(|message| serde_json::to_vec(message).unwrap().len())
+            .sum()
+    }
+
+    /// A child carrying `messages`, for tests that are about one transcript and
+    /// not about the tree.
+    fn child(messages: Vec<Message>) -> AgentSession {
+        AgentSession {
+            id: 7,
+            parent: Some(0),
+            depth: 1,
+            brief: "port the parser".into(),
+            title: None,
+            branch: None,
+            status: StoredStatus::Done,
+            landed: None,
+            leftover: false,
+            summary: None,
+            result_unread: false,
+            messages,
+        }
+    }
+
+    /// An assistant turn that asks for one call, so a fixture can carry the
+    /// call/result pairs the cut must not separate.
+    fn calling(id: &str, text: String) -> Message {
+        let mut message = Message::assistant(text);
+        message.tool_calls = Some(vec![crate::ToolCall {
+            id: id.into(),
+            kind: "function".into(),
+            function: crate::FunctionCall {
+                name: "read_file".into(),
+                arguments: "{}".into(),
+            },
+        }]);
+        message
+    }
+
+    /// A directory and no leftovers, for the tests that go through a file.
+    fn temp_root(label: &str) -> std::path::PathBuf {
+        let root = std::env::temp_dir().join(format!("mush-cap-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    /// A child's transcript is cut to the cap at write time: the newest work
+    /// and the brief survive, the middle goes, and what is left is at most the
+    /// cap plus the one message the cap never takes.
+    #[test]
+    fn a_child_over_the_cap_stores_the_newest_work_and_its_brief() {
+        let cap = 8 * 1024;
+        let mut session = saying("the root");
+        let full: Vec<Message> = (0..40).flat_map(|i| round(i, 400)).collect();
+        let full_len = full.len();
+        session.agents.push(child(full));
+        session.bound_stored_at(usize::MAX, cap);
+
+        let stored = &session.agents[0].messages;
+        let head = cost(&stored[..1]);
+        assert!(cost(stored) <= cap + head, "{} bytes", cost(stored));
+        assert!(
+            cost(stored) > cap / 2,
+            "the cap is used, not merely tripped: {} bytes",
+            cost(stored)
+        );
+        assert!(stored[0].text().starts_with("ask 0 "));
+        assert!(
+            stored[1].text().starts_with("ok "),
+            "whole segments, not half a round"
+        );
+        assert!(
+            stored[stored.len() - 2].text().starts_with("ask 39 "),
+            "the newest round is what a restart resumes from: {}",
+            stored[stored.len() - 2].text()
+        );
+        assert!(stored.last().unwrap().text().starts_with("ok "));
+        assert!(stored.len() < full_len, "something was actually cut");
+        assert_eq!(
+            session.truncated, None,
+            "a child alone does not mark the root"
+        );
+    }
+
+    /// The cap the file actually gets is [`SESSION_AGENT_BYTES`]: a child a
+    /// little over it is stored a little under, with every other field of its
+    /// row untouched.
+    #[test]
+    fn save_applies_the_shipped_child_cap() {
+        let root = temp_root("child");
+        let mut session = saying("the root");
+        let full: Vec<Message> = (0..900).flat_map(|i| round(i, 400)).collect();
+        let full_len = full.len();
+        session.agents.push(child(full));
+        session.save(&root).unwrap();
+
+        let loaded = Session::load(&root).unwrap();
+        let stored = &loaded.agents[0].messages;
+        let head = cost(&stored[..1]);
+        assert!(
+            cost(stored) <= SESSION_AGENT_BYTES + head,
+            "{} bytes for a {SESSION_AGENT_BYTES}-byte cap",
+            cost(stored)
+        );
+        assert!(cost(stored) > SESSION_AGENT_BYTES / 2);
+        assert!(stored.len() < full_len, "the fixture must actually be cut");
+        assert!(stored[0].text().starts_with("ask 0 "), "the task stays");
+        assert!(stored[stored.len() - 2].text().starts_with("ask 899 "));
+        assert!(stored.last().unwrap().text().starts_with("ok "));
+        assert_eq!(loaded.agents[0].brief, "port the parser");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An assistant's calls and the results that answer them cross the cut
+    /// together: a stored child never comes back with a call whose answers are
+    /// gone or an answer whose call is gone, because the endpoint would reject
+    /// the next request and the child's history would lie about what it knows.
+    #[test]
+    fn a_stored_child_keeps_every_call_and_its_results_together() {
+        let cap = 4 * 1024;
+        let mut messages = vec![Message::user("the brief")];
+        for i in 0..60 {
+            messages.push(calling(
+                &format!("call{i}"),
+                format!("step {i} {}", "y".repeat(200)),
+            ));
+            messages.push(Message::tool(format!("call{i}"), format!("result {i}")));
+        }
+        let mut session = saying("the root");
+        session.agents.push(child(messages));
+        session.bound_stored_at(usize::MAX, cap);
+
+        let stored = &session.agents[0].messages;
+        assert!(stored.len() >= 3, "the fixture must actually be cut");
+        assert_eq!(stored[0].text(), "the brief");
+        let calls: Vec<&str> = stored
+            .iter()
+            .flat_map(|message| message.tool_calls().iter().map(|call| call.id.as_str()))
+            .collect();
+        let answered: Vec<&str> = stored
+            .iter()
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect();
+        assert_eq!(
+            calls, answered,
+            "no call without its answer, no orphan answer"
+        );
+        assert!(!calls.is_empty(), "some work survives");
+        assert!(
+            stored
+                .iter()
+                .any(|message| message.text().starts_with("step 59 ")),
+            "and the newest step is among it"
+        );
+    }
+
+    /// Bounding is a cut into the stored copy, not a decay: saving the same
+    /// session again writes the same bytes, so a crash and a restart cannot
+    /// keep shrinking what is stored one write at a time.
+    #[test]
+    fn a_bounded_session_saves_the_same_bytes_twice() {
+        let root = temp_root("idempotent");
+        let mut session = saying("the root");
+        session.messages = (0..80).flat_map(|i| round(i, 500)).collect();
+        session
+            .agents
+            .push(child((0..900).flat_map(|i| round(i, 400)).collect()));
+        session.bound_stored_at(4 * 1024, SESSION_AGENT_BYTES);
+        session.save(&root).unwrap();
+        let first = fs::read(session_path(&root)).unwrap();
+
+        let loaded = Session::load(&root).unwrap();
+        loaded.save(&root).unwrap();
+        let second = fs::read(session_path(&root)).unwrap();
+
+        assert_eq!(
+            first, second,
+            "a save of what a save stored changes nothing"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The root's cap is a guard, not a budget, and it is *recorded*: the file
+    /// says how much of the human's conversation is not in it, keeps the newest
+    /// messages, and keeps that marker through a save that stops cutting.
+    #[test]
+    fn a_root_over_its_cap_is_marked_and_truncated_from_the_middle() {
+        let root_cap = 6 * 1024;
+        let mut session = saying("the root");
+        session.messages = (0..60).flat_map(|i| round(i, 500)).collect();
+        let full_len = session.messages.len();
+        session.bound_stored_at(root_cap, SESSION_AGENT_BYTES);
+
+        let dropped = session.truncated.expect("the root was cut, and says so");
+        assert_eq!(dropped.messages, full_len - session.messages.len());
+        assert!(dropped.bytes > 0);
+        // Never the newest messages, never the opening task: a saved
+        // conversation still ends where the human left it and still says what
+        // it was about.
+        assert!(session.messages[0].text().starts_with("ask 0 "));
+        assert!(session.messages.last().unwrap().text().starts_with("ok "));
+        assert!(session.messages[session.messages.len() - 2]
+            .text()
+            .starts_with("ask 59 "));
+
+        // A second save cannot unmark it: the conversation in the file is still
+        // cut, even though this save had nothing left to drop.
+        let stored_len = session.messages.len();
+        session.bound_stored_at(root_cap, SESSION_AGENT_BYTES);
+        assert_eq!(session.truncated, Some(dropped));
+        assert_eq!(session.messages.len(), stored_len);
+
+        // And the marker counts the whole conversation, not the last save: what
+        // the file already said plus what this cut gave up.
+        session
+            .messages
+            .extend((60..120).flat_map(|i| round(i, 500)));
+        session.bound_stored_at(root_cap, SESSION_AGENT_BYTES);
+        let more = session.truncated.unwrap();
+        assert!(
+            more.messages > dropped.messages,
+            "{} <= {}",
+            more.messages,
+            dropped.messages
+        );
+        assert!(more.bytes > dropped.bytes);
+        assert!(session.messages[0].text().starts_with("ask 0 "));
+        assert!(session.messages.last().unwrap().text().starts_with("ok "));
+    }
+
+    /// The marker is what the next launch reads: a bounded session writes it to
+    /// the file, and the loaded one carries the same counts. Without the round
+    /// trip the first quiet save after a restart would relabel a cut
+    /// conversation as whole.
+    #[test]
+    fn the_truncation_marker_round_trips_through_the_file() {
+        let root = temp_root("marker");
+        let mut session = saying("the root");
+        session.messages = (0..40).flat_map(|i| round(i, 500)).collect();
+        session.bound_stored_at(4 * 1024, SESSION_AGENT_BYTES);
+        let marker = session.truncated.expect("the root was cut");
+        session.save(&root).unwrap();
+
+        let loaded = Session::load(&root).unwrap();
+        assert_eq!(loaded.truncated, Some(marker));
+
+        // And a whole conversation writes no marker at all: the field is
+        // additive, so a file that predates the cap still reads and a file that
+        // does not need one does not carry the shape of a cut one.
+        loaded.save(&root).unwrap();
+        let loaded_again = Session::load(&root).unwrap();
+        assert_eq!(loaded_again.truncated, Some(marker));
+        let _ = fs::remove_dir_all(&root);
+
+        let whole = temp_root("whole");
+        saying("a conversation that fits").save(&whole).unwrap();
+        let json = fs::read_to_string(session_path(&whole)).unwrap();
+        assert!(!json.contains("truncated"), "{json}");
+        assert!(Session::load(&whole).unwrap().truncated.is_none());
+        let _ = fs::remove_dir_all(&whole);
+    }
+
+    /// The shipped caps: the child's is the measured one, and the root's is
+    /// much higher — a runaway guard for the human's own words, not a budget
+    /// for them. The constants are checked directly because a test that built a
+    /// 32 MiB transcript to watch the root trip would cost more than the rule it
+    /// proves; that the same function bounds the root is what
+    /// `a_root_over_its_cap_is_marked_and_truncated_from_the_middle` shows at a
+    /// size a test can afford. (The ordering between them is a compile-time
+    /// assertion beside the constants.)
+    #[test]
+    fn the_shipped_caps_are_the_measured_child_and_a_much_higher_root() {
+        assert_eq!(SESSION_AGENT_BYTES, 256 * 1024);
+        assert_eq!(SESSION_ROOT_BYTES, 32 * 1024 * 1024);
+    }
+
+    /// A session with N children is bounded by N times the child cap: this is
+    /// the test that would have caught the ~100 MB session — a few hundred
+    /// children each carrying their whole transcript — and the reason a save's
+    /// cost is bounded by what a conversation last said and not by how many
+    /// agents it ever spawned.
+    #[test]
+    fn a_session_of_many_children_is_bounded_by_their_cap() {
+        let children = 4;
+        let mut session = saying("the root");
+        for _ in 0..children {
+            // Each child a good deal over the cap, so the bound is the cap's
+            // doing and not the fixture's. Body-sized rounds rather than many
+            // tiny ones: the pretty file spends a fixed few dozen bytes per
+            // message on indentation, and a fixture of two-line answers would
+            // measure that instead of the cap.
+            session
+                .agents
+                .push(child((0..400).flat_map(|i| round(i, 2_000)).collect()));
+        }
+        session.bound_stored();
+
+        let head = cost(&session.agents[0].messages[..1]);
+        for agent in &session.agents {
+            assert!(
+                cost(&agent.messages) <= SESSION_AGENT_BYTES + head,
+                "{} bytes",
+                cost(&agent.messages)
+            );
+        }
+        let json = serde_json::to_vec_pretty(&session).unwrap();
+        // The pretty array spends indentation and newlines per message on top
+        // of the compact cap — 1.03x on a real transcript, and a tenth on this
+        // fixture — so the bound carries a tenth for the file's own shape. A
+        // session storing the whole transcripts would be several times over it.
+        let bound = children * (SESSION_AGENT_BYTES + head);
+        assert!(
+            json.len() < bound + bound / 10,
+            "{} bytes for {children} capped children, bound {bound}",
+            json.len()
+        );
+        assert!(
+            json.len() > bound / 2,
+            "the caps must be doing the bounding, not an empty fixture"
+        );
     }
 }

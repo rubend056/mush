@@ -15,6 +15,15 @@
 //! [`SessionSave::flush`] is the other half: the transitions that mean "this
 //! must be on disk" wait for their own write, a cost paid once per human
 //! action instead of once per response.
+//!
+//! What one write carries is bounded as well. A snapshot is a whole
+//! conversation — the root transcript and every child's — and a long run made
+//! that megabytes of JSON per response; `Session::save` now cuts each stored
+//! transcript to the caps in `mush_core::session` before serializing it. The
+//! cut runs here, on the writer's thread, with the serialization the writer was
+//! already doing: the UI thread hands over a snapshot and never measures a
+//! message, and the conversation it holds stays whole (see
+//! `Session::bound_stored`).
 
 use std::path::PathBuf;
 #[cfg(test)]
@@ -52,8 +61,9 @@ pub trait SessionSave: Send + Sync {
 
 /// The real seam: one writer thread, and the newest snapshot.
 ///
-/// The write itself is `Session::save`, unchanged — same path, same fields,
-/// same format, still read by `Session::load`. Pretty, not compact: this file is
+/// The write itself is `Session::save` — same path, same fields, same format,
+/// still read by `Session::load` — with the stored transcripts bounded to the
+/// caps it ships before they are serialized. Pretty, not compact: this file is
 /// what a human opens to see what mush remembered, and the pretty-printing now
 /// costs a thread that has nothing else to do rather than a dropped frame.
 pub struct Writer {
@@ -302,6 +312,7 @@ mod tests {
             context: None,
             updated: 0,
             messages: vec![Message::user(text)],
+            truncated: None,
             agents: Vec::new(),
             notices: Vec::new(),
         }
