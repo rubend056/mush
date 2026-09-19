@@ -484,7 +484,8 @@ was asked for, and what it now says:
 
 - §1: the line count — the design doc claimed "roughly 5,000" /
   "roughly 9,000" lines; it now points at `scripts/census.py` for the split
-  (production, tests, comments) instead of asserting a total that would drift.
+  (blank, comments, tests, production) instead of asserting a total that would
+  drift.
 - §6: the module tree now names the modules that actually landed (`app/{mod,tree,
   chat,settings,keys,commands}.rs`, `jobs.rs`, `model.rs`, `machine.rs`,
   `clock.rs`, `events.rs`, `session_save.rs`, core `transcript.rs`/`text.rs`),
@@ -593,11 +594,11 @@ evidence's commit is named, and a price re-set by a later review says so (the
 sixth review, after the `Screen` rewrite, re-priced `D9` and `R9`).
 
 The census the reviews read, and the tree this ledger anchors to, measured at
-`b8d8baa`: 42 425 lines (prod 7 010, tests 22 476, comments 10 153) — from the
-`960e073` baseline it was seeded with, 41 447 (prod 7 568, tests 21 531, comments
-9 635; `findings.md` §8.19), so prod −558 / tests +945 / comments +518.
+`b8d8baa`: 42 394 lines (prod 11 543, tests 17 943, comments 10 153) — from the
+`960e073` baseline it was seeded with, 41 416 (prod 11 800, tests 17 299, comments
+9 635; `findings.md` §8.19), so prod −257 / tests +644 / comments +518.
 `scripts/census.py` is the method; `findings.md` §8.5 has the per-wave deltas,
-from 9 200 lines at `143325a15` to 41 123 at `f70374f` (prod ×1.8, tests ×6.9,
+from 9 185 lines at `143325a15` to 41 093 at `f70374f` (prod ×2.5, tests ×6.7,
 comments ×7.5).
 
 | # | What is duplicated | Net | Risk | Protecting test | Status |

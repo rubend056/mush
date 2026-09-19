@@ -413,21 +413,21 @@ first commit past 9k lines (`143325a15`, the "4x LOC" that started this):
 
 | | `143325a15` | `f70374f` | growth |
 |---|---|---|---|
-| total | 9,200 | 41,123 | 4.5x |
-| **prod** (blank/comments/tests stripped) | 4,183 | **7,679** | **1.8x** |
-| tests (inside `mod tests` blocks) | 3,065 | 21,277 | 6.9x |
+| total | 9,185 | 41,093 | 4.5x |
+| **prod** (blank/comments/tests stripped) | 4,689 | **11,863** | **2.5x** |
+| tests (inside `mod tests` blocks) | 2,559 | 17,094 | 6.7x |
 | comments | 1,255 | 9,468 | 7.5x |
 
 The fix wave's own delta, `eab825e..f70374f` (five commits, ~20 findings):
-**prod +64, tests +1,197, comments +708** — behaviour moved by sixty-four
-lines and the harness around it by twelve hundred.
+**prod +155, tests +542, comments +341** — behaviour moved by a hundred and
+fifty-five lines and the harness around it by five hundred.
 
-The two big files are 46% of the tree and 58% of the tests: `app/mod.rs`
-(9,665 total, 6,642 test) and `agent.rs` (9,130, 5,640 test).
+The two big files are 46% of the tree and 57% of the tests: `app/mod.rs`
+(9,664 total, 5,189 test) and `agent.rs` (9,129, 4,498 test).
 
 What the census says, and what it does not:
 
-- The behaviour is ~7.7k lines and the harness ~21k. A fast offline suite is
+- The behaviour is ~12k lines and the harness ~17k. A fast offline suite is
   worth paying for, so the *volume* is not the defect — the **shape** is. The
   tests pin roads and sentences one at a time, which is exactly why they could
   not see a fact with two spellings or a road that forgot to record. Coverage
@@ -460,8 +460,8 @@ session; the wave did the top two tiers. As a class it closed the agent-side of
 the wire (H1's actor-side facts, H5's reply), the lock trap (H13's third fix,
 `1df1a53`), the spawn base (H7), the machine's load line (H8's warning half),
 and the refactor items `A19` (`http::resolve_bounded`, `7dc5e1b`) and `R21`.
-Census at `d753db8`: total **41,875** (was 41,123), **prod 7,783 (+104)**,
-tests 21,691 (+414), comments 9,662 (+194).
+Census at `d753db8`: total **41,844** (was 41,093), **prod 12,050 (+187)**,
+tests 17,424 (+330), comments 9,662 (+194).
 
 ---
 
@@ -497,8 +497,8 @@ and a run gets six waits, not one); the root's lock exemption is learned from
 the result note rather than stated in advance; and `RUNAWAY_TURNS`'s wrap-up
 turn explains itself when it fires.
 
-**Census at `00571b4`** (the six commits above plus the dedup): total 42,448
-(was 41,875), **prod 7,808 (+25)**, tests 22,065 (+374), comments 9,804
+**Census at `00571b4`** (the six commits above plus the dedup): total 42,417
+(was 41,844), **prod 12,149 (+99)**, tests 17,724 (+300), comments 9,804
 (+142). Test-heavy on purpose: every trip-level row has a test that fails
 without its fix. The audit itself ran against a `prompt.rs` that was being
 edited by hand, so its prompt quotes are a snapshot; the executor-side rows are
@@ -534,8 +534,8 @@ One contract now says both: `spawn_agent(brief, title, base?)`.
   `a_named_base_is_resolved_before_anything_is_created`, and
   `a_spawn_forks_from_the_named_base_and_says_so`.
 
-**Census at `15648ae`:** total 42,477 (was 42,448), **prod 7,807 (−1)**, tests
-22,106 (+41), comments 9,792 (−12). The production side is a net removal: the
+**Census at `15648ae`:** total 42,446 (was 42,417), **prod 12,142 (−7)**, tests
+17,771 (+47), comments 9,792 (−12). The production side is a net removal: the
 name rides a path the brief already travelled, and deleting the degradation
 path paid for it. Owed in the doc-sync pass: `docs/mush.md` §3's signature and
 tool table (`brief, title, base?`) and §5.5's `isolated unavailable` sentence,
@@ -564,8 +564,8 @@ row this fixed had no test of its own left — it is pinned by the fixture in
 `on_disk` is what judges it) and by every `isolation`/leftover test that
 still registers a real worktree.
 
-**Census at `e63a84c`:** total 42,614 (was 42,477), **prod 7,819 (+12)**, tests
-22,186 (+80), comments 9,829 (+37).
+**Census at `e63a84c`:** total 42,583 (was 42,446), **prod 12,171 (+29)**, tests
+17,834 (+63), comments 9,829 (+37).
 
 ---
 
@@ -593,8 +593,8 @@ stored in the session. Discovery is automatic, so `rm -rf .mush` cannot
 resurrect a row. Nineteen tests died with the commands they pinned (456 →
 437, 3 ignored; mush-core 108 after its prune test went too).
 
-**Census at `ad5b791`:** total 41,343 (was 42,614), **prod 7,534 (−285)**,
-tests 21,503 (−683), comments 9,600 (−229). Net −1,271 lines.
+**Census at `ad5b791`:** total 41,312 (was 42,583), **prod 11,757 (−414)**,
+tests 17,280 (−554), comments 9,600 (−229). Net −1,271 lines.
 
 **Owed in the doc-sync pass:** `README.md`’s chat-command list and its
 “Isolated agents” section (the three commands and `/worktrees`), plus
@@ -634,8 +634,8 @@ table.
   briefly-added “help lands in the focused pane” rule went with the foot
   notice — the popup has no pane to land in.
 
-**Census at `960e073`:** total 41,447 (was 41,343), **prod 7,568 (+34)**, tests
-21,531 (+28), comments 9,635 (+35).
+**Census at `960e073`:** total 41,416 (was 41,312), **prod 11,800 (+43)**, tests
+17,299 (+19), comments 9,635 (+35).
 
 ---
 
@@ -727,8 +727,8 @@ flight on `mush/4`; the session bound is in flight on `mush/5`; child reaping
 worktrees, each with tests — the human's condition on the reclamation was
 "thorough testing" before it touches a branch.
 
-**Census at `6fc7435`:** total 42,702 (was 41,447 at `960e073`), **prod 7,013**,
-tests 22,705, comments 10,177. The deltas belong to the repository's own commits
+**Census at `6fc7435`:** total 42,671 (was 41,416 at `960e073`), **prod 11,591**,
+tests 18,127, comments 10,177. The deltas belong to the repository's own commits
 between those two points — this section added no Rust (its instruments are
 Python, which the census does not count), and the prod column is down because
 the wave's lines went to tests and comments, the trade §8.5 warns about.
@@ -788,9 +788,9 @@ until the setter became `mark_kept`/`mark_reclaimed` and the predicate kept its
 name: a verb and a question, apart at every call site. `cc89598` carries the
 repair, because the tree must build at every commit.
 
-**Census at `cc89598`:** total 46,557 (was 42,702 at `6fc7435`), **prod 7,127
-(+114)**, tests 24,882 (+2,177), comments 11,512 (+1,335). Read that the way §8.5
-asks: five patches, 3,855 lines, and 114 of them behaviour. The wave bought its
+**Census at `cc89598`:** total 46,525 (was 42,671 at `6fc7435`), **prod 12,271
+(+680)**, tests 19,738 (+1,611), comments 11,512 (+1,335). Read that the way §8.5
+asks: five patches, 3,854 lines, and 680 of them behaviour. The wave bought its
 closures with tests and prose — these are the wave's own numbers, and they say
 the next one should be judged on the prod column.
 
@@ -941,10 +941,10 @@ readers), which is unstarted.
 - the `agent.rs` halves of T1 §9/§11/§12 (`label`, the 10 ms literal, 60 vs 40):
   the file belonged to another branch; they are in flight with §8.27.
 
-**Census** (`scripts/census.py`, method in §8.5). At `491113a`: total 46,472 ·
-**prod 7,245** · tests 24,716 · comments 11,490. On the merged tree: total
-46,591 · **prod 7,127** · tests 24,836 · comments 11,600. 118 lines out of
-production, 120 lines of harness in — which is the honest shape of this wave:
+**Census** (`scripts/census.py`, method in §8.5). At `491113a`: total 46,440 ·
+**prod 12,183** · tests 19,778 · comments 11,490. On the merged tree: total
+46,559 · **prod 12,088** · tests 19,875 · comments 11,600. 95 lines out of
+production, 97 lines of harness in — which is the honest shape of this wave:
 two of the three branches are net deletions of production code, and the harness
 grew by the tests that pin the two real bugs (the `/model` bullet, the refusal
 that used to land in the transcript).
@@ -1202,16 +1202,16 @@ then `python3 scripts/census.py /tmp/x`; §8.5's method):
 
 | | before (`a003e36`) | after (`ff315d8`) | Δ |
 |---|---|---|---|
-| total | 46,604 | 47,831 | +1,227 |
-| production | 7,056 | 7,061 | **+5** |
-| tests | 24,886 | 25,698 | +812 |
+| total | 46,572 | 47,798 | +1,226 |
+| production | 12,032 | 12,225 | **+193** |
+| tests | 19,910 | 20,534 | +624 |
 | comments | 11,633 | 11,971 | +338 |
-| blank | 3,029 | 3,101 | +72 |
+| blank | 2,997 | 3,068 | +71 |
 
 The production column is the wave's most interesting number. A new module (the
-workspace lock, 32 production lines), a real concurrency fix, a rewritten
-environment reader and six model-facing corrections together cost **five** lines
-of production code, because every one of them came with deletions. 99.6% of what
+workspace lock, 43 production lines), a real concurrency fix, a rewritten
+environment reader and six model-facing corrections together cost **193** lines
+of production code, because every one of them came with deletions. 84.3% of what
 the wave added is harness and prose — which is the shape §8.5 was written to make
 visible, and the reason a wave is now planned around *what a claim costs to
 prove* rather than around a line budget.
@@ -1301,7 +1301,7 @@ The human's feature, approved mid-flight and landed as one branch: two mush
 windows on two workspaces were indistinguishable — same borders, same focus
 badge, same selected row, same eight colours — and the screen held no fact that
 could fix it, because every colour was a constant opinion rather than a
-derivation. `crates/mush/src/theme.rs` (new, 143 production lines) is that fact.
+derivation. `crates/mush/src/theme.rs` (new, 229 production lines) is that fact.
 
 **The decision.** `FNV-1a 64` of the workspace's canonical path, modulo thirty,
 indexes a table of named hues. The hash is written out rather than taken from
@@ -1376,10 +1376,10 @@ voices should follow the hue is a ruling, recorded in §8.32.
 
 **Cost.** +19 tests (15 theme, 2 `ui.rs`, 1 `app`, 1 `main.rs`), mush 515 → 534,
 mush-core untouched at 128, fmt and clippy clean, all three smoke scenarios
-passing. The census at the merge: **48 920** total · **7 161** prod · **26 316**
-tests · **12 273** comments — against 47 831 / 7 061 / 25 698 / 11 971 at
-`ff315d8`. A feature that is mostly a palette and its guarantees costs 143
-production lines and 413 test lines in its own file, and 100 production lines
+passing. The census at the merge: **48 886** total · **12 467** prod · **21 010**
+tests · **12 273** comments — against 47 798 / 12 225 / 20 534 / 11 971 at
+`ff315d8`. A feature that is mostly a palette and its guarantees costs 229
+production lines and 327 test lines in its own file, and 242 production lines
 net across the crate.
 
 One merge note, because it is the kind of thing that looks like a bug later: the
@@ -1493,5 +1493,7 @@ document's history is understated by the comments and blank lines of the test
 directories — the same class of defect §8.28 found in `session_blame.py`, and
 fixed the same way: `mush/123` turns the columns into the partition the
 docstring claims they are, hand-checks `app/mod.rs` end to end, and re-measures
-the four refs this record quotes.
+the four refs this record quotes. Every census figure in this file and in
+`docs/refactor.md` has now been re-run with the fixed script at `1f324bd`;
+figures printed before the fix are not comparable with the ones after it.
 
