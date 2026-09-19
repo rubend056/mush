@@ -26,10 +26,11 @@
 //!    what a foreground command's result keeps, because the model reads it
 //!    while the command still runs. There is no second window and no second
 //!    source: both readers go through [`preview`].
-//! 2. **A job dies with its owner.** `Stop`, `Shutdown`, Ctrl-N and quitting
-//!    mush all end up in [`Registry::kill_owned`] or [`Registry::kill_all`], and
-//!    [`Registry`]'s `Drop` is the backstop for a path that forgets. A build an
-//!    agent started must not outlive a clean quit.
+//! 2. **A job dies with its owner.** `Stop`, `Shutdown`, Ctrl-N, a cut-off
+//!    owner and quitting mush all end up in [`Registry::kill_owned`] or
+//!    [`Registry::kill_all`]; [`Registry`]'s `Drop` is the backstop for a path
+//!    that forgets, with the reach its own doc states. A build an agent started
+//!    must not outlive a clean quit.
 //! 3. **One command at a time may own the machine.** An `exclusive` command
 //!    takes a workspace-wide lock, so a benchmark, a profiler, or anything that
 //!    binds a fixed port runs without a sibling stealing cores. The lock
@@ -1050,15 +1051,25 @@ impl Registry {
 }
 
 impl Drop for Registry {
-    /// The backstop: whatever path ends the tree, no process group it started
-    /// outlives it. `App` calls `kill_all` explicitly on the way out; this
-    /// catches the paths that do not (a panic inside an actor, a test).
+    /// The backstop for the paths that drop a tree with nothing running: no
+    /// process group this registry still reaches outlives it.
+    ///
+    /// The reach is narrower than "whatever path ends the tree", and the
+    /// difference is what made Ctrl-N leak: a *running* job's watch thread
+    /// holds its own `Arc<Registry>` ([`Registry::launch`]), so dropping the
+    /// tree's handle does not drop the registry — the walk below cannot run
+    /// until that job ends, and the job it would have killed is the one keeping
+    /// it alive. Every path that ends a tree while jobs may run therefore kills
+    /// explicitly: quitting (`App`'s `Drop`), Ctrl-N (`App::new_chat`), and a
+    /// cut-off owner whose actor is gone (`App::report_cut_off`). What is left
+    /// here is the path that forgets and has no job running — a panic inside an
+    /// actor, a test — where there is nothing left to kill.
     ///
     /// It kills through [`Registry::kill`], the same walk `Stop`, Ctrl-N and
     /// quitting take, so the backstop is the rule and not a second copy of it:
     /// walking the job list alone left the commands a tool call is holding —
     /// the ones finding S4 is about — outside a drop that is meant to be
-    /// everything.
+    /// everything it *can* reach.
     fn drop(&mut self) {
         self.kill(None);
     }

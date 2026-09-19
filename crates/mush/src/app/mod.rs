@@ -2104,14 +2104,24 @@ impl App {
         }
     }
 
-    /// Reset the conversation: stop every actor in the old tree and start a
-    /// fresh root, so the new chat has a clean slate and a live mailbox.
+    /// Reset the conversation: stop every actor in the old tree, kill what the
+    /// old tree left running on the machine, and start a fresh root, so the new
+    /// chat has a clean slate and a live mailbox.
     ///
     /// Ctrl-N lands here: a chat that is cleared without restarting the root
     /// would leave the actor holding the old transcript (and a busy flag) while
     /// the UI shows an empty one.
     fn new_chat(&mut self) {
         self.stop_all();
+        // Ctrl-N kills the old tree's processes here and not by dropping the
+        // tree: a running job's watch thread holds its own `Arc<Registry>`
+        // (`Registry::launch`), so the registry is not dropped with the tree and
+        // its `Drop` backstop cannot fire until the job ends — which is exactly
+        // the job it is meant to end. The one handle left, the tree's, is
+        // replaced two lines below; this is the last moment the job list is
+        // reachable, so it is where a kill has to be said out loud (see the
+        // `Drop` docs in `jobs.rs`).
+        self.tree.handles().jobs.kill_all();
         // The respawned root owns its own config cell, conversation tag, and id
         // counter; the UI adopts the handle with the fresh tree, or a later
         // /model would never reach the agent.
@@ -2577,6 +2587,15 @@ impl App {
     fn report_cut_off(&mut self, id: AgentId) {
         self.chat.note_cut_off_for(id, cut_off_notice());
         self.mark_session_dirty();
+        // The actor that owned this agent's jobs is the thing that vanished, so
+        // nothing else will ever stop them: `Registry::stop` refuses any caller
+        // but the owner, and `kill_owned` is otherwise reached only from inside
+        // the owning actor's own `Stop`/`Shutdown` handlers (`agent.rs`). Left
+        // alone, a build the agent started would run until mush quits, owned by
+        // a row that says the work was cut off. The UI is the only observer
+        // left, so the kill is the UI's to make — and it is what the row, the
+        // notice and the parent's message are describing.
+        self.tree.handles().jobs.kill_owned(id.0);
         if id == self.tree.focused {
             self.say(format!(
                 "agent {id} was already gone — its run was cut off, nothing committed"
@@ -5633,6 +5652,40 @@ mod tests {
         assert_eq!(app.tree.agents[0].phase, Phase::Thinking);
     }
 
+    /// Ctrl-N has to kill what the old tree left running on the machine, and it
+    /// cannot rely on the registry's own `Drop` to do it: a running job's watch
+    /// thread holds an `Arc<Registry>` (`jobs.rs`'s `Drop` docs), so the
+    /// registry, its backstop and the process group all outlive the tree that
+    /// started them — an old build fighting the new chat's for the target
+    /// directory. `stop_all` is not enough either: it reaches only *live*
+    /// actors, and the job's owner here is one whose actor is already gone.
+    #[test]
+    fn ctrl_n_kills_the_jobs_the_old_tree_left_running() {
+        let (mut app, _rx) = test_app("new-chat-job");
+        // A node whose actor is not there to hear the Shutdown (the helper
+        // drops its receiver), owning a live job.
+        spawn_agent(&mut app, 1, 0, 1, "a task", None);
+        let machine = running_job_on(&mut app, 1);
+        assert_eq!(
+            app.tree.handles().jobs.running(),
+            1,
+            "the old tree's registry knows it"
+        );
+
+        ctrl(&mut app, 'n');
+
+        assert_eq!(
+            machine.kills(),
+            1,
+            "the old tree's job is killed as the chat is replaced"
+        );
+        assert_eq!(
+            app.tree.handles().jobs.running(),
+            0,
+            "and the new tree starts with nothing running"
+        );
+    }
+
     /// `Ctrl-T` flips what the chat pane paints — the endpoint's own reasoning
     /// above the turn it decided — and `Ctrl-N` leaves the choice as the human
     /// made it: the toggle is a view, not a fact about the conversation.
@@ -7392,6 +7445,13 @@ mod tests {
     /// A job running on this machine, launched through the one registry the
     /// rows, the selected row's footer and the bar all read.
     fn running_job(app: &mut App, owner: u64) {
+        running_job_on(app, owner);
+    }
+
+    /// The same, with the machine handed back so a test can ask it what was
+    /// killed; the *command* half of "is this job really gone" is not visible
+    /// through the registry (its record survives the kill, as a stopped job).
+    fn running_job_on(app: &mut App, owner: u64) -> Arc<crate::machine::fake::Scripted> {
         use crate::jobs::Launch;
         use crate::machine::fake::{Script, Scripted};
         use crate::machine::{Machine, ShellCommand};
@@ -7415,6 +7475,7 @@ mod tests {
                 job,
             ))
             .unwrap();
+        machine
     }
 
     /// Twenty agents three levels deep, with a branch on one of them, a run in
@@ -8667,6 +8728,34 @@ mod tests {
                 .is_some_and(|(text, _)| text.contains("cut off")),
             "the key that did nothing says so: {:?}",
             app.status_line()
+        );
+    }
+
+    /// A cut-off owner's job is killed rather than orphaned. The actor that
+    /// started it is the one that vanished, so `Registry::stop` (owner-only) and
+    /// the owner's own `Stop`/`Shutdown` handlers can never reach it, and the UI
+    /// — the only observer left — is where the kill has to be made. Without it
+    /// the build runs until quit, owned by a row that says the work was cut off.
+    #[test]
+    fn a_cut_off_owners_job_is_killed() {
+        let (mut app, _rx) = test_app("cut-off-job");
+        let machine = running_job_on(&mut app, 1);
+        // Agent #1 mid-run with a dead mailbox: the exact shape a cut-off owner
+        // has. `spawn_agent` drops the receiver, so the Stop cannot land.
+        spawn_agent(&mut app, 1, 0, 1, "a task", None);
+        begin_run(&mut app, AgentId(1));
+
+        app.stop_one(AgentId(1));
+
+        assert_eq!(
+            app.tree.node(AgentId(1)).map(|node| node.phase.clone()),
+            Some(Phase::CutOff),
+            "the row says the run died where it stood"
+        );
+        assert_eq!(
+            machine.kills(),
+            1,
+            "and the job the vanished actor left behind is killed"
         );
     }
 
