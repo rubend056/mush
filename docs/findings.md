@@ -45,11 +45,14 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   id that really is gone. Two residuals the fix named rather than papered over:
   **H22** below, and the instant a child is reaped between the failed send and
   the UI's read, where the wake lands nowhere — the next `wait` blocks to its cap,
-  which "forget this child" (H19) is what would fix.
-- **H19** — a reaped child's name stays in its parent's books
-  (`state.children`/`completed`), so `status` can list a row that is no longer on
-  screen. Deliberate in `ab54de3` — dropping it needs a "forget this child"
-  message — but it is the one visible inconsistency the window left (§8.23).
+  which "forget this child" (H19) is what would fix. Both landed in `mush/125`
+  (§8.34): the stale mailbox outright, and the reaped child's name by the forget
+  message the race left owed.
+- **H19** — ✅ fixed by `mush/125` (§8.34): the reap's fifth step tells the
+  parent to forget the child (`AgentMsg::ForgetChild`, read before `tree.reap`),
+  and the id is tombstoned so a report still in flight from it cannot re-open
+  the book. Only `ChildBook` clears a tombstone — a row handed back is proof the
+  forget is stale.
 - **H20** — the sentences the model is told that are **not** true, where the fix
   is wording in `crates/mush-core/src/prompt.rs` (§8.27 items 2, 5, 9, and the
   `status` schema's "title" in item 1). The human owns that file, so the four are
@@ -65,12 +68,10 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   its *parent's* branch, both landed on the row as a merge into HEAD. Fixed in
   `mush/122` (§8.33) by asking the two questions apart — is the branch's work in
   the base's history, and did the run commit anything of its own.
-- **H22** — a parent's mailbox goes stale for the rest of the session after *any*
-  revive of its child (a human nudge, `/compact`, or a previous parent message):
-  the tree gets a fresh sender and the parent's `ActorState::children` keeps the
-  dead one, so its next `control` takes the wake path again. The message lands
-  (the UI sends into the tree's live sender), which is why `mush/109` left it;
-  the honest fix is a new `AgentMsg` carrying a `Sender<AgentMsg>`.
+- **H22** — ✅ fixed by `mush/125` (§8.34): `App::deliver_to_actor` hands the
+  parent the `Sender<AgentMsg>` the revival built (`AgentMsg::ChildMailbox`), so
+  the book names the live actor and the next `control` delivers instead of
+  taking the wake path again.
 - **H23** — an attach client's `edit --agent N` draft lands in the **focused**
   agent's message box while the ack names `#N`: `Chat::set_draft` replaces the one
   box the human owns, and the `send` half of the same command aims focus at `id`
@@ -82,24 +83,30 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   and `bar_rows`' doc justifies the trade by what the compact footer carries,
   which is not those three. Waiting on a ruling: give the one-row bar a third
   fact, or say in the doc that the trade is the decision.
-- **H25** — a parent restored from a session starts with empty `children` books,
-  so its `control` answers "no such child agent #N — status lists yours" about
-  children whose rows are on screen. Pre-existing, found while fixing H18.
-- **H26** — the leftovers the audit wave did not fix, by file: `focus 1 --agent 2`
-  gives two ids and the flag loses silently, and a repeated flag last-wins
-  (`main.rs`'s `Cli::detect` — the flags it *owns*, so it needs a
-  mutual-exclusion rule, not a row in the flag table); `NOTHING_RUNNING`'s
-  "Ctrl-N starts a new chat" is the same understatement D1 fixed in the key's
-  help, left because the row is spent on the badge and two keys; a status that is
-  neither an exit code nor a signal still spells `-1`
-  (`machine::ended`'s last resort, unreachable for a unix child); and `edit`'s
-  pinned usage line leaves `--base R` unbracketed although the parser defaults it
-  to 0.
+- **H25** — ✅ fixed by `mush/125` (§8.34): an actor that starts with empty
+  books is handed the tree's rows — one `ChildBook` per child, at a session
+  restore (`App::seed_children`) and at the wake of a revived agent
+  (`App::deliver_to_actor`, before the send that starts its run). The review
+  round is what found the wake path missing from the first patch.
+- **H26** — ✅ fixed by `mush/125` (§8.34): a doubled attach flag is refused by
+  name before its value is read (`require_once`) and `mush focus` takes one id
+  in either order; `NOTHING_RUNNING` says `Ctrl-N drops every transcript`;
+  `machine::End::Unknown` carries a status that names neither an exit code nor a
+  signal (and is reachable — `ExitStatus::from_raw(0x7f)` names neither); and
+  `edit`'s pinned usage line brackets `[--base R]` as the parser does.
 - **H27** — `App::fork_base` falls back to `"HEAD"` when a parent's branch is
   gone, so a nested child's reclamation is measured against the root's tip rather
   than the branch its work actually went into. Found while landing §8.33. It errs
   toward keeping — a branch that is not an ancestor of `HEAD` is left alone and
   the row says why — so it is a row and not a defect.
+- **H28** — `lock::tests` flakes under the full suite. Two of its five tests were
+  each seen once in a full run this wave (`…acquire_is_refused_and_drop_…` at
+  `lock.rs:124`, and `the_lock_file_is_not_removed_when_the_holder_leaves`, seen
+  by `mush/125`), and neither failed in 40 isolated runs across two trees. The
+  assert that flaked is that the lock is takeable again once its holder is
+  dropped — if that were ever real rather than a flake, a workspace lock would
+  outlive the process that held it. The next wave should freeze it with a clock
+  or catch it, the same way §8.26 left its own full-suite flake.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -774,7 +781,8 @@ produced, and the reason a brief is not a design:
 **Disclosed, and now the queue's own:** H18 (a parent's steer or stop of a parked
 child fails as "gone") and H19 (a reaped child's name stays in its parent's
 books). Not rows, but recorded because a later wave should not have to
-rediscover them: a microscopic completion-versus-sweep race in reclamation
+rediscover them (H18 and H19 are both fixed now: `mush/109`, `mush/125`; §8.32,
+§8.34): a microscopic completion-versus-sweep race in reclamation
 (a completion sent but not yet in the tree, and the sweep takes the directory a
 wake is about to use); `git branch -d` measuring against the root checkout's HEAD,
 so a nested branch merged into an unmerged parent is removed with its branch kept
@@ -1228,7 +1236,8 @@ count, not a source), H16 residual (the per-minute deep copy of every kept
 transcript), H18 (a parent's steer to a *parked* child still fails as "gone" —
 `ff315d8` fixed the adjacent worktree-gone case, not parking), H19 (a reaped
 child's name stays in its parent's books), and H20 (four sentences in the
-human's `prompt.rs`, plus the `edit_file` schema's `replace_all`). Of
+human's `prompt.rs`, plus the `edit_file` schema's `replace_all`). H18 and H19
+have both landed since — `mush/109` and `mush/125` (§8.32, §8.34). Of
 `docs/refactor.md`'s structural rows: T1 §7 (`-y`/`--yes`/`AUTO_APPROVE`, the
 human's call), T2 §17 (the attach `id` field, a wire contract), T3 §3
 (`worktree_add`'s `.git` probe refuses a workspace that is a subdirectory of a
@@ -1589,3 +1598,93 @@ not left as a claim the numbers no longer support.
 and a third variant in the two that mirror it, and most of the diff is the prose
 that says which fact each surface now has.
 
+---
+
+## 8.34 A parent's books follow the tree (H19, H22, H25, and four leftovers, `mush/125`)
+
+Three rows in the queue were one defect seen from three sides. A parent's books
+about its children — `ActorState::children`, `completed`, `delivered`, `running`,
+`shared`, `work` — were written at a spawn and never reconciled with the app's
+tree again: a parent restored from a session started with *empty* books and
+answered "no such child agent #N" about a row on screen (H25); a child the
+history window reaped stayed in its parent's books for good (H19); and a child
+revived after parking left its parent holding the sender of the actor that no
+longer existed, so every later `control` took the wake path again (H22) — the
+message landed anyway, which is why it went unnoticed for a session.
+
+**The rule now: the tree is the truth, and the books are seeded where an actor
+learns who its children are and reconciled by messages while it runs.** Three
+new `AgentMsg` variants carry the tree's facts, and each is book-keeping —
+`Fold::Idle`, honoured in the idle drain, mid-run and at a message boundary
+alike, so none of them starts or resumes a run:
+
+- `ChildBook { id, cmd, outcome, read, shared }` — a row. Sent by
+  `App::seed_parent`, once per child, from two places: `App::seed_children`
+  after a restore has put every row back, and `App::deliver_to_actor` for an
+  agent it has just revived — *before* the send that hands over the command
+  which starts that run, so a `status` in the run's own first request already
+  sees the books. The outcome is recorded under `NO_RUN` (0: `runs` starts at 0
+  and is incremented where a run ends, so no actor ever claims it), the `read`
+  flag is the row's `✉` mark so a `wait` still hands an unread result over
+  exactly once, and `shared` is the fact the one-shared-child rule reads.
+- `ChildMailbox { id, cmd }` — the sender a revival built.
+- `ForgetChild { id }` — the reap. `App::reap_history` is five documented steps
+  now, and this one reads the parent *before* `tree.reap`, the last moment the
+  node still says whose child it was. It is a plain send into the parent's
+  mailbox: a parked parent has no books left to correct, a restored one
+  re-derives them from a tree that no longer has the child, and neither is
+  woken just to drop a name.
+
+**A forgotten id is tombstoned, and every per-child book respects the tombstone**
+— `note_completion`, `record_child`, `note_running`, `note_work`,
+`note_mailbox` — so a report still travelling from a reaped child cannot re-open
+a book the reap closed and arm a fold the tree has no row for. Only `ChildBook`
+clears it: the tree can only hand a row back for a node that exists, so a handed
+row is proof the forget is stale. The ids are never reused (`crate::ids`), so the
+memory cannot name a new child by mistake.
+
+**The four leftovers (H26).** A doubled attach flag is refused by name before its
+value is read (`require_once`, wired into `--agent`/`--since`/`--base`/`--send`,
+the precedent `mush/118` set), and `mush focus` refuses a positional id and
+`--agent` together in either order instead of silently dropping one. The bar's
+`NOTHING_RUNNING` says `Ctrl-N drops every transcript` — the half of that key a
+human cannot undo, and the line is only ever read when nothing is running, so the
+half worth naming is what goes. `machine::ended`'s last resort is no longer `-1`:
+`End::Unknown`, `Ended::Unknown` and `JobOutcome::Unknown` are the state of a
+status that names neither an exit code nor a signal, because `-1` reads as a code
+a reader could act on. And `edit`'s pinned usage line brackets `[--base R]`, as
+the parser (`base: 0`) has always meant.
+
+**One brief was wrong and the code was right.** The plan said `End::Unknown` was
+unreachable for a unix child and should be kept honest anyway. It is reachable:
+`ExitStatus::from_raw(0x7f)` — a stopped wait status with no stop signal — makes
+both `code()` and `signal()` answer `None`. The landing corrects the three
+comments that claimed no unix status reads that way and pins the case with a real
+test, which is the §8.31/§8.32 pattern again: the register of what is told is not
+the register of what happens.
+
+**What the review found, which the patch did not.** The first round seeded books
+only at restore, so a parent woken after `WARM_CHILDREN` parked it still answered
+"no children and no jobs" — the same defect on the path that actually runs during
+a session. The second round gave the seeding one home (`App::seed_parent`) with
+both callers, guarded `note_mailbox` with the tombstone like every other book,
+and corrected the `forgotten` field's own doc, which claimed a tombstone is never
+cleared while the code clears it. Twelve tests in the landing, each verified to
+fail with its production line reverted and then restored.
+
+**Verification, and a merge that was clean by text and broken by field.** The
+branch is 562 + 130 green; master after the merge is **566 + 132**, fmt and clippy
+clean, three smoke scenarios pass. The merge itself was the wave's one new
+failure mode: `mush/122` had added `tree::Spawn::fork` while `mush/125`'s four new
+hand-made `Spawn` initializers were written against a tree without it, so git
+merged without a single conflict and the *test* build failed with four "missing
+field" errors — the binary built and the smoke scenarios passed while the suite
+could not compile. Fixed on the merge's own commit (`a954358`), and a rule for the
+next merge: build the merged tree before believing the merge. `lock::tests` also
+flaked once in a full run here and once for `mush/125`, never in 40 isolated runs
+across two trees — H28.
+
+**Census at the merge** (`a954358`): total 51,967 · **prod 12,874** · tests
+22,506 · comments 13,326. The wave's 1,350 lines are 186 of production and 670 of
+test code: three messages, one tombstone and ten tests, wrapped in the prose that
+says which fact lives where.
