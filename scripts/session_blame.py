@@ -20,6 +20,14 @@ snapshot of a moment); a 100 MB session needs a few hundred MB of RAM to parse.
 
 The `--top 20` output is small enough to paste back for analysis; the 100 MB
 file never has to move.
+
+The window the yardstick is drawn against is **read, not assumed**: the third
+argument states it, else the session file's own `context` field (the one mush
+stores when a human stated a window), else `MUSH_CONTEXT` in this shell, else
+the home config; with none of those the sizes are still reported and the fold
+trigger is left unnamed. It used to default to 128000, which is nobody's
+number: mush's built-in default is 8192, and the workspace this was written for
+runs at 500000.
 """
 
 import argparse
@@ -38,9 +46,77 @@ import sys
 SCHEMA_TOKENS = 1200
 REPLY_SHARE_DIVISOR = 4
 MARGIN_TOKENS = 200
-# The window a session gets when nothing states one: the shape `config.rs`
-# documents as the default, and the one the tests pin 283_800 bytes for.
-DEFAULT_CONTEXT = 128_000
+# `Config::DEFAULT_CONTEXT_TOKENS` (config.rs:23): what mush assumes when the
+# human stated no window *and* the endpoint advertised none. It is named here
+# only to be quoted in the message for "no window is known" — it is **not** a
+# default for this script, because the window that matters is the one the
+# process that wrote the file was using, and assuming a number is how this
+# script came to call a 500k session a 128k one.
+BUILT_IN_CONTEXT = 8192
+
+
+def window_from_environment():
+    """`MUSH_CONTEXT` in *this* shell, if it is a token count.
+
+    mush ranks it above a workspace's stored window, so it is worth reading —
+    but it is this shell's environment, not the one the file was written in,
+    and the caller says which source it used.
+    """
+    value = os.environ.get("MUSH_CONTEXT")
+    if not value:
+        return None
+    try:
+        tokens = int(value)
+    except ValueError:
+        return None
+    return tokens if tokens > 0 else None
+
+
+def config_path():
+    """`mush_core::userconfig::config_path`, mirrored."""
+    override = os.environ.get("MUSH_CONFIG")
+    if override:
+        return override
+    xdg = os.environ.get("XDG_CONFIG_HOME") or os.path.join(os.path.expanduser("~"), ".config")
+    return os.path.join(xdg, "mush", "config.json")
+
+
+def window_from_home_config():
+    """The window the human's own config states, if any."""
+    try:
+        with open(config_path()) as f:
+            stated = json.load(f).get("context")
+    except (OSError, ValueError):
+        return None
+    return stated if isinstance(stated, int) and stated > 0 else None
+
+
+def window_of(args, session):
+    """(tokens, source) for the yardstick, or `(None, why nothing states one)`.
+
+    The order is the one that keeps the measurement honest rather than the one
+    mush resolves config in: the *session's* own stated window first, because
+    the file is the subject and a `/context` was a fact about this workspace;
+    then this shell's `MUSH_CONTEXT` (mush ranks it above the session's, but a
+    shell today is not the environment the file was written in); then the home
+    config, which is the lowest layer that can state one. Nothing here guesses
+    from the model: a derived window comes from the endpoint advertising it,
+    and this script does not talk to the network.
+    """
+    if args.context is not None:
+        return args.context, "the command line"
+    stated = session.get("context") if isinstance(session, dict) else None
+    if isinstance(stated, int) and stated > 0:
+        return stated, "stated in this session.json (`context`)"
+    from_env = window_from_environment()
+    if from_env is not None:
+        return from_env, "MUSH_CONTEXT in this shell"
+    from_home = window_from_home_config()
+    if from_home is not None:
+        return from_home, config_path()
+    return None, ("nothing states one: the session stores only a window the human stated, "
+                  "mush assumes %d otherwise, and a window the endpoint advertised was never "
+                  "stored — pass it as the third argument" % BUILT_IN_CONTEXT)
 
 
 def budget_for(context_tokens):
@@ -80,8 +156,9 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path")
     ap.add_argument("--top", type=int, default=10)
-    ap.add_argument("context", type=int, nargs="?", default=DEFAULT_CONTEXT,
-                    help="the session's window in tokens (default %d)" % DEFAULT_CONTEXT)
+    ap.add_argument("context", type=int, nargs="?", default=None,
+                    help="the session's window in tokens; without it the window comes from"
+                         " the session file, then MUSH_CONTEXT, then the home config")
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -92,6 +169,9 @@ def main():
 
     data = {"path": os.path.abspath(args.path), "bytes": len(raw),
             "compact_bytes": compact, "indent_cost": round(len(raw) / max(1, compact), 3)}
+
+    tokens, window_source = window_of(args, d)
+    data["window"] = {"tokens": tokens, "source": window_source}
 
     if not args.json:
         print("session: %s" % data["path"])
@@ -143,15 +223,18 @@ def main():
             asc = sorted(s for s, _, _ in sizes)
             mid = asc[len(asc) // 2]
             p90 = asc[min(len(asc) - 1, int(len(asc) * 0.9))]
-            budget, trigger = budget_for(args.context)
             print("  median %s · p90 %s · largest %s"
                   % (human(mid), human(p90), human(asc[-1])))
-            at_ceiling = sum(1 for s in asc if s > trigger * 0.5)
-            print("  window %d tokens -> budget %s, fold trigger %s"
-                  % (args.context, human(budget), human(trigger)))
-            print("  %d of %d hold more than half that trigger; a finished agent's"
-                  " transcript is never folded again"
-                  % (at_ceiling, len(asc)))
+            if tokens is None:
+                print("  window unknown: %s" % window_source)
+            else:
+                budget, trigger = budget_for(tokens)
+                at_ceiling = sum(1 for s in asc if s > trigger * 0.5)
+                print("  window %d tokens (%s) -> budget %s, fold trigger %s"
+                      % (tokens, window_source, human(budget), human(trigger)))
+                print("  %d of %d hold more than half that trigger; a finished agent's"
+                      " transcript is never folded again"
+                      % (at_ceiling, len(asc)))
         for s, a, n in sizes[:args.top]:
             print("    #%-6s %-9s %4d msgs %9s  %s"
                   % (a.get("id"), str(a.get("status"))[:9], n, human(s),
