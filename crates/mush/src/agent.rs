@@ -4021,6 +4021,12 @@ enum Ended {
     /// number no command returns, and it told a crash and an OOM kill apart
     /// from neither (finding B6).
     Signalled(i32),
+    /// The platform's status named neither an exit code nor a signal
+    /// ([`machine::End::Unknown`]). A state of its own, not the `-1` sentinel
+    /// that read as a real exit code (finding H26); no child mush starts
+    /// produces such a status, and a seam that is handed one says so rather than
+    /// naming a number nothing returned.
+    Unknown,
     /// mush stopped it. The reason is [`jobs::Stopped`]'s, not a second copy of
     /// the same three variants: the watcher already decides between them with
     /// `jobs::stopping`, and a fourth reason added there must reach the model's
@@ -4119,6 +4125,12 @@ fn end_note(ended: &Ended, timeout: Duration, detachable: bool, cap: usize) -> S
         // `[exit -1]` was this arm's spelling for a `SIGSEGV` and for an OOM
         // kill alike, and it read as the command's own doing (finding B6).
         Ended::Signalled(signal) => format!("[killed by signal {signal}]"),
+        // Neither a code nor a signal: the state names what is unknown rather
+        // than the `-1` sentinel, which read as a code a command can return
+        // (finding H26). No child mush starts ends this way — `machine::ended`
+        // reads an exit or a death by signal from the statuses `wait` produces —
+        // and the arm is honest anyway.
+        Ended::Unknown => "[no exit status: neither an exit code nor a signal]".to_string(),
         Ended::Stopped(jobs::Stopped::TimedOut) => {
             let mut note = format!("[timed out after {}s", timeout.as_secs());
             // The one case where "a long command detaches by itself" cannot
@@ -4219,6 +4231,7 @@ fn wait_bounded(
         match job.poll() {
             Ok(Some(End::Exited(code))) => return Ok(Ended::Exited(code)),
             Ok(Some(End::Signalled(signal))) => return Ok(Ended::Signalled(signal)),
+            Ok(Some(End::Unknown)) => return Ok(Ended::Unknown),
             Ok(None) => {}
             Err(error) => {
                 // Never leave a running process behind on an error path.
@@ -8578,10 +8591,11 @@ mod tests {
         }
 
         // And every arm of the table has its own sentence: the three ways the
-        // watcher stops a command, an exit, the signal that killed it, and the
-        // end that is not one — a command handed to the job registry, which
+        // watcher stops a command, an exit, the signal that killed it, the end
+        // that is not one — a command handed to the job registry, which
         // `run_shell` returns from before it builds a report, so no run reads it
-        // (refactor R15).
+        // — and the nameless end a platform with no exit status produces, which
+        // no unix child can (refactor R15, finding H26).
         let notes = vec![
             end_note(&Ended::Exited(0), minute, true, mush_core::CMD_CAP),
             end_note(&Ended::Signalled(9), minute, true, mush_core::CMD_CAP),
@@ -8610,6 +8624,7 @@ mod tests {
                 mush_core::CMD_CAP,
             ),
             end_note(&Ended::Detached, minute, true, mush_core::CMD_CAP),
+            end_note(&Ended::Unknown, minute, true, mush_core::CMD_CAP),
         ];
         let mut unique = notes.clone();
         unique.sort();
@@ -8636,6 +8651,10 @@ mod tests {
             notes[6].contains("registry"),
             "a detached command is not a timed-out one: {}",
             notes[6]
+        );
+        assert_eq!(
+            notes[7], "[no exit status: neither an exit code nor a signal]",
+            "an end with no status says so instead of naming a code nothing returns"
         );
         // The timeout's sentence says why it could not detach when the budget
         // was the reason.

@@ -241,6 +241,14 @@ pub enum JobOutcome {
     /// past any honest build, and its slot and its scratch belong to someone
     /// else by then.
     RanTooLong,
+    /// It ended in a way the platform's status does not name: neither an exit
+    /// code nor a signal. Its own state rather than an exit code standing in
+    /// for one: the `-1` this used to be reads as a real code, and a state that
+    /// says "unknown" cannot be acted on as one (finding H26). No job mush
+    /// starts ends this way — `machine::ended` reads an exit or a death by
+    /// signal from the statuses `wait` produces — and a status that names
+    /// neither is what this is for.
+    Unknown,
 }
 
 impl JobOutcome {
@@ -260,6 +268,7 @@ impl JobOutcome {
                 | JobOutcome::Signalled(_)
                 | JobOutcome::TooMuchOutput
                 | JobOutcome::RanTooLong
+                | JobOutcome::Unknown
         )
     }
 
@@ -281,6 +290,13 @@ impl JobOutcome {
                 format!("{id} killed by signal {signal} · {}", short_age(age))
             }
             JobOutcome::Stopped => format!("{id} stopped after {}", short_age(age)),
+            // The state names what is unknown rather than inventing a code:
+            // `exit -1` was a real-looking number that no command returns and
+            // that a reader could act on as if it were one (finding H26).
+            JobOutcome::Unknown => format!(
+                "{id} ended without an exit code or a signal · {}",
+                short_age(age)
+            ),
             JobOutcome::TooMuchOutput => format!(
                 "{id} killed: it wrote past {CMD_OUTPUT_LIMIT} bytes · {}",
                 short_age(age)
@@ -308,6 +324,9 @@ impl From<End> for JobOutcome {
         match end {
             End::Exited(code) => JobOutcome::Exited(code),
             End::Signalled(signal) => JobOutcome::Signalled(signal),
+            // The end of the `-1`: a status that named neither is carried as
+            // neither, so no reader can mistake it for an exit code.
+            End::Unknown => JobOutcome::Unknown,
         }
     }
 }
@@ -1506,6 +1525,31 @@ mod tests {
         assert!(
             JobOutcome::RanTooLong.is_news(),
             "four hours of silence is a reason to wake the owner, not a line to sit on"
+        );
+        // The end a platform's status does not name: no code, no signal. Its own
+        // outcome and its own sentence, because the `exit -1` it used to be was
+        // a number a command could have returned and a reader could act on
+        // (finding H26). No job mush starts ends this way — `machine::ended`
+        // reads an exit or a death by signal from the statuses `wait` produces
+        // — and the line is what a status naming neither would report.
+        let unknown =
+            JobOutcome::Unknown.line(JobId(2), "cargo test", Duration::from_secs(192), tail);
+        assert_eq!(
+            unknown,
+            "#c2 ended without an exit code or a signal · 3m12s · cargo test — running 12 \
+             tests · test result: ok. 12 passed"
+        );
+        assert!(
+            JobOutcome::Unknown.is_news(),
+            "a job that ended is a result, however namelessly"
+        );
+        assert!(
+            !unknown.contains("-1"),
+            "no sentinel standing in for a code: {unknown}"
+        );
+        assert!(
+            matches!(JobOutcome::from(End::Unknown), JobOutcome::Unknown),
+            "the seam carries a status that names neither as neither, not as -1"
         );
 
         // The kept window is a tail, so a long one keeps its *end* and says
