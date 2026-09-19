@@ -1200,6 +1200,23 @@ impl App {
                 // reading that never happened (finding H4).
                 self.tree.result_read(AgentId(child));
             }
+            AgentEvent::ChildAsleep { child, command } => {
+                // A parent's `control` found its child's mailbox empty: the
+                // actor behind it is gone — parked, which reclaims the thread
+                // and nothing else (`Self::park_history`), or replaced by a
+                // newer actor the parent's one mailbox cannot know about. The
+                // command is handed over through the same door the human's own
+                // message uses, because the UI is the only hand holding the
+                // transcript a new actor is rebuilt from. A child whose node is
+                // gone really is gone, and `deliver_to_actor` starts nothing
+                // for it.
+                //
+                // The answer is dropped rather than used: the parent wrote its
+                // model a reply before this event reached the UI thread, and
+                // what settles the parent's books from here is the child's own
+                // `ChildRunning` and `ChildDone` (finding H18).
+                let _ = self.deliver_to_actor(AgentId(child), command);
+            }
             AgentEvent::Reclaimed => {
                 // The actor's own run end swept its worktree: the checkout and
                 // the branch are gone, so the row stops offering a `git diff`
@@ -3531,6 +3548,99 @@ mod tests {
             "and the woken child began a run"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other hand that can wake a parked child is not the human's: a
+    /// parent's own `control message` finds the same empty mailbox and reaches
+    /// the same door. The parent holds no transcript and cannot revive, so the
+    /// command travels to the UI as an event — and the words land in the child's
+    /// transcript, where the human can read what their model was told
+    /// (finding H18).
+    #[test]
+    fn a_parents_message_wakes_a_parked_child_through_the_ui() {
+        let root = repo("parent-wake");
+        let (mut app, rx) = app_and_rx(root.clone());
+        // A parked child: the tree holds the mailbox and nobody holds the
+        // receiver, which is what a reclaimed thread leaves.
+        let (tx, parked) = crossbeam_channel::unbounded::<AgentMsg>();
+        drop(parked);
+        let opened = app.tree.insert(Spawn {
+            id: AgentId(2),
+            parent: AgentId::ROOT,
+            brief: "port the parser".to_string(),
+            depth: 1,
+            branch: None,
+            cmd: tx,
+        });
+        app.chat.push_message(opened.id, opened.opening);
+        app.tree.finish(AgentId(2), Some("did it".to_string()));
+        app.tree.result_read(AgentId(2));
+
+        // What the parent's actor emits when its send finds no actor there.
+        app.update(Msg::Agent {
+            conversation: app.tree.conversation(),
+            id: AgentId::ROOT,
+            event: AgentEvent::ChildAsleep {
+                child: 2,
+                command: AgentMsg::Steer("carry on".into()),
+            },
+        });
+
+        assert!(
+            app.tree.agent_tx[&AgentId(2)].send(AgentMsg::Stop).is_ok(),
+            "the mailbox has an actor behind it again"
+        );
+        assert!(
+            runs(&mut app, &rx, AgentId(2)),
+            "and the words the parent sent start the child"
+        );
+        assert!(
+            app.chat
+                .transcript(AgentId(2))
+                .iter()
+                .any(|message| message.text() == "carry on"),
+            "the human reads the words their model was told"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A command for a child the tree no longer has — the parent's books keep a
+    /// reaped child's name (finding H19), so its `control` can still be aimed at
+    /// one — starts nothing. The UI is a door to the agents that are here, not a
+    /// hand that invents one (finding H18).
+    #[test]
+    fn a_command_for_a_child_the_tree_has_forgotten_wakes_nothing() {
+        let (mut app, _rx) = test_app("parent-wake-forgotten");
+        let (tx, parked) = crossbeam_channel::unbounded::<AgentMsg>();
+        drop(parked);
+        app.tree.insert(Spawn {
+            id: AgentId(2),
+            parent: AgentId::ROOT,
+            brief: "port the parser".to_string(),
+            depth: 1,
+            branch: None,
+            cmd: tx,
+        });
+        app.tree.finish(AgentId(2), Some("did it".to_string()));
+        // What the window does with a child nobody is listening to any more:
+        // the node and the mailbox go, and the id is left in the parent's own
+        // books (finding H19).
+        app.tree.reap(&[AgentId(2)]);
+
+        app.update(Msg::Agent {
+            conversation: app.tree.conversation(),
+            id: AgentId::ROOT,
+            event: AgentEvent::ChildAsleep {
+                child: 2,
+                command: AgentMsg::Steer("hello?".into()),
+            },
+        });
+
+        assert!(!app.tree.has(AgentId(2)), "no row is conjured");
+        assert!(
+            !app.tree.agent_tx.contains_key(&AgentId(2)),
+            "and no actor behind the mailbox either"
+        );
     }
 
     /// The git line is refreshed on the transitions a human drives — a focus
