@@ -1,11 +1,11 @@
 //! The transcript algebra: the rules that decide the *shape* of a request.
 //!
 //! Pairing tool calls with their results, repairing arguments a model sent as
-//! something other than JSON, dropping the oldest turns to fit a budget, and
-//! deciding when a conversation should be folded into a summary. Nothing here
-//! calls a model or touches an actor — these are pure functions over
-//! `Message`s, which is why they live in core and not in the run loop that
-//! applies them.
+//! something other than JSON, dropping the oldest turns to fit a budget (and
+//! saying so in the request), and deciding when a conversation should be
+//! folded into a summary. Nothing here calls a model or touches an actor —
+//! these are pure functions over `Message`s, which is why they live in core
+//! and not in the run loop that applies them.
 
 use serde_json::Value;
 
@@ -152,14 +152,51 @@ pub fn sanitize_tool_calls(mut message: Message) -> Message {
     message
 }
 
+/// The one line a request carries when trimming had to drop the oldest turns:
+/// without it a model continues as if it held the whole conversation and can
+/// contradict a fact it "already read", with nothing to say why the fact is
+/// gone. The note travels in the request only — the vec [`trim_history`] trims
+/// is the actor's working copy, while the copy a session stores is the UI's,
+/// which learns a line only from an emitted [`Message`] event — so it is not
+/// accumulated in `.mush/session.json`.
+///
+/// It speaks in the user's voice, the voice mush's other out-of-band notes use
+/// (`COMPACT_INSTRUCTION`, `TRUNCATION_INSTRUCTION`, a folded completion): the
+/// assistant's would be a fabricated turn, and a thinking endpoint refuses a
+/// replayed assistant turn that carries no `reasoning_content`. [`trim_history`]
+/// keeps it out of the `user_indices` arithmetic, which counts user lines as
+/// turn boundaries.
+const DROPPED_TURNS_NOTE: &str = "\
+The oldest turns of this conversation were dropped to fit the context window, \
+so this transcript is not the whole conversation: a fact you cannot find here \
+may have been dropped rather than never said.";
+
 /// Drop the oldest turns until the conversation fits the budget. Trimming at a
 /// user message keeps assistant/tool pairs intact, which servers validate.
 /// The budget comes from the endpoint's context window.
+///
+/// A transcript that lost turns says so once, in [`DROPPED_TURNS_NOTE`]'s line.
+/// The note is built here, counted against the budget like any other message,
+/// and kept out of the draining below — a `user` line would otherwise read as
+/// a turn boundary — and a later drain replaces it along with the turns it was
+/// explaining.
 pub fn trim_history(messages: &mut Vec<Message>, budget: usize) {
+    // Whatever an earlier call left comes out first: the arithmetic below
+    // counts `user` lines as turns, and the note is not one.
+    let carried = messages.get(2).is_some_and(is_dropped_note);
+    if carried {
+        messages.remove(2);
+    }
+    let note = Message::user(DROPPED_TURNS_NOTE);
+    let mut dropped = false;
     loop {
-        let total: usize = messages.iter().map(Message::weight).sum();
+        // Once a drop happens the request will carry the note, so the budget
+        // has to hold the note too, or the line explaining the trim would be
+        // what pushes the request past the window.
+        let total: usize = messages.iter().map(Message::weight).sum::<usize>()
+            + if carried || dropped { note.weight() } else { 0 };
         if total <= budget {
-            return;
+            break;
         }
         let user_indices: Vec<usize> = messages
             .iter()
@@ -171,7 +208,7 @@ pub fn trim_history(messages: &mut Vec<Message>, budget: usize) {
         // task — for subagents that is the parent's brief, which must survive
         // trimming. System + task + the newest turn is the minimum shape.
         if user_indices.len() < 3 {
-            return;
+            break;
         }
         // Drop the oldest full turn: everything after the task message up to
         // the third user message, cutting at user boundaries so pairs stay
@@ -179,10 +216,23 @@ pub fn trim_history(messages: &mut Vec<Message>, budget: usize) {
         // here forever) on a transcript that does not start with system+user.
         let keep_from = user_indices[2];
         if keep_from <= 2 {
-            return;
+            break;
         }
         messages.drain(2..keep_from);
+        dropped = true;
     }
+    if carried || dropped {
+        // Where the dropped turns were: after the system prompt and the
+        // opening task, before the oldest turn that was kept.
+        messages.insert(2, note);
+    }
+}
+
+/// Whether a message is the note [`trim_history`] leaves behind when it drops
+/// turns. One shape, compared in the one place that has to tell the note from
+/// a turn.
+fn is_dropped_note(message: &Message) -> bool {
+    message.role == "user" && message.text() == DROPPED_TURNS_NOTE
 }
 
 #[cfg(test)]
@@ -277,6 +327,114 @@ mod tests {
             3,
             "nothing can be trimmed without a pair to keep"
         );
+    }
+
+    /// How many copies of the note a transcript carries.
+    fn note_count(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .filter(|message| message.text() == DROPPED_TURNS_NOTE)
+            .count()
+    }
+
+    /// A long transcript as a run builds one: the opening system+task pair and
+    /// then `turns` user turns, each with an assistant reply and a tool result.
+    fn long_transcript(turns: usize) -> Vec<Message> {
+        let mut messages = vec![Message::system("you are mush"), Message::user("first")];
+        for i in 0..turns {
+            messages.push(Message::assistant(format!("reply {i} {}", "x".repeat(500))));
+            messages.push(Message::tool(format!("call{i}"), "result"));
+            messages.push(Message::user(format!("again {i}")));
+        }
+        messages
+    }
+
+    /// A drain is not silent: the request carries one line saying the oldest
+    /// turns were dropped, where they used to be — after the system prompt and
+    /// the opening task — so a model cannot read a fact out of a transcript
+    /// that no longer holds it.
+    #[test]
+    fn a_trimmed_request_says_the_oldest_turns_were_dropped() {
+        let mut messages = long_transcript(50);
+        trim_history(&mut messages, 8_000);
+
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user", "the opening task survives");
+        assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE);
+        assert_eq!(
+            messages[2].role, "user",
+            "the note is a user line, and it is not counted as a turn"
+        );
+        assert_eq!(note_count(&messages), 1, "one line, however much was cut");
+        assert!(
+            messages.iter().map(Message::weight).sum::<usize>() <= 8_000,
+            "the explanation fits the budget it explains"
+        );
+    }
+
+    /// A second drain on the same transcript replaces the line and keeps its
+    /// place: a long run carries exactly one note about what it lost, never a
+    /// pile of them.
+    #[test]
+    fn a_second_drain_replaces_the_note_instead_of_stacking_it() {
+        let mut messages = long_transcript(50);
+        trim_history(&mut messages, 8_000);
+        assert_eq!(note_count(&messages), 1);
+
+        for i in 50..100 {
+            messages.push(Message::assistant(format!("reply {i} {}", "x".repeat(500))));
+            messages.push(Message::tool(format!("call{i}"), "result"));
+            messages.push(Message::user(format!("again {i}")));
+        }
+        trim_history(&mut messages, 8_000);
+        assert_eq!(note_count(&messages), 1, "replaced, not stacked");
+        assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE, "and still in place");
+        assert_eq!(messages[1].role, "user");
+        assert!(messages.iter().map(Message::weight).sum::<usize>() <= 8_000);
+    }
+
+    /// A trim that can cut no further keeps the line it already carries:
+    /// there is no second note and no lost explanation.
+    #[test]
+    fn a_note_is_carried_when_a_later_trim_can_cut_no_further() {
+        let mut messages = long_transcript(50);
+        trim_history(&mut messages, 8_000);
+        assert_eq!(note_count(&messages), 1);
+        // Below the minimum shape's own weight: the drain reaches system +
+        // task + one turn and stops, and the note has to survive that.
+        trim_history(&mut messages, 0);
+        assert_eq!(note_count(&messages), 1, "kept, not lost or stacked");
+        assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+    }
+
+    /// Nothing dropped means nothing said: a transcript that already fits is
+    /// not annotated, and neither is one the trimmer cannot cut (a shape with
+    /// no pair to keep) — the note is a fact about what happened, not a hedge.
+    #[test]
+    fn an_untouched_transcript_carries_no_note() {
+        let mut messages = vec![Message::system("you are mush"), Message::user("task")];
+        let before = serde_json::to_string(&messages).unwrap();
+        trim_history(&mut messages, 10_000);
+        assert_eq!(serde_json::to_string(&messages).unwrap(), before);
+
+        let mut messages = vec![Message::user("a"), Message::user("b"), Message::user("c")];
+        trim_history(&mut messages, 0);
+        assert_eq!(messages.len(), 3, "nothing can be trimmed without a pair");
+        assert_eq!(note_count(&messages), 0);
+
+        // Exactly two turns and over budget: the guard refuses the drain, so
+        // there is no drop to explain and no note to add either.
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("first"),
+            Message::assistant("done"),
+            Message::user("x".repeat(10_000)),
+        ];
+        trim_history(&mut messages, 100);
+        assert_eq!(messages.len(), 4);
+        assert_eq!(note_count(&messages), 0);
     }
 
     fn call(id: &str) -> ToolCall {
