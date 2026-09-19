@@ -7,7 +7,7 @@ makes them the only test that covers the whole path — keys, agent loop, tool
 execution, atomic writes, and session persistence.
 
 Usage:
-    python3 scripts/smoke.py [BINARY] [WORKDIR] [--agent|--resize|--cancel]
+    python3 scripts/smoke.py [BINARY] [WORKDIR] [--agent|--resize|--cancel|--lock]
 
 The resize and cancel scenarios need no model endpoint; the others do.
 
@@ -215,6 +215,62 @@ def scenario_resize(binary: str, root: pathlib.Path) -> bool:
     return all(results)
 
 
+def scenario_lock(binary: str, root: pathlib.Path) -> bool:
+    """One mush per workspace: the second start says no, and lets the first work.
+
+    No model needed — the refusal happens before any request, and before the
+    session is read. The three things that matter are all here: the second
+    process exits non-zero *with the holder's pid in the sentence* (so the
+    human knows who to quit), a subcommand still reaches the running mush (the
+    refusal tells them to do exactly that), and the lock dies with its holder,
+    so the workspace is usable again after a `kill -9` with nothing to clean up.
+    """
+    print(f"\n== lock == {root}")
+    env = {"MUSH_URL": "http://127.0.0.1:1", "MUSH_PROVIDER": "custom", "MUSH_MODEL": "probe"}
+    tui = Tui(binary, root, rows=34, cols=110, env_extra=env)
+    tui.pump(2.0)
+
+    second = subprocess.run([binary, str(root)], capture_output=True, text=True, timeout=30)
+    refusal = second.stderr.strip()
+
+    # `mush agents` is the escape hatch the refusal names: it drives the
+    # running process over its socket, so it must not be refused itself.
+    subcommand = subprocess.run([binary, "agents", str(root)], capture_output=True, text=True, timeout=30)
+
+    exit_code = tui.close()
+
+    # The holder is gone now; the same workspace must open again. This is the
+    # part a pid file would get wrong (a stale file, and a refused start after
+    # a crash), which is why the lock is `flock(2)` and never unlinked.
+    reopened = Tui(binary, root, rows=34, cols=110, env_extra=env)
+    reopened.pump(1.5)
+    reopened_code = reopened.close()
+
+    results = [
+        check("the second start is refused", second.returncode == 1, f"exit {second.returncode}"),
+        check(
+            "the refusal names the holder",
+            str(tui.proc.pid) in refusal and "already running in this workspace" in refusal,
+            refusal or "(nothing on stderr)",
+        ),
+        check(
+            "the refusal points at `mush agents`",
+            "mush agents" in refusal,
+            refusal,
+        ),
+        check(
+            "a subcommand still reaches the running mush",
+            subcommand.returncode == 0 and "root" in subcommand.stdout,
+            f"exit {subcommand.returncode}: {subcommand.stdout.strip()[:200]}",
+        ),
+        check("the first mush exited cleanly", exit_code == 0, f"exit {exit_code}"),
+        check("the lock went with it", reopened_code == 0, f"exit {reopened_code}"),
+    ]
+    if not all(results):
+        print(tui.tail())
+    return all(results)
+
+
 def scenario_cancel(binary: str, root: pathlib.Path) -> bool:
     """Ctrl-C must stop a model call that has not answered yet.
 
@@ -310,6 +366,7 @@ def main() -> int:
     parser.add_argument("--agent", action="store_true", help="run only the agent scenario")
     parser.add_argument("--resize", action="store_true", help="run only the resize scenario")
     parser.add_argument("--cancel", action="store_true", help="run only the cancel scenario")
+    parser.add_argument("--lock", action="store_true", help="run only the lock scenario")
     args = parser.parse_args()
 
     binary = str(pathlib.Path(args.binary).resolve())
@@ -317,7 +374,8 @@ def main() -> int:
         print(f"binary not found: {binary}", file=sys.stderr)
         return 2
 
-    both = not (args.agent or args.resize or args.cancel)
+    chosen = [args.agent, args.resize, args.cancel, args.lock]
+    both = not any(chosen)
     base = pathlib.Path(args.workdir)
     passed = True
     if both or args.agent:
@@ -326,6 +384,9 @@ def main() -> int:
         passed &= scenario_resize(binary, base / "resize")
     if both or args.cancel:
         passed &= scenario_cancel(binary, base / "cancel")
+    # Last, and not only because it is cheap: it needs the workspace to itself.
+    if both or args.lock:
+        passed &= scenario_lock(binary, base / "lock")
 
     print("\n" + ("all scenarios passed" if passed else "scenario failures"))
     return 0 if passed else 1

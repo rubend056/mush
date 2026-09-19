@@ -20,6 +20,10 @@ unicode-width = "0.2"
 tempfile.workspace = true
 unicode-segmentation.workspace = true
 unicode-truncate.workspace = true
+# `flock(2)` for the one-mush-per-workspace lock. The workspace forbids
+# `unsafe`, so the syscall comes from a safe wrapper rather than a hand-written
+# `extern "C"`; rustix is already in the tree under tempfile and rustls.
+rustix = { version = "1", features = ["fs"] }
 # TLS so hosted https endpoints (e.g. DeepSeek) work; the HTTP client itself
 # stays hand-rolled and blocking.
 rustls = "0.23"

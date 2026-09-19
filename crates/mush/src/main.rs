@@ -13,6 +13,7 @@ mod http;
 mod ids;
 mod input;
 mod jobs;
+mod lock;
 mod machine;
 mod model;
 mod session_save;
@@ -636,6 +637,12 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     let workspace = Workspace::new(&dir)?;
     session::ensure_mush_dir(workspace.root())?;
+    // One mush per workspace, taken before anything is read or written: a
+    // second process on this directory would write the same `session.json`, and
+    // that write is a whole-file replace on a minute's debounce, so the two
+    // conversations would erase each other in turn. A refused start leaves the
+    // store exactly as it found it (see `lock`).
+    let _lock = lock::acquire(workspace.root())?;
 
     // CLI flags > environment > saved session > home config > defaults; the
     // whole precedence lives in one tested function in mush-core.
