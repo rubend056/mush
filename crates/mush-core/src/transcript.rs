@@ -175,7 +175,7 @@ may have been dropped rather than never said.";
 /// user message keeps assistant/tool pairs intact, which servers validate.
 /// The budget comes from the endpoint's context window.
 ///
-/// A transcript that lost turns says so once, in [`DROPPED_TURNS_NOTE`]'s line.
+/// A transcript that lost turns says so once, in `DROPPED_TURNS_NOTE`'s line.
 /// The note is built here, counted against the budget like any other message,
 /// and kept out of the draining below — a `user` line would otherwise read as
 /// a turn boundary — and a later drain replaces it along with the turns it was

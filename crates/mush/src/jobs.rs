@@ -170,7 +170,7 @@ pub fn label(id: JobId) -> String {
 /// so the row, the footer and the transcript foot all read the one answer, and
 /// an hourglass is never painted as a spinner (finding U7).
 ///
-/// [`Phase::waiting`]: crate::app::tree::Phase::waiting
+/// [`Phase::waiting`]: crate::app::Phase::waiting
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Waited;
 
