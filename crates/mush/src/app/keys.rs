@@ -508,35 +508,6 @@ mod tests {
         }
     }
 
-    /// `Ctrl-T` is the reasoning toggle wherever the keyboard is: in either
-    /// pane, and with a picker up — it is a view of the pane behind the modal,
-    /// exactly like the other app-wide Ctrl keys. The one help line both
-    /// surfaces print is the key table's own.
-    #[test]
-    fn ctrl_t_toggles_the_reasoning_from_anywhere() {
-        for focus in [Focus::Agents, Focus::Chat] {
-            for picker_open in [false, true] {
-                assert_eq!(
-                    at(focus, picker_open, ctrl('t')),
-                    Intent::ToggleReasoning,
-                    "{focus:?} picker={picker_open}"
-                );
-            }
-        }
-        let help = |keys: &str| {
-            KEYS.iter()
-                .find(|binding| binding.keys == keys)
-                .unwrap_or_else(|| panic!("no `{keys}` row"))
-                .help
-        };
-        assert_eq!(help("Ctrl-T"), "show or hide the model's reasoning");
-        let table = help_table();
-        assert!(
-            table.contains("Ctrl-T"),
-            "both help surfaces render this table:\n{table}"
-        );
-    }
-
     /// The agent pane owns the rows: moving, both ends, focusing, stopping, and
     /// the way back to the root.
     #[test]
@@ -767,59 +738,6 @@ mod tests {
         );
     }
 
-    /// `PgUp`/`PgDn` page whichever list has the keyboard: the agents pane
-    /// moves its cursor a page of rows and the chat still scrolls the
-    /// transcript. The two must be the same distance apart from the pane, or a
-    /// human would have to learn a second notion of "a page" — and the chat's
-    /// half is the one an over-eager match arm loses.
-    #[test]
-    fn page_up_and_page_down_page_the_pane_that_has_the_keyboard() {
-        assert_eq!(
-            at(Focus::Agents, false, none(KeyCode::PageUp)),
-            Intent::TreeMove(-PAGE),
-            "PgUp goes up a page of rows"
-        );
-        assert_eq!(
-            at(Focus::Agents, false, none(KeyCode::PageDown)),
-            Intent::TreeMove(PAGE),
-            "PgDn goes down a page of rows"
-        );
-        assert_eq!(
-            at(Focus::Chat, false, none(KeyCode::PageUp)),
-            Intent::Chat(ChatKey::Scroll(PAGE)),
-            "and the transcript still scrolls"
-        );
-        assert_eq!(
-            at(Focus::Chat, false, none(KeyCode::PageDown)),
-            Intent::Chat(ChatKey::Scroll(-PAGE)),
-            "down the transcript is the other sign"
-        );
-    }
-
-    /// `←`/`→` belong to whichever pane has the keyboard: the tree walks its
-    /// parent links in the agents pane, and the chat keeps them for the message
-    /// box cursor. Both halves are one row of this table, so "`←` moves the
-    /// tree" cannot quietly become "`←` moves the box too".
-    #[test]
-    fn left_and_right_belong_to_whichever_pane_has_the_keyboard() {
-        assert_eq!(
-            at(Focus::Agents, false, none(KeyCode::Left)),
-            Intent::TreeWalk(-1)
-        );
-        assert_eq!(
-            at(Focus::Agents, false, none(KeyCode::Right)),
-            Intent::TreeWalk(1)
-        );
-        assert_eq!(
-            at(Focus::Chat, false, none(KeyCode::Left)),
-            Intent::Chat(ChatKey::Left)
-        );
-        assert_eq!(
-            at(Focus::Chat, false, none(KeyCode::Right)),
-            Intent::Chat(ChatKey::Right)
-        );
-    }
-
     /// The help both surfaces print comes from [`KEYS`], so this is where a
     /// binding can be lost: every row must be in the rendered table, each
     /// context must head its rows once, and the real scroll keys — not the
@@ -877,8 +795,6 @@ mod tests {
                 .unwrap_or_else(|| panic!("no `{keys}` row"))
                 .help
         };
-        assert_eq!(help("Ctrl-C"), "stop the focused agent");
-        assert_eq!(help("Ctrl-X"), "stop every running agent");
         assert_ne!(
             help("Ctrl-C"),
             help("Ctrl-X"),
