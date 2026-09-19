@@ -545,7 +545,7 @@ impl App {
             let prompt = if self.tree.focused == AgentId::ROOT {
                 "› ".to_string()
             } else {
-                format!("#{} › ", self.tree.focused)
+                format!("{} › ", self.tree.focused)
             };
             let prompt_width = UnicodeWidthStr::width(prompt.as_str());
             let columns = (field.width as usize).saturating_sub(prompt_width);
@@ -845,7 +845,7 @@ fn compact_footer(mut full: Vec<Line<'static>>, budget: usize) -> Vec<Line<'stat
 fn agent_footer(app: &App, node: &AgentNode, row: &AgentRow, width: usize) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled(format!(" #{} ", node.id), Style::default().fg(Color::Cyan)),
+        Span::styled(format!(" {} ", node.id), Style::default().fg(Color::Cyan)),
         Span::styled(
             truncate(&node.brief, width.saturating_sub(6)),
             Style::default(),
@@ -917,7 +917,7 @@ fn unread_footer(app: &App, node: &AgentNode) -> String {
         let head = ids
             .iter()
             .take(NAMED)
-            .map(|id| format!("#{id}"))
+            .map(|id| id.to_string())
             .collect::<Vec<_>>()
             .join(", ");
         if ids.len() > NAMED {
@@ -930,7 +930,7 @@ fn unread_footer(app: &App, node: &AgentNode) -> String {
     let mut parts = Vec::new();
     if node.result_unread {
         parts.push(match node.parent {
-            Some(parent) => format!("✉ result unread by #{parent}"),
+            Some(parent) => format!("✉ result unread by {parent}"),
             None => "✉ result unread".to_string(),
         });
     }

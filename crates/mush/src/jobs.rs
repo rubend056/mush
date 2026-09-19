@@ -12,9 +12,10 @@
 //! `AgentCtx` (the same handle `ids` and `live` travel through), because a job
 //! is a fact about the *machine*, not about one actor: the budget is
 //! machine-wide, the lock is machine-wide, and Ctrl-N has to be able to kill
-//! everything the old tree left running. Job ids are drawn from the tree's one
-//! id counter, so `#c2` can never collide with agent `#2`, with `#N` in a
-//! message, or with an id recovered from a leftover worktree (finding B1).
+//! everything the old tree left running. Job ids are drawn from the
+//! conversation's own job counter ([`crate::ids`]), so `#c2` and agent `#2` are
+//! two different things that may share a number — the `c` in the display, and
+//! the `JobId` type in the code, are what keep them apart.
 //!
 //! Three rules live here:
 //!
@@ -25,10 +26,11 @@
 //!    what a foreground command's result keeps, because the model reads it
 //!    while the command still runs. There is no second window and no second
 //!    source: both readers go through [`preview`].
-//! 2. **A job dies with its owner.** `Stop`, `Shutdown`, Ctrl-N and quitting
-//!    mush all end up in [`Registry::kill_owned`] or [`Registry::kill_all`], and
-//!    [`Registry`]'s `Drop` is the backstop for a path that forgets. A build an
-//!    agent started must not outlive a clean quit.
+//! 2. **A job dies with its owner.** `Stop`, `Shutdown`, Ctrl-N, a cut-off
+//!    owner and quitting mush all end up in [`Registry::kill_owned`] or
+//!    [`Registry::kill_all`]; [`Registry`]'s `Drop` is the backstop for a path
+//!    that forgets, with the reach its own doc states. A build an agent started
+//!    must not outlive a clean quit.
 //! 3. **One command at a time may own the machine.** An `exclusive` command
 //!    takes a workspace-wide lock, so a benchmark, a profiler, or anything that
 //!    binds a fixed port runs without a sibling stealing cores. The lock
@@ -43,7 +45,7 @@
 //! records under the registry lock, drops it, and only then touches a handle.
 
 use std::collections::BTreeMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -54,9 +56,10 @@ use mush_core::text::truncate;
 use mush_core::workspace::tail_for_model;
 
 use crate::agent::{AgentEvent, AgentMsg};
-use crate::app::{short_age, AgentId};
+use crate::app::short_age;
 use crate::clock::Clock;
 use crate::events::Events;
+use crate::ids::{AgentId, Ids, JobId};
 use crate::machine::Job;
 
 /// How many jobs may be alive in one workspace at once, beside `MAX_AGENTS`.
@@ -115,9 +118,11 @@ pub const CMD_DETACH_AFTER: Duration = Duration::from_secs(60);
 const REFUSAL_COMMAND_COLUMNS: usize = 60;
 
 /// `#c2` — a job's name, as the model and the human both read it. The `c` is
-/// what tells a command's id from an agent's at a glance.
-pub fn label(id: u64) -> String {
-    format!("#c{id}")
+/// what tells a command's id from an agent's at a glance, and it lives in
+/// [`JobId`]'s `Display`; this is that spelling under a verb a call site can
+/// read (`label(id)`), so nothing formats a `#c` by hand.
+pub fn label(id: JobId) -> String {
+    id.to_string()
 }
 
 /// What a run is parked on: the one `wait` tool.
@@ -195,7 +200,7 @@ impl JobOutcome {
     /// The one line a job is reported in: `#c2 done: exit 0 · 3m12s · cargo
     /// test — test result: ok.`. Kept here so the transcript line, the bar and
     /// `status` say the same thing about the same job.
-    pub fn line(&self, id: u64, command: &str, age: Duration, tail: &str) -> String {
+    pub fn line(&self, id: JobId, command: &str, age: Duration, tail: &str) -> String {
         let head = match self {
             JobOutcome::Exited(code) => {
                 format!("{} done: exit {code} · {}", label(id), short_age(age))
@@ -238,7 +243,7 @@ pub fn preview_tail(tail: &str) -> String {
 
 /// One job as the registry holds it.
 struct Record {
-    id: u64,
+    id: JobId,
     owner: u64,
     command: String,
     started: Instant,
@@ -554,8 +559,10 @@ impl Source {
 pub struct Registry {
     clock: Arc<dyn Clock>,
     events: Arc<dyn Events>,
-    /// The tree's id counter, shared with the agents: one space, no collisions.
-    ids: Arc<AtomicU64>,
+    /// The conversation's id counters, shared with the agents: the *job* half
+    /// is what a launch draws from, so a job and an agent can no longer be
+    /// handed the same number by one counter.
+    ids: Ids,
     inner: Mutex<Inner>,
 }
 
@@ -563,10 +570,10 @@ pub struct Registry {
 struct Inner {
     /// In id order: at most `MAX_JOBS` live plus `JOB_HISTORY` finished, so a
     /// handful of records.
-    jobs: BTreeMap<u64, Record>,
+    jobs: BTreeMap<JobId, Record>,
     /// The agent holding the machine, its command, and the job holding it while
     /// that job runs.
-    holder: Option<(u64, String, Option<u64>)>,
+    holder: Option<(u64, String, Option<JobId>)>,
     /// The commands running as tool calls, keyed by slot and owned by the agent
     /// that started each: what [`Registry::kill_all`] and
     /// [`Registry::kill_owned`] reach beyond the job list. In slot order, one
@@ -578,7 +585,7 @@ struct Inner {
 }
 
 impl Registry {
-    pub fn new(clock: Arc<dyn Clock>, events: Arc<dyn Events>, ids: Arc<AtomicU64>) -> Arc<Self> {
+    pub fn new(clock: Arc<dyn Clock>, events: Arc<dyn Events>, ids: Ids) -> Arc<Self> {
         Arc::new(Self {
             clock,
             events,
@@ -611,7 +618,7 @@ impl Registry {
         Self::new(
             Arc::new(crate::clock::System),
             Arc::new(Silent),
-            Arc::new(AtomicU64::new(1)),
+            Ids::default(),
         )
     }
 
@@ -750,7 +757,7 @@ impl Registry {
     /// Who holds the machine, if anyone: the agent, its command, and the job
     /// holding it when the holder is a detached job rather than a live tool
     /// call.
-    pub fn held(&self) -> Option<(u64, String, Option<u64>)> {
+    pub fn held(&self) -> Option<(u64, String, Option<JobId>)> {
         let inner = self.inner();
         inner.holder.clone()
     }
@@ -765,7 +772,7 @@ impl Registry {
     /// the handle would leave the process group alive, unregistered and out of
     /// `kill_all`'s reach. The kill happens after the registry lock is dropped,
     /// never under it (see the module docs on lock order).
-    pub fn launch(self: &Arc<Self>, launch: Launch) -> Result<u64, Refused> {
+    pub fn launch(self: &Arc<Self>, launch: Launch) -> Result<JobId, Refused> {
         let Launch {
             owner,
             command,
@@ -799,7 +806,7 @@ impl Registry {
             match refusal {
                 Some(refusal) => Err(refusal),
                 None => {
-                    let id = self.ids.fetch_add(1, Ordering::SeqCst);
+                    let id = self.ids.next_job();
                     if exclusive {
                         inner.holder = Some((owner, command.clone(), Some(id)));
                     }
@@ -858,7 +865,7 @@ impl Registry {
 
     /// Ask one job to stop, and report the line its owner reads. A job that has
     /// already ended is not an error: it is an answer.
-    pub fn stop(&self, owner: u64, id: u64) -> Result<String, String> {
+    pub fn stop(&self, owner: u64, id: JobId) -> Result<String, String> {
         let record = self.jobs().into_iter().find(|record| record.id == id);
         match record {
             None => Err(format!("no such job {} — status lists yours", label(id))),
@@ -1004,7 +1011,7 @@ impl Registry {
     /// A job has ended: keep its line and its window, release the machine if it
     /// was the holder, and forget the oldest ended job if there are too many.
     /// Called from the job's own thread, which is also what tells the owner.
-    fn finish(&self, id: u64, outcome: &JobOutcome, tail: String) -> Option<String> {
+    fn finish(&self, id: JobId, outcome: &JobOutcome, tail: String) -> Option<String> {
         let mut inner = self.inner();
         let (started, command) = {
             let record = inner.jobs.get(&id)?;
@@ -1044,15 +1051,25 @@ impl Registry {
 }
 
 impl Drop for Registry {
-    /// The backstop: whatever path ends the tree, no process group it started
-    /// outlives it. `App` calls `kill_all` explicitly on the way out; this
-    /// catches the paths that do not (a panic inside an actor, a test).
+    /// The backstop for the paths that drop a tree with nothing running: no
+    /// process group this registry still reaches outlives it.
+    ///
+    /// The reach is narrower than "whatever path ends the tree", and the
+    /// difference is what made Ctrl-N leak: a *running* job's watch thread
+    /// holds its own `Arc<Registry>` ([`Registry::launch`]), so dropping the
+    /// tree's handle does not drop the registry — the walk below cannot run
+    /// until that job ends, and the job it would have killed is the one keeping
+    /// it alive. Every path that ends a tree while jobs may run therefore kills
+    /// explicitly: quitting (`App`'s `Drop`), Ctrl-N (`App::new_chat`), and a
+    /// cut-off owner whose actor is gone (`App::report_cut_off`). What is left
+    /// here is the path that forgets and has no job running — a panic inside an
+    /// actor, a test — where there is nothing left to kill.
     ///
     /// It kills through [`Registry::kill`], the same walk `Stop`, Ctrl-N and
     /// quitting take, so the backstop is the rule and not a second copy of it:
     /// walking the job list alone left the commands a tool call is holding —
     /// the ones finding S4 is about — outside a drop that is meant to be
-    /// everything.
+    /// everything it *can* reach.
     fn drop(&mut self) {
         self.kill(None);
     }
@@ -1071,7 +1088,7 @@ impl Events for Silent {
 /// has been running. No handle, no file read — a painter can ask for this.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct JobView {
-    pub id: u64,
+    pub id: JobId,
     pub command: String,
     pub exclusive: bool,
     pub age: Duration,
@@ -1083,7 +1100,7 @@ pub struct JobView {
 fn watch(
     registry: Arc<Registry>,
     live: Live,
-    id: u64,
+    id: JobId,
     owner: u64,
     command: String,
     started: Instant,
@@ -1200,7 +1217,7 @@ mod tests {
     fn registry() -> (Arc<Registry>, Arc<Recorder>, Arc<Advanceable>) {
         let clock = Arc::new(Advanceable::new());
         let events = Recorder::new();
-        let registry = Registry::new(clock.clone(), events.clone(), Arc::new(AtomicU64::new(1)));
+        let registry = Registry::new(clock.clone(), events.clone(), Ids::default());
         (registry, events, clock)
     }
 
@@ -1211,7 +1228,7 @@ mod tests {
         registry: &Arc<Registry>,
         machine: &Arc<ScriptedMachine>,
         owner: u64,
-    ) -> (u64, Receiver<AgentMsg>) {
+    ) -> (JobId, Receiver<AgentMsg>) {
         let job = machine
             .spawn(&ShellCommand {
                 command: "cargo build",
@@ -1264,23 +1281,25 @@ mod tests {
     #[test]
     fn a_completion_line_names_the_status_the_age_the_command_and_the_tail() {
         let tail = "running 12 tests\ntest result: ok. 12 passed";
-        let line = JobOutcome::Exited(0).line(2, "cargo test", Duration::from_secs(192), tail);
+        let line =
+            JobOutcome::Exited(0).line(JobId(2), "cargo test", Duration::from_secs(192), tail);
         assert_eq!(
             line,
             "#c2 done: exit 0 · 3m12s · cargo test — running 12 tests · test result: ok. 12 passed"
         );
         assert!(JobOutcome::Exited(0).is_news(), "a result nobody has read");
-        let stopped = JobOutcome::Stopped.line(2, "cargo test", Duration::from_secs(4), "");
+        let stopped = JobOutcome::Stopped.line(JobId(2), "cargo test", Duration::from_secs(4), "");
         assert_eq!(stopped, "#c2 stopped after 4s · cargo test");
         assert!(!JobOutcome::Stopped.is_news(), "a kill is not a result");
         assert!(JobOutcome::TooMuchOutput
-            .line(2, "yes", Duration::from_secs(1), "y")
+            .line(JobId(2), "yes", Duration::from_secs(1), "y")
             .contains("wrote past"));
 
         // The kept window is a tail, so a long one keeps its *end* and says
         // where it was cut off — the head is what a foreground result keeps.
         let long = format!("start{}{}", "x".repeat(4000), "the end that matters");
-        let line = JobOutcome::Exited(0).line(3, "cargo build", Duration::from_secs(1), &long);
+        let line =
+            JobOutcome::Exited(0).line(JobId(3), "cargo build", Duration::from_secs(1), &long);
         assert!(line.contains("the end that matters"), "{line}");
         assert!(!line.contains("startxxxx"), "the head was dropped: {line}");
     }
@@ -1294,7 +1313,11 @@ mod tests {
         );
         let (registry, events, _clock) = registry();
         let (id, mailbox) = launch(&registry, &machine, 7);
-        assert_eq!(id, 1, "jobs draw from the tree's one id counter");
+        assert_eq!(
+            id,
+            JobId(1),
+            "the first job draws from the job counter, at 1"
+        );
 
         let (reported, line, news) = match mailbox.recv_timeout(Duration::from_secs(5)) {
             Ok(AgentMsg::CommandDone { id, line, news }) => (id, line, news),
@@ -1327,6 +1350,29 @@ mod tests {
             .events_for(AgentId(7))
             .iter()
             .any(|event| matches!(event, AgentEvent::JobDone { .. })));
+    }
+
+    /// The two id spaces are separate: a launch draws from the *job* counter,
+    /// so a job never spends a child's number — and `#1` and `#c1` may name a
+    /// child and a job at the same time. One shared counter used to make the
+    /// first job take the first child's id.
+    #[test]
+    fn a_job_launch_leaves_the_agent_counter_untouched() {
+        let ids = Ids::default();
+        let clock = Arc::new(Advanceable::new());
+        let registry = Registry::new(clock, Recorder::new(), ids.clone());
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::exits(0)));
+
+        let (job, _mailbox) = launch(&registry, &machine, 7);
+
+        assert_eq!(job, JobId(1), "the first job is #c1");
+        assert_eq!(ids.agents_floor(), 1, "the agent counter did not move");
+        assert_eq!(
+            ids.next_agent(),
+            AgentId(1),
+            "and the first child is #1, not #2"
+        );
+        registry.kill_all();
     }
 
     /// A job that never ends is stopped by a `Stop` aimed at its owner, and by
@@ -1367,7 +1413,10 @@ mod tests {
             registry.stop(9, first).is_err(),
             "another agent's job is not"
         );
-        assert!(registry.stop(7, 99).is_err(), "and an id nobody ran is not");
+        assert!(
+            registry.stop(7, JobId(99)).is_err(),
+            "and an id nobody ran is not"
+        );
         registry.kill_all();
     }
 
@@ -1474,9 +1523,9 @@ mod tests {
         let status = registry.status_for(7).expect("the jobs are listed");
         for id in 1..=2 * MAX_JOBS as u64 {
             assert!(
-                status.contains(&label(id)),
+                status.contains(&label(JobId(id))),
                 "{} is missing from a {}-byte status",
-                label(id),
+                label(JobId(id)),
                 status.len()
             );
         }
@@ -1576,7 +1625,7 @@ mod tests {
         let registry = Registry::new(
             Arc::new(crate::clock::System),
             Recorder::new(),
-            Arc::new(AtomicU64::new(1)),
+            Ids::default(),
         );
         let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
         let held = registry.hold(
@@ -1620,7 +1669,7 @@ mod tests {
         let registry = Registry::new(
             Arc::new(crate::clock::System),
             Recorder::new(),
-            Arc::new(AtomicU64::new(1)),
+            Ids::default(),
         );
         for _ in 0..MAX_JOBS {
             launch(&registry, &machine, 7);

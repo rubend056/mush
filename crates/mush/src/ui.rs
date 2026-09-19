@@ -137,7 +137,7 @@ pub(crate) fn agent_line(row: &AgentRow, width: usize) -> String {
     let indent = "  ".repeat(row.depth);
     let marker = if row.focused { "▶" } else { " " };
     let mut head = format!(
-        "{indent}{marker}{glyph} #{id}",
+        "{indent}{marker}{glyph} {id}",
         id = row.id,
         glyph = row.glyph
     );
