@@ -541,6 +541,12 @@ pub enum AgentEvent {
         brief: String,
         depth: usize,
         branch: Option<String>,
+        /// The revision the new worktree was created at, read back from the
+        /// fresh checkout; `None` for a shared child. The UI keeps it on the
+        /// node, because a sweep that cannot tell a branch with no commit of
+        /// its own from a merged one paints "merged" over an ordinary
+        /// read-only child.
+        fork: Option<String>,
         /// The three-word name the caller chose, if it did; the row falls back
         /// to a handle derived from the brief.
         title: Option<String>,
@@ -563,9 +569,11 @@ pub enum AgentEvent {
     /// The run was stopped by a request (a Stop, Ctrl-C, Ctrl-N). The actor is
     /// still alive, so the row goes quiet instead of claiming a failure.
     Stopped,
-    /// Mush's own sweep took this agent's worktree: its branch is in the base
-    /// the run was forked from (or the run never committed anything), so the
-    /// checkout and the branch are gone.
+    /// Mush's own sweep took this agent's worktree: its branch adds nothing to
+    /// the base the run was forked from — its work was merged, or the run never
+    /// committed anything — so the checkout and the branch are gone. `landing`
+    /// says which of the two it was, so the row can say it too instead of
+    /// painting "merged" over both.
     ///
     /// The row has to hear it — `git::reclaim` is the only thing in production
     /// that removes a worktree, and a row still naming `.mush/wt/<id>` and
@@ -573,7 +581,9 @@ pub enum AgentEvent {
     /// that cannot run (finding U13, H10). Emitted by the actor whose run ended,
     /// because that actor is the only one that knows *when* the worktree became
     /// free.
-    Reclaimed,
+    Reclaimed {
+        landing: git::Landing,
+    },
     /// The parent has read a child's result: the line is in its transcript now,
     /// wherever it came from — the fold at a message boundary, the wake-up a
     /// napping parent got, or a `wait` that asked for it.
@@ -875,15 +885,30 @@ struct Actor {
     /// The isolated worktree branch this agent works on, if any; children
     /// branch from it so nested work is not lost.
     branch: Option<String>,
-    /// The commit id this agent's worktree was forked from: `spawn_tool`
-    /// resolves the caller's `base` to a revision before `worktree_add` sees it,
-    /// and stores that revision here. It is what the run-end sweep measures the
-    /// branch against — "nothing was committed by this run" is exactly "the
-    /// branch adds no commit of its own to this base" (finding H10). `None` for
-    /// an agent with no worktree, and for one revived from a stored session — a
-    /// base is not in the file, and the sweep then reads the root's `HEAD`,
-    /// which keeps more than it should rather than less.
+    /// The *name* of the ref this agent's worktree was forked from: the
+    /// caller's `base` argument, or `HEAD` when it gave none. It is kept as a
+    /// name because the run-end sweep asks its first question about the base
+    /// *now* — a hand merge that happened while the run was going moves the
+    /// base's tip onto the branch's work, and re-resolving the name is the
+    /// only way to see it (the revision `worktree_add` was handed at the spawn
+    /// would look like a branch ahead of its base, and mush would stop
+    /// reclaiming merged work).
+    ///
+    /// `None` for an agent with no worktree, and for one revived from a stored
+    /// session — a base is not in the file, and the sweep then reads the root's
+    /// `HEAD`, which keeps more than it should rather than less.
     base: Option<String>,
+    /// The revision this agent's worktree was created at, resolved once from
+    /// the fresh checkout (`spawn_tool` reuses it for the spawn reply's
+    /// `at <sha>`). It is the sweep's second question — "did the run commit
+    /// anything of its own?" — and without it a branch whose base moved on
+    /// since the spawn is indistinguishable from a merged one, which is the
+    /// row that told a read-only child its work had been merged.
+    ///
+    /// `None` for an agent with no worktree, and for a revived agent: the fork
+    /// revision is not in the stored session either, and the sweep keeps the
+    /// answer it has always given there rather than guessing.
+    fork: Option<String>,
     /// The task this agent was given (empty for the root). Used as the commit
     /// subject when an isolated agent's run ends.
     brief: String,
@@ -1001,6 +1026,7 @@ fn root_actor(
         ws,
         branch: None,
         base: None,
+        fork: None,
         brief: String::new(),
         my_tx: cmd_tx.clone(),
         parent_tx: dead_tx,
@@ -1115,7 +1141,11 @@ pub fn revive(
         // A revived agent's base is not in the stored session, and the sweep
         // then measures against the root's `HEAD`: that keeps more than it
         // should rather than less, which is the only way this patch may err.
+        // Neither is its fork revision, so the sweep keeps the single answer it
+        // has always given there — called `merged` — rather than turning an
+        // unknowable into a guess about a run nobody watched.
         base: None,
+        fork: None,
         brief: brief.clone(),
         my_tx: cmd_tx.clone(),
         // Its completions go where the caller said they belong: to the dead
@@ -1236,9 +1266,10 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         // H10's residue is never made because of this line: without it, every
         // isolated run that changed nothing leaves a worktree behind for good.
         // Anything unmerged or dirty is left alone, and the sweep says so
-        // instead of doing it.
-        if reclaim_own_worktree(&actor, &state) {
-            actor.ctx.emit(actor.id, AgentEvent::Reclaimed);
+        // instead of doing it. The landing travels with the event, so the UI
+        // can mark the row with what really happened to the branch.
+        if let Some(landing) = reclaim_own_worktree(&actor, &state) {
+            actor.ctx.emit(actor.id, AgentEvent::Reclaimed { landing });
         }
         // This run is over, and this is its number: a parent that hears the
         // same run again has heard this report twice, while a run after it is
@@ -1596,32 +1627,32 @@ fn absorb(
     }
 }
 
-/// Sweep the worktree an isolated run has just finished in, and answer whether
-/// mush took it — which is the fact the UI needs to mark the row landed, so the
-/// row stops offering a `git diff` against a directory that is gone and a branch
+/// Sweep the worktree an isolated run has just finished in, and answer which
+/// landing took it — the fact the UI needs to mark the row landed, so the row
+/// stops offering a `git diff` against a directory that is gone and a branch
 /// that is gone with it (finding U13, H10).
 ///
-/// The run's own end is the one place the base is known *exactly*: it is the
-/// revision `worktree_add` was handed at the spawn, so "this run committed
-/// nothing" is the same git fact as "the branch adds no commit to its base" and
-/// not a memory of what the commit step thought. A revived agent has no base in
-/// its stored session, and the root's `HEAD` is the conservative answer there:
-/// it keeps a worktree more often than it takes one, which is the only way this
-/// may err.
+/// The run's own end knows both questions' inputs exactly: the base's *name*
+/// (asked now, so a merge that happened while the run was going is seen) and the
+/// fork revision `worktree_add` created the branch at (so "this run committed
+/// nothing" is the git shape of the branch, not a memory of what the commit
+/// step thought). A revived agent has neither in its stored session, and the
+/// sweep then reads the root's `HEAD` with no fork: it keeps more than it should
+/// rather than less, and the one landing it can name is `Merged`.
 ///
 /// An actor that still has work of its own out — a child that will wake it, or a
 /// job whose report does — keeps its worktree: that wake starts a run *in this
 /// directory*, and a run in a directory that is gone recreates it as a plain
 /// path no surface can see (finding S1). The next run's end sweeps it instead.
-fn reclaim_own_worktree(actor: &Actor, state: &ActorState) -> bool {
+fn reclaim_own_worktree(actor: &Actor, state: &ActorState) -> Option<git::Landing> {
     if actor.branch.is_none() || !state.running.is_empty() || !state.running_jobs.is_empty() {
-        return false;
+        return None;
     }
     let base = actor.base.clone().unwrap_or_else(|| "HEAD".to_string());
-    matches!(
-        git::reclaim(&actor.ctx.root, actor.id, &base),
-        git::Reclaimed::Removed { .. }
-    )
+    match git::reclaim(&actor.ctx.root, actor.id, &base, actor.fork.as_deref()) {
+        git::Reclaimed::Removed { landing, .. } => Some(landing),
+        _ => None,
+    }
 }
 
 /// Whether this actor is an isolated agent whose worktree has been reclaimed
@@ -1639,10 +1670,13 @@ fn worktree_gone(actor: &Actor) -> bool {
 }
 
 /// What such an actor reports when work arrives anyway: nothing ran, and where
-/// to work instead.
+/// to work instead. All three ways mush settles a worktree are named — a run
+/// that committed nothing lands the same way a merge or a discard does —
+/// because this line cannot see which one took *this* worktree, and claiming
+/// "merged" about a run that never committed is the lie the row stopped telling.
 fn worktree_gone_line(id: u64) -> String {
     format!(
-        "agent #{id}'s worktree is gone (it was merged or discarded) — \
+        "agent #{id}'s worktree is gone (it was merged, discarded or never committed) — \
          work in the root or spawn a fresh agent; this message did not run"
     )
 }
@@ -2882,7 +2916,11 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // A base is the isolation switch: with one, the child gets its own worktree
     // and branch forked from that ref; without one it shares this workspace.
     // A base is a promise about history, so it is resolved before anything is
-    // created and never silently dropped (finding H7).
+    // created and never silently dropped (finding H7). The resolved id is what
+    // `worktree_add` gets; the *name* is what the actor keeps, because the
+    // run-end sweep asks whether the base contains the branch's work — and a
+    // merge that happened while the run was going moved the base's tip, which
+    // only re-resolving the name can see.
     let named = args.get("base").and_then(Value::as_str);
     let base: Option<String> = match named {
         Some(name) => Some(git::resolve(&ctx.root, name).ok_or_else(|| {
@@ -2890,6 +2928,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         })?),
         None => None,
     };
+    let base_name = named.map(str::to_string);
     let isolated = base.is_some();
     // The name the caller chose for the row, trimmed; blank means none, and the
     // row falls back to its handle from the brief.
@@ -2977,10 +3016,16 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         .as_deref()
         .map(|branch| format!(" on {branch}"))
         .unwrap_or_default();
-    let at = branch
+    // The one resolve of the new checkout's `HEAD`, reused for the reply's
+    // `at <sha>` and kept as the actor's fork revision: a run that commits
+    // nothing leaves the branch standing exactly here, and this is the only
+    // thing that can tell such a branch from one whose work was merged.
+    let fork = branch
         .as_ref()
-        .and_then(|_| git::resolve(&git::worktree_path(&ctx.root, id.0), "HEAD"))
-        .map(|sha| format!(" at {}", short_revision(&sha)))
+        .and_then(|_| git::resolve(&git::worktree_path(&ctx.root, id.0), "HEAD"));
+    let at = fork
+        .as_deref()
+        .map(|sha| format!(" at {}", short_revision(sha)))
         .unwrap_or_default();
     // A child with no base runs in this workspace: it is one of the children
     // the one-shared-child rule is about.
@@ -2997,6 +3042,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
             brief: brief.clone(),
             depth: depth + 1,
             branch: branch.clone(),
+            fork: fork.clone(),
             title,
             cmd: cmd_tx.clone(),
         },
@@ -3024,10 +3070,11 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         depth: depth + 1,
         ws: child_ws,
         branch,
-        // The base this worktree was forked from, as `worktree_add` got it: the
-        // run's own end measures the branch against this, so "this run committed
-        // nothing" is a git fact and not a memory (finding H10).
-        base: base.clone(),
+        // The base's name, for question 1 at the run's end; the fork revision
+        // below is question 2 there. Neither is a memory of what the commit
+        // step thought: both are git facts (finding H10).
+        base: base_name.clone(),
+        fork: fork.clone(),
         brief: brief.clone(),
         my_tx: cmd_tx.clone(),
         parent_tx: actor.my_tx.clone(),
@@ -6170,6 +6217,7 @@ mod tests {
             depth: 0,
             ws: Workspace::new(&root).unwrap(),
             branch: None,
+            fork: None,
             base: None,
             brief: String::new(),
             my_tx: my_tx.clone(),
@@ -9209,11 +9257,15 @@ mod tests {
             "and the branch with it: the name is free for the next child"
         );
         assert!(
-            events
-                .events()
-                .iter()
-                .any(|(id, event)| id.0 == 1 && matches!(event, AgentEvent::Reclaimed)),
-            "the row is told, or it keeps offering two commands that cannot run"
+            events.events().iter().any(|(id, event)| id.0 == 1
+                && matches!(
+                    event,
+                    AgentEvent::Reclaimed {
+                        landing: git::Landing::NothingCommitted
+                    }
+                )),
+            "the row is told what really happened — the branch never gained a commit \
+             of its own — or `merged` is painted over a run only ever made of reads"
         );
         // Nothing was written anywhere: the root's own checkout is untouched.
         assert_eq!(
@@ -9290,7 +9342,7 @@ mod tests {
             !events
                 .events()
                 .iter()
-                .any(|(_, event)| matches!(event, AgentEvent::Reclaimed)),
+                .any(|(_, event)| matches!(event, AgentEvent::Reclaimed { .. })),
             "nothing was reclaimed, so nothing says it was"
         );
         let _ = fs::remove_dir_all(&root);

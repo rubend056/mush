@@ -609,6 +609,7 @@ impl App {
             }
             let landed = agent.landed.map(|landed| match landed {
                 session::StoredLanded::Merged => Landed::Merged,
+                session::StoredLanded::NothingCommitted => Landed::NothingCommitted,
                 session::StoredLanded::Discarded => Landed::Discarded,
             });
             // One decision, two readers: a stored branch whose worktree is gone
@@ -655,6 +656,10 @@ impl App {
                 title: agent.title,
                 phase,
                 branch,
+                // A stored session has no fork revision: nothing wrote one to
+                // the file, so the sweep keeps the answer it has always given
+                // for this node rather than guessing (see `git::reclaimable`).
+                fork: None,
                 summary,
                 leftover: agent.leftover,
                 landed,
@@ -698,14 +703,17 @@ impl App {
         let root = self.ws.root().to_path_buf();
         // Resolved here: the tree is UI state, and the worker must not touch it.
         // A nested agent forked from its parent's branch, so that is what its
-        // work is measured against; a top-level one forked from HEAD.
+        // work is measured against; a top-level one forked from HEAD. The node's
+        // fork revision goes with them, so the worker can tell a branch that
+        // never committed from one whose work was merged (see
+        // `git::reclaimable`); a node without one gets the conservative answer.
         //
         // The same walk yields the worktrees a sweep may take, and it takes only
         // the ones *at rest*: a worktree whose agent is running — or whose job is
         // — is being used right now, whatever git says about its branch, and the
         // read must not even propose it (finding H10).
         let mut branches: Vec<(AgentId, String, String)> = Vec::new();
-        let mut sweep: Vec<(AgentId, String)> = Vec::new();
+        let mut sweep: Vec<(AgentId, String, Option<String>)> = Vec::new();
         // A worktree may only be swept while nothing of its agent's own is out: a
         // child that is still working, or a result the agent has not read yet,
         // wakes its actor into a fresh run *in that directory* — and a run in a
@@ -731,7 +739,7 @@ impl App {
                 .and_then(|parent| parent.branch.clone())
                 .unwrap_or_else(|| "HEAD".to_string());
             if !self.in_flight(node) && !waking.contains(&node.id) {
-                sweep.push((node.id, base.clone()));
+                sweep.push((node.id, base.clone(), node.fork.clone()));
             }
             branches.push((node.id, base, branch));
         }
@@ -747,8 +755,8 @@ impl App {
             // this thread never removes anything.
             let sweep = sweep
                 .into_iter()
-                .map(|(id, base)| {
-                    let found = git::reclaimable(&root, id.0, &base);
+                .map(|(id, base, fork)| {
+                    let found = git::reclaimable(&root, id.0, &base, fork.as_deref());
                     (id, found)
                 })
                 .collect();
@@ -790,7 +798,8 @@ impl App {
     ///
     /// This is where a hand merge becomes visible without a restart: the sweep
     /// runs on every git read, the read runs every couple of seconds while
-    /// anything is working, and the row is marked `merged` (finding H10).
+    /// anything is working, and the row is marked `merged` or `nothing
+    /// committed`, whichever git told (finding H10).
     ///
     /// The removal happens *here*, on the thread that owns the tree, and only
     /// after asking the tree again: the read above is a snapshot, and a node that
@@ -810,15 +819,19 @@ impl App {
             match found {
                 git::Reclaimable::Nothing => self.tree.mark_kept(id, None),
                 git::Reclaimable::Kept(why) => self.tree.mark_kept(id, Some(why)),
-                git::Reclaimable::Landable => {
+                git::Reclaimable::Landable(_) => {
                     if self.in_flight_id(id) {
                         continue;
                     }
                     let base = self.fork_base(id);
+                    // The node's fork revision, asked again for the same reason
+                    // the base is: the decision above is a snapshot, and this is
+                    // the moment the removal happens.
+                    let fork = self.tree.node(id).and_then(|node| node.fork.clone());
                     let root = self.ws.root().to_path_buf();
-                    match git::reclaim(&root, id.0, &base) {
-                        git::Reclaimed::Removed { .. } => {
-                            self.tree.mark_reclaimed(id);
+                    match git::reclaim(&root, id.0, &base, fork.as_deref()) {
+                        git::Reclaimed::Removed { landing, .. } => {
+                            self.tree.mark_reclaimed(id, landing.into());
                             // `landed` is what a restart shows, so it goes in the
                             // same file the tree does.
                             self.mark_session_dirty();
@@ -894,9 +907,16 @@ impl App {
         // branch the sweep will not take is left exactly where it was and says
         // why, and its number stays spent below.
         for id in git::isolated_ids(&root).unwrap_or_default() {
-            match git::reclaim(&root, id, "HEAD") {
-                git::Reclaimed::Removed { branch_kept } => {
-                    self.tree.mark_reclaimed(AgentId(id));
+            match git::reclaim(&root, id, "HEAD", None) {
+                git::Reclaimed::Removed {
+                    branch_kept,
+                    landing,
+                } => {
+                    // No node is registered yet for a leftover that lands here,
+                    // so this marks only a restored agent that already has a
+                    // row; `landing` is `Merged` on this path, the answer a
+                    // run with no stored fork revision gets.
+                    self.tree.mark_reclaimed(AgentId(id), landing.into());
                     // A ref git would not delete still holds the name — `-d` is
                     // the only deletion mush runs, and it deletes what it can
                     // certify — so the number is spent anyway, exactly as the
@@ -991,6 +1011,10 @@ impl App {
                 title: None,
                 phase,
                 branch: Some(full),
+                // A leftover found on disk has no fork revision to read: git
+                // never wrote one down, and the branch it would identify is
+                // exactly the thing under question.
+                fork: None,
                 summary: Some(summary.to_string()),
                 leftover: true,
                 landed: None,
@@ -1129,6 +1153,7 @@ impl App {
                 brief,
                 depth,
                 branch,
+                fork,
                 title,
                 cmd,
             } => {
@@ -1138,6 +1163,7 @@ impl App {
                     brief,
                     depth,
                     branch,
+                    fork,
                     cmd,
                 });
                 // The caller's name for this child, when it chose one: the row
@@ -1217,14 +1243,15 @@ impl App {
                 // `ChildRunning` and `ChildDone` (finding H18).
                 let _ = self.deliver_to_actor(AgentId(child), command);
             }
-            AgentEvent::Reclaimed => {
+            AgentEvent::Reclaimed { landing } => {
                 // The actor's own run end swept its worktree: the checkout and
                 // the branch are gone, so the row stops offering a `git diff`
                 // against either and says where the work is instead — the base
                 // the run was forked from (finding U13, H10). A row still
                 // offering `.mush/wt/<id>` after this would be offering a path
-                // nothing can run in.
-                self.tree.mark_reclaimed(id);
+                // nothing can run in. `landing` is git's answer about the branch
+                // (merged, or never committed), in the tree's own vocabulary.
+                self.tree.mark_reclaimed(id, landing.into());
                 // `landed` is what a restart shows, so it is stored.
                 self.mark_session_dirty();
             }
@@ -1672,11 +1699,21 @@ impl App {
     fn worktree_gone(&self, id: AgentId) -> Option<String> {
         let node = self.tree.node(id)?;
         if let Some(landed) = node.landed {
-            return Some(format!(
-                "agent {id} was {} — its worktree is gone; \
-                 spawn a fresh agent or work in the root",
-                landed.past()
-            ));
+            // "was nothing committed" is not a sentence, so the third landing's
+            // refusal says the fact the way a human does. It is still the
+            // landing's own story — no merge is claimed anywhere — and the row
+            // spells it with `Landed::past` just as before (refactor R12).
+            return Some(match landed {
+                Landed::NothingCommitted => format!(
+                    "agent {id} committed nothing — its worktree is gone; \
+                     spawn a fresh agent or work in the root"
+                ),
+                landed => format!(
+                    "agent {id} was {} — its worktree is gone; \
+                     spawn a fresh agent or work in the root",
+                    landed.past()
+                ),
+            });
         }
         if node.branch.is_some() && !git::worktree_path(self.ws.root(), id.0).exists() {
             return Some(format!(
@@ -2704,6 +2741,7 @@ impl App {
                 },
                 landed: node.landed.map(|landed| match landed {
                     Landed::Merged => session::StoredLanded::Merged,
+                    Landed::NothingCommitted => session::StoredLanded::NothingCommitted,
                     Landed::Discarded => session::StoredLanded::Discarded,
                 }),
                 leftover: node.leftover,
@@ -3391,6 +3429,7 @@ mod tests {
             brief: format!("task {id}"),
             depth: 1,
             branch: None,
+            fork: None,
             cmd: tx,
         });
         app.tree.finish(AgentId(id), Some(format!("did {id}")));
@@ -3523,6 +3562,7 @@ mod tests {
             brief: "port the parser".to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd: tx,
         });
         app.chat.push_message(opened.id, opened.opening);
@@ -3570,6 +3610,7 @@ mod tests {
             brief: "port the parser".to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd: tx,
         });
         app.chat.push_message(opened.id, opened.opening);
@@ -3619,6 +3660,7 @@ mod tests {
             brief: "port the parser".to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd: tx,
         });
         app.tree.finish(AgentId(2), Some("did it".to_string()));
@@ -3798,6 +3840,7 @@ mod tests {
                     brief: format!("task {id}"),
                     depth: 1,
                     branch: Some(format!("mush/{id}")),
+                    fork: None,
                     title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
@@ -4397,29 +4440,55 @@ mod tests {
 
     /// A landed agent's nudge is refused in the landing's own word: the past
     /// tense is [`Landed::past`]'s, so the refusal and the row cannot tell the
-    /// same story two ways (refactor R12).
+    /// same story two ways (refactor R12). The third landing is the case a past
+    /// tense cannot carry — "was nothing committed" is not a sentence — so its
+    /// refusal is worded around the same fact, and still claims no merge.
     #[test]
     fn a_nudge_to_a_landed_agent_names_how_it_landed() {
-        let root = dir("landed-refusal");
-        let mut stored = stored_with_agent(
-            session::StoredStatus::Done,
-            vec![Message::user("port the parser")],
-        );
-        stored.agents[0].landed = Some(session::StoredLanded::Merged);
-        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
-
-        assert_eq!(
-            app.worktree_gone(AgentId(2)).as_deref(),
-            Some(
+        for (landed, want) in [
+            (
+                session::StoredLanded::Merged,
                 format!(
                     "agent #2 was {} — its worktree is gone; \
                      spawn a fresh agent or work in the root",
                     Landed::Merged.past()
-                )
-                .as_str()
-            )
-        );
-        let _ = std::fs::remove_dir_all(&root);
+                ),
+            ),
+            (
+                session::StoredLanded::Discarded,
+                format!(
+                    "agent #2 was {} — its worktree is gone; \
+                     spawn a fresh agent or work in the root",
+                    Landed::Discarded.past()
+                ),
+            ),
+            (
+                session::StoredLanded::NothingCommitted,
+                "agent #2 committed nothing — its worktree is gone; \
+                 spawn a fresh agent or work in the root"
+                    .to_string(),
+            ),
+        ] {
+            let root = dir("landed-refusal");
+            let mut stored = stored_with_agent(
+                session::StoredStatus::Done,
+                vec![Message::user("port the parser")],
+            );
+            stored.agents[0].landed = Some(landed);
+            let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+            assert_eq!(
+                app.worktree_gone(AgentId(2)).as_deref(),
+                Some(want.as_str())
+            );
+            if matches!(landed, session::StoredLanded::NothingCommitted) {
+                assert!(
+                    !want.contains("merged"),
+                    "a run that never committed must not claim a merge: {want}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&root);
+        }
     }
 
     /// One decision at restore: a stored branch whose worktree is gone is not
@@ -4902,6 +4971,7 @@ mod tests {
             brief: "lexer".to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd: child_tx,
         });
         app.tree.focus(AgentId(1));
@@ -5173,6 +5243,7 @@ mod tests {
                 brief: format!("child {id}"),
                 depth: 1,
                 branch: None,
+                fork: None,
                 cmd,
             });
         }
@@ -5215,6 +5286,7 @@ mod tests {
             brief: "lexer".to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd,
         });
         app.chat.insert("do the thing");
@@ -5917,6 +5989,7 @@ mod tests {
                     brief: format!("task {id}"),
                     depth: 1,
                     branch: None,
+                    fork: None,
                     title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
@@ -5978,6 +6051,7 @@ mod tests {
                     depth: 1,
                     brief: format!("create a file called {path} containing exactly: work"),
                     branch: None,
+                    fork: None,
                     title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
@@ -6010,6 +6084,7 @@ mod tests {
                     depth: 1,
                     brief: "create a file called deep.txt containing exactly: work".to_string(),
                     branch: None,
+                    fork: None,
                     title: title.map(str::to_string),
                     cmd: crossbeam_channel::unbounded().0,
                 },
@@ -7010,6 +7085,7 @@ mod tests {
             brief: "lexer".to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd: crossbeam_channel::unbounded().0,
         });
         app.tree
@@ -7041,6 +7117,7 @@ mod tests {
             brief: "lexer".to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd: child_tx,
         });
         let (parent_tx, parent_rx) = crossbeam_channel::unbounded::<AgentMsg>();
@@ -7072,6 +7149,7 @@ mod tests {
             brief: "lexer".to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd,
         });
         app.tree.insert(Spawn {
@@ -7080,6 +7158,7 @@ mod tests {
             brief: "parser".to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd: crossbeam_channel::unbounded().0,
         });
         app.tree.cursor_top();
@@ -7123,6 +7202,7 @@ mod tests {
             brief: "lexer".to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd,
         });
         app.tree.begin(AgentId(1), None);
@@ -7150,6 +7230,7 @@ mod tests {
             brief: "lexer".to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd: crossbeam_channel::unbounded().0,
         });
         let (mailbox, asked) = crossbeam_channel::unbounded::<AgentMsg>();
@@ -7184,6 +7265,7 @@ mod tests {
             brief: "lexer".to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd: crossbeam_channel::unbounded().0,
         });
         app.tree
@@ -7273,6 +7355,7 @@ mod tests {
             brief: brief.to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd: crossbeam_channel::unbounded().0,
         });
         app.tree.move_cursor(1);
@@ -7534,6 +7617,7 @@ mod tests {
                 brief: format!("child {id}"),
                 depth,
                 branch: None,
+                fork: None,
                 cmd,
             });
         }
@@ -7678,6 +7762,7 @@ mod tests {
                 brief: format!("child {id}"),
                 depth: 1,
                 branch: None,
+                fork: None,
                 cmd,
             });
         }
@@ -7815,6 +7900,7 @@ mod tests {
                 brief: "sneaky".to_string(),
                 depth: 1,
                 branch: None,
+                fork: None,
                 title: None,
                 cmd: child_tx,
             },
@@ -7972,6 +8058,7 @@ mod tests {
                     brief: format!("child {id}"),
                     depth,
                     branch: None,
+                    fork: None,
                     title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
@@ -8085,6 +8172,7 @@ mod tests {
                     brief: format!("agent {id}"),
                     depth,
                     branch: None,
+                    fork: None,
                     title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
@@ -8160,6 +8248,7 @@ mod tests {
                 brief: "lexer".to_string(),
                 depth: 1,
                 branch: None,
+                fork: None,
                 title: None,
                 cmd: crossbeam_channel::unbounded().0,
             },
@@ -8205,6 +8294,7 @@ mod tests {
                     brief: format!("child {id}"),
                     depth: 1,
                     branch: None,
+                    fork: None,
                     title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
@@ -8252,6 +8342,7 @@ mod tests {
                 brief: "lexer".to_string(),
                 depth: 1,
                 branch: None,
+                fork: None,
                 title: None,
                 cmd: crossbeam_channel::unbounded().0,
             },
@@ -8486,6 +8577,7 @@ mod tests {
                 depth,
                 brief: brief.to_string(),
                 branch: branch.map(str::to_string),
+                fork: None,
                 title: None,
                 cmd: crossbeam_channel::unbounded().0,
             },
@@ -9605,6 +9697,7 @@ mod tests {
                     brief: "a task".to_string(),
                     depth,
                     branch: None,
+                    fork: None,
                     title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
@@ -9737,6 +9830,7 @@ mod tests {
                     brief: format!("task {child}"),
                     depth,
                     branch: None,
+                    fork: None,
                     title: None,
                     cmd,
                 },
@@ -9843,6 +9937,7 @@ mod tests {
                     brief: format!("task {child}"),
                     depth,
                     branch: None,
+                    fork: None,
                     title: None,
                     cmd: crossbeam_channel::unbounded().0,
                 },
@@ -9937,6 +10032,7 @@ mod tests {
                 brief: "count the lexer tokens".to_string(),
                 depth: 1,
                 branch: None,
+                fork: None,
                 title: None,
                 cmd: crossbeam_channel::unbounded().0,
             },
@@ -10182,6 +10278,9 @@ mod tests {
         let root = repo("reclaim-refresh");
         let (mut app, rx) = app_and_rx(root.clone());
         wait_git(&mut app, &rx);
+        // The revision the worktree below is forked at, read the way the spawn
+        // path reads it: the reply's `at <sha>` and the sweep's question 2.
+        let fork = git_of(&root, &["rev-parse", "HEAD"]).expect("HEAD");
         // An isolated child of the root, at rest: its worktree exists, its work
         // is on a branch nobody has merged.
         let conversation = app.tree.conversation();
@@ -10194,6 +10293,7 @@ mod tests {
                 brief: "build the thing".to_string(),
                 depth: 1,
                 branch: Some("mush/1".to_string()),
+                fork: Some(fork),
                 title: None,
                 cmd: crossbeam_channel::unbounded().0,
             },
@@ -10261,6 +10361,193 @@ mod tests {
         // with is gone, and a run there would recreate it as a plain directory
         // no surface can see (finding S1).
         assert!(app.worktree_gone(AgentId(1)).is_some());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The UI's sweep is the second removal path, and it must reach the same
+    /// answer the actor's run end does: a child whose run committed nothing,
+    /// with the base moved on since its spawn, is "nothing committed" — never
+    /// "merged", which is the lie the row told about an ordinary read-only
+    /// child (the defect this patch is).
+    #[test]
+    fn a_child_that_committed_nothing_is_swept_as_nothing_committed() {
+        use std::fs;
+
+        let root = repo("reclaim-nothing-committed");
+        let (mut app, rx) = app_and_rx(root.clone());
+        wait_git(&mut app, &rx);
+        let fork = git_of(&root, &["rev-parse", "HEAD"]).expect("HEAD");
+        let conversation = app.tree.conversation();
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Spawned {
+                child: 1,
+                parent: 0,
+                brief: "look at the repository".to_string(),
+                depth: 1,
+                branch: Some("mush/1".to_string()),
+                fork: Some(fork.clone()),
+                title: None,
+                cmd: crossbeam_channel::unbounded().0,
+            },
+        });
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId(1),
+            event: AgentEvent::Done,
+        });
+        wait_git(&mut app, &rx);
+        // The run's worktree, standing on its fork revision and nothing else:
+        // the state every read-only child leaves.
+        git(
+            &root,
+            &["worktree", "add", "-q", "-b", "mush/1", ".mush/wt/1"],
+        );
+        assert_eq!(
+            git_of(&root, &["rev-parse", "refs/heads/mush/1"]).unwrap(),
+            fork,
+            "the branch really is its fork revision"
+        );
+        // The base moves on the way HEAD does under a session, so the branch is
+        // an ancestor of it without anybody merging anything — the shape that
+        // used to read "merged into HEAD".
+        fs::write(root.join("human.txt"), "the human's own work\n").unwrap();
+        git(&root, &["add", "-A"]);
+        git(&root, &["commit", "-qm", "the human's own work"]);
+
+        app.refresh_git();
+        wait_git(&mut app, &rx);
+
+        let child = app.tree.node(AgentId(1)).expect("the child is in the tree");
+        assert_eq!(
+            child.landed,
+            Some(Landed::NothingCommitted),
+            "the row says what happened: the run never committed"
+        );
+        assert_eq!(child.branch, None, "and the branch it named is gone");
+        assert!(
+            !root.join(".mush/wt/1").exists(),
+            "the checkout is reclaimed, even though the base moved on"
+        );
+        assert!(
+            git_of(&root, &["rev-parse", "--verify", "refs/heads/mush/1"]).is_err(),
+            "and `branch -d` deletes it: it is an ancestor of the new HEAD"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A nested child's merge lands in its *parent's* branch, and the row says
+    /// "merged" — never "into HEAD", which is a ref the work was never in. The
+    /// two nodes are real: a real worktree on `mush/1`, a real child on `mush/2`
+    /// forked from it, and a real merge back into it.
+    #[test]
+    fn a_nested_merge_reads_merged_and_never_claims_head() {
+        use std::fs;
+
+        let root = repo("reclaim-nested-landing");
+        let (mut app, rx) = app_and_rx(root.clone());
+        wait_git(&mut app, &rx);
+        // The parent's worktree, forked from HEAD, with a commit of its own —
+        // the base a nested child forks from.
+        let parent_fork = git_of(&root, &["rev-parse", "HEAD"]).expect("HEAD");
+        git(
+            &root,
+            &["worktree", "add", "-q", "-b", "mush/1", ".mush/wt/1"],
+        );
+        let parent = root.join(".mush/wt/1");
+        fs::write(parent.join("parent.txt"), "parent\n").unwrap();
+        git(&parent, &["add", "-A"]);
+        git(&parent, &["commit", "-qm", "mush #1: parent work"]);
+        // The child, forked from the parent's branch...
+        let child_fork = git_of(&root, &["rev-parse", "refs/heads/mush/1"]).expect("mush/1");
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "mush/2",
+                ".mush/wt/2",
+                "mush/1",
+            ],
+        );
+        let child = root.join(".mush/wt/2");
+        fs::write(child.join("child.txt"), "child\n").unwrap();
+        git(&child, &["add", "-A"]);
+        git(&child, &["commit", "-qm", "mush #2: child work"]);
+        // ...merged back into it, which is where a nested landing happens.
+        git(&parent, &["merge", "--no-edit", "mush/2"]);
+
+        let conversation = app.tree.conversation();
+        for (child, parent, brief, branch, fork) in [
+            (
+                1u64,
+                0u64,
+                "parent work".to_string(),
+                "mush/1".to_string(),
+                parent_fork,
+            ),
+            (
+                2,
+                1,
+                "child work".to_string(),
+                "mush/2".to_string(),
+                child_fork,
+            ),
+        ] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId(parent),
+                event: AgentEvent::Spawned {
+                    child,
+                    parent,
+                    brief,
+                    depth: 1,
+                    branch: Some(branch),
+                    fork: Some(fork),
+                    title: (child == 2).then(|| "kid".to_string()),
+                    cmd: crossbeam_channel::unbounded().0,
+                },
+            });
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId(child),
+                event: AgentEvent::Done,
+            });
+        }
+        wait_git(&mut app, &rx);
+
+        app.refresh_git();
+        wait_git(&mut app, &rx);
+
+        let child = app.tree.node(AgentId(2)).expect("the child is in the tree");
+        assert_eq!(
+            child.landed,
+            Some(Landed::Merged),
+            "the child's work is in the base it was forked from"
+        );
+        assert_eq!(child.branch, None, "so its branch is dropped with it");
+        assert!(
+            !root.join(".mush/wt/2").exists(),
+            "and the checkout is reclaimed"
+        );
+        // The row's detail is read in the footer under the list, for the row
+        // the cursor is on: point it at the child before the frame is painted.
+        assert!(
+            app.tree.point_cursor_at(AgentId(2)),
+            "the child must have a row to select"
+        );
+        let rows = screen(&mut app, 100, 30);
+        let detail = rows
+            .iter()
+            .find(|row| row.contains("merged"))
+            .unwrap_or_else(|| panic!("the child's landing must be painted: {rows:?}"));
+        assert!(
+            !detail.contains("HEAD"),
+            "a nested landing is not a merge into HEAD: {detail:?}"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 
@@ -10356,6 +10643,7 @@ mod tests {
             brief: "lexer".to_string(),
             depth: 1,
             branch: Some("mush/1".to_string()),
+            fork: None,
             cmd: crossbeam_channel::unbounded().0,
         });
 
@@ -10417,6 +10705,7 @@ mod tests {
             brief: "lexer".to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd: crossbeam_channel::unbounded().0,
         });
         app.focus = Focus::Agents;
@@ -10771,6 +11060,7 @@ mod tests {
             brief: "lexer".to_string(),
             depth: 1,
             branch: None,
+            fork: None,
             cmd,
         });
         let base = app.chat.revision(AgentId(1));

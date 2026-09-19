@@ -920,7 +920,14 @@ fn unread_footer(app: &App, node: &AgentNode) -> String {
 /// reclaimed learns here why it was not (finding H10).
 fn agent_detail(node: &AgentNode) -> Vec<String> {
     match node.landed {
-        Some(Landed::Merged) => vec!["merged into HEAD".to_string()],
+        // The landing's own word alone. Which base the work went into is not a
+        // fact this row has, and "into HEAD" was false for every nested child
+        // whose work landed in its parent's branch.
+        Some(Landed::Merged) => vec![Landed::Merged.past().to_string()],
+        // The row is the only thing that ever said what happened to a branch
+        // the run never committed to: there is no diff to show and no merge to
+        // claim, so the row says the one fact that is true of it.
+        Some(Landed::NothingCommitted) => vec![Landed::NothingCommitted.past().to_string()],
         Some(Landed::Discarded) => vec!["discarded — its work is gone".to_string()],
         None => {
             let mut detail = match &node.branch {
@@ -1118,6 +1125,7 @@ mod tests {
             phase,
             since: std::time::Instant::now() - std::time::Duration::from_secs(age),
             branch: None,
+            fork: None,
             summary: None,
             leftover: false,
             landed: None,
@@ -1166,7 +1174,7 @@ mod tests {
     /// the row's to word.
     #[test]
     fn a_landed_agent_does_not_offer_commands_that_cannot_work() {
-        for landed in [Landed::Merged, Landed::Discarded] {
+        for landed in [Landed::Merged, Landed::NothingCommitted, Landed::Discarded] {
             let mut node = node(Phase::Done, 1);
             node.branch = Some("mush/9".to_string());
             node.landed = Some(landed);
@@ -1190,7 +1198,7 @@ mod tests {
     /// fail however the row was worded (refactor R12).
     #[test]
     fn a_landed_row_spells_the_landing_in_the_landings_own_word() {
-        for landed in [Landed::Merged, Landed::Discarded] {
+        for landed in [Landed::Merged, Landed::NothingCommitted, Landed::Discarded] {
             let mut node = node(Phase::Done, 1);
             node.branch = Some("mush/9".to_string());
             node.landed = Some(landed);
@@ -1235,7 +1243,31 @@ mod tests {
         // whole of what the row says about where the work went.
         open.landed = Some(Landed::Merged);
         let text = agent_detail(&open).join(" · ");
-        assert_eq!(text, "merged into HEAD");
+        assert_eq!(text, "merged");
+    }
+
+    /// A merge by hand lands in whatever base the branch was forked from, which
+    /// is not necessarily HEAD: a nested child's branch goes into its parent's
+    /// branch, so a row that says `into HEAD` names a ref the work was never in
+    /// (the defect this patch is about). The row's word is the one git proved
+    /// and no more.
+    #[test]
+    fn a_merged_row_does_not_claim_head() {
+        let mut node = node(Phase::Done, 1);
+        node.branch = Some("mush/9".to_string());
+        node.landed = Some(Landed::Merged);
+        assert_eq!(agent_detail(&node).join(" · "), "merged");
+    }
+
+    /// The third landing has its own row, because it is the only surface that
+    /// ever said what happened to a branch the run never committed to: there is
+    /// no diff to offer and no merge to claim.
+    #[test]
+    fn a_run_that_committed_nothing_says_so_on_its_row() {
+        let mut node = node(Phase::Done, 1);
+        node.branch = Some("mush/9".to_string());
+        node.landed = Some(Landed::NothingCommitted);
+        assert_eq!(agent_detail(&node).join(" · "), "nothing committed");
     }
 
     /// The floor notice must never name a size the program does not need: the
