@@ -59,9 +59,12 @@ pub fn draw(frame: &mut Frame, screen: &Screen) {
             );
         }
         Screen::Panes(panes) => {
-            draw_agents(frame, &panes.agents);
-            draw_chat(frame, &panes.chat);
-            draw_status(frame, &panes.bar);
+            // One focus, passed to every pane that is painted from it: the
+            // borders, the bar's badge and the message box's cursor are three
+            // readers of one fact (finding T2 §11).
+            draw_agents(frame, &panes.agents, panes.focus);
+            draw_chat(frame, &panes.chat, panes.focus);
+            draw_status(frame, &panes.bar, panes.focus);
             if let Some(picker) = &panes.picker {
                 draw_picker(frame, picker);
             }
@@ -69,10 +72,10 @@ pub fn draw(frame: &mut Frame, screen: &Screen) {
     }
 }
 
-fn draw_agents(frame: &mut Frame, pane: &AgentsPane) {
+fn draw_agents(frame: &mut Frame, pane: &AgentsPane, focus: Focus) {
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(border(pane.focused))
+        .border_style(border(focus == Focus::Agents))
         // The pane's own title, already elided by `App::agents_pane` to the
         // columns this pane has: the painter paints words, it does not choose
         // them.
@@ -164,10 +167,11 @@ pub(crate) fn agent_line(row: &AgentRow, width: usize) -> String {
     fit_row(&head, &row.title, &row.place, &tail, width)
 }
 
-fn draw_chat(frame: &mut Frame, pane: &ChatPane) {
+fn draw_chat(frame: &mut Frame, pane: &ChatPane, focus: Focus) {
+    let focused = focus == Focus::Chat;
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(border(pane.focused));
+        .border_style(border(focused));
     match &pane.transcript {
         Some(painted) => {
             let inner = block.inner(pane.transcript_area);
@@ -179,7 +183,7 @@ fn draw_chat(frame: &mut Frame, pane: &ChatPane) {
 
     let input_block = Block::default()
         .borders(Borders::ALL)
-        .border_style(border(pane.focused))
+        .border_style(border(focused))
         .title(" message ");
     let input_inner = input_block.inner(pane.input_area);
     frame.render_widget(input_block, pane.input_area);
@@ -203,7 +207,7 @@ fn draw_chat(frame: &mut Frame, pane: &ChatPane) {
         ]));
     }
     frame.render_widget(Paragraph::new(Text::from(rendered)), input_inner);
-    if pane.focused {
+    if focused {
         let x = input_inner.x
             + ((prompt_width + input.column).min(input_inner.width.saturating_sub(1) as usize)
                 as u16);
@@ -222,7 +226,7 @@ fn draw_picker(frame: &mut Frame, picker: &PickerPane) {
         .title(picker.title.clone());
     let inner = block.inner(picker.area);
     frame.render_widget(block, picker.area);
-    if !picker.show_hint || inner.height == 0 || inner.width == 0 {
+    if inner.height == 0 || inner.width == 0 {
         return;
     }
 
@@ -250,8 +254,8 @@ fn draw_picker(frame: &mut Frame, picker: &PickerPane) {
     );
 }
 
-fn draw_status(frame: &mut Frame, pane: &BarPane) {
-    let focus = match pane.focus {
+fn draw_status(frame: &mut Frame, pane: &BarPane, focus: Focus) {
+    let badge = match focus {
         Focus::Agents => "agents",
         Focus::Chat => "chat",
     };
@@ -261,7 +265,7 @@ fn draw_status(frame: &mut Frame, pane: &BarPane) {
     };
     let line = Line::from(vec![
         Span::styled(
-            format!(" {focus} "),
+            format!(" {badge} "),
             Style::default().fg(Color::Black).bg(Color::Cyan),
         ),
         Span::raw(" "),
@@ -274,5 +278,46 @@ fn draw_status(frame: &mut Frame, pane: &BarPane) {
             Paragraph::new(Line::from(Span::styled(facts.clone(), dim()))),
             rows[1],
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// A popup with no inner room — a terminal too narrow or too short for a
+    /// list — paints `Clear`, its border, and nothing else: the list and the
+    /// hint need the row and the column `Block::inner` does not leave, which is
+    /// the one place that question is answered (Tier 1 §23).
+    #[test]
+    fn a_popup_with_no_inner_room_paints_nothing_but_its_border() {
+        for area in [Rect::new(0, 0, 2, 6), Rect::new(0, 0, 20, 2)] {
+            let picker = PickerPane {
+                area,
+                title: " models ".to_string(),
+                hint: "j/k or PgUp/PgDn",
+                items: vec!["• test-model · 500k".to_string()],
+                cursor: 0,
+            };
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal.draw(|frame| draw_picker(frame, &picker)).unwrap();
+            let buffer = terminal.backend().buffer();
+            let painted: String = (0..area.height)
+                .map(|y| {
+                    (0..area.width)
+                        .map(|x| buffer[(x, y)].symbol())
+                        .collect::<String>()
+                })
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(!painted.contains('•'), "{area:?}: {painted}");
+            assert!(!painted.contains("test-model"), "{area:?}: {painted}");
+            assert!(
+                !painted.contains("PgUp"),
+                "the hint needs the row the popup does not have: {area:?}: {painted}"
+            );
+        }
     }
 }

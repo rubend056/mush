@@ -161,6 +161,9 @@ pub struct Panes {
     pub bar: BarPane,
     /// The modal list, painted last because it covers what is under it.
     pub picker: Option<PickerPane>,
+    /// Which pane has the keyboard: the one fact the two borders, the message
+    /// box's cursor and the bar's badge are painted from (finding T2 §11).
+    pub focus: Focus,
 }
 
 /// The agent tree pane: one row per agent, and the cursor row's facts.
@@ -172,7 +175,6 @@ pub struct AgentsPane {
     /// out again, so the hidden-row counts (which are arithmetic over it) are
     /// counts of the rows that are really on screen (finding V1).
     pub list_area: Rect,
-    pub focused: bool,
     /// The pane's title, already elided to the columns this pane has: the
     /// clauses, ranked so that the ones that exist *only* here come first (the
     /// hidden-row counts `▲3`, `▼17`, then what the whole tree is doing, then
@@ -224,7 +226,6 @@ pub struct ChatPane {
     pub transcript_area: Rect,
     /// The message box's whole rect, border included.
     pub input_area: Rect,
-    pub focused: bool,
     /// The transcript as `Chat` rendered it, windowed to the room it has, or
     /// `None` when the pane has no inner room at all — a pane that short paints
     /// its border and nothing else.
@@ -250,7 +251,6 @@ pub struct InputPane {
 pub struct BarPane {
     /// The bar's rows: one, or two on a terminal at least 24 rows tall.
     pub area: Rect,
-    pub focus: Focus,
     /// The line that won the precedence table, or `None` for the idle hint.
     /// The rank is carried rather than a colour because the colour is a
     /// painting decision and the order is not.
@@ -269,8 +269,6 @@ pub struct PickerPane {
     pub items: Vec<String>,
     /// The cursor's index into `items`.
     pub cursor: usize,
-    /// Whether the popup is tall enough to paint the hint row at all.
-    pub show_hint: bool,
 }
 
 use super::chat::Painted;
@@ -341,6 +339,7 @@ impl App {
             chat: self.chat_pane(chat_area),
             bar: self.bar_pane(bar_area),
             picker: self.picker_pane(area),
+            focus: self.focus,
         }))
     }
 
@@ -348,7 +347,6 @@ impl App {
     /// links, so a child is drawn under its parent rather than after everything
     /// spawned before it (finding U4) — the cursor row's footer, and the title.
     fn agents_pane(&self, area: Rect) -> AgentsPane {
-        let focused = self.focus == Focus::Agents;
         let inner = inner(area);
         let nodes = self.tree.rows();
         let cursor = self.tree.cursor();
@@ -417,7 +415,6 @@ impl App {
         AgentsPane {
             area,
             list_area,
-            focused,
             // The pane's title: ` agents · 3 working · 2 jobs · 2 waiting ·
             // Σ +324 −40`, with the clauses that do not fit dropped whole from
             // the right and the pane's own name kept when none of them fit.
@@ -426,7 +423,6 @@ impl App {
                 " · ",
                 " agents · ",
                 " agents ",
-                0,
                 inner.width as usize,
             ),
             rows,
@@ -495,7 +491,6 @@ impl App {
 
     /// The chat column: the transcript `Chat` renders and the message box.
     fn chat_pane(&self, area: Rect) -> ChatPane {
-        let focused = self.focus == Focus::Chat;
         // The box grows with the message: a multi-line draft has to be visible,
         // not hidden behind a one-line window. It stops growing so the
         // transcript keeps the screen.
@@ -566,7 +561,6 @@ impl App {
         ChatPane {
             transcript_area,
             input_area,
-            focused,
             transcript,
             input,
         }
@@ -581,7 +575,6 @@ impl App {
         let tree = self.tree_line();
         BarPane {
             area,
-            focus: self.focus,
             word: bar_word(self.status_line(), tree.as_deref()),
             // The facts line: where this is, what it is on, how much has moved.
             // Elided from the right, so the repository survives longest and the
@@ -601,30 +594,17 @@ impl App {
         let y = area.y + area.height.saturating_sub(height) / 2;
         let popup = Rect::new(x, y, width, height);
 
-        // A terminal this short has no room for a list; the hint line and the
-        // window below both need at least one row.
         let room = inner(popup);
-        if room.height == 0 || room.width == 0 {
-            return Some(PickerPane {
-                area: popup,
-                title: picker.title(),
-                hint: picker.hint(),
-                items: Vec::new(),
-                cursor: 0,
-                show_hint: false,
-            });
-        }
-
         let visible = room.height.saturating_sub(1) as usize;
         let start = picker.cursor.saturating_sub(visible / 2);
         let mut items = Vec::new();
         for item in picker.items.iter().skip(start).take(visible) {
             let current = match picker.kind {
-                PickerKind::Model => picker
-                    .items
-                    .get(picker.cursor)
-                    .map(|item| item.split(" · ").next().unwrap_or(item) == self.cfg().model)
-                    .unwrap_or(false),
+                // The row being painted, not the row the cursor sits on: read
+                // from the cursor, every visible row wore `• ` while the picker
+                // opened on the current model and none did after one `j`
+                // (Tier 3 §1).
+                PickerKind::Model => item.split(" · ").next().unwrap_or(item) == self.cfg().model,
                 PickerKind::Provider => item == self.cfg().provider.name(),
                 // Nothing in this list is a choice, so nothing is marked as
                 // one.
@@ -648,7 +628,6 @@ impl App {
             hint: picker.hint(),
             items,
             cursor: picker.cursor.saturating_sub(start),
-            show_hint: true,
         })
     }
 }
@@ -703,7 +682,7 @@ fn facts_line(app: &App, width: usize) -> String {
     cells.push(format!("{} · {}", app.cfg().label(), app.context_meter()));
     // The workspace cell is never given up: it is the one fact that says which
     // tree the screen is about, so it is this line's floor.
-    elide(&cells, " │ ", "", &cells[0], 1, width)
+    elide(&cells, " │ ", "", &cells[0], width)
 }
 
 /// Drop cells from the right until the line fits: one rule for the two lines
@@ -711,26 +690,14 @@ fn facts_line(app: &App, width: usize) -> String {
 /// one home of it (finding D9).
 ///
 /// A cell goes whole, because a clause cut mid-number (`Σ +324 −`, `2 waitin`)
-/// is a count that is not the count. The first `min_kept` cells are never given
-/// up, and `floor` is what is painted when even they do not fit: the pane keeps
-/// its own name, and the facts line keeps the `⌂` cell that says which tree the
-/// screen is about. `prefix` opens every kept line, so the separator *inside*
-/// the line (` · `, ` │ `) and the one joining it to what precedes are each
-/// said once.
-fn elide(
-    cells: &[String],
-    separator: &str,
-    prefix: &str,
-    floor: &str,
-    min_kept: usize,
-    width: usize,
-) -> String {
-    for kept in (min_kept..=cells.len()).rev() {
-        let line = if kept == 0 {
-            floor.to_string()
-        } else {
-            format!("{prefix}{}", cells[..kept].join(separator))
-        };
+/// is a count that is not the count. The first cell is never given up, and
+/// `floor` is what is painted when even it does not fit: the pane keeps its own
+/// name, and the facts line keeps the `⌂` cell that says which tree the screen
+/// is about. `prefix` opens every kept line, so the separator *inside* the line
+/// (` · `, ` │ `) and the one joining it to what precedes are each said once.
+fn elide(cells: &[String], separator: &str, prefix: &str, floor: &str, width: usize) -> String {
+    for kept in (1..=cells.len()).rev() {
+        let line = format!("{prefix}{}", cells[..kept].join(separator));
         if UnicodeWidthStr::width(line.as_str()) <= width {
             return line;
         }
@@ -1316,5 +1283,79 @@ mod tests {
         // An empty branch is a detached HEAD, not a blank cell.
         let detached = git::RepoStatus::default();
         assert_eq!(git_cell(&detached, None), "detached");
+    }
+
+    /// The `/model` bullet marks the row being painted, not the row the cursor
+    /// happens to sit on: reading `items[picker.cursor]` made `current`
+    /// constant for the whole visible window — every row wore `• ` while the
+    /// picker opened on the current model, and none did after one `j` (Tier 3
+    /// §1). The mark is derived here, so this paints a frame and counts the rows
+    /// that carry it.
+    #[test]
+    fn the_model_picker_marks_the_current_model_and_only_it() {
+        use crate::agent::spawn;
+        use crate::app::ConfigCell;
+        use crate::session_save;
+        use crate::Msg;
+        use crossbeam_channel::unbounded;
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        let root = std::env::temp_dir().join(format!("mush-bullet-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = mush_core::Workspace::new(&root).unwrap();
+        let cell = ConfigCell::own(mush_core::Config::new(
+            "http://127.0.0.1:1",
+            "test-model",
+            None,
+        ));
+        let (tx, _rx) = unbounded::<Msg>();
+        let handle = spawn(cell.handle(), tx.clone(), root.clone());
+        let mut app = App::new(
+            ws,
+            cell,
+            None,
+            handle,
+            tx,
+            session_save::fake::Recorder::new(),
+        );
+        app.models = vec![
+            crate::http::Model {
+                id: "test-model".to_string(),
+                context: Some(500_000),
+            },
+            crate::http::Model {
+                id: "deepseek-chat".to_string(),
+                context: Some(128_000),
+            },
+        ];
+        app.open_model_picker();
+        // One `j` off the current model: it is still the model that is marked,
+        // and the row the cursor moved to is not.
+        app.move_picker(1);
+
+        let (width, height) = (80u16, 24u16);
+        app.set_term_size(width, height);
+        let screen = app.screen(Rect::new(0, 0, width, height));
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &screen))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let marked: Vec<String> = (0..height)
+            .map(|y| {
+                (0..width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .filter(|row| row.contains('•'))
+            .collect();
+        assert_eq!(marked.len(), 1, "exactly one row is marked: {marked:?}");
+        assert!(
+            marked[0].contains("test-model"),
+            "and it is the current model: {marked:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 }

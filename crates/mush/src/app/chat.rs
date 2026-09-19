@@ -174,12 +174,13 @@ impl Voice {
 /// What wins when more than one line wants to be a pane's last (finding B12):
 /// a failure first, then derived activity, then what mush merely said.
 ///
-/// This is the one precedence table. The bar (`ui::bar_line`) picks the line it
-/// shows through it, and the foot ranks through it to decide what survives its
-/// cap — so neither can disagree with the other about which of two things the
-/// human needs to see first, which is how an `Error` status came to lose to a
+/// This is the one precedence table. The bar picks the line it shows through
+/// [`Rank::last_word`]; a notice says where it sits through [`Notice::rank`];
+/// and the foot keeps the alert over the run in flight over a hint by the same
+/// order — so no two surfaces can disagree about which of two things the human
+/// needs to see first, which is how an `Error` status came to lose to a
 /// `thinking…` line.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Rank {
     /// A line mush wrote: a hint, `opened notes.txt`, a merge that landed.
     Said,
@@ -313,6 +314,20 @@ enum Reading {
     Following,
     /// Holding a window `offset` rows above the bottom of `messages[..up_to]`.
     Holding { offset: usize, up_to: usize },
+}
+
+impl Reading {
+    /// The held window's `(offset, up_to)`, if the transcript still has it: a
+    /// fold or a shorter restored session can leave a reading pointing past the
+    /// end, and a position the transcript no longer has is not a position — the
+    /// pane is at the bottom again. One rule, so the pane's title and its body
+    /// cannot disagree about which transcripts this reading may be read from.
+    fn held(self, messages: usize) -> Option<(usize, usize)> {
+        match self {
+            Reading::Holding { offset, up_to } if up_to <= messages => Some((offset, up_to)),
+            _ => None,
+        }
+    }
 }
 
 /// One conversation: what has been said, what mush added to it, and what the
@@ -798,27 +813,26 @@ impl Chat {
             // to no rows at all (an empty text another version stored) leaves
             // the head where it was rather than pointing past the list.
             let head = rows.len();
-            let marker = match notice.kind {
-                NoticeKind::Info => "·",
-                NoticeKind::Stopped => "⊘",
-                NoticeKind::CutOff => "⚠",
-                NoticeKind::Error => "!",
-            };
+            // The glyph has one home, beside the kind it marks: this list and
+            // the pane's foot paint the same mark for the same kind of line.
+            let (mark, _) = notice.kind.mark();
             let age = short_age(Duration::from_secs(now.saturating_sub(notice.at)));
-            let lead = format!("{age} {marker} ");
+            let lead = format!("{age} {mark}");
             // The lead is part of the first row, so the text is wrapped *inside*
             // what the lead leaves — a continuation row carries the same indent.
             // Wrapping at `width` and then prepending the lead made the very
-            // first row `lead.len()` columns too wide, which is exactly the row
-            // that was clipped even on an 80-column popup.
-            for (index, line) in wrap_text(&notice.line(), width.saturating_sub(lead.len()))
+            // first row `lead` wider than the popup, which is exactly the row
+            // that was clipped even on an 80-column popup. Like every other
+            // width on this screen, the lead is measured in columns.
+            let lead_width = UnicodeWidthStr::width(lead.as_str());
+            for (index, line) in wrap_text(&notice.line(), width.saturating_sub(lead_width))
                 .into_iter()
                 .enumerate()
             {
                 if index == 0 {
                     rows.push(format!("{lead}{line}"));
                 } else {
-                    rows.push(format!("{}{line}", " ".repeat(lead.len())));
+                    rows.push(format!("{}{line}", " ".repeat(lead_width)));
                 }
             }
             if rows.len() > head {
@@ -891,13 +905,7 @@ impl Chat {
         if messages == 0 {
             return;
         }
-        let held = match self.reading(agent) {
-            // A held window the transcript no longer has (it was folded, or
-            // restored from a shorter one) is not a position: the pane is at
-            // the bottom again, and this key starts from there.
-            Reading::Holding { offset, up_to } if up_to <= messages => Some((offset, up_to)),
-            _ => None,
-        };
+        let held = self.reading(agent).held(messages);
         let next = match (held, rows) {
             // Already at the bottom, and asked for something below it: there is
             // nothing under the bottom, and the pane still follows.
@@ -941,7 +949,8 @@ impl Chat {
         // pane could spend. `scroll` stays the transcript's: the foot does not
         // scroll away, which is what makes it a foot rather than the newest
         // message.
-        let protected = usize::from(!self.transcript(pane.agent).is_empty());
+        let transcript = self.transcript(pane.agent);
+        let protected = usize::from(!transcript.is_empty());
         let room = FOOT_ROWS.min(height.saturating_sub(protected));
         let foot = self.foot(pane, width, room);
         let mut lines = self.body(pane, width, height.saturating_sub(foot.lines.len()));
@@ -966,10 +975,8 @@ impl Chat {
         // is the only one who knows they did (finding T10). The rows are the
         // held window's own offset, and the key named is the chat pane's way
         // back down to the newest line.
-        if let Reading::Holding { offset, up_to } = self.reading(pane.agent) {
-            if up_to <= self.transcript(pane.agent).len() {
-                title.push_str(&format!("· scrolled ↑{offset} rows · PgDn "));
-            }
+        if let Some((offset, _)) = self.reading(pane.agent).held(transcript.len()) {
+            title.push_str(&format!("· scrolled ↑{offset} rows · PgDn "));
         }
         Painted { lines, title }
     }
@@ -983,14 +990,12 @@ impl Chat {
         // Which conversation this window is made of, and how far above its
         // bottom it starts. Holding is a fact about the human's reading, so it
         // is read here rather than guessed from the rows.
-        let (messages, scroll) = match self.reading(pane.agent) {
-            Reading::Holding { offset, up_to } if up_to <= transcript.len() => {
-                (&transcript[..up_to], offset)
-            }
+        let (messages, scroll) = match self.reading(pane.agent).held(transcript.len()) {
+            Some((offset, up_to)) => (&transcript[..up_to], offset),
             // The transcript the pane was holding is gone: a fold replaced it,
             // or the session was restored with less. Falling back to the bottom
             // is the only position that still means something.
-            _ => (transcript, 0),
+            None => (transcript, 0),
         };
 
         // A pane with nothing in it says what it is waiting for rather than
