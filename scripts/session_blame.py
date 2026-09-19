@@ -28,12 +28,27 @@ import os
 import sys
 
 # `Config::history_budget` is `(context_tokens - reserve) * 3` bytes
-# (crates/mush-core/src/config.rs:403) and a transcript folds at three quarters
-# of it (`transcript::compaction_trigger`, transcript.rs:46). The test at
-# config.rs:1327 pins 283_800 bytes for the large window; anything smaller folds
-# proportionally sooner. Used here only as the yardstick that makes "each child
-# stopped just short of its ceiling" visible.
-BUDGET_REFERENCE = 283_800
+# (crates/mush-core/src/config.rs:403) with `reserve = min(SCHEMA_TOKENS +
+# context/4 + 200, context/2)`, and a transcript folds at three quarters of the
+# budget (`transcript::compaction_trigger`, transcript.rs:46). Those three
+# numbers are what makes "each child stopped just short of its own ceiling"
+# visible, so this script derives them from the window it is told about rather
+# than comparing against one constant — a yardstick that does not name the
+# window it belongs to is the rumour this file exists to avoid.
+SCHEMA_TOKENS = 1200
+REPLY_SHARE_DIVISOR = 4
+MARGIN_TOKENS = 200
+# The window a session gets when nothing states one: the shape `config.rs`
+# documents as the default, and the one the tests pin 283_800 bytes for.
+DEFAULT_CONTEXT = 128_000
+
+
+def budget_for(context_tokens):
+    """(budget, trigger) bytes for a window, the way `Config` computes them."""
+    reserve = min(SCHEMA_TOKENS + context_tokens // REPLY_SHARE_DIVISOR + MARGIN_TOKENS,
+                  context_tokens // 2)
+    budget = max(0, context_tokens - reserve) * 3
+    return budget, budget * 3 // 4
 
 
 def human(n):
@@ -65,6 +80,8 @@ def main():
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("path")
     ap.add_argument("--top", type=int, default=10)
+    ap.add_argument("context", type=int, nargs="?", default=DEFAULT_CONTEXT,
+                    help="the session's window in tokens (default %d)" % DEFAULT_CONTEXT)
     ap.add_argument("--json", action="store_true")
     args = ap.parse_args()
 
@@ -120,15 +137,21 @@ def main():
         print("\n-- children: %d agents, %s in transcripts (%.0f%% of the file)"
               % (len(agents), human(total), 100.0 * total / max(1, len(raw))))
         if sizes:
-            mid = sizes[len(sizes) // 2][0]
-            p90 = sizes[int(len(sizes) * 0.9)][0] if len(sizes) > 1 else sizes[0][0]
+            # `sizes` is largest-first (the top list reads it that way), so the
+            # percentiles are taken from its mirror image: reading them off the
+            # descending list labelled the tenth percentile `p90`.
+            asc = sorted(s for s, _, _ in sizes)
+            mid = asc[len(asc) // 2]
+            p90 = asc[min(len(asc) - 1, int(len(asc) * 0.9))]
+            budget, trigger = budget_for(args.context)
             print("  median %s · p90 %s · largest %s"
-                  % (human(mid), human(p90), human(sizes[0][0])))
-            at_ceiling = sum(1 for s, _, _ in sizes if s > BUDGET_REFERENCE * 0.5)
-            print("  of those, %d hold more than half the reference fold trigger (%s);"
-                  % (at_ceiling, human(BUDGET_REFERENCE)))
-            print("  a transcript folds at 3/4 of the endpoint's history budget, but a"
-                  " *finished* agent's transcript is never folded again")
+                  % (human(mid), human(p90), human(asc[-1])))
+            at_ceiling = sum(1 for s in asc if s > trigger * 0.5)
+            print("  window %d tokens -> budget %s, fold trigger %s"
+                  % (args.context, human(budget), human(trigger)))
+            print("  %d of %d hold more than half that trigger; a finished agent's"
+                  " transcript is never folded again"
+                  % (at_ceiling, len(asc)))
         for s, a, n in sizes[:args.top]:
             print("    #%-6s %-9s %4d msgs %9s  %s"
                   % (a.get("id"), str(a.get("status"))[:9], n, human(s),
