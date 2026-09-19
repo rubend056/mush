@@ -113,8 +113,7 @@ const STATUS_COMMAND_COLUMNS: usize = 60;
 /// between a `Stop` and a process group dying, and costs nothing while idle.
 ///
 /// One rule with two watchers — a job's own thread here and the foreground
-/// watcher in `agent.rs` — so it is crate-visible: that other spelling of this
-/// cadence is still a bare literal to move here.
+/// watcher in `agent.rs` — so it is crate-visible and both sleep on it.
 pub(crate) const POLL: Duration = Duration::from_millis(10);
 
 /// Hard ceiling on what one command may write to its scratch files before mush
@@ -138,18 +137,25 @@ pub const CMD_DETACH_AFTER: Duration = Duration::from_secs(60);
 /// is not a ceiling on the disk every agent shares.
 pub const JOB_MAX_AGE: Duration = Duration::from_secs(4 * 60 * 60);
 
-/// How much of the holder's command goes into a refusal sentence. The command
-/// can be a paragraph; a refusal is a line the model reads and acts on, and
-/// the part it needs is the start (finding H13).
-const REFUSAL_COMMAND_COLUMNS: usize = 60;
+/// How much of a command goes into a sentence that names it while refusing a
+/// call or noting a run beside another's: both arms of [`Refused::Machine`]
+/// and `agent.rs`'s `beside_note`. The command can be a paragraph; a refusal is
+/// a line the model reads and acts on, and the part it needs is the start
+/// (finding H13).
+///
+/// `status`'s headlines name a command too and have their own bound
+/// ([`STATUS_COMMAND_COLUMNS`]): a listing and a refusal cut the same field for
+/// different reasons — the headline keeps a `STATUS_WINDOW` bounded, the
+/// sentence keeps itself to one line.
+pub(crate) const REFUSAL_COMMAND_COLUMNS: usize = 60;
 
 /// `#c2` — a job's name, as the model and the human both read it.
 ///
 /// The `c` that tells a command's id from an agent's lives in [`JobId`]'s
 /// `Display`, which every site in this module formats through: `{id}` is the
-/// whole spelling. The two callers left in `agent.rs` spell the name through
-/// this function instead — `JobId`'s own `Display` is all it forwards to, so
-/// they can do the same without changing a byte.
+/// whole spelling. This wrapper survives for the two callers outside this
+/// module that read a `JobId` (`app/mod.rs`'s bar note and job lines) and
+/// forwards to that `Display`; every other site spells `{id}` itself.
 pub fn label(id: JobId) -> String {
     id.to_string()
 }
@@ -232,11 +238,20 @@ pub enum JobOutcome {
 }
 
 impl JobOutcome {
-    /// Whether this is news worth waking a napping owner for. A job mush killed
-    /// is the human's or the model's own doing; a job that *ended* is a result
-    /// nobody has read yet.
+    /// Whether this is news worth waking a napping owner for.
+    ///
+    /// A job that *ended* is a result nobody has read yet, and so is a job mush
+    /// killed for a reason the owner must act on: it ran past [`JOB_MAX_AGE`]
+    /// or wrote past [`CMD_OUTPUT_LIMIT`], and the line saying so is the thing
+    /// that decides what the owner does next. A `Stopped` job is the human's own
+    /// doing — a Stop aimed at its owner, Ctrl-N, a quit — and a stop ends the
+    /// agent's work by design, so its line waits in the transcript and starts no
+    /// run.
     pub fn is_news(&self) -> bool {
-        matches!(self, JobOutcome::Exited(_))
+        matches!(
+            self,
+            JobOutcome::Exited(_) | JobOutcome::TooMuchOutput | JobOutcome::RanTooLong
+        )
     }
 
     /// The one line a job is reported in: `#c2 done: exit 0 · 3m12s · cargo
@@ -495,24 +510,28 @@ impl Refused {
     /// What the model is told, in words that let it act: who to wait for, or
     /// what to stop.
     ///
-    /// The asker is not read: every [`Held`] is built by a *not-you* test (see
-    /// the arm below), so no refusal is ever about the asker's own lock. The
-    /// parameter is still in the signature for `agent.rs`'s call sites, which
-    /// pass it.
-    pub fn message(&self, _asker: u64) -> String {
+    /// This is the road of a *sibling* refusal — the child that queued for the
+    /// lock, and the launch handed a command while somebody else held it — plus
+    /// the one refusal whose asker is the holder: its own second exclusive call,
+    /// which `take_machine` refuses under the registry's lock and therefore
+    /// never queues.
+    pub fn message(&self, asker: u64) -> String {
         match self {
-            // A sibling's lock — always a sibling's. The two places that build a
-            // `Held` are `machine_free_for`, which answers `Ok` for the holder,
-            // and `launch`, which refuses only a holder that is *not* the owner,
-            // so `held.agent` is never the asker and "you hold the machine" is a
-            // sentence no state can ask for. This is the whole word list.
-            //
-            // The one thing it must not read as is "try again now": retrying
-            // the identical call is what mush's own loop guard counts, and it
-            // killed two agents that only met a locked machine (finding H13).
-            // Who holds it, what they are running, and what to do instead — and
-            // no tool can wait on another agent's job, so `wait` must not be
-            // offered (audit row 5).
+            // The asker already owns the machine: a second exclusive command
+            // would interleave exactly what the lock exists to keep apart. No
+            // queue is involved — the lock is the asker's own — so the sentence
+            // says what it may do about it instead.
+            Refused::Machine(held) if held.agent == asker => format!(
+                "you hold the machine with an exclusive command ({}); wait for it (wait) or stop \
+                 it (control stop) before starting another",
+                truncate(&held.command, REFUSAL_COMMAND_COLUMNS)
+            ),
+            // A sibling's lock. The one thing it must not read as is "try again
+            // now": retrying the identical call is what mush's own loop guard
+            // counts, and it killed two agents that only met a locked machine
+            // (finding H13). Who holds it, what they are running, and what to do
+            // instead — and no tool can wait on another agent's job, so `wait`
+            // must not be offered (audit row 5).
             Refused::Machine(held) => format!(
                 "#{} holds the machine with an exclusive command ({}); this call queued and the lock \
                  was still held — do not retry in a loop; do other work and try once after it finishes \
@@ -525,6 +544,29 @@ impl Refused {
                  Stop one with control, or wait for one with wait."
             ),
             Refused::Thread(error) => format!("could not start the job: {error}"),
+        }
+    }
+
+    /// What the **root** is told when its *exclusive* call meets a sibling's
+    /// lock.
+    ///
+    /// The root is the human's own hands and is exempt from the lock: it
+    /// commands beside a held one and is told so (`agent.rs`'s `beside_note`),
+    /// but two claims to own the machine is the one thing the lock forbids. Its
+    /// refusal is immediate — `LOCK_QUEUE` is a *sibling's* road, and the root is
+    /// never sent down the queue — so the sentence must not claim the call
+    /// queued. The holder's own refusal (an asker that already holds the lock)
+    /// stays the holder's sentence whatever road it took.
+    pub fn root_message(&self, asker: u64) -> String {
+        match self {
+            Refused::Machine(held) if held.agent != asker => format!(
+                "#{} holds the machine with an exclusive command ({}); you are the root — your \
+                 exclusive call was refused at once, without queueing. Do other work and try once \
+                 after it finishes (no tool can wait on another agent's job)",
+                held.agent,
+                truncate(&held.command, REFUSAL_COMMAND_COLUMNS)
+            ),
+            other => other.message(asker),
         }
     }
 }
@@ -779,8 +821,11 @@ impl Registry {
 
     /// Whether `agent` may run a command at all. Only an exclusive command takes
     /// the lock, but *every* command respects it: a benchmark with a sibling's
-    /// `cargo build` on the other cores is not a benchmark. An agent's own
-    /// commands are its business — it holds the machine and can decide.
+    /// `cargo build` on the other cores is not a benchmark. The holder's own
+    /// *non-exclusive* commands are its business — it holds the machine and can
+    /// decide — while a second *exclusive* claim is refused by
+    /// [`Registry::take_machine`], because two claims to own the machine is the
+    /// one thing the lock exists to prevent.
     pub fn machine_free_for(&self, agent: u64) -> Result<(), Held> {
         match self.held() {
             Some((holder, command, _)) if holder != agent => Err(Held {
@@ -792,11 +837,25 @@ impl Registry {
     }
 
     /// Take the workspace-wide lock for `agent`.
+    ///
+    /// A lock already held is refused whoever holds it — including the asker.
+    /// This is the only writer of the holder record, and the record names the
+    /// claim in flight (`Some(job)` while an exclusive *job* holds it), so
+    /// overwriting it would both lose that name and let the first call's own
+    /// release free a machine its job still holds: `exclusive=true` was not
+    /// exclusive against its own owner.
     pub fn take_machine(&self, agent: u64, command: &str) -> Result<(), Held> {
-        self.machine_free_for(agent)?;
         let mut inner = self.inner();
-        inner.holder = Some((agent, command.to_string(), None));
-        Ok(())
+        match &inner.holder {
+            Some((holder, held, _)) => Err(Held {
+                agent: *holder,
+                command: held.clone(),
+            }),
+            None => {
+                inner.holder = Some((agent, command.to_string(), None));
+                Ok(())
+            }
+        }
     }
 
     /// Release the lock if `agent` holds it *as a tool call*. A release from
@@ -810,6 +869,11 @@ impl Registry {
     /// benchmark the lock exists for still runs, contradicting §5.6 — "a
     /// detached exclusive job holds the lock for its whole life". The job's own
     /// end gives the machine back, in [`Registry::finish`].
+    ///
+    /// The claim a call releases is always the one `take_machine` wrote for it
+    /// (`claimed: None`): a call that never took the lock — the holder's own
+    /// non-exclusive command beside an exclusive job — has nothing here to
+    /// release, and a job's claim is not a call's to give up.
     pub fn release_machine(&self, agent: u64) {
         let mut inner = self.inner();
         if matches!(&inner.holder, Some((holder, _, None)) if *holder == agent) {
@@ -848,10 +912,17 @@ impl Registry {
             let mut inner = self.inner();
             let refusal = if exclusive {
                 match &inner.holder {
-                    Some((holder, held, _)) if *holder != owner => Some(Refused::Machine(Held {
-                        agent: *holder,
-                        command: held.clone(),
-                    })),
+                    // Somebody else's claim, or a *job* of the owner's already
+                    // holding the machine: two exclusive claims may not overlap.
+                    // `claimed.is_some()` even for the owner is a second job —
+                    // the handover this arm exists for replaces the owner's own
+                    // *foreground* claim (`None`), and nothing else.
+                    Some((holder, held, claimed)) if *holder != owner || claimed.is_some() => {
+                        Some(Refused::Machine(Held {
+                            agent: *holder,
+                            command: held.clone(),
+                        }))
+                    }
                     _ => None,
                 }
             } else {
@@ -1384,6 +1455,10 @@ mod tests {
         assert!(JobOutcome::TooMuchOutput
             .line(JobId(2), "yes", Duration::from_secs(1), "y")
             .contains("wrote past"));
+        assert!(
+            JobOutcome::TooMuchOutput.is_news(),
+            "a job mush killed past the output limit is a line its owner has to act on"
+        );
         // The ceiling says what it was, because the one thing its owner needs
         // to know is that the command was still running after four hours.
         let long = JobOutcome::RanTooLong.line(JobId(3), "cargo run", JOB_MAX_AGE, "");
@@ -1391,7 +1466,10 @@ mod tests {
             long,
             "#c3 killed: it ran past the 4h ceiling · 4h00m · cargo run"
         );
-        assert!(!JobOutcome::RanTooLong.is_news(), "a kill is not a result");
+        assert!(
+            JobOutcome::RanTooLong.is_news(),
+            "four hours of silence is a reason to wake the owner, not a line to sit on"
+        );
 
         // The kept window is a tail, so a long one keeps its *end* and says
         // where it was cut off — the head is what a foreground result keeps.
@@ -1927,6 +2005,107 @@ mod tests {
         assert!(registry.machine_free_for(4).is_ok());
     }
 
+    /// `exclusive=true` is not exclusive against its own owner: a second claim
+    /// from the holder is refused, and the first claim's record — which names
+    /// the job it became — is not overwritten. Overwriting it used to erase the
+    /// `Some(job)`, so the first call's own release freed a machine the
+    /// benchmark still held, and the sibling this lock refuses ran beside it.
+    #[test]
+    fn the_holder_cannot_claim_the_machine_itself_twice() {
+        let registry = Registry::bare();
+        registry.take_machine(3, "cargo bench").unwrap();
+
+        // The holder's own second exclusive claim: refused, in words that name
+        // the lock it already owns rather than a queue it never sat in.
+        let held = registry
+            .take_machine(3, "cargo bench --other")
+            .expect_err("the lock is not a re-entrant one");
+        assert_eq!(held.agent, 3, "the refusal names the holder: the asker");
+        let refusal = Refused::Machine(held).message(3);
+        assert!(refusal.starts_with("you hold the machine"), "{refusal}");
+        assert!(refusal.contains("cargo bench"), "{refusal}");
+        assert!(refusal.contains("control stop"), "{refusal}");
+        assert!(
+            !refusal.contains("queued"),
+            "the holder never queues for its own lock: {refusal}"
+        );
+
+        // And the record is exactly the first claim's, not the second's.
+        assert_eq!(
+            registry.held(),
+            Some((3, "cargo bench".to_string(), None)),
+            "a claim the holder did not take was not overwritten"
+        );
+    }
+
+    /// The one admission door holds the same rule as `take_machine`: an
+    /// exclusive *job* claim is not replaced by another exclusive job, even for
+    /// the same owner. The legitimate handover — a foreground call giving its
+    /// own claim to the job it became — replaces a `None` claim and nothing
+    /// else.
+    #[test]
+    fn a_second_exclusive_job_is_refused_even_for_its_owner() {
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::hangs())
+                .runs(Script::hangs()),
+        );
+        let (registry, _events, _clock) = registry();
+        assert!(registry.machine_free_for(7).is_ok());
+
+        // The owner's first exclusive job: the claim now names it.
+        let first = machine
+            .spawn(&ShellCommand {
+                command: "cargo bench",
+                root: Path::new("/tmp"),
+            })
+            .unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let id = registry
+            .launch(Launch::started(
+                7,
+                "cargo bench".to_string(),
+                true,
+                tx,
+                first,
+            ))
+            .unwrap();
+        assert_eq!(
+            registry.held(),
+            Some((7, "cargo bench".to_string(), Some(id)))
+        );
+
+        // A second exclusive job from the same owner is refused, and the
+        // command it was handed is killed rather than orphaned.
+        let second = machine
+            .spawn(&ShellCommand {
+                command: "cargo bench --other",
+                root: Path::new("/tmp"),
+            })
+            .unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        assert_eq!(
+            registry.launch(Launch::started(
+                7,
+                "cargo bench --other".to_string(),
+                true,
+                tx,
+                second,
+            )),
+            Err(Refused::Machine(Held {
+                agent: 7,
+                command: "cargo bench".to_string(),
+            })),
+        );
+        assert_eq!(machine.kills(), 1, "the refused command's group is killed");
+        assert_eq!(
+            registry.held(),
+            Some((7, "cargo bench".to_string(), Some(id))),
+            "the first job still holds the machine, under its own name"
+        );
+        registry.kill_all();
+    }
+
     /// The registry is the tree's one counter of live jobs, and the UI reads it
     /// as the row's badge: what it lists is what is running, with the command
     /// and the age.
@@ -1972,7 +2151,10 @@ mod tests {
             }) => {
                 assert_eq!(done, id);
                 assert!(line.contains("ran past the 4h ceiling"), "{line}");
-                assert!(!news, "a job mush killed is not a result to read");
+                assert!(
+                    news,
+                    "the owner's run must start so it reads why its job died: {line}"
+                );
             }
             Ok(_) => panic!("a job's completion is a CommandDone"),
             Err(error) => panic!("no completion arrived: {error}"),

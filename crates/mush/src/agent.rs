@@ -1999,7 +1999,11 @@ fn run_loop(
                     cfg.reply_cap()
                 )),
             );
-            messages.push(Message::user(TRUNCATION_INSTRUCTION));
+            // One door, so both see it: the instruction is in the request the
+            // model answers, and a line that reached `messages` alone would be
+            // a line the human's copy cannot account for — the actor's
+            // transcript is replaced by the UI's at the next idle `Run`.
+            push_line(actor, messages, TRUNCATION_INSTRUCTION.to_string());
             continue;
         }
         // A reply that was not cut off ends the run of them: the guard counts
@@ -3145,7 +3149,7 @@ fn in_flight(state: &ActorState) -> Vec<String> {
     out.extend(children.into_iter().map(|id| format!("#{id}")));
     let mut jobs: Vec<JobId> = state.running_jobs.iter().copied().collect();
     jobs.sort_unstable();
-    out.extend(jobs.into_iter().map(jobs::label));
+    out.extend(jobs.into_iter().map(|job| job.to_string()));
     out
 }
 
@@ -3237,9 +3241,18 @@ fn child_listing(state: &ActorState) -> String {
     for id in ids {
         // A child that is running again after its last report is *running*: the
         // recorded outcome is history, and printing it made a resumed child
-        // read as stopped while it worked (audit row 1).
+        // read as stopped while it worked (audit row 1). An isolated child
+        // works on the branch its id derives (the same `mush/<id>` every other
+        // surface names), so a parent with several children can tell which is
+        // which; a shared child has no branch of its own, and inventing a
+        // second name for it here is not this listing's to do.
         if state.running.contains(&id) {
-            lines.push(format!("#{id} ◐ running"));
+            let on = if state.shared.contains(&id) {
+                String::new()
+            } else {
+                format!(" on {}", git::branch_name(id))
+            };
+            lines.push(format!("#{id} ◐ running{on}"));
             continue;
         }
         // The same `✉` the tree rows carry (H4): a result nobody has read.
@@ -3276,13 +3289,12 @@ fn control_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<S
         Target::Job(id) => match action.as_str() {
             "stop" => actor.ctx.registry.stop(actor.id, id),
             other => Err(format!(
-                "unknown action `{other}` for a job ({}) — a job can only be stopped",
-                jobs::label(id)
+                "unknown action `{other}` for a job ({id}) — a job can only be stopped"
             )),
         },
         Target::Agent(id) => match action.as_str() {
             "stop" => stop_agent(state, id),
-            "message" => message_agent(state, args, id),
+            "message" => message_agent(actor, state, args, id),
             other => Err(format!(
                 "unknown action `{other}` for agent #{id} (stop or message)"
             )),
@@ -3333,10 +3345,27 @@ fn stop_agent(state: &mut ActorState, id: u64) -> Result<String, String> {
 /// Message a child this agent owns. The words resume an idle child, so the
 /// parent's own book says it is running: a wait must not answer the old result,
 /// and the shared-workspace guard must see it (audit row 1).
-fn message_agent(state: &mut ActorState, args: &Value, id: u64) -> Result<String, String> {
+///
+/// A landed child's actor is still alive but its worktree is gone, and that
+/// actor drops a steer on the floor with a `Notice` only the UI sees — so a
+/// reply promising a resume would leave the parent waiting for a result that
+/// can never arrive. The human's own path refuses the same message up front
+/// (`App::worktree_gone`); this is the parent's half of that rule, in the words
+/// the child itself reports for a message that reached a gone worktree.
+fn message_agent(
+    actor: &Actor,
+    state: &mut ActorState,
+    args: &Value,
+    id: u64,
+) -> Result<String, String> {
     let Some(cmd) = state.children.get(&id) else {
         return Err(format!("no such child agent #{id} — status lists yours"));
     };
+    // An isolated child's worktree is where a run would write; a *shared* child
+    // has none of its own and runs in this workspace, which is still here.
+    if !state.shared.contains(&id) && !git::worktree_path(&actor.ctx.root, id).exists() {
+        return Err(worktree_gone_line(id));
+    }
     // Whether the words are read *now* or at the child's next message boundary
     // is the parent's own book (`running`), and the reply says which: "messaged
     // agent #N" claimed delivery with no way to tell a child that resumes from
@@ -3404,7 +3433,16 @@ fn edit_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
         _ => {
             let old = tools::arg_string(args, "old_string")?;
             let new = tools::arg_string(args, "new_string")?;
-            tools::edit_text(&current, &old, &new, &rel)?
+            // The single pair honours a top-level `replace_all` exactly as a
+            // batch entry honours its own: the schema's sentence promises the
+            // flag changes every occurrence, and a refusal that said "set
+            // replace_all" to a model that had already set it sent the loop
+            // guard after an identical retry.
+            let replace_all = args
+                .get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            tools::edit_text(&current, &old, &new, replace_all, &rel)?
         }
     };
     ws.write_file(&rel, &updated)?;
@@ -3447,7 +3485,10 @@ fn wait_for_machine(actor: &Actor, cancel: &AtomicBool) -> Result<(), jobs::Held
 ///
 /// The root is exempt from the lock (finding H13), and an exemption that is not
 /// said is exactly the kind of silent state this tree keeps finding: the model
-/// can decide to distrust a timing-sensitive result, or wait next time.
+/// can decide to distrust a timing-sensitive result, or wait next time. The
+/// command is cut to [`jobs::REFUSAL_COMMAND_COLUMNS`], the bound the refusal
+/// sentence beside it uses: one home for how much of a command such a sentence
+/// may carry.
 fn beside_note(text: String, held: Option<&jobs::Held>) -> String {
     match held {
         None => text,
@@ -3455,8 +3496,22 @@ fn beside_note(text: String, held: Option<&jobs::Held>) -> String {
             "{text}\n(ran while #{} held the machine for an exclusive command ({}) — \
              timing-sensitive results from its run may be perturbed)",
             held.agent,
-            truncate(&held.command, 40)
+            truncate(&held.command, jobs::REFUSAL_COMMAND_COLUMNS)
         ),
+    }
+}
+
+/// The sentence a `Refused::Machine` gets in `run_command`, chosen by the road
+/// the asker actually took: the root is exempt from the lock and never queues
+/// (see [`Refused::root_message`]), a sibling queues for `LOCK_QUEUE` and is
+/// refused only when the lock outlasts it. Picking by the asker is the whole
+/// rule — the exempt caller is exactly the root — so no call site can pair a
+/// refusal with the other road's words.
+fn machine_refusal(actor: &Actor, held: jobs::Held) -> String {
+    if actor.id == AgentId::ROOT.0 {
+        Refused::Machine(held).root_message(actor.id)
+    } else {
+        Refused::Machine(held).message(actor.id)
     }
 }
 
@@ -3487,25 +3542,34 @@ fn run_command(
     // for the duration of a sibling's benchmark cost the orchestrator its only
     // lever (finding H13). A root *exclusive* command is refused like anyone's:
     // two claims to own the machine is the one thing the lock exists to
-    // prevent. A sibling queues, bounded, instead of refusing on sight.
+    // prevent. A sibling queues, bounded, instead of refusing on sight. The
+    // *holder's* own exclusive call is refused too — by `take_machine`, the
+    // only writer of the holder record — because the lock is not re-entrant:
+    // a second claim would overwrite the record naming the first one (and the
+    // job it became), and the first call's release would then free a machine
+    // its job still holds.
     let mut beside: Option<jobs::Held> = None;
     if let Err(held) = registry.machine_free_for(actor.id) {
         if actor.id == AgentId::ROOT.0 {
             if exclusive {
-                return Err(ToolError::Refused(Refused::Machine(held).message(actor.id)));
+                return Err(ToolError::Refused(machine_refusal(actor, held)));
             }
             beside = Some(held);
         } else if let Err(held) = wait_for_machine(actor, cancel) {
-            return Err(ToolError::Refused(Refused::Machine(held).message(actor.id)));
+            return Err(ToolError::Refused(machine_refusal(actor, held)));
         }
     }
     if detach && !registry.has_room() {
         return Err(ToolError::Refused(Refused::Budget.message(actor.id)));
     }
     if exclusive {
+        // A refusal here is the holder's own second claim (or a sibling that
+        // took the lock between the check above and this line), so it goes
+        // through the same chooser: no sentence claims a queue the call did not
+        // sit in.
         registry
             .take_machine(actor.id, command)
-            .map_err(|held| ToolError::Refused(Refused::Machine(held).message(actor.id)))?;
+            .map_err(|held| ToolError::Refused(machine_refusal(actor, held)))?;
     }
     // `detach: true` asks for a job from the start: the model knows it started
     // a server, and waiting sixty seconds to be told so is not an answer. This
@@ -3626,10 +3690,7 @@ fn detach_now(
 /// id is in it because every later tool call about it (status, stop, wait) needs
 /// the id, and the model has nothing else to go on.
 fn detached_line(id: JobId) -> String {
-    format!(
-        "[still running — detached as {}; you will be told when it finishes]",
-        jobs::label(id)
-    )
+    format!("[still running — detached as {id}; you will be told when it finishes]")
 }
 
 /// Hard ceiling on what one command may write to its scratch files. The model
@@ -3879,7 +3940,7 @@ fn wait_bounded(
             job.kill();
             return Ok(Ended::Stopped(stopped));
         }
-        actor.ctx.clock.sleep(Duration::from_millis(10));
+        actor.ctx.clock.sleep(jobs::POLL);
     }
 }
 
@@ -4199,6 +4260,34 @@ mod tests {
         assert!(lines.contains("mush/1 clean — nothing changed"), "{lines}");
     }
 
+    /// A running child has no outcome to print, and `#N ◐ running` alone does
+    /// not tell a parent with three children which is which. An isolated
+    /// child's branch is derivable from its id — the same `mush/<id>` every
+    /// other surface names — so the listing carries it; a shared child has no
+    /// branch of its own and gets no invented one. (The schema's "title" half
+    /// lives in the UI tree and is not a fact this listing holds.)
+    #[test]
+    fn a_running_child_names_the_branch_it_works_on() {
+        let (actor, _mailbox) = test_actor("status-running-branch");
+        let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let mut state = ActorState::default();
+        // #1 is isolated (not in `shared`), #2 runs in this workspace.
+        state.children.insert(1, tx.clone());
+        state.running.insert(1);
+        state.children.insert(2, tx);
+        state.running.insert(2);
+        state.shared.insert(2);
+
+        let lines = status_tool(&actor, &state).unwrap();
+        assert!(lines.contains("#1 ◐ running on mush/1"), "{lines}");
+        assert!(
+            lines.ends_with("#2 ◐ running"),
+            "a shared child has no branch to name: {lines}"
+        );
+        assert!(!lines.contains("mush/2"), "{lines}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// The work fact is a listing, not a signal: it starts no run and changes
     /// no transcript.
     #[test]
@@ -4467,9 +4556,12 @@ mod tests {
         let mut messages = vec![Message::system("you are mush")];
         let text = "stop spawning subagents";
 
-        // Sent the way `control message` sends it.
+        // Sent the way `control message` sends it. The child runs in this
+        // workspace (a shared child): only an isolated child has a worktree of
+        // its own that can be gone.
         let (child_tx, child_rx) = crossbeam_channel::unbounded();
         state.children.insert(1, child_tx);
+        state.shared.insert(1);
         let sent = exec_tool(
             &actor,
             &mut state,
@@ -4554,6 +4646,56 @@ mod tests {
         );
         assert_eq!(events.len(), before, "a typed nudge is not echoed twice");
         assert_eq!(messages.last().unwrap().text(), "my own words");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A landed child's worktree is gone, and its actor drops a steer with a
+    /// `Notice` only the UI sees — so `control message` must refuse instead of
+    /// promising a resume the parent would wait `wait`'s whole timeout for. The
+    /// refusal uses the words the child itself reports for a message that
+    /// reached a gone worktree, so parent and child say one thing about it.
+    #[test]
+    fn messaging_a_child_whose_worktree_is_gone_is_refused() {
+        let (actor, _events, _mailbox) = recording_actor("gone-message");
+        let mut state = ActorState::default();
+        let (child_tx, child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child_tx);
+
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Control,
+            &json!({ "id": "1", "action": "message", "text": "carry on" }),
+            &AtomicBool::new(false),
+        )
+        .unwrap_err();
+        let ToolError::Failed(refused) = refused else {
+            panic!("a message that cannot run is a failure, not a retry-later refusal");
+        };
+        assert!(refused.contains("worktree is gone"), "{refused}");
+        assert!(refused.contains("did not run"), "{refused}");
+        assert!(
+            child_rx.try_recv().is_err(),
+            "nothing is delivered to a child that cannot run it"
+        );
+        assert!(
+            !state.running.contains(&1),
+            "and the parent's books do not claim the run that will never happen"
+        );
+
+        // A shared child has no worktree of its own: the same message lands,
+        // and the books follow it.
+        state.shared.insert(1);
+        let sent = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Control,
+            &json!({ "id": "1", "action": "message", "text": "carry on" }),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(sent.contains("resumes it"), "{sent}");
+        assert!(state.running.contains(&1));
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -5640,6 +5782,45 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("2 times"), "{error}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The schema's sentence promises that `replace_all` changes every
+    /// occurrence, and the ambiguity refusal tells the model to set it. A
+    /// *top-level* flag must therefore reach the single-pair path too: it used
+    /// to be dropped on the floor (`tools::edit_text` hardcoded `false`), so
+    /// the model that took the refusal's advice re-sent the identical call and
+    /// the loop guard counted it.
+    #[test]
+    fn a_top_level_replace_all_changes_every_occurrence() {
+        let (actor, _mailbox) = test_actor("replace-all");
+        fs::write(actor.ws.root().join("f.rs"), "old();\nold(arg);\n").unwrap();
+
+        let refused = edit_tool(
+            &actor.ws,
+            &json!({ "path": "f.rs", "old_string": "old", "new_string": "new" }),
+        )
+        .unwrap_err();
+        assert!(
+            refused.contains("replace_all"),
+            "the refusal names the way out: {refused}"
+        );
+
+        let report = edit_tool(
+            &actor.ws,
+            &json!({
+                "path": "f.rs",
+                "old_string": "old",
+                "new_string": "new",
+                "replace_all": true
+            }),
+        )
+        .unwrap();
+        assert_eq!(report, "edited f.rs");
+        assert_eq!(
+            fs::read_to_string(actor.ws.root().join("f.rs")).unwrap(),
+            "new();\nnew(arg);\n"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -7184,6 +7365,126 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// `exclusive=true` is not exclusive against its own owner: a second
+    /// exclusive call from the agent that already holds the machine is refused.
+    /// The first claim's record — which names the *job* it became — is not
+    /// overwritten, so the first call's own release at its end cannot free a
+    /// machine its job still holds and let the sibling it refuses run beside it.
+    #[test]
+    fn a_second_exclusive_call_from_the_holder_is_refused() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("holder-exclusive", machine, clock);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // The first call outlives `CMD_DETACH_AFTER`, so it hands its claim to
+        // the job it becomes (the handover test above): the tool call ends, the
+        // claim is `Some(job)`.
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "cargo bench", "exclusive": true }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(report.contains("detached as #c1"), "{report}");
+        let held = Some((7, "cargo bench".to_string(), Some(JobId(1))));
+        assert_eq!(actor.ctx.registry.held(), held);
+
+        // A second exclusive call, from the same agent, is refused at once —
+        // the lock is its own, so there is no queue to sit in.
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "cargo bench --other", "exclusive": true }),
+            &cancel,
+        )
+        .unwrap_err();
+        let ToolError::Refused(why) = refused else {
+            panic!("its own lock is a refusal, not a failure of the work");
+        };
+        assert!(why.starts_with("you hold the machine"), "{why}");
+        assert!(why.contains("cargo bench"), "{why}");
+        assert!(why.contains("control stop"), "{why}");
+        assert!(
+            !why.contains("queued"),
+            "the holder never queues for its own lock: {why}"
+        );
+
+        // The machine is still held, under the first job's name: the refusal
+        // changed nothing, and the first call's release did not take the job's
+        // claim away.
+        assert_eq!(
+            actor.ctx.registry.held(),
+            held,
+            "the first claim (and the job it names) survived"
+        );
+        assert!(
+            actor.ctx.registry.machine_free_for(9).is_err(),
+            "and a sibling is still refused"
+        );
+        actor.ctx.registry.kill_all();
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// And the holder's *non-exclusive* work runs beside its own exclusive job:
+    /// the lock coordinates siblings, so the call is admitted — and it must not
+    /// re-write the holder record, because a claim it did not take would be
+    /// released at its end (the bug above), freeing the machine while the job
+    /// still runs.
+    #[test]
+    fn a_holder_runs_beside_its_own_exclusive_job_without_losing_it() {
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::hangs())
+                .runs(Script::exits(0).says("renamed it")),
+        );
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("holder-beside-own", machine, clock);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "cargo bench", "exclusive": true }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(report.contains("detached as #c1"), "{report}");
+
+        // Its own ordinary command runs beside the job it owns.
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "git diff" }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(report.contains("renamed it"), "{report}");
+        assert!(
+            !report.contains("held the machine"),
+            "the holder's own lock is not a note it needs: {report}"
+        );
+
+        assert_eq!(
+            actor.ctx.registry.held(),
+            Some((7, "cargo bench".to_string(), Some(JobId(1)))),
+            "the exempt call took no claim and released none"
+        );
+        assert!(
+            actor.ctx.registry.machine_free_for(9).is_err(),
+            "so a sibling is still refused while the benchmark runs"
+        );
+        actor.ctx.registry.kill_all();
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// A clock that lets go of the machine on its first slice: the wait's own
     /// movement ends the wait, so the queue is proved with no thread and no
     /// real time. The registry is installed after the actor is built (the
@@ -7324,6 +7625,152 @@ mod tests {
         assert!(
             actor.ctx.registry.machine_free_for(9).is_err(),
             "the root ran beside the lock; it did not take or break it"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The root is exempt from the lock, not from the rule: its *exclusive*
+    /// call meets a sibling's lock as a refusal. That refusal is immediate —
+    /// `LOCK_QUEUE` is a sibling's road and the root is never sent down it — so
+    /// the sentence must not claim the call queued.
+    #[test]
+    fn the_roots_exclusive_call_is_refused_without_queueing() {
+        // No script on the machine: a command that runs at all has spent its
+        // refusal on nothing.
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor(
+            "root-exclusive-immediate",
+            Arc::new(ScriptedMachine::new()),
+            clock.clone(),
+        );
+        let actor = Actor {
+            id: AgentId::ROOT.0,
+            ..actor
+        };
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        actor.ctx.registry.take_machine(2, "cargo bench").unwrap();
+
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "cargo bench", "exclusive": true }),
+            &cancel,
+        )
+        .unwrap_err();
+        let ToolError::Refused(why) = refused else {
+            panic!("a held lock refuses the root's exclusive claim");
+        };
+        assert!(why.starts_with("#2 holds the machine"), "{why}");
+        assert!(why.contains("you are the root"), "{why}");
+        assert!(why.contains("without queueing"), "{why}");
+        assert!(
+            !why.contains("this call queued"),
+            "the root never reaches the queue, so its refusal must not claim one: {why}"
+        );
+        assert!(
+            clock.elapsed() < LOCK_QUEUE,
+            "no queue was spent on the root: {:?}",
+            clock.elapsed()
+        );
+        assert!(
+            actor.ctx.registry.machine_free_for(9).is_err(),
+            "and the refusal took nothing from the holder"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A job mush *killed* is news: four hours of silence or a run past the
+    /// output limit is a reason to act, and the line saying why must reach the
+    /// owner's run. A *stop* is the human's doing — the line waits in the
+    /// transcript, and the owner's run is not paid for by it.
+    #[test]
+    fn a_job_mush_killed_wakes_its_owner_but_a_stop_does_not() {
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::hangs())
+                .runs(Script::hangs()),
+        );
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor("job-news", machine, clock.clone());
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut transcript = vec![Message::system("you are mush")];
+
+        // The ceiling: the job's own thread ends it, and the completion it
+        // sends must be news — the owner's run starts so it reads why.
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "cargo bench", "detach": true }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(report.contains("detached as #c1"), "{report}");
+        clock.advance(jobs::JOB_MAX_AGE + Duration::from_secs(1));
+        let (line, news) = match actor.rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(AgentMsg::CommandDone { id, line, news }) => {
+                assert_eq!(id, JobId(1));
+                (line, news)
+            }
+            _ => panic!("the job must report its own end"),
+        };
+        assert!(line.contains("ran past the 4h ceiling"), "{line}");
+        assert!(news, "the owner has to read this: {line}");
+        let folded = absorb(
+            &actor,
+            &mut state,
+            &mut transcript,
+            AgentMsg::CommandDone {
+                id: JobId(1),
+                line,
+                news,
+            },
+        );
+        assert!(
+            matches!(folded, Fold::Run),
+            "so the run that reads it starts"
+        );
+
+        // A stop: `control stop` on the second job. The line still arrives —
+        // the owner reads it whenever it next runs — but it wakes nobody.
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": "npm run dev", "detach": true }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(report.contains("detached as #c2"), "{report}");
+        assert_eq!(
+            actor.ctx.registry.stop(actor.id, JobId(2)).unwrap(),
+            "stopping job #c2"
+        );
+        let (line, news) = match actor.rx.recv_timeout(Duration::from_secs(5)) {
+            Ok(AgentMsg::CommandDone { id, line, news }) => {
+                assert_eq!(id, JobId(2));
+                (line, news)
+            }
+            _ => panic!("a stopped job reports its own end too"),
+        };
+        assert!(line.contains("stopped after"), "{line}");
+        assert!(!news, "a stop is the human's doing: no run starts: {line}");
+        let folded = absorb(
+            &actor,
+            &mut state,
+            &mut transcript,
+            AgentMsg::CommandDone {
+                id: JobId(2),
+                line,
+                news,
+            },
+        );
+        assert!(
+            matches!(folded, Fold::Idle),
+            "the line is in the transcript, and the run is not paid for"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
@@ -8055,7 +8502,10 @@ mod tests {
         let asked = model.asked();
         assert_eq!(asked.len(), 2);
         assert_eq!(asked[0].model, "test");
-        assert!(asked[0].tools > 0, "the first turn offered the tools");
+        assert!(
+            !asked[0].tool_schemas.is_empty(),
+            "the first turn offered the tools"
+        );
         let carried = asked[1].messages.last().unwrap();
         assert_eq!(carried.role, "tool");
         assert_eq!(

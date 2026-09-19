@@ -113,12 +113,19 @@ pub struct Edit {
     pub replace_all: bool,
 }
 
-/// The text `edit_file` produces: `current` with exactly one occurrence of
-/// `old` replaced by `new`. Refusing to guess is the point — a missing or
-/// ambiguous match is an error the model can correct, and a wrong edit is
-/// impossible.
-pub fn edit_text(current: &str, old: &str, new: &str, rel: &str) -> Result<String, String> {
-    apply_one(current, old, new, false, rel, None)
+/// The text `edit_file` produces for a single pair: `current` with exactly one
+/// occurrence of `old` replaced by `new` — or with *every* occurrence replaced
+/// when `replace_all` is set, which is the same promise a batch entry's flag
+/// makes. Refusing to guess is the point — a missing or ambiguous match is an
+/// error the model can correct, and a wrong edit is impossible.
+pub fn edit_text(
+    current: &str,
+    old: &str,
+    new: &str,
+    replace_all: bool,
+    rel: &str,
+) -> Result<String, String> {
+    apply_one(current, old, new, replace_all, rel, None)
 }
 
 /// Several edits applied in order, in memory, as one change.
@@ -230,8 +237,15 @@ mod tests {
     #[test]
     fn replace_all_changes_every_occurrence() {
         let file = "old_name();\nold_name(arg);\n";
-        let plain = edit_text(file, "old_name", "new_name", "f.rs").unwrap_err();
+        let plain = edit_text(file, "old_name", "new_name", false, "f.rs").unwrap_err();
         assert!(plain.contains("2 times"), "{plain}");
+        // The same flag reaches the single-pair path, not just a batch entry:
+        // the schema's sentence offers it and the refusal above tells the model
+        // to set it, so the call that *has* set it must change every occurrence.
+        assert_eq!(
+            edit_text(file, "old_name", "new_name", true, "f.rs").unwrap(),
+            "new_name();\nnew_name(arg);\n"
+        );
 
         let all = Edit {
             old: "old_name".to_string(),
@@ -286,17 +300,17 @@ mod tests {
     fn edit_text_replaces_only_an_unambiguous_match() {
         let file = "let a = 1;\nlet b = 2;\n";
         assert_eq!(
-            edit_text(file, "let b = 2;", "let b = 3;", "f.rs").unwrap(),
+            edit_text(file, "let b = 2;", "let b = 3;", false, "f.rs").unwrap(),
             "let a = 1;\nlet b = 3;\n"
         );
 
-        let missing = edit_text(file, "let c", "x", "f.rs").unwrap_err();
+        let missing = edit_text(file, "let c", "x", false, "f.rs").unwrap_err();
         assert!(missing.contains("not found"), "{missing}");
 
-        let ambiguous = edit_text(file, "let ", "const ", "f.rs").unwrap_err();
+        let ambiguous = edit_text(file, "let ", "const ", false, "f.rs").unwrap_err();
         assert!(ambiguous.contains("2 times"), "{ambiguous}");
 
-        let empty = edit_text(file, "", "x", "f.rs").unwrap_err();
+        let empty = edit_text(file, "", "x", false, "f.rs").unwrap_err();
         assert!(empty.contains("must not be empty"), "{empty}");
     }
 }
