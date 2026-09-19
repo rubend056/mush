@@ -212,6 +212,38 @@ enum Cli {
     },
 }
 
+/// The flags each attach subcommand takes, one row per subcommand, so a set is
+/// written once and every reader agrees on it: [`Cli::detect`] reads the row of
+/// the chosen subcommand before it parses any flag, and refuses one the row
+/// does not name instead of parsing it and dropping the value. `mush agents
+/// --since 3` and `mush read /w --send` used to parse with the value then
+/// dropped, and a value mush cannot use is reported by name, never ignored
+/// (finding A16's class, the rule the unknown-option arm and the second
+/// directory already follow).
+const ATTACH_FLAGS: &[(&str, &[&str])] = &[
+    ("agents", &[]),
+    ("read", &["--agent", "--since"]),
+    // `--agent` is `focus`'s alternative to the positional id.
+    ("focus", &["--agent"]),
+    ("edit", &["--agent", "--base", "--send"]),
+];
+
+/// `Ok` when [`ATTACH_FLAGS`] gives `command` this flag; otherwise the refusal,
+/// naming the flag, the subcommand that does not take it and `--help`, where
+/// the ones it does take are listed.
+fn require_flag(command: &str, flag: &str) -> Result<(), String> {
+    let owned = ATTACH_FLAGS
+        .iter()
+        .any(|(name, flags)| *name == command && flags.contains(&flag));
+    if owned {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{flag}` is not a flag for `mush {command}` (try --help)"
+        ))
+    }
+}
+
 impl Cli {
     /// Recognise a subcommand as the first argument, or `None` for the TUI's
     /// own parsing. A directory named like a subcommand is not opened this way
@@ -243,10 +275,25 @@ impl Cli {
                     positional.extend(args.map(|arg| arg.to_string()));
                     break;
                 }
-                "--agent" => agent = Some(number(args.next(), "--agent")?),
-                "--since" => since = number(args.next(), "--since")? as usize,
-                "--base" => base = number(args.next(), "--base")?,
-                "--send" => send = true,
+                // Each flag asks the table first: a value for a flag this
+                // subcommand does not take is refused before the value is even
+                // read, so the refusal always blames the flag.
+                "--agent" => {
+                    require_flag(name, "--agent")?;
+                    agent = Some(number(args.next(), "--agent")?);
+                }
+                "--since" => {
+                    require_flag(name, "--since")?;
+                    since = number(args.next(), "--since")? as usize;
+                }
+                "--base" => {
+                    require_flag(name, "--base")?;
+                    base = number(args.next(), "--base")?;
+                }
+                "--send" => {
+                    require_flag(name, "--send")?;
+                    send = true;
+                }
                 other if other.starts_with("--") => {
                     return Err(format!(
                         "unknown option `{other}` for `mush {name}` (try --help)"
@@ -462,9 +509,11 @@ fn help_text() -> String {
          \x20   mush read [DIR] [--agent N] [--since N]\n\
          \x20                         an agent's transcript lines\n\
          \x20   mush focus ID [DIR]   focus that agent, as Enter on its row does\n\
+         \x20                         (--agent N instead of the id)\n\
          \x20   mush edit [--agent N] --base R [--send] TEXT [DIR]\n\
          \x20                         set the message box's draft, or send it as the human\n\
-         \x20                         (-- ends the options, for a directory named like one)\n\
+         \x20                         (--base 0 unless given; -- ends the options, for a\n\
+         \x20                         directory named like one)\n\
          Endpoint, API key, model, and the request knobs live in\n\
          $MUSH_CONFIG or the platform config directory. That file is hand-editable,\n\
          every field is optional, and the one mush writes documents itself.\n\
@@ -1708,6 +1757,92 @@ mod tests {
         assert_eq!(parse(&["--help"]).unwrap(), None);
         assert_eq!(parse(&["/w"]).unwrap(), None);
         assert_eq!(parse(&[]).unwrap(), None);
+    }
+
+    /// A flag the chosen subcommand does not take is refused by name, in
+    /// `detect` and before any socket is touched: `mush agents --since 3`,
+    /// `mush focus 1 --base 9` and `mush read /w --send` used to parse, and the
+    /// value was then dropped on the floor — the one thing a value mush cannot
+    /// use must not be (finding A16's class, the rule the unknown-option arm
+    /// and the second directory already follow). The refusal names the flag,
+    /// the subcommand that does not take it and where its own flags are.
+    #[test]
+    fn a_flag_outside_its_subcommand_is_refused_by_name() {
+        let parse = |argv: &[&str]| {
+            Cli::detect(&argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        };
+        for (argv, flag, command) in [
+            (&["agents", "--since", "3"][..], "--since", "agents"),
+            (&["agents", "--agent", "1"][..], "--agent", "agents"),
+            (&["focus", "1", "--base", "9"][..], "--base", "focus"),
+            (&["focus", "1", "--since", "3"][..], "--since", "focus"),
+            (&["focus", "1", "--send"][..], "--send", "focus"),
+            (&["read", "/w", "--send"][..], "--send", "read"),
+            (&["read", "/w", "--base", "9"][..], "--base", "read"),
+            (&["edit", "--since", "3", "a draft"][..], "--since", "edit"),
+            // The flag is refused even where the subcommand needs a value, so
+            // `focus --base 9` blames `--base`, not the missing id.
+            (&["focus", "--base", "9"][..], "--base", "focus"),
+        ] {
+            let error = parse(argv).expect_err(&format!(
+                "`mush {command}` does not take `{flag}`, so it must be refused, not parsed"
+            ));
+            for want in [flag, command, "--help"] {
+                assert!(
+                    error.contains(want),
+                    "the refusal must name `{want}`: {error}"
+                );
+            }
+        }
+    }
+
+    /// The flags each subcommand takes, checked as a matrix: every one of the
+    /// four flags either lands for a subcommand or is refused by name, and only
+    /// the ones that subcommand owns land. The expectation is spelled out here
+    /// rather than read from [`ATTACH_FLAGS`], so the test states the contract
+    /// instead of mirroring the table it checks.
+    #[test]
+    fn each_attach_subcommand_takes_exactly_the_flags_it_owns() {
+        let parse = |argv: &[&str]| {
+            Cli::detect(&argv.iter().map(|arg| arg.to_string()).collect::<Vec<_>>())
+        };
+        let owned: &[(&str, &[&str])] = &[
+            ("agents", &[]),
+            ("read", &["--agent", "--since"]),
+            ("focus", &["--agent"]),
+            ("edit", &["--agent", "--base", "--send"]),
+        ];
+        for &(command, takes) in owned {
+            for flag in ["--agent", "--since", "--base", "--send"] {
+                // Everything the subcommand needs besides the flag under test,
+                // so acceptance turns on the flag alone: `focus` gets an id
+                // unless `--agent` is the id it is testing, and `--send` is the
+                // one flag that takes no value.
+                let mut argv = vec![command];
+                if command == "focus" && flag != "--agent" {
+                    argv.push("1");
+                }
+                argv.push(flag);
+                if flag != "--send" {
+                    argv.push("1");
+                }
+                if command == "edit" {
+                    argv.push("a draft");
+                }
+                let parsed = parse(&argv);
+                if takes.contains(&flag) {
+                    assert!(
+                        parsed.is_ok(),
+                        "`mush {command}` takes `{flag}`: {parsed:?}"
+                    );
+                } else {
+                    assert!(
+                        parsed.is_err(),
+                        "`mush {command}` does not take `{flag}`: {parsed:?}"
+                    );
+                }
+            }
+        }
     }
 
     /// The CLI builds the one request line its subcommand means, and echoes it
