@@ -17,6 +17,7 @@ mod lock;
 mod machine;
 mod model;
 mod session_save;
+mod theme;
 mod ui;
 
 use std::error::Error;
@@ -513,8 +514,8 @@ fn unreadable_session_notice(
 /// `.mush/`, no request to an endpoint. This is what makes a hand-edited home
 /// file debuggable, and the only way to see the precedence chain rather than
 /// guess at it.
-fn print_config(config: &Config) {
-    for (field, value) in describe(config, auto_approve()) {
+fn print_config(config: &Config, theme: &theme::Theme) {
+    for (field, value) in describe(config, auto_approve(), theme) {
         println!("{field:<13}{value}");
     }
 }
@@ -522,7 +523,7 @@ fn print_config(config: &Config) {
 /// One `field  value` line per fact, in the order a human reads them. The
 /// values are what a request will carry, not what some file wished for; the
 /// window is the one fact whose *source* matters, so it is named.
-fn describe(config: &Config, approved: bool) -> Vec<(String, String)> {
+fn describe(config: &Config, approved: bool, theme: &theme::Theme) -> Vec<(String, String)> {
     let key = match config.api_key.as_deref().filter(|key| !key.is_empty()) {
         Some(key) => format!("{} (masked)", mask_key(key)),
         None => "(none)".to_string(),
@@ -592,6 +593,10 @@ fn describe(config: &Config, approved: bool) -> Vec<(String, String)> {
         ("reply cap".to_string(), reply_cap),
         ("api key".to_string(), key),
         ("auto-approve".to_string(), approve.to_string()),
+        // What the chrome would look like, hue and source together: a human
+        // comparing two windows needs the fact `--print-config` shows to be
+        // the one the window would have, environment included.
+        ("theme".to_string(), theme.describe()),
     ]
 }
 
@@ -626,17 +631,32 @@ fn run() -> Result<(), Box<dyn Error>> {
         .into());
     }
 
+    // The three variables the theme decision reads, read once, here at the
+    // edge; `theme::Theme::resolve` below is a pure function of them and a
+    // path, so nothing further down touches the process environment.
+    let env = theme::EnvText::read();
+
     if args.print_config {
         // The resolved config, then out: no terminal is entered, no `.mush/` is
         // created, and no request is made. The workspace's stored session is
         // still read, because it is a layer of the precedence being shown.
+        //
+        // The theme is a fact about what the window would look like, so it is
+        // resolved here too — from the same directory argument, tolerating one
+        // that does not canonicalize yet, because this dump describes a
+        // workspace that may not exist.
         let stored = Session::load(&dir);
         let config = config::resolve(&overrides, &UserConfig::load(), stored.as_ref())?;
-        print_config(&config);
+        let theme = theme::Theme::resolve(&env, &dir)?;
+        print_config(&config, &theme);
         return Ok(());
     }
 
     let workspace = Workspace::new(&dir)?;
+    // One hue per workspace, from the canonical root `Workspace::new` just
+    // resolved: two spellings of one directory are one window in one colour,
+    // and the hue is handed to every frame below rather than re-derived.
+    let theme = theme::Theme::resolve(&env, workspace.root())?;
     session::ensure_mush_dir(workspace.root())?;
     // One mush per workspace, taken before anything is read or written: a
     // second process on this directory would write the same `session.json`, and
@@ -736,7 +756,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     if let Ok(size) = guard.terminal.size() {
         app.set_term_size(size.width, size.height);
     }
-    let result = event_loop(&mut guard.terminal, &mut app, &rx);
+    let result = event_loop(&mut guard.terminal, &mut app, &rx, &theme);
     drop(guard);
     result
 }
@@ -745,6 +765,7 @@ fn event_loop(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     app: &mut App,
     rx: &Receiver<Msg>,
+    theme: &theme::Theme,
 ) -> Result<(), Box<dyn Error>> {
     /// The most input events consumed before a frame is painted. A pasted
     /// megabyte is thousands of key events, and painting once at the end is
@@ -798,7 +819,7 @@ fn event_loop(
             // on screen cannot be a second derivation of the state it draws.
             terminal.draw(|frame| {
                 let screen = app.screen(frame.area());
-                ui::draw(frame, &screen)
+                ui::draw(frame, &screen, theme)
             })?;
             app.dirty_screen = false;
         }
@@ -1066,7 +1087,7 @@ mod tests {
         cfg.reasoning_effort = Some(config::ReasoningEffort::Max);
         cfg.thinking = Some(config::ThinkingMode::Off);
 
-        let lines = describe(&cfg, true);
+        let lines = describe(&cfg, true, &theme::Theme::default());
         let field = |name: &str| {
             lines
                 .iter()
@@ -1095,7 +1116,7 @@ mod tests {
         // under the name every endpoint documents.
         let plain = Config::new("http://host:1", "", None);
         let cap = plain.reply_cap();
-        let plain = describe(&plain, false);
+        let plain = describe(&plain, false, &theme::Theme::default());
         let field = |name: &str| {
             plain
                 .iter()
@@ -1125,7 +1146,7 @@ mod tests {
         // the thinking mode are sent, and the line says whose they are.
         let mut preset = Config::new("https://api.deepseek.com", "deepseek-flash", None);
         preset.provider = config::Provider::DeepSeek;
-        let preset = describe(&preset, false);
+        let preset = describe(&preset, false, &theme::Theme::default());
         let field = |name: &str| {
             preset
                 .iter()
@@ -1137,6 +1158,46 @@ mod tests {
         assert_eq!(field("thinking"), "on (the provider's default)");
     }
 
+    /// The theme row says what a window would look like: the hue, the form the
+    /// terminal would paint it in, and whether the workspace path or
+    /// `MUSH_THEME` chose it. The fixed palette says it is fixed, rather than
+    /// naming a hue nobody chose.
+    #[test]
+    fn describe_reports_the_theme_a_window_would_wear() {
+        let cfg = Config::new("http://host:1", "m", None);
+        let value = |theme: &theme::Theme| {
+            describe(&cfg, false, theme)
+                .into_iter()
+                .find(|(field, _)| field == "theme")
+                .map(|(_, value)| value)
+                .expect("no `theme` line")
+        };
+        assert_eq!(value(&theme::Theme::default()), "none (fixed colours)");
+
+        let env = theme::EnvText {
+            theme: None,
+            colorterm: Some("truecolor".to_string()),
+            term: None,
+        };
+        let themed = theme::Theme::resolve(&env, std::path::Path::new("/work")).unwrap();
+        let name = themed.hue().unwrap().name;
+        assert_eq!(
+            value(&themed),
+            format!("{name} (truecolor, from the workspace path)")
+        );
+
+        // A named hue names `MUSH_THEME` as its source, and an indexed form is
+        // said as indexed — the row cannot claim a truecolor paint a 256-colour
+        // terminal would not make.
+        let env = theme::EnvText {
+            theme: Some("teal".to_string()),
+            colorterm: None,
+            term: None,
+        };
+        let named = theme::Theme::resolve(&env, std::path::Path::new("/work")).unwrap();
+        assert_eq!(value(&named), "teal (indexed, MUSH_THEME)");
+    }
+
     /// An id an endpoint chose — adopted from `/v1/models`, or restored from
     /// the session — must not rename the terminal through `--print-config`.
     /// The row carries the id itself, defanged by the same door the facts line
@@ -1146,7 +1207,7 @@ mod tests {
     fn describe_defangs_the_model_an_endpoint_named() {
         let hostile = "boom\rREST \x1b]0;PWNED\x07\x1b[2J\x1b[Hmock";
         let cfg = Config::new("http://x:1", hostile, None);
-        let lines = describe(&cfg, false);
+        let lines = describe(&cfg, false, &theme::Theme::default());
         let model = lines
             .iter()
             .find(|(field, _)| field == "model")
@@ -1172,7 +1233,7 @@ mod tests {
         config.rederive_context();
         assert!(!config.context_explicit, "a default, not a statement");
 
-        let lines = describe(&config, false);
+        let lines = describe(&config, false, &theme::Theme::default());
         let field = |name: &str| {
             lines
                 .iter()
