@@ -198,6 +198,37 @@ fn cut_off_notice() -> String {
         .to_string()
 }
 
+/// What a root transcript the cap cut says on the screen: the half of the
+/// record a human is actually looking at.
+///
+/// The durable half is [`Session::truncated`], which the file carries; this
+/// half exists because a pane that begins with the newest part of a
+/// conversation reads exactly like a conversation that began there, and the
+/// root is the human's own scrollback. Children get no line: their truncation
+/// is what lets a whole tree survive a restart, and a child's brief still opens
+/// the transcript it keeps.
+fn truncation_notice(dropped: session::Dropped) -> String {
+    format!(
+        "the stored conversation was cut at its cap — its oldest {} messages ({}) are not in the file",
+        dropped.messages,
+        size_label(dropped.bytes),
+    )
+}
+
+/// A byte count the way a notice wants it: whole units, because the cap is not
+/// a byte-exact ceiling and a decimal would claim a precision it does not have.
+fn size_label(bytes: usize) -> String {
+    const MIB: usize = 1024 * 1024;
+    const KIB: usize = 1024;
+    if bytes >= MIB {
+        format!("{} MiB", bytes / MIB)
+    } else if bytes >= KIB {
+        format!("{} KiB", bytes / KIB)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
 /// `/help`: the key table, then the command table.
 ///
 /// Both tables are the same one source their CLI counterparts print —
@@ -444,9 +475,14 @@ impl App {
         session_save: Arc<dyn SessionSave>,
     ) -> Self {
         let system = Message::system(prompt::system_prompt(&ws.root_str()));
-        let (messages, stored_agents, stored_notices) = match stored {
-            Some(session) => (session.messages, session.agents, session.notices),
-            None => (Vec::new(), Vec::new(), Vec::new()),
+        let (messages, stored_agents, stored_notices, truncated) = match stored {
+            Some(session) => (
+                session.messages,
+                session.agents,
+                session.notices,
+                session.truncated,
+            ),
+            None => (Vec::new(), Vec::new(), Vec::new(), None),
         };
         let mut app = Self {
             ws,
@@ -478,6 +514,14 @@ impl App {
         // The failures come back before the agents do, because the agent that
         // went back to idle takes its line with it (see `restore_agents`).
         app.chat.restore_notices(stored_notices);
+        // A root the file cut is the transcript the human scrolls back through,
+        // and it does not begin where the conversation did. The marker is
+        // adopted so the next save cannot quietly drop the fact; the notice is
+        // the same fact said where the human is looking.
+        app.chat.set_root_dropped(truncated);
+        if let Some(dropped) = truncated {
+            app.chat.note_for(AgentId::ROOT, truncation_notice(dropped));
+        }
         app.restore_agents(stored_agents);
         app.discover_worktrees();
         app.refresh_git();
@@ -2272,6 +2316,7 @@ impl App {
                 .then_some(self.cfg().context_tokens),
             updated: session::now_secs(),
             messages: self.chat.transcript(AgentId::ROOT).to_vec(),
+            truncated: self.chat.root_dropped(),
             agents,
             // A failure is the one line worth coming back to; a command's answer
             // is not (see `Chat::stored_notices`).
@@ -3550,6 +3595,7 @@ mod tests {
             context: None,
             updated: 0,
             messages: vec![Message::user("the root task")],
+            truncated: None,
             agents: vec![session::AgentSession {
                 id: 2,
                 parent: Some(0),
@@ -3607,6 +3653,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A stored root the cap cut tells the human so: a pane that begins with
+    /// the newest part of a conversation reads exactly like a conversation that
+    /// began there, and the root is the human's own scrollback. The marker
+    /// rides back into the next save too, or one quiet write after the restart
+    /// would relabel the file as whole.
+    #[test]
+    fn a_truncated_stored_root_says_so_and_keeps_its_marker() {
+        let root = dir("truncated-root");
+        let marker = session::Dropped {
+            messages: 12,
+            bytes: 3 * 1024 * 1024,
+        };
+        let mut stored = stored_with_agent(
+            &root,
+            session::StoredStatus::Done,
+            vec![Message::user("port the parser")],
+        );
+        stored.truncated = Some(marker);
+        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+        assert_eq!(app.chat.root_dropped(), Some(marker));
+        let lines: Vec<&str> = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .map(|notice| notice.text.as_str())
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("12 messages") && line.contains("3 MiB")),
+            "the pane must say what the file no longer holds: {lines:?}"
+        );
+        assert_eq!(
+            app.session_snapshot().truncated,
+            Some(marker),
+            "and the save after the restart still marks the conversation as cut"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// A stored conversation with one agent, for the restore path.
     fn stored_with_agent(
         root: &std::path::Path,
@@ -3621,6 +3707,7 @@ mod tests {
             context: None,
             updated: 0,
             messages: vec![Message::user("the root task")],
+            truncated: None,
             agents: vec![session::AgentSession {
                 id: 2,
                 parent: Some(0),
