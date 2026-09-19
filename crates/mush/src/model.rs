@@ -634,6 +634,14 @@ pub(crate) mod fake {
 
     /// One reply from the endpoint: this message, and this finish reason.
     pub fn reply(message: Message, finish_reason: &str) -> ChatResponse {
+        // The real client builds a reply from the response body, so the fake
+        // goes through the same deserializer: a scripted message reaches the
+        // run loop in the shape the wire would give it — a call with no id
+        // gets one there, not in the loop — rather than in a shape no
+        // endpoint could send.
+        let message =
+            serde_json::from_value(serde_json::to_value(message).expect("a message serializes"))
+                .expect("a serialized message deserializes");
         ChatResponse {
             choices: vec![Choice {
                 message,

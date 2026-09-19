@@ -295,12 +295,10 @@ mod tests {
     /// A session with one user message, so which snapshot landed is readable.
     fn saying(text: &str) -> Session {
         Session {
-            root: String::new(),
             model: "test-model".into(),
             provider: "custom".into(),
             base_url: "http://127.0.0.1:1".into(),
             context: None,
-            updated: 0,
             messages: vec![Message::user(text)],
             agents: Vec::new(),
             notices: Vec::new(),

@@ -189,15 +189,6 @@ impl Message {
         self.tool_calls.as_deref().unwrap_or(&[])
     }
 
-    /// See `assign_tool_call_ids`: every call gets an id a strict server
-    /// accepts, and its result can then answer an id that exists. Idempotent,
-    /// so a message that already has unique ids comes out unchanged.
-    pub fn ensure_tool_call_ids(&mut self) {
-        if let Some(calls) = self.tool_calls.as_mut() {
-            assign_tool_call_ids(calls);
-        }
-    }
-
     /// Rough size in bytes, used for history budgeting. The reasoning is
     /// counted: it goes back out with the turn, so it is part of what the
     /// request costs.
@@ -434,21 +425,22 @@ mod tests {
         assert_eq!(ids, ["call_1", "call_0"], "the existing id is never taken");
     }
 
-    /// Normalizing is idempotent: a batch that already has unique ids — every
-    /// call mush got from a well-behaved endpoint — is left exactly as it was.
+    /// Normalizing happens on the way in and only there: a batch that already
+    /// has unique ids — every call mush got from a well-behaved endpoint — is
+    /// left exactly as it was.
     #[test]
     fn unique_tool_call_ids_are_left_alone() {
-        let mut message: Message = serde_json::from_str(
+        let message: Message = serde_json::from_str(
             r#"{"role":"assistant","tool_calls":[
                  {"id":"call_a","type":"function","function":{"name":"ls","arguments":"{}"}},
                  {"id":"call_1","type":"function","function":{"name":"ls","arguments":"{}"}}
                ]}"#,
         )
         .unwrap();
-        let before = serde_json::to_string(&message).unwrap();
-        message.ensure_tool_call_ids();
-        message.ensure_tool_call_ids();
-        assert_eq!(serde_json::to_string(&message).unwrap(), before);
+        assert_eq!(
+            serde_json::to_string(&message).unwrap(),
+            r#"{"role":"assistant","tool_calls":[{"id":"call_a","type":"function","function":{"name":"ls","arguments":"{}"}},{"id":"call_1","type":"function","function":{"name":"ls","arguments":"{}"}}]}"#
+        );
     }
 
     /// A reply may report its own token counts; what mush *sends* never does,

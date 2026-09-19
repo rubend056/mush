@@ -71,10 +71,10 @@ pub fn needs_compaction(messages: &[Message], budget_bytes: usize) -> bool {
 pub fn repair_tool_pairs(messages: &mut Vec<Message>) {
     let mut index = 0;
     while index < messages.len() {
-        // Normalize before pairing: a transcript adopted from an older session
-        // may hold a call with no id, and a result has to answer an id that
-        // exists. Idempotent, so a valid transcript is untouched.
-        messages[index].ensure_tool_call_ids();
+        // Ids are not normalized here: every message parsed from the wire or
+        // from `session.json` already got them in `Message`'s own deserializer
+        // (`tool_calls_from_wire`), and nothing else builds a message with
+        // tool calls.
         let calls: Vec<String> = messages[index]
             .tool_calls()
             .iter()
@@ -132,12 +132,10 @@ pub fn repair_tool_pairs(messages: &mut Vec<Message>) {
 /// the whole request with a parse error; rewrite invalid arguments to `{}` so
 /// the tool executor returns a clear per-call error instead.
 ///
-/// The same pass gives every call an id a strict server accepts, because the
-/// id is what pairs a call with its result: a batch that arrives with a missing
-/// or repeated id would otherwise be answered with `tool_call_id: ""` (or the
-/// duplicate) and be rejected.
+/// The ids are already the deserializer's (`tool_calls_from_wire`): a batch
+/// with a missing or repeated id got one there, so it cannot arrive here as
+/// `tool_call_id: ""` for the result to answer.
 pub fn sanitize_tool_calls(mut message: Message) -> Message {
-    message.ensure_tool_call_ids();
     let Some(calls) = message.tool_calls.as_mut() else {
         return message;
     };
@@ -373,45 +371,26 @@ mod tests {
         assert_eq!(serde_json::to_string(&messages).unwrap(), before);
     }
 
-    /// Every reply the run loop sanitizes leaves with a non-empty, unique id
-    /// per call — the ids its results will answer.
-    #[test]
-    fn sanitize_gives_every_call_an_id_to_answer() {
-        let mut message = Message::assistant("working");
-        message.tool_calls = Some(vec![call(""), call("dup"), call("dup")]);
-        let repaired = sanitize_tool_calls(message);
-        let ids: Vec<&str> = repaired
-            .tool_calls()
-            .iter()
-            .map(|c| c.id.as_str())
-            .collect();
-        assert!(!ids.iter().any(|id| id.is_empty()), "{ids:?}");
-        let mut unique = ids.clone();
-        unique.sort_unstable();
-        unique.dedup();
-        assert_eq!(unique.len(), ids.len(), "{ids:?}");
-        // The message that goes back into history carries the same ids the run
-        // answers, so the pairing the server checks is exact.
-        let sent = serde_json::to_string(&repaired).unwrap();
-        for id in &ids {
-            assert!(sent.contains(&format!("\"id\":\"{id}\"")), "{sent}");
-        }
-    }
-
-    /// An adopted transcript whose call has no id is repaired the same way, so
-    /// the error result inserted for a dangling call answers a real id.
+    /// An adopted transcript whose call arrived with no id is answered with the
+    /// id the deserializer gave it, so the error result inserted for a dangling
+    /// call answers a real id.
     #[test]
     fn a_dangling_call_with_no_id_is_answered_with_one() {
-        let mut messages = vec![
-            Message::system("you are mush"),
-            Message::user("task"),
-            assistant_calling(&[""]),
-        ];
+        let mut messages: Vec<Message> = serde_json::from_str(
+            r#"[
+                 {"role":"system","content":"you are mush"},
+                 {"role":"user","content":"task"},
+                 {"role":"assistant","tool_calls":[
+                    {"type":"function","function":{"name":"read_file","arguments":"{}"}}
+                 ]}
+               ]"#,
+        )
+        .unwrap();
         repair_tool_pairs(&mut messages);
 
         assert_eq!(roles(&messages), ["system", "user", "assistant", "tool"]);
         let id = messages[2].tool_calls()[0].id.clone();
-        assert!(!id.is_empty(), "the call was given an id");
+        assert_eq!(id, "call_0", "the deserializer named the call");
         assert_eq!(messages[3].tool_call_id.as_deref(), Some(id.as_str()));
         assert!(messages[3].text().starts_with("error:"));
     }

@@ -154,7 +154,6 @@ pub struct StoredNotice {
 /// deliberately NOT stored — it comes from the environment or `/key` each run.
 #[derive(Default, Serialize, Deserialize)]
 pub struct Session {
-    pub root: String,
     pub model: String,
     /// Provider name as given by [`Provider::name`], i.e. a name
     /// `--provider` accepts (see `provider::PROVIDERS`).
@@ -168,7 +167,6 @@ pub struct Session {
     /// re-read from the endpoint, so a stale guess cannot outlive its cause.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<usize>,
-    pub updated: u64,
     pub messages: Vec<Message>,
     /// The subagents this conversation had, so their context outlives the
     /// process. Old sessions have none and still load.
@@ -272,11 +270,7 @@ impl Session {
     /// *unreadable* (see [`Stored`]). Callers that only need the conversation —
     /// the config precedence, a test — want [`Self::load`].
     pub fn read(root: &Path) -> Stored {
-        Self::read_from(&session_path(root))
-    }
-
-    pub fn read_from(path: &Path) -> Stored {
-        let bytes = match fs::read(path) {
+        let bytes = match fs::read(session_path(root)) {
             Ok(bytes) => bytes,
             // No file is not a file mush cannot use: a workspace nobody has
             // opened yet must stay silent.
@@ -297,11 +291,7 @@ impl Session {
     /// cases must not be indistinguishable to the caller that overwrites the
     /// file.
     pub fn load(root: &Path) -> Option<Self> {
-        Self::load_from(&session_path(root))
-    }
-
-    pub fn load_from(path: &Path) -> Option<Self> {
-        match Self::read_from(path) {
+        match Self::read(root) {
             Stored::Loaded(session) => Some(session),
             Stored::Absent | Stored::Unusable(_) => None,
         }
@@ -319,7 +309,10 @@ impl Session {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let json = serde_json::to_vec_pretty(&self).unwrap_or_else(|_| b"{}".to_vec());
+        // A serialization failure is an error like any other: the writer's
+        // error channel two files away is where the human hears about it, and a
+        // session replaced by `{}` would be a save reporting success.
+        let json = serde_json::to_vec_pretty(&self).map_err(std::io::Error::other)?;
         crate::workspace::atomic_write(&path, &json)
     }
 }
@@ -462,12 +455,10 @@ mod tests {
     /// rather than about the fields.
     fn saying(text: &str) -> Session {
         Session {
-            root: String::new(),
             model: "test".into(),
             provider: "custom".into(),
             base_url: String::new(),
             context: None,
-            updated: 0,
             messages: vec![Message::user(text)],
             agents: Vec::new(),
             notices: Vec::new(),
@@ -493,12 +484,10 @@ mod tests {
         ensure_mush_dir(&root).unwrap();
 
         let session = Session {
-            root: root.display().to_string(),
             model: "test".into(),
             provider: "custom".into(),
             base_url: "http://localhost:9".into(),
             context: Some(123_456),
-            updated: now_secs(),
             messages: vec![
                 Message::user("hello"),
                 Message {
@@ -563,7 +552,9 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Old sessions have no context field; they must still load.
+    /// Old sessions have no context field; they must still load. So must the
+    /// `root` and `updated` keys every file written before those fields were
+    /// dropped still carries — an unknown key is not a broken session.
     #[test]
     fn a_session_without_a_context_loads() {
         let root = std::env::temp_dir().join(format!("mush-session3-{}", std::process::id()));
