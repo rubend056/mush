@@ -22,14 +22,23 @@ landed in between (S5 in `README.md`/`docs/mush.md` §4; S8's (iii)).
 
 ## The open queue
 
-The row tables still owe two items; the structural queue in `docs/refactor.md`
+The row tables still owe four items; the structural queue in `docs/refactor.md`
 sits beside them. This is the one list: each row carries what the defect costs
 and where the fix belongs, and a closure is recorded on the row, never here.
 
 - **H10** — a `mush prune`; nothing reclaims a finished, merged worktree and
-  its branch.
+  its branch. **The specimen arrived (§8.21):** `mush/2` and `mush/3` were this
+  session's own children's merged work, checkouts long gone, still named in
+  `git branch` — and still fatal to the next isolated spawn. The reclaim rule is
+  decided: merged-or-clean only, never an unmerged branch, and mush never
+  merges on its own; `MAX_WORKTREES = 70`, above the history window, so a spawn
+  is never refused for want of a slot.
 - **H12** — per-agent token accounting, so a run's cost is visible while it is
   spent.
+- **H16** — a save re-serializes the whole conversation once a second, and
+  nothing bounds a transcript's stored size (§8.21).
+- **H17** — one counter for children and jobs, and the number an isolated spawn
+  burns when git refuses its worktree (§8.21).
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -570,3 +579,91 @@ table.
 
 **Census at `960e073`:** total 41,447 (was 41,343), **prod 7,568 (+34)**, tests
 21,531 (+28), comments 9,635 (+35).
+
+---
+
+## 8.21 Observed live: the counter that skips, and the file that never forgets (H16, H17, `6fc7435`)
+
+The human asked three questions from the other side of a screen: why a run's
+children are numbered with gaps, how long a child lives, and why a second
+session's `session.json` had reached 100 MB and was rewritten on every
+conversation. All three were answered against a live session — the one
+orchestrating this repository — and the source behind it. Two read-only
+instruments came out of it and are in `scripts/`: `inspect_run.py` (the
+process: the tree, the fds, every socket fd joined back from `ss` by inode, and
+samples that turn `write_bytes` into the amplification factor of a save) and
+`session_blame.py` (where a session file's bytes are). Both name what they
+measure; neither connects to the socket, because a byte injected into a live
+session is a real message.
+
+**The counter is shared on purpose, and that is most of the gap.** One
+`Arc<AtomicU64>` per conversation (`agent.rs:911`) is cloned into every actor,
+the tree, the UI handle and the job registry, and is indexed from exactly two
+places: `spawn_tool` (`agent.rs:2693`) and `Registry::launch` (`jobs.rs:802`).
+Children render `#N` and jobs `#cN` (`jobs.rs:119`), so a session that ran
+twelve detached commands shows children `1, 2, 14, 15, …` with nothing wrong
+anywhere. Two residues widen the jumps:
+
+- **H17 — the number is spent before git can fail.** The id is taken at
+  `agent.rs:2693`, and both failure arms of the worktree it then asks for
+  (`agent.rs:2695-2705`) return *after* it: an error to the model, no node, no
+  trace, and a gap on the screen that nothing explains.
+- **A branch with no checkout reserves nothing.** `discover_worktrees` skips a
+  `mush/<id>` whose `on_disk()` checkout is gone (`git.rs:186-205`,
+  `app/mod.rs:737-744`), so it never reaches `reserve_ids` (`app/tree.rs:660`)
+  — while `git worktree add -b mush/<id>` still refuses the name
+  (`git.rs:277-305`). §8.15's P13 fixed the registry side of this; the branch
+  side is what was left. Found live here: `mush/2` and `mush/3` were this
+  session's own children's merged work (`1d84477`, `25a092c`), and the next
+  isolated spawn died on `a branch named 'mush/2' already exists` until they
+  were deleted by hand. They are also **H10's missing specimen**: merged, never
+  reclaimed, invisible until git refused to reuse the name.
+
+**H16 — a save carries the whole conversation, and nothing bounds it.**
+`session_snapshot` (`app/mod.rs:2201-2270`) deep-copies the root transcript and
+every child's on the UI thread; `Session::save` (`mush-core/src/session.rs:310-317`)
+serializes the lot and writes it as one file, once per
+`SESSION_DEBOUNCE = 1s` while anything is dirty (`app/mod.rs:287`, `:873-887`).
+A transcript folds only when its own endpoint window fills (`transcript.rs:46`,
+`config.rs:403` — about 284 KB of history at the large window), a *finished*
+child is never folded again, and the number of children is bounded by nothing:
+`MAX_AGENTS = 16` counts **running** agents (`agent.rs:150`, `:2636`) and
+`MAX_DEPTH = 3` bounds depth, not breadth. The file is therefore the sum over
+every child the run ever had.
+
+Measured here, on one child: that child's transcript alone was 318.9 KiB of a
+675 KiB session after ~80 messages; `agents` outweighed `messages`; the file
+grew 73 KiB → 675 KiB in 25 minutes of work; and a five-second window showed
+0.82 MiB written for a 0.41 MiB file — one full rewrite per save, 2.0x. Two
+suspects are cleared by measurement rather than argument: indentation costs
+1.03x (the payload is long strings), and the writer's own thread is not the
+cost — the cost is the *size of what each save carries*.
+
+**Decisions taken by the human, this wave:**
+
+- A cap on what a save carries: 256 KiB of stored transcript per child, and a
+  high ceiling on the root — the human's own words may be trimmed, but never
+  silently: a cut file must read as cut.
+- **No archives.** *Everything needs a cap, even a high one*; an archive of
+  children is one more lifetime to reason about, so the reaped transcript is
+  gone.
+- `MAX_WORKTREES = 70` — above the 50-child window, so reaping history can
+  never be what refuses a spawn.
+- Jobs: a 4-hour ceiling and 200 concurrent, with the per-command output budget
+  made shared rather than per-job (200 x `CMD_OUTPUT_LIMIT` = 8 MiB would
+  otherwise be a legal 1.6 GiB of scratch).
+- Worktree reclamation is automatic **merged-or-clean only**: an unmerged or
+  dirty branch is kept and named, and mush never merges anything itself.
+
+**Where the patches are:** the id split and the job hygiene one-liners are in
+flight on `mush/4`; the session bound is in flight on `mush/5`; child reaping
+(`Chat::forget`, actor parking, the last-50 window) and worktree reclamation
+(the residue pass over `discover_worktrees`, `git::reclaim`) follow in their own
+worktrees, each with tests — the human's condition on the reclamation was
+"thorough testing" before it touches a branch.
+
+**Census at `6fc7435`:** total 42,702 (was 41,447 at `960e073`), **prod 7,013**,
+tests 22,705, comments 10,177. The deltas belong to the repository's own commits
+between those two points — this section added no Rust (its instruments are
+Python, which the census does not count), and the prod column is down because
+the wave's lines went to tests and comments, the trade §8.5 warns about.
