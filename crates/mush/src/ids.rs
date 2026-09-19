@@ -23,7 +23,7 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Which agent, in the tree.
 ///
@@ -74,19 +74,32 @@ const LOST_POOL: usize = 8;
 /// by the UI's own handles.
 ///
 /// `Clone` is the sharing: the actors, the tree, the registry and the root
-/// handle each hold a copy of the same pair of atomics, because there is one
+/// handle each hold a copy of the same pair of counters, because there is one
 /// conversation and therefore one answer to "which id is next".
 #[derive(Clone)]
 pub struct Ids {
-    /// The next agent number if none was handed back.
-    agents: Arc<AtomicU64>,
+    /// The agent numbers: the counter and the numbers handed back, under one
+    /// lock, because drawing one and retiring one are one question — see
+    /// [`Ids::next_agent`].
+    agents: Arc<Mutex<Agents>>,
     /// The next job number. Jobs are never handed back: a launch that got as
     /// far as an id has a record and possibly a process group behind it.
     jobs: Arc<AtomicU64>,
+}
+
+/// The agent space: the next number, and the numbers a failed spawn gave back.
+///
+/// This used to be an atomic beside a locked pool, so a draw read the counter
+/// and the pool under two locks while [`Ids::reserve_agents`] retired numbers
+/// against the same counter from the other side: a number the repository had
+/// just named could be handed out of the pool in the window between the two
+/// (finding B1's invariant, one lock late). One lock, one answer.
+#[derive(Default)]
+struct Agents {
+    /// The next agent number if none was handed back.
+    counter: u64,
     /// Numbers a failed spawn gave back, newest last: see [`Ids::lose_agent`].
-    /// A `Mutex` rather than a channel because the pool is read exactly once
-    /// per allocation and never waited on.
-    lost: Arc<Mutex<Vec<u64>>>,
+    lost: Vec<u64>,
 }
 
 /// The counters start at 1, not at 0: agent 0 is the root, and a first child
@@ -98,9 +111,11 @@ pub struct Ids {
 impl Default for Ids {
     fn default() -> Self {
         Self {
-            agents: Arc::new(AtomicU64::new(1)),
+            agents: Arc::new(Mutex::new(Agents {
+                counter: 1,
+                lost: Vec::new(),
+            })),
             jobs: Arc::new(AtomicU64::new(1)),
-            lost: Arc::new(Mutex::new(Vec::new())),
         }
     }
 }
@@ -110,17 +125,21 @@ impl Ids {
     ///
     /// The pool is popped first so a retry after a refusal is consecutive —
     /// nothing was created under the lost number, so nothing can collide with
-    /// it. A pooled number below the counter's floor (a leftover branch naming
-    /// it was found after it was lost) is not ours any more and is dropped
-    /// rather than handed out.
+    /// it. Everything in the pool is below the counter by construction
+    /// ([`Ids::lose_agent`] pushes nothing else and the counter only grows), and
+    /// a number the repository has named since is retired by
+    /// [`Ids::reserve_agents`] rather than handed out: draw and retire take the
+    /// same lock, so neither can happen inside the other.
     pub fn next_agent(&self) -> AgentId {
-        let mut lost = self.lost();
-        while let Some(id) = lost.pop() {
-            if id < self.agents.load(Ordering::SeqCst) {
-                return AgentId(id);
+        let mut agents = self.agents();
+        match agents.lost.pop() {
+            Some(id) => AgentId(id),
+            None => {
+                let id = agents.counter;
+                agents.counter += 1;
+                AgentId(id)
             }
         }
-        AgentId(self.agents.fetch_add(1, Ordering::SeqCst))
     }
 
     /// Give a number back: the spawn it was drawn for failed before git could
@@ -133,11 +152,11 @@ impl Ids {
     /// branch would make the next `add -b` fail — the very residue
     /// [`Ids::reserve_agents`] raises the floor for).
     pub fn lose_agent(&self, id: AgentId) {
-        let mut lost = self.lost();
-        if id.0 >= self.agents.load(Ordering::SeqCst) || lost.len() >= LOST_POOL {
+        let mut agents = self.agents();
+        if id.0 >= agents.counter || agents.lost.len() >= LOST_POOL {
             return;
         }
-        lost.push(id.0);
+        agents.lost.push(id.0);
     }
 
     /// Keep the agent counter above `floor`.
@@ -149,8 +168,9 @@ impl Ids {
     /// below the new floor are dropped: they are numbers with no record *here*,
     /// but the repository has since named them, which is the invariant's line.
     pub fn reserve_agents(&self, floor: u64) {
-        self.agents.fetch_max(floor, Ordering::SeqCst);
-        self.lost().retain(|id| *id >= floor);
+        let mut agents = self.agents();
+        agents.counter = agents.counter.max(floor);
+        agents.lost.retain(|id| *id >= floor);
     }
 
     /// The number the next fresh agent draw would take, without taking it.
@@ -160,7 +180,7 @@ impl Ids {
     /// not spend a number — so it exists only under `cfg(test)`.
     #[cfg(test)]
     pub fn agents_floor(&self) -> u64 {
-        self.agents.load(Ordering::SeqCst)
+        self.agents().counter
     }
 
     /// The next job id. One counter for the machine's jobs, never a pool: a job
@@ -170,12 +190,12 @@ impl Ids {
         JobId(self.jobs.fetch_add(1, Ordering::SeqCst))
     }
 
-    /// The lost-number pool. A lock poisoned by a panic elsewhere is taken as
-    /// it is — the house shape for a lock whose failure must not be fatal: the
-    /// records are not corrupted by someone else's panic, and the alternative
-    /// is a panic or a leaked id.
-    fn lost(&self) -> std::sync::MutexGuard<'_, Vec<u64>> {
-        self.lost
+    /// The agent space — the counter and the pool, one lock. A lock poisoned by
+    /// a panic elsewhere is taken as it is: the house shape for a lock whose
+    /// failure must not be fatal, because the records are not corrupted by
+    /// someone else's panic, and the alternatives are a panic or a leaked id.
+    fn agents(&self) -> MutexGuard<'_, Agents> {
+        self.agents
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -219,7 +239,8 @@ mod tests {
     #[test]
     fn a_floor_retires_lost_numbers_below_it() {
         let ids = Ids::default();
-        ids.lose_agent(AgentId(1));
+        let given = ids.next_agent();
+        ids.lose_agent(given);
         ids.reserve_agents(9);
         assert_eq!(ids.agents_floor(), 9);
         assert_eq!(ids.next_agent(), AgentId(9), "the lost #1 is not reused");
@@ -229,5 +250,16 @@ mod tests {
             10,
             "a lower floor never lowers the counter (the draw above moved it)"
         );
+
+        // A lost number the floor does not reach is still the next one out: the
+        // retire and the draw are one lock apart, not two.
+        let ids = Ids::default();
+        for _ in 0..5 {
+            ids.next_agent();
+        }
+        ids.lose_agent(AgentId(5));
+        ids.reserve_agents(4);
+        assert_eq!(ids.agents_floor(), 6);
+        assert_eq!(ids.next_agent(), AgentId(5), "the pool is still a pool");
     }
 }
