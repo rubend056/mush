@@ -1690,6 +1690,20 @@ fn request<'a>(
     request
 }
 
+/// The one spelling of a reply whose *framing* broke before it could be read —
+/// used by the run's own turn and by a fold, so the two cannot describe the same
+/// class of failure differently.
+///
+/// It names the reply, never the endpoint's opinion: this error comes from bytes
+/// that failed to frame themselves (a status line, a header, a chunk size that
+/// is not one), not from an answer the endpoint sent — [`ModelError::Refused`]
+/// is the one where the endpoint really did answer and mush is the one saying no
+/// (a body past the cap). Reporting the two as the same sentence is what told a
+/// human their endpoint refused a request it had answered (finding B27).
+fn reply_broke(base_url: &str, error: &str) -> String {
+    format!("the reply from {base_url} broke before it could be read: {error}")
+}
+
 /// One turn's ask, with the bounded retry a transport hiccup gets: the pause
 /// waits on the run's clock, the cancel flag is read between attempts, and
 /// every retry is a line in this agent's transcript rather than a spinner that
@@ -1851,12 +1865,19 @@ fn run_loop(
             // The reader stops the moment the human cancels; that is a
             // cancellation, not a failure to reach the endpoint.
             Err(ModelError::Cancelled) => return Err(CANCELLED.to_string()),
-            // A refusal — a body past `MAX_BODY_BYTES`, a malformed status or
-            // chunk line — is not a connection failure: the endpoint answered,
-            // and saying so is the difference between "check the URL" and "the
-            // reply was too big".
+            // A refusal — a body past `MAX_BODY_BYTES` — is not a connection
+            // failure: the endpoint answered, and saying so is the difference
+            // between "check the URL" and "the reply was too big".
             Err(ModelError::Refused(error)) => {
                 return Err(format!("the endpoint's reply was refused: {error}"));
+            }
+            // A reply whose framing broke is neither: it is bytes that never
+            // framed themselves, on a connection `http.rs` has already
+            // dropped. It must not be reported as the endpoint's refusal —
+            // that is what told the human to blame a healthy endpoint for a
+            // chunk line mush could not account for (finding B27).
+            Err(ModelError::Framing(error)) => {
+                return Err(reply_broke(&cfg.base_url, &error));
             }
             // Unreachable and Transport reach the human the same way; the
             // difference between them is that a Transport failure was already
@@ -2325,10 +2346,14 @@ fn compact_history(
         // The run will fail on its real request anyway; surface it. A
         // `Transport` failure got its retries here, the same as the run's own
         // ask: compaction is a model call like any other.
-        Err(ModelError::Unreachable(error))
-        | Err(ModelError::Transport(error))
-        | Err(ModelError::Refused(error)) => {
+        Err(ModelError::Unreachable(error)) | Err(ModelError::Transport(error)) => {
             return Err(format!("cannot reach {}: {error}", cfg.base_url));
+        }
+        // A reply that broke on the way in is not a connection failure either:
+        // say what it was, in the run's own words.
+        Err(ModelError::Framing(error)) => return Err(reply_broke(&cfg.base_url, &error)),
+        Err(ModelError::Refused(error)) => {
+            return Err(format!("the endpoint's reply was refused: {error}"));
         }
         Err(ModelError::Encode(error)) => return Err(format!("could not encode request: {error}")),
         // The endpoint complained, or answered something we cannot read: the
@@ -6486,6 +6511,51 @@ mod tests {
             "a refusal is not an empty reply"
         );
         assert_eq!(scripted.asked().len(), 1, "a refusal is not retried");
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// The third case of the class B23 and B25 each closed half of: a reply
+    /// whose *framing* broke used to reach the run as `Refused`, so the human
+    /// read "the endpoint's reply was refused" about a chunk line that may just
+    /// as well have been mush's own leftover — and no bounded retry touched it
+    /// (finding B27). Now the reply gets the retries the wire's failures get,
+    /// each one announced in B23's shape, and the final line names what broke:
+    /// the *reply*, never the endpoint's opinion.
+    #[test]
+    fn a_broken_frame_is_retried_and_named_as_a_broken_reply() {
+        let broken = "malformed chunk size: \"\"";
+        let frame = || ModelError::Framing(broken.to_string());
+        let scripted = Arc::new(Scripted::new().fails(frame()).fails(frame()).fails(frame()));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, events, mailbox) = scripted_actor_on_clock("framing", &scripted, clock);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("say something"),
+        ];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+
+        assert!(error.contains("broke before it could be read"), "{error}");
+        assert!(error.contains(broken), "the cause is not hidden: {error}");
+        assert!(
+            !error.contains("refused"),
+            "a broken frame is not the endpoint refusing the request: {error}"
+        );
+        assert_eq!(scripted.asked().len(), 3, "the bounded retry ran");
+        let notices: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(line) => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 2, "each retry was announced: {notices:?}");
+        assert!(notices[0].contains("retrying (2/3)"), "{notices:?}");
+        assert!(notices[1].contains("retrying (3/3)"), "{notices:?}");
         let _ = fs::remove_dir_all(actor.ws.root());
         let _ = mailbox;
     }

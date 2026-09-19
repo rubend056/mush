@@ -1228,24 +1228,22 @@ impl App {
             AgentEvent::Error(error) => {
                 self.tree.fail(id, error.clone());
                 self.refresh_git();
-                // Only the agent the human is reading needs the bar — another
-                // agent's failure is on its own row's `✗` and in its own pane's
-                // foot — and the sentence names the agent, which the foot's `!`
-                // line (already in front of the human) does not. A guard-stop
-                // is this same event (the runaway guard's `stopped after N
-                // turns…` is the run's error), so one arm covers both endings.
-                let line = (id == self.tree.focused).then(|| {
-                    // A failure is the third way a run can end, and it is the
-                    // one that did not reach the bar: `Stopped` says so,
-                    // `Failed` fell back to the idle hint, so the newest thing
-                    // that had happened could be a crash under a line
-                    // advertising Ctrl-P.
-                    format!("agent {id} failed — {error}")
-                });
+                // The failure reaches the bar *when it happens*, whoever it
+                // belongs to. It used to be the focused agent's line only —
+                // another agent's failure was on its own row's `✗` and in its
+                // own pane's foot — but a row can be scrolled out of the
+                // history window and a pane the human is not reading shows
+                // nothing, so a run could be dead for as long as it took them to
+                // look at that child (finding B27's live shape). The sentence
+                // names the agent, so the bar is unambiguous whichever pane is
+                // open. A guard-stop is this same event (the runaway guard's
+                // `stopped after N turns…` is the run's error), so one arm
+                // covers both endings.
+                let line = format!("agent {id} failed — {error}");
                 // The durable half too: the row's `✗` is derived and dies with
                 // the next run, while the notice is tagged, stamped and written
                 // to the session, so a restart still says what broke.
-                self.fail_for(id, error, line);
+                self.fail_for(id, error, Some(line));
             }
             AgentEvent::Done => {
                 let summary = self.last_assistant_text(id);
@@ -7930,6 +7928,49 @@ mod tests {
         );
     }
 
+    /// A child's run dies while the human is reading the root. The failure has
+    /// to be visible *when it happens* — the row's `✗`, the bar, and the child's
+    /// own foot — not only when something later asks the child for its state
+    /// (finding B27's live shape: an agent's run died with a framing error and
+    /// the human learned what broke from a line that blamed the endpoint).
+    #[test]
+    fn a_childs_failure_is_visible_when_it_happens() {
+        let (mut app, _rx) = test_app("child-failure-visible");
+        let _child = finished_child(&mut app, 1);
+        begin_run(&mut app, AgentId::ROOT);
+        let error = "the reply from http://127.0.0.1:1 broke before it could be \
+                     read: malformed chunk size: \"\"";
+
+        app.on_agent(AgentId(1), AgentEvent::Error(error.to_string()));
+
+        // The row: `✗`, derived the moment the event lands.
+        assert_eq!(
+            app.tree.node(AgentId(1)).map(|node| &node.phase),
+            Some(&Phase::Failed(error.to_string())),
+            "the failed child's row wears `✗`"
+        );
+        // The bar: named, even though the human is reading the root — a row can
+        // be scrolled out of the history window, and the bar is the one line
+        // that is always in front of them.
+        let (line, kind) = app.status_line().expect("the bar says what happened");
+        assert_eq!(kind, StatusKind::Error, "and it stays until replaced");
+        assert!(line.contains("agent #1 failed"), "{line}");
+        assert!(line.contains("malformed chunk size"), "{line}");
+        // The child's own pane: the durable `!` line under its row.
+        let notes = app.chat.notes_report(AgentId(1), 0, 200).rows.join("\n");
+        assert!(
+            notes.contains("malformed chunk size"),
+            "the pane it happened to says so too: {notes}"
+        );
+        // And nothing of it landed in the root's pane: a child's failure is the
+        // child's line (finding B19).
+        let root_notes = app.chat.notes_report(AgentId::ROOT, 0, 200).rows.join("\n");
+        assert!(
+            !root_notes.contains("malformed chunk size"),
+            "a child's failure is not the root's notice: {root_notes}"
+        );
+    }
+
     /// Ages are read at a glance, so they must not be raw seconds.
     #[test]
     fn ages_read_like_clocks() {
@@ -9726,6 +9767,13 @@ mod tests {
             id: AgentId(1),
             event: AgentEvent::Done,
         });
+        // `Done` asks the tree for a git read, and that read owns a `git`
+        // process against this repository. Let it finish *before* the test
+        // drives git itself: two git processes on one repository race the
+        // index lock, and a read that snapshots the worktree between the
+        // write and the commit puts the wrong `kept` reason on the row — the
+        // test used to fail either way, depending on which thread won.
+        wait_git(&mut app, &rx);
         git(
             &root,
             &["worktree", "add", "-q", "-b", "mush/1", ".mush/wt/1"],
