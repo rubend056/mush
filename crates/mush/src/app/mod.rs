@@ -631,6 +631,12 @@ impl App {
                     brief: agent.brief.clone(),
                     branch: branch.clone(),
                     messages: agent.messages.clone(),
+                    // A restored child reports to nobody: the run it would
+                    // report is not one this process watched, and the root
+                    // waking up with a completion it never asked for is the
+                    // case the dead channel exists to prevent. The human's own
+                    // message is what starts it again.
+                    parent: None,
                 },
             );
             self.tree.register(Existing {
@@ -928,6 +934,14 @@ impl App {
         if self.tree.expire_cancels() {
             self.dirty_screen = true;
         }
+        // The run's memory, bounded (§8.21): finished children past the history
+        // window are forgotten, and the actor threads of the ones past the warm
+        // window are parked. Both are filters over a tree this very window keeps
+        // small, so this is not a reason to skip a frame's worth of either — and
+        // both are *idempotent*, which is what lets them live on a tick rather
+        // than on a transition nobody would remember to add.
+        self.reap_history();
+        self.park_history();
         // The file is allowed to lag the conversation by `SESSION_DEBOUNCE`.
         // This is where that lag is paid: the rebuild and the hand-over happen
         // once per interval, on a tick, and never in the handler that received
@@ -1548,26 +1562,89 @@ impl App {
                 return Err(line);
             }
             // Nudge a specific agent; running ones fold it in, idle ones rerun.
-            // If the mailbox is gone the node's phase is put back exactly as it
-            // was, instead of leaving a lie on the row (finding B10).
+            // A *parked* child — its thread reclaimed by `park_history`, which
+            // leaves the node and the transcript — is woken by these words, and
+            // the message is what starts it. If the words cannot be delivered at
+            // all the node's phase is put back exactly as it was, instead of
+            // leaving a lie on the row (finding B10).
             let previous = self.tree.nudge(target);
-            self.chat.push_message(target, Message::user(text.clone()));
-            match self.tree.agent_tx.get(&target) {
-                Some(tx) if tx.send(AgentMsg::Nudge(text)).is_ok() => {
-                    // The human resumed a child its parent may believe is at
-                    // rest: the parent's books decide its waits and the
-                    // one-shared-child guard, so they are told (audit row 1).
-                    self.tell_parent_running(target);
-                    Ok(())
-                }
-                _ => {
-                    let line = agent::gone(target);
-                    self.tree.nudge_failed(target, previous);
-                    self.fail(&line);
-                    Err(line)
-                }
+            let delivered = self.deliver_to_actor(target, AgentMsg::Nudge(text.clone()));
+            // The human's line lands in the pane on the same turn, and *after*
+            // the send: a revived actor's first event cannot be applied until
+            // this `update` returns, so the answer can never be painted above
+            // the question that asked for it.
+            self.chat.push_message(target, Message::user(text));
+            if delivered {
+                // The human resumed a child its parent may believe is at
+                // rest: the parent's books decide its waits and the
+                // one-shared-child guard, so they are told (audit row 1).
+                self.tell_parent_running(target);
+                Ok(())
+            } else {
+                let line = agent::gone(target);
+                self.tree.nudge_failed(target, previous);
+                self.fail(&line);
+                Err(line)
             }
         }
+    }
+
+    /// Hand an agent's actor `command`, waking a parked one to take it. Returns
+    /// whether somebody took the command.
+    ///
+    /// A parked child has no actor thread ([`Self::park_history`]); what is left
+    /// of its actor is the mailbox, and a send into it fails — which is how this
+    /// knows, without a stored "parked" flag that could disagree with the thread
+    /// it describes. The node, the id and the transcript never moved, so the
+    /// words wake it through the door a restart already uses (`agent::revive`),
+    /// seeded with the transcript the pane is showing; the command comes back
+    /// with the failed send, so nothing is lost to the probe.
+    ///
+    /// The root is never parked — it is nobody's child, and the window keeps it —
+    /// so a dead root mailbox stays the answer it was: `Ctrl-N` restarts it
+    /// (`App::deliver`'s root half, `App::new_chat`).
+    fn deliver_to_actor(&mut self, id: AgentId, command: AgentMsg) -> bool {
+        let refused = match self.tree.agent_tx.get(&id) {
+            Some(tx) => match tx.send(command) {
+                Ok(()) => return true,
+                Err(error) => error.0,
+            },
+            // No mailbox at all: a leftover worktree found on disk was never
+            // given an actor to wake, and there is no transcript it was asked
+            // for one with.
+            None => return false,
+        };
+        if id == AgentId::ROOT {
+            return false;
+        }
+        let Some(node) = self.tree.node(id) else {
+            return false;
+        };
+        let spec = agent::ReviveSpec {
+            id: id.0,
+            depth: node.depth,
+            brief: node.brief.clone(),
+            branch: node.branch.clone(),
+            messages: self.chat.transcript(id).to_vec(),
+            // Its parent's mailbox, when it has one: the completion belongs
+            // where every other completion of that child's went, and the
+            // parent's books have just been told (or are about to be told) that
+            // this child is running (audit row 1).
+            parent: node
+                .parent
+                .and_then(|parent| self.tree.agent_tx.get(&parent).cloned()),
+        };
+        let tx = agent::revive(
+            self.tree.handles(),
+            self.cell.handle(),
+            self.ui_tx.clone(),
+            self.tree.conversation().0,
+            self.ws.root().to_path_buf(),
+            spec,
+        );
+        let taken = tx.send(refused).is_ok();
+        self.tree.agent_tx.insert(id, tx);
+        taken
     }
 
     /// Tell `id`'s parent, when it has one, that the child is running again.
@@ -2135,16 +2212,18 @@ impl App {
         } else {
             Vec::new()
         };
-        match self.tree.agent_tx.get(&target) {
-            Some(tx) if tx.send(AgentMsg::Compact(messages)).is_ok() => {
-                // The word comes from the fold the human just asked for, so the
-                // acknowledgement and the row it is answered by read the same
-                // verb (refactor R8): a run in flight turns this request into a
-                // `Parked` fold a moment later, whose row says `folding at the
-                // next step…`.
-                self.say(format!("{} {target}…", Compacting::Requested.verb()));
-            }
-            _ => self.fail(agent::gone(target)),
+        // A parked child is woken by the request: folding is a command like any
+        // other, and `gone` about an agent whose row and transcript are on
+        // screen is exactly the lie parking must not tell (§8.21).
+        if self.deliver_to_actor(target, AgentMsg::Compact(messages)) {
+            // The word comes from the fold the human just asked for, so the
+            // acknowledgement and the row it is answered by read the same
+            // verb (refactor R8): a run in flight turns this request into a
+            // `Parked` fold a moment later, whose row says `folding at the
+            // next step…`.
+            self.say(format!("{} {target}…", Compacting::Requested.verb()));
+        } else {
+            self.fail(agent::gone(target));
         }
     }
 
@@ -2198,6 +2277,75 @@ impl App {
     fn toggle_reasoning(&mut self) {
         self.chat.set_reasoning(!self.chat.shows_reasoning());
         self.dirty_screen = true;
+    }
+
+    /// Forget the finished children the history window is done with, and park
+    /// the actor threads of the ones it keeps — the two halves of §8.21's
+    /// "everything needs a cap, even a high one", run from `tick` because both
+    /// are filters over the tree rather than events.
+    ///
+    /// **The four steps, in one place, in this order.** Forgetting a child is
+    /// not dropping a node: it is four things that used to happen nowhere. The
+    /// actor has to be told to end — [`AgentMsg::Shutdown`] is the only thing
+    /// that stops a thread, and its own arm ends the run it is in and kills the
+    /// jobs the agent owns with it (`agent::absorb`, `drain_signals`); then the
+    /// tree drops the node and everything keyed by its id; then the
+    /// conversation drops the transcript, the voices, the revision an attach
+    /// client holds and the pane's reading position ([`Chat::forget`]); and
+    /// then the file is told, or the next save writes back the child this
+    /// forgot (`mark_session_dirty` — the write itself waits for the debounce,
+    /// so a reap costs no write).
+    fn reap_history(&mut self) {
+        for id in self.tree.past_history() {
+            if let Some(tx) = self.tree.agent_tx.get(&id) {
+                let _ = tx.send(AgentMsg::Shutdown);
+            }
+            self.tree.reap(&[id]);
+            self.chat.forget(id);
+            self.mark_session_dirty();
+        }
+    }
+
+    /// Park the actor threads of the children the tree has stopped listening
+    /// to, keeping the newest few warm (see `tree::WARM_CHILDREN`).
+    ///
+    /// A node costs a struct; a thread costs a stack, an entry in every
+    /// scheduler's picture and a name in `/proc`, and every finished child used
+    /// to hold `mush-agent-{id}` until mush quit — a run with a hundred
+    /// children held a hundred threads, of which at most the handful a human is
+    /// talking to were ever going to wake again (§8.21). Parking ends the
+    /// thread and nothing else: the node, the id and the transcript stay
+    /// exactly where they fall, and the next message to that child rebuilds its
+    /// actor from the transcript on screen ([`Self::deliver_to_actor`]), so what
+    /// the human sees does not change by one row.
+    ///
+    /// The send is the whole probe. A parked child's mailbox still exists —
+    /// it is what the tree and its parent hold — and it has no receiver, so a
+    /// `Shutdown` into it fails and says so; a live actor takes it and ends.
+    /// Nothing here reads a stored "parked" flag, because there is none to get
+    /// out of step with the thread it describes.
+    fn park_history(&mut self) {
+        for id in self.tree.parkable() {
+            let Some(tx) = self.tree.agent_tx.get(&id) else {
+                // A leftover worktree found on disk: no actor was ever started
+                // for it, so there is no thread to reclaim.
+                continue;
+            };
+            if tx.send(AgentMsg::Shutdown).is_err() {
+                // Already parked. The parent was told when it happened, and the
+                // window recomputes the same set every frame.
+                continue;
+            }
+            // The parent's books outlive the child's actor, and its run
+            // numbering does not: a woken child reports run 1 again, and a book
+            // that still holds that number as read would swallow the result
+            // (finding B24, `agent::note_parked`).
+            if let Some(parent) = self.tree.node(id).and_then(|node| node.parent) {
+                if let Some(tx) = self.tree.agent_tx.get(&parent) {
+                    let _ = tx.send(AgentMsg::ChildParked { id: id.0 });
+                }
+            }
+        }
     }
 
     /// Ask every actor in the tree to shut down. `Shutdown`, not `Stop`: a
@@ -2966,6 +3114,181 @@ mod tests {
             }
         }
         panic!("no git read came back");
+    }
+
+    /// A finished child of the root, the state both windows are about: inserted
+    /// with a live mailbox, its run over, and its result read by its parent
+    /// (which is what takes the `✉` off).
+    ///
+    /// The receive half comes back because it is the difference between the two
+    /// things a mailbox can be: a receiver that is *there* is a live actor, and
+    /// a parked one is exactly a mailbox with no receiver behind it — which is
+    /// what the tests that want one drop.
+    fn finished_child(app: &mut App, id: u64) -> Receiver<AgentMsg> {
+        let (tx, rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.insert(Spawn {
+            id: AgentId(id),
+            parent: AgentId::ROOT,
+            brief: format!("task {id}"),
+            depth: 1,
+            branch: None,
+            cmd: tx,
+        });
+        app.tree.finish(AgentId(id), Some(format!("did {id}")));
+        app.tree.result_read(AgentId(id));
+        app.chat
+            .push_message(AgentId(id), Message::user(format!("task {id}")));
+        rx
+    }
+
+    /// Wait for `id` to report that a run began, applying whatever else arrives.
+    /// The actor's own word is the only evidence that words woken with started
+    /// work, so this is what "the child runs" is asserted on.
+    fn runs(app: &mut App, rx: &Receiver<Msg>, id: AgentId) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(msg) => {
+                    let began = matches!(
+                        &msg,
+                        Msg::Agent { id: who, event: AgentEvent::Running { .. }, .. } if *who == id
+                    );
+                    app.update(msg);
+                    if began {
+                        return true;
+                    }
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        false
+    }
+
+    /// A run that spawned fifty-one children keeps fifty of them: the history
+    /// window drops the oldest row, its transcript with it, and the file the
+    /// next save writes carries what is left — a cap on the thing that had none
+    /// (finding H16, §8.21).
+    #[test]
+    fn the_history_window_forgets_the_oldest_child_and_keeps_fifty() {
+        let (mut app, _rx) = test_app("history-window");
+        // The receivers are kept: the child the window forgets is told to end
+        // its actor, and a mailbox with no receiver behind it could not show it.
+        let mailboxes: Vec<Receiver<AgentMsg>> =
+            (1..=51).map(|id| finished_child(&mut app, id)).collect();
+
+        // One tick — the frame every one of these happens on.
+        app.tick();
+
+        assert!(
+            matches!(mailboxes[0].try_recv(), Ok(AgentMsg::Shutdown)),
+            "the thread is told before the node goes"
+        );
+        assert!(!app.tree.has(AgentId(1)), "the oldest row is gone");
+        assert!(
+            app.chat.transcript(AgentId(1)).is_empty(),
+            "and its transcript with it — no archive (§8.21)"
+        );
+        assert!(
+            app.tree.has(AgentId(2)),
+            "the next-oldest child is the newest of the window"
+        );
+        let stored = app.session_snapshot();
+        assert_eq!(
+            stored.agents.len(),
+            50,
+            "the save carries a window, not everything a run ever said"
+        );
+        let ids: Vec<u64> = stored.agents.iter().map(|agent| agent.id).collect();
+        assert_eq!(
+            ids,
+            (2..=51).collect::<Vec<u64>>(),
+            "reaping from the oldest end leaves the surviving numbers contiguous"
+        );
+    }
+
+    /// A thread is the resource, not a node: the newest children keep theirs,
+    /// and the rest are parked — ending the actor and nothing else, so the row
+    /// and the transcript are exactly where they were (finding H16, §8.21).
+    #[test]
+    fn the_parking_window_keeps_the_newest_children_warm() {
+        let (mut app, _rx) = test_app("parking-window");
+        let (parent_tx, parent_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.agent_tx.insert(AgentId::ROOT, parent_tx);
+        let mailboxes: Vec<Receiver<AgentMsg>> =
+            (1..=10).map(|id| finished_child(&mut app, id)).collect();
+
+        app.tick();
+
+        assert!(
+            matches!(mailboxes[0].try_recv(), Ok(AgentMsg::Shutdown))
+                && matches!(mailboxes[1].try_recv(), Ok(AgentMsg::Shutdown)),
+            "the two oldest actors are told to end"
+        );
+        assert!(
+            mailboxes[9].try_recv().is_err(),
+            "the newest child's thread is untouched"
+        );
+        assert!(
+            app.tree.agent_tx[&AgentId(3)].send(AgentMsg::Stop).is_ok(),
+            "and so is the third-newest: the window is the newest eight"
+        );
+        // The parent's books need the fact the child's actor can no longer
+        // report: its run numbering restarts with the next actor (B24).
+        assert!(
+            matches!(parent_rx.try_recv(), Ok(AgentMsg::ChildParked { id }) if id == 1),
+            "the parent is told which child's thread went away"
+        );
+        // Parking is invisible to the screen: the node and the transcript stay.
+        assert!(app.tree.has(AgentId(1)));
+        assert_eq!(app.chat.transcript(AgentId(1)).len(), 1);
+        // And a second frame re-decides the same set rather than re-parking.
+        app.tick();
+        assert!(app.tree.has(AgentId(1)));
+    }
+
+    /// A parked child is woken by a message: the words rebuild its actor from
+    /// the transcript on screen — the same door a restart uses — and the child
+    /// runs (finding H16, §8.21).
+    #[test]
+    fn a_parked_child_is_woken_by_a_message_and_runs() {
+        let root = repo("parked-wake");
+        let (mut app, rx) = app_and_rx(root.clone());
+        // A finished child whose actor is parked: the tree holds the mailbox and
+        // nobody holds the receiver, which is what a reclaimed thread leaves.
+        let (tx, parked) = crossbeam_channel::unbounded::<AgentMsg>();
+        drop(parked);
+        let opened = app.tree.insert(Spawn {
+            id: AgentId(2),
+            parent: AgentId::ROOT,
+            brief: "port the parser".to_string(),
+            depth: 1,
+            branch: None,
+            cmd: tx,
+        });
+        app.chat.push_message(opened.id, opened.opening);
+        app.tree.finish(AgentId(2), Some("did it".to_string()));
+        app.tree.result_read(AgentId(2));
+        app.tree.focus(AgentId(2));
+        app.chat.insert("carry on");
+
+        app.send_message();
+
+        assert!(app.tree.has(AgentId(2)), "the node is still there");
+        assert_eq!(
+            app.chat.transcript(AgentId(2)).len(),
+            2,
+            "and the transcript it resumes from is the one on screen"
+        );
+        assert!(
+            app.tree.agent_tx[&AgentId(2)].send(AgentMsg::Stop).is_ok(),
+            "the mailbox has an actor behind it again"
+        );
+        assert!(
+            runs(&mut app, &rx, AgentId(2)),
+            "and the woken child began a run"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The git line is refreshed on the transitions a human drives — a focus
@@ -5220,7 +5543,13 @@ mod tests {
         crowd(&mut app, 3);
         // Failing to reach an agent's mailbox is a failure with no other home:
         // it is not a message, so it is never in the transcript. `crowd`'s
-        // children are spawned with a receiver nobody holds.
+        // children are spawned with a receiver nobody holds, which is what a
+        // *parked* actor looks like — and parking is the UI's own doing, so the
+        // request would simply wake it (§8.21). A node the tree has no mailbox
+        // for at all — a leftover worktree, an agent whose actor was never
+        // started — is the one nothing can wake, and that is the failure this
+        // reads for.
+        app.tree.agent_tx.remove(&AgentId(1));
         app.tree.focus(AgentId(1));
         run(&mut app, "/compact");
         assert!(
@@ -9345,10 +9674,12 @@ mod tests {
     #[test]
     fn an_attach_failure_lands_over_the_humans_warning() {
         let (mut app, _rx) = test_app("attach-quit-failure");
-        // A node whose actor is gone: `spawn_agent` drops the mailbox, so the
-        // send this op is about to take fails the way a dead agent's does.
+        // A node the tree has no mailbox for at all: the send this op is about
+        // to take has nowhere to go. A *dead* mailbox is not this case any more
+        // — that is a parked child, and the words wake it (§8.21).
         spawn_agent(&mut app, 1, 0, 1, "port the parser", None);
         begin_run(&mut app, AgentId(1));
+        app.tree.agent_tx.remove(&AgentId(1));
 
         ctrl(&mut app, 'q');
         assert!(app.quit_armed());

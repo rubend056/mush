@@ -501,6 +501,18 @@ pub enum AgentMsg {
     /// shared-workspace guard would miss a sibling that is working (audit of the
     /// prompt vs behaviour, row 1).
     ChildRunning { id: u64 },
+    /// A child whose actor thread the UI reclaimed: its node, id and transcript
+    /// stayed exactly where they were (`App::park_history`), and the thread that
+    /// knew them is gone.
+    ///
+    /// The parent's books identify a completion by (child, run) — the identity
+    /// `docs/findings.md` B24 turns on — and a woken child starts its own
+    /// counter over. Without this, the first run after a wake would land on a
+    /// number the books have already read and be swallowed as news they have
+    /// heard, which is a result the parent's model never gets (§8.21). The
+    /// parked outcome itself is untouched: it is what `status` names the child
+    /// by, and it stays read, because nothing about the result changed.
+    ChildParked { id: u64 },
     /// A job this agent started ended. `line` is the report its owner reads,
     /// rendered once by the registry; `news` says whether it is worth waking a
     /// napping agent for (`ChildDone` and `Outcome::is_news` again: a job mush
@@ -968,6 +980,16 @@ pub struct ReviveSpec {
     /// The messages it had, *without* the system prompt (which is regenerated:
     /// it names a workspace that may have moved).
     pub messages: Vec<Message>,
+    /// Where the new actor reports a finished run, when the caller has the
+    /// mailbox its parent is listening on.
+    ///
+    /// The restart path passes `None`: the parent it would report to is a book
+    /// with no runs in it, and waking the root with a completion nobody asked
+    /// for is what the dead channel is for. A child woken *inside* a live tree
+    /// by the human's own message (`App::deliver_to_actor`) passes `Some`: the
+    /// parent's books already say that child is running, and the completion is
+    /// the only thing that can ever say it stopped.
+    pub parent: Option<Sender<AgentMsg>>,
 }
 
 /// The branch an agent can still work on: one whose worktree is on disk.
@@ -1008,6 +1030,7 @@ pub fn revive(
         brief,
         branch,
         messages,
+        parent,
     } = spec;
     // Its own worktree if it still exists, else the shared root — an agent whose
     // branch was merged continues in the main checkout, which is where its work
@@ -1043,7 +1066,11 @@ pub fn revive(
         branch,
         brief: brief.clone(),
         my_tx: cmd_tx.clone(),
-        parent_tx: dead_tx,
+        // Its completions go where the caller said they belong: to the dead
+        // channel for an agent coming back from a stored session (nobody is
+        // waiting on a run that never happened here), to its parent's live
+        // mailbox for a parked child woken inside the tree (§8.21).
+        parent_tx: parent.unwrap_or(dead_tx),
         rx: cmd_rx,
     };
     // The system prompt is regenerated, and an agent with no transcript but a
@@ -1469,6 +1496,14 @@ fn absorb(
         // (finding H1).
         AgentMsg::Work { id, run, work } => {
             note_work(state, id, run, work);
+            Fold::Idle
+        }
+        // The child's actor thread was replaced: its run numbering starts over,
+        // so the books' identity for it does too (see `note_parked`). Nothing
+        // is delivered and nothing is folded — the outcome stands, and it is
+        // read.
+        AgentMsg::ChildParked { id } => {
+            note_parked(state, id);
             Fold::Idle
         }
         // A child the human resumed begins a run: the parent's books follow,
@@ -2379,6 +2414,10 @@ fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
             // A listing fact, not a signal: it starts nothing, ends nothing,
             // and is folded nowhere (finding H1).
             AgentMsg::Work { id, run, work } => note_work(state, id, run, work),
+            // The child's actor thread went away and its run numbering with it
+            // (see `note_parked`). A signal about the books rather than about
+            // the run in flight, so it is honoured mid-run like any other.
+            AgentMsg::ChildParked { id } => note_parked(state, id),
             // A child the human resumed. Nothing to fold: the parent's book of
             // what is running is the whole point (audit row 1).
             AgentMsg::ChildRunning { id } => {
@@ -2447,6 +2486,10 @@ fn drain_mailbox(
             // The worktree fact of the run just recorded. It is not a result:
             // nothing is pushed and no boundary is moved (finding H1).
             AgentMsg::Work { id, run, work } => note_work(state, id, run, work),
+            // The child's actor thread was replaced, so the books' run
+            // identity for it restarts with it (see `note_parked`). It carries
+            // no work to fold: the words belong to the child's own actor.
+            AgentMsg::ChildParked { id } => note_parked(state, id),
             // A child the human resumed: the parent's books say it is running
             // again, and nothing enters the transcript (audit row 1).
             AgentMsg::ChildRunning { id } => {
@@ -2492,6 +2535,46 @@ fn note_completion(state: &mut ActorState, id: u64, run: u64, outcome: Outcome) 
         state.completed.insert(id, Completion { run, outcome });
     }
     line
+}
+
+/// The books of a child whose actor thread was parked and replaced.
+///
+/// A completion is identified by (child, run) — two runs that read the same are
+/// still two runs, and the same run reported twice is one piece of news
+/// (`docs/findings.md` B24) — while a woken child's counter starts over at 1
+/// (`agent::revive` builds a fresh `ActorState`). The run the books know is
+/// therefore moved to one no actor can report: `state.runs` counts a run as it
+/// *ends*, so the first report any actor makes is run 1 and 0 is nobody's. The
+/// child's next ending then takes a number the books cannot have read, which is
+/// what makes it news.
+///
+/// What the books hold about the result itself is left alone. The outcome is
+/// what `status` names the child by — a child with no recorded outcome reads as
+/// `#N ◐ running`, and a parked child is not running — and it stays *read*: the
+/// pair (outcome, delivered) moves together, so the fact that the parent has
+/// seen this result is exactly as true as it was a moment ago.
+fn note_parked(state: &mut ActorState, id: u64) {
+    // A run number no actor reports: `ActorState::runs` starts at 0 and is
+    // incremented before the report, so the first run is always 1.
+    const NO_RUN: u64 = 0;
+    if let Some(completion) = state.completed.get_mut(&id) {
+        completion.run = NO_RUN;
+    }
+    if let Some(run) = state.delivered.get_mut(&id) {
+        *run = NO_RUN;
+    }
+    // The worktree fact is paired with the run it belongs to (`ActorState::work_for`),
+    // so it moves with the pair above: a listing that lost the branch of the
+    // last run would be the one fact a parent deciding on a merge is missing
+    // (finding H1).
+    if let Some((run, _)) = state.work.get_mut(&id) {
+        *run = NO_RUN;
+    }
+    // A parked child is at rest — that is the window's own condition — so a
+    // book that still says it is running holds a report the parked actor had
+    // already sent and this message outran. Left standing, it is a `wait` that
+    // blocks for the whole timeout on a child that has finished.
+    state.running.remove(&id);
 }
 
 /// Record how a run left its worktree. Kept by run, and only the newest run's
@@ -4670,6 +4753,48 @@ mod tests {
         ));
         assert_eq!(messages.iter().filter(|m| m.text() == line).count(), 1);
         let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A child whose actor thread the UI parked comes back on a *fresh*
+    /// `ActorState`, so its next run lands on a number the books have already
+    /// read — 1 — while a completion is identified by (child, run) and a run the
+    /// books have read is not news (`docs/findings.md` B24). `ChildParked` is
+    /// what moves the identity out of the way, and this is the reason it exists:
+    /// without it the result of the run the human's own message started is
+    /// swallowed, and `wait` answers "(already read — no new run since)" about a
+    /// run nobody ever read.
+    #[test]
+    fn a_woken_childs_next_report_is_still_news() {
+        let mut state = ActorState::default();
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+        state.running.insert(1);
+        // Its first run ended, was reported, and the model read it.
+        let (line, fresh) = state.record_child(1, 1, Outcome::Finished("wrote the lexer".into()));
+        assert!(fresh, "the first report is news: {line}");
+
+        // The UI reclaimed the thread and told the parent so.
+        note_parked(&mut state, 1);
+        assert!(
+            !state.unread(1),
+            "the result the model read is as read as it was"
+        );
+        assert!(
+            !state.running.contains(&1),
+            "a parked child is not running, whatever the books said"
+        );
+
+        // The human's message wakes it, and its second run is numbered 1 again.
+        let (line, fresh) = state.record_child(1, 1, Outcome::Finished("and the tests".into()));
+        assert!(
+            fresh,
+            "the second run is news even on the number the first one used: {line}"
+        );
+        assert!(line.contains("and the tests"), "{line}");
+        assert!(
+            state.outcome(1).is_some(),
+            "and the listing still names the child by its last outcome"
+        );
     }
 
     /// The batch the human saw: three children failed while the parent worked,
