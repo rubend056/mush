@@ -18,7 +18,7 @@
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
 
 use tempfile::NamedTempFile;
 
@@ -34,11 +34,27 @@ pub struct ShellCommand<'a> {
     pub root: &'a Path,
 }
 
+/// How a command ended, as the machine can tell it.
+///
+/// A process a signal killed has no exit code at all — the shell spells such a
+/// death `128 + n` — and mush spelled it `-1`, a number no command returns and
+/// one that says nothing about what ended it: an OOM kill (`9`) and the
+/// command's own `SIGSEGV` (`11`) read identically (finding B6). Telling the
+/// two apart is the machine's to do; what to *make* of either death is the
+/// surfaces' business, not this module's.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum End {
+    /// It ended by itself, with this exit code.
+    Exited(i32),
+    /// A signal killed it, and this is the signal's number.
+    Signalled(i32),
+}
+
 /// One command that has started, as the watcher sees it.
 pub trait Job: Send {
-    /// How it ended, if it has: the exit code, or `-1` when a signal ended it
-    /// (the same spelling the report has always used). `None` while it runs.
-    fn poll(&mut self) -> Result<Option<i32>, String>;
+    /// How it ended, if it has: its own exit code, or the signal that killed
+    /// it (see [`End`]). `None` while it runs.
+    fn poll(&mut self) -> Result<Option<End>, String>;
 
     /// Bytes written to stdout and stderr together — the number the output
     /// limit is measured against. Read from the files, so a background job
@@ -102,10 +118,31 @@ struct Running {
     err: Scratch,
 }
 
+/// How a finished child ended.
+///
+/// `ExitStatus::code()` is `None` exactly when a signal ended the process, and
+/// on unix the signal is there to be named instead. The `#[cfg]` is the one the
+/// rest of this module is written around (the process group, `kill -9 -pgid`):
+/// a death by signal is a unix death, and a platform without one has only the
+/// code its own status carries.
+fn ended(status: ExitStatus) -> End {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        if let Some(signal) = status.signal() {
+            return End::Signalled(signal);
+        }
+    }
+    // Neither an exit code nor a signal: no unix child produces one, so this is
+    // the old spelling kept as the last resort for a status that cannot happen
+    // — not the name for a signal death, which is the arm above.
+    End::Exited(status.code().unwrap_or(-1))
+}
+
 impl Job for Running {
-    fn poll(&mut self) -> Result<Option<i32>, String> {
+    fn poll(&mut self) -> Result<Option<End>, String> {
         match self.child.try_wait() {
-            Ok(Some(status)) => Ok(Some(status.code().unwrap_or(-1))),
+            Ok(Some(status)) => Ok(Some(ended(status))),
             Ok(None) => Ok(None),
             Err(error) => Err(format!("could not wait for command: {error}")),
         }
@@ -207,7 +244,7 @@ pub(crate) mod fake {
 
     use mush_core::workspace::{tail_for_model, truncate_for_model};
 
-    use super::{Job, Machine, ShellCommand};
+    use super::{End, Job, Machine, ShellCommand};
 
     /// What a scripted command does while it "runs".
     ///
@@ -225,6 +262,9 @@ pub(crate) mod fake {
         /// has to be timed out or killed.
         pub exits_after: Option<usize>,
         pub code: i32,
+        /// The signal that killed it instead of an exit code. The two are one
+        /// or the other, as they are in a real status (finding B6).
+        pub signal: Option<i32>,
     }
 
     impl Script {
@@ -232,6 +272,17 @@ pub(crate) mod fake {
         pub fn exits(code: i32) -> Self {
             Self {
                 code,
+                exits_after: Some(0),
+                ..Self::default()
+            }
+        }
+
+        /// A command a signal kills with nobody in mush asking — a `SIGSEGV` of
+        /// its own, an OOM killer's `SIGKILL`. It is the death an exit code
+        /// cannot spell, so the script states the signal rather than a code.
+        pub fn signalled(signal: i32) -> Self {
+            Self {
+                signal: Some(signal),
                 exits_after: Some(0),
                 ..Self::default()
             }
@@ -325,23 +376,27 @@ pub(crate) mod fake {
     }
 
     impl Job for ScriptedJob {
-        fn poll(&mut self) -> Result<Option<i32>, String> {
+        fn poll(&mut self) -> Result<Option<End>, String> {
             self.written += self.script.grows;
             let polls = self.polls;
             self.polls += 1;
             // A killed command is a *dead* command, and the real shell says so:
-            // the child is reaped and `status.code()` is `None`, which the
-            // report has always spelled `-1`. A fake that kept a killed command
+            // the child is reaped with no exit code at all, which is a death by
+            // signal — `kill` sends `SIGKILL`, and `Running::kill` follows with
+            // `kill -9 -pgid` for the group. A fake that kept a killed command
             // "running" forever could not tell a watcher that noticed the kill
             // from one that slept through it — which is finding S4's whole
-            // question — so the death is scripted here too.
+            // question — so the death is scripted here too, signal and all.
             if self.killed {
-                return Ok(Some(-1));
+                return Ok(Some(End::Signalled(9)));
             }
             // `exits_after` counts the polls that pass *before* it ends; a kill
             // lands before the poll that would have ended it.
             match self.script.exits_after {
-                Some(after) if polls >= after => Ok(Some(self.script.code)),
+                Some(after) if polls >= after => Ok(Some(match self.script.signal {
+                    Some(signal) => End::Signalled(signal),
+                    None => End::Exited(self.script.code),
+                })),
                 _ => Ok(None),
             }
         }
@@ -370,5 +425,29 @@ pub(crate) mod fake {
                 self.kills.fetch_add(1, Ordering::SeqCst);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ended, End};
+
+    /// The one reading of a real status: an exit code, or the signal that killed
+    /// the process. `ExitStatusExt::from_raw` is the inverse of the `into_raw` a
+    /// wait(2) status carries, so both shapes are built here from the numbers a
+    /// shell would report — no `sh`, no `kill` — and the seam every surface
+    /// reads through is pinned rather than left to a subprocess (finding B6).
+    #[cfg(unix)]
+    #[test]
+    fn a_finished_child_reads_as_its_exit_code_or_its_signal() {
+        use std::os::unix::process::ExitStatusExt;
+        use std::process::ExitStatus;
+
+        // A wait status is the code in the high byte, or the signal in the low
+        // seven bits.
+        assert_eq!(ended(ExitStatus::from_raw(3 << 8)), End::Exited(3));
+        assert_eq!(ended(ExitStatus::from_raw(0)), End::Exited(0));
+        assert_eq!(ended(ExitStatus::from_raw(9)), End::Signalled(9));
+        assert_eq!(ended(ExitStatus::from_raw(11)), End::Signalled(11));
     }
 }

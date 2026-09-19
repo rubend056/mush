@@ -628,10 +628,34 @@ impl Config {
         self.base_url = normalize_url(url);
     }
 
+    /// Whether the endpoint a request will carry is the provider's own — the
+    /// question anything that wants to name the vendor rather than the URL has
+    /// to ask first.
+    ///
+    /// [`Self::base_url`] is the whole of where a request goes ([`Self::chat_url`]
+    /// appends to it), so it is what decides. Not the provider: its knobs
+    /// outlive a URL that points elsewhere (`--provider deepseek --url
+    /// https://my-proxy`, or a `/url` typed at a running mush). And not
+    /// [`crate::provider::ProviderSpec::switches_endpoint`], which says what
+    /// *selecting* the provider does once, not where requests are being sent
+    /// now. Both sides are compared as they are stored: `base_url` is normalized
+    /// by every writer ([`Self::set_base_url`], `resolve`), and a table row's
+    /// `default_base_url` carries no trailing slash.
+    fn on_the_providers_own_endpoint(&self) -> bool {
+        self.provider.spec().default_base_url == self.base_url
+    }
+
     /// A short label for the status bar: the model, then the endpoint — the
     /// provider's own name where the provider owns the endpoint (see
     /// [`crate::provider::ProviderSpec::display_endpoint`]), the configured URL
     /// otherwise.
+    ///
+    /// "Owns" is [`Self::on_the_providers_own_endpoint`], not "has a
+    /// `display_endpoint`": asked of the provider alone, the bar painted the
+    /// provider's own short name over a request whose URL was a proxy — a
+    /// vendor's name on somebody else's host, while the `/url` ack printed the
+    /// proxy (finding A2). A URL that is not the provider's own is named as it
+    /// is, so a custom endpoint never borrows a vendor's name either.
     ///
     /// The model's own spelling is defanged as it is labelled, because it is a
     /// name an *endpoint* chose (`/v1/models`) that only ever exists to be
@@ -645,8 +669,8 @@ impl Config {
             crate::text::sanitize(self.model.rsplit('/').next().unwrap_or(&self.model))
         };
         let endpoint = match self.provider.spec().display_endpoint {
-            Some(endpoint) => endpoint.to_string(),
-            None => self.base_url.clone(),
+            Some(endpoint) if self.on_the_providers_own_endpoint() => endpoint.to_string(),
+            _ => self.base_url.clone(),
         };
         format!("{model} @ {endpoint}")
     }
@@ -1425,6 +1449,64 @@ mod tests {
     fn label_falls_back_when_no_model() {
         let cfg = Config::new("http://x:1", "", None);
         assert_eq!(cfg.label(), "no model @ http://x:1");
+    }
+
+    /// A provider's display endpoint is a shortening of the URL it owns, so it
+    /// may stand for the request only while the request goes there: asked of the
+    /// provider alone, the bar read `deepseek-flash @ deepseek.com` over a
+    /// request whose URL was a proxy, while the `/url` ack printed the proxy.
+    /// Both reachable paths leave exactly that state — `--provider deepseek
+    /// --url https://my-proxy`, which only a missing `--provider` would have
+    /// turned into `Custom`, and a `/provider deepseek` followed by a `/url` at
+    /// a running mush (finding A2).
+    #[test]
+    fn a_label_names_the_providers_endpoint_only_where_a_request_goes() {
+        let mut cfg = Config {
+            provider: Provider::DeepSeek,
+            ..Config::new(
+                Provider::DeepSeek.default_base_url(),
+                "deepseek-flash",
+                None,
+            )
+        };
+        assert_eq!(
+            cfg.label(),
+            "deepseek-flash @ deepseek.com",
+            "the provider's own endpoint, as its row spells it"
+        );
+
+        cfg.set_base_url("https://my-proxy");
+        assert_eq!(
+            cfg.label(),
+            "deepseek-flash @ https://my-proxy",
+            "the endpoint in use, not the one the provider would have used"
+        );
+    }
+
+    /// And the other direction: a URL the provider does not own is named as a
+    /// URL, even when it is on the provider's own host — the label claims
+    /// nothing about who answers that the request does not carry, so a custom
+    /// endpoint can never start wearing a vendor's name (finding A2).
+    #[test]
+    fn a_label_spells_out_an_endpoint_the_provider_does_not_own() {
+        // The human typed the vendor's host but kept the `custom` row: the
+        // endpoint is theirs, and it is a fact worth seeing.
+        let cfg = Config::new(
+            Provider::DeepSeek.default_base_url(),
+            "deepseek-flash",
+            None,
+        );
+        assert_eq!(cfg.provider, Provider::Custom);
+        assert_eq!(cfg.label(), "deepseek-flash @ https://api.deepseek.com");
+
+        // A path under the provider's host is not the provider's endpoint: a
+        // request goes to `<base_url>/v1/chat/completions`, so a base URL with
+        // a path of its own is a different endpoint, and is shown as itself.
+        let cfg = Config {
+            provider: Provider::DeepSeek,
+            ..Config::new("https://api.deepseek.com/v1", "deepseek-flash", None)
+        };
+        assert_eq!(cfg.label(), "deepseek-flash @ https://api.deepseek.com/v1");
     }
 
     /// The model half of the label is a *name an endpoint chose*, painted in

@@ -26,7 +26,7 @@
 //! | `/key [SECRET]` | optional | show the key in use, or set one |
 //! | `/models` | ignored | re-read the endpoint's model list |
 //! | `/compact` | ignored | fold the focused conversation into a summary |
-//! | `/notes` | ignored | read the notes the foot had no room for |
+//! | `/notes` | ignored | read every note about the focused agent |
 //! | `/help` (`/?`) | ignored | list the keys and the commands |
 //! | `/quit` (`/q`) | ignored | leave mush |
 //!
@@ -57,7 +57,11 @@ pub enum Command {
     /// `/models`: re-read the endpoint's list.
     Models,
     Compact,
-    /// `/notes`: read every note the foot had no room for.
+    /// `/notes`: read every note about the focused agent, in full.
+    ///
+    /// Every one of them, not just the two the foot had room for: the picker
+    /// lists the agent's whole set of notices, the ones the foot already showed
+    /// included, because that is what the lines mush wrote about the agent are.
     Notes,
 }
 
@@ -152,7 +156,7 @@ pub const COMMANDS: &[Spec] = &[
         name: "/notes",
         aliases: &[],
         args: "",
-        help: "read the notes the foot had no room for",
+        help: "read every note about the focused agent, in full",
     },
     Spec {
         name: "/help",

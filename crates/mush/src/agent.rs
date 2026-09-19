@@ -35,7 +35,7 @@ use crate::clock;
 use crate::events::{Events, Ui};
 use crate::ids::{AgentId, Ids, JobId};
 use crate::jobs::{self, Refused};
-use crate::machine::{Job, Machine, Shell, ShellCommand};
+use crate::machine::{End, Job, Machine, Shell, ShellCommand};
 use crate::model::{retrying, HttpModel, ModelClient, ModelError};
 
 /// Backstop against a model that never stops — *not* a budget for the work.
@@ -3719,8 +3719,14 @@ fn command_cap(actor: &Actor) -> usize {
 
 /// Why a command stopped running.
 enum Ended {
-    /// It ended by itself, with this exit code (`-1` when a signal ended it).
+    /// It ended by itself, with this exit code.
     Exited(i32),
+    /// A signal killed it — the OOM killer's `9`, the `SIGSEGV` of a crashed
+    /// binary — with this signal's number. A variant of its own because a
+    /// signal death has no exit code: the `-1` this arm used to hold was a
+    /// number no command returns, and it told a crash and an OOM kill apart
+    /// from neither (finding B6).
+    Signalled(i32),
     /// mush stopped it. The reason is [`jobs::Stopped`]'s, not a second copy of
     /// the same three variants: the watcher already decides between them with
     /// `jobs::stopping`, and a fourth reason added there must reach the model's
@@ -3805,7 +3811,7 @@ fn run_shell(
 }
 
 /// The model's sentence for how its command ended: `[exit 0]`, `[cancelled]`,
-/// the timeout, the output cap.
+/// the timeout, the output cap, the signal that killed it.
 ///
 /// One home for the whole translation table, so every reason mush stops a
 /// command has exactly one sentence and a new one cannot be added to one
@@ -3815,6 +3821,10 @@ fn run_shell(
 fn end_note(ended: &Ended, timeout: Duration, detachable: bool, cap: usize) -> String {
     match ended {
         Ended::Exited(code) => format!("[exit {code}]"),
+        // A signal death is not an exit code, and the sentence says what it is:
+        // `[exit -1]` was this arm's spelling for a `SIGSEGV` and for an OOM
+        // kill alike, and it read as the command's own doing (finding B6).
+        Ended::Signalled(signal) => format!("[killed by signal {signal}]"),
         Ended::Stopped(jobs::Stopped::TimedOut) => {
             let mut note = format!("[timed out after {}s", timeout.as_secs());
             // The one case where "a long command detaches by itself" cannot
@@ -3879,14 +3889,19 @@ fn command_report(stdout: &str, stderr: &str) -> String {
 ///   the arm below only touches an exit.
 /// - A command killed from *outside* the watcher — quitting mush (`kill_all`),
 ///   Ctrl-N, or the registry's half of a `Stop` — is reported as a cancel. The
-///   process died from the signal mush sent it, and `-1` handed to the model as
-///   an exit code would read as the command's own doing; this is the arm
-///   finding S4's fix needs.
-/// - A command that ended by itself keeps its real exit status, signal deaths
-///   included: nobody asked for those.
+///   process died of the signal mush sent it, and a death by signal handed to
+///   the model as an exit code (`-1`, once) reads as the command's own doing;
+///   this is the arm finding S4's fix needs.
+/// - A command that ended by itself keeps its real exit status — a signal death
+///   from anyone else's hand included: nobody in mush asked for those.
 fn ending(ended: Ended, stopped_from_outside: bool) -> Ended {
     match ended {
-        Ended::Exited(_) if stopped_from_outside => Ended::Stopped(jobs::Stopped::Cancelled),
+        // Either shape a dead command comes back in — its own code, or the
+        // signal that killed it — is a cancel when the flag was set from
+        // outside the watcher.
+        Ended::Exited(_) | Ended::Signalled(_) if stopped_from_outside => {
+            Ended::Stopped(jobs::Stopped::Cancelled)
+        }
         ended => ended,
     }
 }
@@ -3908,7 +3923,8 @@ fn wait_bounded(
     let started = actor.ctx.clock.now();
     loop {
         match job.poll() {
-            Ok(Some(code)) => return Ok(Ended::Exited(code)),
+            Ok(Some(End::Exited(code))) => return Ok(Ended::Exited(code)),
+            Ok(Some(End::Signalled(signal))) => return Ok(Ended::Signalled(signal)),
             Ok(None) => {}
             Err(error) => {
                 // Never leave a running process behind on an error path.
@@ -7880,18 +7896,20 @@ mod tests {
     fn the_three_ways_a_foreground_command_ends_are_not_confusable() {
         let minute = Duration::from_secs(60);
         // A kill from outside the watcher: the process died of a signal, and
-        // that is a cancel — not `[exit -1]`, which reads as the command's own
-        // doing. This is the arm finding S4 added.
+        // that is a cancel — not `[killed by signal 9]`, which is the kill's
+        // own death and reads as somebody else's doing. This is the arm finding
+        // S4 added.
         assert!(matches!(
-            ending(Ended::Exited(-1), true),
+            ending(Ended::Signalled(9), true),
             Ended::Stopped(jobs::Stopped::Cancelled)
         ));
-        // A command that ended by itself keeps its exit status, whoever else's
-        // signal it was.
+        // A command that ended by itself keeps its status, whoever else's signal
+        // it was: its own exit code, or the signal that killed it with nobody
+        // in mush asking (finding B6).
         assert!(matches!(ending(Ended::Exited(3), false), Ended::Exited(3)));
         assert!(matches!(
-            ending(Ended::Exited(-1), false),
-            Ended::Exited(-1)
+            ending(Ended::Signalled(11), false),
+            Ended::Signalled(11)
         ));
         // The watcher's own kills keep their own reasons. They set the same
         // flag on the way out, so an arm that keyed off the flag rather than
@@ -7912,11 +7930,13 @@ mod tests {
         }
 
         // And every arm of the table has its own sentence: the three ways the
-        // watcher stops a command, an exit, and the end that is not one — a
-        // command handed to the job registry, which `run_shell` returns from
-        // before it builds a report, so no run reads it (refactor R15).
+        // watcher stops a command, an exit, the signal that killed it, and the
+        // end that is not one — a command handed to the job registry, which
+        // `run_shell` returns from before it builds a report, so no run reads it
+        // (refactor R15).
         let notes = vec![
             end_note(&Ended::Exited(0), minute, true, mush_core::CMD_CAP),
+            end_note(&Ended::Signalled(9), minute, true, mush_core::CMD_CAP),
             end_note(
                 &Ended::Stopped(jobs::Stopped::TimedOut),
                 minute,
@@ -7952,18 +7972,22 @@ mod tests {
             "two ends share a sentence: {notes:?}"
         );
         assert_eq!(notes[0], "[exit 0]");
-        assert!(notes[1].starts_with("[timed out after 60s"), "{}", notes[1]);
-        assert_eq!(notes[2], "[cancelled]");
-        assert!(
-            notes[3].starts_with("[killed: output passed"),
-            "{}",
-            notes[3]
+        assert_eq!(
+            notes[1], "[killed by signal 9]",
+            "a signal death is not an exit code"
         );
-        assert!(notes[4].starts_with("[killed: it ran past"), "{}", notes[4]);
+        assert!(notes[2].starts_with("[timed out after 60s"), "{}", notes[2]);
+        assert_eq!(notes[3], "[cancelled]");
         assert!(
-            notes[5].contains("registry"),
+            notes[4].starts_with("[killed: output passed"),
+            "{}",
+            notes[4]
+        );
+        assert!(notes[5].starts_with("[killed: it ran past"), "{}", notes[5]);
+        assert!(
+            notes[6].contains("registry"),
             "a detached command is not a timed-out one: {}",
-            notes[5]
+            notes[6]
         );
         // The timeout's sentence says why it could not detach when the budget
         // was the reason.
@@ -7974,13 +7998,13 @@ mod tests {
             mush_core::CMD_CAP,
         );
         assert!(full.contains("budget is full"), "{full}");
-        assert!(!notes[1].contains("budget"), "{}", notes[1]);
+        assert!(!notes[2].contains("budget"), "{}", notes[2]);
     }
 
     /// The quit half of finding S4, at the seam: a command killed from *outside*
     /// the watcher — nothing sets the run's own cancel flag, which is the shape
-    /// a quit has — is reported as a cancel rather than as an exit code of `-1`.
-    /// The kill is the registry's, the same call `App::drop` makes.
+    /// a quit has — is reported as a cancel rather than as the signal that
+    /// killed it. The kill is the registry's, the same call `App::drop` makes.
     ///
     /// The real clock here on purpose: the watcher sleeps ten milliseconds a
     /// poll, so the test has the whole sixty-second detach window to land its

@@ -101,7 +101,12 @@ pub const KEYS: &[Binding] = &[
     Binding {
         context: Context::Anywhere,
         keys: "Ctrl-N",
-        help: "start a new chat",
+        // The parenthetical is the half a human cannot undo: the key stops
+        // every actor in the tree, kills what they left running, and drops
+        // every transcript (root and children) — the ack's `agents stopped,
+        // root restarted` is the same fact, and "start a new chat" on its own
+        // read as if only a beginning were at stake (finding D1).
+        help: "start a new chat (stops every agent, drops every transcript)",
     },
     Binding {
         context: Context::Anywhere,
@@ -800,5 +805,21 @@ mod tests {
             help("Ctrl-X"),
             "the two scopes are not the same key's job"
         );
+    }
+
+    /// The key that ends everything says so. `Ctrl-N` stops every actor in the
+    /// tree, kills what they left running and drops every transcript — its own
+    /// ack reads `agents stopped, root restarted` — so "start a new chat"
+    /// alone understated a key whose cost is the whole conversation (finding
+    /// D1).
+    #[test]
+    fn the_new_chat_key_names_what_it_stops_and_drops() {
+        let help = KEYS
+            .iter()
+            .find(|binding| binding.keys == "Ctrl-N")
+            .expect("the new-chat row")
+            .help;
+        assert!(help.contains("stops every agent"), "{help}");
+        assert!(help.contains("transcript"), "{help}");
     }
 }

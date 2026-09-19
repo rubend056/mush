@@ -60,7 +60,7 @@ use crate::app::short_age;
 use crate::clock::Clock;
 use crate::events::Events;
 use crate::ids::{AgentId, Ids, JobId};
-use crate::machine::Job;
+use crate::machine::{End, Job};
 
 /// How many jobs may be alive in one workspace at once, beside `MAX_AGENTS`.
 ///
@@ -223,8 +223,14 @@ pub fn stopping(
 /// How a job ended.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum JobOutcome {
-    /// It ended by itself, with this exit code (`-1` when a signal ended it).
+    /// It ended by itself, with this exit code.
     Exited(i32),
+    /// A signal killed it — the OOM killer's `9`, the `SIGSEGV` of a crashed
+    /// binary — with this signal's number. A separate outcome, not an exit code
+    /// standing in for one: a signal death has no exit code, and the `-1` that
+    /// used to spell it was a number no command returns, telling an OOM kill and
+    /// a crash apart from neither (finding B6).
+    Signalled(i32),
     /// mush stopped it: a `Stop` aimed at its owner, `control stop`,
     /// Ctrl-N, or quitting.
     Stopped,
@@ -250,7 +256,10 @@ impl JobOutcome {
     pub fn is_news(&self) -> bool {
         matches!(
             self,
-            JobOutcome::Exited(_) | JobOutcome::TooMuchOutput | JobOutcome::RanTooLong
+            JobOutcome::Exited(_)
+                | JobOutcome::Signalled(_)
+                | JobOutcome::TooMuchOutput
+                | JobOutcome::RanTooLong
         )
     }
 
@@ -265,6 +274,12 @@ impl JobOutcome {
         let command = truncate(command, STATUS_COMMAND_COLUMNS);
         let head = match self {
             JobOutcome::Exited(code) => format!("{id} done: exit {code} · {}", short_age(age)),
+            // The signal by its number is the one name for it every human reads
+            // the same way (`9` under an OOM killer, `11` for a `SIGSEGV`); the
+            // colon-and-name spellings are per-platform and per-shell.
+            JobOutcome::Signalled(signal) => {
+                format!("{id} killed by signal {signal} · {}", short_age(age))
+            }
             JobOutcome::Stopped => format!("{id} stopped after {}", short_age(age)),
             JobOutcome::TooMuchOutput => format!(
                 "{id} killed: it wrote past {CMD_OUTPUT_LIMIT} bytes · {}",
@@ -281,6 +296,18 @@ impl JobOutcome {
             format!("{head} · {command}")
         } else {
             format!("{head} · {command} — {tail}")
+        }
+    }
+}
+
+/// The machine's own distinction, kept all the way to the line a human reads:
+/// a command that ended by itself did so with a code or with a signal, and the
+/// two are not interchangeable (finding B6).
+impl From<End> for JobOutcome {
+    fn from(end: End) -> Self {
+        match end {
+            End::Exited(code) => JobOutcome::Exited(code),
+            End::Signalled(signal) => JobOutcome::Signalled(signal),
         }
     }
 }
@@ -379,7 +406,7 @@ impl Live {
     /// the registry's grip on it. A poison outside this module must not take
     /// the waiter down with it: the command cannot be waited for any more, and
     /// that is what the answer says.
-    fn poll(&self) -> Result<Option<i32>, String> {
+    fn poll(&self) -> Result<Option<End>, String> {
         match self.job.lock() {
             Ok(mut job) => job.poll(),
             Err(_) => Err("the command's handle was poisoned".to_string()),
@@ -463,7 +490,7 @@ impl Drop for Foreground {
 }
 
 impl Job for Foreground {
-    fn poll(&mut self) -> Result<Option<i32>, String> {
+    fn poll(&mut self) -> Result<Option<End>, String> {
         self.live.poll()
     }
 
@@ -1236,20 +1263,20 @@ fn watch(
                 break JobOutcome::Stopped;
             };
             match job.poll() {
-                Ok(Some(code)) => (job.written(), Ok(code)),
+                Ok(Some(end)) => (job.written(), Ok(end)),
                 Ok(None) => (job.written(), Err(None)),
                 Err(error) => (job.written(), Err(Some(error))),
             }
         };
         match ended {
-            Ok(code) => {
+            Ok(end) => {
                 // A kill that landed between the poll and the flag is what the
                 // flag is for: report it as a stop rather than as the command's
-                // own exit code.
+                // own end — its code or the signal mush sent it.
                 break if live.stop.load(Ordering::SeqCst) {
                     JobOutcome::Stopped
                 } else {
-                    JobOutcome::Exited(code)
+                    JobOutcome::from(end)
                 };
             }
             Err(None) => {}
@@ -1449,6 +1476,16 @@ mod tests {
             "#c2 done: exit 0 · 3m12s · cargo test — running 12 tests · test result: ok. 12 passed"
         );
         assert!(JobOutcome::Exited(0).is_news(), "a result nobody has read");
+        // A signal death is its own outcome and its own sentence: `-1` was not
+        // an exit code, and it said nothing about what ended the job — an OOM
+        // kill and a `SIGSEGV` read the same through it (finding B6).
+        let signalled =
+            JobOutcome::Signalled(9).line(JobId(2), "cargo test", Duration::from_secs(192), "");
+        assert_eq!(signalled, "#c2 killed by signal 9 · 3m12s · cargo test");
+        assert!(
+            JobOutcome::Signalled(9).is_news(),
+            "a result nobody has read, whoever ended it"
+        );
         let stopped = JobOutcome::Stopped.line(JobId(2), "cargo test", Duration::from_secs(4), "");
         assert_eq!(stopped, "#c2 stopped after 4s · cargo test");
         assert!(!JobOutcome::Stopped.is_news(), "a kill is not a result");
@@ -1526,6 +1563,41 @@ mod tests {
             .events_for(AgentId(7))
             .iter()
             .any(|event| matches!(event, AgentEvent::JobDone { .. })));
+    }
+
+    /// A job a signal killed — the OOM killer's `9`, the `SIGSEGV` of a crashed
+    /// binary — reaches its owner as that signal and not as an exit code: the
+    /// machine's distinction is the one the line carries, from the poll that
+    /// learned it to the bar and the transcript that paint it (finding B6).
+    #[test]
+    fn a_job_a_signal_killed_reports_the_signal() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::signalled(9)));
+        let (registry, _events, _clock) = registry();
+        let (id, mailbox) = launch(&registry, &machine, 7);
+
+        let line = match mailbox.recv_timeout(Duration::from_secs(5)) {
+            Ok(AgentMsg::CommandDone {
+                id: reported,
+                line,
+                news,
+            }) => {
+                assert_eq!(reported, id);
+                assert!(news, "a job that ended is news, however it ended");
+                line
+            }
+            Ok(_) => panic!("the completion must be a `CommandDone`"),
+            Err(error) => panic!("the owner was never told: {error}"),
+        };
+        assert!(line.starts_with("#c1 killed by signal 9 · "), "{line}");
+        assert!(line.ends_with("cargo build"), "{line}");
+        assert_eq!(machine.kills(), 0, "nobody in mush killed it");
+        let listed = registry
+            .status_for(7)
+            .expect("the finished job stays listed");
+        assert!(
+            listed.contains("killed by signal 9"),
+            "and `status` says the same thing: {listed}"
+        );
     }
 
     /// The two id spaces are separate: a launch draws from the *job* counter,

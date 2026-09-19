@@ -331,6 +331,35 @@ fn job_title(command: &str) -> String {
     mush_core::text::truncate(clause, JOB_TITLE_COLUMNS)
 }
 
+/// How much of one bar row the cursor row's brief may spend.
+///
+/// `Enter` in the tree says which row the chat pane now shows, and it says it
+/// with the brief the row carries — a sentence written *for a model*, often a
+/// paragraph. The bar paints its line whole and does no width arithmetic of its
+/// own (the rule [`QUIT_LINE_COLUMNS`] states), so the brief used to run off
+/// the end of the row and lose its tail, which is the part that says what the
+/// task is. This is not the agent *row's* bound (`app/tree.rs`'s
+/// `TITLE_COLUMNS` is 24): that number is a handle on a row, and this one is a
+/// sentence on the bar, so the two are two decisions.
+///
+/// The line's head, `agent #id: `, is not part of the budget: it is what says
+/// whose brief this is, and it is short enough that keeping it whole costs the
+/// brief a few columns. What is left is one row at the ubiquitous 80×24 — 73
+/// columns, the ` chat ` badge and the space after it taking seven of the
+/// eighty — with a column spare.
+const CURSOR_LINE_COLUMNS: usize = 72;
+
+/// How much of one bar row a typo'd command's name may spend.
+///
+/// The line is `unknown command: {name} — /help lists them`, and the name is
+/// whatever the human typed: a paste is unbounded, and the bar paints its line
+/// whole and does no width arithmetic of its own, so an over-long one would
+/// have its tail clipped — and the tail is the half that says where the
+/// commands are. The name is therefore the part that gets cut, visibly, and
+/// this is what one row leaves for it: 73 columns at the ubiquitous 80×24, less
+/// the 36 the fixed head and tail take between them (finding D3).
+const UNKNOWN_NAME_COLUMNS: usize = 36;
+
 /// How much of one bar row the quit warning may spend.
 ///
 /// One row at the ubiquitous 80×24 is 73 columns — the ` chat ` badge and the
@@ -1598,9 +1627,17 @@ impl App {
             // error it was ranked an alert (never the line the cap yielded),
             // painted red, and written to the session, so a typo outlived the
             // run it answered and came back at the next start.
-            Err(CommandError::Unknown(name)) => self
-                .chat
-                .note_for(self.tree.focused, format!("unknown command: {name}")),
+            Err(CommandError::Unknown(name)) => {
+                // The way out is named with the complaint: the bar is the one
+                // line a human reads after a typo, and `/help` is where the
+                // commands are. The name is what a paste can stretch, so the
+                // name is what the row's budget cuts (finding D3).
+                let name = mush_core::text::truncate(&name, UNKNOWN_NAME_COLUMNS);
+                self.chat.note_for(
+                    self.tree.focused,
+                    format!("unknown command: {name} — /help lists them"),
+                )
+            }
         }
     }
 
@@ -2075,7 +2112,15 @@ impl App {
             }
             Command::ApiKey(None) => match &self.cell.ui().api_key {
                 Some(key) => self.say(format!("api key set ({}…)", mask_key(key))),
-                None => self.say("no api key — /key <secret> sets one (memory only)"),
+                // Where a secret lands is the fact a human needs *before*
+                // typing one, and this arm said "memory only": the arm below
+                // writes the key into the home config in plain text and says
+                // so, so the promise was wrong in the one direction that costs
+                // a secret (finding A1).
+                None => self.say(format!(
+                    "no api key — /key <secret> sets one (saved to {})",
+                    userconfig::config_path().display()
+                )),
             },
             Command::ApiKey(Some(secret)) => {
                 // Masked before it is moved: the message quotes the same secret
@@ -3084,7 +3129,12 @@ impl App {
                 .node(id)
                 .map(|node| node.brief.clone())
                 .unwrap_or_default();
-            self.say(format!("agent {id}: {brief}"));
+            // The head is kept whole — it is what says whose brief this is —
+            // and the brief takes what is left of the row.
+            let head = format!("agent {id}: ");
+            let room = CURSOR_LINE_COLUMNS.saturating_sub(head.chars().count());
+            let brief = mush_core::text::truncate(&brief, room);
+            self.say(format!("{head}{brief}"));
             // A focus change is a read-the-bar moment; refresh the git line so
             // it is current when the human looks (finding P8).
             self.refresh_git();
@@ -5547,6 +5597,10 @@ mod tests {
     /// and not a line the session file writes down and a relaunch reads back. A
     /// *run's* failure is the opposite and stays stored — see
     /// [`a_failure_is_stored_and_a_command_answer_is_not`].
+    ///
+    /// The line names the command that lists the ones that do exist: a human
+    /// who typed a name that is not one needs the list, and "unknown command"
+    /// on its own left them to guess at it (finding D3).
     #[test]
     fn a_typoed_command_is_a_moment_not_a_stored_failure() {
         let root = dir("typo");
@@ -5559,7 +5613,7 @@ mod tests {
             .notices_for(AgentId::ROOT)
             .next()
             .expect("the typo is answered");
-        assert_eq!(notice.text, "unknown command: /hlep");
+        assert_eq!(notice.text, "unknown command: /hlep — /help lists them");
         assert_eq!(
             notice.rank(),
             Rank::Said,
@@ -5585,6 +5639,37 @@ mod tests {
             "and a relaunch does not bring the typo back"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A typed name is unbounded — a paste reaches the box whole — and the bar
+    /// paints its line whole, so the name is what the row's budget cuts: the
+    /// half of the sentence that must survive is the one that says where the
+    /// commands are (finding D3).
+    #[test]
+    fn an_over_long_typo_still_points_at_the_help() {
+        let (mut app, _rx) = test_app("typo-paste");
+        app.chat.insert(&format!("/{}", "x".repeat(400)));
+        app.send_message();
+
+        let notice = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .next()
+            .expect("the typo is answered");
+        assert!(
+            notice.text.ends_with(" — /help lists them"),
+            "the way out is not what the row clips: {}",
+            notice.text
+        );
+        assert!(
+            notice.text.contains('…'),
+            "the cut is visible: {}",
+            notice.text
+        );
+        // The name got its whole budget and no more: `unknown command: ` and
+        // the tail are 17 and 19 columns of the row, so the line is exactly
+        // what the two named numbers say it is.
+        assert_eq!(notice.text.chars().count(), UNKNOWN_NAME_COLUMNS + 36);
     }
 
     /// A fresh run of an agent supersedes its stale failure: the row is derived
@@ -7040,6 +7125,57 @@ mod tests {
         assert!(
             rows.iter().any(|row| row.contains(" help · line 1/")),
             "the popup paints the list and where in it the reader is: {rows:?}"
+        );
+    }
+
+    /// `/key` with no key says where a key *would* go. It promised "memory
+    /// only", while the arm beside it writes the secret into the home config in
+    /// plain text and names the file it wrote: the promise was wrong in the one
+    /// direction that costs a secret, so the sentence names the file (finding
+    /// A1).
+    #[test]
+    fn the_key_report_names_where_a_key_would_be_saved() {
+        let (mut app, _rx) = test_app("key-report");
+        run(&mut app, "/key");
+        assert_eq!(
+            text_of(&app),
+            format!(
+                "no api key — /key <secret> sets one (saved to {})",
+                userconfig::config_path().display()
+            )
+        );
+    }
+
+    /// `Enter` on a row says whose transcript the pane shows, and the brief it
+    /// says it with is bounded like every other bar line: a brief is a sentence
+    /// written *for a model* and the bar paints its row whole, so the line took
+    /// whatever the brief gave it — for a long one, the rest of the terminal
+    /// (finding B7). The head survives, because it is what says whose brief it
+    /// is.
+    #[test]
+    fn the_focus_line_bounds_the_brief_it_carries() {
+        let (mut app, _rx) = test_app("focus-line");
+        let brief = "please create a file called deep.txt and fill it with everything \
+                     the task needs, at length, in prose";
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: brief.to_string(),
+            depth: 1,
+            branch: None,
+            cmd: crossbeam_channel::unbounded().0,
+        });
+        app.tree.move_cursor(1);
+        assert_eq!(app.tree.cursor_id(), Some(AgentId(1)));
+
+        app.focus_cursor_row();
+
+        let line = text_of(&app);
+        assert!(line.starts_with("agent #1: "), "whose brief it is: {line}");
+        assert!(line.contains('…'), "the cut is visible: {line}");
+        assert!(
+            line.chars().count() <= CURSOR_LINE_COLUMNS,
+            "one bar row at 80×24: {line}"
         );
     }
 

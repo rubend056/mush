@@ -159,14 +159,19 @@ pub enum Voice {
 }
 
 impl Voice {
-    /// The mark this voice leads with, and its colour. [`Voice::Mush`] has none:
-    /// its rows are marked by the caller, because it is not a voice.
-    fn mark(self) -> (&'static str, Color) {
+    /// The mark this voice leads with, and the style it is painted in.
+    ///
+    /// Every voice is here, [`Voice::Mush`] included: it is not a speaker, so
+    /// its mark carries no speaker's colour — the `· ` that names mush's own
+    /// words, in the dim style the pane paints those rows in. It used to be
+    /// spelled twice, once here and once in an arm of `render_message`, with
+    /// two styles and the copy here unreachable (finding C1).
+    fn mark(self) -> (&'static str, Style) {
         match self {
-            Voice::Human => ("you › ", Color::Cyan),
-            Voice::Brief => ("brief › ", Color::Cyan),
-            Voice::Parent => ("parent › ", Color::Magenta),
-            Voice::Mush => ("· ", Color::Reset),
+            Voice::Human => ("you › ", Style::default().fg(Color::Cyan)),
+            Voice::Brief => ("brief › ", Style::default().fg(Color::Cyan)),
+            Voice::Parent => ("parent › ", Style::default().fg(Color::Magenta)),
+            Voice::Mush => ("· ", dim()),
         }
     }
 }
@@ -1447,21 +1452,11 @@ fn render_message(
 ) {
     match message.role.as_str() {
         "user" => {
-            match voice.unwrap_or(Voice::Human) {
-                // Mush's own line in the conversation: nobody said it, so it is
-                // marked like the other lines mush writes into a pane.
-                Voice::Mush => marked(out, "· ", dim(), message.text(), width),
-                voice => {
-                    let (mark, colour) = voice.mark();
-                    marked(
-                        out,
-                        mark,
-                        Style::default().fg(colour),
-                        message.text(),
-                        width,
-                    );
-                }
-            }
+            // Mush's own line in the conversation is marked like the other
+            // lines mush writes into a pane, and `mark()` is the one spelling
+            // of that mark as it is of every speaker's.
+            let (mark, style) = voice.unwrap_or(Voice::Human).mark();
+            marked(out, mark, style, message.text(), width);
             out.push(Line::from(""));
         }
         "assistant" => {
