@@ -282,17 +282,13 @@ fn request(ask: &Ask<'_>, clock: &dyn Clock, pool: &Pool, open: Open<'_>) -> io:
             // never answered and sending it again cannot duplicate anything.
             // One retry, only for a connection that was reused, and never for a
             // cancellation or a deadline: those are decisions, not a dead
-            // socket, and must be reported as themselves. `Interrupted` is in
-            // this list because the only one that reaches here is the watch's
-            // own cancellation — a signal that interrupted the socket was
-            // retried inside the read or the write that met it.
-            let dead_kept = reused
-                && !heard
-                && !watch.cancelled()
-                && !matches!(
-                    error.kind(),
-                    io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
-                );
+            // socket, and must be reported as themselves. A cancellation is
+            // the watch's own `Interrupted`, and `!watch.cancelled()` above
+            // already excludes it: a signal that interrupted the socket was
+            // retried inside the read or the write that met it. That leaves
+            // `TimedOut` as the one kind to name here.
+            let dead_kept =
+                reused && !heard && !watch.cancelled() && error.kind() != io::ErrorKind::TimedOut;
             if !dead_kept {
                 return Err(error);
             }
@@ -691,13 +687,13 @@ fn connect(
             }
         };
         // Liveness guards, not UX timers: a stalled endpoint must not pin a
-        // thread (and, for the model list, the whole TUI) forever. During
-        // setup the socket gets the whole budget — a TLS handshake is a
-        // conversation, not a read — and only then the short slice that lets a
-        // cancellation land while the model thinks.
+        // thread (and, for the model list, the whole TUI) forever.
         stream.set_write_timeout(Some(WRITE_TIMEOUT))?;
-        stream.set_read_timeout(Some(read_timeout))?;
         if tls {
+            // A TLS handshake is a conversation, not a read, so during setup
+            // it gets the whole budget; only the reads after it get the short
+            // slice that lets a cancellation land while the model thinks.
+            stream.set_read_timeout(Some(read_timeout))?;
             let stream = tls_connect(host, stream)?;
             stream.sock.set_read_timeout(Some(READ_SLICE))?;
             return Ok(Box::new(stream));

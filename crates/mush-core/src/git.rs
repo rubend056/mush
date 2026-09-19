@@ -72,10 +72,21 @@ pub const GIT_UNAVAILABLE: &str = "git binary unavailable";
 /// stdout. Unlike [`status`] and friends this can fail for a reason the human
 /// needs to read (a merge conflict, a worktree that is still checked out), so
 /// the error carries git's own message instead of collapsing to `None`.
+pub fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
+    run_named(dir, args.first().copied().unwrap_or(""), args)
+}
+
+/// [`run`] with the failing command named by the caller. The one failure git
+/// itself says nothing more about is a nonzero exit with both streams empty,
+/// and there the argv is not enough: `git worktree add`'s first word names a
+/// subcommand group, so it would read `git worktree failed` while the human
+/// needs the verb that failed. The name is passed in, never matched back out of
+/// the error text — a reworded message here would silently retire such a match
+/// (see [`GIT_UNAVAILABLE`] for what a copy of a message costs).
 ///
 /// The one invocation style for mutating verbs: `-C` so the caller names the
 /// repository, and `LC_ALL=C` so a conflict or error reads the same everywhere.
-pub fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
+fn run_named(dir: &Path, name: &str, args: &[&str]) -> Result<String, String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -88,7 +99,7 @@ pub fn run(dir: &Path, args: &[&str]) -> Result<String, String> {
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let detail = if stderr.is_empty() { stdout } else { stderr };
         return Err(if detail.is_empty() {
-            format!("git {} failed", args.first().unwrap_or(&""))
+            format!("git {name} failed")
         } else {
             detail
         });
@@ -178,11 +189,18 @@ pub fn worktree_path(root: &Path, id: u64) -> PathBuf {
     root.join(worktree_rel(id))
 }
 
+/// The branch namespace every isolated agent's branch lives in: `mush/<id>`.
+/// One spelling, for the same reason [`WORKTREE_DIR`] is one: the name a
+/// worktree is created on, the id read back out of it, and the ref prefix
+/// [`isolated_ids`] asks git for used to be three copies — and a divergence
+/// between them is a branch nobody can find or reclaim.
+const BRANCH_PREFIX: &str = "mush/";
+
 /// The branch an isolated agent's worktree is checked out on: `mush/<id>`.
 /// Mush creates it and mush reclaims it, so its name is not the human's to
 /// choose — [`worktree_id`] reads the id back out of it.
 pub fn branch_name(id: u64) -> String {
-    format!("mush/{id}")
+    format!("{BRANCH_PREFIX}{id}")
 }
 
 /// How many isolated worktrees one repository may hold before an isolated spawn
@@ -200,7 +218,7 @@ pub const MAX_WORKTREES: usize = 70;
 /// branch the human made by hand must not be adopted as mush's leftover, so
 /// everything that is not exactly this shape stays unnamed.
 pub fn worktree_id(branch: &str) -> Option<u64> {
-    branch.strip_prefix("mush/")?.parse().ok()
+    branch.strip_prefix(BRANCH_PREFIX)?.parse().ok()
 }
 
 /// One entry of `git worktree list --porcelain`: where the checkout is, the
@@ -309,8 +327,11 @@ pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf,
     }
     let path = worktree_path(dir, id);
     let branch = branch_name(id);
-    run(
+    // The name is `worktree add`, not `run`'s `worktree`: a silent failure has
+    // to name the subcommand that failed, and this is the call that knows it.
+    run_named(
         dir,
+        "worktree add",
         &[
             "worktree",
             "add",
@@ -321,15 +342,6 @@ pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf,
         ],
     )
     .map(|_| (path, branch))
-    .map_err(|error| {
-        // `run` names the verb it failed at, and a silent failure reads
-        // "git worktree failed"; the human needs the subcommand that failed.
-        if error == "git worktree failed" {
-            "git worktree add failed".to_string()
-        } else {
-            error
-        }
-    })
 }
 
 /// What one look at the worktree of agent `id` found: the decision [`reclaim`]
@@ -513,14 +525,8 @@ fn remove(root: &Path, id: u64) -> Reclaimed {
 /// mush/<id>` refusing (finding H10, P13). Naming every one of them lets a
 /// caller reclaim the merged ones and reserve the rest.
 pub fn isolated_ids(dir: &Path) -> Option<Vec<u64>> {
-    let text = git(
-        dir,
-        &[
-            "for-each-ref",
-            "--format=%(refname:short)",
-            "refs/heads/mush/",
-        ],
-    )?;
+    let refs = format!("refs/heads/{BRANCH_PREFIX}");
+    let text = git(dir, &["for-each-ref", "--format=%(refname:short)", &refs])?;
     let mut ids: Vec<u64> = text.lines().filter_map(worktree_id).collect();
     ids.sort_unstable();
     ids.dedup();
@@ -611,15 +617,15 @@ pub fn resolve(dir: &Path, name: &str) -> Option<String> {
 
 fn diff_stat(dir: &Path, args: &[&str]) -> Option<Stat> {
     let text = git(dir, args)?;
-    parse_shortstat(&text)
+    Some(parse_shortstat(&text))
 }
 
 /// Parse `git diff --shortstat`: ` 3 files changed, 12 insertions(+), 4 deletions(-)`.
 /// Any part may be missing — git only prints the lines that apply — and an
 /// empty string is a clean tree.
-pub fn parse_shortstat(text: &str) -> Option<Stat> {
+pub fn parse_shortstat(text: &str) -> Stat {
     if text.trim().is_empty() {
-        return Some(Stat::default());
+        return Stat::default();
     }
     let mut stat = Stat::default();
     let words: Vec<&str> = text
@@ -640,7 +646,7 @@ pub fn parse_shortstat(text: &str) -> Option<Stat> {
             _ => {}
         }
     }
-    Some(stat)
+    stat
 }
 
 #[cfg(test)]
@@ -651,9 +657,9 @@ mod tests {
 
     #[test]
     fn shortstat_parses_every_shape() {
-        assert_eq!(parse_shortstat("").unwrap(), Stat::default());
+        assert_eq!(parse_shortstat(""), Stat::default());
         assert_eq!(
-            parse_shortstat(" 1 file changed, 1 insertion(+)").unwrap(),
+            parse_shortstat(" 1 file changed, 1 insertion(+)"),
             Stat {
                 files: 1,
                 added: 1,
@@ -661,7 +667,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_shortstat(" 3 files changed, 12 insertions(+), 4 deletions(-)").unwrap(),
+            parse_shortstat(" 3 files changed, 12 insertions(+), 4 deletions(-)"),
             Stat {
                 files: 3,
                 added: 12,
@@ -669,7 +675,7 @@ mod tests {
             }
         );
         assert_eq!(
-            parse_shortstat(" 2 files changed, 5 deletions(-)").unwrap(),
+            parse_shortstat(" 2 files changed, 5 deletions(-)"),
             Stat {
                 files: 2,
                 added: 0,
@@ -694,7 +700,7 @@ mod tests {
 
     #[test]
     fn a_huge_diff_keeps_its_count() {
-        let stat = parse_shortstat(" 1 file changed, 5000000000 insertions(+)").unwrap();
+        let stat = parse_shortstat(" 1 file changed, 5000000000 insertions(+)");
         assert_eq!(stat.files, 1);
         assert_eq!(stat.added, 5_000_000_000, "u32 would have read this as 0");
         assert_eq!(stat.removed, 0);
@@ -764,6 +770,25 @@ mod tests {
             error.contains("no-such-branch") || error.contains("not something we can merge"),
             "{error}"
         );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The one failure git says nothing about is named by the caller, not read
+    /// back out of the error: `worktree_add` passes `worktree add`, so a silent
+    /// add cannot be reported as the group it lives in. This is the mechanism
+    /// that replaced matching the error against a copy of its own text.
+    #[test]
+    fn a_silent_failure_is_named_by_the_caller() {
+        let dir = init_repo("verb-silent");
+        // `--quiet` and an unresolvable revision: exit 1 with both streams
+        // empty, which is the silent path.
+        let error = run_named(
+            &dir,
+            "worktree add",
+            &["rev-parse", "--verify", "-q", "no-such-ref"],
+        )
+        .unwrap_err();
+        assert_eq!(error, "git worktree add failed");
         let _ = fs::remove_dir_all(&dir);
     }
 

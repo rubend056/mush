@@ -64,37 +64,16 @@ fn main() {
 
 struct Args {
     dir: PathBuf,
-    url: Option<String>,
-    model: Option<String>,
-    provider: Option<String>,
-    context: Option<usize>,
-    temperature: Option<f32>,
-    max_completion_tokens: Option<bool>,
-    reasoning_effort: Option<config::ReasoningEffort>,
-    thinking: Option<config::ThinkingMode>,
+    /// The command line as the config layer sees it, in the layer's own shape:
+    /// a flag sets one field here and nowhere else, so a new knob cannot be
+    /// left out of a hand-copied second struct. mush has no API-key flag; a key
+    /// comes from `MUSH_API_KEY` or the home config, so `api_key` stays `None`.
+    overrides: Overrides,
     /// `-y` / `--yes`: recorded in [`AUTO_APPROVE`] and nowhere else.
     yes: bool,
     /// `--print-config`: print the resolved config and exit, instead of opening
     /// the terminal.
     print_config: bool,
-}
-
-impl Args {
-    /// The command line as the config layer sees it. mush has no API-key flag;
-    /// a key comes from `MUSH_API_KEY` or the home config.
-    fn overrides(&self) -> Overrides {
-        Overrides {
-            url: self.url.clone(),
-            model: self.model.clone(),
-            provider: self.provider.clone(),
-            api_key: None,
-            context: self.context,
-            temperature: self.temperature,
-            max_completion_tokens: self.max_completion_tokens,
-            reasoning_effort: self.reasoning_effort,
-            thinking: self.thinking,
-        }
-    }
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -105,14 +84,7 @@ fn parse_args() -> Result<Args, String> {
 /// without a process environment.
 fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
     let mut dir: Option<PathBuf> = None;
-    let mut url = None;
-    let mut model = None;
-    let mut provider = None;
-    let mut context = None;
-    let mut temperature = None;
-    let mut max_completion_tokens = None;
-    let mut reasoning_effort = None;
-    let mut thinking = None;
+    let mut overrides = Overrides::default();
     let mut yes = false;
     let mut print_config = false;
     let mut only_flags = false;
@@ -136,10 +108,12 @@ fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
             "--" => only_flags = true,
             "-y" | "--yes" => yes = true,
             "--print-config" => print_config = true,
-            "--max-completion-tokens" => max_completion_tokens = Some(true),
-            "--url" => url = Some(args.next().ok_or("--url needs a value")?),
-            "--model" => model = Some(args.next().ok_or("--model needs a value")?),
-            "--provider" => provider = Some(args.next().ok_or("--provider needs a value")?),
+            "--max-completion-tokens" => overrides.max_completion_tokens = Some(true),
+            "--url" => overrides.url = Some(args.next().ok_or("--url needs a value")?),
+            "--model" => overrides.model = Some(args.next().ok_or("--model needs a value")?),
+            "--provider" => {
+                overrides.provider = Some(args.next().ok_or("--provider needs a value")?)
+            }
             "--context" => {
                 let value = args.next().ok_or("--context needs a value")?;
                 let tokens = value
@@ -147,7 +121,7 @@ fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
                     .ok()
                     .filter(|n| *n > 0)
                     .ok_or_else(|| format!("--context needs a token count, got `{value}`"))?;
-                context = Some(tokens);
+                overrides.context = Some(tokens);
             }
             "--temperature" => {
                 let value = args.next().ok_or("--temperature needs a value")?;
@@ -159,7 +133,7 @@ fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
                     .ok()
                     .filter(|f| f.is_finite())
                     .ok_or_else(|| format!("--temperature needs a number, got `{value}`"))?;
-                temperature = Some(stated);
+                overrides.temperature = Some(stated);
             }
             "--reasoning-effort" => {
                 let value = args.next().ok_or("--reasoning-effort needs a value")?;
@@ -170,7 +144,7 @@ fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
                 let stated = config::ReasoningEffort::parse(&value).map_err(|_| {
                     format!("--reasoning-effort needs low, high or max, got `{value}`")
                 })?;
-                reasoning_effort = Some(stated);
+                overrides.reasoning_effort = Some(stated);
             }
             "--thinking" => {
                 let value = args.next().ok_or("--thinking needs a value")?;
@@ -178,7 +152,7 @@ fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
                 // to leave the thinking mode on.
                 let stated = config::ThinkingMode::parse(&value)
                     .map_err(|_| format!("--thinking needs on or off, got `{value}`"))?;
-                thinking = Some(stated);
+                overrides.thinking = Some(stated);
             }
             other if other.starts_with("--") => {
                 return Err(format!("unknown option `{other}` (try --help)"));
@@ -189,14 +163,7 @@ fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
 
     Ok(Args {
         dir: dir.unwrap_or_else(|| PathBuf::from(".")),
-        url,
-        model,
-        provider,
-        context,
-        temperature,
-        max_completion_tokens,
-        reasoning_effort,
-        thinking,
+        overrides,
         yes,
         print_config,
     })
@@ -558,10 +525,17 @@ fn describe(config: &Config, approved: bool) -> Vec<(String, String)> {
         Some(key) => format!("{} (masked)", mask_key(key)),
         None => "(none)".to_string(),
     };
+    // The model row is the id a request carries, **defanged**: an id an endpoint
+    // chose (adopted from `/v1/models`, or restored from the session) can carry
+    // a control sequence, and this line reaches a terminal. It is not
+    // [`Config::label`]: that is the facts line's whole `model @ endpoint`, and
+    // this dump already has an `endpoint` row of its own. The word for an unset
+    // model is the one the label uses, and the defanging is the same door
+    // (`mush_core::text::sanitize`) every terminal-bound string goes through.
     let model = if config.model.is_empty() {
-        "(none yet)".to_string()
+        "no model".to_string()
     } else {
-        config.model.clone()
+        mush_core::text::sanitize(&config.model)
     };
     let window = if config.context_explicit {
         "stated"
@@ -633,7 +607,7 @@ fn run() -> Result<(), Box<dyn Error>> {
     // and read by the features that will ask (and by `--print-config`). Nothing
     // else changes because of it.
     AUTO_APPROVE.store(args.yes, Ordering::Relaxed);
-    let overrides = args.overrides();
+    let overrides = args.overrides;
 
     let dir = args.dir;
     if dir.is_file() {
@@ -900,34 +874,34 @@ mod tests {
 
     #[test]
     fn cli_overrides_map_to_the_config_layer() {
-        let args = Args {
-            dir: PathBuf::from("."),
-            url: Some("http://host:1".into()),
-            model: None,
-            provider: Some("deepseek".into()),
-            context: Some(64_000),
-            temperature: Some(0.2),
-            max_completion_tokens: Some(true),
-            reasoning_effort: Some(config::ReasoningEffort::Max),
-            thinking: Some(config::ThinkingMode::Off),
-            yes: true,
-            print_config: false,
-        };
-        let overrides = args.overrides();
+        let args = parse_from(
+            [
+                "-y",
+                "--url",
+                "http://host:1",
+                "--provider",
+                "deepseek",
+                "--context",
+                "64000",
+                "--max-completion-tokens",
+            ]
+            .iter()
+            .map(|arg| arg.to_string()),
+        )
+        .unwrap();
+        let overrides = args.overrides;
         assert_eq!(overrides.url.as_deref(), Some("http://host:1"));
         assert_eq!(overrides.provider.as_deref(), Some("deepseek"));
         assert_eq!(overrides.model, None);
         assert_eq!(overrides.context, Some(64_000));
-        assert_eq!(overrides.temperature, Some(0.2));
+        assert_eq!(overrides.temperature, None, "unstated is not a value");
         assert_eq!(overrides.max_completion_tokens, Some(true));
-        assert_eq!(
-            overrides.reasoning_effort,
-            Some(config::ReasoningEffort::Max)
-        );
-        assert_eq!(overrides.thinking, Some(config::ThinkingMode::Off));
+        assert_eq!(overrides.reasoning_effort, None);
+        assert_eq!(overrides.thinking, None);
         // The key never comes from argv, and `-y` is not a config value: it is
         // recorded for the features that will ask, and nothing else.
         assert_eq!(overrides.api_key, None);
+        assert!(args.yes, "`-y` is not copied into the config layer");
     }
 
     /// The flags a human types reach the config layer, the session flag is
@@ -948,22 +922,28 @@ mod tests {
         ];
         let args = parse_from(argv.into_iter().map(str::to_string)).unwrap();
         assert_eq!(args.dir, PathBuf::from("work"));
-        assert_eq!(args.temperature, Some(0.25));
-        assert_eq!(args.max_completion_tokens, Some(true));
+        assert_eq!(args.overrides.temperature, Some(0.25));
+        assert_eq!(args.overrides.max_completion_tokens, Some(true));
         // A stated value survives parsing as one: the config layer has to be
         // able to tell it from silence.
-        assert_eq!(args.reasoning_effort, Some(config::ReasoningEffort::Max));
-        assert_eq!(args.thinking, Some(config::ThinkingMode::Off));
+        assert_eq!(
+            args.overrides.reasoning_effort,
+            Some(config::ReasoningEffort::Max)
+        );
+        assert_eq!(args.overrides.thinking, Some(config::ThinkingMode::Off));
         assert!(args.yes, "`-y` is remembered, not acted on");
         assert!(args.print_config);
 
         // Long form, and nothing else stated: every flag stays unset.
         let args = parse_from(["--yes".to_string()].into_iter()).unwrap();
         assert!(args.yes);
-        assert_eq!(args.temperature, None);
-        assert_eq!(args.max_completion_tokens, None);
-        assert_eq!(args.reasoning_effort, None, "unstated is not a value");
-        assert_eq!(args.thinking, None);
+        assert_eq!(args.overrides.temperature, None);
+        assert_eq!(args.overrides.max_completion_tokens, None);
+        assert_eq!(
+            args.overrides.reasoning_effort, None,
+            "unstated is not a value"
+        );
+        assert_eq!(args.overrides.thinking, None);
         assert!(!args.print_config);
         assert_eq!(args.dir, PathBuf::from("."));
     }
@@ -1088,6 +1068,8 @@ mod tests {
         };
         assert_eq!(field("endpoint"), "http://host:1");
         assert_eq!(field("provider"), "custom");
+        // The id itself, not the facts line's `model @ endpoint`: the endpoint
+        // is a row of its own two lines above.
         assert_eq!(field("model"), "deepseek-v4-pro");
         assert_eq!(field("window"), "64000 tokens (stated)");
         assert_eq!(field("temperature"), "0.0", "0 is a value, not an absence");
@@ -1112,7 +1094,7 @@ mod tests {
                 .map(|(_, value)| value.clone())
                 .unwrap()
         };
-        assert_eq!(field("model"), "(none yet)");
+        assert_eq!(field("model"), "no model");
         assert_eq!(
             field("window"),
             "8192 tokens (assumed from the model or the provider)"
@@ -1144,6 +1126,29 @@ mod tests {
         };
         assert_eq!(field("reasoning"), "high (the provider's default)");
         assert_eq!(field("thinking"), "on (the provider's default)");
+    }
+
+    /// An id an endpoint chose — adopted from `/v1/models`, or restored from
+    /// the session — must not rename the terminal through `--print-config`.
+    /// The row carries the id itself, defanged by the same door the facts line
+    /// and every other terminal-bound string goes through (finding §4 of the
+    /// contract audit).
+    #[test]
+    fn describe_defangs_the_model_an_endpoint_named() {
+        let hostile = "boom\rREST \x1b]0;PWNED\x07\x1b[2J\x1b[Hmock";
+        let cfg = Config::new("http://x:1", hostile, None);
+        let lines = describe(&cfg, false);
+        let model = lines
+            .iter()
+            .find(|(field, _)| field == "model")
+            .map(|(_, value)| value.clone())
+            .unwrap();
+        assert!(!model.contains('\x1b'), "{model:?}");
+        assert!(!model.contains('\r'), "{model:?}");
+        assert_eq!(
+            model, "boom␍REST mock",
+            "the id, minus what a terminal obeys"
+        );
     }
 
     /// The session the shipped DeepSeek defaults describe, as `--print-config`
