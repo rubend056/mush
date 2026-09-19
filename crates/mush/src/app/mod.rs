@@ -323,7 +323,15 @@ const INFO_TTL: Duration = Duration::from_secs(5);
 ///
 /// The same words from both stop keys — `Ctrl-C` on an idle tree and `Ctrl-X`
 /// with nothing in flight — because it is one fact and one place it is read.
-const NOTHING_RUNNING: &str = "nothing running · Ctrl-Q quits · Ctrl-N starts a new chat";
+///
+/// The hint names the half of `Ctrl-N` a human cannot undo. "starts a new
+/// chat" alone read as if only a beginning were at stake, the understatement
+/// D1 fixed in the key's own help; the key stops every agent, kills what they
+/// left running and drops every transcript (root and children). Here the line
+/// is only ever read when *nothing is running*, so the half still worth a
+/// warning is the one that goes: every transcript. It fits the row the badge
+/// and the two key hints already share (finding H26).
+const NOTHING_RUNNING: &str = "nothing running · Ctrl-Q quits · Ctrl-N drops every transcript";
 
 /// How long the session file may lag the conversation.
 ///
@@ -5547,6 +5555,39 @@ mod tests {
 
         ctrl(&mut app, 'q');
         assert!(app.should_quit, "the second press quits");
+    }
+
+    /// The line a stop key answers with when nothing runs names the half of
+    /// `Ctrl-N` a human cannot undo. "starts a new chat" alone read as if only a
+    /// beginning were at stake, while the key stops every agent, kills what they
+    /// left running and drops every transcript — root and children (finding
+    /// H26).
+    ///
+    /// It has to fit the bar's one row at 80×24, badge and the space after it
+    /// included: the bar paints its line whole and does no width arithmetic of
+    /// its own, so a longer warning would have its tail clipped — and the tail
+    /// is where the transcripts are.
+    #[test]
+    fn the_nothing_running_line_names_what_the_new_chat_key_drops() {
+        let (mut app, _rx) = test_app("nothing-running");
+        ctrl(&mut app, 'x');
+
+        let line = text_of(&app).to_string();
+        assert_eq!(line, NOTHING_RUNNING);
+        assert!(
+            line.contains("Ctrl-N drops every transcript"),
+            "the cost of the key, not just the new beginning: {line}"
+        );
+        assert!(
+            line.chars().count() <= 73,
+            "one bar row once the badge takes its seven columns: {line}"
+        );
+
+        // And the frame paints it whole on the bar's own row, which is where a
+        // clipped tail would show.
+        let frame = shot(&mut app, 80, 24);
+        frame.assert_shape("nothing running", 80, 24);
+        assert!(frame.line(22).contains(&line), "{:?}", frame.line(22));
     }
 
     /// The warning is composed from the tree, not remembered, so it follows it:
