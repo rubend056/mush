@@ -601,6 +601,39 @@ impl Chat {
         }
     }
 
+    /// Forget one agent's conversation: the child the history window reaped
+    /// (`App::reap_history`), whose node, transcript and stored row all go
+    /// together.
+    ///
+    /// **No archive** (§8.21): the transcript is dropped, not written anywhere,
+    /// because an archive is one more lifetime to reason about and the stored
+    /// copy of a child's transcript is already capped at 256 KiB — so dropping
+    /// the row drops at most that from the next save.
+    ///
+    /// Every map in here is keyed by the agent's id, so every one of them goes
+    /// with it: the transcript itself, the voices keyed by line index, the
+    /// revision an attach client edits against, and the pane's reading
+    /// position. The notices go too — they are tagged with the agent they were
+    /// written about, and only failures are written to the session, so leaving
+    /// them behind would keep the file growing with `!` lines about an agent
+    /// nothing can open (`Chat::stored_notices`).
+    ///
+    /// The revision is *dropped* rather than stepped forward the way
+    /// [`Self::clear`] steps it, and that is safe only because the id is spent:
+    /// a reaped node's number is one `Ids::next_agent` has already passed, so
+    /// the `0` a missing entry reads as can never be a token for a live
+    /// conversation — and both attach doors refuse an agent the tree does not
+    /// have (`App::attach_read`/`attach_edit`) before they compare a revision
+    /// at all. Never the root: the window keeps it, and the pane the human
+    /// reads is not this method's to empty.
+    pub fn forget(&mut self, agent: AgentId) {
+        self.agents.remove(&agent);
+        self.spoken.remove(&agent);
+        self.revisions.remove(&agent);
+        self.reading.remove(&agent);
+        self.notices.retain(|notice| notice.agent != agent);
+    }
+
     /// A line for the transcript that is not a message: a hint, or a failure.
     /// It concerns the root conversation unless tagged otherwise.
     ///
@@ -2738,6 +2771,41 @@ mod tests {
         chat.set_root_dropped(Some(marker));
         chat.clear();
         assert_eq!(chat.root_dropped(), None, "a new chat is stored whole");
+    }
+
+    /// Forgetting one agent — the child the history window reaped (§8.21) —
+    /// drops every map this conversation keys by its id, and nothing else: the
+    /// transcript, the voices keyed by line, the revision an attach client
+    /// edits against, the pane's own reading position, and the lines mush wrote
+    /// about it.
+    #[test]
+    fn forgetting_an_agent_drops_only_its_own_entries() {
+        let mut chat = Chat::bare();
+        say(&mut chat, AgentId(1), "port the parser");
+        chat.push_message(AgentId(1), Message::user("#1 done: did it"));
+        chat.note_error_for(AgentId(1), "boom");
+        chat.scroll_by(AgentId(1), 2);
+        say(&mut chat, AgentId(2), "port the lexer");
+        chat.note_error_for(AgentId(2), "the lexer's own failure");
+        assert!(chat.spoken.contains_key(&AgentId(1)));
+        assert!(chat.reading.contains_key(&AgentId(1)));
+
+        chat.forget(AgentId(1));
+
+        assert!(!chat.agents.contains_key(&AgentId(1)));
+        assert!(!chat.spoken.contains_key(&AgentId(1)));
+        assert!(!chat.revisions.contains_key(&AgentId(1)));
+        assert!(!chat.reading.contains_key(&AgentId(1)));
+        assert!(
+            !chat.notices.iter().any(|notice| notice.agent == AgentId(1)),
+            "a `!` line about an agent whose pane cannot be opened is not a line"
+        );
+        assert!(chat.transcript(AgentId(1)).is_empty());
+
+        // The sibling is untouched, entry for entry.
+        assert_eq!(chat.transcript(AgentId(2))[0].text(), "port the lexer");
+        assert!(chat.notices.iter().any(|notice| notice.agent == AgentId(2)));
+        assert_eq!(chat.revision(AgentId(2)), 1);
     }
 
     /// Clearing is per agent, because a line about one conversation is not a

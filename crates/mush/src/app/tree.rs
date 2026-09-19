@@ -8,7 +8,7 @@
 //! these methods, it never writes a node's fields itself. What each agent has
 //! said is not here: that is the conversation, and it lives in [`super::chat`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -488,6 +488,35 @@ pub struct Existing {
 /// mailbox is dead), and a row that spins forever is worse than an idle one
 /// (finding B6).
 const STALE_CANCEL: Duration = Duration::from_secs(10);
+
+/// How many finished children a tree keeps before it starts forgetting the
+/// oldest ones.
+///
+/// Everything needs a cap, even a high one (§8.21), and a run's memory had
+/// none: `MAX_AGENTS` counts the agents *running* (`agent.rs`), `MAX_DEPTH`
+/// bounds depth rather than breadth, and `reap` had one caller, at startup — so
+/// a node, a transcript and a `mush-agent-{id}` thread accumulated for every
+/// child a session ever spawned, and the file `session_snapshot` writes grew
+/// with all of them (finding H16). The window is the *finished* children
+/// [`AgentTree::past_history`] may drop; a child that must be kept — an unread
+/// result, an unlanded branch — does not spend one of these slots, so it can
+/// never push an older, droppable one out of the window.
+///
+/// **No archive.** The reaped transcript is *gone*, not written anywhere: an
+/// archive would be one more lifetime to reason about, and the stored copy of
+/// each transcript is already capped at 256 KiB, so dropping a row drops at
+/// most that from the next save (the human's decision, §8.21).
+pub const CHILD_HISTORY: usize = 50;
+
+/// How many of the newest children keep their actor thread.
+///
+/// A thread is the resource, not a node: `mush-agent-{id}` lives until a
+/// `Shutdown` arrives, and every finished child used to hold one for the life
+/// of the session. The newest few stay warm, so an ordinary nudge — the human
+/// typing at the child they just watched finish — costs a message instead of a
+/// thread; everything older is parked, node and transcript untouched
+/// ([`AgentTree::parkable`], `App::park_history`).
+const WARM_CHILDREN: usize = 8;
 
 /// The agents of one conversation, and everything keyed by their ids.
 pub struct AgentTree {
@@ -1027,11 +1056,223 @@ impl AgentTree {
         }
     }
 
+    /// The finished children past the history window: the nodes, transcripts
+    /// and stored rows the tree may drop, oldest first.
+    ///
+    /// The window counts the children it is *allowed* to drop, not the children
+    /// that exist: an agent whose result nobody has read does not spend one of
+    /// the [`CHILD_HISTORY`] slots, so it cannot push an older, droppable child
+    /// out of the window and make a run's memory look bounded when it is not.
+    ///
+    /// Oldest first, so what survives is the newest window: a run that spawned
+    /// fifty-one children loses its first row and keeps numbers 2..=51, a gap
+    /// at the *end* of the history where it reads as history. Reaping from the
+    /// middle — whichever node happened to become eligible first — would leave
+    /// the same count with holes in it, and a hole is the one shape a row list
+    /// cannot explain.
+    ///
+    /// Nothing kept hangs under any of these rows ([`Self::reapable`]), so a row
+    /// that goes never takes a reader with it. Its own eligible children do
+    /// stay — a node does not inherit its parent's age — and a link to a parent
+    /// that is not in the tree is a top-level row in the painted order
+    /// ([`Self::rows`]), so a forgotten parent can never hide a child.
+    pub fn past_history(&self) -> Vec<AgentId> {
+        let jobs_live = self.live_job_count() > 0;
+        // One walk for the whole question "is anything below this node owed
+        // something", rather than a scan per candidate (finding R29).
+        let kept_above = self.kept_above(jobs_live);
+        let mut eligible: Vec<AgentId> = self
+            .agents
+            .iter()
+            .filter(|node| self.reapable(node, &kept_above, jobs_live))
+            .map(|node| node.id)
+            .collect();
+        // The vector is spawn order, oldest first, so the oldest `over` of them
+        // are exactly the ones the window is over: what is left in it after the
+        // truncation is the list of children to drop.
+        let over = eligible.len().saturating_sub(CHILD_HISTORY);
+        eligible.truncate(over);
+        eligible
+    }
+
+    /// Whether the history window may forget this node — the whole predicate,
+    /// in one place, because a wrong `true` here is a transcript nobody can
+    /// open again and there is no archive to fall back on (§8.21).
+    ///
+    /// Everything it asks is "can news still arrive here", and ineligible is
+    /// always the safe answer. The rules split in two, which is what the two
+    /// halves of the test below are:
+    ///
+    /// 1. nothing about *this* node needs it: [`Self::kept`] — not the root, not
+    ///    the agent whose transcript the human is reading ([`Self::focused`]),
+    ///    not a run in flight, not a job of its own that a `Shutdown` would
+    ///    kill, not a result its parent's model has not been handed (`✉`, the
+    ///    `wait`/fold protocol, finding H4), and not an isolated agent whose
+    ///    work was never landed — the row is the only thing that names
+    ///    `mush/<id>`;
+    /// 2. nothing *below* it is owed anything: nothing it hangs over is kept
+    ///    ([`Self::kept_above`]) — a napping agent's node is where its
+    ///    children's completions fold in, and a descendant wearing `✉` is news
+    ///    this node's transcript is the only place to read.
+    ///
+    /// A leftover worktree found on disk needs no rule of its own: it is
+    /// isolated by construction (`branch` set, `landed` unset), so rule 1 keeps
+    /// it and its row.
+    fn reapable(&self, node: &AgentNode, kept_above: &HashSet<AgentId>, jobs_live: bool) -> bool {
+        !self.kept(node, jobs_live) && !kept_above.contains(&node.id)
+    }
+
+    /// Whether the window must keep this node for its own sake: the six rules of
+    /// [`Self::reapable`], in the one place either window reads them, because a
+    /// wrong `false` here is a transcript nobody can open again and there is no
+    /// archive to fall back on (§8.21).
+    ///
+    /// Everything it asks is "can news still arrive here", and kept is always
+    /// the safe answer: the root and the agent whose transcript the human is
+    /// reading ([`Self::focused`], whose pane a reap would blank); a run in
+    /// flight, which has a result coming; a job of its own, which a `Shutdown`
+    /// would kill (`kill_owned`, `agent::absorb`); a result its parent's model
+    /// has not been handed (`✉`, [`Self::result_read`], finding H4); and an
+    /// isolated agent whose work was never landed, whose row is the only thing
+    /// that names `mush/<id>` — a branch a human may still have to look at.
+    ///
+    /// Exempting the unlanded is safe to be conservative about: a sibling patch
+    /// bounds worktrees at `MAX_WORKTREES = 70`, *above* this window, precisely
+    /// so that a spawn can never be refused for want of a slot (§8.21); the row
+    /// is planted on the worktree, not the other way round.
+    fn kept(&self, node: &AgentNode, jobs_live: bool) -> bool {
+        let job_running = jobs_live && !self.live_jobs(node.id).is_empty();
+        node.id == AgentId::ROOT
+            || node.id == self.focused
+            || node.phase.is_busy()
+            || job_running
+            || node.result_unread
+            || (node.branch.is_some() && node.landed.is_none())
+    }
+
+    /// Every node with something *kept* below it, at any depth: the ancestors of
+    /// the nodes [`Self::kept`] refuses, derived in one walk up the parent links
+    /// from each of them.
+    ///
+    /// The subtree and not just the direct children, because a row is the whole
+    /// of what a parent is: a napping agent's node is where its children's
+    /// completions fold, a parent still wearing `✉` is owed a read, and an
+    /// isolated branch under it is work nobody has landed. Forgetting an
+    /// ancestor of any of those leaves a report with no reader — a completion
+    /// notifies a mailbox that no longer exists — and a row whose reader cannot
+    /// ever fold it in. Nor does a node inherit safety from its parent: what is
+    /// kept below is kept *up*, which is why this is the ancestors rather than
+    /// the descendants.
+    fn kept_above(&self, jobs_live: bool) -> HashSet<AgentId> {
+        let mut above: HashSet<AgentId> = HashSet::new();
+        for node in self.agents.iter().filter(|node| self.kept(node, jobs_live)) {
+            // The root has no parent, and `kept` names it only so that no
+            // caller has to ask twice; the walk below is a no-op for it.
+            let mut at = node.parent;
+            while let Some(id) = at {
+                // An ancestor already marked has its own ancestors marked too:
+                // this is what keeps the walk linear in the tree rather than in
+                // the number of kept nodes.
+                if !above.insert(id) {
+                    break;
+                }
+                at = self.node(id).and_then(|node| node.parent);
+            }
+        }
+        above
+    }
+
+    /// The children whose actor thread is no longer worth keeping, oldest
+    /// first: the ones `App::park_history` may send a `Shutdown` to.
+    ///
+    /// Ranks are counted over the children in spawn order, oldest first, so
+    /// "the newest [`WARM_CHILDREN`]" is a promise about the rows a human has
+    /// just been watching — the child they are most likely to nudge. Past the
+    /// [`CHILD_HISTORY`] window the read mark stops mattering as well: the node
+    /// and the transcript keep the result either way, and the next message wakes
+    /// the actor back into it.
+    ///
+    /// One condition is about not *losing* anything, and it yields to no age
+    /// however far outside a window a child is:
+    ///
+    /// - **children.** A parent is a *reader*: its transcript is where its
+    ///   children's completions fold, and its mailbox is the channel they
+    ///   travel on (a child clones its parent's mailbox at spawn). Parking it
+    ///   would drop those reports on the floor, and a revived parent could not
+    ///   get them back — its children hold the mailbox the old actor had. So the
+    ///   *leaf* is the unit of parking, which is also where the threads are: a
+    ///   wide tree of fifty children has one parent.
+    ///
+    /// That one rule is also what keeps a napping agent's thread: a leaf has no
+    /// descendants, so "nothing kept below it" — the second half of the history
+    /// window's predicate — needs no second copy here. The pane the human is
+    /// reading is kept warm as well ([`Self::may_park`]), one thread that costs
+    /// nothing and is the one about to be typed at.
+    pub fn parkable(&self) -> Vec<AgentId> {
+        // Every node that is some child's reader, in one pass: whether a
+        // candidate is a leaf is asked of each one, and a scan per candidate
+        // would make one frame quadratic in the size of the history the window
+        // just capped.
+        let readers: HashSet<AgentId> = self.agents.iter().filter_map(|node| node.parent).collect();
+        // The registry with nothing running — the ordinary state of a finished
+        // tree — cannot hold a job for any of these children, so the per-
+        // candidate lookup is only worth its lock when there is something to
+        // find. (This is asked on every frame.)
+        let jobs_live = self.live_job_count() > 0;
+        let children: Vec<&AgentNode> = self
+            .agents
+            .iter()
+            .filter(|node| node.parent.is_some())
+            .collect();
+        // A rank counted from the oldest child, so `len - N` is the first of the
+        // newest N: the warm window and the reap window are one arithmetic.
+        let warm = children.len().saturating_sub(WARM_CHILDREN);
+        let window = children.len().saturating_sub(CHILD_HISTORY);
+        children
+            .iter()
+            .enumerate()
+            .filter(|(rank, node)| {
+                *rank < warm && self.may_park(*rank < window, node, &readers, jobs_live)
+            })
+            .map(|(_, node)| node.id)
+            .collect()
+    }
+
+    /// Whether one child's thread may be parked: at rest, alone, and — unless it
+    /// is past the reap window — done being listened to. See [`Self::parkable`]
+    /// for why each of these exists.
+    fn may_park(
+        &self,
+        past_window: bool,
+        node: &AgentNode,
+        readers: &HashSet<AgentId>,
+        jobs_live: bool,
+    ) -> bool {
+        // Inside the window, an unread result is what a nudge is *for*: the
+        // child keeps its thread until its parent's model has been handed the
+        // line. Past the window the result is a fact on the node and a line in
+        // the transcript like any other, and a message brings the actor back to
+        // it.
+        let result_read = !node.result_unread || past_window;
+        let job_running = jobs_live && !self.live_jobs(node.id).is_empty();
+        // The one agent whose thread is never reclaimed: the pane the human is
+        // reading is the child they are most likely to type at this moment, and
+        // this window runs on a tick — a phase can be one message stale, so a
+        // park could otherwise cancel the very run those words just started.
+        // The reaper excludes it for the same reason (`Self::kept`).
+        let focused = node.id == self.focused;
+        !focused
+            && !node.phase.is_busy()
+            && !job_running
+            && !readers.contains(&node.id)
+            && result_read
+    }
+
     /// Drop nodes that are gone — a leftover whose worktree no longer exists,
-    /// an agent the human forgot — and everything keyed by their ids. The focus
-    /// and the cursor are put back on a node that is really there: reaping used
-    /// to leave them on a ghost, so the pane stayed titled `agent #4` while
-    /// typing reported that the agent was gone (finding B11).
+    /// an agent the history window forgot — and everything keyed by their ids.
+    /// The focus and the cursor are put back on a node that is really there:
+    /// reaping used to leave them on a ghost, so the pane stayed titled
+    /// `agent #4` while typing reported that the agent was gone (finding B11).
     pub fn reap(&mut self, gone: &[AgentId]) {
         if gone.is_empty() {
             return;
@@ -1944,6 +2185,261 @@ mod tests {
         assert_eq!(tree.cursor(), tree.agents.len().saturating_sub(1));
         assert!(!tree.agent_tx.contains_key(&gone));
         assert!(!tree.agent_stats.contains_key(&gone));
+    }
+
+    /// A finished child of the root: at rest, with a result its parent has read
+    /// (which is the state the history window is about), and a live mailbox, so
+    /// a test can see the `Shutdown` its reap sends.
+    fn finished(tree: &mut AgentTree, id: u64) -> Receiver<AgentMsg> {
+        let rx = spawn(tree, id, 0, 1);
+        tree.finish(AgentId(id), Some(format!("did {id}")));
+        // `finish` arms the `✉` mark — its parent has not read it *yet* — and
+        // the read is what takes it off.
+        tree.result_read(AgentId(id));
+        rx
+    }
+
+    /// Fifty-one finished children keep fifty: the window is a prefix of the
+    /// *oldest* ones, so the survivors are the newest fifty, contiguous.
+    #[test]
+    fn the_history_window_forgets_from_the_oldest_end() {
+        let mut tree = AgentTree::bare();
+        let _mailboxes: Vec<_> = (1..=51).map(|id| finished(&mut tree, id)).collect();
+
+        assert_eq!(
+            tree.past_history(),
+            vec![AgentId(1)],
+            "one child over fifty, and it is the first one"
+        );
+
+        // Fifty exactly is not over the window: nothing to forget.
+        tree.reap(&[AgentId(1)]);
+        assert!(tree.past_history().is_empty());
+    }
+
+    /// A result its parent has not read is the `✉` protocol, and the child
+    /// wearing it is never a candidate — it does not even spend one of the
+    /// fifty slots, so it can never push a droppable child out of the window.
+    #[test]
+    fn the_window_keeps_a_child_whose_result_is_unread() {
+        let mut tree = AgentTree::bare();
+        let _mailboxes: Vec<_> = (1..=52).map(|id| finished(&mut tree, id)).collect();
+        // #1's last run produced something its parent has not been handed.
+        tree.finish(AgentId(1), Some("did 1".to_string()));
+        assert!(tree.node(AgentId(1)).unwrap().result_unread);
+
+        let gone = tree.past_history();
+
+        assert!(
+            !gone.contains(&AgentId(1)),
+            "the oldest child is the one that is owed a read: {gone:?}"
+        );
+        assert_eq!(
+            gone,
+            vec![AgentId(2)],
+            "and the row beyond the window's fifty eligible ones is the one that goes"
+        );
+    }
+
+    /// Work somewhere below a node — at any depth — is the completion that node
+    /// exists to fold in, so the window keeps it however old it is.
+    #[test]
+    fn the_window_keeps_a_child_with_work_below_it() {
+        let mut tree = AgentTree::bare();
+        let _mailboxes: Vec<_> = (1..=52).map(|id| finished(&mut tree, id)).collect();
+        // #1's own child is still working: #1 is napping, and its transcript is
+        // where #100's completion will fold in.
+        let _grandchild = spawn(&mut tree, 100, 1, 2);
+
+        let gone = tree.past_history();
+
+        assert!(
+            !gone.contains(&AgentId(1)),
+            "a napping parent is the reader of the work below it: {gone:?}"
+        );
+        assert_eq!(gone, vec![AgentId(2)]);
+    }
+
+    /// The rule above, generalized: *nothing* the window must keep may hang
+    /// under a row it forgets — not just work in flight. A descendant whose
+    /// result its parent has not read is news with one reader, and that reader is
+    /// the ancestor's transcript: drop the ancestor and the report has nowhere
+    /// left to fold.
+    #[test]
+    fn the_window_keeps_every_ancestor_of_a_child_it_must_keep() {
+        let mut tree = AgentTree::bare();
+        // #1 is a finished, read child — eligible on its own — and #100 hangs
+        // under it with a result nobody has read yet.
+        let _first = finished(&mut tree, 1);
+        let _child = spawn(&mut tree, 100, 1, 2);
+        tree.finish(AgentId(100), Some("did 100".to_string()));
+        // Fifty-two more, so the window is two over even with the rows it must
+        // keep: two rows go, and neither is #1.
+        let _mailboxes: Vec<_> = (2..=53).map(|id| finished(&mut tree, id)).collect();
+
+        let gone = tree.past_history();
+
+        assert_eq!(
+            gone,
+            vec![AgentId(2), AgentId(3)],
+            "the window went past #1, whose child is still wearing `✉`"
+        );
+
+        // Read the child's result and it becomes history like any other: its
+        // ancestor's row goes on the next pass, with nothing left orphaned.
+        tree.result_read(AgentId(100));
+        assert!(
+            tree.past_history().contains(&AgentId(1)),
+            "a read result is the ancestor's to forget: {:?}",
+            tree.past_history()
+        );
+    }
+
+    /// An isolated child whose work nobody has landed is the row that names
+    /// `mush/<id>`: dropping it would lose the only handle a human has on a
+    /// branch that may be unmerged. It is the conservative exemption, and it
+    /// costs the window nothing but the slot it does not take.
+    #[test]
+    fn the_window_keeps_an_isolated_child_whose_work_is_not_landed() {
+        let mut tree = AgentTree::bare();
+        let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "port the parser".to_string(),
+            depth: 1,
+            branch: Some("mush/1".to_string()),
+            cmd: tx,
+        });
+        tree.finish(AgentId(1), Some("did it".to_string()));
+        tree.result_read(AgentId(1));
+        let _mailboxes: Vec<_> = (2..=52).map(|id| finished(&mut tree, id)).collect();
+
+        let gone = tree.past_history();
+
+        assert!(
+            !gone.contains(&AgentId(1)),
+            "the row is the only thing that names mush/1: {gone:?}"
+        );
+        assert_eq!(gone, vec![AgentId(2)]);
+
+        // Landing it is what makes the row droppable like any other: the
+        // exemption is `branch` without `landed`, and nothing else.
+        tree.node_mut(AgentId(1)).unwrap().landed = Some(Landed::Merged);
+        assert!(tree.past_history().contains(&AgentId(1)));
+    }
+
+    /// The thread window is a promise about the *newest* children — the ones a
+    /// human has just been watching — and an older one past it is parked.
+    #[test]
+    fn the_parking_window_keeps_the_newest_children_warm() {
+        let mut tree = AgentTree::bare();
+        let _mailboxes: Vec<_> = (1..=10).map(|id| finished(&mut tree, id)).collect();
+
+        let parked = tree.parkable();
+
+        assert_eq!(
+            parked,
+            vec![AgentId(1), AgentId(2)],
+            "ten children, the newest eight keep their threads"
+        );
+        assert!(
+            parked.iter().all(|id| !(3..=10).any(|n| AgentId(n) == *id)),
+            "and only the two oldest are parked: {parked:?}"
+        );
+
+        // The pane the human is reading keeps its thread too, however old the
+        // child: a phase can be one message stale on the tick this runs, and a
+        // park in that moment cancels the run the human's own words just
+        // started.
+        tree.focus(AgentId(1));
+        assert!(
+            !tree.parkable().contains(&AgentId(1)),
+            "the child the pane is open on is not the window's to reclaim: {:?}",
+            tree.parkable()
+        );
+    }
+
+    /// Parking never cancels work: a run in flight, a parent (whose mailbox is
+    /// the channel its children's completions travel on) and a napping agent
+    /// over a working child are all left alone, however old they are.
+    #[test]
+    fn the_parking_window_never_reclaims_a_thread_with_work_to_hear() {
+        let mut tree = AgentTree::bare();
+        let _mailboxes: Vec<_> = (1..=10).map(|id| finished(&mut tree, id)).collect();
+        // #1 has a child that is still working: its completion is on its way to
+        // #1's mailbox, so #1 is not a candidate and neither is its own child.
+        let _grandchild = spawn(&mut tree, 100, 1, 2);
+        // #2 has a child of its own, at rest and read: it is a reader too.
+        let _child = spawn(&mut tree, 101, 2, 2);
+        tree.finish(AgentId(101), Some("did 101".to_string()));
+        tree.result_read(AgentId(101));
+        // #3 is working: a `Shutdown` would cancel the run it is in.
+        tree.begin(AgentId(3), None);
+
+        let parked = tree.parkable();
+
+        assert!(
+            !parked.contains(&AgentId(1)),
+            "a napping parent is where a completion folds in: {parked:?}"
+        );
+        assert!(
+            !parked.contains(&AgentId(2)),
+            "a parent is the channel its children report on: {parked:?}"
+        );
+        assert!(
+            !parked.contains(&AgentId(3)),
+            "a run in flight is not work to reclaim: {parked:?}"
+        );
+    }
+
+    /// A child that still owns a running job is work in flight, not history:
+    /// both windows end a thread with `Shutdown`, and `Shutdown` kills the jobs
+    /// its owner started (`agent::absorb`'s arm, the registry's `kill_owned`) —
+    /// so a `⚙` a human is still waiting on is the one thing neither may take.
+    #[test]
+    fn neither_window_touches_a_child_that_still_owns_a_job() {
+        use std::path::Path;
+
+        use crate::machine::fake::{Script, Scripted};
+        use crate::machine::{Machine, ShellCommand};
+
+        let mut tree = AgentTree::bare();
+        // Fifty-two, so the window is one over even *with* the child it must
+        // keep: the row it goes on to drop is what says #1 was passed over.
+        let _mailboxes: Vec<_> = (1..=52).map(|id| finished(&mut tree, id)).collect();
+        let machine = Arc::new(Scripted::new().runs(Script::hangs()));
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        tree.jobs
+            .launch(jobs::Launch::started(
+                1,
+                "cargo build".to_string(),
+                false,
+                tx,
+                machine
+                    .spawn(&ShellCommand {
+                        command: "cargo build",
+                        root: Path::new("/tmp"),
+                    })
+                    .unwrap(),
+            ))
+            .unwrap();
+
+        assert_eq!(
+            tree.past_history(),
+            vec![AgentId(2)],
+            "the oldest row is skipped for the one holding work"
+        );
+        let parked = tree.parkable();
+        assert!(
+            !parked.contains(&AgentId(1)),
+            "its thread is not reclaimed either: {parked:?}"
+        );
+        assert!(
+            parked.contains(&AgentId(2)),
+            "while its sibling with no job is a candidate, so the job is what kept #1: {parked:?}"
+        );
+        tree.jobs.kill_all();
     }
 
     /// A Stop reaches a live mailbox; a dead one is a gone actor, and the row
