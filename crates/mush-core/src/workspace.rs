@@ -60,10 +60,6 @@ impl Workspace {
             .replace('\\', "/")
     }
 
-    pub fn exists(&self, rel: &str) -> bool {
-        self.resolve(rel).map(|p| p.exists()).unwrap_or(false)
-    }
-
     /// Read a text file whole. Binary files are refused.
     ///
     /// It used to take a `cap`, keep the head of a long file and mark the cut
@@ -192,7 +188,7 @@ mod tests {
         let ws = temp_workspace("roundtrip");
         ws.write_file("src/lib.rs", "fn a() {}\n").unwrap();
         assert_eq!(ws.read_file("src/lib.rs").unwrap(), "fn a() {}\n");
-        assert!(!ws.exists("src/missing.rs"));
+        assert!(!ws.resolve("src/missing.rs").unwrap().exists());
     }
 
     /// The whole file or a refusal: `edit_file` is the one caller left, and an
