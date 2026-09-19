@@ -38,10 +38,14 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   transcript on the UI thread is now paid once a minute instead
   (`SESSION_DEBOUNCE = 60 s`), which is why it stopped being a hitch; an
   incremental save is still owed if a minute's rebuild ever shows.
-- **H18** — a parent's own `control message`/`stop` to a *parked* child fails as
-  "agent #N is gone": parking ends the actor thread, and the parent's mailbox
-  send finds no receiver. The human's path (message, nudge, `/compact`) revives
-  it; the parent's does not, and before parking it did (§8.23).
+- **H18** — ✅ fixed by `af6ba05` (`mush/109`, §8.32): a parent whose send finds no
+  actor behind its child's mailbox now hands the *command* to the UI in an event
+  (`AgentEvent::ChildAsleep`), and the UI delivers it through the door the
+  human's own message uses, reviving a parked child and starting nothing for an
+  id that really is gone. Two residuals the fix named rather than papered over:
+  **H22** below, and the instant a child is reaped between the failed send and
+  the UI's read, where the wake lands nowhere — the next `wait` blocks to its cap,
+  which "forget this child" (H19) is what would fix.
 - **H19** — a reaped child's name stays in its parent's books
   (`state.children`/`completed`), so `status` can list a row that is no longer on
   screen. Deliberate in `ab54de3` — dropping it needs a "forget this child"
@@ -56,6 +60,41 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   `ff315d8` (`mush/87`), item 10 in `f34c4de` (`mush/88`) — see §8.29. A second
   wording item the wave added: the `edit_file` schema declares `replace_all` only
   inside `edits` items, though the code now honours a top-level one (item 3).
+- **H21** — a reclaimed branch was called "merged into HEAD" whatever it was: a
+  read-only child that never committed, and a nested child whose work went into
+  its *parent's* branch, both landed on the row as a merge into HEAD. Fixed in
+  `mush/122` (§8.33) by asking the two questions apart — is the branch's work in
+  the base's history, and did the run commit anything of its own.
+- **H22** — a parent's mailbox goes stale for the rest of the session after *any*
+  revive of its child (a human nudge, `/compact`, or a previous parent message):
+  the tree gets a fresh sender and the parent's `ActorState::children` keeps the
+  dead one, so its next `control` takes the wake path again. The message lands
+  (the UI sends into the tree's live sender), which is why `mush/109` left it;
+  the honest fix is a new `AgentMsg` carrying a `Sender<AgentMsg>`.
+- **H23** — an attach client's `edit --agent N` draft lands in the **focused**
+  agent's message box while the ack names `#N`: `Chat::set_draft` replaces the one
+  box the human owns, and the `send` half of the same command aims focus at `id`
+  for its turn, which the draft half has no equivalent of. Waiting on a ruling:
+  aim focus for the turn, or make the ack and `attach.rs`'s doc say where a draft
+  goes.
+- **H24** — below 24 rows the bar silently drops the model, the endpoint and the
+  context meter (`bar_rows` picks one row, and `facts_line` is their only home),
+  and `bar_rows`' doc justifies the trade by what the compact footer carries,
+  which is not those three. Waiting on a ruling: give the one-row bar a third
+  fact, or say in the doc that the trade is the decision.
+- **H25** — a parent restored from a session starts with empty `children` books,
+  so its `control` answers "no such child agent #N — status lists yours" about
+  children whose rows are on screen. Pre-existing, found while fixing H18.
+- **H26** — the leftovers the audit wave did not fix, by file: `focus 1 --agent 2`
+  gives two ids and the flag loses silently, and a repeated flag last-wins
+  (`main.rs`'s `Cli::detect` — the flags it *owns*, so it needs a
+  mutual-exclusion rule, not a row in the flag table); `NOTHING_RUNNING`'s
+  "Ctrl-N starts a new chat" is the same understatement D1 fixed in the key's
+  help, left because the row is spent on the badge and two keys; a status that is
+  neither an exit code nor a signal still spells `-1`
+  (`machine::ended`'s last resort, unreachable for a unix child); and `edit`'s
+  pinned usage line leaves `--base R` unbracketed although the parser defaults it
+  to 0.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -1348,3 +1387,111 @@ branch was cut from `ff315d8` and `b87bb40` (the budget re-tune) landed before
 it, so `main.rs` conflicted — in exactly one test line, where the re-tune had
 added `let cap = plain.reply_cap();` above a `describe` call that the theme
 branch had changed to take a `Theme`. Both survived; no fix was lost.
+
+## 8.32 The surface a human reads, audited — and four branches (`2da5f11`..`af6ba05`)
+
+A blind, read-only auditor was pointed at the whole *human-facing* surface at
+`2bb414f`: the `--help` text, the key table, the command table, the bar, the row
+footers, the startup and refusal messages, the attach protocol, and the prose in
+`docs/` where it names behaviour. Its brief was to report, for each claim, the
+text as written and the code that contradicts it — no proposed rewrites, no
+taste. It returned 16 findings in four classes (A: a sentence false about a
+limit or a state; B: a reachable state with no sentence; C: one fact spelled
+twice; D: prose and taste), each with a file, a line and a reachable path — plus
+a long list of what it had checked and found honest, which is what makes the
+rest worth acting on rather than re-litigating.
+
+**What landed, in the order the branches were cut** (each verified in its own
+worktree — `cargo test`, `cargo fmt --check`, `cargo clippy --all-targets -- -D
+warnings`, the smoke scenarios — merged `--no-ff`, and the merged tree verified
+again: **550** mush tests, **130** mush-core, 0 failed, 4 ignored, all three
+smoke scenarios passing):
+
+- **`2da5f11` (`mush/108`) — the help, the dump and two startup errors.** The
+  ATTACH block documented `mush focus [DIR] ID` and `mush edit [DIR] …` while the
+  parser takes the value first, so a human following `--help` got an error
+  blaming the argument they had just typed; the lines now match the parser and a
+  test pins all four usage lines *and* the two orders the parser refuses. `mush
+  /typo` answered `No such file or directory (os error 2)` — no path, no advice —
+  and an unmakeable `.mush/` answered with a second bare errno; both now name the
+  path and what it is for, in the shape the file-where-a-directory-was-wanted
+  case already had. And `--print-config` read the stored session through
+  `Session::load`, which answers `None` for a file that is there and unreadable
+  exactly as it does for no file at all — the one dump whose job is to *show* the
+  precedence chain had a link silently missing: it reads `Stored` now and prints a
+  `session` row (`none` / `read (N messages)` / `unreadable — <reason>`, the
+  reason sanitized like the model id), and the notice for a session it could not
+  set aside now says the consequence (the conversation starts empty, the file is
+  still there, the next save replaces it) instead of stopping at the reason.
+- **`fe52542` (`mush/107`) — seven sentences that were not so.** `/key` with no
+  key promised "memory only" while the arm below writes the secret into the home
+  config in plain text: wrong in the one direction that costs a secret, and it
+  names the file now. The facts line painted a provider's own short endpoint
+  over a request whose URL was a proxy (a *named* provider keeps its knobs when
+  `--url` is given, and `/url` never touches the provider), so the label asks
+  whether the endpoint in use is the provider's own before it shortens, and a URL
+  the provider does not own is spelled out. A job a signal killed read `exit -1`
+  — a number no command returns, telling an OOM kill and a `SIGSEGV` apart from
+  neither — and is now `killed by signal 9` from the machine's own distinction
+  (`machine::End`), through the job's line, the owner's transcript and `status`.
+  The bar's cursor line, the one producer with no column budget, bounds the brief
+  it carries while keeping `agent #id: ` whole; a typo'd command names `/help`
+  inside the same discipline. `Voice::Mush`'s mark was spelled twice with one
+  spelling unreachable — the table is the only spelling now, and the renderer
+  calls it. Ctrl-N's help says what it stops and drops, and `/notes` says it
+  reads every note about the focused agent, which is what the picker lists.
+- **`3f93cfd` (`mush/118`) — a flag a subcommand does not take.** Found by the
+  branch above while it was in the same file: `mush agents --since 3`, `mush
+  focus 1 --base 9` and `mush read /w --send` parsed and then dropped the value
+  on the floor, against this file's own rule (the one the unknown-option arm and
+  the second directory already follow). One table now gives each subcommand its
+  flags, `Cli::detect` asks it before reading any value, and a miss is refused by
+  name — naming the flag, the subcommand and `--help` — while nothing new is
+  silently honoured.
+- **`af6ba05` (`mush/109`) — a parked child its parent can reach.** H18: a
+  parent's `control message`/`stop` read an empty mailbox as "agent #N is gone",
+  and an empty mailbox says no such thing — parking ends the *actor thread* and
+  leaves the node, the id and the transcript where they were. The parent holds no
+  transcript and so cannot rebuild the actor; the UI can. The command now travels
+  to the UI in an event (`AgentEvent::ChildAsleep`) and is handed over through
+  the door a human's own message uses — reviving a parked child, starting nothing
+  for an id that really is gone — and the reply says what happened ("its actor
+  was parked, so mush is waking one") rather than claiming a delivery the parent
+  cannot check.
+
+**What the wave did not do, and why.** Four findings were put to the human
+together with the fixes, because each needs a ruling rather than a correction:
+**A4** (the row that says "merged into HEAD" about a run that never committed,
+and about a nested child whose work went into its *parent's* branch) — the
+ruling was to fix it in the git layer rather than in the wording, and it is
+`mush/122` (§8.33); **B4** (an attach client's `edit --agent N` draft lands in the
+focused agent's box while the ack names `#N`) and **B5** (below 24 rows the bar
+silently loses the model, the endpoint and the context meter) — both are H23 and
+H24 above, waiting; and **C2** (the row's "merged into HEAD" against
+`Landed::past()`) folded into A4, since it is the mechanism A4 travelled through.
+**D2** — the quit warning's phase word inside the list of what dies ("kills #0
+idle + 1 job") — was judged and left: the list is what dies, the word whose it
+is, and `docs/refactor.md` R22 already argued the case.
+
+Two corrections to the *record* came out of the same conversation rather than
+out of the audit, and both are the kind only a reader of the live thing can
+make. The manual's enumeration of what `--print-config` prints had lost
+`auto-approve` and the theme (and now the session row), and `$MUSH_THEME` was in
+no human-facing text at all. And the 256 KiB per-transcript cap — quoted at me
+in conversation, and *still asserted by two doc comments* (`app/tree.rs:496`,
+`app/chat.rs:597`) — was reverted by the human's own decision in §8.25 and is
+nowhere in the code: `mush/122` corrects both comments to what actually bounds a
+stored transcript (the fold, and for a finished child the size it froze at).
+
+**The instrument was wrong too.** Writing this section meant quoting the census,
+and the census's `prod` column is `total − blank − comment − tests`, which
+double-subtracts the blanks and comments *inside* test modules: it reported
+`app/mod.rs` as 49 production lines out of 10,858, at the same time as that file
+holds the whole `App` and a test module that starts at line 3,242. The reported
+figure is exactly `K_prod − B_test − C_test`, so every "prod" number in this
+document's history is understated by the comments and blank lines of the test
+directories — the same class of defect §8.28 found in `session_blame.py`, and
+fixed the same way: `mush/123` turns the columns into the partition the
+docstring claims they are, hand-checks `app/mod.rs` end to end, and re-measures
+the four refs this record quotes.
+
