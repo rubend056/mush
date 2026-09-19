@@ -1052,10 +1052,14 @@ by the 4 h ceiling or the output limit is news and wakes its owner while
 `mush/<id>` and invents no title (item 1's code half); a top-level
 `replace_all` is honoured (item 3); and the root's immediate refusal no longer
 claims a queue it never sat in (item 7), through one `machine_refusal` chooser
-rather than three call sites picking their own words. Leftovers: `Asked.tools`
-(one reader, a restatement of `tool_schemas.len()`) gone; `beside_note` and both
-`Refused::Machine` arms cut a command at one bound; `wait_bounded` sleeps
-`jobs::POLL`; `TRUNCATION_INSTRUCTION` reaches the transcript through `push_line`.
+rather than three call sites picking their own words. Leftovers, by row id: T1 §5
+(`Asked.tools` — one reader, a restatement of `tool_schemas.len()`) gone; T1 §9
+(the 60-vs-40 pair: `beside_note` and both `Refused::Machine` arms now cut a
+command at one bound, `STATUS_COMMAND_COLUMNS` keeping its own where a headline
+needs one); T1 §11 **partial** — agent.rs's three callers spell `{id}` while
+`jobs::label` survives for the two callers in `app/mod.rs`; T1 §12
+(`wait_bounded` sleeps `jobs::POLL`); T3 §6 (`TRUNCATION_INSTRUCTION` reaches the
+transcript through `push_line`).
 **Refused, and why:** `jobs::label` cannot be deleted — two of its five callers
 are in `app/mod.rs`, which this branch did not own — and `Held.agent`/`Record.owner`
 were not retyped to `AgentId` because the `u64` flows into `app/tree.rs`
