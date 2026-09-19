@@ -25,13 +25,19 @@ landed in between (S5 in `README.md`/`docs/mush.md` §4; S8's (iii)).
 The row tables owe four items; the structural queue in `docs/refactor.md` sits
 beside them. This is the one list: each row carries what the defect costs and
 where the fix belongs, and a closure is recorded on the row, never here. §8.23
-closed three of the four it listed — H10 by `cc89598`, H16 by `8c1a860`, H17 by
-`fb012d1` — and opened two in their place:
+closed three of the four it listed — H10 by `cc89598`, H17 by `fb012d1`, and
+H16 by `8c1a860`, **which was then reverted on the human's decision**
+(`de80f9c`, §8.25: the cut is gone, and the file is bounded by reaping instead)
+— and opened two in their place:
 
 - **H12** — per-agent token accounting, so a run's cost is visible while it is
   spent. (Open, unchanged.)
-- **H16, residual** — the *file* is bounded; the per-second deep copy of every
-  transcript on the UI thread is not. An incremental save is still owed.
+- **H16, residual** — the byte cut is gone (§8.25); what bounds the *file* is the
+  history window (`CHILD_HISTORY = 50`) applied by `App::reap_history`, so the
+  store only ever writes live tree nodes. The per-second deep copy of every kept
+  transcript on the UI thread is now paid once a minute instead
+  (`SESSION_DEBOUNCE = 60 s`), which is why it stopped being a hitch; an
+  incremental save is still owed if a minute's rebuild ever shows.
 - **H18** — a parent's own `control message`/`stop` to a *parked* child fails as
   "agent #N is gone": parking ends the actor thread, and the parent's mailbox
   send finds no receiver. The human's path (message, nudge, `/compact`) revives
@@ -741,3 +747,61 @@ repair, because the tree must build at every commit.
 asks: five patches, 3,855 lines, and 114 of them behaviour. The wave bought its
 closures with tests and prose — these are the wave's own numbers, and they say
 the next one should be judged on the prod column.
+
+**Reverted:** the H16 landing §8.23 records above was undone on the human's
+decision — see §8.25.
+
+---
+
+## 8.25 The cut that was reverted, and the minute that replaced it (`de80f9c`)
+
+The store's byte cap (`8c1a860`, §8.23's H16 landing) is gone. The human's rule
+is the reason, in their words: *"the cut comes from reaping children; the file
+should never have that kind of heuristic because then we'd just have edge cases
+and drift"* — and the cap did not even bound what it claimed. Its own test
+asserted a file of `children × (256 KiB + head) + 10%` (`session.rs:1002`): linear
+in stored children, a per-child budget rather than a bound on the file. On the
+file it was written for (~100 MB, ~300 children, an average child of ~340 KiB) it
+fired on nearly every child, and children carry no marker, so nothing said so —
+while the root, whose cap was 32 MiB, never tripped at all.
+
+What bounds the file now is **the tree forgetting children**: `CHILD_HISTORY = 50`
+(`app/tree.rs`) applied every frame by `App::reap_history`, so a save only ever
+writes live tree nodes. No byte heuristic, marker, notice or magic number remains
+in the store, and the proof is a grep — `cap_transcript`, `SESSION_AGENT_BYTES`,
+`SESSION_ROOT_BYTES`, `root_dropped`, `truncation_notice`, `bound_stored`,
+`size_label`, `Dropped`: no matches under `crates/`, `scripts/` or `inspect/`.
+The one lever left on the file's size is that one number, `CHILD_HISTORY`.
+
+Three things that were *not* the cut were kept, because other code depends on
+them: `Session::save` consuming the snapshot the writer hands it (now standing on
+its own reason, not the cut's), `repair_tool_pairs`/`sanitize_tool_calls`, and
+`Phase::CutOff`/`StoredStatus::CutOff`/`cut_off_notice` — a different CutOff, a
+run that never ended, sharing only the word.
+
+`SESSION_DEBOUNCE` went 1 s → 60 s in the same landing. What the interval buys is
+the UI thread: a save rebuilds the snapshot — every live transcript, cloned — and
+that rebuild is what a long run would otherwise pay once a second. What it costs
+is the crash window: at most a minute of machine-generated conversation (streamed
+responses and tool results), and never the human's own turn. The root send, a
+fold, a new chat and quitting were already written before they returned; a message
+typed at a *child* was not and now is
+(`a_message_to_a_child_is_on_disk_before_the_send_returns`,
+`the_session_debounce_is_a_minute`).
+
+The revert is 909 lines out and 81 in; `mush-core` lost the fifteen cap tests
+(138 → 123) and `mush` stayed at 489, the two marker tests replaced by the two
+above. Both smoke scenarios pass on the merged tree.
+
+**A flake, diagnosed while verifying this landing.**
+`a_hand_merge_is_marked_landed_by_the_next_git_read` fails about one run in six
+*under load* — two `cargo test` binaries at once — on `master` as much as on this
+landing's branch, and the panic names the cause rather than a symptom:
+`fatal: Unable to create '…/.git/worktrees/1/index.lock': File exists`. The test
+drives git in the same repository the app's background git worker is reading, so
+the test's own `commit` loses the race; the worktree then stays clean, the sweep
+reclaims it — correctly — and the row never says *kept*, which is what the
+assertion was about. Test hygiene, not product behaviour, and it is the workflow
+this repository is developed in: children running `cargo test` in parallel
+worktrees. The helper that drives git in the tests should tolerate a concurrent
+process (a short retry on the lock) rather than panic.
