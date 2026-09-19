@@ -12,6 +12,7 @@
 //! model that is still thinking instead of waiting for its reply.
 
 use std::collections::HashMap;
+use std::fmt;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream, ToSocketAddrs};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -185,10 +186,16 @@ type Socket = BufReader<Box<dyn ReadWrite>>;
 /// Conservative on purpose: a connection is *taken* before it is used, so two
 /// requests can never hold the same one, and it is only *kept* after a reply
 /// that framed itself (a `Content-Length` or chunked body) and did not say
-/// `Connection: close`. Anything else — an error, a body that ended at the
-/// stream's end, a server that hangs up — leaves the pool empty, so no request
-/// can ever be handed a connection that failed. A kept connection the server
-/// has since closed is retried once on a fresh one, and never counted twice.
+/// `Connection: close`. A body that was not read to its own end never goes
+/// back: every failing road — the wire breaking, a cut-off body, a frame that
+/// did not parse, a cancellation, a deadline — returns `Err` from `exchange`,
+/// and `Err` leaves the pool empty. That is the rule that keeps a framing error
+/// from being *produced* by our own reuse: the next request to this endpoint
+/// opens a fresh connection, and no leftover chunk line can be read as its
+/// reply (finding B27). Anything else — a body that ended at the stream's end,
+/// a server that hangs up — leaves the pool empty too, so no request can ever
+/// be handed a connection that failed. A kept connection the server has since
+/// closed is retried once on a fresh one, and never counted twice.
 #[derive(Default)]
 struct Pool {
     /// Made on first keep rather than up front, so the pool can be a `static`
@@ -311,6 +318,13 @@ fn request(ask: &Ask<'_>, clock: &dyn Clock, pool: &Pool, open: Open<'_>) -> io:
 /// byte of the answer had arrived: nothing heard means the connection was dead
 /// before the endpoint saw the request, which is the only failure a retry on a
 /// fresh connection cannot duplicate.
+///
+/// A `Response` exists only for a reply whose body framed itself completely
+/// (to the `Content-Length`, through the zero chunk and its trailer, or to the
+/// stream's end). Every `Err` is therefore a reply of which *nothing was handed
+/// over* — the wire broke, the body was cut off, a frame did not parse — and
+/// that is the rule `model.rs::retrying` reads when it decides what may be
+/// asked again, and why asking again cannot duplicate anything a run has read.
 fn exchange(
     mut stream: Socket,
     ask: &Ask<'_>,
@@ -378,10 +392,7 @@ fn exchange(
                 Ok(length) => content_length = Some(length),
                 Err(_) => {
                     return Err((
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("malformed Content-Length: {:?}", value.trim()),
-                        ),
+                        framing(format!("malformed Content-Length: {:?}", value.trim())),
                         heard,
                     ))
                 }
@@ -849,29 +860,119 @@ fn parse_port(port: &str, url: &str) -> io::Result<u16> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("bad port in {url}")))
 }
 
+/// A reply whose framing broke before its body could be read: a status line or
+/// `Content-Length` that is not one, a chunk size that is not hex, a chunk
+/// terminator that is not the terminator the framing promised.
+///
+/// Its own type rather than a bare `InvalidData`, because the kind alone cannot
+/// say whether the endpoint *answered* or its reply *broke on the way in* — and
+/// the two want opposite treatment. A body past [`MAX_BODY_BYTES`] is an answer
+/// mush refuses (a `Refused`, never retried); a frame that never parsed was
+/// never handed to the caller, so asking again on a fresh connection cannot
+/// duplicate anything the run has read, and the connection that carried the
+/// broken frame is dropped rather than kept (finding B27, `model.rs`).
+#[derive(Debug)]
+struct Framing(String);
+
+impl fmt::Display for Framing {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Framing {}
+
+/// A framing error, as [`Framing`] carries it.
+fn framing(why: impl Into<String>) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, Framing(why.into()))
+}
+
+/// Whether `error` is a reply's framing breaking rather than an answer: the
+/// distinction [`Framing`] exists for. `model.rs` asks this instead of matching
+/// the message, so "what a framing error is" has one home.
+pub fn is_framing(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<Framing>().is_some())
+}
+
 fn parse_status(line: &str) -> io::Result<u16> {
     line.split_whitespace()
         .nth(1)
         .and_then(|code| code.parse().ok())
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("malformed status line: {line:?}"),
-            )
-        })
+        .ok_or_else(|| framing(format!("malformed status line: {line:?}")))
+}
+
+/// A body that reached the end of the stream before its framing did.
+///
+/// `UnexpectedEof` — the wire failing under a reply the caller never saw — and
+/// deliberately not `InvalidData`: read as a malformed chunk, a dropped
+/// connection became "the endpoint sent a broken frame", was classified as the
+/// endpoint refusing the request, and killed the run without a retry (finding
+/// B27). The message is this body's own, because `read_exact`'s says
+/// `Content-Length` and a chunked reply has none.
+fn body_cut_off() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "the reply ended inside its chunked body",
+    )
+}
+
+/// Exactly `len` bytes of a chunked body, where the stream ending early is the
+/// body being cut off rather than `read_exact`'s `Content-Length` complaint.
+fn read_chunk_bytes<R: BufRead>(reader: &mut R, len: usize, watch: &Watch) -> io::Result<Vec<u8>> {
+    read_exact(reader, len, watch).map_err(|error| match error.kind() {
+        io::ErrorKind::UnexpectedEof => body_cut_off(),
+        _ => error,
+    })
+}
+
+/// The CRLF that ends a chunk's data.
+///
+/// A bare LF is accepted where a server writes one: how a peer terminates its
+/// own chunks is not this reader's opinion to enforce, and insisting on the
+/// `\r` used to eat the *first byte of the next size line*, turning a verbose
+/// but perfectly readable body into `malformed chunk size: ""` — the exact
+/// misdiagnosis finding B27 was filed for. Anything else is the framing
+/// breaking, and says so with its own kind.
+fn read_chunk_terminator<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<()> {
+    let first = read_chunk_bytes(reader, 1, watch)?[0];
+    if first == b'\n' {
+        return Ok(());
+    }
+    if first != b'\r' {
+        return Err(framing(format!("malformed chunk terminator: {first:?}")));
+    }
+    let second = read_chunk_bytes(reader, 1, watch)?[0];
+    if second != b'\n' {
+        return Err(framing(format!(
+            "malformed chunk terminator: {:?}",
+            [first, second]
+        )));
+    }
+    Ok(())
 }
 
 fn read_chunked<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<String> {
     let mut out = Vec::new();
     loop {
-        let size_line = read_line(reader, watch)?.unwrap_or_default();
-        let size_field = size_line.trim().split(';').next().unwrap_or("0").trim();
-        let size = usize::from_str_radix(size_field, 16).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("malformed chunk size: {size_field:?}"),
-            )
-        })?;
+        // A blank line where a chunk size belongs is framing noise, not a size:
+        // some proxies write one, and a connection whose last body was
+        // abandoned can leave one behind. `exchange` skips exactly this line
+        // before a status line, and for the same reason. Whitespace counts as
+        // blank too, so `"  \r\n"` cannot become `malformed chunk size: ""`.
+        // A reply that then reaches the stream's end is a *cut-off* body, said
+        // as one below.
+        let size_line = loop {
+            match read_line(reader, watch)? {
+                Some(line) if line.trim().is_empty() => continue,
+                Some(line) => break line,
+                None => return Err(body_cut_off()),
+            }
+        };
+        let size_field = size_line.trim().split(';').next().unwrap_or("").trim();
+        let size = usize::from_str_radix(size_field, 16)
+            .map_err(|_| framing(format!("malformed chunk size: {size_field:?}")))?;
         if size == 0 {
             // The body ends at the zero chunk, but its framing does not: a
             // trailer section follows — `0 CRLF`, any trailer fields, then a
@@ -892,8 +993,8 @@ fn read_chunked<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<String>
         if out.len() + size > MAX_BODY_BYTES {
             return Err(body_too_large());
         }
-        out.extend_from_slice(&read_exact(reader, size, watch)?);
-        let _crlf = read_exact(reader, 2, watch)?;
+        out.extend_from_slice(&read_chunk_bytes(reader, size, watch)?);
+        read_chunk_terminator(reader, watch)?;
     }
     Ok(String::from_utf8_lossy(&out).into_owned())
 }
@@ -1290,6 +1391,315 @@ mod tests {
             1,
             "the chunked reply's connection is reused cleanly"
         );
+    }
+
+    /// The live failure of finding B27, scripted byte for byte: a chunked reply
+    /// whose connection ends between chunks. `read_line`'s end-of-stream used to
+    /// become an *empty chunk-size line* — `malformed chunk size: ""` — and
+    /// `InvalidData` is the class mush reads as "the endpoint deliberately sent
+    /// this": refused, not retried, and the run ended blaming a healthy
+    /// endpoint. A body that reached the stream's end inside its own framing is
+    /// the wire failing under a reply nobody was handed, and says so.
+    ///
+    /// The second half is the pool rule: a body that was not read to its end is
+    /// never kept, so the retry (or the next request) opens a fresh connection
+    /// and cannot read leftover framing as its own reply.
+    #[test]
+    fn a_chunked_body_cut_off_before_its_zero_chunk_is_a_cut_off_body() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opens = opened.clone();
+        let mut queue = std::collections::VecDeque::new();
+        // One whole chunk — size, data and terminator — and then the stream
+        // ends: no next size line, no zero chunk, no trailer. This is what a
+        // dropped connection looks like from inside `read_chunked`, and it is
+        // the shape that used to be read as an empty chunk size.
+        queue.push_back(wire(
+            &written,
+            &["HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+               Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"],
+        ));
+        // The connection opened after it — the retry, or the next call —
+        // answers normally.
+        queue.push_back(wire(&written, &[&ok("{\"after\":1}")]));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+            opens.fetch_add(1, Ordering::SeqCst);
+            match queue.pop_front() {
+                Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+                None => Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "the test scripted no more connections",
+                )),
+            }
+        };
+        let pool = Pool::new();
+        let url = "http://models.test:8078/v1/chat/completions";
+
+        let error = send(&pool, &mut opener, url, "{}").unwrap_err();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::UnexpectedEof,
+            "a cut-off body is the wire failing, not a frame the endpoint sent: {error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "the reply ended inside its chunked body",
+            "{error}"
+        );
+        assert!(
+            !is_framing(&error),
+            "a body cut off at the stream's end is the wire, and is classified like\
+             a short Content-Length body: {error}"
+        );
+        assert_eq!(pool.idle(), 0, "a body that was not consumed is never kept");
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            1,
+            "no retry hides inside one request"
+        );
+
+        // The connection that carried the broken body is gone: the next
+        // request opens its own and reads its reply from the first byte.
+        assert_eq!(
+            send(&pool, &mut opener, url, "{}").unwrap().body,
+            "{\"after\":1}"
+        );
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            2,
+            "the retry is on a fresh connection, never the broken one"
+        );
+    }
+
+    /// A blank line where a chunk size belongs — some proxies write one, and an
+    /// abandoned body can leave one behind — is skipped like the blank line
+    /// `exchange` already skips before a status line. It is not a size, and it
+    /// must not poison a reply that frames perfectly well behind it.
+    #[test]
+    fn a_stray_blank_line_before_a_chunk_size_is_skipped() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opens = opened.clone();
+        let mut queue = std::collections::VecDeque::new();
+        // The blank line sits between the first chunk's terminator and the
+        // zero chunk.
+        let chunked = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                       Transfer-Encoding: chunked\r\n\r\n\
+                       5\r\nhello\r\n\r\n0\r\n\r\n";
+        queue.push_back(wire(&written, &[chunked, &ok("{\"two\":2}")]));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+            opens.fetch_add(1, Ordering::SeqCst);
+            match queue.pop_front() {
+                Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+                None => Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "the test scripted no more connections",
+                )),
+            }
+        };
+        let pool = Pool::new();
+        let url = "http://models.test:8078/v1/chat/completions";
+
+        assert_eq!(send(&pool, &mut opener, url, "{}").unwrap().body, "hello");
+        assert_eq!(
+            send(&pool, &mut opener, url, "{}").unwrap().body,
+            "{\"two\":2}"
+        );
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            1,
+            "the noise did not end a connection the reply framed"
+        );
+    }
+
+    /// A chunk terminator written as a bare LF — a server variant seen in the
+    /// wild — used to be read as `\r` + *the next size line's first byte*,
+    /// which left `\r\n` where the size belongs and produced the same
+    /// `malformed chunk size: ""` as a dropped connection. The terminator is
+    /// the peer's to write; this reads the body it framed.
+    #[test]
+    fn a_chunk_terminated_with_a_bare_lf_is_read() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(wire(
+            &written,
+            &["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc\n0\r\n\r\n"],
+        ));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| match queue
+            .pop_front()
+        {
+            Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+            None => Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "the test scripted no more connections",
+            )),
+        };
+        let pool = Pool::new();
+
+        assert_eq!(
+            send(
+                &pool,
+                &mut opener,
+                "http://models.test:8078/v1/chat/completions",
+                "{}"
+            )
+            .unwrap()
+            .body,
+            "abc"
+        );
+    }
+
+    /// The classification `model.rs` retries on: a frame that did not parse is a
+    /// *framing* error — the reply broke on the way in, nothing of it was handed
+    /// over — while a body past the cap is an answer mush refuses. The kind is
+    /// `InvalidData` for both, which is exactly why the marker exists.
+    #[test]
+    fn a_frame_that_did_not_parse_is_marked_apart_from_a_refusal() {
+        let huge = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+            MAX_BODY_BYTES + 1
+        );
+        let cases: [(&str, bool); 4] = [
+            // A chunk size that is not hex, a Content-Length that is not a
+            // number, a chunk terminator the framing did not promise, and the
+            // one answer mush refuses.
+            (
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nzz\r\n",
+                true,
+            ),
+            ("HTTP/1.1 200 OK\r\nContent-Length: twelve\r\n\r\n", true),
+            (
+                "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabcX",
+                true,
+            ),
+            (&huge, false),
+        ];
+        for (answer, framed) in cases {
+            let written = Arc::new(Mutex::new(Vec::new()));
+            let mut queue = std::collections::VecDeque::new();
+            queue.push_back(wire(&written, &[answer]));
+            let mut opener =
+                move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| match queue
+                    .pop_front()
+                {
+                    Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+                    None => Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "the test scripted no more connections",
+                    )),
+                };
+            let pool = Pool::new();
+            let error = send(
+                &pool,
+                &mut opener,
+                "http://models.test:8078/v1/chat/completions",
+                "{}",
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+            assert_eq!(is_framing(&error), framed, "{answer:?}: {error}");
+        }
+    }
+
+    /// A Stop that lands while a chunked body is arriving abandons the reply
+    /// where it stands, and the abandoned body is **not** what waits in the
+    /// pool for the next request: the connection is dropped, and the next call
+    /// opens a fresh one. This is the invariant that rules out the "our own
+    /// leftover framing" hypothesis — nothing partially consumed ever goes
+    /// back.
+    #[test]
+    fn a_cancelled_body_is_not_kept_for_the_next_request() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let opened = Arc::new(AtomicUsize::new(0));
+        let opens = opened.clone();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n";
+        let flag_at = head.len() + 3 + 2; // past the size line, inside `hello`
+        let stopped = cancel.clone();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(Drip {
+            inner: wire(&written, &[&format!("{head}5\r\nhello\r\n0\r\n\r\n")]),
+            chunk: 4,
+            served: 0,
+            flag_at,
+            cancel: stopped,
+        });
+        queue.push_back(Drip {
+            inner: wire(&written, &[&ok("{\"after\":1}")]),
+            chunk: 4,
+            served: 0,
+            flag_at: usize::MAX, // the Stop has already landed
+            cancel: cancel.clone(),
+        });
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
+            opens.fetch_add(1, Ordering::SeqCst);
+            match queue.pop_front() {
+                Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+                None => Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "the test scripted no more connections",
+                )),
+            }
+        };
+        let pool = Pool::new();
+        let ask = Ask {
+            method: "POST",
+            url: "http://models.test:8078/v1/chat/completions",
+            body: Some("{}"),
+            api_key: None,
+            read_timeout: Duration::from_secs(5),
+            cancel: Some(&cancel),
+        };
+
+        let error = request(&ask, clock::system(), &pool, &mut opener).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert_eq!(pool.idle(), 0, "the abandoned body is not kept");
+
+        // The next request is served on a connection opened fresh, whose reply
+        // is read from its first byte — no leftover chunk line can be read as
+        // the status of a body that never started.
+        cancel.store(false, Ordering::SeqCst);
+        assert_eq!(
+            send(&pool, &mut opener, ask.url, "{}").unwrap().body,
+            "{\"after\":1}"
+        );
+        assert_eq!(opened.load(Ordering::SeqCst), 2, "a fresh connection");
+    }
+
+    /// A connection that serves its scripted reply a few bytes at a time, so a
+    /// Stop can land *inside* a chunk instead of between replies. `flag_at` is
+    /// the byte count after which the flag is set: one read delivers at most
+    /// `chunk` bytes, so the cancel is observed at the next watch check.
+    struct Drip {
+        inner: Wire,
+        chunk: usize,
+        served: usize,
+        flag_at: usize,
+        cancel: Arc<AtomicBool>,
+    }
+
+    impl Read for Drip {
+        fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+            let take = buf.len().min(self.chunk);
+            let mut scratch = vec![0u8; take];
+            let read = self.inner.read(&mut scratch)?;
+            buf[..read].copy_from_slice(&scratch[..read]);
+            self.served += read;
+            if self.served >= self.flag_at {
+                self.cancel.store(true, Ordering::SeqCst);
+            }
+            Ok(read)
+        }
+    }
+
+    impl Write for Drip {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.inner.write(buf)
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.inner.flush()
+        }
     }
 
     /// A server can put a bare CRLF in front of a reply on an idle kept

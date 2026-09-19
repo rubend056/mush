@@ -15,7 +15,8 @@
 //! request races its parent's next one.
 //!
 //! A model call is also where the retry lives: [`retrying`] repeats a request
-//! whose *transport* failed, and never one the endpoint answered. The loop is
+//! whose *wire* failed — the transport breaking, or a reply whose framing broke
+//! before its body was read — and never one the endpoint answered. The loop is
 //! driven by the caller, because the caller is the layer that holds the clock
 //! the backoff waits on, the cancel flag the human's Stop sets, and the agent
 //! whose transcript the retry is announced in.
@@ -48,15 +49,31 @@ pub enum ModelError {
     /// broken question: a URL mush cannot parse, a name that does not resolve,
     /// a TLS handshake that failed, a config cell that would not be read.
     Unreachable(String),
-    /// The wire failed under a request the endpoint never answered: a
+    /// The wire failed under a request the endpoint never answered — or a reply
+    /// that was still coming in was cut off before its body framed itself: a
     /// connection reset or refused, an unexpected end of stream, a connect or
-    /// read timeout. The one failure [`retrying`] may ask again, because the
-    /// endpoint had no opinion about this request — a status, a refusal and a
-    /// body that did not parse are all answers, and all of them end the call
-    /// (finding B23).
+    /// read timeout, a chunked body whose stream ended inside it. One of the two
+    /// failures [`retrying`] may ask again: nothing of the reply was handed to
+    /// the caller, and a completion has no effect on the endpoint's state, so
+    /// asking again cannot duplicate work. What a retry on a body cut in half
+    /// costs is tokens, and it saves the run (finding B23).
     Transport(String),
+    /// The reply's framing broke before its body could be read: a status line
+    /// or `Content-Length` that is not one, a chunk size that is not hex, a
+    /// chunk terminator the framing did not promise. [`http`] raises these, and
+    /// they are *not* an answer the endpoint chose — nothing of the reply was
+    /// handed over, so asking again cannot duplicate anything a run has read.
+    /// The remedy is a fresh connection, never the one that carried the broken
+    /// frame: `http` drops every failing connection rather than returning it to
+    /// the pool, so the retry cannot read the same leftover framing again. This
+    /// is also why a retry is safe if the break was *ours* — a kept connection
+    /// whose previous body was not fully consumed cannot exist, and the one
+    /// that produced the error is gone (finding B27).
+    Framing(String),
     /// The endpoint answered, but its reply was refused before it could be
-    /// read: a body past `http`'s cap, a malformed status line or chunk line.
+    /// read: a body past `http`'s cap. A malformed status line or chunk line is
+    /// *not* here — those are [`ModelError::Framing`], a reply that broke on the
+    /// way in rather than an answer.
     Refused(String),
     /// The endpoint answered with a status other than 200. `body` is what it
     /// said, verbatim: the caller reads the endpoint's own complaint out of it
@@ -71,6 +88,14 @@ pub enum ModelError {
 /// `Send + Sync` because one client is shared by every agent in a tree: a
 /// child's run and its parent's go through the same value, which is also what
 /// lets a scripted client serve a whole tree.
+///
+/// The one contract beyond the signature: a call that returns `Err` has handed
+/// the caller *nothing of a reply*. [`retrying`] reads that rule when it decides
+/// what may be asked again — a repeat can only duplicate work if part of the
+/// first reply was already used — so a client that ever streams a partial body
+/// must report a later failure as something that is never retried. `HttpModel`
+/// satisfies it by construction: it makes a `Response` only from a body that
+/// framed itself (finding B27).
 pub trait ModelClient: Send + Sync {
     /// `cancel` is the flag the human's Stop sets; the call must notice it
     /// while it waits, not only once the endpoint has answered.
@@ -113,6 +138,15 @@ impl ModelClient for HttpModel {
             // checked first, so a request that failed *because* of the cancel
             // is reported as one however the socket reported it.
             Err(_) if cancel.load(Ordering::SeqCst) => return Err(ModelError::Cancelled),
+            // The reply's framing broke before its body was read: nothing of
+            // the reply exists for this caller to have used — a `Response` is
+            // only ever made from a body that framed itself — and `http`
+            // dropped the connection that carried it. Its own class, because
+            // `InvalidData` alone also covers the answers mush *refuses* (a
+            // body past the cap), and those are never retried (finding B27).
+            Err(error) if http::is_framing(&error) => {
+                return Err(ModelError::Framing(error.to_string()))
+            }
             // A refusal is not a connection failure: the endpoint answered.
             Err(error) if error.kind() == ErrorKind::InvalidData => {
                 return Err(ModelError::Refused(error.to_string()));
@@ -148,10 +182,13 @@ impl ModelClient for HttpModel {
 ///
 /// What is *not* here is as deliberate: `InvalidData` is a refusal `http.rs`
 /// already classified, and `Interrupted` is how the cancel flag is reported. A
-/// signal that interrupted a read or a write — the human resizing the terminal
-/// — was already made again inside `http.rs`, so the interrupt itself never
-/// reaches this classifier (finding B25); the only `Interrupted` that arrives
-/// here is a decision, and a cancellation is never retried.
+/// reply whose *framing* broke is its own class too ([`ModelError::Framing`]):
+/// it is retried, but through the marker `http.rs` raises for it rather than
+/// through this kind, which would also sweep a body past the cap into the retry
+/// net. A signal that interrupted a read or a write — the human resizing the
+/// terminal — was already made again inside `http.rs`, so the interrupt itself
+/// never reaches this classifier (finding B25); the only `Interrupted` that
+/// arrives here is a decision, and a cancellation is never retried.
 /// `NotFound`/`InvalidInput`/`Other` are a name that does not resolve, a URL
 /// that cannot be parsed and a TLS handshake that failed — misconfiguration,
 /// where a retry only repeats the mistake.
@@ -185,22 +222,36 @@ const BACKOFF_SLICE: Duration = Duration::from_millis(50);
 /// B23: three agents in one session died mid-work on `Connection reset by
 /// peer`, which was the network and not the endpoint).
 ///
-/// `attempt` is one whole try — for the real client, one `http::post_json`.
-/// This decides whether a failed try is worth another, waits the backoff on the
-/// run's own [`Clock`], and hands every retry to `announce`, so the human reads
+/// `attempt` is one whole try — for the real client, one `http::post_json` —
+/// and it must obey the [`ModelClient`] contract: an `Err` means the caller got
+/// nothing of the reply, which is what makes a repeat safe. This decides
+/// whether a failed try is worth another, waits the backoff on the run's own
+/// [`Clock`], and hands every retry to `announce`, so the human reads
 /// `Connection reset by peer (os error 104) — retrying (2/3)` in the transcript
 /// instead of watching a spinner that looks stuck.
 ///
-/// Only a [`ModelError::Transport`] is repeated. A cancellation, a status the
+/// Two failures are repeated: a [`ModelError::Transport`] one, and a
+/// [`ModelError::Framing`] one. Both mean the reply was never handed to the
+/// caller — `http.rs` makes a `Response` only from a body that framed itself —
+/// so asking again cannot duplicate anything the run has read, and a completion
+/// has no effect on the endpoint's state, so it cannot replay a write the way
+/// re-sending a `POST` that changed something would. What a retry on a body cut
+/// in half costs is tokens — and it saves the run.
+///
+/// A framing error is retried on a *fresh* connection by construction: `http.rs`
+/// never returns a connection whose body did not read to its own end to the
+/// pool, and it drops the one that carried the broken frame, so the second
+/// attempt cannot be handed the leftover framing that may have produced the
+/// first (finding B27). That is the reason a retry is the honest answer here and
+/// not a bug hidden behind one: if the stray empty chunk-size line was ours,
+/// the connection that held it is gone; if it was the peer's, one fresh ask is
+/// the cheapest way to find out.
+///
+/// Everything else is returned at once, unchanged: a cancellation, a status the
 /// endpoint chose (4xx *and* 5xx: an answer is not a hiccup, and the 400 that
 /// teaches mush a smaller window already has exactly one retry of its own in
-/// the run loop), a refusal, and a body that arrived and did not parse are all
-/// returned at once, unchanged.
-///
-/// Asking again cannot duplicate work: a completion has no effect on the
-/// endpoint's state, so a retry after a reset cannot replay a write the way
-/// re-sending a `POST` that changed something would. What a retry on a body
-/// cut in half costs is tokens — and it saves the run.
+/// the run loop), a refusal (a body past the cap), and a body that arrived and
+/// did not parse are all answers.
 ///
 /// Worst case: [`RETRY_ATTEMPTS`] attempts, each bounded by the transport below
 /// it (`http.rs`: 5 s to connect, 30 s to write, a 600 s read deadline — and
@@ -227,19 +278,20 @@ pub fn retrying<T>(
             Ok(value) => return Ok(value),
             Err(error) => error,
         };
-        let ModelError::Transport(message) = error else {
-            // A cancellation, the endpoint's own verdict, a refusal, a body
-            // that did not parse: an answer, never asked for twice.
-            return Err(error);
+        // A failure the wire produced, not one the endpoint answered: the
+        // transport broke, or the reply's framing did. Anything else — a
+        // cancellation, the endpoint's own verdict, a refusal, a body that did
+        // not parse — is an answer, and is never asked for twice.
+        let message = match &error {
+            ModelError::Transport(message) | ModelError::Framing(message) => message.clone(),
+            _ => return Err(error),
         };
         if tries == RETRY_ATTEMPTS {
             // The endpoint's own message, plus the fact that it is not the
             // first time it was heard: a retry layer that replaced it with a
             // bare "unreachable after retries" would hide the only detail the
             // human can act on.
-            return Err(ModelError::Transport(format!(
-                "{message} — {RETRY_ATTEMPTS} attempts failed"
-            )));
+            return Err(error.after_attempts());
         }
         announce(&format!(
             "{message} — retrying ({}/{RETRY_ATTEMPTS})",
@@ -270,6 +322,20 @@ fn wait(clock: &dyn Clock, cancel: &AtomicBool, tries: usize) -> Result<(), Mode
         return Err(ModelError::Cancelled);
     }
     Ok(())
+}
+
+impl ModelError {
+    /// The same failure, saying how many times it was asked. Only the two
+    /// retryable classes carry a count; every other error is returned from
+    /// [`retrying`] before this is reached.
+    fn after_attempts(self) -> Self {
+        let say = |message: String| format!("{message} — {RETRY_ATTEMPTS} attempts failed");
+        match self {
+            ModelError::Transport(message) => ModelError::Transport(say(message)),
+            ModelError::Framing(message) => ModelError::Framing(say(message)),
+            other => other,
+        }
+    }
 }
 
 /// A scripted model, for tests: a queue of replies, and a log of the requests
@@ -668,10 +734,11 @@ mod tests {
 
     use super::fake::Scripted;
     use super::{
-        retrying, transport, ModelClient, ModelError, BACKOFF_SLICE, RETRY_ATTEMPTS, RETRY_BACKOFF,
+        retrying, transport, HttpModel, ModelClient, ModelError, BACKOFF_SLICE, RETRY_ATTEMPTS,
+        RETRY_BACKOFF,
     };
     use crate::agent::AgentEvent;
-    use crate::app::AgentId;
+    use crate::app::{AgentId, ConfigHandle};
     use crate::clock::fake::Advanceable;
     use crate::clock::Clock;
     use crate::events::fake::Recorder;
@@ -886,6 +953,203 @@ mod tests {
             clock.clock.elapsed(),
             BACKOFF_SLICE,
             "and it stopped at the first slice of the backoff, not at its end"
+        );
+    }
+
+    /// The whole live road, once, through a real (loopback) endpoint: a chunked
+    /// reply cut off inside its body — the shape that produced
+    /// `the endpoint's reply was refused: malformed chunk size: ""` in a real
+    /// run — is classified as the wire by `HttpModel`, so `retrying` asks again
+    /// on the fresh connection the broken one leaves behind, and the run gets
+    /// its reply. Before finding B27's fix this was `Refused`: one attempt, and
+    /// the run ended blaming the endpoint.
+    #[test]
+    fn a_chunked_body_cut_off_on_a_real_wire_is_retried_on_a_fresh_connection() {
+        use std::io::{Read as _, Write as _};
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let answer = r#"{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#;
+        let server = std::thread::spawn(move || {
+            let mut accepted = 0;
+            for round in 0..2 {
+                let (mut connection, _) = listener.accept().unwrap();
+                accepted += 1;
+                let mut scratch = [0u8; 8192];
+                let _ = connection.read(&mut scratch);
+                if round == 0 {
+                    // One whole chunk, then the stream ends: the connection is
+                    // dropped at the end of this iteration, which is what a
+                    // server dying mid-reply looks like to the client.
+                    let _ = connection.write_all(
+                        b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n",
+                    );
+                } else {
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+                        answer.len()
+                    );
+                    let _ = connection.write_all(head.as_bytes());
+                    let _ = connection.write_all(answer.as_bytes());
+                    // Long enough that the reply is read whole before the close.
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                let _ = connection.flush();
+            }
+            accepted
+        });
+
+        let cfg = ConfigHandle::own(mush_core::Config::new(
+            format!("http://127.0.0.1:{port}"),
+            "test",
+            None,
+        ));
+        let model = HttpModel::new(cfg);
+        let cancel = AtomicBool::new(false);
+        let log = Recorder::new();
+        let messages = vec![Message::user("task")];
+        let request = ChatRequest {
+            model: "test",
+            messages: &messages,
+            tools: &[],
+            tool_choice: "auto",
+            stream: false,
+            temperature: 0.0,
+            max_tokens: 0,
+            max_completion_tokens: None,
+            thinking: None,
+            reasoning_effort: None,
+        };
+
+        let reply = retrying(
+            crate::clock::system(),
+            &cancel,
+            |line| log.emit(AgentId(7), AgentEvent::Notice(line.to_string())),
+            || model.chat(&request, &cancel),
+        )
+        .unwrap();
+
+        assert_eq!(reply.choices[0].message.text(), "done");
+        assert_eq!(
+            server.join().unwrap(),
+            2,
+            "the broken connection was dropped, so the retry opened a fresh one"
+        );
+        let lines = retry_lines(&log);
+        assert_eq!(lines.len(), 1, "the retry was visible: {lines:?}");
+        assert!(lines[0].contains("retrying (2/3)"), "{lines:?}");
+    }
+
+    /// A reply whose framing broke is not an answer: nothing of it was handed to
+    /// the caller, and the connection that carried the broken frame is dropped —
+    /// so the retry asks a *fresh* connection, and the human reads the same
+    /// `retrying — <why> (n/3)` line a transport hiccup gets (finding B27).
+    #[test]
+    fn a_broken_frame_is_retried_and_announced() {
+        let broken = "malformed chunk size: \"\"";
+        let model = Arc::new(
+            Scripted::new()
+                .fails(ModelError::Framing(broken.to_string()))
+                .says("done"),
+        );
+        let clock = Advanceable::new();
+        let log = Recorder::new();
+
+        let reply = called(&model, &clock, &AtomicBool::new(false), &log).unwrap();
+
+        assert_eq!(reply.choices[0].message.text(), "done");
+        assert_eq!(
+            model.asked().len(),
+            2,
+            "the broken reply was asked for once more"
+        );
+        assert_eq!(
+            retry_lines(&log),
+            vec![format!("{broken} — retrying (2/3)")],
+            "and the retry was visible, in B23's shape"
+        );
+        assert_eq!(
+            clock.elapsed(),
+            RETRY_BACKOFF,
+            "the backoff waits on the clock it was handed"
+        );
+    }
+
+    /// Every attempt breaks the same way: the error keeps its class, so the run
+    /// can say the *reply* broke — never that the endpoint refused it — and it
+    /// names the attempts rather than hiding what the wire said.
+    #[test]
+    fn framing_failures_on_every_attempt_keep_their_class() {
+        let broken = "malformed chunk size: \"\"";
+        let model = Arc::new(
+            Scripted::new()
+                .fails(ModelError::Framing(broken.to_string()))
+                .fails(ModelError::Framing(broken.to_string()))
+                .fails(ModelError::Framing(broken.to_string())),
+        );
+        let clock = Advanceable::new();
+        let log = Recorder::new();
+
+        let error = called(&model, &clock, &AtomicBool::new(false), &log).unwrap_err();
+
+        assert_eq!(
+            model.asked().len(),
+            RETRY_ATTEMPTS,
+            "three attempts, no more"
+        );
+        match error {
+            ModelError::Framing(reason) => {
+                assert!(
+                    reason.starts_with(broken),
+                    "the cause reaches the caller: {reason}"
+                );
+                assert!(
+                    reason.contains("3 attempts"),
+                    "and the attempts are named: {reason}"
+                );
+            }
+            other => panic!("a framing failure, not {other:?}"),
+        }
+        assert_eq!(
+            retry_lines(&log).len(),
+            RETRY_ATTEMPTS - 1,
+            "both retries were announced before giving up"
+        );
+    }
+
+    /// Ctrl-C during the backoff abandons a framing retry at once, exactly as it
+    /// abandons a transport one: a cancellation is never retried, whatever the
+    /// failed attempt was.
+    #[test]
+    fn a_cancellation_during_the_backoff_abandons_a_framing_retry() {
+        let model = Arc::new(
+            Scripted::new()
+                .fails(ModelError::Framing(
+                    "malformed chunk size: \"\"".to_string(),
+                ))
+                .says("too late"),
+        );
+        let flag = Arc::new(AtomicBool::new(false));
+        let clock = CancelledDuringBackoff {
+            flag: flag.clone(),
+            clock: Advanceable::new(),
+        };
+        let log = Recorder::new();
+
+        let error = called(&model, &clock, &flag, &log).unwrap_err();
+
+        assert_eq!(error, ModelError::Cancelled);
+        assert_eq!(
+            model.asked().len(),
+            1,
+            "the retry the human cancelled was never made"
+        );
+        assert_eq!(retry_lines(&log).len(), 1, "they were told it was coming");
+        assert_eq!(
+            clock.clock.elapsed(),
+            BACKOFF_SLICE,
+            "and it stopped at the first slice of the backoff"
         );
     }
 
