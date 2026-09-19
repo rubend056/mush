@@ -3552,6 +3552,14 @@ fn end_note(ended: &Ended, timeout: Duration, detachable: bool, cap: usize) -> S
         Ended::Stopped(jobs::Stopped::TooMuchOutput) => {
             format!("[killed: output passed {CMD_OUTPUT_LIMIT} bytes; the first {cap} are above]")
         }
+        // A job's ceiling, never a tool call's: a foreground command has no
+        // ceiling, because past `CMD_DETACH_AFTER` it is handed to the registry
+        // instead. The second arm no run reaches, and here for the same reason
+        // as the first: every reason in the table gets exactly one sentence.
+        Ended::Stopped(jobs::Stopped::RanTooLong) => format!(
+            "[killed: it ran past the {}h ceiling]",
+            jobs::JOB_MAX_AGE.as_secs() / 3600
+        ),
         // Not an end, and not reachable from `run_shell`: a command that may
         // detach is handed to the registry before a report is built. It used to
         // print the timeout's sentence, which is one thing this cannot be (a
@@ -3641,6 +3649,10 @@ fn wait_bounded(
             job.written(),
             waited,
             Some(timeout),
+            // No ceiling: a foreground command cannot reach one — past
+            // `detach_after` it becomes a job, and the job's own thread is what
+            // watches it from there.
+            None,
             cancel.load(Ordering::SeqCst),
         ) {
             job.kill();
@@ -7129,6 +7141,7 @@ mod tests {
             jobs::Stopped::TimedOut,
             jobs::Stopped::TooMuchOutput,
             jobs::Stopped::Cancelled,
+            jobs::Stopped::RanTooLong,
         ] {
             assert!(matches!(
                 ending(Ended::Stopped(reason), true),
@@ -7160,6 +7173,12 @@ mod tests {
                 true,
                 4_096,
             ),
+            end_note(
+                &Ended::Stopped(jobs::Stopped::RanTooLong),
+                minute,
+                true,
+                mush_core::CMD_CAP,
+            ),
             end_note(&Ended::Detached, minute, true, mush_core::CMD_CAP),
         ];
         let mut unique = notes.clone();
@@ -7178,10 +7197,11 @@ mod tests {
             "{}",
             notes[3]
         );
+        assert!(notes[4].starts_with("[killed: it ran past"), "{}", notes[4]);
         assert!(
-            notes[4].contains("registry"),
+            notes[5].contains("registry"),
             "a detached command is not a timed-out one: {}",
-            notes[4]
+            notes[5]
         );
         // The timeout's sentence says why it could not detach when the budget
         // was the reason.

@@ -649,12 +649,17 @@ cost — the cost is the *size of what each save carries*.
   gone.
 - `MAX_WORKTREES = 70` — above the 50-child window, so reaping history can
   never be what refuses a spawn.
-- Jobs: **the concurrency cap stays at 8**, plus a 4-hour age ceiling. The
-  human's first answer was 200 concurrent; the arithmetic killed it — scratch is
-  8 MiB per command (`CMD_OUTPUT_LIMIT`), so 200 jobs is a legal 1.6 GiB of
-  `/tmp`, where 8 jobs beside at most 16 foreground commands is about 192 MiB.
-  *Everything needs a cap, even a high one* — but the cap has to bound the thing
-  it multiplies.
+- Jobs: **the concurrency cap stays at 8**, plus a **hardcoded 4-hour ceiling on
+  a job's wall life** (`JOB_MAX_AGE`, `jobs.rs`) — no knob, because a ceiling a
+  config can raise is not a ceiling on the disk every agent shares. `MAX_JOBS`
+  bounds how many jobs may exist, not how long one may hold its slot, its
+  process group and its scratch files: without the ceiling, a hung `detach`ed
+  command held all three until mush quit, since a job has no tool call to time
+  it out. The human's first answer was 200 concurrent jobs; the arithmetic
+  killed it — scratch is 8 MiB per command (`CMD_OUTPUT_LIMIT`), so 200 jobs is
+  a legal 1.6 GiB of `/tmp`, where 8 jobs beside at most 16 foreground commands
+  is about 192 MiB. *Everything needs a cap, even a high one* — but the cap has
+  to bound the thing it multiplies.
 - Worktree reclamation is automatic **merged-or-clean only**: an unmerged or
   dirty branch is kept and named, and mush never merges anything itself.
 

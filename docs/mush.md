@@ -629,10 +629,19 @@ detached exclusive job holds the lock for its whole life. The lock coordinates
 `[DECIDED]` The job budget is one machine-wide cap (`MAX_JOBS`), not a per-agent
 one — a per-agent cap would let eight agents hold eight builds each, which is the
 situation the cap exists to prevent — and a job does **not** count against
-`MAX_AGENTS`: the two are separate budgets for separate resources. A job's kept
-output is a **tail**, consistently, in the completion line and in `status`
-alike: a job is read when it *ends*, and what ended it (`test result: FAILED`, `error:
-could not compile`, the panic) is at the bottom, not the top.
+`MAX_AGENTS`: the two are separate budgets for separate resources. **A job also
+has an age ceiling: `JOB_MAX_AGE` = 4 h of wall time, hardcoded.** `MAX_JOBS`
+bounds how many jobs may exist and says nothing about how long one may hold its
+slot, its process group and its scratch files; without the ceiling a hung
+command a model started with `detach` held all three until mush quit, because a
+job has no tool call to time it out — a foreground command does, and past
+`CMD_DETACH_AFTER` it is a job instead. Four hours is past any honest build,
+test or benchmark and still finite, and the kill says so: `#c3 killed: it ran
+past the 4h ceiling · 4h0m · cargo run`. There is no knob, on purpose — a
+ceiling a config can raise is not a ceiling on the disk every agent shares. A
+job's kept output is a **tail**, consistently, in the completion line and in
+`status` alike: a job is read when it *ends*, and what ended it (`test result:
+FAILED`, `error: could not compile`, the panic) is at the bottom, not the top.
 
 `[OPEN]`, in §11: where the human sees jobs at all, beyond the `⚙N` their owner's
 row already wears.

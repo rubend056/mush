@@ -112,6 +112,17 @@ pub const CMD_OUTPUT_LIMIT: u64 = 8 * 1024 * 1024;
 /// How long a command may run as a tool call before it becomes a job.
 pub const CMD_DETACH_AFTER: Duration = Duration::from_secs(60);
 
+/// How long a job may live, in wall time, before mush ends it.
+///
+/// A job is the one thing here that is meant to outlive the run that started
+/// it — a server, a watch — so it is also the one thing with no tool call to
+/// time it out. [`MAX_JOBS`] caps how many may exist; this caps how long one
+/// may hold its slot, its process group and its scratch files. Four hours is
+/// past any honest build, test or benchmark and still finite, and it is
+/// hardcoded rather than configurable on purpose: a ceiling a config can raise
+/// is not a ceiling on the disk every agent shares.
+pub const JOB_MAX_AGE: Duration = Duration::from_secs(4 * 60 * 60);
+
 /// How much of the holder's command goes into a refusal sentence. The command
 /// can be a paragraph; a refusal is a line the model reads and acts on, and
 /// the part it needs is the start (finding H13).
@@ -150,22 +161,31 @@ impl Waited {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Stopped {
     TimedOut,
+    /// It passed [`JOB_MAX_AGE`]: long enough that it is not building anything
+    /// any more, whatever it is doing.
+    RanTooLong,
     Cancelled,
     TooMuchOutput,
 }
 
 /// Whether a still-running command must now be stopped. `limit` is the
-/// foreground waiter's timeout: a detached job has none — running until it ends
-/// is the whole point — so `None` means only a cancellation or a runaway writer
-/// can stop it. One function, so both watchers answer this the same way.
+/// foreground waiter's timeout and `ceiling` is [`JOB_MAX_AGE`]: the first is
+/// how long a *tool call* may wait, the second is how long a *job* may live. A
+/// foreground command passes `None` for the ceiling, because it cannot reach
+/// one — past [`CMD_DETACH_AFTER`] it is a job, and the job's own thread watches
+/// it from there. One function, so both watchers answer this the same way.
 pub fn stopping(
     written: u64,
     waited: Duration,
     limit: Option<Duration>,
+    ceiling: Option<Duration>,
     cancel: bool,
 ) -> Option<Stopped> {
     if limit.is_some_and(|limit| waited > limit) {
         return Some(Stopped::TimedOut);
+    }
+    if ceiling.is_some_and(|ceiling| waited > ceiling) {
+        return Some(Stopped::RanTooLong);
     }
     if cancel {
         return Some(Stopped::Cancelled);
@@ -187,6 +207,10 @@ pub enum JobOutcome {
     /// It passed the output limit, so mush killed it rather than let it fill the
     /// disk.
     TooMuchOutput,
+    /// It passed [`JOB_MAX_AGE`], so mush killed it: four hours of wall clock is
+    /// past any honest build, and its slot and its scratch belong to someone
+    /// else by then.
+    RanTooLong,
 }
 
 impl JobOutcome {
@@ -209,6 +233,12 @@ impl JobOutcome {
             JobOutcome::TooMuchOutput => format!(
                 "{} killed: it wrote past {CMD_OUTPUT_LIMIT} bytes · {}",
                 label(id),
+                short_age(age)
+            ),
+            JobOutcome::RanTooLong => format!(
+                "{} killed: it ran past the {}h ceiling · {}",
+                label(id),
+                JOB_MAX_AGE.as_secs() / 3600,
                 short_age(age)
             ),
         };
@@ -1144,10 +1174,14 @@ fn watch(
         }
         let waited = registry.clock.now().saturating_duration_since(started);
         let stop = live.stop.load(Ordering::SeqCst);
-        match stopping(written, waited, None, stop) {
+        match stopping(written, waited, None, Some(JOB_MAX_AGE), stop) {
             Some(Stopped::TooMuchOutput) => {
                 live.kill();
                 break JobOutcome::TooMuchOutput;
+            }
+            Some(Stopped::RanTooLong) => {
+                live.kill();
+                break JobOutcome::RanTooLong;
             }
             Some(_) => break JobOutcome::Stopped,
             None => registry.clock.sleep(POLL),
@@ -1248,31 +1282,56 @@ mod tests {
         (id, rx)
     }
 
-    /// The three ways mush stops a command, decided in one place so the
+    /// The four ways mush stops a command, decided in one place so the
     /// foreground watcher and a job's thread cannot disagree.
     #[test]
-    fn stopping_names_the_three_ways_a_command_is_killed() {
+    fn stopping_names_the_four_ways_a_command_is_killed() {
         let nothing = Duration::from_secs(0);
         let waited = Duration::from_secs(1);
         assert_eq!(
-            stopping(0, nothing, None, false),
+            stopping(0, nothing, None, None, false),
             None,
             "it is still running"
         );
         assert_eq!(
-            stopping(0, waited, Some(nothing), false),
+            stopping(0, waited, Some(nothing), None, false),
             Some(Stopped::TimedOut)
         );
-        assert_eq!(stopping(0, nothing, None, true), Some(Stopped::Cancelled));
         assert_eq!(
-            stopping(CMD_OUTPUT_LIMIT + 1, nothing, None, false),
+            stopping(0, nothing, None, None, true),
+            Some(Stopped::Cancelled)
+        );
+        assert_eq!(
+            stopping(CMD_OUTPUT_LIMIT + 1, nothing, None, None, false),
             Some(Stopped::TooMuchOutput)
         );
-        // The timeout outranks a cancel, and a cancel outranks the writer: each
-        // answer means a different thing to the model, so the order is fixed.
+        // A job's ceiling is the one limit it has, and it is not a tool call's
+        // timeout: exactly at it the command still runs, one moment past it is
+        // the ceiling's answer.
         assert_eq!(
-            stopping(CMD_OUTPUT_LIMIT + 1, waited, Some(nothing), true),
+            stopping(0, JOB_MAX_AGE, None, Some(JOB_MAX_AGE), false),
+            None
+        );
+        assert_eq!(
+            stopping(0, JOB_MAX_AGE + waited, None, Some(JOB_MAX_AGE), false),
+            Some(Stopped::RanTooLong)
+        );
+        // The order is fixed, because each answer means a different thing: the
+        // timeout outranks a cancel, a cancel outranks the writer, and the
+        // ceiling — the only limit a job has — outranks a cancel aimed at it.
+        assert_eq!(
+            stopping(CMD_OUTPUT_LIMIT + 1, waited, Some(nothing), None, true),
             Some(Stopped::TimedOut)
+        );
+        assert_eq!(
+            stopping(
+                CMD_OUTPUT_LIMIT + 1,
+                JOB_MAX_AGE + waited,
+                None,
+                Some(JOB_MAX_AGE),
+                true
+            ),
+            Some(Stopped::RanTooLong)
         );
     }
 
@@ -1294,6 +1353,14 @@ mod tests {
         assert!(JobOutcome::TooMuchOutput
             .line(JobId(2), "yes", Duration::from_secs(1), "y")
             .contains("wrote past"));
+        // The ceiling says what it was, because the one thing its owner needs
+        // to know is that the command was still running after four hours.
+        let long = JobOutcome::RanTooLong.line(JobId(3), "cargo run", JOB_MAX_AGE, "");
+        assert_eq!(
+            long,
+            "#c3 killed: it ran past the 4h ceiling · 4h00m · cargo run"
+        );
+        assert!(!JobOutcome::RanTooLong.is_news(), "a kill is not a result");
 
         // The kept window is a tail, so a long one keeps its *end* and says
         // where it was cut off — the head is what a foreground result keeps.
@@ -1796,5 +1863,36 @@ mod tests {
             "another agent's row is empty"
         );
         registry.kill_all();
+    }
+
+    /// A job may not live forever. Past `JOB_MAX_AGE` the job's own thread ends
+    /// it, and the owner is told what happened and why — a ceiling nobody is
+    /// told about is a command that vanished.
+    #[test]
+    fn a_job_that_runs_past_the_ceiling_is_killed_and_its_owner_is_told() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::hangs()));
+        let (registry, _events, clock) = registry();
+        let (id, mailbox) = launch(&registry, &machine, 7);
+
+        // The job's thread sleeps on this same clock, so advancing past the
+        // ceiling is what lets the poll that sees it happen at all.
+        clock.advance(JOB_MAX_AGE + Duration::from_secs(1));
+        match mailbox.recv_timeout(Duration::from_secs(5)) {
+            Ok(AgentMsg::CommandDone {
+                id: done,
+                line,
+                news,
+            }) => {
+                assert_eq!(done, id);
+                assert!(line.contains("ran past the 4h ceiling"), "{line}");
+                assert!(!news, "a job mush killed is not a result to read");
+            }
+            Ok(_) => panic!("a job's completion is a CommandDone"),
+            Err(error) => panic!("no completion arrived: {error}"),
+        }
+        assert!(
+            registry.live_for(7).is_empty(),
+            "the slot, the process group and the scratch are given back"
+        );
     }
 }
