@@ -447,6 +447,12 @@ impl Outcome {
 pub(crate) const CUT_OFF_RUN: u64 = u64::MAX;
 
 /// Commands sent into an agent actor's mailbox.
+///
+/// `Clone` and `Debug` because one travels *back* out of an actor: a parent
+/// whose send finds no actor behind its child's mailbox hands the command to
+/// the UI in an event ([`AgentEvent::ChildAsleep`]), and an event is a value —
+/// `crate::events::fake`'s recording sink hands out a copy of everything it saw.
+#[derive(Clone, Debug)]
 pub enum AgentMsg {
     /// Adopt these messages and run. The actor keeps the transcript, so later
     /// nudges continue the same conversation.
@@ -579,6 +585,27 @@ pub enum AgentEvent {
     /// (finding H4).
     ResultRead {
         child: u64,
+    },
+    /// A command a parent could not hand to a child it owns: the mailbox the
+    /// parent's books hold has no actor behind it any more.
+    ///
+    /// That is what a *parked* child leaves behind — `App::park_history` ends
+    /// the thread and nothing else, so the node, the id and the transcript stay
+    /// exactly where they were — and it is also what a child the history window
+    /// has since forgotten leaves, which the parent's books outlive as well
+    /// (finding H19). The parent cannot tell the two apart, and cannot wake
+    /// either one: only the UI holds the transcript an actor is rebuilt from.
+    /// So the command travels here and the UI hands it over through the door a
+    /// human's own message uses (`App::deliver_to_actor`), which revives a
+    /// parked child and drops a command for an id that really is gone.
+    ///
+    /// The parent has already answered its model by then — an empty mailbox is
+    /// not proof that the child is gone, which is the whole of finding H18 — so
+    /// nothing on the UI side writes a result for this: the child's own
+    /// `ChildRunning` and `ChildDone` are what settle the parent's books.
+    ChildAsleep {
+        child: u64,
+        command: AgentMsg,
     },
     Error(String),
     /// A job this agent started began running in the background. The registry
@@ -3293,7 +3320,7 @@ fn control_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<S
             )),
         },
         Target::Agent(id) => match action.as_str() {
-            "stop" => stop_agent(state, id),
+            "stop" => stop_agent(actor, state, id),
             "message" => message_agent(actor, state, args, id),
             other => Err(format!(
                 "unknown action `{other}` for agent #{id} (stop or message)"
@@ -3322,24 +3349,53 @@ fn parse_target(raw: &str) -> Result<Target, String> {
     })
 }
 
-/// The actor a message was aimed at no longer answers: the mailboxes, the UI
-/// and a nudge all reach the same dead end and the same words. Takes the typed
-/// id, so the sentence's `#` comes from [`AgentId`]'s `Display` alone.
+/// The child a human's own message was aimed at is not there to take it: the
+/// UI reached for it and found no node at all, so there is nothing to revive
+/// (`App::deliver_to_actor`). A *parent's* `control` no longer lands here: the
+/// mailbox it holds being empty is a parked child, which the UI can wake
+/// ([`AgentEvent::ChildAsleep`]). Takes the typed id, so the sentence's `#`
+/// comes from [`AgentId`]'s `Display` alone.
 pub(crate) fn gone(id: AgentId) -> String {
     format!("agent {id} is gone")
 }
 
 /// Stop a child this agent owns. Stopping is not finishing: the child keeps its
 /// context and work, and a later `control message` resumes it.
-fn stop_agent(state: &mut ActorState, id: u64) -> Result<String, String> {
+fn stop_agent(actor: &Actor, state: &mut ActorState, id: u64) -> Result<String, String> {
     let Some(cmd) = state.children.get(&id) else {
         return Err(format!("no such child agent #{id} — status lists yours"));
     };
-    // A dead mailbox means the child is gone; saying "stopping" anyway would
-    // have the model wait on a result that can never arrive.
-    cmd.send(AgentMsg::Stop)
-        .map(|_| format!("stopping agent #{id}"))
-        .map_err(|_| gone(AgentId(id)))
+    // An empty mailbox is a child whose *actor* is gone, never a child that is
+    // gone: parking reclaims the thread of a finished child and leaves the row
+    // and the transcript the human is reading (finding H18). The command goes to
+    // the UI, the only hand that can rebuild the actor a Stop needs — and the
+    // revival is what takes it, since a parked child is at rest by the window's
+    // own condition.
+    match cmd.send(AgentMsg::Stop) {
+        Ok(()) => Ok(format!("stopping agent #{id}")),
+        Err(_) => {
+            hand_to_ui(actor, id, AgentMsg::Stop);
+            Ok(format!(
+                "stopping agent #{id} — its actor was parked, so mush is waking one to take the stop"
+            ))
+        }
+    }
+}
+
+/// Hand the UI a command the parent could not deliver, so that a parked child
+/// can be woken to take it.
+///
+/// A mailbox with no actor behind it used to be read as "the child is gone",
+/// which is the one thing it does not say: parking ends a finished child's
+/// *thread* and leaves its node, its id and its transcript exactly where they
+/// were (`App::park_history`). The parent holds no transcript and so cannot
+/// revive — the UI can, and delivers through the same door a human's own
+/// message uses (`App::deliver_to_actor`, finding H18). What the reply says is
+/// the caller's: this only makes sure the command is not lost on the way there.
+fn hand_to_ui(actor: &Actor, child: u64, command: AgentMsg) {
+    actor
+        .ctx
+        .emit(actor.id, AgentEvent::ChildAsleep { child, command });
 }
 
 /// Message a child this agent owns. The words resume an idle child, so the
@@ -3352,6 +3408,10 @@ fn stop_agent(state: &mut ActorState, id: u64) -> Result<String, String> {
 /// can never arrive. The human's own path refuses the same message up front
 /// (`App::worktree_gone`); this is the parent's half of that rule, in the words
 /// the child itself reports for a message that reached a gone worktree.
+///
+/// A *parked* child is the other shape a missing actor takes, and there the
+/// answer is the opposite one: the words are handed to the UI, which wakes the
+/// child to take them ([`hand_to_ui`], finding H18).
 fn message_agent(
     actor: &Actor,
     state: &mut ActorState,
@@ -3372,7 +3432,7 @@ fn message_agent(
     // one that is mid-run (finding H5).
     let at_rest = !state.running.contains(&id);
     let text = tools::arg_string(args, "text")?;
-    let sent = cmd.send(AgentMsg::Steer(text));
+    let sent = cmd.send(AgentMsg::Steer(text.clone()));
     match sent {
         Ok(()) if at_rest => {
             // The words resume the child, so the parent's own books say it is
@@ -3386,7 +3446,22 @@ fn message_agent(
         Ok(()) => Ok(format!(
             "messaged agent #{id} — it is mid-run, so it reads this at its next step"
         )),
-        Err(_) => Err(gone(AgentId(id))),
+        Err(_) => {
+            // No actor behind the mailbox: a parked child, whose thread the UI
+            // reclaimed and whose transcript is the one on screen (finding H18).
+            // "Gone" was the one thing the empty mailbox did not say, and it
+            // made the parent give up on a child the human was looking at — so
+            // the words go to the UI, the hand that can rebuild the actor they
+            // need, and the books follow the words rather than the mailbox they
+            // bounced off: an at-rest child is resumed by them exactly as the
+            // branch above resumes one, so a `wait` must not answer the result
+            // of the run that ended before them (audit row 1).
+            hand_to_ui(actor, id, AgentMsg::Steer(text));
+            state.running.insert(id);
+            Ok(format!(
+                "messaged agent #{id} — its actor was parked, so mush is waking one: this resumes it"
+            ))
+        }
     }
 }
 
@@ -4696,6 +4771,103 @@ mod tests {
         .unwrap();
         assert!(sent.contains("resumes it"), "{sent}");
         assert!(state.running.contains(&1));
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A parked child's mailbox is still there and its actor is not: parking
+    /// ends the thread and nothing else (`App::park_history`). The parent holds
+    /// no transcript, so it cannot rebuild the actor its words need — the UI
+    /// can — and until this travelled there the model was told its child was
+    /// *gone* about a row and a transcript the human could see (finding H18).
+    #[test]
+    fn a_message_to_a_parked_child_travels_to_the_ui_that_can_wake_it() {
+        let (actor, events, _mailbox) = recording_actor("parked-message");
+        let mut state = ActorState::default();
+        // Exactly what parking leaves: the mailbox the books hold, nobody at the
+        // other end of it. A shared child, so the worktree check above it is out
+        // of the way.
+        let (child_tx, parked) = crossbeam_channel::unbounded();
+        drop(parked);
+        state.children.insert(1, child_tx);
+        state.shared.insert(1);
+
+        let sent = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Control,
+            &json!({ "id": "1", "action": "message", "text": "carry on" }),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(!sent.contains("gone"), "{sent}");
+        assert!(sent.contains("resumes it"), "{sent}");
+        // The words themselves are what travels, not a sentence about them: the
+        // actor that resumes is rebuilt from the UI's copy of the transcript,
+        // and a line the UI could not hand over would be a resume that never
+        // happened.
+        let handed: Vec<(u64, AgentMsg)> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ChildAsleep { child, command } => Some((child, command)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(handed.len(), 1, "one command, one hand-over: {handed:?}");
+        assert_eq!(handed[0].0, 1, "for the child the parent aimed at");
+        assert!(
+            matches!(&handed[0].1, AgentMsg::Steer(words) if words == "carry on"),
+            "and as steering, the way a live child gets it"
+        );
+        // The books follow the words: they resume the child, so a `wait` must
+        // not answer the result of the run that ended before them.
+        assert!(state.running.contains(&1));
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The other half: a `stop` aimed at a parked child reaches it too. The
+    /// child is at rest by parking's own condition, so nothing is cancelled —
+    /// but a gone sentence here is just as false, and it leaves the parent
+    /// believing the child it was told to stop no longer exists (finding H18).
+    #[test]
+    fn a_stop_aimed_at_a_parked_child_is_handed_over_rather_than_called_gone() {
+        let (actor, events, _mailbox) = recording_actor("parked-stop");
+        let mut state = ActorState::default();
+        let (child_tx, parked) = crossbeam_channel::unbounded();
+        drop(parked);
+        state.children.insert(1, child_tx);
+        state.shared.insert(1);
+
+        let sent = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Control,
+            &json!({ "id": "1", "action": "stop" }),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(!sent.contains("gone"), "{sent}");
+        assert!(sent.contains("stopping agent #1"), "{sent}");
+        let handed: Vec<(u64, AgentMsg)> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ChildAsleep { child, command } => Some((child, command)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(handed.len(), 1, "one command, one hand-over: {handed:?}");
+        assert_eq!(handed[0].0, 1);
+        assert!(
+            matches!(handed[0].1, AgentMsg::Stop),
+            "the stop is what the child is woken to take"
+        );
+        assert!(
+            !state.running.contains(&1),
+            "a stop puts nobody to work, so the books stay where they were"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
