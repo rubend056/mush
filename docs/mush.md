@@ -190,7 +190,7 @@ second copy of it.
 | `spawn_agent` | `brief`, `title`, `base?` | a new agent with its own transcript; `title` names its row, and `base` forks a worktree on `mush/<id>` for it (§5.5) |
 | `status` | — | your children and your jobs in one listing: each child's state and branch, each job's state, age and command; `✉` marks a result you have not read; a listing, not a delivery — `wait` hands results over |
 | `control` | `id`, `action`, `text?` | stop or message one, naming it as `status` prints it (`2` for a child, `c2` for a job); a job can only be stopped |
-| `wait` | — | blocks until every child and every job you own has finished, then one digest; returns at once when there is nothing to wait for; a subagent also waits out another agent's machine lock, gives up after 10 minutes, and a message to it ends the wait early |
+| `wait` | `on?` | blocks until every child and every job you own has finished, then one digest; returns at once when there is nothing to wait for; a subagent also waits out another agent's machine lock, gives up after 10 minutes, and a message to it ends the wait early; `on` narrows it to one thing, named as `status` prints it — the rest keeps running, but any result you have not read ends the wait too, and the machine lock is not waited for |
 
 The `spawn_agent` row is omitted from a leaf agent's schema (`MAX_DEPTH`), which
 is what bounds the tree, so a root has ten tools and a leaf nine; the `status`,
@@ -751,7 +751,9 @@ a result the wait hands over first says the lock is still held, so wait again �
 and then make this call once more; do not retry it in a loop`. The refusal has a
 road back that is not a retry: a subagent's `wait` blocks while another agent
 holds the machine (the root's does not — see below), so the refused call can run
-once the machine is free. A wait that finds a result nobody has read hands that
+once the machine is free. The road is the *bare* `wait`: a targeted one
+(`wait({on})`, H34) is not the lock's business — it waits for its target, and a
+target that holds the lock releases it when it ends. A wait that finds a result nobody has read hands that
 over first, so the road back can be two waits: the refusal says so, the `wait`
 schema owns the order, and the hold that outlives it is named beside the result.
 A detached exclusive job holds the lock for its whole life.

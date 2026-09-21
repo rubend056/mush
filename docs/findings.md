@@ -112,8 +112,12 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   by `mush/125`), and neither failed in 40 isolated runs across two trees. The
   assert that flaked is that the lock is takeable again once its holder is
   dropped — if that were ever real rather than a flake, a workspace lock would
-  outlive the process that held it. The next wave should freeze it with a clock
-  or catch it, the same way §8.26 left its own full-suite flake.
+  outlive the process that held it. One more, once, in §8.37's full run:
+  `the_turn_limit_ends_with_a_summary` (`agent.rs`) did not end within its
+  `WAIT`; alone it passes in 2.7 s and the next full run was green, so it is the
+  same class — a loaded suite outrunning a wall-clock wait, not a broken road.
+  The next wave should freeze these with a clock or catch them, the same way
+  §8.26 left its own full-suite flake.
 - **H29** — ✅ settled by the third read (the file-tool wave's audit, §8.36), and by
   reading rather than a test, because there is no race to drive: no road leads
   into `Registry::launch`'s `Machine` arm with a *sibling* holding the lock.
@@ -197,6 +201,9 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   altogether), and one state still lets the screen and `wait` disagree — H30's
   restored child — but a sleep cannot fix that one either: the row never
   changes, and the honest moves there are `control message` or ending the turn.
+  The *peek* half of the habit has a shape now (`wait({on})`, H34): a sleep made
+  the model blind for its duration, where a targeted wait ends on any unread
+  result, a message, or the target itself.
 - **H34** — `wait` is all-or-nothing, so a model that wants a *peek* at one
   thing reaches for `sleep`: `wait({})` blocks on every child and job at once,
   `status` is a listing (and polling it is what the loop guard stops), and
@@ -220,19 +227,28 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   Now a job's line travels only when `record_job` says it is fresh, and the
   entry guard counts only *unread* job reports — a read child still keeps its
   marked digest and still holds the wait, because it can run again and
-  `every_delivery_road_hands_a_result_over_once` pins that. **⬜ the missing
-  shape**: "wait for that one thing while the rest runs" still has no call. One
-  optional target (`wait({ on: "c2" })`, named as `status` prints it; a bare
-  `wait` unchanged) was designed and measured by the wave's investigation:
-  +279 schema bytes, so `SCHEMA_TOKENS` 1 900 → 2 000, and it has to be argued
-  against H15 (one shape, one meaning, a wrong argument refused rather than
-  defaulted to "everything") before it lands. The alternative — a sentence in
-  `wait`'s schema saying a finish arrives on its own — only restates
-  `DELEGATION`, which every root already pays for. Not settled: whether the
-  stop that lost the run was the loop guard (which ends only the run, so the
-  job's `CommandDone` later wakes the actor) or a human Stop (which kills the
-  job), and whether the shape would measurably curb the reach for `sleep` —
-  only a live model can say that.
+  `every_delivery_road_hands_a_result_over_once` pins that. **✅ the missing
+  shape** (`076e164`): one optional target — `wait({ on: "c2" })`, named as
+  `status` prints it, a bare `wait` unchanged — blocks on that one child or job
+  while the rest of the books run on, and never on the machine lock (bare
+  `wait` stays the one road back the lock refusal names). What it does not
+  narrow is its attention, which the human asked for in as many words: a
+  cancellation, the human's or a parent's words, and any result nobody has read
+  — a child that failed, a job that ended — all end the wait and are handed
+  over, with the target's own state named beside them, so a targeted wait cannot
+  sit on a failure for ten minutes. It is argued against H15 the only way that
+  trap allows: one shape, one meaning, the no-argument default untouched, and a
+  wrong type refused rather than read as "everything" (`on` must be one target
+  as `status` names it). The call cost +309 schema bytes, so `SCHEMA_TOKENS`
+  moved 1 900 → 2 000 by the constant's own rule (the 128k history budget
+  315 300 → 315 000; the 8k default is unchanged because its reserve is
+  window-capped). The alternative — a sentence in `wait`'s schema saying a
+  finish arrives on its own — only restates `DELEGATION`, which every root
+  already pays for, and was not taken. Not settled: whether the stop that lost
+  the run was the loop guard (which ends only the run, so the job's
+  `CommandDone` later wakes the actor) or a human Stop (which kills the job),
+  and whether the shape measurably curbs the reach for `sleep` — only a live
+  model can say that.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -414,7 +430,7 @@ cheap.
 | H12 | **Context and reply caps were the quiet bottleneck.** A 20 480 reply cap truncated real work mid-task (`U9`), and several agents burned turns on runaway guards and compaction instead of the task. | Several runs cut off mid-edit. | ⬜ still owed: per-agent token accounting (`M6`, §11.2), so a run's cost is visible while it is spent; the shipped defaults are done (`U9`) |
 | H13 | **The exclusive machine lock is machine-wide, and a refused command is a trap.** The harness's lock is taken by a *command* (`exclusive=true`), which the tool's own guidance recommends "for anything timing- or port-sensitive" — and every review brief flags the 60fps frame test as load-sensitive, so a reviewer takes it to get one clean number. While it is held, every sibling's command *and the orchestrator's own* is refused ("#N holds the machine; retry when it finishes"); the refusal is an **error, not a queue**, so an agent that retries it is doing exactly what `LOOP_ROUNDS` counts, and mush's own guard then kills the run: `#65` and `#66` died mid-work this way, and the orchestrator could not even read a file for the duration. | Two agents' runs lost (one integrator, one fixer), a stalled wave, and an orchestrator blind at a moment it had to inspect. | ✅ all three (`4cb4739`, `1df1a53`): a refusal before anything ran is `ToolError::Refused` and never a loop round, the refusal names the holder and says not to retry in a loop, a sibling's command queues for the lock (bounded at 30 s, cancel-aware), and the root is exempt from a lock it did not take and is told it ran beside `#N`'s exclusive command. A root *exclusive* command is still refused — two claims to own the machine is what the lock prevents. The refusal's road back landed later (§8.35, `5eba64a`): a subagent's `wait` blocks while another agent holds the machine, so "try once after it finishes" became an instruction a model can actually follow — the wait the first three fixes could only say was missing. The sentences around that wait were audited in the same wave (`4aad8a7`): the timeout names `control stop #N` when the holder is the asker's own child, the root's wait is said not to block, and the refusal says the road back can be two waits, because one with an unread result to hand over comes back holding the lock. The wave's second read (`fd0e615`) had to teach the loop guard the same lesson one level down: a `wait` that slept is not a repeat of itself, or the "wait again" this row's road back names would have stopped the run as a loop on its fifth taking |
 | H14 | **A run stopped as a loop cannot be resumed.** `Ctrl-C`-stopped agents resume when you message them (that is the promise on the row: `stopped · re-send to resume`), but two loop-stopped agents (`✗ the run was stopped as a loop: the same tool call repeated 6 times with nothing changed in between`) re-stopped **immediately and identically** on the nudge — so the one place a human would first try to recover is where resuming does not work. Either the repeated call is still in the window the guard counts, or the resumed run's first call is counted against the old rounds; either way the orchestrator had to spawn a fresh agent with a rebuilt brief (cheap only because the dead one's work had already been committed — `c3f5984`). | Two agents re-spawned instead of nudged; the loop-stop's own advice ("re-send to resume") is unactionable. | ✅ (`4cb4739`): a loop-stop records the count it stopped at, and the next run opens with the guard's own words, so a nudge resumes it (`a_loop_stopped_run_resumes_with_a_warning`) |
-| H15 | **`wait_agents` answers from history, and nothing says what a wait releases.** After the crash the orchestrator re-spawned six children; its first `wait_agents` (no ids, a long timeout) returned the summary of `#10` — a child of the *previous* process, finished before it died — which reads exactly like a live completion. Spooked, it then named one id, and `ids=[…]` means "wait only for that one", the opposite of the intent (be woken by *any*). The tool's own description calls the answer "its summary" and never states the release rule, so the call has to be reasoned out from the implementation: no ids = first finish, `ids` = only those, `all` = every child, `timeout` = a bound. | A blind 900 s wait while two children were dead, and one result that reported the past as if it were news. | ✅ (`4cb4739`): `status` is a bounded listing (`Outcome::digest`; `✉` marks a result nobody has read), an unread result comes over in full where an already-read one is a digest, and the descriptions state the release rule — later narrowed again by the twelve-to-six cut (`ba04c49`), where `wait` takes no arguments and releases when every child and every job the agent owns has finished |
+| H15 | **`wait_agents` answers from history, and nothing says what a wait releases.** After the crash the orchestrator re-spawned six children; its first `wait_agents` (no ids, a long timeout) returned the summary of `#10` — a child of the *previous* process, finished before it died — which reads exactly like a live completion. Spooked, it then named one id, and `ids=[…]` means "wait only for that one", the opposite of the intent (be woken by *any*). The tool's own description calls the answer "its summary" and never states the release rule, so the call has to be reasoned out from the implementation: no ids = first finish, `ids` = only those, `all` = every child, `timeout` = a bound. | A blind 900 s wait while two children were dead, and one result that reported the past as if it were news. | ✅ (`4cb4739`): `status` is a bounded listing (`Outcome::digest`; `✉` marks a result nobody has read), an unread result comes over in full where an already-read one is a digest, and the descriptions state the release rule — later narrowed again by the twelve-to-six cut (`ba04c49`), where `wait` takes no arguments and releases when every child and every job the agent owns has finished — reopened once, deliberately, by H34: `wait` gained a single optional `on` target, the no-argument call unchanged and a wrong type refused rather than defaulted, which is the one shape the trap allows |
 
 **What already made it easier, and should not be traded away:** one worktree per
 isolated agent with its own branch, and mush committing that worktree's work when
@@ -2189,3 +2205,76 @@ the other's side — and it came back with three corrections to that brief (a
 field's `serialize_with` cannot see its sibling; the test counts grew the second
 number; `skip_deserializing` is what keeps a session from resurrecting payloads),
 which is the delegation loop working as designed.
+
+---
+
+## 8.37 The wait that can name one thing (`0291027`, `076e164`, `mush/5`)
+
+H34 opened with the human's own root agent explaining a `sleep` it should not
+have written: "`wait` is exactly the tool for it … I reached for `sleep` because
+`wait` also blocks on the two subagents that are still running, and I wanted a
+peek at the job only." An investigation (`mush/5`, read-only, forked from
+`28f1c84`) verified the books and measured what a repeated `wait` was actually
+answering, and the human's next message set the new shape's one hard rule: it
+must yield on anything that needs attention — a child or job error, a message,
+"really anything" — and never sit on news the way a `sleep` does.
+
+**The defect under it** (`0291027`): a job's report was delivered once and then
+recapped *bare* on every later `wait` — `wait_digest`'s job loop fell back to
+`report.line` when `record_job` answered `None` — and `done_jobs` is never
+pruned, so the recap grew with every job the session had ever run. Measured on a
+fabricated state: one read job answered the identical unread-looking line, three
+read jobs 151 B, 32 read jobs 1 942 B, where the truth is 58 B; a wait whose
+only book entry was a read job answered that recap instead of
+`NOTHING_TO_WAIT_FOR`. Now a job's line travels only when `record_job` says it
+is fresh, and the wait's entry guard counts only *unread* job reports — a read
+child still keeps its marked digest and still holds the wait, because it can run
+again. Zero schema bytes; `a_wait_hands_a_job_report_over_once_and_never_recaps_it`
+and a read job added to the timeout test fail before the fix.
+
+**The shape** (`076e164`): `wait` gained one optional `on` — a single child
+(`2`) or job (`c2`), named as `status` prints it, with the bare call unchanged
+and a wrong type refused rather than read as "everything". It blocks on the
+target alone: the rest of the books run on, and the machine lock is never this
+call's business (bare `wait` stays the one road back the refusal names). What it
+does not narrow is its attention: a cancellation, the human's or a parent's
+words, and any result nobody has read — a child that failed, a job that ended —
+all end the wait and are handed over, with the target named beside them. A
+target that is neither running nor holding a result (a seeded child, H30) is
+named for what it is rather than slept on for ten minutes. Both waits now share
+`wait_tick` (drain, cancellation, parked words) and differ only in what they
+block on; `Target` gained the lookups a wait needs, and `jobs::unknown_job` is
+the one home of the sentence `control` and `wait` both give.
+
+**Against H15.** The trap was three shapes (`ids`/`all`/`timeout`) and "no ids
+= first finish". `on` is one shape with one meaning, the default is the call it
+always was, and a wrong argument is refused: "`on` must be one target as status
+names it (`2` a child, `c2` a job)". The worst wrong call lands on one named
+target, is answered with that name, and a repeat on a read target returns at
+once — so the loop guard still stops it.
+
+**The price, stated plainly.** `on` cost 309 schema bytes (the investigation's
+sketch measured 279; the landed sentences are longer by the yield rule), so
+`SCHEMA_TOKENS` moved 1 900 → 2 000 by the constant's own documented rule:
+schemas 5 620 → 5 929 against 6 000, and the 128k history budget 315 300 →
+315 000. The 8k default is unchanged (12 288 bytes) because its reserve is
+window-capped at half the window. The alternative — a sentence in `wait`'s
+schema restating `DELEGATION`'s "a finish arrives on its own" — was not taken:
+bytes spent saying what every root already reads.
+
+**Verification by removal.** Reverting the recap fix fails both of its
+assertions with the recap printed in the failure; removing the news yield makes
+`an_optional_target_waits_for_one_thing_and_lets_the_rest_run` time out instead
+of handing over the failed child and job. The plain wait's own tests (the human
+message, the parent's steering, the machine roads) are unchanged and green
+through the `wait_tick` extraction. `cargo test` 588 + 147, `fmt` and `clippy`
+clean. One full-suite flake was seen once and not again
+(`the_turn_limit_ends_with_a_summary` did not end within its `WAIT`; it passes
+alone and the next full run was green) — the H28 class, recorded there.
+
+**Census** at `076e164` (`scripts/census.py`), against §8.36's landing
+(`bfa0b12`: total 55,072 · prod 13,773 · tests 23,795 · comments 14,087): total
+55,548 · **prod 13,915** · tests 24,003 · comments 14,187 — 476 lines: 142
+production, 208 test, 100 comment, 26 blank. The production lines are the target
+plumbing (`wait_target`, `Target`'s six lookups), the shared tick, the recap
+fix, the one schema argument, and `jobs::unknown_job`'s new home.
