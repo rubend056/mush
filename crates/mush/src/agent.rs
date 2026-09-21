@@ -3392,7 +3392,7 @@ fn parked_message(state: &ActorState) -> Option<Waiting> {
 }
 
 /// The answer to a `wait` that was asked with nothing behind it — no children
-/// and no jobs, and no other agent holding the machine. One spelling, three
+/// and no jobs, and no other agent holding the machine. One spelling, two
 /// roads out of `wait_tool`.
 const NOTHING_TO_WAIT_FOR: &str = "nothing to wait for: no children and no jobs";
 
@@ -3444,17 +3444,39 @@ fn machine_timed_out(held: &jobs::Held) -> String {
     )
 }
 
+/// What a wait says when it hands a result over while another agent is still
+/// holding the machine. The model asked for the result, not for the lock, so
+/// the lock is a fact beside the answer rather than a reason to delay it — and
+/// it is the fact the model's next move turns on, because the call that was
+/// refused for the lock will be refused again until the wait has waited it out.
+fn machine_held(held: &jobs::Held) -> String {
+    format!(
+        "the machine is still held by {} — wait again to wait it out, or work without the shell",
+        machine_holding(held)
+    )
+}
+
+/// Whether a `wait` has a result nobody has read to hand over: a child whose
+/// body the model has not been given yet. A job's line is not here — it was
+/// folded into the transcript when the job ended (`note_job`), so handing it
+/// over again is a recap, not news.
+fn unread_result(state: &ActorState) -> bool {
+    state.children.keys().any(|id| state.unread(*id))
+}
+
 fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Result<String, String> {
     // `wait` has no arguments: "everything I own has finished" is the only
     // thing the call can mean now (finding H15 — a model that reasoned
     // `ids`/`all`/`timeout` wrong waited nine minutes on a child that was
     // already dead). The release rule is the whole name.
+    //
+    // What this call can still be for: something of its own — running, or a
+    // result the transcript is owed — or, for a subagent, the machine, which
+    // another agent's exclusive command is holding. The machine is the reason
+    // the lock refusal points at (see [`machine_wait`]), so "nothing to wait
+    // for" is only the truth once all of them are answered.
     let owned =
         !state.children.is_empty() || !state.running_jobs.is_empty() || !state.done_jobs.is_empty();
-    // A subagent whose command met a sibling's lock has nothing of its own to
-    // wait for and no other way to span the hold — this is the wait the lock
-    // refusal points at, so "nothing to wait for" is only the truth once the
-    // machine is free too. The root is never a waiter (see [`machine_wait`]).
     let mut holding = machine_wait(actor);
     if !owned && holding.is_none() {
         return Ok(NOTHING_TO_WAIT_FOR.to_string());
@@ -3485,26 +3507,38 @@ fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Resu
         }
         let running = in_flight(state);
         if running.is_empty() {
-            // Everything this agent owns has finished (or was already): hand
-            // over every result in one digest. Nothing in flight returns at
-            // once, here.
-            let answers = wait_digest(actor, state, false);
-            if !answers.is_empty() {
-                return Ok(answers.join("\n"));
+            // A result nobody has read comes first, whatever the machine is
+            // doing: waiting is what a model does when it wants a result, and
+            // parking one behind a sibling's benchmark is the blindness H13 is
+            // about. Everything else a digest would carry — an already-read
+            // body, a job's line — is a recap of something the transcript
+            // already holds, so it is not a reason to refuse to wait.
+            if unread_result(state) {
+                let answers = wait_digest(actor, state, false).join("\n");
+                return Ok(match machine_wait(actor) {
+                    Some(held) => format!("{answers}\n{}", machine_held(&held)),
+                    None => answers,
+                });
             }
-            // Nothing of its own is left. The one thing still to wait for is
-            // the machine — and when it lets go, the refused call can run.
             match machine_wait(actor) {
                 Some(held) => {
                     if clock.now() >= deadline {
-                        return Ok(machine_timed_out(&held));
+                        return Ok(with_digest(actor, state, machine_timed_out(&held)));
                     }
                     holding = Some(held);
                 }
                 None => {
-                    return Ok(match holding.take() {
-                        Some(held) => machine_free(&held),
-                        None => NOTHING_TO_WAIT_FOR.to_string(),
+                    // The machine let go, or was never the wait's business:
+                    // hand over whatever the call has, plus the fact the
+                    // refused command can run when the wait is what freed it.
+                    let answers = wait_digest(actor, state, false);
+                    return Ok(match (answers.is_empty(), holding.take()) {
+                        (false, Some(held)) => {
+                            format!("{}\n{}", answers.join("\n"), machine_free(&held))
+                        }
+                        (false, None) => answers.join("\n"),
+                        (true, Some(held)) => machine_free(&held),
+                        (true, None) => NOTHING_TO_WAIT_FOR.to_string(),
                     });
                 }
             }
@@ -3514,13 +3548,22 @@ fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Resu
             // ones travel — a result the model has already read is the past,
             // and a timeout is not the moment to report it as news (H15).
             let note = format!("wait timed out — {} still running", running.join(", "));
-            let answers = wait_digest(actor, state, true);
-            if answers.is_empty() {
-                return Ok(note);
-            }
-            return Ok(format!("{}\n{note}", answers.join("\n")));
+            return Ok(with_digest(actor, state, note));
         }
         clock.sleep(Duration::from_millis(50));
+    }
+}
+
+/// A timeout's answer: whatever results the wait has not already handed over,
+/// then the sentence that says what is still going on. The two timeout roads —
+/// its own work, and the machine — read the same, so a model that gets one
+/// learns the same shape.
+fn with_digest(actor: &Actor, state: &mut ActorState, note: String) -> String {
+    let answers = wait_digest(actor, state, true);
+    if answers.is_empty() {
+        note
+    } else {
+        format!("{}\n{note}", answers.join("\n"))
     }
 }
 
@@ -8620,10 +8663,11 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
-    /// The machine is only what a wait has *left* once it has nothing of its
-    /// own: a finished child's result is handed over at once, even while a
+    /// The machine is only what a wait has *left* once it has nothing unread
+    /// to hand over: a finished child's result comes over at once, even while a
     /// sibling holds the lock, because the model asked for the result — not for
-    /// the machine.
+    /// the machine. The lock still rides along as a fact, so the next move is
+    /// not a blind retry.
     #[test]
     fn a_finished_result_is_handed_over_before_the_machine_is_waited_out() {
         let clock = Arc::new(Advanceable::new());
@@ -8648,10 +8692,49 @@ mod tests {
         let answer = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
         assert!(answer.contains("#1 done: wrote the parser"), "{answer}");
         assert!(
-            !answer.contains("machine"),
-            "the lock is not the result the call asked for: {answer}"
+            answer.contains("the machine is still held by #2's exclusive command")
+                && answer.contains("cargo bench"),
+            "the lock rides along with the result, so the next move is informed: {answer}"
         );
         assert_eq!(clock.elapsed(), Duration::ZERO, "no wait was spent");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A recap is not news: a result the model has already read does not take a
+    /// wait away from the machine. That is the road the lock refusal points at,
+    /// and an agent that has read everything it owns must still be able to take
+    /// it — the earlier shape of this rule asked whether the agent owned *any*
+    /// child or job, so a single finished job locked it out of the wait for
+    /// good.
+    #[test]
+    fn a_read_result_does_not_take_a_wait_away_from_the_machine() {
+        let clock = Arc::new(ReleasesOnSleep::new());
+        let (actor, _mailbox) = scripted_tools_actor(
+            "wait-machine-recap",
+            Arc::new(ScriptedMachine::new()),
+            clock.clone(),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+        state.completed.insert(
+            1,
+            Completion {
+                run: 1,
+                outcome: Outcome::Finished("wrote the parser".into()),
+            },
+        );
+        state.delivered.insert(1, 1);
+        actor.ctx.registry.take_machine(2, "cargo bench").unwrap();
+        clock.release_after(actor.ctx.registry.clone(), 2);
+
+        let answer = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
+        assert!(answer.contains("the machine is free now"), "{answer}");
+        assert!(
+            answer.contains("wrote the parser"),
+            "the recap rides along with the fact the machine is free: {answer}"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 

@@ -212,10 +212,11 @@ pub fn tool_schemas() -> Vec<Value> {
             ToolName::Wait,
             "Block until nothing you own is still running \u{2014} every child and every job \u{2014} then \
              answer with one digest: a result you have not read comes in full, an already-read one as a \
-             line. A subagent also waits while another agent holds the machine, so a command refused with \
-             `#N holds the machine` is retried here. Returns at once when there is nothing to wait for; \
-             gives up after 10 minutes and names what is still running; a message to you ends the wait \
-             early and says so.",
+             line. A result nobody has read is handed over first, whatever the machine is doing; \
+             otherwise a subagent's wait also waits while another agent holds the machine, which is how \
+             a command refused with `#N holds the machine` is retried. Returns at once when there is \
+             nothing to wait for; gives up after 10 minutes and names what is still running; a message \
+             to you ends the wait early and says so.",
             json!({ "type": "object", "properties": {} }),
         ),
     ]
@@ -439,6 +440,10 @@ mod tests {
         assert!(
             description.contains("another agent holds the machine"),
             "{description}"
+        );
+        assert!(
+            description.contains("handed over first"),
+            "an unread result outranks the machine wait: {description}"
         );
         assert!(description.contains("10 minutes"), "{description}");
         assert!(description.contains("ends the wait early"), "{description}");
