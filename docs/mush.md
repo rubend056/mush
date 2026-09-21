@@ -677,10 +677,14 @@ binds a fixed port — then runs without a sibling stealing cores or a port, and
 everyone else is queued behind it and then refused, by name, rather than
 silently interleaving: `#3 holds the machine with an exclusive command (…); this
 call queued and the lock was still held. wait blocks until the machine is free —
-then make this call once more; do not retry it in a loop`. The refusal has a
+a result the wait hands over first says the lock is still held, so wait again —
+and then make this call once more; do not retry it in a loop`. The refusal has a
 road back that is not a retry: a subagent's `wait` blocks while another agent
 holds the machine (the root's does not — see below), so the refused call can run
-once it is free. A detached exclusive job holds the lock for its whole life.
+once the machine is free. A wait that finds a result nobody has read hands that
+over first, so the road back can be two waits: the refusal says so, the `wait`
+schema owns the order, and the hold that outlives it is named beside the result.
+A detached exclusive job holds the lock for its whole life.
 The lock coordinates *agents*; it cannot see the human's own build or an
 unrelated process, so it is “agents do not fight each other”, not isolation. The
 root is exempt from a lock it did not take — it commands beside a held one and

@@ -3434,12 +3434,25 @@ fn machine_free(held: &jobs::Held) -> String {
 }
 
 /// What a wait says when the hold outlasts it. The timeout is not a lost wait:
-/// the holder is named, and the two remaining moves are named with it, because
-/// nothing the model can call ends another agent's hold.
-fn machine_timed_out(held: &jobs::Held) -> String {
+/// the holder is named, and the one move that can end *that* hold is named with
+/// it. A child of this agent is the one holder `control` reaches — its own
+/// `stop` lands as `kill_owned`, which kills the job holding the lock — so the
+/// sentence says so; a sibling's or a parent's hold is ended by nobody this
+/// agent can call, and then the two remaining moves are work without the shell
+/// or an honest end to the run.
+fn machine_timed_out(held: &jobs::Held, mine: bool) -> String {
+    let move_left = if mine {
+        format!(
+            "it is your own child — `control stop #{}` ends the hold",
+            held.agent
+        )
+    } else {
+        "nothing you can call ends it — do work that needs no shell, or finish this run and say \
+         you are blocked"
+            .to_string()
+    };
     format!(
-        "wait timed out — {} still holds the machine; nothing you can call ends it — do work that \
-         needs no shell, or finish this run and say you are blocked",
+        "wait timed out — {} still holds the machine; {move_left}",
         machine_holding(held)
     )
 }
@@ -3500,9 +3513,21 @@ fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Resu
                 Waiting::Human => "the human wrote to you",
                 Waiting::Parent => "your parent sent you a message",
             };
+            // What the wait was for, said the way it is: a wait the *machine*
+            // is keeping alive has nothing of this agent's running, and "your
+            // work is still running" was the false half of this sentence in
+            // exactly the case the lock road creates.
+            let still = if !in_flight(state).is_empty() {
+                "your work is still running; ".to_string()
+            } else {
+                match machine_wait(actor) {
+                    Some(held) => format!("{} still holds the machine; ", machine_holding(&held)),
+                    None => String::new(),
+                }
+            };
             return Ok(format!(
                 "interrupted — {who} while you waited; it is in your transcript. Answer it; \
-                 your work is still running. Use wait again when you need a result."
+                 {still}use wait again when you need it."
             ));
         }
         let running = in_flight(state);
@@ -3523,7 +3548,8 @@ fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Resu
             match machine_wait(actor) {
                 Some(held) => {
                     if clock.now() >= deadline {
-                        return Ok(with_digest(actor, state, machine_timed_out(&held)));
+                        let mine = state.children.contains_key(&held.agent);
+                        return Ok(with_digest(actor, state, machine_timed_out(&held, mine)));
                     }
                     holding = Some(held);
                 }
@@ -8595,8 +8621,11 @@ mod tests {
     }
 
     /// And a hold that outlasts the wait: the timeout names the holder and the
-    /// two moves it has left, because nothing it can call ends another agent's
-    /// hold. The clock, not a real ten minutes, is what reaches the deadline.
+    /// two moves it has left, because nothing it can call ends *another
+    /// agent's* hold — the holder here is a sibling, which no `control` of
+    /// this agent's reaches (the holder that is its own child is the one road
+    /// with a call, pinned below). The clock, not a real ten minutes, is what
+    /// reaches the deadline.
     #[test]
     fn a_wait_that_no_holder_ends_times_out_and_names_it() {
         let clock = Arc::new(Advanceable::new());
@@ -8627,6 +8656,99 @@ mod tests {
             actor.ctx.registry.machine_free_for(9).is_err(),
             "the refusal took nothing from the holder"
         );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The one holder whose hold the agent can end itself. A child of its own
+    /// can take the lock — a detached benchmark job of a child is still that
+    /// child's work, and `control stop` on the child lands as `kill_owned`,
+    /// which kills the job and gives the machine back — so the timeout names
+    /// that call instead of the two moves left for a hold nothing it can call
+    /// reaches. The state is an ordinary one: a job dies with its owner, not
+    /// with its run, so a child at rest whose job holds the lock is exactly
+    /// what a wait on a busy machine meets.
+    #[test]
+    fn a_timeout_held_by_the_agents_own_child_names_the_stop_that_ends_it() {
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor(
+            "wait-machine-own-child",
+            Arc::new(ScriptedMachine::new()),
+            clock.clone(),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+        // The child's result has been read, so the wait has nothing to hand
+        // over first: what is left of this call is the machine.
+        state.completed.insert(
+            1,
+            Completion {
+                run: 1,
+                outcome: Outcome::Finished("started the benchmark".into()),
+            },
+        );
+        state.delivered.insert(1, 1);
+        actor.ctx.registry.take_machine(1, "cargo bench").unwrap();
+
+        let answer = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
+        assert!(answer.contains("wait timed out"), "{answer}");
+        assert!(answer.contains("#1's exclusive command"), "{answer}");
+        assert!(
+            answer.contains("it is your own child — `control stop #1` ends the hold"),
+            "the one call that ends this hold is named: {answer}"
+        );
+        assert!(
+            !answer.contains("nothing you can call ends it"),
+            "a child's hold is not one of the holds nothing reaches: {answer}"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// And what the interrupted-wait sentence is allowed to claim about why the
+    /// wait was still going. A wait the *machine* alone keeps alive has nothing
+    /// of this agent's running — that is the state the lock road creates, an
+    /// agent waiting on a sibling with no work of its own — and "your work is
+    /// still running" was the false half of the sentence exactly there.
+    #[test]
+    fn an_interrupted_wait_says_what_it_was_waiting_for() {
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor(
+            "wait-interrupt-machine",
+            Arc::new(ScriptedMachine::new()),
+            clock.clone(),
+        );
+        let cancel = Arc::new(AtomicBool::new(false));
+        actor.ctx.registry.take_machine(2, "cargo bench").unwrap();
+        let mut state = ActorState::default();
+        state
+            .deferred
+            .push(AgentMsg::Nudge("are you there?".to_string()));
+
+        let answer = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
+        assert!(
+            answer.contains("interrupted — the human wrote to you while you waited"),
+            "{answer}"
+        );
+        assert!(
+            !answer.contains("your work is still running"),
+            "nothing of this agent's is running; the machine is what kept the wait alive: {answer}"
+        );
+        assert!(
+            answer.contains("#2's exclusive command") && answer.contains("still holds the machine"),
+            "so the holder is what it names: {answer}"
+        );
+
+        // And with work of its own in flight, the old half is the true one.
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+        state.running.insert(1);
+        let answer = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
+        assert!(
+            answer.contains("your work is still running"),
+            "a wait on its own work says so: {answer}"
+        );
+        assert!(!answer.contains("still holds the machine"), "{answer}");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 

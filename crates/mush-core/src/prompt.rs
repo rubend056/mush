@@ -35,9 +35,11 @@ as #c2]\" and the command keeps its own process group. The tools' schemas say wh
 what reads, waits on or stops it.\n\
 - exclusive=true owns the machine for timing- or port-sensitive work (a benchmark, a profiler, a fixed \
 port): a sibling's command queues behind it and is refused if the lock outlasts that (`#N holds \
-the machine`) — and then `wait` blocks until the machine is free, and one more call runs. Never retry a \
-refused call in a loop. The root is exempt from a lock it did not take: it works beside the holder, told \
-when it did, and only its own exclusive claim is refused.";
+the machine`) — and then a subagent's `wait` is the road back: it blocks until the machine is free \
+(however many waits that takes — the schema says what each one hands over), and one more call runs. \
+Never retry a refused call in a loop. The root is exempt from a lock it did not take: it works \
+beside the holder, told when it did, only its own exclusive claim is refused, and its `wait` does \
+not block on the lock.";
 
 /// The delegation policy, for every agent that has the orchestration tools:
 /// the root and any subagent below `MAX_DEPTH`. It used to live only in the
@@ -214,9 +216,10 @@ pub fn tool_schemas() -> Vec<Value> {
              answer with one digest: a result you have not read comes in full, an already-read one as a \
              line. A result nobody has read is handed over first, whatever the machine is doing; \
              otherwise a subagent's wait also waits while another agent holds the machine, which is how \
-             a command refused with `#N holds the machine` is retried. Returns at once when there is \
-             nothing to wait for; gives up after 10 minutes and names what is still running; a message \
-             to you ends the wait early and says so.",
+             a command refused with `#N holds the machine` is retried. Returns at once when you have \
+             nothing to wait for \u{2014} no children, no jobs, no other agent holding the machine; \
+             gives up after 10 minutes and names what is still running; a message to you ends the wait \
+             early and says so.",
             json!({ "type": "object", "properties": {} }),
         ),
     ]
@@ -409,11 +412,16 @@ mod tests {
     /// machine block that owns it (`wait` spans the hold) and `wait`'s schema
     /// that owns what the call covers. The two cannot disagree: the refusal in
     /// `jobs.rs` sends the model to a wait that its own schema describes.
+    ///
+    /// The wait is scoped to a subagent, because the root's is not this wait:
+    /// the root works beside a holder, so a blocking wait for a lock it never
+    /// took is exactly what its exemption spares it.
     #[test]
     fn the_prompts_say_how_a_refused_command_gets_retried() {
         let root = system_prompt("/tmp/ws");
         assert!(
-            root.contains("`wait` blocks until the machine is free"),
+            root.contains("a subagent's `wait` is the road back")
+                && root.contains("it blocks until the machine is free"),
             "the road back is the machine block's fact: {root}"
         );
         assert!(
@@ -421,11 +429,27 @@ mod tests {
             "{root}"
         );
         // The exemption is said where the root reads the lock's rule, so the
-        // orchestrator does not sit out a lock it never took.
+        // orchestrator does not sit out a lock it never took — and the wait is
+        // scoped in the same breath, so it does not read the subagent's wait as
+        // its own.
         assert!(root.contains("The root is exempt"), "{root}");
         assert!(
+            root.contains("its `wait` does not block on the lock"),
+            "{root}"
+        );
+        // The block must not promise that *one* wait frees the lock: a wait
+        // with an unread result to hand over comes back first, holding the
+        // lock — what the call hands over, and in what order, is the schema's
+        // fact, and the block points at it rather than spelling it twice.
+        assert!(
+            root.contains(
+                "however many waits that takes — the schema says what each one hands over"
+            ),
+            "{root}"
+        );
+        assert!(
             subagent_prompt("/tmp/ws", 1, true, true)
-                .contains("`wait` blocks until the machine is free"),
+                .contains("a subagent's `wait` is the road back"),
             "a subagent is refused, so it is the one that needs the wait"
         );
 
@@ -447,6 +471,13 @@ mod tests {
         );
         assert!(description.contains("10 minutes"), "{description}");
         assert!(description.contains("ends the wait early"), "{description}");
+        // And what "nothing to wait for" means, since the immediate return is
+        // the one clause a locked-out agent could read as "the wait the refusal
+        // named comes straight back".
+        assert!(
+            description.contains("no children, no jobs, no other agent holding the machine"),
+            "{description}"
+        );
     }
 
     #[test]

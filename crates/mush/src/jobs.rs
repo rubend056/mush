@@ -579,10 +579,17 @@ impl Refused {
             // call that spans the hold: `wait` blocks while another agent holds
             // the machine (`agent::wait_tool`), so this refusal has a road back
             // that is not a retry loop — the wait the first H13 fix could not
-            // offer, because there was none.
+            // offer, because there was none. The asker here is never the root
+            // (`root_message` takes that road), so the blocking wait is its own:
+            // the order the wait answers in is the one thing this sentence must
+            // not get wrong, since a wait with an unread result to hand over
+            // comes back with the lock still held (`machine_held`) rather than
+            // waiting it out — and "make this call once more" would then be a
+            // second refusal.
             Refused::Machine(held) => format!(
                 "#{} holds the machine with an exclusive command ({}); this call queued and the lock \
-                 was still held. wait blocks until the machine is free — then make this call once \
+                 was still held. wait blocks until the machine is free — a result the wait hands over \
+                 first says the lock is still held, so wait again — and then make this call once \
                  more; do not retry it in a loop",
                 held.agent,
                 truncate(&held.command, REFUSAL_COMMAND_COLUMNS)
@@ -2108,13 +2115,17 @@ mod tests {
         // refusal counted as a loop (finding H13). They name the holder, what
         // it runs, and the one wait that spans the hold — `wait` blocks while
         // another agent holds the machine — so a refused call has a road back
-        // that is not a retry.
+        // that is not a retry. And the order that wait answers in is said too:
+        // a wait with an unread result hands it over and comes back with the
+        // lock still held, so the model must wait again rather than read the
+        // next refusal as the wait having failed.
         let refusal = Refused::Machine(held).message(4);
         assert!(refusal.starts_with("#3 holds the machine"), "{refusal}");
         assert!(refusal.contains("cargo bench"), "{refusal}");
         assert!(refusal.contains("do not retry"), "{refusal}");
         assert!(
-            refusal.contains("wait blocks until the machine is free"),
+            refusal.contains("wait blocks until the machine is free")
+                && refusal.contains("says the lock is still held, so wait again"),
             "{refusal}"
         );
         // Only the holder can release it: a release from anyone else is a no-op
