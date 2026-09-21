@@ -3608,8 +3608,16 @@ fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Resu
     // another agent's exclusive command is holding. The machine is the reason
     // the lock refusal points at (see [`machine_wait`]), so "nothing to wait
     // for" is only the truth once all of them are answered.
-    let owned =
-        !state.children.is_empty() || !state.running_jobs.is_empty() || !state.done_jobs.is_empty();
+    // A read child is still something to wait for — it can run again, and its
+    // digest is the answer — but a read job is not: its line is delivered once
+    // and never recapped ([`wait_digest`]), so counting it here would answer a
+    // wait with the recap instead of the truth that nothing is left.
+    let owned = !state.children.is_empty()
+        || !state.running_jobs.is_empty()
+        || state
+            .done_jobs
+            .keys()
+            .any(|job| !state.delivered_jobs.contains(job));
     let mut holding = machine_wait(actor);
     if !owned && holding.is_none() {
         return Ok(NOTHING_TO_WAIT_FOR.to_string());
@@ -3748,9 +3756,9 @@ fn already_read(digest: &str) -> String {
 /// Every result this agent has, in id order: children first, then jobs. A
 /// child's result nobody has read comes in full and is marked read; one already
 /// read comes as its digest, never the body again, and never the past reported
-/// as news (finding H15/B26). A job's report is its line, and asking twice
-/// answers with the line twice — a job ends once, so there is no "already read"
-/// digest to give.
+/// as news (finding H15/B26). A job's report is its line, handed over once: a
+/// job ends once and cannot run again, so a repeat `wait` has no digest to give
+/// it — the line stays in the transcript, and the listing still shows the job.
 ///
 /// `fresh_only` is the timeout's answer: only results nobody has read, because
 /// the wait did not finish and a digest of something already answered is not
@@ -3786,10 +3794,9 @@ fn wait_digest(actor: &Actor, state: &mut ActorState, fresh_only: bool) -> Vec<S
     jobs.sort_unstable();
     for id in jobs {
         if let Some(report) = state.done_jobs.get(&id).cloned() {
-            let line = state
-                .record_job(id, report.line.clone(), report.news)
-                .unwrap_or(report.line);
-            out.push(line);
+            if let Some(line) = state.record_job(id, report.line, report.news) {
+                out.push(line);
+            }
         }
     }
     out
@@ -7966,6 +7973,17 @@ mod tests {
         .unwrap();
         assert!(started.contains("detached as #c1"), "{started}");
 
+        // A job whose line the model has already read is not the timeout's to
+        // report (finding H34): the deadline answers with what is *unread*.
+        state.done_jobs.insert(
+            JobId(2),
+            JobReport {
+                line: "#c2 done: exit 0 · 2s · ls — already in the transcript".into(),
+                news: true,
+            },
+        );
+        state.delivered_jobs.insert(JobId(2));
+
         let begun = Instant::now();
         let result = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
 
@@ -7980,6 +7998,61 @@ mod tests {
             begun.elapsed() < Duration::from_secs(1),
             "and it was reached without waiting for it: {:?}",
             begun.elapsed()
+        );
+        assert!(
+            !result.contains("#c2"),
+            "the timeout does not reprint a read job: {result}"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A job's line is a delivery, not a listing: `wait` hands it over once and
+    /// never recaps it (finding H34). A bare recap was invisible — a read
+    /// report and an unread one arrived in the same words — and it grew with
+    /// every job the session had ever run, so a wait whose only book entry was
+    /// read answered the truth with history.
+    #[test]
+    fn a_wait_hands_a_job_report_over_once_and_never_recaps_it() {
+        let (actor, _mailbox) = scripted_tools_actor(
+            "wait-job-once",
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let line = "#c2 done: exit 0 · 12s · cargo test — 586 passed";
+
+        note_job(&mut state, JobId(2), line.into(), true);
+        let first = wait_tool(&actor, &mut state, &cancel).unwrap();
+        assert_eq!(first, line, "the unread report travels, once");
+        assert!(state.delivered_jobs.contains(&JobId(2)));
+
+        // Read is read: this call has nothing of its own left, and says the
+        // truth instead of reprinting what the transcript already holds.
+        let again = wait_tool(&actor, &mut state, &cancel).unwrap();
+        assert_eq!(again, NOTHING_TO_WAIT_FOR);
+        assert!(!again.contains(line), "no recap: {again}");
+
+        // A read child keeps its marked digest — it can run again — while the
+        // read job beside it stays unsaid.
+        let mut state = ActorState::default();
+        let (one, _one_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, one);
+        note_completion(&mut state, 1, 1, Outcome::Finished("old news".into()));
+        state.delivered.insert(1, 1);
+        state.done_jobs.insert(
+            JobId(3),
+            JobReport {
+                line: "#c3 done: exit 0 · 2s · ls".into(),
+                news: true,
+            },
+        );
+        state.delivered_jobs.insert(JobId(3));
+        let mixed = wait_tool(&actor, &mut state, &cancel).unwrap();
+        assert!(mixed.contains("already read"), "{mixed}");
+        assert!(
+            !mixed.contains("#c3"),
+            "the read job is not recapped beside it: {mixed}"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
