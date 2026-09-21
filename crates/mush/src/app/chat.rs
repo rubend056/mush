@@ -47,11 +47,12 @@ use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use mush_core::message::Message;
+use mush_core::message::{Image, Message};
 use mush_core::session;
 use mush_core::text::{truncate, wrap_text, wrap_text_capped};
 
 use crate::agent::summarize_args;
+use crate::app::image_label;
 use crate::app::keys::ChatKey;
 use crate::app::short_age;
 use crate::app::tree::Compacting;
@@ -352,6 +353,12 @@ pub struct Chat {
     notices: Vec<Notice>,
     /// The message box, whose cursor counts graphemes, not chars (finding N2).
     input: Input,
+    /// The images attached to the next message, in the order they were
+    /// attached. They live beside the box and not in it because they are not
+    /// text: the box edits graphemes, and a picture has none. They travel with
+    /// the send — [`Chat::take_attachments`] is the send's half — and a
+    /// refused send hands them back the way it hands the words back.
+    attachments: Vec<Image>,
     /// Where each conversation's pane is reading from, keyed by the agent whose
     /// transcript it shows. Per conversation because the position is the
     /// human's *reading of one pane*: news about another agent must not move
@@ -405,6 +412,7 @@ impl Chat {
             agents: HashMap::new(),
             notices: Vec::new(),
             input: Input::default(),
+            attachments: Vec::new(),
             reading: HashMap::new(),
             spoken: HashMap::new(),
             revisions: HashMap::new(),
@@ -1190,6 +1198,32 @@ impl Chat {
         self.input.insert(text);
     }
 
+    /// Attach one image to the next message. The gate that decides whether an
+    /// image may ride at all is [`crate::app::App::attach_image`]'s, not this
+    /// one's: the box holds what the human asked for, and the app says what
+    /// cannot be carried.
+    pub fn attach(&mut self, image: Image) {
+        self.attachments.push(image);
+    }
+
+    /// The images waiting to be sent, oldest first.
+    pub fn attachments(&self) -> &[Image] {
+        &self.attachments
+    }
+
+    /// Take the attachments out, as a send does. Like [`Self::take_input`], a
+    /// send that does not land gives them back
+    /// ([`Self::restore_attachments`]).
+    pub fn take_attachments(&mut self) -> Vec<Image> {
+        std::mem::take(&mut self.attachments)
+    }
+
+    /// Put attachments back in the box after a send that did not land: the
+    /// human's pictures are not something they should have to paste again.
+    pub fn restore_attachments(&mut self, images: Vec<Image>) {
+        self.attachments = images;
+    }
+
     /// Take the box's text out, as a send does. The words are remembered until
     /// their echo arrives, so the line that comes back is painted as the human's
     /// ([`Self::push_message`]).
@@ -1203,9 +1237,14 @@ impl Chat {
     /// painted as theirs — the mark a typed message gets. `take_input` does this
     /// on the typing path; an attach client's `edit send` has no box to take, so
     /// it states the words here through the same one place.
+    ///
+    /// A message with no words at all — one that is only an attachment — is
+    /// still the human's line, so an empty sentence is queued when an image is
+    /// attached: without that, the echo would fall to [`elsewhere`] and the
+    /// picture would open as `parent › `, somebody else's words.
     pub fn expect_human(&mut self, text: &str) {
         let words = text.trim();
-        if !words.is_empty() {
+        if !words.is_empty() || !self.attachments.is_empty() {
             self.pending = Some(words.to_string());
         }
     }
@@ -1237,7 +1276,18 @@ impl Chat {
             // recent Alacritty); elsewhere it arrives as a plain Enter, which
             // is why Alt+Enter does the same thing and is the reliable one.
             ChatKey::Newline => self.input.insert("\n"),
-            ChatKey::Backspace => self.input.backspace(),
+            // Backspace on an empty box deletes the newest attachment instead
+            // of doing nothing: the box is what the human is looking at, and
+            // the attachment is the newest thing in it. With text in the box
+            // the key is the text's, because deleting the picture while words
+            // are being edited would be a surprise with an undo of none.
+            ChatKey::Backspace => {
+                if self.input.is_empty() && !self.attachments.is_empty() {
+                    self.attachments.pop();
+                } else {
+                    self.input.backspace();
+                }
+            }
             ChatKey::Delete => self.input.delete_forward(),
             ChatKey::Left => self.input.move_left(),
             ChatKey::Right => self.input.move_right(),
@@ -1245,7 +1295,14 @@ impl Chat {
             ChatKey::End => self.input.move_end(),
             ChatKey::Insert(c) => self.input.insert(&c.to_string()),
             ChatKey::Scroll(rows) => self.scroll_by(on, rows),
-            ChatKey::Clear => self.input.clear(),
+            // Esc empties the box, and everything waiting to be sent with it:
+            // what the human asked to clear is the message they were writing,
+            // and half of that message left behind would be a picture they
+            // thought they had let go of.
+            ChatKey::Clear => {
+                self.input.clear();
+                self.attachments.clear();
+            }
         }
     }
 }
@@ -1459,7 +1516,22 @@ fn render_message(
             // lines mush writes into a pane, and `mark()` is the one spelling
             // of that mark as it is of every speaker's.
             let (mark, style) = voice.unwrap_or(Voice::Human).mark();
-            marked(out, mark, style, message.text(), width);
+            // A message that is only an attachment has no words to mark: the
+            // rows below *are* the message, and a bare `you › ` over them would
+            // be a row saying nothing.
+            if !message.text().trim().is_empty() || message.images.is_empty() {
+                marked(out, mark, style, message.text(), width);
+            }
+            // The images of a live message, one dim row each, named the way the
+            // box names them: a picture whose bytes are gone (a trim, a saved
+            // session) is a placeholder in the text, and this is the reading of
+            // one that still has them.
+            for image in &message.images {
+                out.push(Line::from(Span::styled(
+                    format!("  ▣ {}", image_label(image)),
+                    dim(),
+                )));
+            }
             out.push(Line::from(""));
         }
         "assistant" => {

@@ -30,6 +30,13 @@ impl Input {
         self.cursor = 0;
     }
 
+    /// Whether the box is empty. The question Backspace asks before it pops an
+    /// attachment: on an empty box there is no text for the key to delete, so
+    /// the newest picture is what it means.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
     /// The box's text, newlines included.
     #[cfg(test)]
     pub fn text(&self) -> &str {

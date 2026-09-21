@@ -472,7 +472,13 @@ pub enum AgentMsg {
     /// Append a user message the human typed; if idle, run again. The UI echoed
     /// these words before sending them, so the actor folds them in without
     /// telling it to add them again.
-    Nudge(String),
+    ///
+    /// A whole [`Message`] and not a string, because a human steering an agent
+    /// with a screenshot is a thing that has to work: a nudge *is* a user
+    /// message, and one with images rides in the same content array
+    /// (`Message::user_with_images`) whether the model reads it in a run or
+    /// mid-run.
+    Nudge(Message),
     /// A steering message from another agent — what `control message`
     /// sends (`docs/findings.md` B22). It is the same kind of work as a nudge
     /// and travels the same roads, but it is *not* the human's own typing: the
@@ -1601,14 +1607,14 @@ fn absorb(
             state.delivered_jobs.extend(announced_jobs);
             Fold::Run
         }
-        AgentMsg::Nudge(text) => {
+        AgentMsg::Nudge(message) => {
             if worktree_gone(actor) {
                 actor
                     .ctx
                     .emit(actor.id, AgentEvent::Notice(worktree_gone_line(actor.id)));
                 return Fold::Idle;
             }
-            transcript.push(Message::user(text));
+            transcript.push(message);
             Fold::Run
         }
         // A parent's steering: work to answer, like a nudge, and told to the UI
@@ -2772,7 +2778,7 @@ fn drain_mailbox(
         match command {
             // The human's own words: the UI echoed them before sending, so the
             // actor folds them in without telling the UI to add them again.
-            AgentMsg::Nudge(text) => messages.push(Message::user(text)),
+            AgentMsg::Nudge(message) => messages.push(message),
             // A parent's steering was never echoed anywhere: this is the only
             // way it reaches the human's copy of this agent's transcript.
             AgentMsg::Steer(text) => push_line(actor, messages, text),
@@ -5098,9 +5104,7 @@ mod tests {
         let (actor, _mailbox) = test_actor("parked-nudge");
         let mut state = ActorState::default();
         let mut transcript = vec![Message::system("sys")];
-        state
-            .deferred
-            .push(AgentMsg::Nudge("said once".to_string()));
+        state.deferred.push(AgentMsg::Nudge("said once".into()));
 
         let carried = vec![Message::system("sys"), Message::user("said once")];
         assert!(matches!(
@@ -7970,7 +7974,7 @@ mod tests {
         // Not eaten by the interruption: the boundary that follows folds the
         // words in, which is what makes the model answer them in this run.
         assert!(
-            matches!(state.deferred.first(), Some(AgentMsg::Nudge(text)) if text == "what about the tests?"),
+            matches!(state.deferred.first(), Some(AgentMsg::Nudge(message)) if message.text() == "what about the tests?"),
             "the message must survive the interrupted wait: {:?}",
             state.deferred.len()
         );
@@ -9946,7 +9950,7 @@ mod tests {
         let mut state = ActorState::default();
         state
             .deferred
-            .push(AgentMsg::Nudge("are you there?".to_string()));
+            .push(AgentMsg::Nudge("are you there?".into()));
 
         let answer = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
         assert!(
@@ -11823,7 +11827,7 @@ mod tests {
         land_with_merge(&root);
 
         child_tx
-            .send(AgentMsg::Nudge("write extra.txt".to_string()))
+            .send(AgentMsg::Nudge("write extra.txt".into()))
             .unwrap();
 
         let mut seen = Watched::default();
@@ -11859,7 +11863,7 @@ mod tests {
         land_with_discard(&root);
 
         child_tx
-            .send(AgentMsg::Nudge("write extra.txt".to_string()))
+            .send(AgentMsg::Nudge("write extra.txt".into()))
             .unwrap();
 
         let mut seen = Watched::default();
@@ -12291,9 +12295,7 @@ mod tests {
 
         // The transcript really is `[system, user(summary)]`: the next request
         // is that plus the words the human typed after it.
-        root_tx
-            .send(AgentMsg::Nudge("carry on".to_string()))
-            .unwrap();
+        root_tx.send(AgentMsg::Nudge("carry on".into())).unwrap();
         assert!(
             seen.wait(&events, WAIT, |seen| seen.done >= 2),
             "the nudge must be answered: {seen:?}"
@@ -13074,9 +13076,7 @@ mod tests {
             gate.wait_until_asked(WAIT),
             "the first request never reached the model"
         );
-        root_tx
-            .send(AgentMsg::Nudge("STEERME".to_string()))
-            .unwrap();
+        root_tx.send(AgentMsg::Nudge("STEERME".into())).unwrap();
         gate.release();
 
         let mut seen = Watched::default();

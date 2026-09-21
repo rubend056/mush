@@ -195,6 +195,11 @@ pub const KEYS: &[Binding] = &[
     },
     Binding {
         context: Context::Chat,
+        keys: "Ctrl-V",
+        help: "attach the image on the clipboard",
+    },
+    Binding {
+        context: Context::Chat,
         keys: "Shift / Alt-Enter",
         help: "new line in the message",
     },
@@ -344,6 +349,10 @@ pub enum Intent {
     TreeCancel,
     /// Put the chat pane back on the root agent.
     TreeBackToRoot,
+    /// Attach the image on the system clipboard to the next message (`Ctrl-V`).
+    /// The clipboard is read on its own thread — it is subprocesses — and the
+    /// answer comes back as a message, so nothing here waits.
+    AttachClipboardImage,
     /// Send what is in the message box to the focused agent.
     Send,
     /// A key the chat owns — see [`ChatKey`].
@@ -445,6 +454,12 @@ fn chat(key: KeyEvent) -> Intent {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
+        // The chat pane's own modified key: the box takes the clipboard's
+        // image. It is here rather than with the app-wide `Ctrl-` keys because
+        // it is about the message being written, and it sits below the picker
+        // check in [`key`]: a picker owns the keyboard, and an attachment with
+        // no box on screen has nowhere to land.
+        KeyCode::Char('v') if ctrl => Intent::AttachClipboardImage,
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) || alt => {
             Intent::Chat(ChatKey::Newline)
         }
@@ -562,10 +577,25 @@ mod tests {
             (none(KeyCode::PageUp), Intent::Chat(ChatKey::Scroll(10))),
             (none(KeyCode::PageDown), Intent::Chat(ChatKey::Scroll(-10))),
             (none(KeyCode::Esc), Intent::Chat(ChatKey::Clear)),
+            (ctrl('v'), Intent::AttachClipboardImage),
         ];
         for (key, want) in cases {
             assert_eq!(at(Focus::Chat, false, key), want, "{key:?}");
         }
+    }
+
+    /// `Ctrl-V` is the chat pane's: the box is where an attachment lands, and
+    /// the tree has nothing to attach to it. A picker takes the keyboard from
+    /// both panes, so the key is not a way to reach the box behind one either.
+    #[test]
+    fn ctrl_v_belongs_to_the_chat_pane_and_not_to_a_picker() {
+        assert_eq!(
+            at(Focus::Chat, false, ctrl('v')),
+            Intent::AttachClipboardImage
+        );
+        assert_eq!(at(Focus::Agents, false, ctrl('v')), Intent::Ignore);
+        assert_eq!(at(Focus::Agents, true, ctrl('v')), Intent::Ignore);
+        assert_eq!(at(Focus::Chat, true, ctrl('v')), Intent::Ignore);
     }
 
     /// `<Enter>` is the one key three panes share: send in the chat, focus a

@@ -20,13 +20,14 @@ use std::time::Duration;
 use unicode_width::UnicodeWidthStr;
 
 use mush_core::git;
+use mush_core::message::Image;
 use mush_core::text::{sanitize, truncate};
 
 use crate::ui::dim;
 
 use super::{
-    is_below_floor, short_age, AgentId, AgentNode, App, Focus, Landed, Pane, Phase, PickerKind,
-    Rank, StatusKind, MIN_HEIGHT, MIN_WIDTH,
+    image_label, is_below_floor, short_age, AgentId, AgentNode, App, Focus, Landed, Pane, Phase,
+    PickerKind, Rank, StatusKind, MIN_HEIGHT, MIN_WIDTH,
 };
 
 /// Beyond this the transcript is unreadable, however wide the terminal is.
@@ -55,6 +56,12 @@ const CHAT_MIN_COLUMNS: u16 = 40;
 const GIT_STALE: Duration = Duration::from_secs(10);
 /// How many rows a message box may grow to.
 const MAX_INPUT_LINES: u16 = 6;
+
+/// How many rows the attached images may take in the message box. Three: a box
+/// that grows with every picture would push the transcript off the screen, and
+/// past this the last row counts the rest instead of naming them — the title
+/// still says how many, so nothing is hidden, only abbreviated.
+const MAX_ATTACHMENT_ROWS: usize = 3;
 
 /// The popup the pickers paint in: a share of the terminal, floored so a model
 /// list is readable and capped so it does not sprawl on a wide one. One formula,
@@ -92,6 +99,30 @@ fn agents_columns(terminal_width: u16) -> u16 {
 /// row's fields, the wrapped message box) are laid out for that width.
 fn inner(area: Rect) -> Rect {
     Block::default().borders(Borders::ALL).inner(area)
+}
+
+/// The message box's attachment rows: `▣ path (format · size)`, one per image,
+/// at most [`MAX_ATTACHMENT_ROWS`], in the order they were attached.
+///
+/// Past the cap the last row counts the rest instead of naming them — the box
+/// is a box, and there is no fourth row to spend on the fourth screenshot. The
+/// count of *everything* attached is the title's, not that row's, so an
+/// abbreviated list never claims to be the whole one.
+fn attachment_rows(images: &[Image]) -> Vec<String> {
+    let label = |image: &Image| format!("▣ {}", image_label(image));
+    if images.len() <= MAX_ATTACHMENT_ROWS {
+        return images.iter().map(label).collect();
+    }
+    let mut rows: Vec<String> = images
+        .iter()
+        .take(MAX_ATTACHMENT_ROWS - 1)
+        .map(label)
+        .collect();
+    rows.push(format!(
+        "▣ +{} more",
+        images.len() - (MAX_ATTACHMENT_ROWS - 1)
+    ));
+    rows
 }
 
 /// The bar's rows: two from 24 up, so the facts line — the branch, the dirty
@@ -238,6 +269,15 @@ pub struct ChatPane {
 /// them.
 pub struct InputPane {
     pub prompt: String,
+    /// The attachment rows, above the text: `▣ path (format · size)`, one per
+    /// image, at most [`MAX_ATTACHMENT_ROWS`] — the last of which counts the
+    /// rest when there are more. Dim, because they are what is about to be
+    /// said and not what is being typed.
+    pub attachments: Vec<String>,
+    /// How many images are attached. The rows are capped, so the title's count
+    /// cannot be read off them (`▣ +2 more` counts what is left, not the whole);
+    /// the number lives once, beside the rows it is already arithmetic over.
+    pub attachment_count: usize,
     /// The lines the box shows, already windowed around the cursor.
     pub lines: Vec<String>,
     /// The line the cursor is on, in `lines`.
@@ -494,8 +534,15 @@ impl App {
         // not hidden behind a one-line window. It stops growing so the
         // transcript keeps the screen.
         let input_lines = (self.chat.input().line_count() as u16).clamp(1, MAX_INPUT_LINES);
-        let rows =
-            Layout::vertical([Constraint::Min(3), Constraint::Length(input_lines + 2)]).split(area);
+        // And it grows with the attachments, which are painted above the text:
+        // a row the box does not have is a row the message being typed is
+        // pushed out of.
+        let attachment_count = self.chat.attachments().len().min(MAX_ATTACHMENT_ROWS) as u16;
+        let rows = Layout::vertical([
+            Constraint::Min(3),
+            Constraint::Length(input_lines + attachment_count + 2),
+        ])
+        .split(area);
         let transcript_area = rows[0];
         let input_area = rows[1];
 
@@ -547,10 +594,16 @@ impl App {
             // what the human is editing is always the part on screen.
             // Multi-line drafts are painted line by line, so the cursor's own
             // line is the one kept in view.
-            let (lines, cursor_row, column) =
-                self.chat.input().view(field.height as usize, columns);
+            let attachments = attachment_rows(self.chat.attachments());
+            // The text has the rows the attachment rows leave: the painter
+            // stacks them above the lines, and a view that asked for the whole
+            // field would hand back lines that are under the box's bottom.
+            let text_rows = field.height.saturating_sub(attachments.len() as u16) as usize;
+            let (lines, cursor_row, column) = self.chat.input().view(text_rows, columns);
             InputPane {
                 prompt,
+                attachments,
+                attachment_count: self.chat.attachments().len(),
                 lines,
                 cursor_row,
                 column,

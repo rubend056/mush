@@ -195,7 +195,7 @@ fn draw_chat(frame: &mut Frame, pane: &ChatPane, focus: Focus, theme: &Theme) {
     let input_block = Block::default()
         .borders(Borders::ALL)
         .border_style(border(focused, theme))
-        .title(" message ");
+        .title(input_title(pane));
     let input_inner = input_block.inner(pane.input_area);
     frame.render_widget(input_block, pane.input_area);
 
@@ -203,7 +203,13 @@ fn draw_chat(frame: &mut Frame, pane: &ChatPane, focus: Focus, theme: &Theme) {
         return;
     };
     let prompt_width = UnicodeWidthStr::width(input.prompt.as_str());
-    let mut rendered: Vec<Line> = Vec::with_capacity(input.lines.len());
+    let mut rendered: Vec<Line> = Vec::with_capacity(input.attachments.len() + input.lines.len());
+    // The attachments are painted above the text, as part of the message being
+    // written: they are what will ride with the words below them, and the box
+    // reads top to bottom the way the message does.
+    for row in &input.attachments {
+        rendered.push(Line::from(Span::styled(row.clone(), dim())));
+    }
     for (index, line) in input.lines.iter().enumerate() {
         let (lead, style) = if index == 0 {
             (input.prompt.clone(), Style::default().fg(theme.accent()))
@@ -222,8 +228,23 @@ fn draw_chat(frame: &mut Frame, pane: &ChatPane, focus: Focus, theme: &Theme) {
         let x = input_inner.x
             + ((prompt_width + input.column).min(input_inner.width.saturating_sub(1) as usize)
                 as u16);
-        let y = input_inner.y + (input.cursor_row as u16).min(input_inner.height.saturating_sub(1));
+        // The attachment rows sit above the cursor's own line, so the cursor's
+        // row inside the box is that many rows further down.
+        let row = input.attachments.len() + input.cursor_row;
+        let y = input_inner.y + (row as u16).min(input_inner.height.saturating_sub(1));
         frame.set_cursor_position(Position::new(x, y));
+    }
+}
+
+/// The message box's title: ` message `, and how many images are attached when
+/// any are. The count is the whole one, not the rows': past the row cap the box
+/// shows `▣ +2 more`, and a title that repeated that number would be counting
+/// the abbreviation instead of the message.
+fn input_title(pane: &ChatPane) -> String {
+    match pane.input.as_ref().map(|input| input.attachment_count) {
+        Some(1) => " message · 1 image ".to_string(),
+        Some(count) if count > 1 => format!(" message · {count} images "),
+        _ => " message ".to_string(),
     }
 }
 

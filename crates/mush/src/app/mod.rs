@@ -36,7 +36,8 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 use ratatui::crossterm::event::KeyEvent;
 
-use mush_core::message::Message;
+use mush_core::config::vision_capable;
+use mush_core::message::{Image, Message};
 use mush_core::{
     git, prompt, session, text::mask_key, userconfig, Config, Provider, Session, UserConfig,
     Workspace,
@@ -44,6 +45,7 @@ use mush_core::{
 
 use crate::agent::{self, spawn, AgentEvent, AgentMsg, RootHandle};
 use crate::attach;
+use crate::clipboard;
 use crate::http;
 use crate::session_save::SessionSave;
 
@@ -91,6 +93,15 @@ pub enum Msg {
         from: String,
         request: attach::Request,
         reply: Sender<attach::Response>,
+    },
+    /// What a clipboard read found, off the UI thread (`Ctrl-V`). The read is
+    /// subprocesses with a deadline ([`crate::clipboard`]), so it cannot happen
+    /// where the frame is painted; `conversation` stamps the answer the way
+    /// [`Msg::Agent`]'s does, so a read that outlives a Ctrl-N is dropped
+    /// instead of attaching a screenshot to a chat that never asked for one.
+    Clipboard {
+        conversation: ConversationId,
+        result: Result<Option<Image>, String>,
     },
 }
 
@@ -194,6 +205,38 @@ pub fn tokens_label(tokens: usize) -> String {
         scaled(tokens, 1_000.0, "k")
     } else {
         tokens.to_string()
+    }
+}
+
+/// One image as a row reads it: `shots/a.png (png · 1.2 MB)`.
+///
+/// The one spelling, used by the message box's attachment rows and by the row
+/// the transcript paints under the words: a picture the human is about to send
+/// and that same picture once it is in the conversation must read alike, or the
+/// two surfaces are describing two different things. The format is the mime
+/// without its `image/` head, exactly as a shed payload's placeholder spells it.
+pub fn image_label(image: &Image) -> String {
+    let format = image.mime.strip_prefix("image/").unwrap_or(&image.mime);
+    format!(
+        "{} ({format} · {})",
+        image.path,
+        size_label(image.bytes.len())
+    )
+}
+
+/// A byte count the way a glance wants it: `900 B`, `340 KB`, `1.2 MB`. One
+/// decimal for the unit that needs one — a megabyte is where the rounding is
+/// visible, and `1.2` says more than `1258` or than a bare `1`.
+fn size_label(bytes: usize) -> String {
+    const KB: usize = 1_000;
+    const MB: usize = 1_000_000;
+    if bytes < KB {
+        format!("{bytes} B")
+    } else if bytes < MB {
+        format!("{} KB", bytes / KB)
+    } else {
+        let text = format!("{:.1}", bytes as f64 / MB as f64);
+        format!("{} MB", text.strip_suffix(".0").unwrap_or(&text))
     }
 }
 
@@ -1141,7 +1184,49 @@ impl App {
                 if self.picker.is_none() && !self.below_floor() {
                     // Terminals disagree about line endings in a paste.
                     let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                    self.chat.insert(&text);
+                    // A paste that is nothing but an image's path attaches the
+                    // image — that is what drag-and-drop and a file manager's
+                    // "copy" produce — and one that is anything else is the
+                    // words it is.
+                    match self.ws.pasted_image(&text) {
+                        // A refused attachment is not a swallowed paste: the
+                        // path goes in as text, which is also the road to the
+                        // downscale a refusal may name.
+                        Ok(Some(image)) => {
+                            if !self.attach_image(image) {
+                                self.chat.insert(&text);
+                            }
+                        }
+                        Ok(None) => self.chat.insert(&text),
+                        // It *is* an image, and it cannot ride. The words go in
+                        // anyway — a paste is never swallowed, and the path is
+                        // still useful, since the model can be asked to
+                        // downscale it — and the reason is said as the refusal
+                        // it is.
+                        Err(line) => {
+                            self.chat.insert(&text);
+                            self.fail(line);
+                        }
+                    }
+                }
+            }
+            Msg::Clipboard {
+                conversation,
+                result,
+            } => {
+                // A read that outlives the chat that asked for it is not news
+                // about this chat: dropped, exactly as a stale `Msg::Agent` is.
+                if conversation == self.tree.conversation() {
+                    match result {
+                        Ok(Some(image)) => {
+                            self.attach_image(image);
+                        }
+                        Ok(None) => self.say(
+                            "the clipboard holds no image — copy a screenshot, or paste the path \
+                             of an image file",
+                        ),
+                        Err(line) => self.fail(line),
+                    }
                 }
             }
             Msg::Key(key) => self.on_key(key),
@@ -1733,7 +1818,10 @@ impl App {
     /// arms do.
     fn send_message(&mut self) {
         let text = self.chat.take_input().trim().to_string();
-        if text.is_empty() {
+        // An empty box is a send when an image is attached: a picture with no
+        // words is a legal message, and only the human can judge whether it
+        // needs a sentence.
+        if text.is_empty() && self.chat.attachments().is_empty() {
             return;
         }
         let parsed = commands::parse_command(&text);
@@ -1749,13 +1837,19 @@ impl App {
             // No slash: the human is talking to an agent. A message that does
             // not land is said on the bar by `deliver` itself; the human's own
             // key has no client to answer with a refusal. The refusal changes
-            // nothing in the box either, so the words go back where they were:
-            // a message that cannot be sent is not something the human should
-            // have to retype.
+            // nothing in the box either, so the words and the images go back
+            // where they were: a message that cannot be sent is not something
+            // the human should have to retype or paste again.
             Err(CommandError::NotACommand) => {
                 let words = text.clone();
-                if self.deliver(text).is_err() {
+                // The attachments leave the box with the send; a refusal hands
+                // them back with the words. They are taken *here* and not
+                // before the parse, because a command is not a send and its
+                // attachments stay where they are (a `/model` is not a send).
+                let images = self.chat.take_attachments();
+                if self.deliver(text, images.clone()).is_err() {
                     self.chat.insert(&words);
+                    self.chat.restore_attachments(images);
                 }
             }
             // A command that exists but whose argument does not read. The line
@@ -1820,17 +1914,23 @@ impl App {
         None
     }
 
-    /// A typed message, from the human to the focused agent.
+    /// A typed message, from the human to the focused agent — the words and
+    /// whatever images are attached to them.
     ///
     /// `Err(line)` is a message that did **not** land, with the line the human's
     /// bar says as the reason — a dead mailbox or a gone root. A refusal changes
     /// nothing: not the transcript, not the message box, not the revision — so
     /// an attach client can be answered with the refusal instead of an `Ok`
-    /// revision, and the human's caller puts the words back in the box. It used
-    /// to answer a client's message *after* committing it to the root's
-    /// transcript, so a message that never ran was in the conversation the next
-    /// run would read (Tier 3 §2).
-    fn deliver(&mut self, text: String) -> Result<(), String> {
+    /// revision, and the human's caller puts the words and images back in the
+    /// box. It used to answer a client's message *after* committing it to the
+    /// root's transcript, so a message that never ran was in the conversation
+    /// the next run would read (Tier 3 §2).
+    ///
+    /// The unit of "the human's message" is text plus images, and it is built
+    /// once, here: [`Message::user_with_images`] is what the run carries, what
+    /// a nudge carries and what the transcript pushes, so the three cannot
+    /// disagree about which picture went with which words.
+    fn deliver(&mut self, text: String, images: Vec<Image>) -> Result<(), String> {
         // A request without a model is a guaranteed refusal from the endpoint,
         // and since discovery runs after the first frame this state is
         // reachable for as long as one fetch takes (finding A9). Saying so is
@@ -1841,6 +1941,7 @@ impl App {
             self.fail(line);
             return Err(line.to_string());
         }
+        let message = Message::user_with_images(text, images);
         let target = self.tree.focused;
         if target == AgentId::ROOT {
             // The root's own phase, not the tree's: a napping orchestrator is idle, and
@@ -1859,12 +1960,11 @@ impl App {
                     .tree
                     .agent_tx
                     .get(&AgentId::ROOT)
-                    .map(|tx| tx.send(AgentMsg::Nudge(text.clone())).is_ok())
+                    .map(|tx| tx.send(AgentMsg::Nudge(message.clone())).is_ok())
                     .unwrap_or(false);
                 if alive {
-                    self.chat.expect_human(&text);
-                    self.chat
-                        .push_message(AgentId::ROOT, Message::user(text.clone()));
+                    self.chat.expect_human(message.text());
+                    self.chat.push_message(AgentId::ROOT, message);
                     self.flush_session();
                     self.say("noted — folded in as the agent continues");
                     return Ok(());
@@ -1880,11 +1980,11 @@ impl App {
             // chose where to read, and the key that puts a pane back at the
             // newest line is the one they press (finding U3).
             let mut messages = self.chat.conversation();
-            messages.push(Message::user(text.clone()));
+            messages.push(message.clone());
             match self.tree.agent_tx.get(&AgentId::ROOT) {
                 Some(tx) if tx.send(AgentMsg::Run(messages)).is_ok() => {
-                    self.chat.expect_human(&text);
-                    self.chat.push_message(AgentId::ROOT, Message::user(text));
+                    self.chat.expect_human(message.text());
+                    self.chat.push_message(AgentId::ROOT, message);
                     // The human's own words are the one thing worth blocking on:
                     // the run they start may take minutes, and a crash in it
                     // must not lose the request. This is one write per turn, not
@@ -1919,7 +2019,7 @@ impl App {
             // all the node's phase is put back exactly as it was, instead of
             // leaving a lie on the row (finding B10).
             let previous = self.tree.nudge(target);
-            let delivered = self.deliver_to_actor(target, AgentMsg::Nudge(text.clone()));
+            let delivered = self.deliver_to_actor(target, AgentMsg::Nudge(message.clone()));
             if !delivered {
                 let line = agent::gone(target);
                 self.tree.nudge_failed(target, previous);
@@ -1930,8 +2030,8 @@ impl App {
             // the send: a revived actor's first event cannot be applied until
             // this `update` returns, so the answer can never be painted above
             // the question that asked for it.
-            self.chat.expect_human(&text);
-            self.chat.push_message(target, Message::user(text));
+            self.chat.expect_human(message.text());
+            self.chat.push_message(target, message);
             // The human resumed a child its parent may believe is at rest: the
             // parent's books decide its waits and the one-shared-child guard, so
             // they are told (audit row 1).
@@ -2240,7 +2340,7 @@ impl App {
             // transcript no run will read (findings §6, Tier 2 §3).
             let previous = self.tree.focused;
             self.tree.focused = id;
-            let delivered = self.deliver(text.to_string());
+            let delivered = self.deliver(text.to_string(), Vec::new());
             self.tree.focused = previous;
             if let Err(line) = delivered {
                 return attach::Reply::Err(attach::ReplyError::bad_request(line));
@@ -2970,8 +3070,85 @@ impl App {
                 self.tree.focus(AgentId::ROOT);
             }
             Intent::Send => self.send_message(),
+            Intent::AttachClipboardImage => self.attach_clipboard_image(),
             Intent::Chat(key) => self.chat.apply(self.tree.focused, key),
         }
+    }
+
+    /// `Ctrl-V`: read the clipboard for an image and attach it to the box.
+    ///
+    /// The read is subprocesses with a deadline (`crate::clipboard`), so it
+    /// happens on a thread of its own and the answer comes back as a message:
+    /// a clipboard owner that never answers must cost the human a status line,
+    /// never a frame. The message is stamped with the conversation that asked
+    /// for it, exactly as [`Msg::Agent`] is, so a Ctrl-N in between drops the
+    /// answer instead of attaching it to the new chat.
+    fn attach_clipboard_image(&mut self) {
+        let ws = self.ws.clone();
+        let tx = self.ui_tx.clone();
+        let conversation = self.tree.conversation();
+        std::thread::spawn(move || {
+            let result = clipboard::read_image(&ws);
+            let _ = tx.send(Msg::Clipboard {
+                conversation,
+                result,
+            });
+        });
+    }
+
+    /// The one gate an image goes through, whichever road it came by — a paste
+    /// that named a file, or `Ctrl-V`. Answers whether it was attached, so the
+    /// paste arm knows to insert the path as text when it was not.
+    ///
+    /// Three facts stop an image, and each gets its own line because each needs
+    /// a different move from the human:
+    ///
+    /// - **No model at all.** Sending would be a guaranteed refusal, and it is
+    ///   said in the words [`Self::deliver`] already uses for the same state.
+    /// - **A model not documented to see.** An image sent to one is a rejected
+    ///   request — a whole turn and the human's money — so it is refused
+    ///   *before* the wire, and `Ctrl-P` is named as the road: the one road
+    ///   that changes the fact.
+    /// - **An image bigger than the whole request budget.** This one is
+    ///   attached anyway — the human decides what to send — but the fact they
+    ///   cannot see is said: [`mush_core::transcript::trim_history`] sheds image
+    ///   payloads *before* it drops a turn, so a picture larger than the whole
+    ///   budget is stripped before the model ever looks at it. A screenshot
+    ///   that silently never arrived is the defect, so the downscale is named.
+    ///
+    /// Everything else attaches, and the line says the image, its format and
+    /// its size, and how to send it.
+    fn attach_image(&mut self, image: Image) -> bool {
+        let model = self.cfg().model.clone();
+        if model.is_empty() {
+            let line = "no model yet — /model picks one, /url points mush at an endpoint";
+            self.fail(line);
+            return false;
+        }
+        if !vision_capable(&model) {
+            self.fail(format!(
+                "`{model}` is not a model mush knows to accept images — Ctrl-P picks one whose \
+                 row documents vision"
+            ));
+            return false;
+        }
+        let label = image_label(&image);
+        let path = image.path.clone();
+        let size = image.bytes.len();
+        let budget = self.cfg().history_budget();
+        self.chat.attach(image);
+        if size > budget {
+            self.fail(format!(
+                "{label} is {size} bytes — bigger than the whole {budget}-byte request budget, so \
+                 trim_history sheds its bytes before the model ever looks at it. Downscale it \
+                 (`convert {path} -resize 50% small.png`) and attach that"
+            ));
+            return true;
+        }
+        self.say(format!(
+            "attached {label} — Enter sends it with the message"
+        ));
+        true
     }
 
     /// `Ctrl-Q` (and `/quit`): leave — but never silently over live work.
@@ -5403,6 +5580,409 @@ mod tests {
             app.chat.transcript(AgentId::ROOT).is_empty(),
             "a paste is not a send"
         );
+    }
+
+    /// The bytes of a png, as far as `image_mime` is concerned: the magic
+    /// number is the whole of what it reads, and the padding lets a test size a
+    /// picture to whatever a budget needs.
+    fn png(padding: usize) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.resize(8 + padding, 0);
+        bytes
+    }
+
+    /// A saved image, as a test attaches one without going through a paste.
+    fn image(path: &str) -> Image {
+        Image {
+            path: path.to_string(),
+            mime: "image/png".to_string(),
+            bytes: png(0),
+        }
+    }
+
+    /// Configure the one model the provider table documents as accepting image
+    /// parts, so a test of "an attachment can ride" asks the real gate.
+    fn let_the_model_see(app: &mut App) {
+        app.cell.edit(|cfg| cfg.set_model("deepseek-flash"));
+    }
+
+    /// A bracketed paste that is nothing but an image's path attaches the image
+    /// — no text is inserted — because that is what drag-and-drop and a file
+    /// manager's "copy" produce. The gate is the real one, and the line the bar
+    /// says is the one the human reads.
+    #[test]
+    fn a_pasted_image_path_attaches_and_inserts_nothing() {
+        let (mut app, _rx) = test_app("paste-image");
+        let_the_model_see(&mut app);
+        std::fs::create_dir_all(app.ws.root().join("shots")).unwrap();
+        std::fs::write(app.ws.root().join("shots/a.png"), png(4)).unwrap();
+
+        app.update(Msg::Paste("shots/a.png".into()));
+
+        assert_eq!(app.chat.input().text(), "", "the path is not text");
+        let attached = app.chat.attachments();
+        assert_eq!(attached.len(), 1);
+        assert_eq!(attached[0].path, "shots/a.png");
+        assert_eq!(attached[0].mime, "image/png");
+        assert_eq!(attached[0].bytes, png(4), "the file's own bytes ride");
+        let (line, kind) = app.status_line().expect("a line about the attach");
+        assert_eq!(kind, StatusKind::Info);
+        assert!(line.contains("shots/a.png"), "{line}");
+        assert!(line.contains("png"), "the format is named: {line}");
+        assert!(line.contains("Enter sends"), "and how to send it: {line}");
+        assert!(app.chat.transcript(AgentId::ROOT).is_empty());
+    }
+
+    /// Everything else a paste can be is still text: prose, and the path of a
+    /// file that is not an image — which the model can still be asked to read.
+    /// A paste is never swallowed.
+    #[test]
+    fn a_paste_that_is_not_an_image_is_still_text() {
+        let (mut app, _rx) = test_app("paste-text");
+        let_the_model_see(&mut app);
+        std::fs::write(app.ws.root().join("notes.txt"), "hello").unwrap();
+
+        app.update(Msg::Paste("look at this".into()));
+        assert_eq!(app.chat.input().text(), "look at this");
+        assert!(app.chat.attachments().is_empty());
+
+        app.update(Msg::Paste("notes.txt".into()));
+        assert_eq!(app.chat.input().text(), "look at thisnotes.txt");
+        assert!(
+            app.chat.attachments().is_empty(),
+            "a text file is not an image"
+        );
+    }
+
+    /// When the model is not documented to see, the path lands as text and the
+    /// refusal says why: the model, what mush does not know about it, and the
+    /// one key that changes the fact.
+    #[test]
+    fn a_paste_that_cannot_ride_lands_as_text_with_the_reason() {
+        let (mut app, _rx) = test_app("paste-blind");
+        std::fs::write(app.ws.root().join("shot.png"), png(0)).unwrap();
+
+        app.update(Msg::Paste("shot.png".into()));
+
+        assert_eq!(
+            app.chat.input().text(),
+            "shot.png",
+            "a paste is never swallowed"
+        );
+        assert!(app.chat.attachments().is_empty());
+        let (line, kind) = app.status_line().expect("the refusal stays on the bar");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("test-model"), "the model is named: {line}");
+        assert!(line.contains("Ctrl-P"), "and the road is: {line}");
+    }
+
+    /// The gate itself, on its two refusing arms: no model at all, and a model
+    /// the provider table does not document as seeing. Neither attaches, and
+    /// the line names what the second one needs — `Ctrl-P`, the one key that
+    /// changes the fact.
+    #[test]
+    fn the_attach_gate_refuses_a_model_that_may_not_see() {
+        let (mut app, _rx) = test_app("attach-gate");
+        app.cell.edit(|cfg| cfg.model.clear());
+
+        assert!(!app.attach_image(image("shot.png")), "no model, no attach");
+        assert!(app.chat.attachments().is_empty());
+        let (line, kind) = app.status_line().expect("the refusal");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("no model"), "{line}");
+
+        app.cell.edit(|cfg| cfg.set_model("test-model"));
+        assert!(!app.attach_image(image("shot.png")));
+        assert!(app.chat.attachments().is_empty(), "still not attached");
+        let (line, kind) = app.status_line().expect("the refusal");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("test-model"), "the model is named: {line}");
+        assert!(line.contains("Ctrl-P"), "and the road is: {line}");
+    }
+
+    /// The gate's third arm attaches *and* refuses a line: an image bigger than
+    /// the whole request budget rides — the human decides what to send — but
+    /// the fact they cannot see is said, because `trim_history` sheds image
+    /// payloads before it drops a turn and those bytes would never reach the
+    /// model.
+    #[test]
+    fn an_image_bigger_than_the_whole_budget_attaches_with_the_fact_said() {
+        let (mut app, _rx) = test_app("attach-over-budget");
+        let_the_model_see(&mut app);
+        app.cell.edit(|cfg| cfg.set_context(1_024));
+        let budget = app.cfg().history_budget();
+        let big = Image {
+            bytes: png(budget * 2),
+            ..image("shot.png")
+        };
+
+        assert!(app.attach_image(big), "attached anyway");
+
+        assert_eq!(app.chat.attachments().len(), 1, "the human decides");
+        let (line, kind) = app.status_line().expect("the fact is said");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("request budget"), "{line}");
+        assert!(line.contains("convert"), "the downscale road: {line}");
+    }
+
+    /// An image that *is* an image and cannot ride — past the cap — says so and
+    /// still inserts the path: it is never swallowed, and the path is the road
+    /// to the downscale the sentence names.
+    #[test]
+    fn a_pasted_image_past_the_cap_says_why_and_still_inserts_the_path() {
+        let (mut app, _rx) = test_app("paste-big");
+        let_the_model_see(&mut app);
+        let big = mush_core::workspace::IMAGE_FILE_CAP as usize;
+        std::fs::write(app.ws.root().join("big.png"), png(big)).unwrap();
+
+        app.update(Msg::Paste("big.png".into()));
+
+        assert_eq!(app.chat.input().text(), "big.png");
+        assert!(app.chat.attachments().is_empty());
+        let (line, kind) = app.status_line().expect("a refusal");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("2 MB cap"), "{line}");
+        assert!(line.contains("convert"), "the downscale road: {line}");
+    }
+
+    /// `Ctrl-V`'s answer, in the message box: an image attaches, no image says
+    /// so and names the other road, a failure is a failure — and an answer
+    /// stamped with a conversation that is gone is dropped, like any stale
+    /// event (`Ctrl-N` is the case the stamp exists for).
+    #[test]
+    fn a_clipboard_answer_attaches_or_says_there_is_none() {
+        let (mut app, _rx) = test_app("clipboard");
+        let_the_model_see(&mut app);
+        let conversation = app.tree.conversation();
+
+        app.update(Msg::Clipboard {
+            conversation,
+            result: Ok(None),
+        });
+        assert!(app.chat.attachments().is_empty());
+        let (line, kind) = app.status_line().expect("a line");
+        assert_eq!(kind, StatusKind::Info);
+        assert!(line.contains("holds no image"), "{line}");
+        assert!(line.contains("path"), "and names the other road: {line}");
+
+        app.update(Msg::Clipboard {
+            conversation,
+            result: Ok(Some(image("shot.png"))),
+        });
+        assert_eq!(app.chat.attachments().len(), 1);
+        assert_eq!(app.chat.attachments()[0].path, "shot.png");
+
+        app.update(Msg::Clipboard {
+            conversation,
+            result: Err("no clipboard reader on PATH".to_string()),
+        });
+        let (line, kind) = app.status_line().expect("the refusal");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("no clipboard reader"), "{line}");
+
+        // A new chat: the answer the old one asked for is not news here.
+        ctrl(&mut app, 'n');
+        let before = app.chat.attachments().len();
+        app.update(Msg::Clipboard {
+            conversation,
+            result: Ok(Some(image("stale.png"))),
+        });
+        assert_eq!(
+            app.chat.attachments().len(),
+            before,
+            "a stale clipboard answer is dropped"
+        );
+    }
+
+    /// Backspace deletes in the box while there is text, and on an empty box it
+    /// pops the newest attachment. Esc clears both: what the human asked to
+    /// clear is the message they were writing, pictures included.
+    #[test]
+    fn backspace_pops_an_attachment_only_on_an_empty_box_and_esc_clears_both() {
+        let (mut app, _rx) = test_app("box-keys");
+        app.focus = Focus::Chat;
+        app.chat.attach(image("a.png"));
+        app.chat.attach(image("b.png"));
+
+        // With text in the box, Backspace is the text's.
+        app.chat.insert("hi");
+        backspace(&mut app);
+        assert_eq!(app.chat.input().text(), "h");
+        assert_eq!(
+            app.chat.attachments().len(),
+            2,
+            "the pictures are untouched"
+        );
+
+        // Empty the box, and the next Backspace takes the newest picture.
+        backspace(&mut app);
+        assert_eq!(app.chat.input().text(), "");
+        backspace(&mut app);
+        assert_eq!(app.chat.attachments().len(), 1);
+        assert_eq!(
+            app.chat.attachments()[0].path,
+            "a.png",
+            "the newest goes first"
+        );
+        backspace(&mut app);
+        assert!(app.chat.attachments().is_empty());
+
+        // Attach again, type, and Esc: both halves of the box go.
+        app.chat.attach(image("c.png"));
+        app.chat.insert("draft");
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        assert_eq!(app.chat.input().text(), "");
+        assert!(app.chat.attachments().is_empty());
+    }
+
+    /// An image-only message is a legal send: the box is empty and Enter still
+    /// sends, because the attachment is the message.
+    #[test]
+    fn an_empty_box_with_an_attachment_still_sends() {
+        let (mut app, _rx) = test_app("image-only");
+        app.focus = Focus::Chat;
+        app.chat.attach(image("shot.png"));
+
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+
+        let sent = app
+            .chat
+            .transcript(AgentId::ROOT)
+            .last()
+            .expect("the message");
+        assert_eq!(sent.role, "user");
+        assert_eq!(sent.text(), "", "no words, just the picture");
+        assert_eq!(sent.images.len(), 1);
+        assert_eq!(sent.images[0].path, "shot.png");
+        assert!(
+            app.chat.attachments().is_empty(),
+            "the attachment went with the send"
+        );
+        assert!(app.busy(), "and the root is running it");
+    }
+
+    /// The delivered message carries its images, on both roads: a root run
+    /// carries them in the conversation it is sent, and a nudge — the human
+    /// steering a running agent with a screenshot — is the same user message in
+    /// the actor's mailbox.
+    #[test]
+    fn a_delivered_message_carries_its_images() {
+        let (mut app, _rx) = test_app("deliver-images");
+        let_the_model_see(&mut app);
+
+        app.chat.attach(image("root.png"));
+        app.chat.insert("look");
+        app.send_message();
+        let sent = app.chat.transcript(AgentId::ROOT).last().unwrap();
+        assert_eq!(sent.text(), "look");
+        assert_eq!(sent.images.len(), 1, "the root's run carries the picture");
+        assert_eq!(sent.images[0].path, "root.png");
+
+        let (cmd, mailbox) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "lexer".to_string(),
+            depth: 1,
+            branch: None,
+            fork: None,
+            cmd,
+        });
+        app.tree.focus(AgentId(1));
+        app.chat.attach(image("child.png"));
+        app.chat.insert("steer");
+        app.send_message();
+        match mailbox.try_recv() {
+            Ok(AgentMsg::Nudge(message)) => {
+                assert_eq!(message.text(), "steer");
+                assert_eq!(message.images.len(), 1, "a nudge is a user message too");
+                assert_eq!(message.images[0].path, "child.png");
+            }
+            other => panic!("a nudge with an image: {other:?}"),
+        }
+        assert_eq!(
+            app.chat
+                .transcript(AgentId(1))
+                .last()
+                .map(|message| message.images.len()),
+            Some(1),
+            "and the pane shows the same message"
+        );
+    }
+
+    /// A send that does not land puts the words *and* the attachments back:
+    /// the unit of "the human's message" is both, and neither should have to be
+    /// pasted again.
+    #[test]
+    fn a_refused_send_restores_the_words_and_the_attachments() {
+        let (mut app, _rx) = test_app("refused-send");
+        app.cell.edit(|cfg| cfg.model.clear());
+        app.chat.attach(image("shot.png"));
+        app.chat.insert("look at this");
+        app.send_message();
+
+        assert_eq!(
+            app.chat.input().text(),
+            "look at this",
+            "the words went back"
+        );
+        assert_eq!(app.chat.attachments().len(), 1, "and so did the picture");
+        assert_eq!(app.chat.attachments()[0].path, "shot.png");
+        let (line, kind) = app.status_line().expect("the refusal");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("no model"), "{line}");
+        assert!(
+            app.chat.transcript(AgentId::ROOT).is_empty(),
+            "nothing that did not run is in the conversation"
+        );
+    }
+
+    /// The painted rows name the image in both surfaces and the same way: the
+    /// box's attachment rows and the transcript's row under the words are the
+    /// one label builder, so a picture reads alike before and after it is sent.
+    #[test]
+    fn the_box_and_the_transcript_name_an_attached_image() {
+        let (mut app, _rx) = test_app("paint-image");
+        let_the_model_see(&mut app);
+        std::fs::create_dir_all(app.ws.root().join("shots")).unwrap();
+        std::fs::write(app.ws.root().join("shots/a.png"), png(340_000)).unwrap();
+        app.update(Msg::Paste("shots/a.png".into()));
+
+        let label = "shots/a.png (png · 340 KB)";
+        let Screen::Panes(panes) = app.screen(Rect::new(0, 0, 120, 32)) else {
+            panic!("a terminal with room for the panes");
+        };
+        let input = panes.chat.input.as_ref().expect("the message box");
+        assert_eq!(input.attachments, vec![format!("▣ {label}")]);
+        assert_eq!(input.attachment_count, 1);
+        assert_eq!(input.cursor_row, 0, "the cursor's line is below the row");
+
+        // And the frame really paints it there, with the title counting it.
+        let text = shot(&mut app, 120, 32).text();
+        assert!(
+            text.contains(&format!("▣ {label}")),
+            "the box paints the attachment row: {text}"
+        );
+        assert!(text.contains("message · 1 image"), "{text}");
+
+        // Sent, the transcript names it the same way.
+        app.chat.insert("look");
+        app.send_message();
+        let text = shot(&mut app, 120, 32).text();
+        assert!(text.contains("you › look"), "{text}");
+        assert!(
+            text.contains(&format!("▣ {label}")),
+            "the transcript names it too: {text}"
+        );
+    }
+
+    /// Press Backspace the way the app does: through the pure key table and
+    /// the arms.
+    fn backspace(app: &mut App) {
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Backspace,
+            KeyModifiers::NONE,
+        )));
     }
 
     /// Enter sends; Shift+Enter and Alt+Enter start a new line instead, so a
@@ -11676,7 +12256,7 @@ mod tests {
         assert!(
             matches!(
                 mailbox.try_recv(),
-                Ok(AgentMsg::Nudge(text)) if text == "also rename the module"
+                Ok(AgentMsg::Nudge(message)) if message.text() == "also rename the module"
             ),
             "the message reaches the agent's mailbox the way a typed one does"
         );
