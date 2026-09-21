@@ -7,6 +7,7 @@
 mod agent;
 mod app;
 mod attach;
+mod clipboard;
 mod clock;
 mod events;
 mod http;
