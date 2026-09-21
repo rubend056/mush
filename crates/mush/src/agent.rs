@@ -20,6 +20,7 @@ use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
 
 use mush_core::config::parse_context_hint;
+use mush_core::config::vision_capable;
 use mush_core::git;
 use mush_core::message::{ChatRequest, ChatResponse};
 use mush_core::text::{first_line, sanitize, truncate, truncate_flag};
@@ -29,7 +30,7 @@ use mush_core::transcript::{
     COMPACT_REPLY_TOKENS,
 };
 use mush_core::workspace::{truncate_for_model, SEARCH_FILE_CAP};
-use mush_core::{prompt, tools, Config, Message, Workspace, CMD_TIMEOUT_SECS};
+use mush_core::{prompt, tools, Config, Image, Message, Workspace, CMD_TIMEOUT_SECS};
 
 use crate::app::{tokens_label, Compacting, ConfigHandle, ConversationId, Msg, WindowSource};
 use crate::clock;
@@ -2365,10 +2366,10 @@ fn run_loop(
                 None => Err(ToolError::Failed(format!("unknown tool `{named}`"))),
             };
 
-            let (output, refused) = match result {
-                Ok(output) => (output, false),
-                Err(ToolError::Refused(why)) => (format!("error: {why}"), true),
-                Err(ToolError::Failed(error)) => (format!("error: {error}"), false),
+            let (output, images, refused) = match result {
+                Ok(output) => (output.text, output.images, false),
+                Err(ToolError::Refused(why)) => (format!("error: {why}"), Vec::new(), true),
+                Err(ToolError::Failed(error)) => (format!("error: {error}"), Vec::new(), false),
             };
             // A `wait` that slept says so in the state it set; taking it here
             // is what keeps the guard from reading the same blocking call again
@@ -2379,7 +2380,7 @@ fn run_loop(
             // as nothing attempted, which is what keeps the loop guard from
             // condemning a model waiting on a locked machine (H13).
             all_refused &= refused;
-            let tool_message = Message::tool(call.id.clone(), output);
+            let tool_message = Message::tool_with_images(call.id.clone(), output, images);
             messages.push(tool_message.clone());
             actor.ctx.emit(actor.id, AgentEvent::Message(tool_message));
         }
@@ -3111,6 +3112,55 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
     news
 }
 
+/// What a tool call hands back to the model: the text it reads, plus any images
+/// that travel inside the same tool message.
+///
+/// Almost every call is text alone, and `Deref<Target = str>` (with the three
+/// impls beside it) keeps those call sites and every test reading exactly as
+/// they did. One producer attaches an image — `read_file`, when the file is a
+/// picture — and a tool message carrying both is not a second kind of result:
+/// it is what the spec's vision form asks a tool result to be.
+#[derive(Debug, Default)]
+struct ToolOutput {
+    text: String,
+    images: Vec<Image>,
+}
+
+impl From<String> for ToolOutput {
+    fn from(text: String) -> Self {
+        Self {
+            text,
+            images: Vec::new(),
+        }
+    }
+}
+
+impl std::ops::Deref for ToolOutput {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.text
+    }
+}
+
+impl PartialEq<&str> for ToolOutput {
+    fn eq(&self, other: &&str) -> bool {
+        self.text == *other
+    }
+}
+
+impl PartialEq<String> for ToolOutput {
+    fn eq(&self, other: &String) -> bool {
+        &self.text == other
+    }
+}
+
+impl std::fmt::Display for ToolOutput {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.text)
+    }
+}
+
 /// Why a tool call produced no result.
 ///
 /// `Refused` is the machine saying *not now* — the lock is held, the job budget
@@ -3149,12 +3199,17 @@ fn exec_tool(
     tool: ToolName,
     args: &Value,
     cancel: &AtomicBool,
-) -> Result<String, ToolError> {
+) -> Result<ToolOutput, ToolError> {
     // `run_command` is the one tool that can be refused before anything runs
     // (the machine lock, the job budget), so it returns the verdict itself;
-    // every other tool either ran or failed.
+    // every other tool either ran or failed. `read_file` owns its output type
+    // for the same kind of reason: it is the one tool whose result can be an
+    // image as well as text.
     let answer = match tool {
-        ToolName::RunCommand => return run_command(actor, state, args, cancel),
+        ToolName::RunCommand => {
+            return run_command(actor, state, args, cancel).map(ToolOutput::from)
+        }
+        ToolName::ReadFile => return read_tool(actor, args).map_err(ToolError::Failed),
         ToolName::SpawnAgent => spawn_tool(actor, state, args),
         ToolName::Status => status_tool(actor, state),
         ToolName::Control => control_tool(actor, state, args),
@@ -3163,12 +3218,11 @@ fn exec_tool(
         // that keep working while another agent holds the machine, and the only
         // road that can carry an image (finding H31).
         ToolName::EditFile => edit_tool(&actor.ws, args),
-        ToolName::ReadFile => read_tool(actor, args),
         ToolName::WriteFile => write_tool(actor, args),
         ToolName::ListFiles => list_tool(actor, args),
         ToolName::Search => search_tool(actor, args),
     };
-    answer.map_err(ToolError::Failed)
+    answer.map_err(ToolError::Failed).map(ToolOutput::from)
 }
 
 /// The refusal a spawn gets when the repository already holds `MAX_WORKTREES`
@@ -3988,14 +4042,48 @@ fn commit_worktree(
 ///
 /// It takes no lock and runs no process, which is what makes it the read that
 /// survives another agent's exclusive command — and the reason it exists at all
-/// after the six-tool cut assumed the shell would always be there to read.
-fn read_tool(actor: &Actor, args: &Value) -> Result<String, String> {
+/// after the six-tool cut assumed the shell would always be there to read. It is
+/// also the one road an image can travel by: a shell hands back bytes as text,
+/// and a picture is not text.
+fn read_tool(actor: &Actor, args: &Value) -> Result<ToolOutput, String> {
     let path = tools::arg_string(args, "path")?;
+    if let Some(image) = actor.ws.read_image(&path)? {
+        // Vision is a per-model fact ([`Config::model`]'s row in the provider
+        // table), and an image sent to a model that cannot see it is a rejected
+        // request — a whole turn, and the human's money. The refusal names what
+        // to do instead, because "this model cannot see" is not something the
+        // model can change.
+        let model = actor.ctx.cfg.config()?.model;
+        if !vision_capable(&model) {
+            let format = image.mime.strip_prefix("image/").unwrap_or(&image.mime);
+            return Err(format!(
+                "{path} is a {format} image ({} bytes), and `{model}` is not a model mush knows \
+                 to accept images — so its bytes cannot travel. Work from the file's path, and if \
+                 the picture itself is what the task turns on, say so in your summary: a model \
+                 whose row documents vision can read it",
+                image.bytes.len()
+            ));
+        }
+        let format = image.mime.strip_prefix("image/").unwrap_or(&image.mime);
+        // The text is a label for the transcript, not a description of the
+        // picture: the bytes are what the model looks at. It is what survives
+        // when they are shed (a trim, a saved session), so it must say which
+        // file they came from.
+        let text = format!(
+            "read {path} — a {format} image, {} bytes",
+            image.bytes.len()
+        );
+        return Ok(ToolOutput {
+            text,
+            images: vec![image],
+        });
+    }
     let offset = tools::arg_usize(args, "offset", 1)?;
     let limit = tools::arg_usize(args, "limit", usize::MAX)?;
     actor
         .ws
         .read_window(&path, offset, limit, result_cap(actor))
+        .map(ToolOutput::from)
 }
 
 /// `write_file`: create or replace a whole file. The answer is one line naming
@@ -6320,7 +6408,7 @@ mod tests {
             // the moment it reaches the parent, and delivered by a boundary.
             note_completion(&mut state, 1, 1, Outcome::Finished(body.into()));
             let mut transcript = vec![Message::system("you are mush")];
-            let mut answer = String::new();
+            let mut answer = ToolOutput::default();
             match road {
                 "wait" => {
                     answer = exec_tool(
@@ -7086,6 +7174,120 @@ mod tests {
         .unwrap_err();
         assert!(none.text().contains("at least 1"), "{}", none.text());
         let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The reason the file tools came back: `read_file` is the one road an
+    /// image can travel by. A png is sniffed from its own first bytes — never
+    /// from its name, which is a claim — and the result carries both the bytes
+    /// and the one line the transcript keeps when they are shed.
+    #[test]
+    fn read_file_hands_back_an_image_when_the_model_can_see() {
+        const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
+        // The one model mush knows to accept images, so the read is allowed to
+        // hand one over; `test_cfg`'s model is not documented for them.
+        let cfg = ConfigHandle::own(Config::new("http://127.0.0.1:1", "deepseek-flash", None));
+        let (actor, _events, _mailbox) =
+            build_actor("read-image", Arc::new(HttpModel::new(cfg.clone())), cfg);
+        fs::write(actor.ws.root().join("shot.png"), PNG).unwrap();
+        // A png that lies about its name is still a png; a text file that calls
+        // itself one is still text.
+        fs::write(actor.ws.root().join("lies.txt"), PNG).unwrap();
+        fs::write(actor.ws.root().join("not.png"), "plain text\n").unwrap();
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut read = |path: &str| {
+            exec_tool(
+                &actor,
+                &mut state,
+                ToolName::ReadFile,
+                &json!({ "path": path }),
+                &cancel,
+            )
+        };
+
+        let seen = read("shot.png").unwrap();
+        assert_eq!(seen.images.len(), 1, "the bytes travel with the result");
+        assert_eq!(seen.images[0].mime, "image/png");
+        assert_eq!(seen.images[0].bytes, PNG, "the bytes are the file's");
+        assert_eq!(seen.images[0].path, "shot.png", "and the path is the name");
+        assert_eq!(seen.text, "read shot.png — a png image, 12 bytes");
+
+        // The message the model is sent: one tool result carrying the label and
+        // the picture, in the vision form's own shape.
+        let message = Message::tool_with_images("call_1", seen.text.clone(), seen.images.clone());
+        let wire = serde_json::to_string(&message).unwrap();
+        assert!(
+            wire.starts_with(r#"{"role":"tool","content":[{"type":"text","text":"read shot.png"#),
+            "{wire}"
+        );
+        assert!(wire.contains(r#""type":"image_url""#), "{wire}");
+        assert!(wire.contains(r#""tool_call_id":"call_1""#), "{wire}");
+
+        let misnamed = read("lies.txt").unwrap();
+        assert_eq!(
+            misnamed.images.len(),
+            1,
+            "the magic number decides, not the extension"
+        );
+        let plain = read("not.png").unwrap();
+        assert!(plain.images.is_empty(), "a text file named .png is text");
+        assert_eq!(
+            plain.text, "plain text",
+            "and it is read as the window it is"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// Two refusals an image can meet, each naming a move that exists: a model
+    /// that cannot see it (nothing the model can change — it says so in its
+    /// summary) and an image past the 2 MB cap (downscale it, and read that).
+    /// Neither sentence may borrow the other's road.
+    #[test]
+    fn an_image_that_cannot_travel_is_refused_with_the_move_that_can() {
+        const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
+        let (actor, _mailbox) = test_actor("read-image-off");
+        fs::write(actor.ws.root().join("shot.png"), PNG).unwrap();
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::ReadFile,
+            &json!({ "path": "shot.png" }),
+            &cancel,
+        )
+        .unwrap_err();
+        let why = refused.text();
+        assert!(why.contains("`test`"), "it names the model: {why}");
+        assert!(why.contains("cannot travel"), "{why}");
+        assert!(
+            why.contains("summary"),
+            "and the road is the run's end: {why}"
+        );
+        assert!(!why.contains("Downscale"), "not the size refusal's: {why}");
+
+        // The same file, to a model whose row documents vision, but too big.
+        let cfg = ConfigHandle::own(Config::new("http://127.0.0.1:1", "deepseek-flash", None));
+        let (seer, _events, _mailbox) =
+            build_actor("read-image-big", Arc::new(HttpModel::new(cfg.clone())), cfg);
+        let mut big = PNG.to_vec();
+        big.resize(mush_core::workspace::IMAGE_FILE_CAP as usize + 1, 0);
+        fs::write(seer.ws.root().join("big.png"), big).unwrap();
+        let refused = exec_tool(
+            &seer,
+            &mut state,
+            ToolName::ReadFile,
+            &json!({ "path": "big.png" }),
+            &cancel,
+        )
+        .unwrap_err();
+        let why = refused.text();
+        assert!(why.contains("past the 2 MB cap"), "{why}");
+        assert!(why.contains("convert big.png"), "it names the road: {why}");
+        assert!(!why.contains("summary"), "not the vision refusal's: {why}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = fs::remove_dir_all(seer.ws.root());
     }
 
     /// `write_file` creates what is not there — the one road that was missing

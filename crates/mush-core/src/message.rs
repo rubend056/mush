@@ -195,7 +195,7 @@ impl Serialize for Message {
         S: Serializer,
     {
         let fields = 1
-            + usize::from(self.content.is_some())
+            + usize::from(self.content.is_some() || !self.images.is_empty())
             + usize::from(self.reasoning_content.is_some())
             + usize::from(self.tool_calls.is_some())
             + usize::from(self.tool_call_id.is_some());
@@ -252,6 +252,22 @@ impl Message {
             content: Some(content.into()),
             tool_call_id: Some(tool_call_id.into()),
             ..Default::default()
+        }
+    }
+
+    /// A tool result that carries images as well as its text — what `read_file`
+    /// answers with when the file is a picture. One constructor so the shape a
+    /// vision endpoint reads (text part, then one image part each) has one
+    /// home, and so the tool loop that builds the message cannot pair the wrong
+    /// text with the wrong bytes.
+    pub fn tool_with_images(
+        tool_call_id: impl Into<String>,
+        content: impl Into<String>,
+        images: Vec<Image>,
+    ) -> Self {
+        Self {
+            images,
+            ..Self::tool(tool_call_id, content)
         }
     }
 
@@ -385,7 +401,7 @@ fn placeholder(image: &Image) -> String {
     // this is an image, and the sentence has room for one noun.
     let format = image.mime.strip_prefix("image/").unwrap_or(&image.mime);
     format!(
-        "[image: {} ({format}) — dropped to fit the context window; read it again if you need it]",
+        "[image: {} ({format}) — bytes dropped to save room; read the file again if you need them]",
         image.path
     )
 }
@@ -869,7 +885,7 @@ mod tests {
         message.drop_images();
         assert_eq!(
             message.text(),
-            "what is this?\n[image: shots/tiny.png (png) — dropped to fit the context window; read it again if you need it]"
+            "what is this?\n[image: shots/tiny.png (png) — bytes dropped to save room; read the file again if you need them]"
         );
         assert!(message.images.is_empty(), "the bytes are gone");
 
@@ -888,7 +904,7 @@ mod tests {
         silent.drop_images();
         assert_eq!(
             silent.text(),
-            "[image: shots/tiny.png (png) — dropped to fit the context window; read it again if you need it]"
+            "[image: shots/tiny.png (png) — bytes dropped to save room; read the file again if you need them]"
         );
     }
 

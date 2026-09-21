@@ -171,9 +171,10 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::ReadFile,
-            "Read a workspace file. A long file is a window — `offset`/`limit` are lines \
-             (default: from line 1, as many as fit) — and the cut says what it left. Works while \
-             another agent holds the machine.",
+            "Read a workspace file, or look at an image. Text is a window — `offset`/`limit` are \
+             lines (default: from line 1, as many as fit) and the cut says what it left; a png, \
+             jpeg, gif or webp comes back as the image itself. Works while another agent holds \
+             the machine.",
             json!({
                 "type": "object",
                 "properties": {

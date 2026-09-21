@@ -2,9 +2,10 @@
 //! writes.
 
 use std::fs;
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
+use crate::message::Image;
 use crate::text;
 use tempfile::NamedTempFile;
 
@@ -33,6 +34,13 @@ const SKIP_DIRS: &[&str] = &[
 /// so; a window of a 200 MB log is `run_command`'s job (`tail`, `sed -n`).
 pub const READ_FILE_CAP: u64 = 32 * 1024 * 1024;
 
+/// The largest image a read will hand to a model, in bytes. An image's real
+/// cost is its pixels and the tokens they become — a 4 MB screenshot is a page
+/// of context on most endpoints — so the cap is a size a picture is worth and
+/// not the whole-read cap: past it the refusal names a downscale, which is the
+/// one road that makes the picture readable at all.
+pub const IMAGE_FILE_CAP: u64 = 2 * 1024 * 1024;
+
 /// The longest file `search` opens. A pattern that matches inside a 200 MB log
 /// is a match the model does not need and a walk that takes minutes; `run_command`
 /// is the road to that file.
@@ -41,6 +49,33 @@ pub const SEARCH_FILE_CAP: u64 = 2 * 1024 * 1024;
 /// How much of one matching line `search` shows, so one minified line cannot
 /// spend the whole result.
 const MATCH_LINE_CAP: usize = 240;
+
+/// The mime an image's own first bytes name, or `None` when they are not an
+/// image's. Four formats, and all four are sniffed rather than trusted to a
+/// name: these are what vision endpoints document, and the bytes are what the
+/// `data:` URL will carry.
+///
+/// The signatures are the ones each format defines: png's eight bytes with
+/// `\r\n` and `\x1a\n` in them (they exist to catch a transfer that mangled
+/// newlines), jpeg's three-byte start-of-image marker, gif's two version
+/// spellings, and webp's `RIFF` container with `WEBP` at the offset that makes
+/// it a webp rather than any other RIFF file.
+pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
+    const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if bytes.starts_with(PNG) {
+        return Some("image/png");
+    }
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        return Some("image/jpeg");
+    }
+    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        return Some("image/gif");
+    }
+    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+        return Some("image/webp");
+    }
+    None
+}
 
 /// A single workspace root. All agent file access goes through here, which is
 /// what keeps a runaway model inside the directory the human opened.
@@ -112,9 +147,9 @@ impl Workspace {
     /// It used to take a `cap`, keep the head of a long file and mark the cut
     /// with a sentence of its own — then the six-tool cut took the file tools
     /// away and this became `edit_file`'s private read, which must see the whole
-    /// file or refuse the edit. The read tools are back ([`Self::read_window`])
-    /// because the shell cannot serve them behind a machine lock, so the cut
-    /// lives there and this stays the whole-file read.
+    /// file or refuse the edit. The read tools are back ([`Self::read_window`],
+    /// [`Self::read_image`]) because the shell cannot serve them behind a
+    /// machine lock, so the cut lives there and this stays the whole-file read.
     pub fn read_file(&self, rel: &str) -> Result<String, String> {
         let path = self.resolve(rel)?;
         let bytes = fs::read(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
@@ -122,6 +157,52 @@ impl Workspace {
             return Err(format!("{rel} looks like a binary file"));
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// Read `rel` as an image, when it is one: the mime its own first bytes
+    /// name, and the bytes whole — or `None` when the file is not an image, so
+    /// the caller reads it as text.
+    ///
+    /// The format comes from the magic number and never from the name. An
+    /// extension is a claim by whoever wrote the file; the sniff is the file
+    /// saying what it is, and a `data:` URL's mime is read by an endpoint that
+    /// never sees a name at all. The four are the ones vision endpoints
+    /// document: png, jpeg, gif, webp.
+    ///
+    /// Past [`IMAGE_FILE_CAP`] the refusal names the downscale, because an
+    /// image that big cannot be made to fit any other way — `offset`/`limit`
+    /// are lines and an image has none.
+    pub fn read_image(&self, rel: &str) -> Result<Option<Image>, String> {
+        let path = self.resolve(rel)?;
+        let mut head = [0u8; 16];
+        let Ok(mut file) = fs::File::open(&path) else {
+            // Not there, or not openable: the text read below says so in the
+            // words this tool has always used (`cannot read …`), and one fact
+            // does not need two spellings.
+            return Ok(None);
+        };
+        let Ok(read) = file.read(&mut head) else {
+            return Ok(None);
+        };
+        let Some(mime) = image_mime(&head[..read]) else {
+            return Ok(None);
+        };
+        let bytes = fs::read(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
+        let size = bytes.len() as u64;
+        if size > IMAGE_FILE_CAP {
+            let cap = IMAGE_FILE_CAP / (1024 * 1024);
+            return Err(format!(
+                "{rel} is a {} image of {size} bytes — past the {cap} MB cap on an image. \
+                 Downscale it with run_command (`convert {rel} -resize 50% small.png`) and read \
+                 that",
+                mime.strip_prefix("image/").unwrap_or(mime)
+            ));
+        }
+        Ok(Some(Image {
+            path: rel.to_string(),
+            mime: mime.to_string(),
+            bytes,
+        }))
     }
 
     /// A window of a text file, as the model reads it: `limit` lines from

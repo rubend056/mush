@@ -24,7 +24,8 @@ edit the files.
   `read_file`, `write_file`, `list_files` and `search` touch files, `edit_file`
   replaces exact text, `run_command` is the shell, `spawn_agent` delegates, and
   `status`, `control` and `wait` manage what it started — a long command becomes
-  a **job** the agent can check on later.
+  a **job** the agent can check on later, and `read_file` is the one road an
+  image can travel by.
 - mush holds **no file state**: agents read and write files directly, and the
   UI shows their tree, their transcripts, and the git facts.
 - The agent's **system prompt is three short blocks** — the rules, the
@@ -77,10 +78,9 @@ premise (H31):
   way to, and the wait that frees the machine is minutes long. The file tools
   take no lock and work beside one.
 - **A shell cannot carry an image.** A screenshot, a chart or a rendered diagram
-  on disk is bytes no shell command hands back to a model that can see. An image
+  on disk is bytes no shell command hands back to a model that can see; an image
   arrives in a tool result as an image, which only a typed tool can build. So
-  `read_file` is the tool that will carry one — the second half of this reversal,
-  landing next (§9).
+  `read_file` is the tool that carries one (§3).
 
 The rest is unchanged: `edit_file` keeps its exactness, and any other
 agent — a shell script, a different harness — can still collaborate through the
@@ -136,8 +136,11 @@ and never share state with the painter.
   `read_file` of a file past 32 MB is refused (a window cannot get past it — the
   file is opened whole first), and a `search` past 2 MB *in one file* skips it
   and counts it, so a "no match" that skipped a file says how many and names
-  `run_command` (`sed -n`, `rg`) as the road. Edit operations always work on the
-  complete file.
+  `run_command` (`sed -n`, `rg`) as the road. An image has a cap of its own and
+  no window: past 2 MB it is refused with a downscale as the road, and an image
+  the run's model is not documented to see is refused *before* it is sent, so a
+  request that cannot be read never costs a turn. Edit operations always work on
+  the complete file.
 - **Bounded loops.** A run ends when the model stops calling tools; a *loop* —
   the same tool batch five rounds over with nothing changed in between — ends it
   early, and a 200-turn runaway guard withdraws the tools and asks for a
@@ -179,7 +182,7 @@ second copy of it.
 | Tool | Arguments | Notes |
 |---|---|---|
 | `edit_file` | `path`, `edits` | exact-and-unique replacement, one shape: `edits` is always a list (a lone edit is a list of one), `replace_all` opts into an ambiguous match, and the batch lands all-or-nothing in one call |
-| `read_file` | `path`, `offset?`, `limit?` | a file as a window of lines, with no line numbers (a numbered line is a string that cannot match `edit_file`'s `old_string`) and one trailing sentence saying what the window left; works beside a held lock |
+| `read_file` | `path`, `offset?`, `limit?` | a file as a window of lines, with no line numbers (a numbered line is a string that cannot match `edit_file`'s `old_string`) and one trailing sentence saying what the window left; a png, jpeg, gif or webp — sniffed from the file's own bytes, never its name — comes back as the image itself, if the model is documented to see; works beside a held lock |
 | `write_file` | `path`, `content` | create or replace a whole file, parent directories included; the answer is one line naming what it replaced; the workspace root itself is refused |
 | `list_files` | `path?` | the files under a path, sorted, one per line; build and VCS directories are skipped; capped at 400 names with the way past it |
 | `search` | `pattern`, `path?`, `ignore_case?` | a literal string (no regex — a regex engine is a dependency, and `rg` is the shell's), one `path:line: text` per match; binary and huge files skipped |
@@ -208,6 +211,41 @@ typed while a tool batch ran (their words land between the calls and the results
 and a quit mid-batch can leave calls with no results. `repair_tool_pairs` moves
 results back beside their assistant message and answers whatever is still missing
 before the request goes out.
+
+### Images
+
+`read_file` is the one road an image travels by, and it carries it **inside the
+tool result**: a message with text and one `image_url` content part per image,
+each a `data:` URL of the bytes (`Message::content_parts`). Nothing else in the
+request path knows images exist — `ChatRequest` takes `&[Message]`, and a message
+with no images serializes byte for byte as it always did — because a second
+message type for the vision case is a second thing to keep in step with the
+first.
+
+Three facts decide whether an image travels:
+
+- **The format is sniffed, not named.** Png, jpeg, gif and webp are recognised
+  by their own first bytes; an extension is a claim by whoever wrote the file,
+  and a `data:` URL's mime is read by an endpoint that never sees a name.
+- **The model must be documented to see it.** Vision is a per-model fact in the
+  provider table (`ModelSpec::vision`; `deepseek-flash` is the one row that
+  states it), and everything else — including every model mush has never heard
+  of — is off. Being wrong in that direction costs an image the model could have
+  read; being wrong the other way costs the whole turn, because an endpoint that
+  never documented image parts may reject the request.
+- **An image is capped at 2 MB and cannot be windowed.** `offset`/`limit` are
+  lines and an image has none, so the refusal names the one road that makes a
+  big picture readable: downscale it with `run_command` and read that.
+
+An image's bytes leave the transcript the same way they would leave the context:
+`Message::drop_images` replaces them, in place, with one line naming the path and
+format (`[image: shots/a.png (png) — bytes dropped to save room; read the file
+again if you need them]`). Trimming calls it **before** it drops any turn — an
+image is what an over-budget transcript is usually made of and the cheapest thing
+to lose, since the placeholder still says where it is — and the session writer
+calls it before it serializes, so a multi-megabyte screenshot never lands in
+`.mush/session.json`. The drop is idempotent, which is what keeps a session
+saved, loaded and saved again from stacking placeholder on placeholder.
 
 ### History budget
 
