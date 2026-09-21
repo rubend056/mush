@@ -6,6 +6,7 @@ use std::io::{self, Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use crate::message::Image;
+use crate::session;
 use crate::text;
 use tempfile::NamedTempFile;
 
@@ -174,32 +175,160 @@ impl Workspace {
     /// are lines and an image has none.
     pub fn read_image(&self, rel: &str) -> Result<Option<Image>, String> {
         let path = self.resolve(rel)?;
-        let mut head = [0u8; 16];
-        let Ok(mut file) = fs::File::open(&path) else {
-            // Not there, or not openable: the text read below says so in the
-            // words this tool has always used (`cannot read …`), and one fact
-            // does not need two spellings.
+        self.image_at(&path, rel)
+    }
+
+    /// The image a paste names, when the paste is nothing but the name of one.
+    /// `Ok(None)` = "this is text, not an image".
+    ///
+    /// This is the *human's* door, and it is deliberately not the model's:
+    /// [`Self::resolve`] refuses an absolute path because a run-away model
+    /// must not read `/etc/passwd`, while the human already has the file and
+    /// is choosing to show it. Drag-and-drop, a file manager's "copy", and a
+    /// browser's `file://` URL all hand the terminal an absolute path; refusing
+    /// it would make the one gesture the feature exists for a refusal. The
+    /// trust is not extended to the model: the image is read from wherever the
+    /// human named it but travels as a `data:` URL inside the message, and a
+    /// clipboard image is [saved into the workspace](Self::save_pasted_image)
+    /// before it can ride anywhere.
+    ///
+    /// What a paste may be, in the order each rule is tried:
+    ///
+    /// - Surrounding whitespace and newlines are the terminal's, not the
+    ///   name's, so they are trimmed. An interior newline makes the paste a
+    ///   paragraph, and an interior whitespace that no backslash escaped makes
+    ///   it prose — a space is what separates words, and a paste with one is
+    ///   read as the words it is. The two spellings a tool uses for a file's
+    ///   *own* space, `\ ` and `%20`, survive to the name.
+    /// - One pair of matching surrounding quotes is stripped: a quoted paste
+    ///   is a tool saying "this is one name", so its interior spaces are the
+    ///   name's and are not re-judged.
+    /// - A `file://` scheme is dropped, a `localhost` host with it, and `%XX`
+    ///   escapes are decoded as the UTF-8 bytes they are (a name arrives
+    ///   percent-encoded from a browser, where a backslash would be a path
+    ///   separator).
+    /// - Backslash escapes are unescaped — `\ `, `\(`, `\)`, `\[`, `\]`,
+    ///   `\\`, and generally `\x` → `x` — because that is how a terminal
+    ///   pastes a dragged file's shell-special characters.
+    /// - An absolute name is used as it is; a relative one goes through
+    ///   [`Self::resolve`], so `..` and an escape are refused (and come back as
+    ///   `Ok(None)`: they are text, not an image that cannot ride). `~` is
+    ///   *not* expanded and the process's own directory is not consulted — the
+    ///   workspace was opened with a folder, and that folder is the only
+    ///   meaning a bare relative name has here.
+    ///
+    /// The file must exist and its first bytes must sniff as an image. Not
+    /// existing, not being a file at all, and not being an image are all
+    /// `Ok(None)`: the paste is inserted as the text it is. Past
+    /// [`IMAGE_FILE_CAP`] it is an image that cannot ride, and the `Err` is the
+    /// read tool's own refusal sentence — one file refused at either door is
+    /// refused with the same words.
+    pub fn pasted_image(&self, paste: &str) -> Result<Option<Image>, String> {
+        let Some(name) = pasted_name(paste) else {
             return Ok(None);
         };
+        let path = if Path::new(&name).is_absolute() {
+            PathBuf::from(&name)
+        } else {
+            match self.resolve(&name) {
+                Ok(path) => path,
+                // An escape or a `..` is not a name this door opens; the paste
+                // goes in the box as the words it is.
+                Err(_) => return Ok(None),
+            }
+        };
+        // The name the placeholder keeps: workspace-relative for a file inside
+        // the root (however the human spelled it), and the absolute path as
+        // given for one outside — a name that still means the file after the
+        // bytes are shed.
+        let label = self.rel(&path);
+        self.image_at(&path, &label)
+    }
+
+    /// Write bytes that came from outside the workspace (the clipboard) into
+    /// `.mush/paste/` and hand back the image that names them.
+    ///
+    /// A clipboard image has no path — the clipboard is a buffer, not a file —
+    /// and [`Image`] carries one: it is the name a shed payload's placeholder
+    /// keeps, so the bytes are given one here. `.mush/` ignores itself via its
+    /// own `.gitignore` ([`session::ensure_mush_dir`]), so a pasted screenshot
+    /// cannot dirty the tree, and the file is named for the moment it was
+    /// pasted rather than for the clipboard, which would let a second paste
+    /// overwrite the first.
+    ///
+    /// `Err` is "these bytes are an image, and they cannot ride": bytes that
+    /// sniff as no image at all, or one past [`IMAGE_FILE_CAP`], whose refusal
+    /// names the clipboard's own road (`wl-paste -t image/png > shot.png`,
+    /// then a `convert` downscale) because that is the only one a clipboard
+    /// image has.
+    pub fn save_pasted_image(&self, bytes: Vec<u8>) -> Result<Image, String> {
+        let Some(mime) = image_mime(&bytes) else {
+            return Err(
+                "the clipboard bytes are not a png, jpeg, gif or webp image — copy the picture \
+                 itself, or paste the path of an image file"
+                    .to_string(),
+            );
+        };
+        let size = bytes.len() as u64;
+        if size > IMAGE_FILE_CAP {
+            let cap = IMAGE_FILE_CAP / (1024 * 1024);
+            let format = mime.strip_prefix("image/").unwrap_or(mime);
+            return Err(format!(
+                "the clipboard image is a {format} of {size} bytes — past the {cap} MB cap on an \
+                 image. Save it to a file and downscale it (`wl-paste -t image/png > shot.png`, \
+                 then `convert shot.png -resize 50% small.png`), then copy the smaller one"
+            ));
+        }
+        session::ensure_mush_dir(self.root())
+            .map_err(|e| format!("cannot create {}: {e}", session::MUSH_DIR))?;
+        let dir = self.root().join(session::MUSH_DIR).join("paste");
+        fs::create_dir_all(&dir)
+            .map_err(|e| format!("cannot create {}/paste: {e}", session::MUSH_DIR))?;
+        let name = format!("pasted-{}.{}", now_millis(), pasted_extension(mime));
+        let path = dir.join(&name);
+        fs::write(&path, &bytes)
+            .map_err(|e| format!("cannot write {}/{name}: {e}", session::MUSH_DIR))?;
+        Ok(Image {
+            path: format!("{}/paste/{name}", session::MUSH_DIR),
+            mime: mime.to_string(),
+            bytes,
+        })
+    }
+
+    /// The image at `path`, named `name` in the refusal and in the returned
+    /// [`Image`]: the mime its own first bytes name, and the bytes whole — or
+    /// `Ok(None)` when they are not an image's, so a caller reads the file as
+    /// text (or, in [`Self::pasted_image`]'s case, as the words the paste is).
+    ///
+    /// One reader for the two doors a picture comes in by — the model's
+    /// `read_file` and the human's paste — because a cap, a sniff and a
+    /// refusal sentence that differed between them would be the same decision
+    /// made twice, and the copies would drift. The head is read before the
+    /// whole file so a 200 MB blob that is not an image is not loaded to find
+    /// that out; the file is only whole here once its own bytes said "image".
+    fn image_at(&self, path: &Path, name: &str) -> Result<Option<Image>, String> {
+        let mut head = [0u8; 16];
+        let Ok(mut file) = fs::File::open(path) else {
+            // Not there, or not openable: not an image, so the caller's other
+            // reading of the path is the answer.
+            return Ok(None);
+        };
+        // A directory opens but does not read (or does not open at all,
+        // depending on the platform): either way it is `Ok(None)`, not an
+        // image.
         let Ok(read) = file.read(&mut head) else {
             return Ok(None);
         };
         let Some(mime) = image_mime(&head[..read]) else {
             return Ok(None);
         };
-        let bytes = fs::read(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
+        let bytes = fs::read(path).map_err(|e| format!("cannot read {name}: {e}"))?;
         let size = bytes.len() as u64;
         if size > IMAGE_FILE_CAP {
-            let cap = IMAGE_FILE_CAP / (1024 * 1024);
-            return Err(format!(
-                "{rel} is a {} image of {size} bytes — past the {cap} MB cap on an image. \
-                 Downscale it with run_command (`convert {rel} -resize 50% small.png`) and read \
-                 that",
-                mime.strip_prefix("image/").unwrap_or(mime)
-            ));
+            return Err(image_too_big(name, mime, size));
         }
         Ok(Some(Image {
-            path: rel.to_string(),
+            path: name.to_string(),
             mime: mime.to_string(),
             bytes,
         }))
@@ -469,6 +598,143 @@ impl Workspace {
     }
 }
 
+/// The one refusal an image past [`IMAGE_FILE_CAP`] gets, whichever door it
+/// came in by. One spelling, because it is one fact — the picture is too big
+/// to travel — and one road, because `offset`/`limit` are lines and an image
+/// has none: nothing but a downscale makes it readable.
+fn image_too_big(name: &str, mime: &str, size: u64) -> String {
+    let cap = IMAGE_FILE_CAP / (1024 * 1024);
+    let format = mime.strip_prefix("image/").unwrap_or(mime);
+    format!(
+        "{name} is a {format} image of {size} bytes — past the {cap} MB cap on an image. \
+         Downscale it with run_command (`convert {name} -resize 50% small.png`) and read that"
+    )
+}
+
+/// The name a paste may be, or `None` when the paste is text. The whole parse
+/// of a pasted path lives here so [`Workspace::pasted_image`] reads as its
+/// rules rather than as their arithmetic; see there for why each rule is what
+/// it is.
+fn pasted_name(paste: &str) -> Option<String> {
+    let trimmed = paste.trim();
+    if trimmed.is_empty() || trimmed.contains(['\n', '\r']) {
+        return None;
+    }
+    let (name, quoted) = strip_quotes(trimmed);
+    // A bare space is the separator between words; `\ ` and `%20` are how a
+    // tool spells a file's own space, and a quoted paste is a tool saying the
+    // whole string is one name. Any other whitespace is prose as well.
+    if !quoted && has_bare_space(name) {
+        return None;
+    }
+    let name = match name.strip_prefix("file://") {
+        Some(rest) => {
+            // `file://localhost/tmp/x` and `file:///tmp/x` are the same path:
+            // an empty or `localhost` host is the local machine, and the path
+            // begins at the first `/` that follows.
+            let rest = rest.strip_prefix("localhost").unwrap_or(rest);
+            percent_decode(rest)?
+        }
+        None => name.to_string(),
+    };
+    let name = unescape_backslashes(&name);
+    (!name.is_empty()).then_some(name)
+}
+
+/// One pair of matching surrounding quotes, and whether they were there.
+fn strip_quotes(text: &str) -> (&str, bool) {
+    for quote in ['"', '\''] {
+        if text.len() >= 2 && text.starts_with(quote) && text.ends_with(quote) {
+            return (&text[quote.len_utf8()..text.len() - quote.len_utf8()], true);
+        }
+    }
+    (text, false)
+}
+
+/// Whether any whitespace in `name` is unescaped: the test that tells a dragged
+/// file from a sentence.
+fn has_bare_space(name: &str) -> bool {
+    let mut escaped = false;
+    for ch in name.chars() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if ch.is_whitespace() {
+            return true;
+        }
+    }
+    false
+}
+
+/// `%XX` decoded into its bytes and joined back as UTF-8, so a name that
+/// arrived as several escapes (`%C3%A9`) is the character it spells. A `%`
+/// that is not followed by two hex digits is kept as it is — it is a legal
+/// character in a file name, and a paste from a file manager is not encoded at
+/// all — and bytes that are not UTF-8 make the whole paste text, because a name
+/// that cannot be spelled is not a name.
+fn percent_decode(text: &str) -> Option<String> {
+    fn hex(byte: u8) -> Option<u8> {
+        (byte as char).to_digit(16).map(|digit| digit as u8)
+    }
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut at = 0;
+    while at < bytes.len() {
+        if bytes[at] == b'%' && at + 2 < bytes.len() {
+            if let (Some(high), Some(low)) = (hex(bytes[at + 1]), hex(bytes[at + 2])) {
+                out.push(high << 4 | low);
+                at += 3;
+                continue;
+            }
+        }
+        out.push(bytes[at]);
+        at += 1;
+    }
+    String::from_utf8(out).ok()
+}
+
+/// `\x` → `x` — the escapes a terminal puts in a dragged file's name, the
+/// space above all. A backslash with nothing after it is kept: it is a legal
+/// character in a name, and dropping it would silently rename the file.
+fn unescape_backslashes(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut chars = name.chars();
+    while let Some(ch) = chars.next() {
+        if ch == '\\' {
+            match chars.next() {
+                Some(next) => out.push(next),
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(ch);
+        }
+    }
+    out
+}
+
+/// The extension a saved clipboard image is written with: the mime's own name,
+/// but `jpg` for jpeg, which is the spelling a file browser and `convert` both
+/// read.
+fn pasted_extension(mime: &str) -> &'static str {
+    match mime {
+        "image/png" => "png",
+        "image/gif" => "gif",
+        "image/webp" => "webp",
+        _ => "jpg",
+    }
+}
+
+/// Unix milliseconds, the tail of a saved clipboard image's name: two pastes
+/// are two files, and a name that sorts by when it happened is the one fact
+/// about a clipboard image the clipboard itself does not have.
+fn now_millis() -> u128 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0)
+}
+
 /// Cap text handed to a model, cutting on a char boundary and marking the
 /// cut, so a partial result can never be mistaken for the whole output. The
 /// marker says how much was kept and what to do next — the command result is
@@ -567,6 +833,170 @@ mod tests {
         ws.write_file("src/lib.rs", "fn a() {}\n").unwrap();
         assert_eq!(ws.read_file("src/lib.rs").unwrap(), "fn a() {}\n");
         assert!(!ws.resolve("src/missing.rs").unwrap().exists());
+    }
+
+    /// The bytes of a "png" for a paste test: the magic number is the whole of
+    /// what [`image_mime`] reads, and the padding lets a test craft one past
+    /// the cap without holding a real picture.
+    fn png(padding: usize) -> Vec<u8> {
+        let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        bytes.resize(8 + padding, 0);
+        bytes
+    }
+
+    /// The shapes a human's paste arrives in and the name each one keeps: a
+    /// workspace-relative name, an absolute path (inside the root or out of
+    /// it), a quoted name, and the escapes a terminal uses for a file's own
+    /// spaces — a backslash and a percent-encoding.
+    #[test]
+    fn a_paste_naming_an_image_is_read_as_one() {
+        let ws = temp_workspace("paste-shapes");
+        fs::create_dir_all(ws.root().join("shots")).unwrap();
+        fs::write(ws.root().join("shots/a.png"), png(0)).unwrap();
+        fs::write(ws.root().join("my shot.png"), png(4)).unwrap();
+
+        // A bare workspace-relative name.
+        let image = ws.pasted_image("shots/a.png").unwrap().unwrap();
+        assert_eq!(image.path, "shots/a.png");
+        assert_eq!(image.mime, "image/png");
+        assert_eq!(image.bytes, png(0));
+
+        // An absolute path inside the root keeps the relative name: the
+        // placeholder must mean the file in the workspace the model works in.
+        let inside = ws.root().join("shots/a.png").display().to_string();
+        let image = ws.pasted_image(&inside).unwrap().unwrap();
+        assert_eq!(image.path, "shots/a.png");
+
+        // An absolute path outside the root keeps the path as the human gave
+        // it: there is no workspace name for it.
+        let outside = std::env::temp_dir().join(format!("mush-paste-{}", std::process::id()));
+        fs::write(&outside, png(0)).unwrap();
+        let paste = outside.display().to_string();
+        let image = ws.pasted_image(&paste).unwrap().unwrap();
+        assert_eq!(image.path, paste);
+
+        // A `file://` URL from a browser: the scheme and the `localhost` host
+        // go, and `%20` becomes the space it encodes.
+        let url = format!("file://localhost{}/my%20shot.png", ws.root().display());
+        let image = ws.pasted_image(&url).unwrap().unwrap();
+        assert_eq!(image.path, "my shot.png");
+        let url = format!("file://{}/my%20shot.png", ws.root().display());
+        let image = ws.pasted_image(&url).unwrap().unwrap();
+        assert_eq!(image.path, "my shot.png");
+
+        // The two spellings a terminal uses for a dragged file's own space: a
+        // backslash, and the quotes a "copy as path" puts around it.
+        let image = ws.pasted_image("my\\ shot.png").unwrap().unwrap();
+        assert_eq!(image.path, "my shot.png");
+        let image = ws.pasted_image("\"my shot.png\"").unwrap().unwrap();
+        assert_eq!(
+            image.path, "my shot.png",
+            "a quoted paste is one name, spaces and all"
+        );
+        let image = ws.pasted_image("\"shots/a.png\"").unwrap().unwrap();
+        assert_eq!(image.path, "shots/a.png");
+        let image = ws.pasted_image("'shots/a.png'").unwrap().unwrap();
+        assert_eq!(image.path, "shots/a.png");
+
+        // A `%XX` sequence is decoded as the bytes it is, so a name that
+        // arrives UTF-8 percent-encoded is the character it spells.
+        fs::write(ws.root().join("café.png"), png(0)).unwrap();
+        let url = format!("file://{}/caf%C3%A9.png", ws.root().display());
+        let image = ws.pasted_image(&url).unwrap().unwrap();
+        assert_eq!(image.path, "café.png");
+
+        // An escape around a shell-special character, and the whitespace a
+        // paste may carry at its ends.
+        fs::write(ws.root().join("a(1).png"), png(0)).unwrap();
+        let image = ws.pasted_image("  a\\(1\\).png\n").unwrap().unwrap();
+        assert_eq!(image.path, "a(1).png");
+    }
+
+    /// A paste that is text, in every shape that is not an image's: prose, a
+    /// paragraph, a path that is not there, a directory, a file that is not a
+    /// picture, and a name that escapes the workspace. All of them are
+    /// `Ok(None)` — the paste is inserted as the words it is.
+    #[test]
+    fn a_paste_that_is_not_an_image_is_text() {
+        let ws = temp_workspace("paste-text");
+        fs::write(ws.root().join("notes.txt"), "hello").unwrap();
+        fs::create_dir_all(ws.root().join("shots")).unwrap();
+
+        for paste in [
+            "",
+            "   \n",
+            "hello world",
+            "what about the tests?",
+            "line one\nline two",
+            "notes.txt",
+            "missing.png",
+            "/no/such/file.png",
+            "../secret.png",
+            "shots",
+            // `~` is not expanded, and the workspace has no such file: a
+            // relative name that is not there is text like any other.
+            "~/shot.png",
+        ] {
+            assert!(
+                ws.pasted_image(paste).unwrap().is_none(),
+                "{paste:?} is text, not an image"
+            );
+        }
+    }
+
+    /// An image past the cap is an image that cannot ride, whichever way it
+    /// was named: the refusal is a refusal, not the text fallback, and it names
+    /// the one road a big picture has.
+    #[test]
+    fn an_image_past_the_cap_is_refused_with_a_downscale() {
+        let ws = temp_workspace("paste-big");
+        fs::write(ws.root().join("big.png"), png(IMAGE_FILE_CAP as usize)).unwrap();
+        let refused = ws.pasted_image("big.png").unwrap_err();
+        assert!(refused.contains("past the 2 MB cap"), "{refused}");
+        assert!(refused.contains("convert"), "the downscale: {refused}");
+    }
+
+    /// A clipboard image is written under `.mush/paste/` — which ignores
+    /// itself, so a screenshot cannot dirty the tree — and the bytes come back
+    /// whole: the file is what a later trim's placeholder names.
+    #[test]
+    fn a_clipboard_image_is_saved_under_mush_paste() {
+        let ws = temp_workspace("clipboard");
+        let image = ws.save_pasted_image(png(4)).unwrap();
+        assert_eq!(image.mime, "image/png");
+        assert!(image.path.starts_with(".mush/paste/pasted-"), "{image:?}");
+        assert!(image.path.ends_with(".png"), "{image:?}");
+        assert_eq!(
+            fs::read(ws.root().join(&image.path)).unwrap(),
+            image.bytes,
+            "the saved file is the bytes that were pasted"
+        );
+        assert_eq!(
+            fs::read_to_string(ws.root().join(".mush/.gitignore")).unwrap(),
+            "*\n",
+            "`.mush` ignores itself, so the paste is invisible to git"
+        );
+
+        // The jpeg extension is the spelling a browser reads, and the other
+        // three are the mime's own name.
+        let jpeg = ws
+            .save_pasted_image(vec![0xff, 0xd8, 0xff, 0xe0, 0x00])
+            .unwrap();
+        assert!(jpeg.path.ends_with(".jpg"), "{jpeg:?}");
+
+        // Words are not an image, and an image past the cap names the
+        // clipboard's own road: save it, downscale it, copy the smaller one.
+        let refused = ws.save_pasted_image(b"hello".to_vec()).unwrap_err();
+        assert!(refused.contains("not a png"), "{refused}");
+        let refused = ws
+            .save_pasted_image(png(IMAGE_FILE_CAP as usize))
+            .unwrap_err();
+        assert!(refused.contains("past the 2 MB cap"), "{refused}");
+        assert!(
+            refused.contains("wl-paste"),
+            "the clipboard road: {refused}"
+        );
+        assert!(refused.contains("convert"), "and the downscale: {refused}");
     }
 
     /// The whole file or a refusal: `edit_file` is the one caller left, and an
