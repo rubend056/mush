@@ -3392,9 +3392,57 @@ fn parked_message(state: &ActorState) -> Option<Waiting> {
 }
 
 /// The answer to a `wait` that was asked with nothing behind it — no children
-/// and no jobs, at the call or by the time the loop looked. One spelling, two
+/// and no jobs, and no other agent holding the machine. One spelling, three
 /// roads out of `wait_tool`.
 const NOTHING_TO_WAIT_FOR: &str = "nothing to wait for: no children and no jobs";
+
+/// Why a `wait` keeps waiting after everything the agent owns has finished:
+/// another agent holds the machine.
+///
+/// The root is exempt from the lock — it commands beside a held one and is
+/// *told* — so a sibling's hold is never something it has to wait for, and
+/// blocking the human's own hands on it would be the blindness finding H13 was
+/// about. Every other agent *is* blocked by it, and `wait` is the one call
+/// that can span the hold.
+fn machine_wait(actor: &Actor) -> Option<jobs::Held> {
+    if actor.id == AgentId::ROOT.0 {
+        return None;
+    }
+    let (agent, command, _) = actor.ctx.registry.held()?;
+    (agent != actor.id).then_some(jobs::Held { agent, command })
+}
+
+/// How a wait names the machine's holder, cut the way every refusal cuts the
+/// command it names ([`jobs::REFUSAL_COMMAND_COLUMNS`]): one spelling, so the
+/// sentence the model read from the refusal and the one it reads from the wait
+/// cannot disagree about who held it.
+fn machine_holding(held: &jobs::Held) -> String {
+    format!(
+        "#{}'s exclusive command ({})",
+        held.agent,
+        truncate(&held.command, jobs::REFUSAL_COMMAND_COLUMNS)
+    )
+}
+
+/// What a wait says when the machine it was waiting on comes free: the fact the
+/// model needs, because the call it was refused can now run.
+fn machine_free(held: &jobs::Held) -> String {
+    format!(
+        "the machine is free now — {} ended; the call that was refused for the lock can run",
+        machine_holding(held)
+    )
+}
+
+/// What a wait says when the hold outlasts it. The timeout is not a lost wait:
+/// the holder is named, and the two remaining moves are named with it, because
+/// nothing the model can call ends another agent's hold.
+fn machine_timed_out(held: &jobs::Held) -> String {
+    format!(
+        "wait timed out — {} still holds the machine; nothing you can call ends it — do work that \
+         needs no shell, or finish this run and say you are blocked",
+        machine_holding(held)
+    )
+}
 
 fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Result<String, String> {
     // `wait` has no arguments: "everything I own has finished" is the only
@@ -3403,7 +3451,12 @@ fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Resu
     // already dead). The release rule is the whole name.
     let owned =
         !state.children.is_empty() || !state.running_jobs.is_empty() || !state.done_jobs.is_empty();
-    if !owned {
+    // A subagent whose command met a sibling's lock has nothing of its own to
+    // wait for and no other way to span the hold — this is the wait the lock
+    // refusal points at, so "nothing to wait for" is only the truth once the
+    // machine is free too. The root is never a waiter (see [`machine_wait`]).
+    let mut holding = machine_wait(actor);
+    if !owned && holding.is_none() {
         return Ok(NOTHING_TO_WAIT_FOR.to_string());
     }
     let clock = actor.ctx.clock.as_ref();
@@ -3436,12 +3489,26 @@ fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Resu
             // over every result in one digest. Nothing in flight returns at
             // once, here.
             let answers = wait_digest(actor, state, false);
-            if answers.is_empty() {
-                return Ok(NOTHING_TO_WAIT_FOR.to_string());
+            if !answers.is_empty() {
+                return Ok(answers.join("\n"));
             }
-            return Ok(answers.join("\n"));
-        }
-        if clock.now() >= deadline {
+            // Nothing of its own is left. The one thing still to wait for is
+            // the machine — and when it lets go, the refused call can run.
+            match machine_wait(actor) {
+                Some(held) => {
+                    if clock.now() >= deadline {
+                        return Ok(machine_timed_out(&held));
+                    }
+                    holding = Some(held);
+                }
+                None => {
+                    return Ok(match holding.take() {
+                        Some(held) => machine_free(&held),
+                        None => NOTHING_TO_WAIT_FOR.to_string(),
+                    });
+                }
+            }
+        } else if clock.now() >= deadline {
             // What is known is returned, and what is not is named: a wait that
             // timed out is not a wait that lost the results. Only the *unread*
             // ones travel — a result the model has already read is the past,
@@ -8444,6 +8511,142 @@ mod tests {
             actor.ctx.registry.machine_free_for(9).is_err(),
             "the root ran beside the lock; it did not take or break it"
         );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The wait the refusal points at: a subagent holds nothing of its own and
+    /// a sibling holds the machine, so `wait` blocks — on the clock here, which
+    /// lets the lock go on its first slice — and then says which hold it waited
+    /// out, because the refused call can now run.
+    #[test]
+    fn a_wait_for_the_machine_returns_when_the_holder_lets_go() {
+        let clock = Arc::new(ReleasesOnSleep::new());
+        let (actor, _mailbox) = scripted_tools_actor(
+            "wait-machine",
+            Arc::new(ScriptedMachine::new()),
+            clock.clone(),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        actor.ctx.registry.take_machine(2, "cargo bench").unwrap();
+        clock.release_after(actor.ctx.registry.clone(), 2);
+
+        let answer = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
+        assert!(answer.contains("the machine is free now"), "{answer}");
+        assert!(answer.contains("#2's exclusive command"), "{answer}");
+        assert!(answer.contains("cargo bench"), "{answer}");
+        assert!(
+            answer.contains("the call that was refused for the lock can run"),
+            "the answer is the fact the model needs next: {answer}"
+        );
+        assert!(
+            actor.ctx.registry.held().is_none(),
+            "the clock's release is what freed it"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// And a hold that outlasts the wait: the timeout names the holder and the
+    /// two moves it has left, because nothing it can call ends another agent's
+    /// hold. The clock, not a real ten minutes, is what reaches the deadline.
+    #[test]
+    fn a_wait_that_no_holder_ends_times_out_and_names_it() {
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor(
+            "wait-machine-timeout",
+            Arc::new(ScriptedMachine::new()),
+            clock.clone(),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        actor.ctx.registry.take_machine(2, "cargo bench").unwrap();
+
+        let answer = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
+        assert!(answer.contains("wait timed out"), "{answer}");
+        assert!(answer.contains("#2's exclusive command"), "{answer}");
+        assert!(answer.contains("still holds the machine"), "{answer}");
+        assert!(
+            answer.contains("do work that needs no shell")
+                && answer.contains("finish this run and say you are blocked"),
+            "the two moves left are named: {answer}"
+        );
+        assert!(
+            clock.elapsed() >= Duration::from_secs(WAIT_TIMEOUT_SECS),
+            "the deadline ended it: {:?}",
+            clock.elapsed()
+        );
+        assert!(
+            actor.ctx.registry.machine_free_for(9).is_err(),
+            "the refusal took nothing from the holder"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The root works beside a held lock, so a sibling's hold is not a wait it
+    /// sits through: with nothing of its own behind the call, its `wait` still
+    /// answers at once. Blocking here would be finding H13's blindness again,
+    /// with the orchestrator parked on a child's benchmark instead of refused
+    /// by it.
+    #[test]
+    fn the_roots_wait_does_not_block_on_a_siblings_lock() {
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor(
+            "root-wait-machine",
+            Arc::new(ScriptedMachine::new()),
+            clock.clone(),
+        );
+        // The helper builds agent 7; only the root wears id 0, and the
+        // exemption is about that id.
+        let actor = Actor {
+            id: AgentId::ROOT.0,
+            ..actor
+        };
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        actor.ctx.registry.take_machine(2, "cargo bench").unwrap();
+
+        let answer = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
+        assert_eq!(answer, NOTHING_TO_WAIT_FOR);
+        assert_eq!(clock.elapsed(), Duration::ZERO, "no wait was spent");
+        assert!(
+            actor.ctx.registry.machine_free_for(9).is_err(),
+            "and the wait took nothing from the holder"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The machine is only what a wait has *left* once it has nothing of its
+    /// own: a finished child's result is handed over at once, even while a
+    /// sibling holds the lock, because the model asked for the result — not for
+    /// the machine.
+    #[test]
+    fn a_finished_result_is_handed_over_before_the_machine_is_waited_out() {
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor(
+            "wait-machine-result",
+            Arc::new(ScriptedMachine::new()),
+            clock.clone(),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let (child, _child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child);
+        state.completed.insert(
+            1,
+            Completion {
+                run: 1,
+                outcome: Outcome::Finished("wrote the parser".into()),
+            },
+        );
+        actor.ctx.registry.take_machine(2, "cargo bench").unwrap();
+
+        let answer = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
+        assert!(answer.contains("#1 done: wrote the parser"), "{answer}");
+        assert!(
+            !answer.contains("machine"),
+            "the lock is not the result the call asked for: {answer}"
+        );
+        assert_eq!(clock.elapsed(), Duration::ZERO, "no wait was spent");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 

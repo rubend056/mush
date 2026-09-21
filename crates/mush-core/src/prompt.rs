@@ -34,8 +34,10 @@ The machine is shared (CPU, ports, /tmp — a worktree isolates files, nothing e
 as #c2]\" and the command keeps its own process group. The tools' schemas say what starts one, and \
 what reads, waits on or stops it.\n\
 - exclusive=true owns the machine for timing- or port-sensitive work (a benchmark, a profiler, a fixed \
-port): a sibling's command queues behind it and is refused if the lock outlasts the wait (`#N holds the \
-machine`) — do not retry in a loop.";
+port): a sibling's command queues behind it and is refused if the lock outlasts that (`#N holds \
+the machine`) — and then `wait` blocks until the machine is free, and one more call runs. Never retry a \
+refused call in a loop. The root is exempt from a lock it did not take: it works beside the holder, told \
+when it did, and only its own exclusive claim is refused.";
 
 /// The delegation policy, for every agent that has the orchestration tools:
 /// the root and any subagent below `MAX_DEPTH`. It used to live only in the
@@ -208,9 +210,12 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::Wait,
-            "Block until everything you own has finished \u{2014} every child and every job \u{2014} then \
+            "Block until nothing you own is still running \u{2014} every child and every job \u{2014} then \
              answer with one digest: a result you have not read comes in full, an already-read one as a \
-             line. Returns at once when nothing is in flight.",
+             line. A subagent also waits while another agent holds the machine, so a command refused with \
+             `#N holds the machine` is retried here. Returns at once when there is nothing to wait for; \
+             gives up after 10 minutes and names what is still running; a message to you ends the wait \
+             early and says so.",
             json!({ "type": "object", "properties": {} }),
         ),
     ]
@@ -397,6 +402,46 @@ mod tests {
         let child = subagent_prompt("/tmp/ws", 1, true, false);
         assert!(child.contains("machine is shared"), "{child}");
         assert!(child.contains("exclusive=true"), "{child}");
+    }
+
+    /// The lock refusal has a road back that is not a retry — and it is the
+    /// machine block that owns it (`wait` spans the hold) and `wait`'s schema
+    /// that owns what the call covers. The two cannot disagree: the refusal in
+    /// `jobs.rs` sends the model to a wait that its own schema describes.
+    #[test]
+    fn the_prompts_say_how_a_refused_command_gets_retried() {
+        let root = system_prompt("/tmp/ws");
+        assert!(
+            root.contains("`wait` blocks until the machine is free"),
+            "the road back is the machine block's fact: {root}"
+        );
+        assert!(
+            root.contains("Never retry a refused call in a loop"),
+            "{root}"
+        );
+        // The exemption is said where the root reads the lock's rule, so the
+        // orchestrator does not sit out a lock it never took.
+        assert!(root.contains("The root is exempt"), "{root}");
+        assert!(
+            subagent_prompt("/tmp/ws", 1, true, true)
+                .contains("`wait` blocks until the machine is free"),
+            "a subagent is refused, so it is the one that needs the wait"
+        );
+
+        // And `wait`'s own schema says what the call now covers: the machine,
+        // its 10-minute cap, and the early release a message causes (the
+        // three facts audit item 2 found the context did not state).
+        let wait = tool_schemas()
+            .into_iter()
+            .find(|schema| schema["function"]["name"] == "wait")
+            .expect("wait has a schema");
+        let description = wait["function"]["description"].as_str().unwrap();
+        assert!(
+            description.contains("another agent holds the machine"),
+            "{description}"
+        );
+        assert!(description.contains("10 minutes"), "{description}");
+        assert!(description.contains("ends the wait early"), "{description}");
     }
 
     #[test]

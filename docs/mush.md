@@ -155,7 +155,7 @@ Six tools, in schema order — the shell does the listing, reading and writing, 
 | `spawn_agent` | `brief`, `title`, `base?` | a new agent with its own transcript; `title` names its row, and `base` forks a worktree on `mush/<id>` for it (§5.5) |
 | `status` | — | your children and your jobs in one listing: state, title or branch, age, command; a listing, not a delivery |
 | `control` | `id`, `action`, `text?` | stop or message one, naming it as `status` prints it (`2` for a child, `c2` for a job); a job can only be stopped |
-| `wait` | — | blocks until every child and every job you own has finished, then one digest; returns at once when nothing is in flight |
+| `wait` | — | blocks until every child and every job you own has finished, then one digest; returns at once when there is nothing to wait for; a subagent also waits out another agent's machine lock, gives up after 10 minutes, and a message to it ends the wait early |
 
 The `spawn_agent` row is omitted from a leaf agent's schema (`MAX_DEPTH`), which
 is what bounds the tree, so a root has six tools and a leaf five; the `status`,
@@ -676,11 +676,19 @@ Timing-sensitive work — benchmarks, profiling, `--test-threads=1`, anything th
 binds a fixed port — then runs without a sibling stealing cores or a port, and
 everyone else is queued behind it and then refused, by name, rather than
 silently interleaving: `#3 holds the machine with an exclusive command (…); this
-call queued and the lock was still held — do not retry in a loop; do other work
-and try once after it finishes (no tool can wait on another agent's job)`. A
-detached exclusive job holds the lock for its whole life. The lock coordinates
-*agents*; it cannot see the human's own build or an unrelated process, so it is
-“agents do not fight each other”, not isolation.
+call queued and the lock was still held. wait blocks until the machine is free —
+then make this call once more; do not retry it in a loop`. The refusal has a
+road back that is not a retry: a subagent's `wait` blocks while another agent
+holds the machine (the root's does not — see below), so the refused call can run
+once it is free. A detached exclusive job holds the lock for its whole life.
+The lock coordinates *agents*; it cannot see the human's own build or an
+unrelated process, so it is “agents do not fight each other”, not isolation. The
+root is exempt from a lock it did not take — it commands beside a held one and
+is *told* it did (`beside_note`) — because being blind for the duration of a
+child's benchmark cost the orchestrator its only lever (H13); its own
+*exclusive* claim is still refused, because two claims to own the machine is the
+one thing the lock prevents, and its `wait` does not block on the lock for the
+same reason.
 
 `[DECIDED]` The job budget is one machine-wide cap (`MAX_JOBS`), not a per-agent
 one — a per-agent cap would let eight agents hold eight builds each, which is the

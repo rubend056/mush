@@ -363,7 +363,7 @@ fn normalize_url(url: &str) -> String {
 }
 
 /// Tokens every request reserves for the tool schemas. Six schemas measure
-/// ~3.5 KB (~1.2 K tokens at the 3 bytes/token heuristic), so the reserve
+/// ~3.7 KB (~1.25 K tokens at the 3 bytes/token heuristic), so the reserve
 /// rounds up; `prompt` tests that they keep fitting.
 ///
 /// The schemas are context paid on *every* request, so this is a real cost.
@@ -372,9 +372,11 @@ fn normalize_url(url: &str) -> String {
 /// own call — arguments, defaults, and what comes back. The cut to six tools
 /// (the shell reads and writes better than a bespoke tool) took the payload
 /// from ~5.1 KB to ~3.5 KB; `edit_file`'s nested `edits` and `control`'s two
-/// verbs are most of what is left. The `schemas_fit_the_budget_reserve` test is
-/// what makes growth a decision rather than a silent drift.
-pub const SCHEMA_TOKENS: usize = 1_200;
+/// verbs are most of what is left, and `wait`'s contract grew when it took on
+/// the machine lock (the refusal's road back) and named its own cap. The
+/// `schemas_fit_the_budget_reserve` test is what makes growth a decision
+/// rather than a silent drift.
+pub const SCHEMA_TOKENS: usize = 1_300;
 
 impl Config {
     /// Built-in defaults with the `MUSH_*` environment applied.
@@ -1535,8 +1537,9 @@ mod tests {
         // reserve has moved with every contract change, test and comment
         // together: 1100 (delegation), 1220 (`cd`), 1700 (the machine's three
         // tools), 1750 (what the waits hand over, H15), 1700 when the dedup
-        // pass fit the same rules in fewer bytes, and 1200 after the cut to six
-        // tools took the shell's work off the schema list. See SCHEMA_TOKENS.
+        // pass fit the same rules in fewer bytes, 1200 after the cut to six
+        // tools took the shell's work off the schema list, and 1300 when `wait`
+        // took on the machine lock and named its cap. See SCHEMA_TOKENS.
         let small = Config::new("http://x:1", "m", None);
         assert_eq!(small.context_tokens, DEFAULT_CONTEXT_TOKENS);
         assert_eq!(small.history_budget(), 12_288);
@@ -1549,7 +1552,7 @@ mod tests {
             max_completion_tokens: false,
             ..small.clone()
         };
-        assert_eq!(big.history_budget(), 317_400);
+        assert_eq!(big.history_budget(), 317_100);
 
         // A tiny window shrinks the reserve to half the window instead of
         // ignoring it: history still gets 1536 bytes, and the cap — which has

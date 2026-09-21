@@ -575,13 +575,15 @@ impl Refused {
             // A sibling's lock. The one thing it must not read as is "try again
             // now": retrying the identical call is what mush's own loop guard
             // counts, and it killed two agents that only met a locked machine
-            // (finding H13). Who holds it, what they are running, and what to do
-            // instead — and no tool can wait on another agent's job, so `wait`
-            // must not be offered (audit row 5).
+            // (finding H13). Who holds it, what they are running, and the one
+            // call that spans the hold: `wait` blocks while another agent holds
+            // the machine (`agent::wait_tool`), so this refusal has a road back
+            // that is not a retry loop — the wait the first H13 fix could not
+            // offer, because there was none.
             Refused::Machine(held) => format!(
                 "#{} holds the machine with an exclusive command ({}); this call queued and the lock \
-                 was still held — do not retry in a loop; do other work and try once after it finishes \
-                 (no tool can wait on another agent's job)",
+                 was still held. wait blocks until the machine is free — then make this call once \
+                 more; do not retry it in a loop",
                 held.agent,
                 truncate(&held.command, REFUSAL_COMMAND_COLUMNS)
             ),
@@ -607,8 +609,9 @@ impl Refused {
         match self {
             Refused::Machine(held) if held.agent != asker => format!(
                 "#{} holds the machine with an exclusive command ({}); you are the root — your \
-                 exclusive call was refused at once, without queueing. Do other work and try once \
-                 after it finishes (no tool can wait on another agent's job)",
+                 exclusive call was refused at once, without queueing, and your other commands run \
+                 beside it. Do other work and make this claim once more after it ends; do not retry \
+                 it in a loop",
                 held.agent,
                 truncate(&held.command, REFUSAL_COMMAND_COLUMNS)
             ),
@@ -2103,14 +2106,15 @@ mod tests {
         // The words must not read as "try again now": a repeated identical
         // call is what the loop guard counts, and two agents died to a lock
         // refusal counted as a loop (finding H13). They name the holder, what
-        // it runs, and say not to retry — and they do not offer a wait tool,
-        // because no tool can wait on another agent's job (audit row 5).
+        // it runs, and the one wait that spans the hold — `wait` blocks while
+        // another agent holds the machine — so a refused call has a road back
+        // that is not a retry.
         let refusal = Refused::Machine(held).message(4);
         assert!(refusal.starts_with("#3 holds the machine"), "{refusal}");
         assert!(refusal.contains("cargo bench"), "{refusal}");
         assert!(refusal.contains("do not retry"), "{refusal}");
         assert!(
-            refusal.contains("no tool can wait on another agent"),
+            refusal.contains("wait blocks until the machine is free"),
             "{refusal}"
         );
         // Only the holder can release it: a release from anyone else is a no-op
