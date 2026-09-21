@@ -140,6 +140,45 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   the *row* is where the phase came from, and what a restored, actor-less child
   should read as is the same question H18/H22 were about. Settled by a live
   restore with a child saved mid-phase.
+- **H31** — the cut to six tools rested on a premise two facts broke: a machine
+  lock refuses *every* `run_command`, reads included, so an agent blinked at a
+  sibling's benchmark had no way to re-read a file; and a shell cannot carry an
+  image, so a screenshot on disk was invisible to a model that can see. §8.36.
+- **H32** — every `run_command` already runs with its cwd at the agent's *own*
+  workspace root (`machine.rs`'s `Shell::spawn` passes `current_dir(cmd.root)`,
+  and the root is `actor.ws.root()` — for an isolated agent, its worktree), and
+  `RULES` says so in as many words — yet models keep writing
+  `cd /home/rubend/p/mush && cargo fmt` (observed live by the human, in the root
+  and in children). In the root that is ~25 wasted tokens a call; in a child's
+  worktree it is worse than waste: the absolute path a `cd` names is usually the
+  *parent's* checkout (the brief, or the human's task text, names it), so the
+  work lands in the shared tree while the child's branch stays at its base —
+  the "merge git is asked to do is a lie" M2.6 exists to prevent. What is not
+  established: whether the `cd` is pure habit or a symptom. The sentence lives
+  in `RULES`; the *schema* — what a model reads when it decides how to phrase
+  the call — only says "Run a shell command in the workspace root" in the
+  description, and `command`'s own property is just "Sh command.", while
+  nothing anywhere says that a worktree child's cwd is its worktree or what a
+  `cd` out of it costs.
+- **H33** — models `sleep 50`/`sleep 55` to wait (observed live by the human),
+  and there is no case for it: `wait` blocks on the thing itself — its own
+  children and jobs (`in_flight`) and, for a subagent, a sibling's machine lock —
+  polling its mailbox every 50 ms, so a completion *ends* the wait and its result
+  travels in the same tool result; a completion also folds in on its own at the
+  next batch boundary and wakes a napping agent (`AgentMsg::CommandDone` →
+  `Fold::Run`), so an agent that simply ends its turn is told anyway. A sleeping
+  agent learns nothing a waiting one does not learn sooner: `wait_bounded` drains
+  signals mid-command but folds nothing, so a result that lands during a `sleep`
+  waits for the sleep to end. Sleeping has one cost `wait` does not: 5 identical
+  rounds stop the run as a loop (`count_round` exempts a repeated *wait* through
+  `state.waited`, and a repeated `sleep` is an identical batch with nothing
+  changed in between). What is not established: whether some road makes sleeping
+  *look* necessary — H30's `◐ running` child that `wait` answers "nothing of
+  yours is running" about is one, and a root whose `wait` deliberately does not
+  block on a lock it did not take is another. The 50-55 s shape is itself
+  evidence: it sits just under `CMD_DETACH_AFTER`, so the model is avoiding a
+  detach it knows about, which reads as a deliberate poll rather than an
+  accident.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
