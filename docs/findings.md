@@ -114,20 +114,21 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   dropped — if that were ever real rather than a flake, a workspace lock would
   outlive the process that held it. The next wave should freeze it with a clock
   or catch it, the same way §8.26 left its own full-suite flake.
-- **H29** — the sibling half of a `Machine` refusal may have no road into
-  `Registry::launch`. `impl Refused`'s own doc says the road is "the child that
-  queued for the lock, **and the launch handed a command while somebody else
-  held it**"; the queue half is `agent::machine_refusal` and is well covered,
-  but a launch refuses `Machine` only for an *exclusive* claim, and every
-  exclusive launch is preceded by a successful `take_machine` for that same
-  agent (`agent.rs`'s `run_command`), which no sibling can then hold. So the arm
-  `Refused::Machine(held) if held.agent == asker` (the owner's own second
-  exclusive job) is the only one `launch` can produce, and the comment names a
-  road that looks like none. Raised by §8.35's second read, which could not
-  prove it dead without a test driving a race it has not found: if it *is*
-  reachable, "this call queued and the lock was still held" is false there (a
-  refused launch never queued). Either way the fix is one comment or one
-  sentence, settled by a test that reaches `launch` with a sibling's hold.
+- **H29** — ✅ settled by the third read (the file-tool wave's audit, §8.36), and by
+  reading rather than a test, because there is no race to drive: no road leads
+  into `Registry::launch`'s `Machine` arm with a *sibling* holding the lock.
+  Every exclusive caller reaches `launch` through `run_command`'s `take_machine`,
+  which refuses any existing holder — the owner included — and only that actor
+  thread writes claims, so between the claim and the handover no other agent can
+  hold the machine; the arm's other half (`claimed.is_some()` for the owner)
+  needs a second exclusive job, which `take_machine` refuses before `launch` is
+  ever called. The doc comment now says so (the arm "is a guard, not a road"),
+  and `Refused::message`'s own doc no longer names a road that looks like none.
+  What the same read found *beside* it was real and is fixed with a test: a
+  sibling refusal that never queued (the exclusive claim losing the race between
+  the lock check and `take_machine`) borrowed the queued road's "this call
+  queued and the lock was still held" — `Refused::unqueued_message` now owns that
+  sentence, and the shared road back has one home (`Refused::lock_road`).
 - **H30** — a child seeded from a tree row whose phase is not an ending reads
   as `#2 ◐ running` while nothing about it is actually running. `seed_parent`
   sends `ChildBook { outcome: seeded_outcome(&node.phase, …) }`, which is `None`
@@ -154,31 +155,44 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   *parent's* checkout (the brief, or the human's task text, names it), so the
   work lands in the shared tree while the child's branch stays at its base —
   the "merge git is asked to do is a lie" M2.6 exists to prevent. What is not
-  established: whether the `cd` is pure habit or a symptom. The sentence lives
-  in `RULES`; the *schema* — what a model reads when it decides how to phrase
-  the call — only says "Run a shell command in the workspace root" in the
-  description, and `command`'s own property is just "Sh command.", while
-  nothing anywhere says that a worktree child's cwd is its worktree or what a
-  `cd` out of it costs.
+  established: whether the `cd` is pure habit or a symptom. Both prompts say
+  where a command runs — the root's `RULES` ("a command runs with its cwd at the
+  workspace root") and a child's "You work at … It is your workspace root" — so
+  what is *missing* is not the fact but the price of leaving it, and only a
+  worktree child can pay that price. ✅ (`5602acc`+'s wave, §8.36): the isolated
+  child's sentence says it ("every command already starts there — so never `cd`
+  to an absolute path a brief or a task names: that is another checkout, and
+  work done there lands outside your branch"), and the `subagent_prompt` doc no
+  longer claims a path it prints is "not offered as something to type". Nothing
+  was added to `RULES` (paid by everyone) or to `command`'s property (a second
+  home for the rule). Held in reserve if the habit survives the sentence, since
+  it lands *after* the damage: a note appended to that call's own result when a
+  leading `cd` names an absolute path outside the actor's workspace ("`mush:`
+  that cd left your workspace …"), zero schema bytes and read where the model
+  looks next.
 - **H33** — models `sleep 50`/`sleep 55` to wait (observed live by the human),
   and there is no case for it: `wait` blocks on the thing itself — its own
   children and jobs (`in_flight`) and, for a subagent, a sibling's machine lock —
-  polling its mailbox every 50 ms, so a completion *ends* the wait and its result
-  travels in the same tool result; a completion also folds in on its own at the
-  next batch boundary and wakes a napping agent (`AgentMsg::CommandDone` →
-  `Fold::Run`), so an agent that simply ends its turn is told anyway. A sleeping
-  agent learns nothing a waiting one does not learn sooner: `wait_bounded` drains
-  signals mid-command but folds nothing, so a result that lands during a `sleep`
-  waits for the sleep to end. Sleeping has one cost `wait` does not: 5 identical
-  rounds stop the run as a loop (`count_round` exempts a repeated *wait* through
-  `state.waited`, and a repeated `sleep` is an identical batch with nothing
-  changed in between). What is not established: whether some road makes sleeping
-  *look* necessary — H30's `◐ running` child that `wait` answers "nothing of
-  yours is running" about is one, and a root whose `wait` deliberately does not
-  block on a lock it did not take is another. The 50-55 s shape is itself
-  evidence: it sits just under `CMD_DETACH_AFTER`, so the model is avoiding a
-  detach it knows about, which reads as a deliberate poll rather than an
-  accident.
+  polling its mailbox every 50 ms, so the last of its own work finishing *ends*
+  the wait and the results travel in the same tool answer (an earlier completion
+  is folded in and waits with the rest); a completion also folds in on its own at
+  the next batch boundary and wakes a napping agent when it is news
+  (`AgentMsg::CommandDone` → `Fold::Run`; a stopped child or a stopped job is not
+  news, `is_news`), so an agent that simply ends its turn is told anyway. A
+  sleeping agent learns nothing a waiting one does not learn sooner:
+  `wait_bounded` drains signals mid-command but folds nothing, so a result that
+  lands during a `sleep` waits for the sleep to end. Sleeping has one cost `wait`
+  does not: 5 identical rounds stop the run as a loop (`count_round` exempts a
+  repeated *wait* through `state.waited`, and a repeated `sleep` is an identical
+  batch with nothing changed in between). ✅ (`5602acc`+'s wave, §8.36): `DELEGATION`'s
+  last bullet says "never `sleep` to wait: a finish arrives on its own, and a
+  repeated `sleep` is stopped as a loop" — the block belongs to exactly the
+  agents that have children or jobs, and `run_command`'s schema does not name
+  `wait` a third time. The 50-55 s shape still reads as a dodge of the
+  identical-batch guard (alternating the duration resets `count_round`
+  altogether), and one state still lets the screen and `wait` disagree — H30's
+  restored child — but a sleep cannot fix that one either: the row never
+  changes, and the honest moves there are `control message` or ending the turn.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -1054,9 +1068,9 @@ mismatches below are code facts.
 
 | # | what is false | disposition |
 |---|---|---|
-| 1 | `status` promises "each child's state and title or branch" while a running child prints only `#3 ◐ running` — no title (it lives in the UI tree) and no branch | ✅ `ff315d8` (`mush/87`): print the branch when mush can name it (an isolated child's is `mush/<id>`); no title source invented. The schema sentence is `prompt.rs` (H20) |
+| 1 | `status` promises "each child's state and title or branch" while a running child prints only `#3 ◐ running` — no title (it lives in the UI tree) and no branch | ✅ `ff315d8` (`mush/87`): print the branch when mush can name it (an isolated child's is `mush/<id>`); no title source invented. ✅ `1452477` (the file-tool wave, §8.36): the schema sentence followed the listing — "each child's state and branch … `✉` marks a result you have not read" — because the sentence must describe what the call answers; the other direction (putting the title in the listing) needs the title threaded into the actor's books and stays open |
 | 2 | `wait` "blocks until everything you own has finished" — it gives up at 600 s and any message ends it early, and the context says neither | ✅ `5eba64a` (§8.35): the schema owns the machine clause, the 10-minute cap and the early release, and `SCHEMA_TOKENS` moved for it (1200 → 1300) |
-| 3 | `edit_file`'s description offers a top-level `replace_all`; only `edits[].replace_all` is read, so the refusal tells the model to set the flag it just set | ✅ `ff315d8` (`mush/87`), fixed in code: the single-pair path honours a top-level `replace_all`. The schema's `properties` are still `prompt.rs` (H20) |
+| 3 | `edit_file`'s description offers a top-level `replace_all`; only `edits[].replace_all` is read, so the refusal tells the model to set the flag it just set | ✅ `ff315d8` (`mush/87`), fixed in code: the single-pair path honours a top-level `replace_all`. ✅ `1452477`: the second shape is gone (one `edits` list), and the description no longer offers the flag as the fix for a *missing* match — "A missing `old_string` is refused; a non-unique one is refused unless `replace_all` is set" |
 | 4 | **`exclusive=true` is not exclusive against its own owner.** `machine_free_for` answers `Ok` for the holder, `take_machine` then overwrites the record that names the exclusive job with a `(agent, command, None)`, and that call's release frees the machine while the job still runs — so a sibling's benchmark is admitted beside it. The promise ("Siblings are refused, not interleaved") silently stops holding | ✅ `ff315d8` (`mush/87`): `take_machine` refuses **any** existing holder (it is the record's only writer), and an exempt non-exclusive call leaves the record alone. The sentence for the holder's own second claim — deleted by `2c6b53f` as unreachable, which is what made the bug invisible — is back |
 | 5 | a job's result is not handed over "in full": `wait`'s digest carries the job's one-line report, whose output is `preview_tail`'s last 400 chars of a 2 KB window | ⬜ the human's file (`prompt.rs`): say what a job's result is |
 | 6 | "you are told when it finishes" — a job killed by the 4 h ceiling, the 8 MiB output limit or a stop is written to the transcript but does not wake its owner (`is_news()` is true only for `Exited`) | ✅ `ff315d8` (`mush/87`): a job mush *killed* is news; a `Stopped` outcome still does not restart a run |

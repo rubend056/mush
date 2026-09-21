@@ -224,7 +224,7 @@ server, if it lands, calls it directly rather than a buffer host. The twelve-to-
 `list_files`, `read_file` and `write_file` are gone, because the shell lists,
 reads and writes better than a bespoke tool could — so `edit_file` is the only
 file tool left and the signature above is history twice over. That cut was
-reversed in turn (`docs/findings.md` §8.36): a machine lock refuses *every*
+reversed in turn (`docs/findings.md` H31, §8.36): a machine lock refuses *every*
 `run_command`, reads included, and a shell cannot carry an image, so `read_file`,
 `write_file`, `list_files` and `search` came back beside `edit_file` — still one
 dispatcher, still no `ToolHost`.

@@ -1542,8 +1542,10 @@ mod tests {
         // together: 1100 (delegation), 1220 (`cd`), 1700 (the machine's three
         // tools), 1750 (what the waits hand over, H15), 1700 when the dedup
         // pass fit the same rules in fewer bytes, 1200 after the cut to six
-        // tools took the shell's work off the schema list, and 1300 when `wait`
-        // took on the machine lock and named its cap. See SCHEMA_TOKENS.
+        // tools took the shell's work off the schema list, 1300 when `wait`
+        // took on the machine lock and named its cap, and 1900 when the file
+        // tools came back and `edit_file` lost its second shape (H31). See
+        // `SCHEMA_TOKENS`.
         let small = Config::new("http://x:1", "m", None);
         assert_eq!(small.context_tokens, DEFAULT_CONTEXT_TOKENS);
         assert_eq!(small.history_budget(), 12_288);

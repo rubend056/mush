@@ -33,7 +33,7 @@ tests, builds).\n\
 const MACHINE: &str = "\
 The machine is shared (CPU, ports, /tmp — a worktree isolates files, nothing else):\n\
 - A long command detaches into a job instead of dying: run_command answers \"[still running — detached \
-as #c2]\" and the command keeps its own process group. The tools' schemas say what starts one, and \
+as #c2; …]\" and the command keeps its own process group. The tools' schemas say what starts one, and \
 what reads, waits on or stops it.\n\
 - exclusive=true owns the machine for timing- or port-sensitive work (a benchmark, a profiler, a fixed \
 port): a sibling's command queues behind it and is refused if the lock outlasts that (`#N holds \
@@ -62,7 +62,8 @@ split by what is independent, not by how long you think it takes.\n\
 a few big delegations over many small ones.\n\
 - Ending your turn while children still run is fine: they keep working and a finish wakes you with its \
 \"#N done: summary\". wait is optional — use it when you want the results now (its schema says what it \
-hands over).";
+hands over) — but never `sleep` to wait: a finish arrives on its own, and a repeated `sleep` is \
+stopped as a loop.";
 
 /// The opening a blank brief leaves: the child's first user message and the
 /// transcript's first line, so the model and the human read the same words.
@@ -86,19 +87,21 @@ pub fn system_prompt(root: &str) -> String {
 /// works in, and the rules. The task itself is not embedded here — it arrives
 /// as the first user message, mirroring the root's system+user shape.
 /// `root` is what a human reading a log would recognise as this agent's
-/// workspace. It is deliberately *not* offered as something to type: an
-/// isolated agent's worktree is its cwd already, and `edit_file` refuses an
-/// absolute path, so naming it in a command is a mistake the prompt should not
-/// invite.
-///
+/// workspace, and for an isolated one that is its own worktree. Naming it is
+/// not an invitation to type it: every command already starts there, and the
+/// one mistake the sentence exists to prevent is a `cd` to some *other*
+/// checkout — usually the parent's, named in the brief — which lands the work
+/// outside the branch this agent is here to fill (finding H32).
 /// `delegates` is whether this agent gets the orchestration tools (depth below
 /// `MAX_DEPTH`): the policy reads exactly when the tools are there (audit row
 /// 6).
 pub fn subagent_prompt(root: &str, depth: usize, isolated: bool, delegates: bool) -> String {
     let workspace = if isolated {
         format!(
-            "You work at `{root}`, a worktree of your own branch. It \
-             is your workspace root."
+            "You work at `{root}`, a worktree of your own branch. It is your workspace root, \
+             and every command already starts there — so never `cd` to an absolute path a brief \
+             or a task names: that is another checkout, and work done there lands outside your \
+             branch."
         )
     } else {
         format!("Your workspace is `{root}`.")
@@ -143,8 +146,8 @@ pub fn tool_schemas() -> Vec<Value> {
         tool(
             ToolName::EditFile,
             "Replace exact text in one file: every edit lands or none do, so prefer one call for \
-             multi-part changes. A missing or non-unique `old_string` is refused unless \
-             `replace_all` is set.",
+             multi-part changes. A missing `old_string` is refused; a non-unique one is refused \
+             unless `replace_all` is set.",
             json!({
                 "type": "object",
                 "properties": {
@@ -221,7 +224,8 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::RunCommand,
-            "Run a shell command in the workspace root. The result is capped to fit the context window; a capped result says so — rerun it narrower (rg, head, a smaller path) to see the rest.",
+            "Run a shell command in the workspace root. A result too big for the context window \
+             is cut, and the cut says how to read on.",
             json!({
                 "type": "object",
                 "properties": {
@@ -247,8 +251,9 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::Status,
-            "List your children and your jobs in one place: each child's state and title or branch, each \
-             job's state, age and command. A listing, not a delivery \u{2014} wait hands results over.",
+            "List your children and your jobs in one place: each child's state and branch, each \
+             job's state, age and command; \u{2709} marks a result you have not read. A listing, not a \
+             delivery \u{2014} wait hands results over.",
             json!({ "type": "object", "properties": {} }),
         ),
         tool(

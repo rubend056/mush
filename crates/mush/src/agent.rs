@@ -28,7 +28,7 @@ use mush_core::transcript::{
     needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
     COMPACT_REPLY_TOKENS,
 };
-use mush_core::workspace::truncate_for_model;
+use mush_core::workspace::{truncate_for_model, SEARCH_FILE_CAP};
 use mush_core::{prompt, tools, Config, Message, Workspace, CMD_TIMEOUT_SECS};
 
 use crate::app::{tokens_label, Compacting, ConfigHandle, ConversationId, Msg, WindowSource};
@@ -4006,11 +4006,15 @@ fn write_tool(actor: &Actor, args: &Value) -> Result<String, String> {
     let cap = result_cap(actor);
     if content.len() > cap {
         return Err(format!(
-            "content is {} bytes — over the {cap}-byte cap on one write; write the file once and \
-             extend it with edit_file",
+            "content is {} bytes — over the {cap}-byte cap on one write; write the first part, \
+             then extend it with edit_file",
             content.len()
         ));
     }
+    // Existence, not readability. A file this tool is about to replace is a
+    // file whether or not its bytes are text: answering "(new)" over a binary
+    // file — an image, a blob — records a history fact that is simply false.
+    let existed = actor.ws.exists(&path);
     let before = actor
         .ws
         .read_file(&path)
@@ -4025,19 +4029,16 @@ fn write_tool(actor: &Actor, args: &Value) -> Result<String, String> {
     } else {
         format!("{after} lines")
     };
-    Ok(match before {
-        Some(before) => format!("wrote {path} — {before} → {after}"),
-        None => format!("wrote {path} — {after} (new)"),
+    Ok(match (existed, before) {
+        (_, Some(before)) => format!("wrote {path} — {before} → {after}"),
+        (true, None) => format!("wrote {path} — {after} (replaced a file that is not text)"),
+        (false, None) => format!("wrote {path} — {after} (new)"),
     })
 }
 
 /// `list_files`: the workspace's files under a path, one per line.
 fn list_tool(actor: &Actor, args: &Value) -> Result<String, String> {
-    let rel = args
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let rel = tools::arg_path(args, "path")?;
     let (files, truncated) = actor.ws.list_files(&rel, LIST_LIMIT)?;
     if files.is_empty() {
         return Ok(format!("{}: no files", shown_path(&rel)));
@@ -4054,26 +4055,51 @@ fn list_tool(actor: &Actor, args: &Value) -> Result<String, String> {
 /// `search`: a literal string in the workspace's text files.
 fn search_tool(actor: &Actor, args: &Value) -> Result<String, String> {
     let pattern = tools::arg_string(args, "pattern")?;
-    let rel = args
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .to_string();
+    let rel = tools::arg_path(args, "path")?;
     let ignore_case = tools::arg_bool(args, "ignore_case", false)?;
-    let (matches, more) = actor.ws.search(&pattern, &rel, ignore_case, SEARCH_LIMIT)?;
-    if matches.is_empty() {
-        return Ok(format!(
-            "no match for `{pattern}` under {}",
-            shown_path(&rel)
+    let found = actor.ws.search(&pattern, &rel, ignore_case, SEARCH_LIMIT)?;
+    if found.matches.is_empty() {
+        // A miss that never opened every file is not a miss. "No match" is
+        // what a model reads as "it is not there", so the files the walk
+        // skipped are named along with the road to them.
+        let under = shown_path(&rel);
+        return Ok(if found.skipped == 0 {
+            format!("no match for `{pattern}` under {under}")
+        } else {
+            format!(
+                "no match for `{pattern}` under {under} — {}",
+                skipped_note(found.skipped)
+            )
+        });
+    }
+    let mut out = found.matches.join("\n");
+    let mut notes = Vec::new();
+    if found.more {
+        notes.push(format!(
+            "the first {SEARCH_LIMIT} matches — narrow the pattern or the path"
         ));
     }
-    let mut out = matches.join("\n");
-    if more {
-        out.push_str(&format!(
-            "\n[mush: the first {SEARCH_LIMIT} matches — narrow the pattern or the path]"
-        ));
+    if found.skipped > 0 {
+        notes.push(skipped_note(found.skipped));
+    }
+    if !notes.is_empty() {
+        out.push_str(&format!("\n[mush: {}]", notes.join("; ")));
     }
     Ok(truncate_for_model(out, result_cap(actor)))
+}
+
+/// The files a search did not open, as a sentence. One function for both
+/// numbers, because English will not take one: the note is not decoration — it
+/// is the difference between "the symbol is not here" and "I did not look".
+fn skipped_note(skipped: usize) -> String {
+    let cap = SEARCH_FILE_CAP / (1024 * 1024);
+    if skipped == 1 {
+        format!("1 file was skipped (binary or over {cap} MB); run_command (`rg`) reads it")
+    } else {
+        format!(
+            "{skipped} files were skipped (binary or over {cap} MB); run_command (`rg`) reads them"
+        )
+    }
 }
 
 /// How many files a listing names, and how many matches a search returns,
@@ -4168,14 +4194,19 @@ fn beside_note(text: String, held: Option<&jobs::Held>) -> String {
 /// The sentence a `Refused::Machine` gets in `run_command`, chosen by the road
 /// the asker actually took: the root is exempt from the lock and never queues
 /// (see [`Refused::root_message`]), a sibling queues for `LOCK_QUEUE` and is
-/// refused only when the lock outlasts it. Picking by the asker is the whole
-/// rule — the exempt caller is exactly the root — so no call site can pair a
-/// refusal with the other road's words.
-fn machine_refusal(actor: &Actor, held: jobs::Held) -> String {
+/// refused only when the lock outlasts it ([`Refused::message`]), and a sibling
+/// whose *exclusive* claim lost a race — another agent took the lock between
+/// the check and the claim — never sat in that queue at all
+/// ([`Refused::unqueued_message`]). Choosing by the road, not by the asker
+/// alone, is what keeps a refusal from claiming a queue that never happened.
+fn machine_refusal(actor: &Actor, held: jobs::Held, queued: bool) -> String {
+    let refused = Refused::Machine(held);
     if actor.id == AgentId::ROOT.0 {
-        Refused::Machine(held).root_message(actor.id)
+        refused.root_message(actor.id)
+    } else if queued {
+        refused.message(actor.id)
     } else {
-        Refused::Machine(held).message(actor.id)
+        refused.unqueued_message(actor.id)
     }
 }
 
@@ -4216,24 +4247,24 @@ fn run_command(
     if let Err(held) = registry.machine_free_for(actor.id) {
         if actor.id == AgentId::ROOT.0 {
             if exclusive {
-                return Err(ToolError::Refused(machine_refusal(actor, held)));
+                return Err(ToolError::Refused(machine_refusal(actor, held, false)));
             }
             beside = Some(held);
         } else if let Err(held) = wait_for_machine(actor, cancel) {
-            return Err(ToolError::Refused(machine_refusal(actor, held)));
+            return Err(ToolError::Refused(machine_refusal(actor, held, true)));
         }
     }
     if detach && !registry.has_room() {
         return Err(ToolError::Refused(Refused::Budget.message(actor.id)));
     }
     if exclusive {
-        // A refusal here is the holder's own second claim (or a sibling that
-        // took the lock between the check above and this line), so it goes
-        // through the same chooser: no sentence claims a queue the call did not
-        // sit in.
+        // A refusal here is the holder's own second claim, or a sibling that
+        // took the lock between the check above and this line — and the second
+        // of those never queued, so it must not read the queued road's words.
+        // Both go through the same chooser, with the road named.
         registry
             .take_machine(actor.id, command)
-            .map_err(|held| ToolError::Refused(machine_refusal(actor, held)))?;
+            .map_err(|held| ToolError::Refused(machine_refusal(actor, held, false)))?;
     }
     // `detach: true` asks for a job from the start: the model knows it started
     // a server, and waiting sixty seconds to be told so is not an answer. This
@@ -7183,9 +7214,117 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
-    /// `edit_file` has one shape, and `edits` is it. A model that sends the
-    /// list of one as a bare object is read as the list it meant; a model that
-    /// sends nothing is told the shape rather than left guessing.
+    /// A search that never opened a file must not answer "no match": a model
+    /// reads a miss as "the symbol is not there", and a file the walk skipped
+    /// is not evidence of absence. The count travels back with the matches,
+    /// singular and plural, and rides along even when something did match —
+    /// the list is then complete-looking but is not.
+    #[test]
+    fn a_search_says_which_files_it_never_opened() {
+        let (actor, _mailbox) = test_actor("search-skips");
+        // Past `SEARCH_FILE_CAP`, so the walk never opens it; and a binary one
+        // that contains the needle as plain bytes.
+        fs::write(
+            actor.ws.root().join("big.txt"),
+            format!("{}needle\n", "x".repeat(SEARCH_FILE_CAP as usize + 1)),
+        )
+        .unwrap();
+        fs::write(actor.ws.root().join("blob.bin"), b"needle\0\0").unwrap();
+        fs::write(actor.ws.root().join("small.txt"), "nothing here\n").unwrap();
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut search =
+            |args: Value| exec_tool(&actor, &mut state, ToolName::Search, &args, &cancel);
+
+        let miss = search(json!({ "pattern": "needle" })).unwrap();
+        assert!(
+            miss.contains("2 files were skipped (binary or over 2 MB)"),
+            "{miss}"
+        );
+        assert!(miss.contains("run_command"), "names the road: {miss}");
+
+        fs::remove_file(actor.ws.root().join("blob.bin")).unwrap();
+        let one = search(json!({ "pattern": "needle" })).unwrap();
+        assert!(
+            one.contains("1 file was skipped") && one.contains("reads it"),
+            "one file reads as one: {one}"
+        );
+
+        // A hit does not make the search complete: the skip still shows.
+        fs::write(actor.ws.root().join("small.txt"), "a needle\n").unwrap();
+        let hit = search(json!({ "pattern": "needle" })).unwrap();
+        assert!(hit.starts_with("small.txt:1: a needle"), "{hit}");
+        assert!(hit.contains("1 file was skipped"), "{hit}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// "Empty" and "not there" are different facts: a listing or a search of a
+    /// path that does not exist must not read as an empty one, and a `path`
+    /// that is not a string must be refused rather than read as the root.
+    #[test]
+    fn a_path_that_is_not_there_is_not_an_empty_one() {
+        let (actor, _mailbox) = test_actor("no-such-path");
+        fs::write(actor.ws.root().join("f.txt"), "x\n").unwrap();
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut call =
+            |tool: ToolName, args: Value| exec_tool(&actor, &mut state, tool, &args, &cancel);
+
+        let listed = call(ToolName::ListFiles, json!({ "path": "nope/deeper" })).unwrap_err();
+        assert!(listed.text().contains("no such path"), "{}", listed.text());
+        let searched = call(
+            ToolName::Search,
+            json!({ "pattern": "x", "path": "nope/deeper" }),
+        )
+        .unwrap_err();
+        assert!(
+            searched.text().contains("no such path"),
+            "{}",
+            searched.text()
+        );
+
+        // A number is not a path: silently listing the root would answer a
+        // question the model did not ask.
+        for tool in [ToolName::ListFiles, ToolName::Search] {
+            let wrong = call(tool, json!({ "pattern": "x", "path": 7 })).unwrap_err();
+            assert!(
+                wrong.text().contains("must be a string"),
+                "{}",
+                wrong.text()
+            );
+        }
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A file this tool is about to replace is a file whether or not its bytes
+    /// are text: `(new)` over a blob is a false history fact, and the over-cap
+    /// refusal must not tell the model to do the thing that just failed.
+    #[test]
+    fn write_file_does_not_call_a_replaced_blob_new() {
+        let (actor, _mailbox) = test_actor("write-blob");
+        fs::write(actor.ws.root().join("blob.bin"), b"\0\0\0\0").unwrap();
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut write =
+            |args: Value| exec_tool(&actor, &mut state, ToolName::WriteFile, &args, &cancel);
+
+        let replaced = write(json!({ "path": "blob.bin", "content": "text\n" })).unwrap();
+        assert_eq!(
+            replaced,
+            "wrote blob.bin — 1 line (replaced a file that is not text)"
+        );
+
+        let over =
+            write(json!({ "path": "big.txt", "content": "x".repeat(result_cap(&actor) + 1) }))
+                .unwrap_err();
+        assert!(
+            over.text().contains("write the first part"),
+            "the road is a split, not a repeat: {}",
+            over.text()
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     #[test]
     fn edit_file_demands_the_one_shape() {
         let (actor, _mailbox) = test_actor("edit-shape");
@@ -9204,6 +9343,49 @@ mod tests {
             "a wait on its own work says so: {answer}"
         );
         assert!(!answer.contains("still holds the machine"), "{answer}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A sibling's `exclusive` claim can lose a race: the lock check passes,
+    /// another agent takes the lock, and `take_machine` refuses — a call that
+    /// never sat in `LOCK_QUEUE`. Its sentence must not claim the queue it never
+    /// joined (the falsehood `root_message` was written to prevent for the
+    /// root), while keeping the road back a subagent really has: the holder is
+    /// another agent, so `wait` blocks on the machine.
+    #[test]
+    fn a_sibling_refusal_never_claims_a_queue_it_did_not_join() {
+        let (actor, _mailbox) = test_actor("unqueued-refusal");
+        let held = || jobs::Held {
+            agent: 2,
+            command: "cargo bench".to_string(),
+        };
+
+        let queued = machine_refusal(&actor, held(), true);
+        assert!(
+            queued.contains("this call queued and the lock was still held"),
+            "{queued}"
+        );
+
+        let unqueued = machine_refusal(&actor, held(), false);
+        assert!(
+            unqueued.contains("refused at once, without queueing"),
+            "{unqueued}"
+        );
+        assert!(!unqueued.contains("this call queued"), "{unqueued}");
+        assert!(
+            unqueued.contains("wait blocks until the machine is free")
+                && unqueued.contains("do not retry it in a loop"),
+            "the same road back, whichever way it was refused: {unqueued}"
+        );
+
+        // The holder's own second claim reads the same on either road: it never
+        // queues, and its sentence is about the lock it already owns.
+        let own = jobs::Held {
+            agent: actor.id,
+            command: "cargo bench".to_string(),
+        };
+        let mine = machine_refusal(&actor, own, false);
+        assert!(mine.starts_with("you hold the machine"), "{mine}");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 

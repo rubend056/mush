@@ -49,6 +49,18 @@ pub struct Workspace {
     root: PathBuf,
 }
 
+/// What a search found: the matching lines, whether the cap cut the list short,
+/// and how many files it never opened (binary, or past [`SEARCH_FILE_CAP`]).
+///
+/// The third field is the one that keeps "no match" honest. A model reads a
+/// miss as "the symbol does not exist", so a search that skipped a file must
+/// say so — the count is what the tool tells it instead of a false negative.
+pub struct Matches {
+    pub matches: Vec<String>,
+    pub more: bool,
+    pub skipped: usize,
+}
+
 impl Workspace {
     pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
         Ok(Self {
@@ -131,9 +143,11 @@ impl Workspace {
         if let Ok(meta) = fs::metadata(&path) {
             if meta.len() > READ_FILE_CAP {
                 return Err(format!(
-                    "{rel} is {} bytes — past the {READ_FILE_CAP}-byte cap on a whole read; use \
-                     run_command (`sed -n '1,200p' {rel}`) or read a smaller file",
-                    meta.len()
+                    "{rel} is {} bytes — past the {} MB cap on a whole read, and a window cannot \
+                     get past it (the file is opened whole first): read part of it with \
+                     run_command (`sed -n '1,200p' {rel}`)",
+                    meta.len(),
+                    READ_FILE_CAP / (1024 * 1024)
                 ));
             }
         }
@@ -178,7 +192,7 @@ impl Workspace {
         if part {
             out.push_str(&format!(
                 "\n[mush: line {offset} of {total} is longer than the {cap}-byte cap — shown in \
-                 part]"
+                 part; run_command (`sed -n '{offset}p' {rel}`) prints the rest]"
             ));
         } else if last < total {
             out.push_str(&format!(
@@ -199,6 +213,12 @@ impl Workspace {
     /// followed, so a listing cannot leave the workspace.
     pub fn list_files(&self, rel: &str, limit: usize) -> Result<(Vec<String>, bool), String> {
         let start = self.resolve(rel)?;
+        // "Empty" and "not there" are different facts, and a listing that
+        // answers `no files` for a path that does not exist is a lie the model
+        // cannot see through.
+        if fs::symlink_metadata(&start).is_err() {
+            return Err(format!("no such path: `{rel}`"));
+        }
         let mut found = Vec::new();
         self.walk(&start, &mut |path: &Path| {
             found.push(self.rel(path));
@@ -219,17 +239,24 @@ impl Workspace {
     /// the one case the shell cannot serve (a held machine lock). Binary files
     /// and files past [`SEARCH_FILE_CAP`] are skipped, and a matching line is
     /// cut to [`MATCH_LINE_CAP`] so one minified file cannot spend the result.
+    ///
+    /// What it skipped is counted and travels back with the matches
+    /// ([`Matches::skipped`]): a search that says "no match" while it never
+    /// opened a file is a false negative a model will act on.
     pub fn search(
         &self,
         pattern: &str,
         rel: &str,
         ignore_case: bool,
         limit: usize,
-    ) -> Result<(Vec<String>, bool), String> {
+    ) -> Result<Matches, String> {
         if pattern.is_empty() {
             return Err("`pattern` must not be empty".to_string());
         }
         let start = self.resolve(rel)?;
+        if fs::symlink_metadata(&start).is_err() {
+            return Err(format!("no such path: `{rel}`"));
+        }
         let needle = if ignore_case {
             pattern.to_lowercase()
         } else {
@@ -237,17 +264,22 @@ impl Workspace {
         };
         let mut matches = Vec::new();
         let mut more = false;
+        let mut skipped = 0usize;
         self.walk(&start, &mut |path: &Path| {
             let Ok(meta) = fs::metadata(path) else {
+                skipped += 1;
                 return true;
             };
             if meta.len() > SEARCH_FILE_CAP {
+                skipped += 1;
                 return true;
             }
             let Ok(bytes) = fs::read(path) else {
+                skipped += 1;
                 return true;
             };
             if bytes.contains(&0) {
+                skipped += 1;
                 return true;
             }
             let text = String::from_utf8_lossy(&bytes);
@@ -273,7 +305,11 @@ impl Workspace {
             }
             true
         });
-        Ok((matches, more))
+        Ok(Matches {
+            matches,
+            more,
+            skipped,
+        })
     }
 
     /// Walk every file under `start` — files only, [`SKIP_DIRS`] by name, no
@@ -327,6 +363,15 @@ impl Workspace {
                 stack.push(path);
             }
         }
+    }
+
+    /// Whether a workspace-relative path exists. The fact `write_file` answers
+    /// "(new)" from: a file it is about to replace is a file whatever its
+    /// bytes are, and "new" over a blob is a false history fact.
+    pub fn exists(&self, rel: &str) -> bool {
+        self.resolve(rel)
+            .map(|path| path.symlink_metadata().is_ok())
+            .unwrap_or(false)
     }
 
     /// Atomically create or replace a file, creating parent directories.

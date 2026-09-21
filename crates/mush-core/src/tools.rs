@@ -145,6 +145,19 @@ pub fn arg_bool(args: &Value, key: &str, default: bool) -> Result<bool, String> 
     }
 }
 
+/// An optional path argument, defaulted to the workspace root.
+///
+/// A value that is present but not a string is refused, like every other typed
+/// argument: `list_files({path: 7})` used to read as "the root" and answer a
+/// question nobody asked, which is exactly the trap [`arg_usize`] documents.
+pub fn arg_path(args: &Value, key: &str) -> Result<String, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(String::new()),
+        Some(Value::String(path)) => Ok(path.trim().to_string()),
+        Some(_) => Err(format!("`{key}` must be a string")),
+    }
+}
+
 /// One replacement in a batch. `replace_all` is what a rename needs: the same
 /// pattern several times in a file is otherwise refused as ambiguous.
 #[derive(Clone, Debug)]

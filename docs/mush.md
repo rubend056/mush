@@ -132,10 +132,12 @@ and never share state with the painter.
   `[mush: output truncated at {cap} bytes (the end is shown) — rerun it narrower to see the rest]`.
   A read has its own window and says so too (`[mush: lines 1–200 of 900 — read on
   with offset=201]`, or `— end of file`), which is a smaller question than the
-  cap and gets its own sentence. Two files are refused rather than windowed: a
-  read of a file past 32 MB, and a search inside a file past 2 MB — both name
-  `run_command` (`tail`, `sed -n`, `rg`) as the road. Edit operations always work
-  on the complete file.
+  cap and gets its own sentence. Two files are read differently from the rest: a
+  `read_file` of a file past 32 MB is refused (a window cannot get past it — the
+  file is opened whole first), and a `search` past 2 MB *in one file* skips it
+  and counts it, so a "no match" that skipped a file says how many and names
+  `run_command` (`sed -n`, `rg`) as the road. Edit operations always work on the
+  complete file.
 - **Bounded loops.** A run ends when the model stops calling tools; a *loop* —
   the same tool batch five rounds over with nothing changed in between — ends it
   early, and a 200-turn runaway guard withdraws the tools and asks for a
@@ -168,9 +170,7 @@ message, so the human's picture of a child starts where the child's does.
 
 ### Tools
 
-Ten tools, in schema order
-
-Ten tools, in schema order — four for the workspace's files, the shell, the
+Ten tools, in schema order — five for the workspace's files, the shell, the
 delegation tool, and three that manage what an agent started (§1). Each schema
 says *the call* and nothing else: its arguments, their defaults, what comes
 back. How to work is the prompt's, so a description that repeats a rule is a
@@ -185,7 +185,7 @@ second copy of it.
 | `search` | `pattern`, `path?`, `ignore_case?` | a literal string (no regex — a regex engine is a dependency, and `rg` is the shell's), one `path:line: text` per match; binary and huge files skipped |
 | `run_command` | `command`, `detach?`, `exclusive?` | a shell in the workspace root, own process group; 120 s timeout, output capped to fit the window, cancellable; `detach` starts a job at once, `exclusive` takes the machine lock (§5.6) |
 | `spawn_agent` | `brief`, `title`, `base?` | a new agent with its own transcript; `title` names its row, and `base` forks a worktree on `mush/<id>` for it (§5.5) |
-| `status` | — | your children and your jobs in one listing: state, title or branch, age, command; a listing, not a delivery |
+| `status` | — | your children and your jobs in one listing: each child's state and branch, each job's state, age and command; `✉` marks a result you have not read; a listing, not a delivery — `wait` hands results over |
 | `control` | `id`, `action`, `text?` | stop or message one, naming it as `status` prints it (`2` for a child, `c2` for a job); a job can only be stopped |
 | `wait` | — | blocks until every child and every job you own has finished, then one digest; returns at once when there is nothing to wait for; a subagent also waits out another agent's machine lock, gives up after 10 minutes, and a message to it ends the wait early |
 

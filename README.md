@@ -31,7 +31,7 @@ cargo build --release
 `Tab` moves between the **agents** tree and the **chat**. Type in the message
 box and press `Enter`. The agent works the workspace through ten tools —
 `edit_file`, `read_file`, `write_file`, `list_files`, `search`, `run_command`,
-`spawn_agent`, `status`, `control`, `wait`: four touch files (`edit_file`
+`spawn_agent`, `status`, `control`, `wait`: five touch files (`edit_file`
 replaces exact text, because an exact-and-unique match is a safety property
 `sed -i` does not have; `read_file` reads a line window and works even while
 another agent holds the machine), `run_command` is the shell for everything
@@ -96,7 +96,7 @@ follow, and what each call takes and hands back is stated once: in the tool's
 own schema, and as the design record in the *agent contract* of
 [docs/mush.md](docs/mush.md). Subagents can spawn their own, four levels deep
 (`MAX_DEPTH` 3, the root included); `spawn_agent` vanishes from a leaf's
-toolset, so a leaf keeps five, and a live-agent budget (`MAX_AGENTS` 16) caps
+toolset, so a leaf keeps nine, and a live-agent budget (`MAX_AGENTS` 16) caps
 total fan-out.
 
 The orchestrator may end its turn while children still run: mush shows

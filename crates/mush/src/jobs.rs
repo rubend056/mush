@@ -556,11 +556,12 @@ impl Refused {
     /// What the model is told, in words that let it act: who to wait for, or
     /// what to stop.
     ///
-    /// This is the road of a *sibling* refusal — the child that queued for the
-    /// lock, and the launch handed a command while somebody else held it — plus
+    /// This is the road of a *sibling* refusal: the child whose command queued
+    /// for `LOCK_QUEUE` and was refused when the lock outlasted the wait — plus
     /// the one refusal whose asker is the holder: its own second exclusive call,
     /// which `take_machine` refuses under the registry's lock and therefore
-    /// never queues.
+    /// never queues. A sibling refusal that never queued at all takes
+    /// [`Refused::unqueued_message`], which owns that road's words.
     pub fn message(&self, asker: u64) -> String {
         match self {
             // The asker already owns the machine: a second exclusive command
@@ -588,11 +589,10 @@ impl Refused {
             // second refusal.
             Refused::Machine(held) => format!(
                 "#{} holds the machine with an exclusive command ({}); this call queued and the lock \
-                 was still held. wait blocks until the machine is free — a result the wait hands over \
-                 first says the lock is still held, so wait again — and then make this call once \
-                 more; do not retry it in a loop",
+                 was still held. {}",
                 held.agent,
-                truncate(&held.command, REFUSAL_COMMAND_COLUMNS)
+                truncate(&held.command, REFUSAL_COMMAND_COLUMNS),
+                Self::lock_road()
             ),
             // The budget is machine-wide, so the two moves are not always the
             // asker's to make: a sibling's jobs are neither its to stop
@@ -630,6 +630,38 @@ impl Refused {
             ),
             other => other.message(asker),
         }
+    }
+
+    /// What a *sibling* is told when its exclusive claim met a lock that was
+    /// taken between the lock check and the claim: nobody queued this call, and
+    /// the queued road's "this call queued and the lock was still held" would
+    /// be a sentence about a wait that never happened (the same falsehood
+    /// `root_message` exists to prevent for the root).
+    ///
+    /// Its road back is the queued road's, because the asker is a subagent and
+    /// the holder is another agent — a subagent's `wait` blocks on the machine
+    /// however the refusal was reached. That shared half has one home
+    /// ([`Refused::lock_road`]); only the clause about the queue differs.
+    pub fn unqueued_message(&self, asker: u64) -> String {
+        match self {
+            Refused::Machine(held) if held.agent != asker => format!(
+                "#{} holds the machine with an exclusive command ({}); this call was refused at \
+                 once, without queueing — the lock was taken in between. {}",
+                held.agent,
+                truncate(&held.command, REFUSAL_COMMAND_COLUMNS),
+                Self::lock_road()
+            ),
+            other => other.message(asker),
+        }
+    }
+
+    /// The road back from a sibling's lock, word for word — the one part the two
+    /// sibling sentences share. It is a separate function so a wait's own
+    /// ordering cannot be spelled twice and drift.
+    fn lock_road() -> &'static str {
+        "wait blocks until the machine is free — a result the wait hands over first says the lock \
+         is still held, so wait again — and then make this call once more; do not retry it in a \
+         loop"
     }
 }
 
@@ -979,6 +1011,15 @@ impl Registry {
                     // `claimed.is_some()` even for the owner is a second job —
                     // the handover this arm exists for replaces the owner's own
                     // *foreground* claim (`None`), and nothing else.
+                    //
+                    // The sibling half is a guard, not a road (finding H29):
+                    // every exclusive caller reaches `launch` through
+                    // `run_command`'s `take_machine`, which refuses any existing
+                    // holder — the owner included — so between that claim and
+                    // this handover no other agent can hold the machine. It
+                    // stays because the alternative, on the day it *is*
+                    // reachable, is two agents each believing it owns the
+                    // machine.
                     Some((holder, held, claimed)) if *holder != owner || claimed.is_some() => {
                         Some(Refused::Machine(Held {
                             agent: *holder,
