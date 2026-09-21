@@ -3,7 +3,8 @@
 //! These are intentionally loose (`Option` everywhere, `#[serde(default)]`) so
 //! that the many "OpenAI-compatible" servers out there all round-trip cleanly.
 
-use serde::{Deserialize, Deserializer, Serialize};
+use serde::ser::SerializeStruct;
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
 
 fn function_type() -> String {
@@ -22,6 +23,16 @@ fn function_type() -> String {
 /// them: they are consecutive pieces of one answer, and a separator mush
 /// invented would put words in the model's mouth. A part that carries no text
 /// (an image URL, a refusal block) contributes nothing.
+///
+/// An `image_url` part is dropped, deliberately. This is the *reply* path and
+/// no OpenAI-compatible endpoint sends an image back today — a model answers
+/// in text — and a round trip cannot recover one properly even if it did: the
+/// data URL carries the mime and the bytes, but not the *path*, which is the
+/// one fact a placeholder must name (see [`placeholder`]). Decoding a
+/// pathless image back into [`Message::images`] would mean inventing a name
+/// for it, which is worse than keeping the text and no image. So nothing is
+/// re-decoded here, and a message that carried an image comes back as its
+/// text.
 fn content_from_wire<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
 where
     D: Deserializer<'de>,
@@ -117,34 +128,97 @@ pub struct ToolCall {
     pub function: FunctionCall,
 }
 
+/// One image carried inside a message: a screenshot, a chart, a rendered
+/// diagram the model is being asked to look at.
+///
+/// The bytes live in the message rather than behind a URL because mush has no
+/// server to put them on: a request is the only thing that leaves this
+/// machine, so anything the model is to look at has to travel in it. `path` is
+/// workspace-relative, the name the producer read it from — the one fact that
+/// makes the image findable again once the bytes are gone (a trimmed history
+/// or a saved session keeps the path and drops the bytes). `mime` is what the
+/// `data:` URL tells the endpoint the bytes are.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct Image {
+    pub path: String,
+    pub mime: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize)]
 pub struct Message {
     pub role: String,
-    /// Always a string on the way out — the spec's own request form, for both
-    /// assistant history and tool results. On the way in, either wire shape
-    /// (see `content_from_wire`).
-    #[serde(
-        default,
-        deserialize_with = "content_from_wire",
-        skip_serializing_if = "Option::is_none"
-    )]
+    /// The message's text. A plain JSON string on the way out — the spec's own
+    /// request form, for both assistant history and tool results — unless the
+    /// message carries images, when it is the content array
+    /// ([`Message::content_parts`]). On the way in, either wire shape (see
+    /// `content_from_wire`).
+    #[serde(default, deserialize_with = "content_from_wire")]
     pub content: Option<String>,
+    /// Images carried *in* this message, in the order they were attached.
+    /// They are not a wire field of their own: they become `image_url` parts
+    /// *inside* `content` on the way out ([`Message::content_parts`]), and a
+    /// part that carries no text contributes nothing on the way in
+    /// (`content_from_wire`). A message that came from an endpoint or from a
+    /// stored session therefore has none: a session never writes the bytes
+    /// ([`Message::drop_images`]), so there is nothing of them to read back.
+    #[serde(default, skip_deserializing)]
+    pub images: Vec<Image>,
     /// A thinking model's reasoning for this turn (`reasoning_content`). It is
     /// read from the reply and written straight
     /// back out with the turn: in thinking mode the endpoint refuses a request
     /// that replays an assistant turn without it, tool-call turns first among
     /// them. `None` for every model that keeps its thinking to itself, and
     /// skipped on the wire then, so no other endpoint ever sees the field.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub reasoning_content: Option<String>,
-    #[serde(
-        default,
-        deserialize_with = "tool_calls_from_wire",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, deserialize_with = "tool_calls_from_wire")]
     pub tool_calls: Option<Vec<ToolCall>>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(default)]
     pub tool_call_id: Option<String>,
+}
+
+/// `Message` is serialized by hand, and only because of `images`.
+///
+/// Every field comes out exactly as the derive used to write it — same names,
+/// same order, same "absent when `None`" rule — so a message with no images is
+/// byte for byte what this type has always sent, whatever the request around
+/// it. What the derive cannot express is that the *shape* of `content` depends
+/// on a sibling: the spec's plain string, or, when images ride along, its
+/// content array. `serialize_with` on a field receives only that field, and
+/// the alternative — a second `Message`-shaped type — is exactly what the
+/// request path must not grow: [`ChatRequest`] takes `&[Message]` and never
+/// learns there are images.
+impl Serialize for Message {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let fields = 1
+            + usize::from(self.content.is_some())
+            + usize::from(self.reasoning_content.is_some())
+            + usize::from(self.tool_calls.is_some())
+            + usize::from(self.tool_call_id.is_some());
+        let mut message = serializer.serialize_struct("Message", fields)?;
+        message.serialize_field("role", &self.role)?;
+        if self.images.is_empty() {
+            if let Some(content) = &self.content {
+                message.serialize_field("content", content)?;
+            }
+        } else {
+            message.serialize_field("content", &self.content_parts())?;
+        }
+        if let Some(reasoning) = &self.reasoning_content {
+            message.serialize_field("reasoning_content", reasoning)?;
+        }
+        if let Some(calls) = &self.tool_calls {
+            message.serialize_field("tool_calls", calls)?;
+        }
+        if let Some(id) = &self.tool_call_id {
+            message.serialize_field("tool_call_id", id)?;
+        }
+        message.end()
+    }
 }
 
 impl Message {
@@ -189,9 +263,63 @@ impl Message {
         self.tool_calls.as_deref().unwrap_or(&[])
     }
 
+    /// The `content` a message with images goes out as: the text first (omitted
+    /// when there is none), then one `image_url` part per image, each holding a
+    /// `data:` URL. This is the vision form of the spec, and the only way an
+    /// image rides in a request: [`ChatRequest`] knows nothing about it.
+    fn content_parts(&self) -> Vec<ContentPart<'_>> {
+        let mut parts = Vec::with_capacity(self.images.len() + 1);
+        if !self.text().is_empty() {
+            parts.push(ContentPart {
+                kind: "text",
+                text: Some(self.text()),
+                url: None,
+            });
+        }
+        parts.extend(self.images.iter().map(|image| ContentPart {
+            kind: "image_url",
+            text: None,
+            url: Some(data_url(image)),
+        }));
+        parts
+    }
+
+    /// Shed this message's image payloads, leaving one [`placeholder`] line
+    /// where each was, so the transcript still says an image was there and
+    /// which file it came from — and the model can read that file again if it
+    /// needs the image.
+    ///
+    /// The one way an image leaves a live message, called by both the trimmer
+    /// (before it drops a whole turn) and the session writer (before it writes
+    /// a file). Idempotent on purpose: a message that already lost its images
+    /// has nothing left to shed, so re-saving a loaded session cannot stack a
+    /// second placeholder on the first one's text.
+    pub fn drop_images(&mut self) {
+        if self.images.is_empty() {
+            return;
+        }
+        let dropped = self
+            .images
+            .drain(..)
+            .map(|image| placeholder(&image))
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.content = Some(match self.content.take() {
+            Some(text) if !text.is_empty() => format!("{text}\n{dropped}"),
+            _ => dropped,
+        });
+    }
+
     /// Rough size in bytes, used for history budgeting. The reasoning is
     /// counted: it goes back out with the turn, so it is part of what the
-    /// request costs.
+    /// request costs. An image is counted as its bytes plus the path and mime
+    /// that travel with it, because those are what have to fit the window.
+    /// Base64's 4/3 inflation is deliberately *not* modeled: the budget's
+    /// bytes-per-token heuristic was measured on text, and an image's real
+    /// token cost is a function of its pixels, not of its byte count or its
+    /// spelling — so this is an estimate that errs toward counting an image as
+    /// too big, which is the safe direction (an over-budget transcript sheds
+    /// image payloads before it drops turns).
     pub fn weight(&self) -> usize {
         let mut n = self.role.len() + self.text().len();
         if let Some(reasoning) = &self.reasoning_content {
@@ -200,8 +328,104 @@ impl Message {
         for call in self.tool_calls() {
             n += call.function.name.len() + call.function.arguments.len() + 16;
         }
+        for image in &self.images {
+            n += image.bytes.len() + image.path.len() + image.mime.len();
+        }
         n
     }
+}
+
+/// One part of the content array an image message goes out as: the text, or
+/// one image's `data:` URL.
+///
+/// Hand-written for the same kind of reason [`Message`]'s serializer is: the
+/// obvious carrier, `serde_json::Value`, holds the same object with its keys
+/// *sorted* (`preserve_order` is a cargo feature, and turning it on would pull
+/// a crate into the tree this repo's budget does not allow). `type` comes
+/// first here because that is the order the vision form documents, so a
+/// request read in a log looks like the shape an endpoint expects.
+struct ContentPart<'a> {
+    /// The part's `type`: `text` or `image_url`.
+    kind: &'static str,
+    text: Option<&'a str>,
+    url: Option<String>,
+}
+
+impl Serialize for ContentPart<'_> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let mut part = serializer.serialize_struct("content_part", 2)?;
+        part.serialize_field("type", self.kind)?;
+        if let Some(text) = self.text {
+            part.serialize_field("text", text)?;
+        }
+        if let Some(url) = &self.url {
+            // One key, so the sorted map cannot reorder anything that matters.
+            part.serialize_field("image_url", &serde_json::json!({"url": url}))?;
+        }
+        part.end()
+    }
+}
+
+/// The `data:` URL an image travels as: its mime, then its bytes in standard
+/// base64. An image is handed to the endpoint as text because that is the one
+/// image spelling OpenAI-compatible vision endpoints document.
+fn data_url(image: &Image) -> String {
+    format!("data:{};base64,{}", image.mime, base64_encode(&image.bytes))
+}
+
+/// The line a dropped image leaves behind, in the one spelling the trimmer and
+/// the session writer both use (never two). It names the path, because that is
+/// what makes the image reachable again — the model can read the file — and the
+/// format, so the line cannot be mistaken for something the model said.
+fn placeholder(image: &Image) -> String {
+    // `image/png` prints as `png`: the mime already leads with the fact that
+    // this is an image, and the sentence has room for one noun.
+    let format = image.mime.strip_prefix("image/").unwrap_or(&image.mime);
+    format!(
+        "[image: {} ({format}) — dropped to fit the context window; read it again if you need it]",
+        image.path
+    )
+}
+
+/// Standard base64 (RFC 4648 §4: `A–Z a–z 0–9 + /`, `=` padding, no line
+/// breaks) — the alphabet a `data:` URL carries an image in.
+///
+/// Hand-rolled rather than pulled in as a crate: this repo's dependency budget
+/// is a rule (§7), it has exactly one caller ([`data_url`]), and a dependency
+/// for thirty lines of table lookup is a tree of code to audit for one
+/// function. Private to this module because this is the only place bytes need
+/// to become text.
+fn base64_encode(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    let mut whole = bytes.chunks_exact(3);
+    for chunk in &mut whole {
+        // `chunks_exact(3)` hands over exactly three bytes, so these indices
+        // cannot leave the slice.
+        let n = u32::from(chunk[0]) << 16 | u32::from(chunk[1]) << 8 | u32::from(chunk[2]);
+        for shift in [18, 12, 6, 0] {
+            out.push(char::from(ALPHABET[(n >> shift) as usize & 0x3f]));
+        }
+    }
+    // One or two bytes are left: pad them out to three with zero bits, then
+    // write `=` for each character that has no input bit behind it.
+    let tail = whole.remainder();
+    if !tail.is_empty() {
+        let mut chunk = [0u8; 3];
+        chunk[..tail.len()].copy_from_slice(tail);
+        let n = u32::from(chunk[0]) << 16 | u32::from(chunk[1]) << 8 | u32::from(chunk[2]);
+        for (slot, shift) in [18, 12, 6, 0].into_iter().enumerate() {
+            if slot <= tail.len() {
+                out.push(char::from(ALPHABET[(n >> shift) as usize & 0x3f]));
+            } else {
+                out.push('=');
+            }
+        }
+    }
+    out
 }
 
 #[derive(Serialize)]
@@ -502,5 +726,197 @@ mod tests {
         let deepseek = serde_json::to_string(&request).unwrap();
         assert!(deepseek.contains("\"thinking\":{\"type\":\"enabled\"}"));
         assert!(deepseek.contains("\"reasoning_effort\":\"high\""));
+    }
+
+    /// The bytes mush puts in a `data:` URL, against the RFC 4648 §10 vectors
+    /// and the tails: one and two spare bytes (two `=` and one `=`), a byte
+    /// value from the high half of the alphabet (a PNG's magic number and a
+    /// JPEG's both start there), and the 57-byte boundary — nineteen whole
+    /// triples, where padding stops and starts again.
+    #[test]
+    fn base64_encodes_the_standard_vectors_and_pads_the_tail() {
+        assert_eq!(base64_encode(b""), "", "nothing encodes to nothing");
+        assert_eq!(base64_encode(b"f"), "Zg==", "one spare byte pads twice");
+        assert_eq!(base64_encode(b"fo"), "Zm8=", "two spare bytes pad once");
+        assert_eq!(
+            base64_encode(b"foo"),
+            "Zm9v",
+            "three bytes fill four characters"
+        );
+        assert_eq!(base64_encode(b"foob"), "Zm9vYg==");
+        assert_eq!(base64_encode(b"fooba"), "Zm9vYmE=");
+        assert_eq!(base64_encode(b"foobar"), "Zm9vYmFy");
+        assert_eq!(
+            base64_encode(&[0xFF, 0xFE]),
+            "//4=",
+            "`+` and `/` are reachable, and the last character is padding"
+        );
+
+        let fifty_seven = vec![0u8; 57];
+        assert_eq!(
+            base64_encode(&fifty_seven),
+            "AAAA".repeat(19),
+            "57 bytes is nineteen whole triples: no padding"
+        );
+        let fifty_eight = vec![0u8; 58];
+        assert_eq!(
+            base64_encode(&fifty_eight),
+            format!("{}AA==", "AAAA".repeat(19)),
+            "58 bytes crosses that boundary: one spare byte and two pads"
+        );
+    }
+
+    /// The wire form of an image: `content` stops being a string and becomes
+    /// the spec's content array — the text first, then one `image_url` part
+    /// holding the mime and the base64 of the bytes. This is the shape the
+    /// brief pins, and it is the whole reason `Message` has a hand-written
+    /// serializer.
+    #[test]
+    fn an_image_rides_inside_content_as_a_data_url() {
+        let mut message = Message::user("what is this?");
+        message.images.push(tiny_image());
+        assert_eq!(
+            serde_json::to_string(&message).unwrap(),
+            r#"{"role":"user","content":[{"type":"text","text":"what is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,//4="}}]}"#
+        );
+
+        // No text, no text part: a message that is only an image is still a
+        // legal request, and an empty `{"type":"text","text":""}` part
+        // would be a part the endpoint has to read for nothing.
+        let mut silent = Message::user("");
+        silent.images.push(tiny_image());
+        assert_eq!(
+            serde_json::to_string(&silent).unwrap(),
+            r#"{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,//4="}}]}"#
+        );
+        let mut wordless = Message::tool("call_0", "");
+        wordless.content = None;
+        wordless.images.push(tiny_image());
+        assert_eq!(
+            serde_json::to_string(&wordless).unwrap(),
+            r#"{"role":"tool","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,//4="}}],"tool_call_id":"call_0"}"#
+        );
+    }
+
+    /// The request struct carries `&[Message]` and nothing else: an image rides
+    /// in the content of a message, so the whole request body has no `images`
+    /// key, and `ChatRequest` never learns that images exist.
+    #[test]
+    fn a_request_carrying_an_image_has_no_images_field() {
+        let mut message = Message::user("what is this?");
+        message.images.push(tiny_image());
+        let messages = [message];
+        let request = ChatRequest {
+            model: "vision-model",
+            messages: &messages,
+            tools: &[],
+            tool_choice: "auto",
+            stream: false,
+            temperature: 0.2,
+            max_tokens: 100,
+            max_completion_tokens: None,
+            thinking: None,
+            reasoning_effort: None,
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(
+            wire.contains(
+                r#""content":[{"type":"text","text":"what is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,//4="}}]"#
+            ),
+            "the image is in the content of the request's message: {wire}"
+        );
+        assert!(
+            !wire.contains("\"images\""),
+            "the request struct must not learn about images: {wire}"
+        );
+    }
+
+    /// A round trip through the wire keeps the text and no image. No
+    /// OpenAI-compatible endpoint answers with an image part today, and one
+    /// that did could not be decoded back *properly*: the data URL carries the
+    /// mime and the bytes but not the path, which is the one fact a placeholder
+    /// must name — so the bytes are dropped rather than given an invented name.
+    #[test]
+    fn an_image_that_comes_back_from_the_wire_is_text_without_bytes() {
+        let mut message = Message::user("what is this?");
+        message.images.push(tiny_image());
+        let wire = serde_json::to_string(&message).unwrap();
+        let back: Message = serde_json::from_str(&wire).unwrap();
+        assert_eq!(back.text(), "what is this?", "the text survives the trip");
+        assert!(
+            back.images.is_empty(),
+            "the bytes have no path to come back to, so they do not come back"
+        );
+
+        // `images` is not a field any file or endpoint writes: one that is
+        // there by hand is ignored, so a session cannot resurrect payloads.
+        let hand_edited: Message = serde_json::from_str(
+            r#"{"role":"user","content":"hi","images":[{"path":"x","mime":"image/png","bytes":[1,2]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(hand_edited.text(), "hi");
+        assert!(hand_edited.images.is_empty(), "no `images` key is a field");
+    }
+
+    /// The placeholder is the one spelling both a trimmed history and a saved
+    /// session leave: it names the path (so the model can read the file again)
+    /// and the format, and dropping twice adds nothing — the idempotence a
+    /// second save of a loaded session depends on.
+    #[test]
+    fn a_dropped_image_leaves_a_placeholder_naming_its_path() {
+        let mut message = Message::user("what is this?");
+        message.images.push(tiny_image());
+        message.drop_images();
+        assert_eq!(
+            message.text(),
+            "what is this?\n[image: shots/tiny.png (png) — dropped to fit the context window; read it again if you need it]"
+        );
+        assert!(message.images.is_empty(), "the bytes are gone");
+
+        let once = message.text().to_string();
+        message.drop_images();
+        assert_eq!(
+            message.text(),
+            once,
+            "a second drop is a no-op, not a second placeholder"
+        );
+
+        // A message whose whole content was the image keeps the placeholder as
+        // the content, with no leading newline.
+        let mut silent = Message::user("");
+        silent.images.push(tiny_image());
+        silent.drop_images();
+        assert_eq!(
+            silent.text(),
+            "[image: shots/tiny.png (png) — dropped to fit the context window; read it again if you need it]"
+        );
+    }
+
+    /// The budget has to see the image: its bytes and the path and mime that
+    /// travel with them. A transcript that carried a screenshot is not the
+    /// size of its text, and a trimmer that thought it was would never shed the
+    /// payload that actually exceeds the window.
+    #[test]
+    fn an_image_weighs_its_bytes_and_the_path_and_mime_with_them() {
+        let mut message = Message::user("look");
+        let text_only = message.weight();
+        let image = tiny_image();
+        let extra = image.bytes.len() + image.path.len() + image.mime.len();
+        message.images.push(image);
+        assert_eq!(
+            message.weight(),
+            text_only + extra,
+            "bytes, path and mime are all part of what has to fit the window"
+        );
+    }
+
+    /// The one image the image tests are about: two bytes, a path and a mime,
+    /// small enough to read in an assertion.
+    fn tiny_image() -> Image {
+        Image {
+            path: "shots/tiny.png".into(),
+            mime: "image/png".into(),
+            bytes: vec![0xFF, 0xFE],
+        }
     }
 }
