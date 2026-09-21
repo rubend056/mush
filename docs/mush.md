@@ -24,8 +24,9 @@ edit the files.
   `read_file`, `write_file`, `list_files` and `search` touch files, `edit_file`
   replaces exact text, `run_command` is the shell, `spawn_agent` delegates, and
   `status`, `control` and `wait` manage what it started — a long command becomes
-  a **job** the agent can check on later, and `read_file` is the one road an
-  image can travel by.
+  a **job** the agent can check on later, and `read_file` is the one *tool* road
+  an image can travel by (the human has two of their own: a pasted path and
+  `Ctrl-V`, §3).
 - mush holds **no file state**: agents read and write files directly, and the
   UI shows their tree, their transcripts, and the git facts.
 - The agent's **system prompt is three short blocks** — the rules, the
@@ -214,13 +215,52 @@ before the request goes out.
 
 ### Images
 
-`read_file` is the one road an image travels by, and it carries it **inside the
-tool result**: a message with text and one `image_url` content part per image,
-each a `data:` URL of the bytes (`Message::content_parts`). Nothing else in the
-request path knows images exist — `ChatRequest` takes `&[Message]`, and a message
-with no images serializes byte for byte as it always did — because a second
-message type for the vision case is a second thing to keep in step with the
-first.
+`read_file` is the one *tool* road an image travels by, and it carries it
+**inside the tool result**: a message with text and one `image_url` content part
+per image, each a `data:` URL of the bytes (`Message::content_parts`). Nothing
+else in the request path knows images exist — `ChatRequest` takes `&[Message]`,
+and a message with no images serializes byte for byte as it always did — because
+a second message type for the vision case is a second thing to keep in step
+with the first.
+
+The **human has two roads of their own**, and both end in the same message:
+
+- **A bracketed paste that is nothing but an image's path** attaches the image
+  to the next message instead of inserting the path as text. That is what
+  drag-and-drop and a file manager's "copy file" put in a paste, and a paste
+  whose *only* word is the path is the human saying "this picture".
+  `Workspace::pasted_image` reads the shapes a terminal produces — a bare
+  workspace-relative name, an absolute path (inside the root or outside it; a
+  human may name what the model's tools may not, because they already have the
+  file), a quoted name, a `file://` URL with its `%20`s, and the `\ ` a terminal
+  uses to escape a dragged file's own space — and `Ok(None)` for anything else:
+  prose, a paragraph, a directory, a file that is not a picture. It is `Err`
+  only when the paste names an image that cannot ride, and then the path is
+  inserted as text anyway — a paste is never swallowed, and the words are the
+  road to a downscale.
+- **`Ctrl-V` in the chat pane** attaches the image on the system clipboard: a
+  screenshot with no file behind it yet. `clipboard.rs` reads it through the
+  programs a human would use (`wl-paste`, `xclip`, `pngpaste`), on a thread of
+  its own with a deadline, and `Workspace::save_pasted_image` writes the bytes
+  to `.mush/paste/pasted-<unix millis>.<png|jpg|gif|webp>` so the model can read
+  the picture again after a trim or a restart. `.mush/` git-ignores itself, so a
+  pasted screenshot cannot dirty the tree.
+
+Both roads end in `Message::user_with_images`: the human's own message, with
+the images riding in it exactly as they ride in a tool result. Two facts can
+refuse an attachment before it is sent — no model at all, and a model the
+provider table does not document as accepting image parts (`Ctrl-P` is the road
+named) — because an endpoint that may reject image parts must not cost a turn
+to discover it. These are the same facts that decide whether a `read_file`
+image travels; the human's gate is the one that keeps the path as text instead
+of dropping the gesture, and the clipboard's is the one that has no path to
+keep.
+
+A third fact is said but does not refuse: an image bigger than the whole
+`Config::history_budget()` attaches, with the line that says `trim_history`
+sheds image payloads *before* it drops a turn, so those bytes would never reach
+the model. The human decides what to send; what the model will actually see is
+not a thing to leave unsaid.
 
 Three facts decide whether an image travels:
 
@@ -314,7 +354,16 @@ elided, and the cursor is always on screen.
 | anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning |
 | picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End`, `PgUp`/`PgDn` move the list, `Enter` take the row, `Esc` close |
 | agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them, `←` the row's parent, `→` its first child, `Enter` show its transcript, `c` cancel that agent, `Esc` back to the root |
-| chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete`, `↑`/`↓`/`PgUp`/`PgDn` scroll, `Esc` clear · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/compact` `/notes` `/help` `/quit` |
+| chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `Ctrl-V` attach the image on the clipboard, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete` (Backspace on an empty box pops the newest attachment), `↑`/`↓`/`PgUp`/`PgDn` scroll, `Esc` clear the box and its attachments · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/compact` `/notes` `/help` `/quit` |
+
+A paste that is nothing but an image's path attaches the image; anything else
+is text and lands in the box as it always did (§3). The attachments are painted
+as dim `▣ path (format · size)` rows above the text — one per image, at most
+three, the third counting the rest when there are more, with the title saying
+how many — and they travel with the send: `Enter` on an empty box with an image
+attached is still a send, because the picture *is* the message. A send that
+does not land puts the words and the images back in the box, and `Esc` clears
+both.
 
 `Enter` in the agents pane moves the *view*, not the keyboard: the row's
 transcript replaces the chat pane while the keys stay in the tree, and `Tab` is
@@ -853,6 +902,7 @@ mush/
       app/keys.rs    key → `Intent`, as a pure table
       app/commands.rs  the slash commands: one parse, one table
       agent.rs       agent actors, model loop, tool dispatch, shell execution
+      clipboard.rs   the system clipboard's image: wl-paste / xclip / pngpaste
       jobs.rs        the job registry: detached commands, the machine lock
       model.rs       the `ModelClient` seam, the HTTP client, the transport retry
       machine.rs     the shell seam: spawn, poll, kill a command
