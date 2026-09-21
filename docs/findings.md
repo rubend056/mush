@@ -197,6 +197,42 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   altogether), and one state still lets the screen and `wait` disagree — H30's
   restored child — but a sleep cannot fix that one either: the row never
   changes, and the honest moves there are `control message` or ending the turn.
+- **H34** — `wait` is all-or-nothing, so a model that wants a *peek* at one
+  thing reaches for `sleep`: `wait({})` blocks on every child and job at once,
+  `status` is a listing (and polling it is what the loop guard stops), and
+  ending the turn is the only other road. Observed live: the human asked their
+  root agent why it slept, and it answered "no good reason — that was a slip.
+  `wait` is exactly the tool for it, and my instructions literally say never
+  `sleep` to wait … I reached for `sleep` because `wait` also blocks on the two
+  subagents that are still running, and I wanted a peek at the job only — but
+  `status` (which I'd already used) was the right peek, and if I wanted the
+  result I should have called `wait`. Worse: the run got stopped at 1m09s in the
+  process, so the test results are gone and I have to redo it." **✅ one real
+  defect under it, fixed with zero schema bytes** (`0291027`): a job's report
+  was delivered once and then **recapped bare** on every later `wait` —
+  `wait_digest`'s job loop fell back to `report.line` when `record_job`
+  answered `None` — and `done_jobs` is never pruned, so the recap grew with
+  every job the session had ever run, and a wait whose only book entry was a
+  read job answered it instead of `NOTHING_TO_WAIT_FOR`, contradicting
+  `unread_result`'s own rule ("a job's line … is a recap, not news"). Measured
+  on a fabricated state: one read job answered the identical unread-looking
+  line, three read jobs 151 B, 32 read jobs 1 942 B, where the truth is 58 B.
+  Now a job's line travels only when `record_job` says it is fresh, and the
+  entry guard counts only *unread* job reports — a read child still keeps its
+  marked digest and still holds the wait, because it can run again and
+  `every_delivery_road_hands_a_result_over_once` pins that. **⬜ the missing
+  shape**: "wait for that one thing while the rest runs" still has no call. One
+  optional target (`wait({ on: "c2" })`, named as `status` prints it; a bare
+  `wait` unchanged) was designed and measured by the wave's investigation:
+  +279 schema bytes, so `SCHEMA_TOKENS` 1 900 → 2 000, and it has to be argued
+  against H15 (one shape, one meaning, a wrong argument refused rather than
+  defaulted to "everything") before it lands. The alternative — a sentence in
+  `wait`'s schema saying a finish arrives on its own — only restates
+  `DELEGATION`, which every root already pays for. Not settled: whether the
+  stop that lost the run was the loop guard (which ends only the run, so the
+  job's `CommandDone` later wakes the actor) or a human Stop (which kills the
+  job), and whether the shape would measurably curb the reach for `sleep` —
+  only a live model can say that.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
