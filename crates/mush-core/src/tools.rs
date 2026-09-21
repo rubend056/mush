@@ -11,12 +11,17 @@ use serde_json::Value;
 
 /// Every tool the model may call.
 ///
-/// Six, deliberately. The shell lists, reads and writes a workspace better than
-/// a bespoke tool could — `rg`, `sed -n '1,200p'`, `ls -la`, `mkdir -p && cat >
-/// f` — so mush keeps only `edit_file`, whose exact-and-unique replacement is a
-/// safety property `sed -i` does not have, and `run_command`, the one controlled
-/// surface for everything else. `spawn_agent` is its own intent; `status`,
-/// `control` and `wait` manage what an agent started.
+/// Ten, and the count has a history worth keeping. Six of them were a *cut*:
+/// `list_files`, `read_file` and `write_file` went, because the shell lists,
+/// reads and writes a workspace better than a bespoke tool could — `rg`, `sed
+/// -n '1,200p'`, `ls -la`, `mkdir -p && cat > f` — and `edit_file` stayed for
+/// the one property the shell cannot offer, an exact-and-unique replacement.
+/// Two facts brought the three back, and neither is taste: the machine lock
+/// refuses *every* `run_command` while another agent holds it, so "the shell can
+/// do it" is false exactly when an agent is blind; and the shell cannot carry
+/// bytes that are not text, so an image had no road at all. `list_files`,
+/// `read_file` and `write_file` work beside a lock and take an image;
+/// `search` is the same argument for finding a line.
 ///
 /// The schemas, the dispatcher and the prompt all name tools through this enum,
 /// so adding a tool is a compile error in every place that has to know about it
@@ -24,6 +29,10 @@ use serde_json::Value;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ToolName {
     EditFile,
+    ReadFile,
+    WriteFile,
+    ListFiles,
+    Search,
     RunCommand,
     SpawnAgent,
     Status,
@@ -32,10 +41,15 @@ pub enum ToolName {
 }
 
 impl ToolName {
-    /// Every tool, in schema order. `prompt::tool_schemas` is tested against
-    /// this list, so a schema and its executor cannot drift.
-    pub const ALL: [ToolName; 6] = [
+    /// Every tool, in schema order: the file work first, then the shell, then
+    /// what an agent manages. `prompt::tool_schemas` is tested against this
+    /// list, so a schema and its executor cannot drift.
+    pub const ALL: [ToolName; 10] = [
         ToolName::EditFile,
+        ToolName::ReadFile,
+        ToolName::WriteFile,
+        ToolName::ListFiles,
+        ToolName::Search,
         ToolName::RunCommand,
         ToolName::SpawnAgent,
         ToolName::Status,
@@ -53,6 +67,10 @@ impl ToolName {
     pub const fn as_str(self) -> &'static str {
         match self {
             ToolName::EditFile => "edit_file",
+            ToolName::ReadFile => "read_file",
+            ToolName::WriteFile => "write_file",
+            ToolName::ListFiles => "list_files",
+            ToolName::Search => "search",
             ToolName::RunCommand => "run_command",
             ToolName::SpawnAgent => "spawn_agent",
             ToolName::Status => "status",
@@ -91,7 +109,7 @@ const fn names<const N: usize>(tools: [ToolName; N]) -> [&'static str; N] {
 
 /// Every tool name, in schema order. Derived from [`ToolName::ALL`], so the two
 /// cannot disagree.
-pub const TOOL_NAMES: [&str; 6] = names(ToolName::ALL);
+pub const TOOL_NAMES: [&str; 10] = names(ToolName::ALL);
 
 /// The names of the delegation-only tools.
 pub const ORCHESTRATION_TOOLS: [&str; 1] = names(ToolName::ORCHESTRATION);
@@ -104,6 +122,29 @@ pub fn arg_string(args: &Value, key: &str) -> Result<String, String> {
         .ok_or_else(|| format!("missing `{key}`"))
 }
 
+/// An optional whole number argument, defaulted. A value that is present but
+/// not a number is refused rather than defaulted: silently reading line 1 when
+/// the model asked for a window is how a read answers a question nobody asked.
+pub fn arg_usize(args: &Value, key: &str, default: usize) -> Result<usize, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value
+            .as_u64()
+            .map(|n| n as usize)
+            .ok_or_else(|| format!("`{key}` must be a whole number")),
+    }
+}
+
+/// An optional boolean argument, defaulted.
+pub fn arg_bool(args: &Value, key: &str, default: bool) -> Result<bool, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(default),
+        Some(value) => value
+            .as_bool()
+            .ok_or_else(|| format!("`{key}` must be true or false")),
+    }
+}
+
 /// One replacement in a batch. `replace_all` is what a rename needs: the same
 /// pattern several times in a file is otherwise refused as ambiguous.
 #[derive(Clone, Debug)]
@@ -111,6 +152,52 @@ pub struct Edit {
     pub old: String,
     pub new: String,
     pub replace_all: bool,
+}
+
+/// Read `edit_file`'s `edits`: the one shape. A list of `{old_string,
+/// new_string, replace_all?}` — and a lone entry given as an object is read as
+/// the list of one it means, because a model that sends the shape it meant
+/// should not spend a turn being told about brackets.
+///
+/// There used to be a second, top-level `old_string`/`new_string` pair beside
+/// this, and the two spellings drifted exactly as a fact with two homes does:
+/// the schema declared `replace_all` only inside the list, while the code
+/// honoured a top-level one (H20 item 3). One shape, one parse.
+pub fn edits_arg(args: &Value) -> Result<Vec<Edit>, String> {
+    let entries = match args.get("edits") {
+        None | Some(Value::Null) => {
+            return Err(
+                "missing `edits`: a list of {old_string, new_string, replace_all?}".to_string(),
+            )
+        }
+        Some(Value::Array(list)) => list.clone(),
+        Some(entry @ Value::Object(_)) => vec![entry.clone()],
+        Some(_) => return Err("`edits` must be a list of edits".to_string()),
+    };
+    if entries.is_empty() {
+        return Err("`edits` is empty — nothing to change".to_string());
+    }
+    let mut edits = Vec::with_capacity(entries.len());
+    for (index, entry) in entries.iter().enumerate() {
+        let at = |what: String| format!("edit {}: {what}", index + 1);
+        let old = entry
+            .get("old_string")
+            .and_then(Value::as_str)
+            .ok_or_else(|| at("missing `old_string`".to_string()))?;
+        let new = entry
+            .get("new_string")
+            .and_then(Value::as_str)
+            .ok_or_else(|| at("missing `new_string`".to_string()))?;
+        edits.push(Edit {
+            old: old.to_string(),
+            new: new.to_string(),
+            replace_all: entry
+                .get("replace_all")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        });
+    }
+    Ok(edits)
 }
 
 /// The text `edit_file` produces for a single pair: `current` with exactly one
@@ -259,8 +346,10 @@ mod tests {
     }
 
     /// One name per variant, and parsing it back gives the same tool: the
-    /// schema table and the dispatcher are two views of one list. Six names,
-    /// and the deleted ones no longer parse.
+    /// schema table and the dispatcher are two views of one list. Ten names —
+    /// the three the six-tool cut deleted are back (a held machine lock and
+    /// images are two roads the shell cannot serve), and `search` came with
+    /// them.
     #[test]
     fn every_tool_name_round_trips() {
         for tool in ToolName::ALL {
@@ -268,11 +357,14 @@ mod tests {
             assert_eq!(tool.to_string(), tool.as_str());
         }
         assert_eq!(ToolName::parse("edit_file"), Some(ToolName::EditFile));
+        assert_eq!(ToolName::parse("read_file"), Some(ToolName::ReadFile));
+        assert_eq!(ToolName::parse("write_file"), Some(ToolName::WriteFile));
+        assert_eq!(ToolName::parse("list_files"), Some(ToolName::ListFiles));
+        assert_eq!(ToolName::parse("search"), Some(ToolName::Search));
         assert_eq!(ToolName::parse("wait"), Some(ToolName::Wait));
         assert_eq!(ToolName::parse("nonsense"), None);
-        assert_eq!(ToolName::parse("list_files"), None);
-        assert_eq!(ToolName::parse("read_file"), None);
-        assert_eq!(ToolName::parse("write_file"), None);
+        assert_eq!(ToolName::parse("read"), None);
+        assert_eq!(ToolName::parse("grep"), None);
         assert_eq!(ToolName::parse("wait_agents"), None);
         assert_eq!(ToolName::parse("agent_status"), None);
         assert_eq!(ToolName::parse("agent_control"), None);
@@ -283,7 +375,7 @@ mod tests {
         // The names derive from the enum, in the same order.
         let all: Vec<&str> = ToolName::ALL.iter().map(|t| t.as_str()).collect();
         assert_eq!(all, TOOL_NAMES.to_vec());
-        assert_eq!(TOOL_NAMES.len(), 6);
+        assert_eq!(TOOL_NAMES.len(), 10);
         let orchestration: Vec<&str> = ToolName::ORCHESTRATION.iter().map(|t| t.as_str()).collect();
         assert_eq!(orchestration, ORCHESTRATION_TOOLS.to_vec());
         // Only delegation bounds a tree. `status`, `control` and `wait` are how

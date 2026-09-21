@@ -28,6 +28,7 @@ use mush_core::transcript::{
     needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
     COMPACT_REPLY_TOKENS,
 };
+use mush_core::workspace::truncate_for_model;
 use mush_core::{prompt, tools, Config, Message, Workspace, CMD_TIMEOUT_SECS};
 
 use crate::app::{tokens_label, Compacting, ConfigHandle, ConversationId, Msg, WindowSource};
@@ -3116,13 +3117,26 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
 /// is full — so nothing ran and nothing changed. `Failed` is the call itself
 /// going wrong. The loop guard reads the difference: a batch of refusals is not
 /// a model repeating itself, and counting it as one killed an integrator and a
-/// fixer whose only mistake was retrying a locked machine (finding H13).
+/// fixer whose only mistake was retrying a locked machine (finding H13). Both
+/// variants travel to the transcript as text under `error: `; only the guard
+/// cares which road produced it.
 #[derive(Debug)]
 enum ToolError {
     Refused(String),
     Failed(String),
 }
 
+impl ToolError {
+    /// The sentence the model reads, either way. Tests assert on it without
+    /// caring which road produced it; production code does care ([`count_round`]
+    /// reads the variant), so this lives only where it is read.
+    #[cfg(test)]
+    fn text(&self) -> &str {
+        match self {
+            ToolError::Refused(why) | ToolError::Failed(why) => why,
+        }
+    }
+}
 impl From<String> for ToolError {
     fn from(error: String) -> Self {
         ToolError::Failed(error)
@@ -3145,8 +3159,14 @@ fn exec_tool(
         ToolName::Status => status_tool(actor, state),
         ToolName::Control => control_tool(actor, state, args),
         ToolName::Wait => wait_tool(actor, state, cancel),
-        // `edit_file` is the one file operation the shell cannot do safely.
+        // The file tools take no lock and start no process: they are the roads
+        // that keep working while another agent holds the machine, and the only
+        // road that can carry an image (finding H31).
         ToolName::EditFile => edit_tool(&actor.ws, args),
+        ToolName::ReadFile => read_tool(actor, args),
+        ToolName::WriteFile => write_tool(actor, args),
+        ToolName::ListFiles => list_tool(actor, args),
+        ToolName::Search => search_tool(actor, args),
     };
     answer.map_err(ToolError::Failed)
 }
@@ -3964,49 +3984,133 @@ fn commit_worktree(
     git::commit_all(root, &commit_subject(id, brief, outcome))
 }
 
-/// `edit_file`: the one file operation no shell line gives safely. Exact and
-/// unique replacement means a wrong edit is impossible, and a batch lands
-/// all-or-nothing so the file cannot be left half-changed. Only the agent's own
-/// thread touches the file: the human's screen never holds a copy, so there is
-/// nothing to keep in sync.
+/// `read_file`: a window of a text file, or an image.
+///
+/// It takes no lock and runs no process, which is what makes it the read that
+/// survives another agent's exclusive command — and the reason it exists at all
+/// after the six-tool cut assumed the shell would always be there to read.
+fn read_tool(actor: &Actor, args: &Value) -> Result<String, String> {
+    let path = tools::arg_string(args, "path")?;
+    let offset = tools::arg_usize(args, "offset", 1)?;
+    let limit = tools::arg_usize(args, "limit", usize::MAX)?;
+    actor
+        .ws
+        .read_window(&path, offset, limit, result_cap(actor))
+}
+
+/// `write_file`: create or replace a whole file. The answer is one line naming
+/// what changed, because the model already knows what it wrote.
+fn write_tool(actor: &Actor, args: &Value) -> Result<String, String> {
+    let path = tools::arg_string(args, "path")?;
+    let content = tools::arg_string(args, "content")?;
+    let cap = result_cap(actor);
+    if content.len() > cap {
+        return Err(format!(
+            "content is {} bytes — over the {cap}-byte cap on one write; write the file once and \
+             extend it with edit_file",
+            content.len()
+        ));
+    }
+    let before = actor
+        .ws
+        .read_file(&path)
+        .ok()
+        .map(|text| text.lines().count());
+    actor.ws.write_file(&path, &content)?;
+    let after = content.lines().count();
+    // "1 lines" is the kind of small wrongness a model copies into its own
+    // summary, so the count is spelled.
+    let after = if after == 1 {
+        "1 line".to_string()
+    } else {
+        format!("{after} lines")
+    };
+    Ok(match before {
+        Some(before) => format!("wrote {path} — {before} → {after}"),
+        None => format!("wrote {path} — {after} (new)"),
+    })
+}
+
+/// `list_files`: the workspace's files under a path, one per line.
+fn list_tool(actor: &Actor, args: &Value) -> Result<String, String> {
+    let rel = args
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let (files, truncated) = actor.ws.list_files(&rel, LIST_LIMIT)?;
+    if files.is_empty() {
+        return Ok(format!("{}: no files", shown_path(&rel)));
+    }
+    let mut out = files.join("\n");
+    if truncated {
+        out.push_str(&format!(
+            "\n[mush: the first {LIST_LIMIT} files — list a narrower path to see the rest]"
+        ));
+    }
+    Ok(truncate_for_model(out, result_cap(actor)))
+}
+
+/// `search`: a literal string in the workspace's text files.
+fn search_tool(actor: &Actor, args: &Value) -> Result<String, String> {
+    let pattern = tools::arg_string(args, "pattern")?;
+    let rel = args
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let ignore_case = tools::arg_bool(args, "ignore_case", false)?;
+    let (matches, more) = actor.ws.search(&pattern, &rel, ignore_case, SEARCH_LIMIT)?;
+    if matches.is_empty() {
+        return Ok(format!(
+            "no match for `{pattern}` under {}",
+            shown_path(&rel)
+        ));
+    }
+    let mut out = matches.join("\n");
+    if more {
+        out.push_str(&format!(
+            "\n[mush: the first {SEARCH_LIMIT} matches — narrow the pattern or the path]"
+        ));
+    }
+    Ok(truncate_for_model(out, result_cap(actor)))
+}
+
+/// How many files a listing names, and how many matches a search returns,
+/// before saying there are more. Sized to a readable result rather than to the
+/// workspace: a listing is a map, not the territory.
+const LIST_LIMIT: usize = 400;
+const SEARCH_LIMIT: usize = 200;
+
+/// How a path argument is named back to the model: the workspace root has no
+/// relative spelling, and "under " with nothing after it reads as a bug.
+fn shown_path(rel: &str) -> String {
+    if rel.trim().is_empty() {
+        "the workspace root".to_string()
+    } else {
+        format!("`{rel}`")
+    }
+}
+
+/// `edit_file`: exact and unique replacement, all-or-nothing, one shape.
+///
+/// It is not a shell line for a reason: `sed -i` has no notion of "exactly
+/// once", so a wrong edit is impossible here and a missing or ambiguous match
+/// is a refusal the model can correct. The shape is `edits` only — a list, of
+/// which a lone edit is the list of one — see [`tools::edits_arg`] for why the
+/// second, top-level spelling is gone.
 fn edit_tool(ws: &Workspace, args: &Value) -> Result<String, String> {
     let rel = tools::arg_string(args, "path")?;
+    let edits = tools::edits_arg(args)?;
     let current = ws.read_file(&rel)?;
-    // A list of edits is applied to one read and written once: all of
-    // them land or none do, so a batch cannot leave the file
-    // half-changed, and the edits see each other's results in order.
-    let updated = match args.get("edits").and_then(Value::as_array) {
-        Some(list) if !list.is_empty() => {
-            let mut edits = Vec::with_capacity(list.len());
-            for entry in list {
-                edits.push(tools::Edit {
-                    old: tools::arg_string(entry, "old_string")?,
-                    new: tools::arg_string(entry, "new_string")?,
-                    replace_all: entry
-                        .get("replace_all")
-                        .and_then(Value::as_bool)
-                        .unwrap_or(false),
-                });
-            }
-            tools::edit_text_many(&current, &edits, &rel)?
-        }
-        _ => {
-            let old = tools::arg_string(args, "old_string")?;
-            let new = tools::arg_string(args, "new_string")?;
-            // The single pair honours a top-level `replace_all` exactly as a
-            // batch entry honours its own: the schema's sentence promises the
-            // flag changes every occurrence, and a refusal that said "set
-            // replace_all" to a model that had already set it sent the loop
-            // guard after an identical retry.
-            let replace_all = args
-                .get("replace_all")
-                .and_then(Value::as_bool)
-                .unwrap_or(false);
-            tools::edit_text(&current, &old, &new, replace_all, &rel)?
-        }
-    };
+    // One read, one write: every edit lands or none do, so the file cannot be
+    // left half-changed and the edits see each other's results in order.
+    let updated = tools::edit_text_many(&current, &edits, &rel)?;
     ws.write_file(&rel, &updated)?;
-    Ok(format!("edited {rel}"))
+    Ok(match edits.len() {
+        1 => format!("edited {rel}"),
+        count => format!("edited {rel} — {count} edits"),
+    })
 }
 
 /// How long a sibling's command queues for a machine lock held by another
@@ -4254,21 +4358,22 @@ fn detached_line(id: JobId) -> String {
 }
 
 /// Hard ceiling on what one command may write to its scratch files. The model
-/// only ever sees the first `command_cap` bytes, so a command that gets here is
+/// only ever sees the first `result_cap` bytes, so a command that gets here is
 /// not communicating, it is running away — and it must not fill the disk. The
 /// size is checked every few milliseconds (see `wait_bounded`), so a fast writer
 /// can overshoot by a few tens of MB before the kill lands. It lives in
 /// `crate::jobs` beside the other rule a job and a tool call share.
 use crate::jobs::CMD_OUTPUT_LIMIT;
 
-/// The bytes one command result may carry.
+/// The bytes one tool result may carry.
 ///
-/// The command is now the only road by which a big text result reaches the
-/// model — the file tools' own caps went with them — so the result is bounded by
-/// the context budget, not by a fixed number: a quarter of what the history can
-/// hold, capped at the old read ceiling (see `Config::cmd_cap`). A result that
-/// hits it says so and says what to do (`truncate_for_model`).
-fn command_cap(actor: &Actor) -> usize {
+/// Every big-text road uses it — a command's output, a file read, a listing, a
+/// search — so a result is bounded by the context budget rather than by a fixed
+/// number: a quarter of what the history can hold, capped at `CMD_CAP` (see
+/// `Config::cmd_cap`). A result that hits it says so and says what to do
+/// (`truncate_for_model`), and the file tools' windows are cut to it as they
+/// are built, so the sentence names the way on rather than a lost tail.
+fn result_cap(actor: &Actor) -> usize {
     actor
         .ctx
         .cfg
@@ -4337,7 +4442,7 @@ fn run_shell(
             // its refusal kills the process group, and the launch owns the only
             // handle to the output — a report built after that would have
             // nothing to show (audit row 2).
-            let (stdout, stderr) = running.output(command_cap(actor));
+            let (stdout, stderr) = running.output(result_cap(actor));
             match detach_now(
                 actor,
                 registry,
@@ -4364,7 +4469,7 @@ fn run_shell(
     // finding S4 is about, or the registry's half of a `Stop` — must not be
     // reported as the command's own exit: `-1` is a signal nobody asked about.
     let ended = ending(ended, running.stopped());
-    let cap = command_cap(actor);
+    let cap = result_cap(actor);
     let (stdout, stderr) = running.output(cap);
     let mut report = command_report(&stdout, &stderr);
     report.push_str(&end_note(
@@ -6699,7 +6804,7 @@ mod tests {
 
         assert!(report.contains("output passed"), "{report}");
         assert_eq!(machine.kills(), 1, "the runaway writer was killed");
-        let cap = command_cap(&actor);
+        let cap = result_cap(&actor);
         assert!(report.len() < cap * 2, "report grew: {}", report.len());
         assert!(
             clock.elapsed() < Duration::from_secs(30),
@@ -6735,7 +6840,7 @@ mod tests {
             report.contains("output truncated at"),
             "cap was not marked: {report}"
         );
-        let cap = command_cap(&actor);
+        let cap = result_cap(&actor);
         assert!(
             report.len() < cap * 2,
             "report grew past the cap: {}",
@@ -6745,15 +6850,17 @@ mod tests {
     }
 
     /// A standalone actor over a scratch workspace, for exercising the mailbox
-    /// plumbing with no model, no UI, and no threads.    /// Several edits to the *same* file in one batch must all land: every file
-    /// tool re-reads from disk, so the second edit sees the first one's result
-    /// instead of clobbering it with a stale copy.
+    /// plumbing with no model, no UI, and no threads.
+    ///
+    /// Several edits to the *same* file, one call after another, must all land:
+    /// every file tool re-reads from disk, so the second edit sees the first
+    /// one's result instead of clobbering it with a stale copy.
     #[test]
     fn several_edits_to_one_file_in_a_batch_all_land() {
         let (actor, _mailbox) = test_actor("multi-edit");
         fs::write(actor.ws.root().join("f.rs"), "let a = 1;\nlet b = 2;\n").unwrap();
 
-        // Exactly what a batch of three `edit_file` calls does, in order.
+        // Three calls, each the one-element list the schema asks for.
         for (old, new) in [
             ("let a = 1;", "let a = 10;"),
             ("let b = 2;", "let b = 20;"),
@@ -6761,7 +6868,7 @@ mod tests {
         ] {
             edit_tool(
                 &actor.ws,
-                &json!({ "path": "f.rs", "old_string": old, "new_string": new }),
+                &json!({ "path": "f.rs", "edits": [{ "old_string": old, "new_string": new }] }),
             )
             .unwrap();
         }
@@ -6782,7 +6889,7 @@ mod tests {
 
         let error = edit_tool(
             &actor.ws,
-            &json!({ "path": "f.rs", "old_string": "x = ", "new_string": "y = " }),
+            &json!({ "path": "f.rs", "edits": [{ "old_string": "x = ", "new_string": "y = " }] }),
         )
         .unwrap_err();
         assert!(error.contains("2 times"), "{error}");
@@ -6790,19 +6897,23 @@ mod tests {
     }
 
     /// The schema's sentence promises that `replace_all` changes every
-    /// occurrence, and the ambiguity refusal tells the model to set it. A
-    /// *top-level* flag must therefore reach the single-pair path too: it used
-    /// to be dropped on the floor (`tools::edit_text` hardcoded `false`), so
-    /// the model that took the refusal's advice re-sent the identical call and
-    /// the loop guard counted it.
+    /// occurrence, and the ambiguity refusal tells the model to set it. The flag
+    /// lives on every entry of `edits` — one shape — so the call that took the
+    /// refusal's advice changes every occurrence.
+    ///
+    /// It used to live on a second, top-level spelling too, and the two drifted
+    /// exactly as a fact with two homes does: the schema declared it inside
+    /// `edits` while the code honoured a top-level one, so a model that set the
+    /// flag the schema named was refused anyway (H20 item 3). The second
+    /// spelling is gone with the `edit_file` simplification.
     #[test]
-    fn a_top_level_replace_all_changes_every_occurrence() {
+    fn replace_all_changes_every_occurrence_in_the_one_shape() {
         let (actor, _mailbox) = test_actor("replace-all");
         fs::write(actor.ws.root().join("f.rs"), "old();\nold(arg);\n").unwrap();
 
         let refused = edit_tool(
             &actor.ws,
-            &json!({ "path": "f.rs", "old_string": "old", "new_string": "new" }),
+            &json!({ "path": "f.rs", "edits": [{ "old_string": "old", "new_string": "new" }] }),
         )
         .unwrap_err();
         assert!(
@@ -6814,9 +6925,7 @@ mod tests {
             &actor.ws,
             &json!({
                 "path": "f.rs",
-                "old_string": "old",
-                "new_string": "new",
-                "replace_all": true
+                "edits": [{ "old_string": "old", "new_string": "new", "replace_all": true }]
             }),
         )
         .unwrap();
@@ -6824,6 +6933,295 @@ mod tests {
         assert_eq!(
             fs::read_to_string(actor.ws.root().join("f.rs")).unwrap(),
             "new();\nnew(arg);\n"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The regression the file tools exist for: a sibling holds the machine and
+    /// every command is refused — while reading, listing, searching and writing
+    /// keep working. Before these tools came back, an agent in this state could
+    /// not read a file, list a directory, or create one: it could only wait.
+    #[test]
+    fn the_file_tools_work_while_the_machine_is_held() {
+        let (actor, _mailbox) = test_actor("beside-the-lock");
+        fs::create_dir_all(actor.ws.root().join("src")).unwrap();
+        fs::write(actor.ws.root().join("src/lib.rs"), "fn held() {}\n").unwrap();
+        actor.ctx.registry.take_machine(2, "cargo bench").unwrap();
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut call =
+            |tool: ToolName, args: Value| exec_tool(&actor, &mut state, tool, &args, &cancel);
+
+        let read = call(ToolName::ReadFile, json!({ "path": "src/lib.rs" })).unwrap();
+        assert!(read.contains("fn held()"), "{read}");
+        let listed = call(ToolName::ListFiles, json!({})).unwrap();
+        assert!(listed.contains("src/lib.rs"), "{listed}");
+        let found = call(ToolName::Search, json!({ "pattern": "held" })).unwrap();
+        assert!(found.contains("src/lib.rs:1"), "{found}");
+        let wrote = call(
+            ToolName::WriteFile,
+            json!({ "path": "src/new.rs", "content": "fn fresh() {}\n" }),
+        )
+        .unwrap();
+        assert_eq!(wrote, "wrote src/new.rs — 1 line (new)");
+        let edited = call(
+            ToolName::EditFile,
+            json!({ "path": "src/new.rs", "edits": [{ "old_string": "fresh", "new_string": "edited" }] }),
+        )
+        .unwrap();
+        assert_eq!(edited, "edited src/new.rs");
+
+        // And the contrast: the shell is what the lock refuses.
+        let refused =
+            call(ToolName::RunCommand, json!({ "command": "cat src/lib.rs" })).unwrap_err();
+        assert!(
+            refused.text().contains("holds the machine"),
+            "{}",
+            refused.text()
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A read is a window, and the window says what it left without numbering
+    /// the lines: a number beside the text is a string a model pastes into
+    /// `edit_file`, where it cannot match.
+    #[test]
+    fn a_read_is_a_window_that_says_what_it_left() {
+        let (actor, _mailbox) = test_actor("read-window");
+        let body: String = (1..=9).map(|n| format!("line {n}\n")).collect();
+        fs::write(actor.ws.root().join("f.txt"), body).unwrap();
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let first = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::ReadFile,
+            &json!({ "path": "f.txt", "limit": 3 }),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            first, "line 1\nline 2\nline 3\n[mush: lines 1–3 of 9 — read on with offset=4]",
+            "the window is the text and one sentence"
+        );
+
+        let last = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::ReadFile,
+            &json!({ "path": "f.txt", "offset": 8 }),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(
+            last, "line 8\nline 9\n[mush: lines 8–9 of 9 — end of file]",
+            "{last}"
+        );
+
+        // A whole small file is its own content, with no note at all.
+        let whole = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::ReadFile,
+            &json!({ "path": "f.txt", "limit": 9 }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(whole.ends_with("line 9"), "{whole}");
+        assert!(!whole.contains("mush:"), "{whole}");
+
+        // An offset past the end is a refusal that names the file's size rather
+        // than an empty read that looks like an empty file.
+        let past = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::ReadFile,
+            &json!({ "path": "f.txt", "offset": 40 }),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(past.text().contains("9 lines"), "{}", past.text());
+
+        // A `limit` of zero is not "everything": it is a window with no lines
+        // in it, which would print a backwards range. It is refused instead.
+        let none = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::ReadFile,
+            &json!({ "path": "f.txt", "limit": 0 }),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(none.text().contains("at least 1"), "{}", none.text());
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// `write_file` creates what is not there — the one road that was missing
+    /// while a lock was held — and answers with what it replaced.
+    #[test]
+    fn write_file_creates_and_says_what_it_replaced() {
+        let (actor, _mailbox) = test_actor("write-file");
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut write =
+            |args: Value| exec_tool(&actor, &mut state, ToolName::WriteFile, &args, &cancel);
+
+        let new = write(json!({ "path": "src/deep/new.rs", "content": "a\n" })).unwrap();
+        assert_eq!(new, "wrote src/deep/new.rs — 1 line (new)");
+
+        let more = write(json!({ "path": "src/deep/new.rs", "content": "a\nb\n" })).unwrap();
+        assert_eq!(more, "wrote src/deep/new.rs — 1 → 2 lines");
+        assert_eq!(
+            fs::read_to_string(actor.ws.root().join("src/deep/new.rs")).unwrap(),
+            "a\nb\n"
+        );
+
+        let replaced = write(json!({ "path": "src/deep/new.rs", "content": "a\nb\nc\n" })).unwrap();
+        assert_eq!(replaced, "wrote src/deep/new.rs — 2 → 3 lines");
+
+        let root = write(json!({ "path": ".", "content": "x" })).unwrap_err();
+        assert!(root.text().contains("workspace root"), "{}", root.text());
+        let big =
+            write(json!({ "path": "big.txt", "content": "x".repeat(result_cap(&actor) + 1) }))
+                .unwrap_err();
+        assert!(big.text().contains("cap"), "{}", big.text());
+        assert!(
+            !actor.ws.root().join("big.txt").exists(),
+            "nothing was written"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// `list_files` and `search` read the same walk: build output and VCS
+    /// metadata are skipped, hidden files are not, and a search says where a
+    /// line is without the model writing a regex.
+    #[test]
+    fn list_files_and_search_read_the_workspace() {
+        let (actor, _mailbox) = test_actor("list-and-search");
+        fs::create_dir_all(actor.ws.root().join("target/debug")).unwrap();
+        fs::create_dir_all(actor.ws.root().join("src")).unwrap();
+        fs::write(actor.ws.root().join("target/debug/junk"), "needle\n").unwrap();
+        fs::write(actor.ws.root().join("src/lib.rs"), "fn needle() {}\n").unwrap();
+        fs::write(actor.ws.root().join("src/other.rs"), "// NEEDLE here\n").unwrap();
+        fs::write(actor.ws.root().join(".gitignore"), "/target\n").unwrap();
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let listed =
+            exec_tool(&actor, &mut state, ToolName::ListFiles, &json!({}), &cancel).unwrap();
+        assert_eq!(listed, ".gitignore\nsrc/lib.rs\nsrc/other.rs", "{listed}");
+        // A path that names a file lists that file, rather than claiming the
+        // directory the model did not name is empty.
+        let one = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::ListFiles,
+            &json!({ "path": "src/lib.rs" }),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(one, "src/lib.rs", "{one}");
+        let sub = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::ListFiles,
+            &json!({ "path": "src" }),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(sub, "src/lib.rs\nsrc/other.rs", "{sub}");
+
+        let found = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Search,
+            &json!({ "pattern": "needle" }),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(found, "src/lib.rs:1: fn needle() {}", "{found}");
+
+        let any_case = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Search,
+            &json!({ "pattern": "needle", "ignore_case": true }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(
+            any_case.contains("src/other.rs:1: // NEEDLE here"),
+            "{any_case}"
+        );
+        assert!(
+            !any_case.contains("target/"),
+            "build output is not workspace text: {any_case}"
+        );
+
+        let none = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Search,
+            &json!({ "pattern": "nothing-like-this" }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(none.contains("no match"), "{none}");
+        assert!(none.contains("workspace root"), "{none}");
+
+        // Searching one named file searches that file.
+        let inside = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Search,
+            &json!({ "pattern": "needle", "path": "src/lib.rs" }),
+            &cancel,
+        )
+        .unwrap();
+        assert_eq!(inside, "src/lib.rs:1: fn needle() {}", "{inside}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// `edit_file` has one shape, and `edits` is it. A model that sends the
+    /// list of one as a bare object is read as the list it meant; a model that
+    /// sends nothing is told the shape rather than left guessing.
+    #[test]
+    fn edit_file_demands_the_one_shape() {
+        let (actor, _mailbox) = test_actor("edit-shape");
+        fs::write(actor.ws.root().join("f.rs"), "let a = 1;\n").unwrap();
+
+        let missing = edit_tool(&actor.ws, &json!({ "path": "f.rs" })).unwrap_err();
+        assert!(missing.contains("`edits`"), "names the shape: {missing}");
+        let wrong = edit_tool(&actor.ws, &json!({ "path": "f.rs", "edits": "let a" })).unwrap_err();
+        assert!(wrong.contains("list"), "{wrong}");
+        let empty = edit_tool(&actor.ws, &json!({ "path": "f.rs", "edits": [] })).unwrap_err();
+        assert!(empty.contains("empty"), "{empty}");
+
+        // The bare object is the list of one, because that is what it means.
+        let sugar = edit_tool(
+            &actor.ws,
+            &json!({ "path": "f.rs", "edits": { "old_string": "let a = 1;", "new_string": "let a = 2;" } }),
+        )
+        .unwrap();
+        assert_eq!(sugar, "edited f.rs");
+        assert_eq!(
+            fs::read_to_string(actor.ws.root().join("f.rs")).unwrap(),
+            "let a = 2;\n"
+        );
+        // And a real batch is one call, one write, one line naming the count.
+        let batch = edit_tool(
+            &actor.ws,
+            &json!({ "path": "f.rs", "edits": [
+                { "old_string": "a = 2", "new_string": "a = 3" },
+                { "old_string": "a = 3", "new_string": "a = 4" }
+            ] }),
+        )
+        .unwrap();
+        assert_eq!(batch, "edited f.rs — 2 edits");
+        assert_eq!(
+            fs::read_to_string(actor.ws.root().join("f.rs")).unwrap(),
+            "let a = 4;\n"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }

@@ -20,15 +20,16 @@ edit the files.
 - `mush` is a TUI in Rust. One binary. **No async runtime.**
 - Workspace-first: `mush [DIR]`, or just `mush` in the folder you are in.
 - An **agent is built in**: it talks to any OpenAI-compatible endpoint
-  (default `http://rubendpc:8078`) and works the workspace through six tools:
-  the shell (`run_command`) lists, reads and writes, `edit_file` replaces exact
-  text, `spawn_agent` delegates, and `status`, `control` and `wait` manage what
-  it started — a long command becomes a **job** the agent can check on later.
+  (default `http://rubendpc:8078`) and works the workspace through ten tools:
+  `read_file`, `write_file`, `list_files` and `search` touch files, `edit_file`
+  replaces exact text, `run_command` is the shell, `spawn_agent` delegates, and
+  `status`, `control` and `wait` manage what it started — a long command becomes
+  a **job** the agent can check on later.
 - mush holds **no file state**: agents read and write files directly, and the
   UI shows their tree, their transcripts, and the git facts.
 - The agent's **system prompt is three short blocks** — the rules, the
   delegation policy, and what the machine is like — and the root's tool set is
-  six functions. A leaf keeps five of them: `spawn_agent` is omitted, which is
+  ten functions. A leaf keeps nine of them: `spawn_agent` is omitted, which is
   what bounds the tree. Small prompt, small interface, one consequence of the
   other.
 - Everything mush writes lives in `<DIR>/.mush/`, which **git-ignores itself**.
@@ -59,19 +60,34 @@ edit the files.
 - Provider-specific, plugin-based, or extensible via a scripting language.
 - An agent framework. It ships one small agent loop, not an orchestration layer.
 
-### Why files + a shell is still the interface
+### Why there are file tools beside a shell
 
-The agent's tools for touching a workspace are `run_command` — a real shell,
-which lists, reads and writes better than a bespoke tool could (`rg`, `sed -n
-'1,200p' file`, `ls -la`, `mkdir -p dir && cat > file <<'EOF'`) — and
-`edit_file`, whose exact-and-unique replacement is a safety property `sed -i`
-does not have. That is the entire surface for files — plus `spawn_agent` and
-the `status`/`control`/`wait` that manage what an agent starts. Any other
-agent — a shell script, a different harness — can collaborate through the same
-two things: the workspace files and the shell. The same two things are also how
-*you* drive mush: the attach protocol of §9 (M3) lets a script you run yourself
-read a transcript and hand a message to an agent over a UNIX socket, without
-needing to know anything about mush's internals.
+`run_command` stays the road for what a shell is for — git, tests, builds — and
+the agent's own tools cover the files: `read_file` (a bounded window that says
+what it left), `write_file`, `list_files`, `search`, and `edit_file`, whose
+exact-and-unique replacement is a safety property `sed -i` does not have. An
+earlier revision cut this down to `edit_file` alone, on the grounds that a shell
+lists, reads and writes better than a bespoke tool could (`rg`, `sed -n '1,200p'
+file`, `ls -la`, `mkdir -p dir && cat > file <<'EOF'`). Two facts broke that
+premise (H31):
+
+- **A lock refuses reads too.** A sibling's `exclusive` command refuses *every*
+  `run_command` (§5.6), which is right for a build and wrong for a read: an
+  agent that launched a long benchmark and then wanted to look at a file had no
+  way to, and the wait that frees the machine is minutes long. The file tools
+  take no lock and work beside one.
+- **A shell cannot carry an image.** A screenshot, a chart or a rendered diagram
+  on disk is bytes no shell command hands back to a model that can see. An image
+  arrives in a tool result as an image, which only a typed tool can build. So
+  `read_file` is the tool that will carry one — the second half of this reversal,
+  landing next (§9).
+
+The rest is unchanged: `edit_file` keeps its exactness, and any other
+agent — a shell script, a different harness — can still collaborate through the
+same two things: the workspace files and the shell. The same two things are also
+how *you* drive mush: the attach protocol of §9 (M3) lets a script you run
+yourself read a transcript and hand a message to an agent over a UNIX socket,
+without needing to know anything about mush's internals.
 
 ---
 
@@ -81,7 +97,7 @@ An editor-shaped design has a hard problem: the agent reads and writes files on
 disk while the human has the same file open in memory. Whoever saves last wins.
 
 mush avoids it by not being an editor. Agents do their own file I/O on their own
-threads (`edit_file`, `run_command`), and the UI holds only what the
+threads (the file tools, `run_command`), and the UI holds only what the
 human needs to steer them: the agent tree, the focused transcript, the message
 box, and the git snapshot. There is no live buffer, so there is no stale copy,
 no lock, and no save race — a consequence of a smaller product.
@@ -92,26 +108,34 @@ and never share state with the painter.
 
 ### Safety rules that stay
 
-- **Atomic saves.** Every `edit_file` write is temp-file + `rename`; readers
-  never see a half-written file, and a crash cannot corrupt the original.
-- **Workspace confinement is a convention, not a fence.** `edit_file` resolves
-  its `path` against the root and rejects an escape (`..`, absolute paths), but
-  `run_command` is a real shell and nothing confines it. So the rules name the
+- **Atomic saves.** Every file write — `write_file`, `edit_file` — is
+  temp-file + `rename`; readers never see a half-written file, and a crash cannot
+  corrupt the original.
+- **Workspace confinement is a convention, not a fence.** Every file tool
+  resolves its `path` against the root and rejects an escape (`..`, absolute
+  paths; `write_file` refuses the root itself), but `run_command` is a real shell
+  and nothing confines it. So the rules name the
   workspace, tell the agent that paths are workspace-relative and that commands
   run with their cwd at its root, and say never to touch paths outside it — and
   the prompt says so in one place (`RULES`). There is no enforced *path jail*:
   the agent is trusted to stay, not stopped from leaving.
-- **Edits are exact.** `edit_file` refuses if `old_string` is missing or appears
-  more than once, so an edit can never hit the wrong occurrence.
-- **Command output is capped, edits are not.** One cap bounds every big-text
-  result — the shell's (`CMD_CAP = 16 000` bytes, scaled down by
-  `Config::cmd_cap()` to a quarter of the history budget, floored at 512) — and a
-  job's report is the same kind of window, a **tail** (§5.6). A capped result
-  says so and says the way past it: a result whose head is kept ends with
+- **Edits are exact.** `edit_file` refuses if an `old_string` is missing or
+  appears more than once, so an edit can never hit the wrong occurrence.
+- **Every big-text result is capped, edits are not.** One cap bounds them all —
+  a command's output, a file read, a listing, a search (`CMD_CAP = 16 000`
+  bytes, scaled down by `Config::cmd_cap()` to a quarter of the history budget,
+  floored at 512) — and a job's report is the same kind of window, a **tail**
+  (§5.6). A capped result says so and says the way past it: a result whose head
+  is kept ends with
   `[mush: output truncated at {cap} bytes — rerun it narrower (rg, head, a smaller path) to see the rest]`,
   and a result whose *end* matters keeps its tail, preceded by
   `[mush: output truncated at {cap} bytes (the end is shown) — rerun it narrower to see the rest]`.
-  Edit operations always work on the complete file.
+  A read has its own window and says so too (`[mush: lines 1–200 of 900 — read on
+  with offset=201]`, or `— end of file`), which is a smaller question than the
+  cap and gets its own sentence. Two files are refused rather than windowed: a
+  read of a file past 32 MB, and a search inside a file past 2 MB — both name
+  `run_command` (`tail`, `sed -n`, `rg`) as the road. Edit operations always work
+  on the complete file.
 - **Bounded loops.** A run ends when the model stops calling tools; a *loop* —
   the same tool batch five rounds over with nothing changed in between — ends it
   early, and a 200-turn runaway guard withdraws the tools and asks for a
@@ -144,13 +168,21 @@ message, so the human's picture of a child starts where the child's does.
 
 ### Tools
 
-Six tools, in schema order — the shell does the listing, reading and writing, so
-`edit_file` is the only file tool and `run_command` the road for everything else
-(§1):
+Ten tools, in schema order
+
+Ten tools, in schema order — four for the workspace's files, the shell, the
+delegation tool, and three that manage what an agent started (§1). Each schema
+says *the call* and nothing else: its arguments, their defaults, what comes
+back. How to work is the prompt's, so a description that repeats a rule is a
+second copy of it.
 
 | Tool | Arguments | Notes |
 |---|---|---|
-| `edit_file` | `path`, `old_string`/`new_string` or `edits` | exact-and-unique replacement; a batch lands all-or-nothing in one call; a missing or ambiguous match is refused |
+| `edit_file` | `path`, `edits` | exact-and-unique replacement, one shape: `edits` is always a list (a lone edit is a list of one), `replace_all` opts into an ambiguous match, and the batch lands all-or-nothing in one call |
+| `read_file` | `path`, `offset?`, `limit?` | a file as a window of lines, with no line numbers (a numbered line is a string that cannot match `edit_file`'s `old_string`) and one trailing sentence saying what the window left; works beside a held lock |
+| `write_file` | `path`, `content` | create or replace a whole file, parent directories included; the answer is one line naming what it replaced; the workspace root itself is refused |
+| `list_files` | `path?` | the files under a path, sorted, one per line; build and VCS directories are skipped; capped at 400 names with the way past it |
+| `search` | `pattern`, `path?`, `ignore_case?` | a literal string (no regex — a regex engine is a dependency, and `rg` is the shell's), one `path:line: text` per match; binary and huge files skipped |
 | `run_command` | `command`, `detach?`, `exclusive?` | a shell in the workspace root, own process group; 120 s timeout, output capped to fit the window, cancellable; `detach` starts a job at once, `exclusive` takes the machine lock (§5.6) |
 | `spawn_agent` | `brief`, `title`, `base?` | a new agent with its own transcript; `title` names its row, and `base` forks a worktree on `mush/<id>` for it (§5.5) |
 | `status` | — | your children and your jobs in one listing: state, title or branch, age, command; a listing, not a delivery |
@@ -158,7 +190,7 @@ Six tools, in schema order — the shell does the listing, reading and writing, 
 | `wait` | — | blocks until every child and every job you own has finished, then one digest; returns at once when there is nothing to wait for; a subagent also waits out another agent's machine lock, gives up after 10 minutes, and a message to it ends the wait early |
 
 The `spawn_agent` row is omitted from a leaf agent's schema (`MAX_DEPTH`), which
-is what bounds the tree, so a root has six tools and a leaf five; the `status`,
+is what bounds the tree, so a root has ten tools and a leaf nine; the `status`,
 `control` and `wait` rows are not omitted, because they manage the *jobs* a leaf
 may run in the background while it edits (§5.6). `mush_core::tools::TOOL_NAMES`
 is the single list of names, and a test asserts the schemas match it.
@@ -686,7 +718,11 @@ over first, so the road back can be two waits: the refusal says so, the `wait`
 schema owns the order, and the hold that outlives it is named beside the result.
 A detached exclusive job holds the lock for its whole life.
 The lock coordinates *agents*; it cannot see the human's own build or an
-unrelated process, so it is “agents do not fight each other”, not isolation. The
+unrelated process, so it is “agents do not fight each other”, not isolation. It
+is also a lock on `run_command` and nothing else: the file tools take no lock, so
+`read_file`, `list_files`, `search`, `write_file` and `edit_file` all work beside
+a held one (H31) — a sibling's benchmark is exactly when an agent wants to
+re-read a file, and refusing that read was never the point. The
 root is exempt from a lock it did not take — it commands beside a held one and
 is *told* it did (`beside_note`) — because being blind for the duration of a
 child's benchmark cost the orchestrator its only lever (H13); its own
@@ -1067,6 +1103,9 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
   edits without reading, and "same tools as always" was false for a leaf.
 - **The schema reserve is measured, not guessed.** A prompt test fails if the tool
   schemas outgrow `Config::SCHEMA_TOKENS`.
+- **A file tool is not a second shell.** `read_file`, `write_file`, `list_files`
+  and `search` exist for the two reads a shell cannot serve — one beside a held
+  machine lock, and one that is an image — and `run_command` stays for the rest.
 - **Transcripts are repaired, not trusted.** A transcript adopted from the UI is
   normalized (results beside their calls, every call answered) before it goes on
   the wire.

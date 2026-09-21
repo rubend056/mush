@@ -362,21 +362,25 @@ fn normalize_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
-/// Tokens every request reserves for the tool schemas. Six schemas measure
-/// ~3.7 KB (~1.25 K tokens at the 3 bytes/token heuristic), so the reserve
+/// Tokens every request reserves for the tool schemas. Ten schemas measure
+/// ~5.6 KB (~1.9 K tokens at the 3 bytes/token heuristic), so the reserve
 /// rounds up; `prompt` tests that they keep fitting.
 ///
 /// The schemas are context paid on *every* request, so this is a real cost.
 /// Ownership keeps it down: the prompts carry how to work (the rules, the
 /// delegation policy, what the machine is like), and a schema carries only its
-/// own call — arguments, defaults, and what comes back. The cut to six tools
-/// (the shell reads and writes better than a bespoke tool) took the payload
-/// from ~5.1 KB to ~3.5 KB; `edit_file`'s nested `edits` and `control`'s two
-/// verbs are most of what is left, and `wait`'s contract grew when it took on
-/// the machine lock (the refusal's road back) and named its own cap. The
-/// `schemas_fit_the_budget_reserve` test is what makes growth a decision
-/// rather than a silent drift.
-pub const SCHEMA_TOKENS: usize = 1_300;
+/// own call — arguments, defaults, and what comes back. The number has moved
+/// twice, and both times for a reason rather than a drift. A cut from twelve
+/// tools to six took the payload from ~5.1 KB to ~3.5 KB on the premise that the
+/// shell reads, lists and writes better than a bespoke tool; three of those
+/// tools are back, because that premise fails in two places the shell cannot
+/// reach — the machine lock refuses every `run_command` while a sibling holds it
+/// (finding H31), and a shell cannot carry an image — and `search` came with
+/// them. `edit_file` earned the other direction: its second, top-level
+/// `old_string`/`new_string` shape is gone, which is where the schema and the
+/// code had drifted (H20 item 3). The `schemas_fit_the_budget_reserve` test is
+/// what makes growth a decision rather than a silent drift.
+pub const SCHEMA_TOKENS: usize = 1_900;
 
 impl Config {
     /// Built-in defaults with the `MUSH_*` environment applied.
@@ -469,14 +473,14 @@ impl Config {
         self.context_explicit = true;
     }
 
-    /// The one cap on the text a tool result may carry. The command's result is
-    /// now the only road by which big text reaches the model — the deleted file
-    /// tools' caps are gone with them — so it scales with the window like a read
+    /// The one cap on the text a tool result may carry — a command's output, a
+    /// file read, a listing, a search. It scales with the window like a read
     /// did: a quarter of [`Self::history_budget`], floored at 512 bytes so a
     /// tiny window still gets an answer, and capped by [`CMD_CAP`] so a huge one
     /// does not hand the model a transcript's worth in a single turn. A result
-    /// that hits the cap says so (see `truncate_for_model`), so a model never
-    /// mistakes a cut result for a complete one.
+    /// that hits the cap says so (see `truncate_for_model`; a file read is cut
+    /// with its own "read on" sentence), so a model never mistakes a cut result
+    /// for a complete one.
     pub fn cmd_cap(&self) -> usize {
         CMD_CAP
             .min(self.history_budget() / 4)
@@ -1552,7 +1556,7 @@ mod tests {
             max_completion_tokens: false,
             ..small.clone()
         };
-        assert_eq!(big.history_budget(), 317_100);
+        assert_eq!(big.history_budget(), 315_300);
 
         // A tiny window shrinks the reserve to half the window instead of
         // ignoring it: history still gets 1536 bytes, and the cap — which has

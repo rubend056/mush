@@ -1,4 +1,5 @@
-//! Workspace filesystem access: safe paths, reads, atomic writes.
+//! Workspace filesystem access: safe paths, reads, listings, search, atomic
+//! writes.
 
 use std::fs;
 use std::io::{self, Write};
@@ -6,6 +7,40 @@ use std::path::{Component, Path, PathBuf};
 
 use crate::text;
 use tempfile::NamedTempFile;
+
+/// Directories a walk never descends into: VCS metadata and build output, whose
+/// contents are never the workspace's work. Hidden names are *not* skipped —
+/// `.github/`, `.gitignore` and `.env.example` are exactly the files an agent is
+/// asked about (audit of the prompt vs behaviour, row 8) — and neither is
+/// `.mush`, whose session file a model may well be asked to look at.
+const SKIP_DIRS: &[&str] = &[
+    ".git",
+    "target",
+    "node_modules",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".idea",
+    ".vscode",
+    "dist",
+    "build",
+    ".next",
+    ".cache",
+];
+
+/// The largest file a read tool will open whole. Past it the memory a read
+/// costs is the agent's problem rather than the file's, and the sentence says
+/// so; a window of a 200 MB log is `run_command`'s job (`tail`, `sed -n`).
+pub const READ_FILE_CAP: u64 = 32 * 1024 * 1024;
+
+/// The longest file `search` opens. A pattern that matches inside a 200 MB log
+/// is a match the model does not need and a walk that takes minutes; `run_command`
+/// is the road to that file.
+pub const SEARCH_FILE_CAP: u64 = 2 * 1024 * 1024;
+
+/// How much of one matching line `search` shows, so one minified line cannot
+/// spend the whole result.
+const MATCH_LINE_CAP: usize = 240;
 
 /// A single workspace root. All agent file access goes through here, which is
 /// what keeps a runaway model inside the directory the human opened.
@@ -63,11 +98,11 @@ impl Workspace {
     /// Read a text file whole. Binary files are refused.
     ///
     /// It used to take a `cap`, keep the head of a long file and mark the cut
-    /// with a sentence of its own — but the file tools that read that way are
-    /// gone (the six-tool cut), and its one caller is `edit_file`, which must
-    /// see the whole file or refuse the edit. A too-big result is the command
-    /// result's problem now, and `truncate_for_model` is the one place that
-    /// says so.
+    /// with a sentence of its own — then the six-tool cut took the file tools
+    /// away and this became `edit_file`'s private read, which must see the whole
+    /// file or refuse the edit. The read tools are back ([`Self::read_window`])
+    /// because the shell cannot serve them behind a machine lock, so the cut
+    /// lives there and this stays the whole-file read.
     pub fn read_file(&self, rel: &str) -> Result<String, String> {
         let path = self.resolve(rel)?;
         let bytes = fs::read(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
@@ -75,6 +110,223 @@ impl Workspace {
             return Err(format!("{rel} looks like a binary file"));
         }
         Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    /// A window of a text file, as the model reads it: `limit` lines from
+    /// 1-based `offset`, cut to `cap` bytes, then one sentence if there is a
+    /// rest — how much of the file this was and the `offset` that reads on.
+    ///
+    /// No line numbers are printed beside the text, on purpose: a model copies
+    /// what it reads into `edit_file`'s `old_string`, and a numbered line is a
+    /// string that cannot match. The range is named once, in the trailing
+    /// sentence.
+    pub fn read_window(
+        &self,
+        rel: &str,
+        offset: usize,
+        limit: usize,
+        cap: usize,
+    ) -> Result<String, String> {
+        let path = self.resolve(rel)?;
+        if let Ok(meta) = fs::metadata(&path) {
+            if meta.len() > READ_FILE_CAP {
+                return Err(format!(
+                    "{rel} is {} bytes — past the {READ_FILE_CAP}-byte cap on a whole read; use \
+                     run_command (`sed -n '1,200p' {rel}`) or read a smaller file",
+                    meta.len()
+                ));
+            }
+        }
+        let text = self.read_file(rel)?;
+        let total = text.lines().count();
+        let offset = offset.max(1);
+        if limit == 0 {
+            return Err(format!(
+                "`limit` must be at least 1 line — {rel} has {total}"
+            ));
+        }
+        if total == 0 {
+            return Ok(format!("{rel} is empty"));
+        }
+        if offset > total {
+            return Err(format!(
+                "{rel} has {total} lines — offset {offset} is past its end"
+            ));
+        }
+        // The window: the lines asked for, then as many of them as the cap pays
+        // for. One line longer than the cap is still shown in part, because a
+        // refusal to show anything is not a read.
+        let mut shown = Vec::new();
+        let mut bytes = 0usize;
+        let mut part = false;
+        for line in text.lines().skip(offset - 1).take(limit) {
+            let width = line.len() + 1;
+            if shown.is_empty() && width > cap {
+                let cut = text::boundary_at_or_before(line, cap);
+                shown.push(&line[..cut]);
+                part = true;
+                break;
+            }
+            if bytes + width > cap {
+                break;
+            }
+            bytes += width;
+            shown.push(line);
+        }
+        let last = offset + shown.len() - 1;
+        let mut out = shown.join("\n");
+        if part {
+            out.push_str(&format!(
+                "\n[mush: line {offset} of {total} is longer than the {cap}-byte cap — shown in \
+                 part]"
+            ));
+        } else if last < total {
+            out.push_str(&format!(
+                "\n[mush: lines {offset}–{last} of {total} — read on with offset={}]",
+                last + 1
+            ));
+        } else if offset > 1 {
+            out.push_str(&format!(
+                "\n[mush: lines {offset}–{last} of {total} — end of file]"
+            ));
+        }
+        Ok(out)
+    }
+
+    /// Every file under `rel` (default the workspace root), workspace-relative
+    /// and sorted, with the first `limit` and whether there were more. Build and
+    /// VCS directories are skipped ([`SKIP_DIRS`]); a symlinked directory is not
+    /// followed, so a listing cannot leave the workspace.
+    pub fn list_files(&self, rel: &str, limit: usize) -> Result<(Vec<String>, bool), String> {
+        let start = self.resolve(rel)?;
+        let mut found = Vec::new();
+        self.walk(&start, &mut |path: &Path| {
+            found.push(self.rel(path));
+            true
+        });
+        found.sort();
+        let truncated = found.len() > limit;
+        found.truncate(limit);
+        Ok((found, truncated))
+    }
+
+    /// Every line under `rel` containing `pattern` — a literal string, not a
+    /// regex — as `path:line: text`, capped at `limit` matches plus the fact
+    /// that there were more.
+    ///
+    /// Literal on purpose: a regex engine is a dependency and a search that
+    /// runs one is the `rg` the shell already has, while this tool exists for
+    /// the one case the shell cannot serve (a held machine lock). Binary files
+    /// and files past [`SEARCH_FILE_CAP`] are skipped, and a matching line is
+    /// cut to [`MATCH_LINE_CAP`] so one minified file cannot spend the result.
+    pub fn search(
+        &self,
+        pattern: &str,
+        rel: &str,
+        ignore_case: bool,
+        limit: usize,
+    ) -> Result<(Vec<String>, bool), String> {
+        if pattern.is_empty() {
+            return Err("`pattern` must not be empty".to_string());
+        }
+        let start = self.resolve(rel)?;
+        let needle = if ignore_case {
+            pattern.to_lowercase()
+        } else {
+            pattern.to_string()
+        };
+        let mut matches = Vec::new();
+        let mut more = false;
+        self.walk(&start, &mut |path: &Path| {
+            let Ok(meta) = fs::metadata(path) else {
+                return true;
+            };
+            if meta.len() > SEARCH_FILE_CAP {
+                return true;
+            }
+            let Ok(bytes) = fs::read(path) else {
+                return true;
+            };
+            if bytes.contains(&0) {
+                return true;
+            }
+            let text = String::from_utf8_lossy(&bytes);
+            for (number, line) in text.lines().enumerate() {
+                let haystack = if ignore_case {
+                    line.to_lowercase()
+                } else {
+                    line.to_string()
+                };
+                if !haystack.contains(&needle) {
+                    continue;
+                }
+                if matches.len() == limit {
+                    more = true;
+                    return false;
+                }
+                matches.push(format!(
+                    "{}:{}: {}",
+                    self.rel(path),
+                    number + 1,
+                    text::truncate(line.trim_end(), MATCH_LINE_CAP)
+                ));
+            }
+            true
+        });
+        Ok((matches, more))
+    }
+
+    /// Walk every file under `start` — files only, [`SKIP_DIRS`] by name, no
+    /// symlinked directories — calling `visit` until it answers `false`. A
+    /// `start` that is itself a file visits that one file, so "list this path"
+    /// and "search this path" answer about the file the model named instead of
+    /// claiming there is nothing there.
+    ///
+    /// One walker for the listing and the search: a second one is a second
+    /// answer to "what is a workspace file", and the two drift.
+    fn walk(&self, start: &Path, visit: &mut dyn FnMut(&Path) -> bool) {
+        if start.is_file() {
+            visit(start);
+            return;
+        }
+        let mut stack = vec![start.to_path_buf()];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut children: Vec<PathBuf> = entries
+                .filter_map(|entry| entry.ok())
+                .map(|e| e.path())
+                .collect();
+            // Sorted here, not at the end: every directory is read in name
+            // order, so a walk that stops at a cap stops at a *deterministic*
+            // place instead of wherever the filesystem happened to list.
+            children.sort();
+            let mut next = Vec::new();
+            for path in children {
+                let Ok(kind) = fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                if kind.is_dir() {
+                    let name = path.file_name().unwrap_or_default().to_string_lossy();
+                    if !SKIP_DIRS.contains(&name.as_ref()) {
+                        next.push(path);
+                    }
+                    continue;
+                }
+                if !kind.is_file() {
+                    continue;
+                }
+                if !visit(&path) {
+                    return;
+                }
+            }
+            // Depth-first, and in name order: the stack takes the directories
+            // reversed, so the first one read is the first one pushed.
+            while let Some(path) = next.pop() {
+                stack.push(path);
+            }
+        }
     }
 
     /// Atomically create or replace a file, creating parent directories.

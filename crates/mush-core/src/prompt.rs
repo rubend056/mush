@@ -1,9 +1,10 @@
 //! The system prompts and the tool schemas.
 //!
 //! These things *are* the agent contract. They are kept deliberately small: a
-//! model only has to know how to edit, run, and delegate — the shell does the
-//! reading and writing, and mush handles the rest. Leaf agents (at `MAX_DEPTH`)
-//! simply don't receive `spawn_agent`, which is how deep chains stay bounded.
+//! model only has to know how to read, write, search, edit, run and delegate —
+//! each schema owns its own call and nothing else, and mush handles the rest.
+//! Leaf agents (at `MAX_DEPTH`) simply don't receive `spawn_agent`, which is how
+//! deep chains stay bounded.
 //!
 //! Ownership, so nothing is said twice: the prompts own *how to work* (the
 //! rules, the delegation policy, what the machine is like); each schema owns
@@ -21,8 +22,9 @@ Rules:\n\
 - Work inside the workspace: paths are workspace-relative (\"src/main.rs\", not an absolute \
 path), and a command runs with its cwd at the workspace root. Never touch paths outside the \
 workspace.\n\
-- Use `run_command` to read/write/rewrite files (`sed -n '1,200p' file`, `rg pattern`) \
-- To edit use `edit_file` with the exact text it replaces, and refuses a match that is missing or not unique.\n\
+- `read_file`, `list_files` and `search` read; `write_file` creates or replaces a whole file; \
+`edit_file` changes exact text in one. `run_command` is the shell, for everything else (git, \
+tests, builds).\n\
 - When you are done finish with a concise summary of what you did.
 - Don't forget to have fun :)";
 
@@ -37,7 +39,8 @@ what reads, waits on or stops it.\n\
 port): a sibling's command queues behind it and is refused if the lock outlasts that (`#N holds \
 the machine`) — and then a subagent's `wait` is the road back: it blocks until the machine is free \
 (however many waits that takes — the schema says what each one hands over), and one more call runs. \
-Never retry a refused call in a loop. The root is exempt from a lock it did not take: it works \
+Never retry a refused call in a loop. The file tools work beside a lock it did not take; only \
+`run_command` is refused by it. The root is exempt from a lock it did not take: it works \
 beside the holder, told when it did, only its own exclusive claim is refused, and its `wait` does \
 not block on the lock.";
 
@@ -139,16 +142,16 @@ pub fn tool_schemas() -> Vec<Value> {
     vec![
         tool(
             ToolName::EditFile,
-            "Replace text: one old_string/new_string, or `edits` for several replacements at once. A batch lands all-or-nothing in one call, so prefer it for multi-part changes. Ambiguous matches are refused unless replace_all is set.",
+            "Replace exact text in one file: every edit lands or none do, so prefer one call for \
+             multi-part changes. A missing or non-unique `old_string` is refused unless \
+             `replace_all` is set.",
             json!({
                 "type": "object",
                 "properties": {
-                    "path": { "type": "string" },
-                    "old_string": { "type": "string", "description": "Exact text, must occur exactly once. Omit when using `edits`." },
-                    "new_string": { "type": "string", "description": "Replacement. Omit when using `edits`." },
+                    "path": { "type": "string", "description": "Workspace-relative file." },
                     "edits": {
                         "type": "array",
-                        "description": "Replacements, applied in order.",
+                        "description": "The replacements, applied in order.",
                         "items": {
                             "type": "object",
                             "properties": {
@@ -160,7 +163,60 @@ pub fn tool_schemas() -> Vec<Value> {
                         }
                     }
                 },
+                "required": ["path", "edits"]
+            }),
+        ),
+        tool(
+            ToolName::ReadFile,
+            "Read a workspace file. A long file is a window — `offset`/`limit` are lines \
+             (default: from line 1, as many as fit) — and the cut says what it left. Works while \
+             another agent holds the machine.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Workspace-relative file." },
+                    "offset": { "type": "integer", "description": "First line, 1-based. Default 1." },
+                    "limit": { "type": "integer", "description": "How many lines. Default as many as fit the cap." }
+                },
                 "required": ["path"]
+            }),
+        ),
+        tool(
+            ToolName::WriteFile,
+            "Create or replace a workspace file, creating parent directories. Answers with one line: \
+             what was written and what it replaced. For changes to a file that exists, edit_file.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Workspace-relative file." },
+                    "content": { "type": "string", "description": "The complete new content." }
+                },
+                "required": ["path", "content"]
+            }),
+        ),
+        tool(
+            ToolName::ListFiles,
+            "List workspace files under a path, one per line and sorted; build and VCS directories \
+             are skipped. Default the workspace root.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Workspace-relative directory or file. Default the root." }
+                }
+            }),
+        ),
+        tool(
+            ToolName::Search,
+            "Find a literal string (no regex) in the workspace's text files: one `path:line: text` per \
+             match. Binary files are skipped.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "The literal text to find." },
+                    "path": { "type": "string", "description": "Directory or file to search. Default the root." },
+                    "ignore_case": { "type": "boolean", "description": "Case-insensitive. Default false." }
+                },
+                "required": ["pattern"]
             }),
         ),
         tool(
@@ -272,7 +328,7 @@ mod tests {
     }
 
     /// Depth is bounded by what a leaf can see: the one delegation tool is gone
-    /// and the workspace and job tools stay.
+    /// and the workspace, file and job tools stay.
     #[test]
     fn a_leaf_keeps_the_workspace_and_job_tools() {
         let leaf = leaf_tool_schemas();
@@ -280,8 +336,18 @@ mod tests {
             .iter()
             .map(|schema| schema["function"]["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names.len(), 5);
-        for kept in ["edit_file", "run_command", "status", "control", "wait"] {
+        assert_eq!(names.len(), 9);
+        for kept in [
+            "edit_file",
+            "read_file",
+            "write_file",
+            "list_files",
+            "search",
+            "run_command",
+            "status",
+            "control",
+            "wait",
+        ] {
             assert!(names.contains(&kept), "a leaf loses {kept}");
         }
         assert!(!names.contains(&"spawn_agent"), "{names:?}");

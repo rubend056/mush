@@ -29,12 +29,14 @@ cargo build --release
 `mush --version` (or `-V`) prints the version and exits.
 
 `Tab` moves between the **agents** tree and the **chat**. Type in the message
-box and press `Enter`. The agent works the workspace through six tools —
-`edit_file`, `run_command`, `spawn_agent`, `status`, `control`, `wait`: the
-shell does the listing, reading and writing (`rg`, `sed -n '1,200p' file`,
-`ls -la`, `mkdir -p dir && cat > file <<'EOF'`), `edit_file` replaces exact text
-because an exact-and-unique match is a safety property `sed -i` does not have,
-and the last four manage the agents and jobs it starts — see *Subagents* below.
+box and press `Enter`. The agent works the workspace through ten tools —
+`edit_file`, `read_file`, `write_file`, `list_files`, `search`, `run_command`,
+`spawn_agent`, `status`, `control`, `wait`: four touch files (`edit_file`
+replaces exact text, because an exact-and-unique match is a safety property
+`sed -i` does not have; `read_file` reads a line window and works even while
+another agent holds the machine), `run_command` is the shell for everything
+else (git, tests, builds), and the last four manage the agents and jobs it
+starts — see *Subagents* below.
 
 It talks to any OpenAI-compatible endpoint with function calling:
 
