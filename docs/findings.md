@@ -144,7 +144,11 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
 - **H31** — the cut to six tools rested on a premise two facts broke: a machine
   lock refuses *every* `run_command`, reads included, so an agent blinked at a
   sibling's benchmark had no way to re-read a file; and a shell cannot carry an
-  image, so a screenshot on disk was invisible to a model that can see. §8.36.
+  image, so a screenshot on disk was invisible to a model that can see. ✅
+  reversed in two landings (§8.36): `read_file`, `write_file`, `list_files` and
+  `search` came back beside `edit_file` (`1452477`), all of them working beside a
+  held lock, and an image now travels in a tool result (`bfa0b12`), which is the
+  half only a typed tool could ever build.
 - **H32** — every `run_command` already runs with its cwd at the agent's *own*
   workspace root (`machine.rs`'s `Shell::spawn` passes `current_dir(cmd.root)`,
   and the root is `actor.ws.root()` — for an isolated agent, its worktree), and
@@ -1985,3 +1989,167 @@ words, and the `MACHINE` block and the `wait` schema — which is why
 than as a silent overshoot. The wave's first landing (`602515c`) was 535 lines,
 the first audit 280 and the second read 144 — and that last 144 took back a road
 back that could have killed the runs it was written for.
+
+---
+
+## 8.36 The tools that came back, and the picture a shell cannot carry (`1452477`..`bfa0b12`, `mush/3`, `mush/4`)
+
+This wave opened with a decision rather than a report: the human watched agents
+work and asked for the file tools back, with the shape spelled out — `read_file`
+that can carry an image, `list_files` and a `search` with short descriptions,
+`edit_file` with **one** shape, no line numbers in a read, and search now rather
+than later. The reversal is H31, and it rests on two facts the six-tool cut's
+premise could not survive: the machine lock refuses *every* `run_command` while a
+sibling holds it, so "the shell can read it" is false exactly when an agent is
+blind (H13's own state), and a shell cannot carry an image, because bytes that
+are not text have no road through a tool result that is a string.
+
+**What came back.** `read_file` reads a window of lines with no line numbers (a
+numbered line is a string that cannot match `edit_file`'s `old_string`) and one
+trailing sentence saying what it left; `write_file` creates or replaces a whole
+file and answers in one line naming what it replaced; `list_files` and `search`
+share one walker, so "what is a workspace file" has one answer — build and VCS
+directories skipped, hidden files not, symlinked directories never followed, each
+directory read in name order so a capped walk stops somewhere deterministic.
+`search` is literal on purpose (a regex engine is a dependency, and `rg` is the
+shell's) and prints `path:line: text`. `edit_file` lost its second, top-level
+`old_string`/`new_string` pair: `edits` is always a list, a lone edit sent as a
+bare object is read as the list of one it means, `replace_all` lives on the
+entry, and the shape the schema declares is the shape the parser reads (H20 item
+3's two homes are one). `SCHEMA_TOKENS` moved 1300 → 1900 by the constant's own
+documented rule, and the headline regression — `the_file_tools_work_while_the_machine_is_held`
+— asserts both halves: the five file tools answer while a sibling's lock is held,
+and the same moment refuses `run_command` by name.
+
+**The audit (`mush/3`), and the two live reports it settled.** A read-only pass
+over every sentence a model receives concluded that the surfaces were sound and
+then found three defects and a falsehood. The defects: a `search` that skipped a
+file (binary, or past `SEARCH_FILE_CAP`) answered **"no match"** — a negative the
+tool cannot know and a model will act on, so `Workspace::search` now returns
+`Matches { matches, more, skipped }` and the count rides back with the answer; a
+path that does not exist read as an **empty** one (`no files`, `no match`), and
+a `path` that was not a string silently listed the root, so both are refused
+(`no such path: …`, and `tools::arg_path` for every optional path); and
+`write_file` said **"(new)"** over a file it replaced whenever `read_file`
+refused the old bytes, which is a false history fact a transcript keeps — it
+answers from existence now, with `(replaced a file that is not text)` in between.
+The falsehood sat beside H29: an *exclusive* sibling claim that loses the race
+between the lock check and `take_machine` never queued, yet read the queued
+road's "this call queued and the lock was still held". `Refused::unqueued_message`
+owns that sentence now, the shared road back has one home (`Refused::lock_road`),
+and `a_sibling_refusal_never_claims_a_queue_it_did_not_join` pins all three
+roads. H29 itself the audit settled **by reading**: no road reaches `launch`'s
+`Machine` arm with a sibling holding the lock, because every exclusive caller
+goes through `take_machine`, which refuses any existing holder — so the arm is
+described as a guard rather than a road, and the doc comment that named an
+impossible one is gone. Four more sentences were repaired in the same pass:
+`edit_file`'s description no longer offers `replace_all` as the fix for a
+*missing* match, `run_command`'s stops repeating the truncation marker's own
+sentence (−46 bytes, which paid for the rest), `status` describes the listing it
+answers (a branch, not a title it does not print; and what `✉` means), and
+`MACHINE`'s quoted detach line is now a prefix of the line `run_command` really
+answers. `read_file`'s 32 MB refusal says a window cannot get past it, and a line
+longer than the cap names `sed -n '{offset}p'` for its rest.
+
+**The two the human asked about.** Agents were writing `cd /home/rubend/p/mush &&
+…` although every command already runs with its cwd at the agent's *own* root —
+for an isolated child, its worktree — and both prompts said so. The audit's
+verdict: habit, with one real gap, and **not** a schema problem; what was missing
+was not the fact but the *price of leaving it*, which only a worktree child can
+pay, because the absolute path a `cd` names is usually the parent's checkout
+(named in the brief or the task text) — the work then lands in the shared tree
+while the child's branch stays at its base, which is the lie M2.6 exists to
+prevent. So the isolated child's sentence now carries the cost and `RULES` grew
+nothing (H32). Agents were also `sleep 50`/`sleep 55` to wait, and the audit
+found no state in which that is rational: `wait` blocks on the thing itself,
+polling its mailbox every 50 ms, so a completion *ends* the wait with the result
+in the same answer; a completion also folds in on its own and wakes a napping
+agent, so a sleeping agent learns nothing sooner (`wait_bounded` drains signals
+but folds nothing) and cannot be interrupted at all — while five identical rounds
+stop the run as a loop, which a repeated `wait` is exempt from and a repeated
+`sleep` is not. `DELEGATION`'s last bullet now says so (H33), and the 50–55 s
+shape is read as a dodge of the identical-batch guard rather than a justification
+— the one state that still lets the screen and `wait` disagree is H30, which a
+sleep cannot fix either. Both rows carry a reserve: if the `cd` habit survives
+the sentence, the cheap non-hostile move is a note on that call's own result, and
+nothing was added to the schema, which is where the reviewer proved the fact
+already was.
+
+**The image half (`mush/4`, then `bfa0b12`).** An `Image` lives *in* the message —
+`path` (workspace-relative), `mime`, `bytes` — because mush has no server to host
+one: the request is the only thing that leaves this machine. It is never a wire
+field of its own: with images, `content` becomes the spec's content array (the
+text part first, then one `image_url` part per image holding a `data:` URL), and
+with none it is byte for byte the string it always was. That shape is why
+`Message` gained a hand-written serializer (a field's `serialize_with` cannot see
+its sibling) and a private `ContentPart`, and why `ChatRequest` still takes
+`&[Message]` and never learns images exist. Base64 is hand-rolled: thirty lines
+of table lookup against §7's dependency budget, tested against the RFC 4648
+vectors and both tails. An image is counted by `Message::weight` as its bytes
+plus its path and mime — base64's 4/3 inflation deliberately not modeled, because
+the bytes-per-token heuristic was measured on text and an image's real cost is
+its pixels, so the estimate errs toward "too big", which is the safe direction.
+An image leaves a transcript the same way it would leave the budget:
+`Message::drop_images` replaces it, in place, with one line naming the path and
+format, and **trimming calls it before it drops any turn** — an image is what an
+over-budget transcript is usually made of and the cheapest thing to lose, since
+the placeholder still says where the file is — while `Session::save` calls it
+before serializing, so a multi-megabyte screenshot never lands in
+`.mush/session.json`. The drop is idempotent, which is what keeps a session
+saved, loaded and saved again from stacking placeholder on placeholder (the test
+saves twice and compares). The placeholder's words were tightened to be true in
+*both* places it is used: `[image: shots/a.png (png) — bytes dropped to save
+room; read the file again if you need them]`.
+
+**The producer.** `read_file` answers with the image itself when the file is one,
+sniffed from its own first bytes and never its name (png, jpeg, gif, webp — the
+four vision endpoints document), through a `ToolOutput` that lets one tool's
+result be more than text while every other call site still reads as it did
+(`Deref<Target = str>`, `Display` and two `PartialEq` impls exist for exactly
+that), and `Message::tool_with_images` is the one constructor for a result that
+carries both. Two refusals, each naming a move that exists and neither borrowing
+the other's: an image the run's model is not documented to see is refused
+*before* it is sent — the road is the run's own end, saying what the picture was
+needed for — and an image past the 2 MB cap is refused with the one thing that
+makes it readable (downscale it with `run_command`; `offset`/`limit` cannot help
+because an image has no lines, and the sentence says so). Vision is a per-model
+fact in the provider table (`ModelSpec::vision`, `deepseek-flash` the one row
+that states it) and **off for everything the table does not name**, because the
+two ways of being wrong are not symmetric: a false "on" sends bytes an endpoint
+may reject, which costs the whole turn and the human's money, where a false "off"
+costs an image a human can still ask about by other means.
+
+**Verification.** Each branch was checked by removing it. With `vision_capable`
+answering `true` for everything, `an_image_that_cannot_travel_is_refused_with_the_move_that_can`
+fails on the model's name; with the sniff replaced by an extension check, a png
+named `lies.txt` reads as text and the test fails; with `drop_images` not
+idempotent, the double-save test counts two placeholders. The audit's three
+defects have tests that fail without them (a skipped-file search answers "no
+match"; a missing path answers `no files`; a replaced blob answers "(new)"), and
+the unqueued refusal's test fails on either road being swapped in. What the audit
+verified and found sound is worth as much as its findings: the lock's four
+sentences agree and the road back is findable from the refusal alone, the
+loop-stop message and `count_round` read honestly, the capped-note words name
+real moves, and nothing now claims a road the file tools made obsolete.
+`cargo test` 586 + 147, `fmt` and `clippy` clean; root schemas 5 620 bytes against
+`SCHEMA_TOKENS` 1 900, which is 80 bytes of headroom rather than a comfortable
+margin — recorded so the next sentence that needs bytes arrives with a decision
+attached.
+
+**Census** at `bfa0b12` (`scripts/census.py`, method in §8.5), against §8.35's
+landing (`fd0e615`: total 52,926 · **prod 13,035** · tests 22,988 · comments
+13,604): total 55,072 · **prod 13,773** · tests 23,795 · comments 14,087 — the
+wave is 2,146 lines, 738 of production, 807 of test code, 483 of comment and 118
+blank. The production lines are the file tools and the walker they share, the one
+shape `edit_file` parses, the audit's four sentence repairs and three defects
+(`Matches::skipped`, the path checks, the existence answer), the unqueued
+refusal and the road both sibling sentences now share, the image layer
+(`Image`, the hand-written message serializer, the base64 encoder, `drop_images`,
+the vision lookup), and the producer's sniff, cap and two refusals — which is why
+`SCHEMA_TOKENS` moved once, by the constant's own documented rule. Two agents
+built it: the tools half in this workspace, the image layer in `mush/4`, whose
+brief had to carry every fact about a message layer neither agent could see from
+the other's side — and it came back with three corrections to that brief (a
+field's `serialize_with` cannot see its sibling; the test counts grew the second
+number; `skip_deserializing` is what keeps a session from resurrecting payloads),
+which is the delegation loop working as designed.
