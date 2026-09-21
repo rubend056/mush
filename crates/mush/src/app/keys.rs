@@ -216,7 +216,7 @@ pub const KEYS: &[Binding] = &[
     Binding {
         context: Context::Chat,
         keys: "Backspace / Delete",
-        help: "delete in the box",
+        help: "delete in the box; on an empty box, Backspace pops the newest attachment",
     },
     Binding {
         context: Context::Chat,
@@ -226,7 +226,7 @@ pub const KEYS: &[Binding] = &[
     Binding {
         context: Context::Chat,
         keys: "Esc",
-        help: "clear the box",
+        help: "clear the box and its attachments",
     },
 ];
 

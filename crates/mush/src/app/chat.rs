@@ -1516,12 +1516,11 @@ fn render_message(
             // lines mush writes into a pane, and `mark()` is the one spelling
             // of that mark as it is of every speaker's.
             let (mark, style) = voice.unwrap_or(Voice::Human).mark();
-            // A message that is only an attachment has no words to mark: the
-            // rows below *are* the message, and a bare `you › ` over them would
-            // be a row saying nothing.
-            if !message.text().trim().is_empty() || message.images.is_empty() {
-                marked(out, mark, style, message.text(), width);
-            }
+            // The mark is painted even for a message that is only an
+            // attachment: the `▣` rows below are *what* was said, and the mark
+            // is *who* said it. Without it, a picture the human sent would read
+            // exactly like a dim line of mush's own.
+            marked(out, mark, style, message.text(), width);
             // The images of a live message, one dim row each, named the way the
             // box names them: a picture whose bytes are gone (a trim, a saved
             // session) is a placeholder in the text, and this is the reading of

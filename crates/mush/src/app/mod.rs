@@ -215,12 +215,27 @@ pub fn tokens_label(tokens: usize) -> String {
 /// and that same picture once it is in the conversation must read alike, or the
 /// two surfaces are describing two different things. The format is the mime
 /// without its `image/` head, exactly as a shed payload's placeholder spells it.
+/// The path goes through [`mush_core::text::sanitize`], like every other row a
+/// name reaches: these rows are painted raw, and a file name is the one part of
+/// this label an outside hand wrote.
 pub fn image_label(image: &Image) -> String {
     let format = image.mime.strip_prefix("image/").unwrap_or(&image.mime);
     format!(
         "{} ({format} · {})",
-        image.path,
+        mush_core::text::sanitize(&image.path),
         size_label(image.bytes.len())
+    )
+}
+
+/// The line an image gets when the model is not documented to accept image
+/// parts. One sentence for one fact, because two gates stop a picture on it —
+/// the box that takes the attachment and the wire that sends it — and a human
+/// who meets both must not read two different explanations of the same
+/// refusal.
+fn blind_model_line(model: &str) -> String {
+    format!(
+        "`{model}` is not a model mush knows to accept images — Ctrl-P picks one whose row \
+         documents vision"
     )
 }
 
@@ -1941,6 +1956,21 @@ impl App {
             self.fail(line);
             return Err(line.to_string());
         }
+        // The model can change between the attachment and the `Enter` that
+        // sends it (`Ctrl-P` is a keystroke away), so the gate the box applies
+        // when a picture is attached ([`Self::attach_image`]) is asked again
+        // here, at the wire: an endpoint that never documented image parts may
+        // reject the whole request, which is a turn and the human's money for a
+        // message that was never going to arrive. The refusal changes nothing,
+        // so the caller's box keeps the words and the pictures.
+        if !images.is_empty() {
+            let model = self.cfg().model.clone();
+            if !vision_capable(&model) {
+                let line = blind_model_line(&model);
+                self.fail(&line);
+                return Err(line);
+            }
+        }
         let message = Message::user_with_images(text, images);
         let target = self.tree.focused;
         if target == AgentId::ROOT {
@@ -3126,10 +3156,7 @@ impl App {
             return false;
         }
         if !vision_capable(&model) {
-            self.fail(format!(
-                "`{model}` is not a model mush knows to accept images — Ctrl-P picks one whose \
-                 row documents vision"
-            ));
+            self.fail(blind_model_line(&model));
             return false;
         }
         let label = image_label(&image);
@@ -3139,9 +3166,10 @@ impl App {
         self.chat.attach(image);
         if size > budget {
             self.fail(format!(
-                "{label} is {size} bytes — bigger than the whole {budget}-byte request budget, so \
-                 trim_history sheds its bytes before the model ever looks at it. Downscale it \
-                 (`convert {path} -resize 50% small.png`) and attach that"
+                "{label} is bigger than the whole request budget ({}) — trim_history sheds an \
+                 image's bytes before it drops a turn, so the model would never look at it. \
+                 Downscale it (`convert {path} -resize 50% small.png`) and attach that",
+                size_label(budget)
             ));
             return true;
         }
@@ -5835,11 +5863,14 @@ mod tests {
         assert!(app.chat.attachments().is_empty());
     }
 
-    /// An image-only message is a legal send: the box is empty and Enter still
-    /// sends, because the attachment is the message.
+    /// An image-only message is a legal send — the box is empty and Enter still
+    /// sends, because the attachment is the message — and it is still marked as
+    /// the human's line in the pane: the `▣` row is what was said, the mark is
+    /// who said it.
     #[test]
     fn an_empty_box_with_an_attachment_still_sends() {
         let (mut app, _rx) = test_app("image-only");
+        let_the_model_see(&mut app);
         app.focus = Focus::Chat;
         app.chat.attach(image("shot.png"));
 
@@ -5859,6 +5890,41 @@ mod tests {
             "the attachment went with the send"
         );
         assert!(app.busy(), "and the root is running it");
+
+        let text = shot(&mut app, 120, 32).text();
+        assert!(text.contains("you ›"), "the speaker mark: {text}");
+        assert!(text.contains("▣ shot.png (png · 8 B)"), "{text}");
+    }
+
+    /// The vision gate holds at the wire, not only at the box: a model can be
+    /// switched (`Ctrl-P`) between the attachment and the `Enter` that sends
+    /// it, and a model mush does not know to see must not be handed image
+    /// parts for the endpoint to reject — a turn and the human's money. The
+    /// refusal changes nothing, so the words and the picture are still there.
+    #[test]
+    fn a_model_switched_after_the_attach_is_refused_at_the_wire() {
+        let (mut app, _rx) = test_app("switch-model");
+        let_the_model_see(&mut app);
+        app.chat.attach(image("shot.png"));
+        app.chat.insert("look at this");
+
+        app.cell.edit(|cfg| cfg.set_model("test-model"));
+        app.send_message();
+
+        assert!(
+            app.chat.transcript(AgentId::ROOT).is_empty(),
+            "nothing that did not run is in the conversation"
+        );
+        assert_eq!(
+            app.chat.input().text(),
+            "look at this",
+            "the words went back"
+        );
+        assert_eq!(app.chat.attachments().len(), 1, "and so did the picture");
+        let (line, kind) = app.status_line().expect("the refusal");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("test-model"), "the model is named: {line}");
+        assert!(line.contains("Ctrl-P"), "and the road is: {line}");
     }
 
     /// The delivered message carries its images, on both roads: a root run

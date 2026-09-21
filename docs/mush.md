@@ -251,10 +251,12 @@ the images riding in it exactly as they ride in a tool result. Two facts can
 refuse an attachment before it is sent — no model at all, and a model the
 provider table does not document as accepting image parts (`Ctrl-P` is the road
 named) — because an endpoint that may reject image parts must not cost a turn
-to discover it. These are the same facts that decide whether a `read_file`
-image travels; the human's gate is the one that keeps the path as text instead
-of dropping the gesture, and the clipboard's is the one that has no path to
-keep.
+to discover it. The second is asked twice, at the box that takes the attachment
+and again at the wire that sends it: `Ctrl-P` can change the model in between,
+and what must never reach a model that cannot see is the *message*. These are
+the same facts that decide whether a `read_file` image travels; the human's gate
+is the one that keeps the path as text instead of dropping the gesture, and the
+clipboard's is the one that has no path to keep.
 
 A third fact is said but does not refuse: an image bigger than the whole
 `Config::history_budget()` attaches, with the line that says `trim_history`
