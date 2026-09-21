@@ -1231,7 +1231,7 @@ pub fn revive(
     if messages.is_empty() && !brief.is_empty() {
         transcript.push(Message::user(brief));
     } else {
-        transcript.extend(messages);
+        transcript.extend(adopted(messages));
     }
     // It comes back at rest, not running: a restart is not a request. Starting
     // a run here replayed every restored agent's task against the endpoint the
@@ -1480,6 +1480,22 @@ fn fold_parked(
     Some(last)
 }
 
+/// A conversation the actor did not build, repaired before it becomes this
+/// actor's own: the transcript the UI stores, and the one a restart restores.
+///
+/// Both shapes a strict server rejects arrive through these doors — a call
+/// whose result was never recorded (the process went away between the
+/// assistant's message and its results) or the human's own words between a call
+/// and them (they typed while the tools ran) — and a door that forgets is a
+/// request the endpoint answers with a complaint about `tool_call_ids` instead
+/// of with work. The fold is the sharpest reader of that, because a `/compact`
+/// on a restored agent is the first request the stored conversation ever
+/// travels in; one helper, so no door can repair differently from another.
+fn adopted(mut messages: Vec<Message>) -> Vec<Message> {
+    repair_tool_pairs(&mut messages);
+    messages
+}
+
 /// What a command means for an actor that is not running.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 enum Fold {
@@ -1514,8 +1530,11 @@ fn absorb(
             // delivered whatever completion lines it carries (the model reads
             // them there), so the pending-completion step below cannot inject
             // the same news twice; anything it cannot know about is still
-            // ours to announce.
-            *transcript = messages;
+            // ours to announce. The hand-over is repaired before anything reads
+            // it: what the UI stored can interleave the human's steering with a
+            // tool batch, or hold a call whose run never recorded a result (see
+            // [`adopted`]), and a strict server rejects both shapes.
+            *transcript = adopted(messages);
             // A nudge parked here is already in that transcript — the UI echoes
             // every human message before sending it — so keeping the copy would
             // hand the model the same words twice at the next boundary. (That is
@@ -1529,10 +1548,6 @@ fn absorb(
             state
                 .deferred
                 .retain(|command| !matches!(command, AgentMsg::Nudge(_) | AgentMsg::Run(_)));
-            // The human may have typed while a tool batch was running, which
-            // puts their words between an assistant's calls and their results;
-            // strict servers reject that shape.
-            repair_tool_pairs(transcript);
             // Which run each line is asked about is the completion's own run:
             // a transcript that carries the line for the *current* record has
             // read that record, and one that carries an older line has not. The
@@ -1608,9 +1623,13 @@ fn absorb(
             // An actor restored from a session starts with no transcript — the
             // UI holds the conversation until the human's next message hands it
             // over. A fold is not a run, so this is that hand-over: without it
-            // the command folded nothing and said nothing.
+            // the command folded nothing and said nothing. It is repaired like
+            // every hand-over ([`adopted`]): the summarize request is the first
+            // one the stored conversation ever travels in, so a call left
+            // dangling by the process that wrote the file is exactly what the
+            // endpoint would refuse here.
             if transcript.is_empty() {
-                *transcript = messages;
+                *transcript = adopted(messages);
             }
             state.compact_requested = true;
             Fold::Idle
@@ -10972,6 +10991,100 @@ mod tests {
             asked[0].saw("the old task"),
             "the fold is of the conversation the request carried"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A stored conversation arrives in whatever shape the process that wrote
+    /// it left behind: a call whose result was never recorded (the run was cut
+    /// off between the assistant's message and its results), and the human's
+    /// own words between a call and the results (they typed while it ran). A
+    /// fold is the first request a restored transcript ever travels in, and a
+    /// strict endpoint rejects both shapes with a complaint about
+    /// `tool_call_ids` — so the hand-over repairs them, exactly as a `Run` does.
+    #[test]
+    fn a_compact_request_repairs_the_call_pairs_a_stored_transcript_is_missing() {
+        let root = scratch_dir("compact-repaired");
+        let summary = "the task and where it got to";
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        let calls = |id: &str| Message {
+            role: "assistant".to_string(),
+            tool_calls: Some(vec![tool_call(
+                id,
+                "run_command",
+                json!({ "command": "true" }),
+            )]),
+            ..Default::default()
+        };
+        // No `Run` first: this is the actor a restart leaves behind, and the
+        // transcript is one a process that went away mid-batch would write —
+        // one call answered late, one never answered at all.
+        root_tx
+            .send(AgentMsg::Compact(vec![
+                Message::system("you are mush"),
+                Message::user("the old task".to_string()),
+                calls("call_1"),
+                Message::user("typed while the batch ran".to_string()),
+                calls("call_2"),
+                Message::tool("call_2", "the result"),
+                Message::assistant("done"),
+            ]))
+            .unwrap();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| !seen.summaries.is_empty()),
+            "the fold must run on the stored transcript: {seen:?}"
+        );
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 1, "one summarize call");
+        // Every call in the request is answered by the message right after its
+        // batch, in the call's own id order: the shape a strict server accepts.
+        let messages = &asked[0].messages;
+        let mut index = 0;
+        while index < messages.len() {
+            let batch = messages[index].tool_calls();
+            if batch.is_empty() {
+                index += 1;
+                continue;
+            }
+            for (offset, call) in batch.iter().enumerate() {
+                let answer = &messages[index + 1 + offset];
+                assert_eq!(
+                    answer.role, "tool",
+                    "call {} is answered right after its batch: {messages:?}",
+                    call.id
+                );
+                assert_eq!(answer.tool_call_id.as_deref(), Some(call.id.as_str()));
+            }
+            index += 1 + batch.len();
+        }
+        // The unanswered call got the sentence a missing result is given, not
+        // silence; the answered one kept its own result; and the human's words
+        // still reached the model, after the batch they interrupted.
+        assert!(
+            messages.iter().any(|message| message
+                .tool_call_id
+                .as_deref()
+                .is_some_and(|id| id == "call_1")
+                && message.text().contains("no result was recorded")),
+            "the dangling call is answered: {messages:?}"
+        );
+        assert!(messages
+            .iter()
+            .any(|message| message.role == "tool" && message.text() == "the result"));
+        assert!(asked[0].saw("typed while the batch ran"));
         let _ = fs::remove_dir_all(&root);
     }
 
