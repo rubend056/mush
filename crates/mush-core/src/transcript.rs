@@ -74,6 +74,13 @@ pub fn needs_compaction(messages: &[Message], budget_bytes: usize) -> bool {
 /// interrupted before it recorded a result. Strict servers reject both shapes,
 /// so pull every batch's results back beside the assistant message that asked
 /// for them, then answer whatever is still missing.
+///
+/// The other direction of the same pair is repaired too: a result whose call is
+/// not there. An old session can hold one — saved before every call had an id,
+/// so its `tool_call_id` is the empty string beside a call the deserializer has
+/// since named `call_0` — and a second result for a call already answered is
+/// the same shape to a strict server. Nothing can be said to the model about a
+/// call it cannot see, so those are dropped ([`drop_orphan_results`]).
 pub fn repair_tool_pairs(messages: &mut Vec<Message>) {
     let mut index = 0;
     while index < messages.len() {
@@ -131,6 +138,46 @@ pub fn repair_tool_pairs(messages: &mut Vec<Message>) {
         }
         index = insert_at;
     }
+    drop_orphan_results(messages);
+}
+
+/// Keep only the `tool` messages that answer the batch right above them.
+///
+/// [`repair_tool_pairs`] guarantees every call has a result; this guarantees
+/// the other direction. A result whose call is gone is what an old session
+/// holds where its calls had no ids yet (the call is renamed `call_0` on the
+/// way in, the result still says `""`), and a second result for one call is
+/// what a hand-edited file grows; both are rejected by a strict server as
+/// firmly as a dangling call, and neither can be explained to a model that
+/// cannot see the call it names. Each accepted result consumes its call, so a
+/// duplicate has nothing left to answer.
+fn drop_orphan_results(messages: &mut Vec<Message>) {
+    let mut batch: Vec<String> = Vec::new();
+    let mut kept: Vec<Message> = Vec::with_capacity(messages.len());
+    for message in messages.drain(..) {
+        if message.role == "assistant" {
+            batch = message
+                .tool_calls()
+                .iter()
+                .map(|call| call.id.clone())
+                .collect();
+        } else if message.role == "tool" {
+            let answered = message
+                .tool_call_id
+                .as_deref()
+                .and_then(|id| batch.iter().position(|call| call == id));
+            match answered {
+                Some(at) => {
+                    batch.remove(at);
+                }
+                None => continue,
+            }
+        } else {
+            batch.clear();
+        }
+        kept.push(message);
+    }
+    *messages = kept;
 }
 
 /// A model occasionally emits `tool_call` arguments that are not valid JSON.
@@ -518,6 +565,33 @@ mod tests {
         );
         assert!(messages[3].text().starts_with("error:"));
         assert!(messages[4].text().starts_with("error:"));
+    }
+
+    /// The other half of a stored pair: a result whose call is not there. A
+    /// session saved before every call had an id holds `tool_call_id: ""`
+    /// beside a call the deserializer has since named `call_0`; a duplicate
+    /// answer is the same shape to a strict server. Neither can be explained to
+    /// a model that cannot see the call, so both are dropped and the valid pair
+    /// is left exactly as it was.
+    #[test]
+    fn a_result_whose_call_is_gone_is_dropped() {
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("task"),
+            assistant_calling(&["a"]),
+            Message::tool("", "the result of a call this file lost"),
+            Message::tool("a", "result a"),
+            Message::tool("a", "the same answer twice"),
+            Message::user("next"),
+        ];
+        repair_tool_pairs(&mut messages);
+
+        assert_eq!(
+            roles(&messages),
+            ["system", "user", "assistant", "tool", "user"]
+        );
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("a"));
+        assert_eq!(messages[3].text(), "result a");
     }
 
     /// An already-valid transcript must come out byte-for-byte unchanged.

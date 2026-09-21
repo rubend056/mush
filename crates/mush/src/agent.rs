@@ -6255,6 +6255,11 @@ mod tests {
         let fresh = vec![
             Message::system("you are mush"),
             Message::user("task"),
+            // The results need the batch that asked for them: adoption drops a
+            // `tool` message whose call is not above it, exactly as a strict
+            // server would reject one, and the scan these lines feed reads what
+            // a real session stores.
+            assistant_calling(&["a", "b", "c"]),
             Message::tool("a", "#2 failed: no route"),
             Message::tool("b", Outcome::Stopped.line(3)),
             Message::tool("c", Outcome::CutOff.line(4)),
