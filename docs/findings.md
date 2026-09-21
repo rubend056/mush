@@ -54,15 +54,20 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   the book. Only `ChildBook` clears a tombstone — a row handed back is proof the
   forget is stale.
 - **H20** — the sentences the model is told that are **not** true, where the fix
-  is wording in `crates/mush-core/src/prompt.rs` (§8.27 items 2, 5, 9, and the
-  `status` schema's "title" in item 1). The human owns that file, so the four are
-  recorded rather than edited: `wait`'s 600 s cap and its early release, what a
-  job's result actually is (its one line, not its window), the 120 s kill when
-  the job budget is full and the 8 MiB output ceiling, and the title a running
-  child does not have. The code half of items 1, 3, 4, 6, 7 and 8 landed in
-  `ff315d8` (`mush/87`), item 10 in `f34c4de` (`mush/88`) — see §8.29. A second
-  wording item the wave added: the `edit_file` schema declares `replace_all` only
-  inside `edits` items, though the code now honours a top-level one (item 3).
+  is wording in `crates/mush-core/src/prompt.rs` (the `status` schema's "title"
+  in §8.27 item 1, items 5 and 9, and the `edit_file` schema's top-level
+  `replace_all` in item 3). The human owns that file, so these are recorded
+  rather than edited: the title a running child does not have, what a job's
+  result actually is (its one line, not its window), the 120 s kill when the
+  job budget is full and the 8 MiB output ceiling, and `replace_all` declared
+  inside `edits` items only. Item 2 — `wait`'s 600 s cap and the early release a
+  message causes — landed with §8.35 (`5eba64a`), because the wait the lock
+  refusal now points at had to say what it is; the same section's audit
+  (`4aad8a7`) fixed five sentences that named that wait, and left one recorded:
+  `exclusive`'s "Siblings are refused, not interleaved" is true of every
+  subagent's command and merely silent about the root's exemption, so it is
+  incomplete rather than false. The code half of items 1, 3, 4, 6, 7 and 8
+  landed in `ff315d8` (`mush/87`), item 10 in `f34c4de` (`mush/88`) — see §8.29.
 - **H21** — a reclaimed branch was called "merged into HEAD" whatever it was: a
   read-only child that never committed, and a nested child whose work went into
   its *parent's* branch, both landed on the row as a merge into HEAD. Fixed in
@@ -286,7 +291,7 @@ cheap.
 | H10 | **Worktrees and branches accumulate and nothing prunes them.** Twenty-two were live at the end, most finished and merged; `/worktrees` also claims "none" while one is on disk (`P10`). | Disk, and two audits that counted the source twice until it was cleaned. | ✅ for discovery (`e63a84c`): a worktree git says is gone gets no row. **Still owed is a `mush prune`** — nothing reclaims a finished, merged worktree and its branch — and the `/worktrees` reporter that once counted what was on disk was deleted in `ad5b791` (§8.17) |
 | H11 | **Docs and code drift silently, and the drift *is* a finding.** One wave left `docs/mush.md`'s key table, §4.5's glyphs, §4.6 in full, §8's deadline and §9's milestones stale, plus `docs/refactor.md`'s checklist statuses; every reviewer spent budget on it and one fix wave existed only for sentences the docs asserted. | Repeated re-derivation, and a doc-sync wave owed at the end of every wave. | ✅ in practice, not by a test: this file's one row per finding is the status record, and each wave's `Record …` commit moves it in the same commit as the code |
 | H12 | **Context and reply caps were the quiet bottleneck.** A 20 480 reply cap truncated real work mid-task (`U9`), and several agents burned turns on runaway guards and compaction instead of the task. | Several runs cut off mid-edit. | ⬜ still owed: per-agent token accounting (`M6`, §11.2), so a run's cost is visible while it is spent; the shipped defaults are done (`U9`) |
-| H13 | **The exclusive machine lock is machine-wide, and a refused command is a trap.** The harness's lock is taken by a *command* (`exclusive=true`), which the tool's own guidance recommends "for anything timing- or port-sensitive" — and every review brief flags the 60fps frame test as load-sensitive, so a reviewer takes it to get one clean number. While it is held, every sibling's command *and the orchestrator's own* is refused ("#N holds the machine; retry when it finishes"); the refusal is an **error, not a queue**, so an agent that retries it is doing exactly what `LOOP_ROUNDS` counts, and mush's own guard then kills the run: `#65` and `#66` died mid-work this way, and the orchestrator could not even read a file for the duration. | Two agents' runs lost (one integrator, one fixer), a stalled wave, and an orchestrator blind at a moment it had to inspect. | ✅ all three (`4cb4739`, `1df1a53`): a refusal before anything ran is `ToolError::Refused` and never a loop round, the refusal names the holder and says not to retry in a loop, a sibling's command queues for the lock (bounded at 30 s, cancel-aware), and the root is exempt from a lock it did not take and is told it ran beside `#N`'s exclusive command. A root *exclusive* command is still refused — two claims to own the machine is what the lock prevents |
+| H13 | **The exclusive machine lock is machine-wide, and a refused command is a trap.** The harness's lock is taken by a *command* (`exclusive=true`), which the tool's own guidance recommends "for anything timing- or port-sensitive" — and every review brief flags the 60fps frame test as load-sensitive, so a reviewer takes it to get one clean number. While it is held, every sibling's command *and the orchestrator's own* is refused ("#N holds the machine; retry when it finishes"); the refusal is an **error, not a queue**, so an agent that retries it is doing exactly what `LOOP_ROUNDS` counts, and mush's own guard then kills the run: `#65` and `#66` died mid-work this way, and the orchestrator could not even read a file for the duration. | Two agents' runs lost (one integrator, one fixer), a stalled wave, and an orchestrator blind at a moment it had to inspect. | ✅ all three (`4cb4739`, `1df1a53`): a refusal before anything ran is `ToolError::Refused` and never a loop round, the refusal names the holder and says not to retry in a loop, a sibling's command queues for the lock (bounded at 30 s, cancel-aware), and the root is exempt from a lock it did not take and is told it ran beside `#N`'s exclusive command. A root *exclusive* command is still refused — two claims to own the machine is what the lock prevents. The refusal's road back landed later (§8.35, `5eba64a`): a subagent's `wait` blocks while another agent holds the machine, so "try once after it finishes" became an instruction a model can actually follow — the wait the first three fixes could only say was missing. The sentences around that wait were audited in the same wave (`4aad8a7`): the timeout names `control stop #N` when the holder is the asker's own child, the root's wait is said not to block, and the refusal says the road back can be two waits, because one with an unread result to hand over comes back holding the lock |
 | H14 | **A run stopped as a loop cannot be resumed.** `Ctrl-C`-stopped agents resume when you message them (that is the promise on the row: `stopped · re-send to resume`), but two loop-stopped agents (`✗ the run was stopped as a loop: the same tool call repeated 6 times with nothing changed in between`) re-stopped **immediately and identically** on the nudge — so the one place a human would first try to recover is where resuming does not work. Either the repeated call is still in the window the guard counts, or the resumed run's first call is counted against the old rounds; either way the orchestrator had to spawn a fresh agent with a rebuilt brief (cheap only because the dead one's work had already been committed — `c3f5984`). | Two agents re-spawned instead of nudged; the loop-stop's own advice ("re-send to resume") is unactionable. | ✅ (`4cb4739`): a loop-stop records the count it stopped at, and the next run opens with the guard's own words, so a nudge resumes it (`a_loop_stopped_run_resumes_with_a_warning`) |
 | H15 | **`wait_agents` answers from history, and nothing says what a wait releases.** After the crash the orchestrator re-spawned six children; its first `wait_agents` (no ids, a long timeout) returned the summary of `#10` — a child of the *previous* process, finished before it died — which reads exactly like a live completion. Spooked, it then named one id, and `ids=[…]` means "wait only for that one", the opposite of the intent (be woken by *any*). The tool's own description calls the answer "its summary" and never states the release rule, so the call has to be reasoned out from the implementation: no ids = first finish, `ids` = only those, `all` = every child, `timeout` = a bound. | A blind 900 s wait while two children were dead, and one result that reported the past as if it were news. | ✅ (`4cb4739`): `status` is a bounded listing (`Outcome::digest`; `✉` marks a result nobody has read), an unread result comes over in full where an already-read one is a digest, and the descriptions state the release rule — later narrowed again by the twelve-to-six cut (`ba04c49`), where `wait` takes no arguments and releases when every child and every job the agent owns has finished |
 
@@ -983,7 +988,7 @@ mismatches below are code facts.
 | # | what is false | disposition |
 |---|---|---|
 | 1 | `status` promises "each child's state and title or branch" while a running child prints only `#3 ◐ running` — no title (it lives in the UI tree) and no branch | ✅ `ff315d8` (`mush/87`): print the branch when mush can name it (an isolated child's is `mush/<id>`); no title source invented. The schema sentence is `prompt.rs` (H20) |
-| 2 | `wait` "blocks until everything you own has finished" — it gives up at 600 s and any message ends it early, and the context says neither | ⬜ the human's file (`prompt.rs`): name the cap, the timeout sentence and the early release |
+| 2 | `wait` "blocks until everything you own has finished" — it gives up at 600 s and any message ends it early, and the context says neither | ✅ `5eba64a` (§8.35): the schema owns the machine clause, the 10-minute cap and the early release, and `SCHEMA_TOKENS` moved for it (1200 → 1300) |
 | 3 | `edit_file`'s description offers a top-level `replace_all`; only `edits[].replace_all` is read, so the refusal tells the model to set the flag it just set | ✅ `ff315d8` (`mush/87`), fixed in code: the single-pair path honours a top-level `replace_all`. The schema's `properties` are still `prompt.rs` (H20) |
 | 4 | **`exclusive=true` is not exclusive against its own owner.** `machine_free_for` answers `Ok` for the holder, `take_machine` then overwrites the record that names the exclusive job with a `(agent, command, None)`, and that call's release frees the machine while the job still runs — so a sibling's benchmark is admitted beside it. The promise ("Siblings are refused, not interleaved") silently stops holding | ✅ `ff315d8` (`mush/87`): `take_machine` refuses **any** existing holder (it is the record's only writer), and an exempt non-exclusive call leaves the record alone. The sentence for the holder's own second claim — deleted by `2c6b53f` as unreachable, which is what made the bug invisible — is back |
 | 5 | a job's result is not handed over "in full": `wait`'s digest carries the job's one-line report, whose output is `preview_tail`'s last 400 chars of a 2 KB window | ⬜ the human's file (`prompt.rs`): say what a job's result is |
@@ -1688,3 +1693,166 @@ across two trees — H28.
 22,506 · comments 13,326. The wave's 1,350 lines are 186 of production and 670 of
 test code: three messages, one tombstone and ten tests, wrapped in the prose that
 says which fact lives where.
+
+---
+
+## 8.35 Two the models said out loud: a fold that 400s, and a lock with no wait (`ad06be5`, `b91d836`, `13a337d`, `5eba64a`, `602515c`, `4aad8a7`)
+
+Neither row came from a reader of the source; both are the human watching the
+models and reporting what came back. That is the register's whole value: one is
+a provider error on a *stored* session, the other is a model saying it had
+nothing to do.
+
+**A `/compact` on an old session was rejected for its tool calls (`ad06be5`).**
+The session had not been opened for days; the fold went out and the provider
+answered `An assistant message with tool calls must be followed by tool call
+ids`. A stored conversation can hold both shapes a strict server rejects — a
+call whose result was never recorded (the process went away between the
+assistant's message and its results) and the human's own words between a call
+and them (they typed while the tools ran) — and `repair_tool_pairs` was applied
+at exactly one door: `AgentMsg::Run`, the hand-over a *message* makes. A
+`/compact` on a restored actor is the other door, and it is the sharper one: the
+fold is not a run, so the stored conversation travels in its first request
+there, with nothing in between to repair it. `revive` — a child's stored
+messages, restored after a restart — was the third. The rule now has one home,
+`adopted`: every conversation the actor did not build is repaired before it
+becomes the actor's own, and the three doors call it. The test hands the fold a
+transcript with one dangling call and one result interleaved behind the human's
+words, and asserts every batch in the summarize request is answered, in id
+order, immediately after the message that asked; on a tree where `adopted` does
+not repair, it fails with the request's next message reading `user` where it
+must read `tool`.
+
+**And the other half of the pair (`b91d836`, `13a337d`).** A pre-`1b70096`
+session holds `tool_call_id: ""` beside a call the deserializer has since
+renamed `call_0`, so answering the call alone would leave a `tool` message that
+answers nothing — the same 400, one message along. `repair_tool_pairs` now
+rebuilds each block instead of only re-ordering one: a result whose call is not
+in the batch above it is dropped (a duplicate answer is the same shape, and each
+accepted result consumes its call), while a result whose id names no call
+*anywhere* in the transcript is the legacy shape of the same pair and is
+re-pointed at the call in its block still waiting for one. Nothing can be
+explained to a model about a call it cannot see — but the first shape alone,
+which is where this wave started, threw away the model's real output and
+answered the call with a made-up `error: no result was recorded for this call`:
+a restored old session would have read a lie where the file held `test result:
+ok`. Position is the only evidence a session without ids has, and the block is
+the position. The two halves are pinned by the direction each can fail in: with
+the adoption pass off, the legacy test reads the synthetic error; with its guard
+off (any unanswered call adopting any leftover result), the misplaced-result
+test hands a late result to the wrong call.
+
+**A locked-out subagent had no way to wait, and the refusal said so
+(`5eba64a`).** The sentence a sibling read was `#3 holds the machine with an
+exclusive command (…); this call queued and the lock was still held — do not
+retry in a loop; do other work and try once after it finishes (no tool can wait
+on another agent's job)`. H13's third fix added the bounded queue and the honest
+refusal, but honesty was all it was: "do other work" is not an instruction a
+model can follow when every command it has needs the shell, and "(no tool can
+wait…)" names the absence rather than a way round it. The models said as much:
+*my only way to wait is by executing tools and I can't wait.*
+
+`wait` is now that wait. For every agent but the root — which is exempt from the
+lock and works beside a holder, so blocking the orchestrator would be H13's
+blindness again — `wait` blocks while another agent holds the machine:
+`machine_wait` (a sibling's `Held`) is what keeps it waiting, and the release is
+answered with `the machine is free now — #3's exclusive command (cargo bench)
+ended; the call that was refused for the lock can run`. A hold that outlasts the
+10-minute wait names the holder and what is left of the call: `control stop #N`
+when the holder is the asker's own child (which is why that branch exists at
+all), and otherwise the two moves left — work that needs no shell, or finish the
+run and say you are blocked.
+
+The rule's first shape asked what the agent *owned*, and got the sharp edge
+wrong twice (`602515c`): a model that had read everything it owned could never
+reach the machine wait at all — one finished job locked it out for good, which
+its own test only exposed by marking a child's result delivered — and a result
+nobody had read would have been parked behind a sibling's benchmark. So an
+unread result is handed over first, whatever the machine is doing (a wait is
+what a model does when it wants a result), and everything else a digest carries
+— an already-read body, a job's line — is a recap the transcript already holds,
+which is not a reason to refuse to wait. When the hold does outlive the result,
+it is named beside it (`machine_held`), so the next call is not a blind retry. A
+machine timeout rides along with any unread result the way its own-work timeout
+always has (`with_digest`), and a recap the call was holding rides along with
+the `machine is free` sentence.
+
+The surfaces that say it cannot disagree: `MACHINE` owns how to work (the
+refusal has a road back; never retry a refused call in a loop), `wait`'s schema
+owns what the call covers (an unread result first, the machine, the 10-minute
+cap, the early release), and `jobs.rs` owns the refusal — which now sends the
+model to `wait` instead of to a retry. `SCHEMA_TOKENS` moved 1200 → 1300 for the
+contract the schema grew, by the constant's own documented rule rather than as a
+silent overshoot; that also closes audit item 2 (H20).
+
+**What the read-only audit found, which the patch did not (`4aad8a7`).** A
+child read the landing against the code and found the new road described by five
+sentences that said more than it does — H20's class exactly, and the reason a
+wave that *adds* a road owes a read of every sentence that names it:
+
+- the machine timeout told every holder "nothing you can call ends it", which is
+  false of exactly one holder: this agent's own child. `control stop` on a child
+  lands as `kill_owned`, which kills the job holding the lock, so the sentence
+  names that call when the holder is a child, and keeps the two remaining moves
+  (work without the shell, or end the run and say you are blocked) for the holds
+  no call reaches;
+- the `MACHINE` block promised a blocking wait to every reader, and the
+  *root*'s never blocks — it is exempt from a lock it did not take and works
+  beside the holder. The clause is scoped to a subagent, and the exemption
+  sentence now says the wait with it;
+- the refusal's road back was stated as one wait, and an agent with a result
+  nobody has read gets that result *first*, with the lock still held
+  (`machine_held`), so the second wait is the one that waits the hold out — the
+  refusal and the block both say so, while what a wait hands over, and in which
+  order, stays the schema's fact rather than becoming a second home for it;
+- `wait`'s schema said "Returns at once when there is nothing to wait for", which
+  the agent the refusal just sent there reads as "…and I own no children and no
+  jobs, so it comes straight back". The phrase now names the lock too: no
+  children, no jobs, no other agent holding the machine;
+- the interrupted-wait sentence said "your work is still running" of a wait the
+  machine alone was keeping alive; it now names what the wait was for, the work
+  when there is any and the holder otherwise.
+
+Each of the five is pinned by a test that fails with its branch removed. The
+rest of the audit's answers were clean: no production path emits a result with no
+batch above it, the three adoption doors are the complete set, and the arms
+`Repair` calls unreachable still are. The one wording item left standing is
+`exclusive`'s "Siblings are refused, not interleaved": true of every subagent's
+command, merely silent about the root's exemption — incomplete rather than false,
+and recorded in H20 rather than paid for out of the schema's byte budget (3,884
+of 3,900 bytes at this landing).
+
+**Verification.** Every fix was checked by breaking it, the way the rows in this
+file demand. With `adopted` not repairing, the new compact test fails with the
+request's second message reading `user` where it must read `tool`; with the
+adoption pass in `repair_tool_pairs` off, the legacy test reads `error: no result
+was recorded` where the file holds `test result: ok`; with the guard on that pass
+off, the misplaced-result test hands a late result to the wrong call; with
+`machine_wait` answering `None`, five fail — the release line is never produced,
+the machine timeout never names the holder, an unread result no longer outranks
+the machine, a recap takes the wait away from it, and an interrupted wait has no
+holder to name. Four limits are pinned in their own tests, unchanged by the wave:
+the root's wait does not block on a sibling's lock, an unread result is handed
+over before the machine is waited out, a read recap does not take the wait away
+from the machine, and the holder's own second exclusive claim still does not
+queue. Two of them fail in the opposite direction, which is the point of them:
+with `machine_wait` answering `None` the *root* test still passes, and it is the
+one test that fails when the exemption is taken out of `machine_wait` (a
+sibling's `Held` for agent 0 too) — the exemption is the road that test exists
+for, not the absence of the wait. The audit's two branches fail their own tests
+when removed: `mine` false loses the `control stop` sentence, and the old `still`
+clause claims running work for a wait the machine was keeping alive. `cargo test`
+574 + 136, `fmt` and `clippy` clean.
+
+**Census** at `4aad8a7` (`scripts/census.py`, method in §8.5), against the merge
+§8.34 closed on (`a954358`: total 51,967 · **prod 12,874** · tests 22,506 ·
+comments 13,326): total 52,782 · **prod 13,024** · tests 22,922 · comments
+13,540 — the wave is 815 lines, 150 of production, 416 of test code, 214 of
+comment and 35 blank. The production lines are the three adoption doors, the
+re-point pass in `repair_tool_pairs`, the machine wait and the sentences around
+it (`machine_wait`, `holding`, `free`, `held`, `timed_out` and its two branches),
+the two refusals' new words, and the `MACHINE` block and the `wait` schema —
+which is why `SCHEMA_TOKENS` moved 1200 → 1300, by the constant's own documented
+rule rather than as a silent overshoot. The wave's first landing (`602515c`) was
+535 lines; the read-only audit cost the other 280, and bought five sentences that
+had said more than the code does.
