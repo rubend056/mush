@@ -271,6 +271,18 @@ impl Message {
         }
     }
 
+    /// The human's own message when it carries images: the words they typed,
+    /// and the pictures they attached. The counterpart of
+    /// [`Self::tool_with_images`] and the same reason for existing — the text
+    /// part comes first and one `image_url` part follows each image, and the
+    /// one place that order is built is here.
+    pub fn user_with_images(text: impl Into<String>, images: Vec<Image>) -> Self {
+        Self {
+            images,
+            ..Self::user(text)
+        }
+    }
+
     pub fn text(&self) -> &str {
         self.content.as_deref().unwrap_or("")
     }
@@ -442,6 +454,23 @@ fn base64_encode(bytes: &[u8]) -> String {
         }
     }
     out
+}
+
+/// Words become a **user** message, because that is the only speaker words
+/// without a role can be: a nudge the human typed, a brief a test hands an
+/// actor. It exists so the call sites that used to pass a bare `String` — the
+/// nudge road, which grew images and is a [`Message`] now — read as the message
+/// they always were rather than as a conversion each one spells out.
+impl From<&str> for Message {
+    fn from(text: &str) -> Self {
+        Self::user(text)
+    }
+}
+
+impl From<String> for Message {
+    fn from(text: String) -> Self {
+        Self::user(text)
+    }
 }
 
 #[derive(Serialize)]
@@ -812,6 +841,35 @@ mod tests {
             serde_json::to_string(&wordless).unwrap(),
             r#"{"role":"tool","content":[{"type":"image_url","image_url":{"url":"data:image/png;base64,//4="}}],"tool_call_id":"call_0"}"#
         );
+    }
+
+    /// The human's own message is built the same way a tool result is, from
+    /// the one constructor that owns the text-then-images order — and a plain
+    /// user message still goes out as the spec's JSON string, byte for byte as
+    /// it always did.
+    #[test]
+    fn a_user_message_with_images_is_the_vision_content_array() {
+        let message = Message::user_with_images("what is this?", vec![tiny_image()]);
+        assert_eq!(message.role, "user");
+        assert_eq!(
+            serde_json::to_string(&message).unwrap(),
+            r#"{"role":"user","content":[{"type":"text","text":"what is this?"},{"type":"image_url","image_url":{"url":"data:image/png;base64,//4="}}]}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&Message::user("just words")).unwrap(),
+            r#"{"role":"user","content":"just words"}"#,
+            "no images, no content array"
+        );
+    }
+
+    /// Words become a user message wherever words become a message: the nudge
+    /// road passes a [`Message`] now, and `.into()` is how a test or a caller
+    /// that holds only words spells it.
+    #[test]
+    fn words_convert_to_a_user_message() {
+        assert_eq!(Message::from("hi").text(), "hi");
+        assert_eq!(Message::from(String::from("hi")).text(), "hi");
+        assert_eq!(Message::from("hi").role, "user");
     }
 
     /// The request struct carries `&[Message]` and nothing else: an image rides
