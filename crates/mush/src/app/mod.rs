@@ -7389,7 +7389,8 @@ mod tests {
     /// A run parked in a wait is not a model call. The transcript foot's
     /// spinner may only claim work in flight, so `wait` must not paint
     /// `working…` over an agent that is waiting for a child's result — and the
-    /// row says what it is waiting for instead (finding U7).
+    /// row says what it is waiting for instead (finding U7), with an icon that
+    /// is not the working one (finding U14).
     #[test]
     fn a_waiting_agent_is_not_drawn_working() {
         let (mut app, _rx) = test_app("waiting-foot");
@@ -7403,10 +7404,17 @@ mod tests {
             !rows.join("\n").contains("working…"),
             "nothing is being computed, so nothing spins: {rows:?}"
         );
-        assert!(
-            rows.iter().any(|row| row.contains("waiting on results 5s")),
-            "the row says what it is waiting for: {rows:?}"
-        );
+        let waiting = rows
+            .iter()
+            .find(|row| row.contains("waiting on results 5s"))
+            .unwrap_or_else(|| panic!("the row says what it is waiting for: {rows:?}"));
+        // The icon is the surface a glance reads, so it says the same thing the
+        // words do: an hourglass, never the working `◐` (finding U14).
+        assert!(waiting.contains("⧗ #0"), "{waiting:?}");
+        assert!(!waiting.contains('◐'), "{waiting:?}");
+        // And the count above it agrees: waiting is not working.
+        assert!(rows[0].contains("1 waiting"), "{}", rows[0]);
+        assert!(!rows[0].contains("working"), "{}", rows[0]);
 
         // A model that really has not answered still says so: the point is the
         // distinction, not the silence.
@@ -7418,6 +7426,7 @@ mod tests {
             "{rows:?}"
         );
         assert!(rows.join("\n").contains("working…"), "{rows:?}");
+        assert!(rows[0].contains("1 working"), "{}", rows[0]);
     }
 
     /// `/notes` is the other half of the cap: the lines the foot ceded are read
@@ -10950,6 +10959,12 @@ mod tests {
         });
         app.tree.activity(AgentId(1), "wait 3s");
         app.tree.activity(AgentId(2), "read_file deep.txt 2s");
+        // Two facts, deliberately different: `busy_counts` is "a run is in
+        // flight" — child #1's is, it is parked in a `wait` and will finish and
+        // report — while the title counts who is *computing*: the root is
+        // napping, #1 is parked on its own child, and only #2 is working
+        // (findings U2, U14).
+        let roster = app.tree.roster();
         assert_eq!(
             (
                 app.tree
@@ -10957,10 +10972,11 @@ mod tests {
                     .get(&AgentId::ROOT)
                     .copied()
                     .unwrap_or(0),
-                app.tree.roster().working
+                roster.working,
+                roster.waiting,
             ),
-            (1, 2),
-            "the tree this is about: the root waits on one of two busy agents"
+            (1, 1, 2),
+            "the tree this is about: the root waits on one of two agents with a run in flight"
         );
 
         let rows = screen(&mut app, 200, 50);
@@ -10968,8 +10984,8 @@ mod tests {
         // The bar's message row, above the facts row it shares the foot with.
         let bar = &rows[rows.len() - 2];
 
-        assert!(title.contains("2 working"), "{title:?}");
-        assert!(title.contains("1 waiting"), "{title:?}");
+        assert!(title.contains("1 working"), "{title:?}");
+        assert!(title.contains("2 waiting"), "{title:?}");
         assert!(
             bar.contains("waiting on 1 subagent(s)"),
             "the bar counted a grandchild the root does not resume on: {bar:?}"
@@ -10992,7 +11008,7 @@ mod tests {
         let rows = screen(&mut app, 200, 50);
         let title = rows.first().expect("the pane title is painted");
         let bar = &rows[rows.len() - 2];
-        assert!(title.contains("1 waiting"), "{title:?}");
+        assert!(title.contains("2 waiting"), "{title:?}");
         assert!(
             bar.contains("waiting on 1 subagent(s)"),
             "the bar and the title agree about a stopped root: {bar:?}"

@@ -290,6 +290,7 @@ the title now read that one derivation instead of each making their own.
 | U11 | **Compaction happens with no visible state anywhere.** The human typed `/compact` and could see no indication that anything was happening: no "folding…" status, no progress, no answer to the only question a frozen pane raises — *may I keep typing?* Three quarters of the shape is already built (`/compact` says one line in the bar; `compact_history` emits `AgentEvent::Status("compacting on request…" / "context nearly full — summarizing…")` and later `AgentEvent::Compact`; §4.6's notice machinery exists), and the gaps are: (1) a `/compact` that arrives **while the actor is running** is *parked* (`state.compact_requested = true`, honoured only at the next message boundary in `agent.rs`) and nothing at all says so — the human waits for a bar line that has already faded; (2) nothing *distinguishes* a fold from an ordinary model call or from waiting on children, at the moment when the model call can take the whole 10-minute deadline (×3 with the transport retry); (3) nothing says whether sending is blocked. It is not: mush never blocks input, the words queue and are answered after the fold — which is exactly the fact the human needs and the screen never states. **And the sharpest form of it, found in the source after the human added "compaction doesn't wake up agents?? … that's odd": an idle fold is work the screen refuses to show at all.** `AgentTree::activity` (`app/tree.rs`) opens with `if !self.is_busy(id) { return; }`, so for an agent at rest the `AgentEvent::Status("compacting on request…")` the actor emits *before* its summarize call is **dropped on the floor**: the agent pays for a real blocking request (up to the 10-minute deadline, ×3 with the transport retry) while its row still reads `·`/`✓`/`✗` and every derived surface says "at rest". Only the *after* line (`context compacted — continuing from a summary`) ever appears. The one setter that could move the agent refuses to move an agent that is not already busy — and the idle fold's cancel flag is minted locally (`AtomicBool::new(false)` inside `compact_now`), so nothing can cancel it either. | ✅ | closed by `Phase::Compacting(Compacting::{Parked, Requested, NearlyFull})` with `Phase::compacting()`/`words()` in `app/tree.rs` — the row glyph (`≡`), the foot, the footer, the pane roster and `App::tree_line`'s sentence all read that one answer — by `compact_now` owning the fold's cancel flag (so Ctrl-C reaches an idle fold; it was minted and dropped inside the call and nothing could flip it), and by `agent.rs` emitting `Compacting` on *accept* (`Parked` from `drain_signals`, `Requested`/`NearlyFull` from the two callers). The row's own correction, verified against the source: the *automatic in-run* fold was already visible (its `Status` line survives for an already-busy agent); the genuinely silent cases were the fold requested at rest — whose `Status` the busy guard dropped — and the one parked behind a running tool, which emitted nothing at all. Merged in `fb7265d` |
 | U12 | **The pane title and the bar disagree about a stopped or failed root that still has a child working.** `AgentTree::roster` counts a waiting agent only when the phase is `Idle \| Done` ("a failed or stopped agent waits for nothing"), while `App::tree_line` counts `busy_children > 0 && !phase.is_busy()` — so a stopped root over a running child gets `0 waiting` in the title, `waiting on 1 subagent(s) — the root resumes as they finish` on the bar, and `⊘ … ⏸1` on its row. The bar is right: the root *does* resume when the child's completion folds in (`absorb` → `Fold::Run`), and the row's `⏸N` already says so. Found by the duplication review of `fb7265d`. | ✅ | one predicate now: `AgentTree::napping` (`!node.phase.is_busy() && busy_children(id) > 0`) is read by the title's bucket and the bar (`642fda8`), and `the_bar_and_the_title_agree_on_who_the_root_waits_for` stops the root |
 | U13 | **After a restart, a stored isolated agent whose worktree is gone keeps a branch its actor does not have.** `restore_agents` passes the stored `branch` straight to the node (`app/mod.rs`), while `revive` filters it on `worktree_path(root, id).exists()` and points the actor's workspace at the root — so the restored row offers `/diff`/`/merge` for a reclaimed directory and the footer paints a dead path, while a nudge is refused by the UI guard even though the actor would have run it in the root. Two surfaces contradicting the promise both restore paths make ("continues in the main checkout"). Found by the duplication review of `c4aa2e3`; untested (both restore tests store `branch: None`). | ✅ | one decision now: `agent::live_branch` is the one place a stored branch is filtered, shared by `restore_agents`, `revive` and the node (`642fda8`), and `a_restored_branch_whose_worktree_is_gone_is_dropped` stores one and asserts the node drops it, the nudge is delivered and `/diff` stops naming it |
+| U14 | **A run parked in a `wait` wears the working icon.** Finding U7 taught the row's *words* (`waiting on results 3s`), the transcript's foot and the row's footer to tell a model call from a run parked on somebody else's result — and stopped one surface short of the glyph, which is the surface a glance reads. Observed live in the session running this repository: the root was parked in a `wait` on a child, its row read `◐ #0 ⏸1 root  waiting on results 3s`, and the human asked why the icon said working. The same fact was wrong in two more places: `Phase::label` answered `working` to the attach roster, and `AgentTree::roster` counted a parked run in the title's `N working`. | ✅ | one derivation, four readers: `Phase::waiting` now reaches the glyph (`⧗`, the one hourglass `unicode-width` calls a single column — `⌛` measures two), `Phase::label` (`waiting`), and `roster`'s buckets, so the title counts a parked run beside the napping parents it already counted there; `busy_counts`/`is_busy` stay "a run is in flight", which is what `⏸N` and the bar's promise read (§8.38) |
 
 ## 2. Observed live: a delivered completion is invisible, and can be delivered twice
 
@@ -2278,3 +2279,67 @@ alone and the next full run was green) — the H28 class, recorded there.
 production, 208 test, 100 comment, 26 blank. The production lines are the target
 plumbing (`wait_target`, `Target`'s six lookups), the shared tick, the recap
 fix, the one schema argument, and `jobs::unknown_job`'s new home.
+
+## 8.38 The icon that said working (`⧗`)
+
+Observed live, in the session running this repository: the root was parked in a
+`wait` on a child, so its row read `◐ #0 ⏸1 root  waiting on results 3s` — the
+words U7's fix had made true, over an icon that still said *working*. The foot
+showed no spinner and the bar said `waiting on 1 subagent(s) — the root resumes
+as they finish`; the glyph and the words disagreed inside one row. The human
+read the row and asked for the surface the finding had missed: "when an agent is
+waiting it still shows the working icon, can we make sure the icon status
+reflect what the agents are actually doing."
+
+**What U7 left behind.** The finding's own words were "the hourglass the human
+asked for", and its closure taught `Phase::waiting` to the row's words, the
+transcript's foot and the row's footer. Three readers did not ask: the glyph
+(`phase_glyph`'s `Phase::Activity(_) => "◐"` arm, reached by a `wait` label like
+any other tool), `Phase::label`'s machine name for the attach roster
+(`working`), and `AgentTree::roster`'s buckets (every `is_busy` phase counted as
+working, and a parked run is busy). One fact — this agent is not computing, it
+is waiting for somebody else's result — with four spellings, three of them
+wrong: the §8 class, found in the surface a glance reads.
+
+**The fix is one derivation, four readers.** `Phase::waiting()` now reaches all
+of them: the glyph is `⧗`, the label is `waiting`, and the title counts a parked
+run in `M waiting` beside the napping parents it already counted there. The one
+hourglass that fits is the one `unicode-width` calls a single column: `⌛`
+(U+231B) is emoji-presentation and measures 2, which `every_row_mark_is_one_
+column` now pins for every mark a row carries, so the next glyph cannot be
+chosen by eye. What deliberately did *not* change is `is_busy`/`busy_counts`:
+"a run is in flight" is the fact the `⏸N` mark and the bar's promise read, and a
+parked run *is* in flight — it will finish and report. The title's `N working`
+is the other question, who is computing.
+
+**The `/compact` half of the same message, answered and left alone.** "I typed
+`/compact` while waiting, it said `folding at the next step` — is that intended,
+I expected immediate compaction." Intended, and it is the behaviour the
+budget chapter documents: a fold never lands between an assistant's tool calls
+and their results, so a request that arrives mid-run parks like a nudge and is
+honoured at the next message boundary (`docs/mush.md`, "the context budget").
+In this session it landed exactly there — the human's next words woke the wait,
+the boundary folded the conversation, and the run after it began with the
+summary (which is why the session's history starts with the compaction message).
+What the screen owes is that the wait be *visible*, and it is: the row's
+`≡ folding at the next step… 12s` ages, and the bar says `keep typing — your
+message is answered after the fold`. Recorded rather than changed. The shape
+the question suggests — let a fold request wake a parked `wait` the way the
+human's own words do, so the fold lands one boundary later instead of when the
+wait ends — is a rule change in the wait's yield list, not a bug fix.
+
+**Verification by removal.** Reverting the glyph arm fails `glyphs_are_truthful`
+with `◐` printed against the name it now answers, and
+`a_waiting_agent_is_not_drawn_working` on `⧗ #0`; reverting `roster` alone fails
+that same test's `1 waiting`/`1 working` pair, which used to read `2 working`
+for one napping parent, one parked run and one working child. Three tests were
+updated rather than worked around: those two — the app test's row and title
+assertions are now the parked run's own — and
+`a_phase_has_one_name_for_every_reader` gained the wait case, where the machine
+name and the bar's word differ by design (`waiting` and the tool's own `wait`). `cargo test` 608 + 153, `fmt`, `clippy -D warnings` clean.
+
+**Census** at this landing (against §8.37's `076e164`: total 55,548 · prod
+13,915 · tests 24,003 · comments 14,187; the image-paste wave sits between
+them): total 57,278 · **prod 14,397** · tests 24,579 · comments 14,745. The wave
+itself is 80 lines: 4 production (the glyph arm, the label arm, the roster
+branch, the `waiting` field doc), 31 test, 44 comment, 1 blank.

@@ -478,7 +478,9 @@ are computed in `App`.
   capped at 110 columns however wide the terminal is.
 - **R4 — Truthful glyphs.** `[DONE]` `·` idle/never ran, `◐` running, `✓`
   finished, `✗` failed, `⚠` a run that was cut off (the process went away with it
-  and nothing was committed), `≡` a conversation being folded. A running agent
+  and nothing was committed), `≡` a conversation being folded, `⧗` a run parked on
+  somebody else's result (`wait` — the icon a glance reads says the same thing
+  the row's words do, `waiting on results 3s`). A running agent
   with children out wears `⏸N` — the count, beside its own phase and never
   instead of it — and `⊘` marks both a cancel in flight and a run that landed
   stopped, so a guard-stop is not dressed as a failure. `✉` marks a result its
@@ -490,7 +492,7 @@ are computed in `App`.
 ```
 ┌ agents · 2 working · 1 waiting · Σ +324 −40 ─────────────────────┐
 │▶· #0 ⏸1 root                                                     │
-│   ◐ #1 ⏸1 lexer   waiting on results 3s                          │
+│   ⧗ #1 ⏸1 lexer   waiting on results 3s                          │
 │     ◐ #2 tests  mush/2 +324−40  edit_file tests/lex.rs 3s        │
 │   ✓ #3 docs       wrote README.md                                │
 ├──────────────────────────────────────────────────────────────────┤

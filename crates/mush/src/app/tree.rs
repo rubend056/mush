@@ -123,11 +123,16 @@ impl Phase {
     /// painter: the attach protocol's roster (M3). The glyph and the row's own
     /// words stay the painter's (`app/screen.rs`); this is the same distinction
     /// in text, so a client can tell a `thinking` agent from a `working`,
-    /// `compacting`, `stopped` one without parsing a glyph.
+    /// `waiting`, `compacting`, `stopped` one without parsing a glyph.
     pub fn label(&self) -> &'static str {
         match self {
             Phase::Idle => "idle",
             Phase::Thinking => "thinking",
+            // The same distinction the row draws as `⧗`: an agent whose run is
+            // parked in a `wait` is not working, it is waiting for a result
+            // (finding U14). Before the `Activity` arm, which would call the
+            // one phase that is not computing *working*.
+            Phase::Activity(_) if self.waiting().is_some() => "waiting",
             Phase::Activity(_) => "working",
             Phase::Compacting(_) => "compacting",
             Phase::Cancelling => "cancelling",
@@ -457,14 +462,23 @@ impl AgentNode {
 ///
 /// A struct rather than a live count beside the list it counts: the two
 /// buckets are derived together, from one walk over the phases, so the title
-/// cannot add up a different set than the rows show (finding U2).
+/// cannot add up a different set than the rows show (finding U2). What each
+/// bucket means — computing, or waiting for somebody else's result — is on the
+/// fields, because the row's `⧗` and the title's `M waiting` are one fact
+/// (finding U14).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Roster {
-    /// Runs in flight: `Thinking`, `Activity`, `Cancelling`.
+    /// Computing: `Thinking`, a tool call that is not a `wait`, a fold in
+    /// flight, a cancel on its way.
     pub working: usize,
-    /// At rest with children working — waiting to be woken by a completion.
-    /// "Children" are its own, the same unit its row's `⏸N` mark counts: a
-    /// grandchild's work is its own parent's to wait for.
+    /// Waiting for somebody else's result: a run parked in a `wait`, or an
+    /// agent at rest whose children are working.
+    ///
+    /// The two are one fact — this agent computes nothing until a result
+    /// arrives — and the row says which of the two it is (`⧗ waiting on
+    /// results 3s` for the parked run, `⏸N` for the napping parent). "Children"
+    /// are its own, the same unit its row's `⏸N` mark counts: a grandchild's
+    /// work is its own parent's to wait for.
     pub waiting: usize,
 }
 
@@ -1464,12 +1478,18 @@ impl AgentTree {
     /// Each agent lands in at most one bucket, so nothing is counted twice for
     /// having children. A run being cancelled counts as working: the actor has
     /// not yielded and the work really is in flight (its row wears `⊘` and says
-    /// `cancelling…`).
+    /// `cancelling…`). A run parked in a `wait` does not: it is in flight and
+    /// is *waiting*, which is the distinction the row draws as `⧗` and the
+    /// words `waiting on results 3s` (findings U7, U14) — a title that counted
+    /// it as working put the same lie one line above the row that was fixed.
     pub fn roster(&self) -> Roster {
         let busy = self.busy_counts();
         let mut roster = Roster::default();
         for node in &self.agents {
-            if node.phase.is_busy() {
+            if node.phase.waiting().is_some() {
+                // Before `is_busy`, which is true of this phase too.
+                roster.waiting += 1;
+            } else if node.phase.is_busy() {
                 roster.working += 1;
             } else if self.napping_with(node.id, &busy) {
                 // At rest with work out: §5.5's napping orchestrator, which the
@@ -1827,6 +1847,13 @@ mod tests {
         assert_eq!(edit.doing(), "edit_file", "the bar carries the tool's own");
         // A label with no words in it is still a word: nothing may read `#0 `.
         assert_eq!(Phase::Activity(String::new()).doing(), "working");
+        // A run parked in a `wait` is the case where the *two* answers differ
+        // for the same tool label, and both are honest: the roster's machine
+        // name says the fact the row's `⧗` draws, and the bar has room for the
+        // tool's own name (finding U14).
+        let parked = Phase::Activity("wait ".to_string());
+        assert_eq!(parked.label(), "waiting");
+        assert_eq!(parked.doing(), "wait");
     }
 
     /// A fold from rest is visible — the hole `activity` could not fill, because

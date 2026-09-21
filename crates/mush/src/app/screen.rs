@@ -1020,6 +1020,12 @@ fn agent_detail(node: &AgentNode) -> Vec<String> {
 /// claiming a park that never happened (finding U1). Folding is a different fact
 /// again: it is a request of its own, and `◐` for it is what made a compaction
 /// look like the run's own model call (finding U11).
+///
+/// A run parked in a `wait` is the third: `⧗`, because the agent is not
+/// computing anything and `◐` for it said *working* about the one thing on
+/// screen that was doing nothing. Finding U7 fixed the words (`waiting on
+/// results 3s`) and the transcript's foot and stopped one surface short of the
+/// glyph, which is the surface a glance reads (finding U14).
 fn phase_glyph(phase: &Phase) -> &'static str {
     match phase {
         Phase::Failed(_) => "✗",
@@ -1030,6 +1036,10 @@ fn phase_glyph(phase: &Phase) -> &'static str {
         Phase::Idle => "·",
         Phase::Done => "✓",
         Phase::Compacting(_) => "≡",
+        // Not `◐`: `Phase::waiting` is the one derivation of "this run is
+        // parked on somebody else's result", the same one the row's words and
+        // the transcript's foot already read.
+        Phase::Activity(_) if phase.waiting().is_some() => "⧗",
         Phase::Thinking | Phase::Activity(_) => "◐",
     }
 }
@@ -1165,6 +1175,40 @@ mod tests {
         assert_eq!(phase_glyph(&Phase::Stopped), "⊘");
         // A fold is not the run's own model call either (finding U11).
         assert_eq!(phase_glyph(&Phase::Compacting(Compacting::Parked)), "≡");
+        // Nor is a run parked on somebody else's result a model call: the
+        // hourglass for the agent that is doing nothing (finding U14).
+        assert_eq!(phase_glyph(&Phase::Activity("wait ".into())), "⧗");
+        assert_eq!(phase_glyph(&Phase::Activity("wait c2".into())), "⧗");
+    }
+
+    /// Every mark a row carries is one column in the arithmetic the rows are
+    /// fitted with (`mush_core::text::fit_row` measures with `unicode-width`):
+    /// a glyph the crate calls two columns wide shifts the whole row, and the
+    /// hourglass the waiting row wanted is the case in point — `⌛` (U+231B) is
+    /// an emoji-presentation character and measures 2, so the hourglass that
+    /// fits a row is `⧗` (U+29D7).
+    #[test]
+    fn every_row_mark_is_one_column() {
+        let glyphs = [
+            phase_glyph(&Phase::Idle),
+            phase_glyph(&Phase::Thinking),
+            phase_glyph(&Phase::Activity("edit_file a.rs".into())),
+            phase_glyph(&Phase::Activity("wait ".into())),
+            phase_glyph(&Phase::Compacting(Compacting::Parked)),
+            phase_glyph(&Phase::Cancelling),
+            phase_glyph(&Phase::Stopped),
+            phase_glyph(&Phase::CutOff),
+            phase_glyph(&Phase::Done),
+            phase_glyph(&Phase::Failed("boom".into())),
+        ];
+        // The marks `ui::agent_line` adds beside the glyph, in the same head.
+        for mark in glyphs.into_iter().chain(["▶", "⏸", "✉", "⚙", "⚠"]) {
+            assert_eq!(
+                UnicodeWidthStr::width(mark),
+                1,
+                "{mark:?} is not one column"
+            );
+        }
     }
 
     /// A node carrying nothing but the facts a row test needs.

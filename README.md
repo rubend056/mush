@@ -118,13 +118,15 @@ left, and that summary is the run's result.
 
 The pane shows the whole tree: depth by indentation, `·` idle, `◐` running,
 `⊘` a cancel in flight or a run that landed stopped, `✓` done (with its final
-summary), `✗` failed, `⚠` a run that was cut off, `≡` a conversation being folded.
+summary), `✗` failed, `⚠` a run that was cut off, `≡` a conversation being folded,
+`⧗` a run parked on somebody else's result (the `wait` tool — the icon says what
+the row's words say, `waiting on results 3s`).
 A running agent that has children out wears `⏸N`, counting them; `✉` marks a
 result its parent has not read (`✉N` the ones from its own children); and a
 running job adds `⚙N` to its owner's row. A row spends its columns on
 state, then the branch and line delta (`mush/2 +8−0`), then the activity with its
 age (`edit_file src/lex.rs 12s`), then a short title derived from the brief
-(`lexer`); the pane title totals the tree (`agents · 2 working · 1 waiting · Σ +324 −40`), and
+(`lexer`); the pane title totals the tree (`agents · 1 working · 1 waiting · Σ +324 −40`), and
 the selected row's full facts — the brief, its activity, the worktree and the git
 command that reads it, its jobs — sit in a footer under the list.
 
