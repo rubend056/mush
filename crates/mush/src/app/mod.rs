@@ -3404,8 +3404,9 @@ impl App {
     /// every other ending uses — one owner of the line, one road into the
     /// conversation (finding H2).
     ///
-    /// A parent that is gone too, and the root, have nobody to tell; the row and
-    /// the pane still say it.
+    /// A parent whose node is gone too, and the root — which is nobody's child
+    /// and never revived — have nobody to tell; the row and the pane still say
+    /// it.
     fn report_cut_off(&mut self, id: AgentId) {
         self.chat.note_cut_off_for(id, cut_off_notice());
         self.mark_session_dirty();
@@ -3426,14 +3427,21 @@ impl App {
         let Some(parent) = self.tree.node(id).and_then(|node| node.parent) else {
             return;
         };
-        let Some(tx) = self.tree.agent_tx.get(&parent) else {
-            return;
-        };
-        let _ = tx.send(AgentMsg::ChildDone {
-            id: id.0,
-            run: agent::CUT_OFF_RUN,
-            outcome: agent::Outcome::CutOff,
-        });
+        // Through the door `AgentEvent::ChildAsleep` uses, not a raw send: the
+        // parent may be *parked* — a node with a mailbox and no thread behind
+        // it (`Self::park_history`) — and a send into that mailbox drops the
+        // one report of a run that never ended. `deliver_to_actor` wakes a
+        // parked parent and hands it the completion, which is what this
+        // message's whole reason for existing promises: it wakes a napping
+        // parent.
+        let _ = self.deliver_to_actor(
+            parent,
+            AgentMsg::ChildDone {
+                id: id.0,
+                run: agent::CUT_OFF_RUN,
+                outcome: agent::Outcome::CutOff,
+            },
+        );
     }
 
     fn cycle_focus(&mut self, direction: i64) {
@@ -11150,6 +11158,58 @@ mod tests {
                 .is_some_and(|(text, _)| text.contains("cut off")),
             "the key that did nothing says so: {:?}",
             app.status_line()
+        );
+    }
+
+    /// The same report when the parent is *parked*: its mailbox is the dead one
+    /// `park_history` leaves, so a raw send drops the one report a run that
+    /// never ended has — and the message's whole reason for existing is that it
+    /// wakes a napping parent. Through `deliver_to_actor` the wake happens and
+    /// the tree ends up holding the newer mailbox it built.
+    #[test]
+    fn a_cut_off_child_wakes_a_parked_parent_through_the_ui() {
+        let (mut app, rx) = test_app("cut-off-parked-parent");
+        let conversation = app.tree.conversation();
+        // A parent (#1) whose receiver is dropped — a parked actor, exactly
+        // what reclaiming a finished child's thread leaves — and a child (#2)
+        // whose actor is gone too, mid-run.
+        let (parent_tx, parked) = crossbeam_channel::unbounded::<AgentMsg>();
+        drop(parked);
+        for (child, parent, depth, cmd) in [
+            (1, 0, 1, parent_tx),
+            (2, 1, 2, crossbeam_channel::unbounded().0),
+        ] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId::ROOT,
+                event: AgentEvent::Spawned {
+                    child,
+                    parent,
+                    brief: format!("task {child}"),
+                    depth,
+                    branch: None,
+                    fork: None,
+                    title: None,
+                    cmd,
+                },
+            });
+        }
+        app.tree.begin(AgentId(2), None);
+
+        app.stop_one(AgentId(2));
+
+        // The mailbox the tree holds for #1 is a newer one, with an actor
+        // behind it: the wake the report itself asked for.
+        assert!(
+            app.tree.agent_tx[&AgentId(1)].send(AgentMsg::Stop).is_ok(),
+            "the parked parent has an actor again"
+        );
+        // And it is this report that woke it: a parent with empty books folds
+        // a cut-off as news, so the completion begins the run that tells its
+        // model — which is the only evidence that the report reached it.
+        assert!(
+            runs(&mut app, &rx, AgentId(1)),
+            "the completion reached the parent the report woke"
         );
     }
 
