@@ -1969,6 +1969,11 @@ fn run_loop(
     // lock: a hold can outlive many waits).
     let mut refused_round = false;
     let mut waited_round = false;
+    // The flag itself is the *call's*, and a run that ended between two calls
+    // of a batch — a Stop, a cut-off reply — can leave it set. It means "the
+    // call just run slept", so a run starts with none behind it: a stale one
+    // would exempt this run's first repeat from the guard.
+    state.waited = false;
     // Consecutive replies the endpoint cut off at the token cap.
     let mut cut_offs = 0usize;
     // What the endpoint itself counted, when it says: the UI's meter is an
