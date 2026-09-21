@@ -9965,6 +9965,23 @@ mod tests {
         });
         keep.push(rx);
 
+        // A run parked on somebody else's result: the hourglass, and never the
+        // working icon or the foot's spinner — the one state three surfaces read
+        // (finding U14). Painted at every size, because the glyph is a column
+        // the rows are fitted with.
+        let (mut waiting, rx) = test_app("sweep-waiting");
+        begin_run(&mut waiting, AgentId::ROOT);
+        waiting.on_agent(AgentId::ROOT, AgentEvent::Status("wait ".into()));
+        states.push(Sweep {
+            name: "a run parked in a wait",
+            app: waiting,
+            words: vec!["⧗ #0", "waiting on results"],
+            roomy: vec![" agents · 1 waiting"],
+            absent: vec!["◐ #0", "working…"],
+            reopen: None,
+        });
+        keep.push(rx);
+
         // A root parked on a child's result — and a grandchild of its own in
         // flight under that child, because the count the bar prints, the `⏸N`
         // on the row and the title's `M waiting` all have to be about the
