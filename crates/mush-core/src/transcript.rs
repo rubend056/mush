@@ -9,6 +9,8 @@
 
 use serde_json::Value;
 
+use std::collections::HashSet;
+
 use crate::message::Message;
 
 /// Ceiling on a compaction summary. A summary is prose, not a transcript, but
@@ -76,12 +78,21 @@ pub fn needs_compaction(messages: &[Message], budget_bytes: usize) -> bool {
 /// for them, then answer whatever is still missing.
 ///
 /// The other direction of the same pair is repaired too: a result whose call is
-/// not there. An old session can hold one — saved before every call had an id,
-/// so its `tool_call_id` is the empty string beside a call the deserializer has
-/// since named `call_0` — and a second result for a call already answered is
-/// the same shape to a strict server. Nothing can be said to the model about a
-/// call it cannot see, so those are dropped ([`drop_orphan_results`]).
+/// not there. A second result for a call already answered, or one whose id names
+/// a call in another batch, is a shape a strict server rejects and is dropped
+/// ([`drop_orphan_results`]). But a result whose id names no call *anywhere* is
+/// the legacy shape of the same pair: a session saved before every call had an
+/// id (`1b70096`) holds `tool_call_id: ""` beside a call the deserializer has
+/// since named `call_0`. Re-pointing it keeps the model's real output, where
+/// dropping it would answer the call with a made-up "no result was recorded".
 pub fn repair_tool_pairs(messages: &mut Vec<Message>) {
+    // Every call id the transcript names, so a result can tell "the batch that
+    // asked for me is gone" (its id is known, somewhere) from "I was saved
+    // before ids existed" (no batch names it).
+    let known: HashSet<String> = messages
+        .iter()
+        .flat_map(|message| message.tool_calls().iter().map(|call| call.id.clone()))
+        .collect();
     let mut index = 0;
     while index < messages.len() {
         // Ids are not normalized here: every message parsed from the wire or
@@ -97,46 +108,80 @@ pub fn repair_tool_pairs(messages: &mut Vec<Message>) {
             index += 1;
             continue;
         }
-        // Results belong immediately after their assistant message. Anything
-        // else that sat in between (a nudge, usually) keeps its order after the
-        // batch — which is where the actor folded it at runtime.
-        let mut cursor = index + 1;
-        let mut insert_at = index + 1;
-        while cursor < messages.len() && messages[cursor].role != "assistant" {
-            let answers_a_call = messages[cursor].role == "tool"
-                && messages[cursor]
-                    .tool_call_id
-                    .as_deref()
-                    .is_some_and(|id| calls.iter().any(|call| call == id));
-            if answers_a_call {
-                if cursor != insert_at {
-                    let result = messages.remove(cursor);
-                    messages.insert(insert_at, result);
+        // The block this batch owns: everything up to the next assistant
+        // message. Results pulled in here belong immediately after the batch;
+        // anything else that sat in between (a nudge, usually) keeps its order
+        // after them — which is where the actor folded it at runtime.
+        let mut end = index + 1;
+        while end < messages.len() && messages[end].role != "assistant" {
+            end += 1;
+        }
+        // Which message answers each call, read-only so the moves below cannot
+        // re-index the answer: a result that names the call, in block order —
+        // a call already answered by an earlier duplicate stays unanswered
+        // here — and then, for calls still unanswered, a result whose id no
+        // batch names, in block order. That second pass is last so a real,
+        // id-carrying result always outranks a legacy one for the same call.
+        let mut source: Vec<Option<usize>> = vec![None; calls.len()];
+        let block = index + 1..end;
+        for (offset, message) in messages[block.clone()].iter().enumerate() {
+            if message.role != "tool" {
+                continue;
+            }
+            let named = message
+                .tool_call_id
+                .as_deref()
+                .and_then(|id| calls.iter().position(|call| call == id))
+                .filter(|at| source[*at].is_none());
+            if let Some(at) = named {
+                source[at] = Some(block.start + offset);
+            }
+        }
+        for (offset, message) in messages[block.clone()].iter().enumerate() {
+            let cursor = block.start + offset;
+            if message.role != "tool" || source.contains(&Some(cursor)) {
+                continue;
+            }
+            let unclaimed = !message
+                .tool_call_id
+                .as_deref()
+                .is_some_and(|id| known.contains(id));
+            if !unclaimed {
+                continue;
+            }
+            let Some(at) = source.iter().position(Option::is_none) else {
+                break;
+            };
+            source[at] = Some(cursor);
+        }
+        // Rebuild the block: each call's result in call order (re-pointed at
+        // the call it answers, so a legacy result carries a real id), a call
+        // with no result answered with an explicit error the model can act on
+        // (the run was interrupted mid-batch), then every other message in its
+        // original order — including an unmatched result, which
+        // [`drop_orphan_results`] takes out.
+        let mut rebuilt: Vec<Message> = Vec::with_capacity(end - index - 1);
+        for (at, id) in calls.iter().enumerate() {
+            match source[at] {
+                Some(cursor) => {
+                    let mut result = messages[cursor].clone();
+                    result.tool_call_id = Some(id.clone());
+                    rebuilt.push(result);
                 }
-                cursor += 1;
-                insert_at += 1;
-            } else {
-                cursor += 1;
+                None => rebuilt.push(Message::tool(
+                    id.clone(),
+                    "error: no result was recorded for this call (the run was interrupted)",
+                )),
             }
         }
-        // A call with no result (the run was interrupted mid-batch) would
-        // dangle forever; give it an explicit error the model can act on.
-        for id in &calls {
-            let answered = messages[index + 1..insert_at]
-                .iter()
-                .any(|message| message.tool_call_id.as_deref() == Some(id.as_str()));
-            if !answered {
-                messages.insert(
-                    insert_at,
-                    Message::tool(
-                        id.clone(),
-                        "error: no result was recorded for this call (the run was interrupted)",
-                    ),
-                );
-                insert_at += 1;
+        for (offset, message) in messages[block.clone()].iter().enumerate() {
+            if !source.contains(&Some(block.start + offset)) {
+                rebuilt.push(message.clone());
             }
         }
-        index = insert_at;
+        let next = index + 1 + rebuilt.len();
+        messages.splice(index + 1..end, rebuilt);
+        index = next;
     }
     drop_orphan_results(messages);
 }
@@ -144,13 +189,13 @@ pub fn repair_tool_pairs(messages: &mut Vec<Message>) {
 /// Keep only the `tool` messages that answer the batch right above them.
 ///
 /// [`repair_tool_pairs`] guarantees every call has a result; this guarantees
-/// the other direction. A result whose call is gone is what an old session
-/// holds where its calls had no ids yet (the call is renamed `call_0` on the
-/// way in, the result still says `""`), and a second result for one call is
-/// what a hand-edited file grows; both are rejected by a strict server as
-/// firmly as a dangling call, and neither can be explained to a model that
-/// cannot see the call it names. Each accepted result consumes its call, so a
-/// duplicate has nothing left to answer.
+/// the other direction. A second result for one call, or one whose id names a
+/// call in an earlier batch that arrived too late to answer it, is what a
+/// hand-edited file grows; both are rejected by a strict server as firmly as a
+/// dangling call, and neither can be explained to a model that cannot see the
+/// call it names. Each accepted result consumes its call, so a duplicate has
+/// nothing left to answer. (A result whose id names no batch at all has already
+/// been re-pointed by [`repair_tool_pairs`] if a call was waiting for it.)
 fn drop_orphan_results(messages: &mut Vec<Message>) {
     let mut batch: Vec<String> = Vec::new();
     let mut kept: Vec<Message> = Vec::with_capacity(messages.len());
@@ -592,6 +637,77 @@ mod tests {
         );
         assert_eq!(messages[3].tool_call_id.as_deref(), Some("a"));
         assert_eq!(messages[3].text(), "result a");
+    }
+
+    /// A session saved before `1b70096` holds a result whose `tool_call_id` is
+    /// the empty string beside a call the deserializer has renamed `call_0`:
+    /// the same pair, with the id half missing. The result is real output and
+    /// the batch is the block it was saved under, so it is re-pointed at the
+    /// call waiting for it — dropping it would answer the call with a made-up
+    /// "no result was recorded" while the real one sat in the file.
+    #[test]
+    fn a_legacy_result_with_no_id_is_re_pointed_at_its_call() {
+        let mut messages: Vec<Message> = serde_json::from_str(
+            r#"[
+                 {"role":"system","content":"you are mush"},
+                 {"role":"user","content":"task"},
+                 {"role":"assistant","tool_calls":[
+                    {"type":"function","function":{"name":"run_command","arguments":"{}"}}
+                 ]},
+                 {"role":"tool","content":"test result: ok","tool_call_id":""}
+               ]"#,
+        )
+        .unwrap();
+        repair_tool_pairs(&mut messages);
+
+        assert_eq!(roles(&messages), ["system", "user", "assistant", "tool"]);
+        let id = messages[2].tool_calls()[0].id.clone();
+        assert_eq!(id, "call_0", "the deserializer named the call");
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some(id.as_str()));
+        assert_eq!(
+            messages[3].text(),
+            "test result: ok",
+            "the real output is kept"
+        );
+    }
+
+    /// An id a batch *does* name is never adopted by another batch's unanswered
+    /// call: a result that arrived in the wrong place is dropped, not handed to
+    /// the wrong call. Only an id no batch names — a session from before ids
+    /// existed — is re-pointed.
+    #[test]
+    fn a_misplaced_result_is_not_adopted_by_another_call() {
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("task"),
+            assistant_calling(&["call_1"]),
+            Message::tool("call_1", "the first answer"),
+            assistant_calling(&["call_2"]),
+            Message::tool("call_1", "arrived one batch too late"),
+            Message::user("next"),
+        ];
+        repair_tool_pairs(&mut messages);
+
+        assert_eq!(
+            roles(&messages),
+            [
+                "system",
+                "user",
+                "assistant",
+                "tool",
+                "assistant",
+                "tool",
+                "user"
+            ]
+        );
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_1"));
+        assert_eq!(messages[3].text(), "the first answer");
+        assert_eq!(messages[5].tool_call_id.as_deref(), Some("call_2"));
+        assert!(
+            messages[5].text().starts_with("error:"),
+            "the second call gets the interrupted sentence, not another call's result: {}",
+            messages[5].text()
+        );
     }
 
     /// An already-valid transcript must come out byte-for-byte unchanged.
