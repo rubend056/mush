@@ -3213,7 +3213,10 @@ fn exec_tool(
         ToolName::SpawnAgent => spawn_tool(actor, state, args),
         ToolName::Status => status_tool(actor, state),
         ToolName::Control => control_tool(actor, state, args),
-        ToolName::Wait => wait_tool(actor, state, cancel),
+        ToolName::Wait => match wait_target(args)? {
+            Some(target) => wait_on_tool(actor, state, cancel, target),
+            None => wait_tool(actor, state, cancel),
+        },
         // The file tools take no lock and start no process: they are the roads
         // that keep working while another agent holds the machine, and the only
         // road that can carry an image (finding H31).
@@ -3625,38 +3628,23 @@ fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Resu
     let clock = actor.ctx.clock.as_ref();
     let deadline = clock.now() + Duration::from_secs(WAIT_TIMEOUT_SECS);
     loop {
-        // This is the one tool that blocks for minutes, so it is also the one
-        // that must notice a cancellation (and a completion) promptly.
-        drain_signals(actor, cancel, state);
-        if cancel.load(Ordering::SeqCst) {
-            return Err(CANCELLED.to_string());
-        }
-        // And it must notice anything said to it. Parking those words is not
-        // enough when the wait can last the whole timeout: the model would not
-        // see them until the thing it was waiting on finished, which is the
-        // opposite of steering. The wait ends, the words stay parked for the
-        // next message boundary, and the model answers them in this run.
-        if let Some(waiting) = parked_message(state) {
-            let who = match waiting {
-                Waiting::Human => "the human wrote to you",
-                Waiting::Parent => "your parent sent you a message",
-            };
+        match wait_tick(actor, state, cancel, |state| {
             // What the wait was for, said the way it is: a wait the *machine*
             // is keeping alive has nothing of this agent's running, and "your
             // work is still running" was the false half of this sentence in
             // exactly the case the lock road creates.
-            let still = if !in_flight(state).is_empty() {
+            if !in_flight(state).is_empty() {
                 "your work is still running; ".to_string()
             } else {
                 match machine_wait(actor) {
                     Some(held) => format!("{} still holds the machine; ", machine_holding(&held)),
                     None => String::new(),
                 }
-            };
-            return Ok(format!(
-                "interrupted — {who} while you waited; it is in your transcript. Answer it; \
-                 {still}use wait again when you need it."
-            ));
+            }
+        }) {
+            Tick::Go => {}
+            Tick::Cancelled => return Err(CANCELLED.to_string()),
+            Tick::Answer(answer) => return Ok(answer),
         }
         let running = in_flight(state);
         if running.is_empty() {
@@ -3709,6 +3697,128 @@ fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Resu
         // repeat of this one (see [`count_round`]). Set on the way into the
         // sleep rather than on the way out, because the answer that ends it —
         // the deadline, the release, a message — all of them follow a sleep.
+        state.waited = true;
+        clock.sleep(Duration::from_millis(50));
+    }
+}
+
+/// What one tick at the top of a wait found. The two waits — everything, and
+/// one named target — share the two rules that outrank the wait itself: a
+/// cancellation stops the run, and words said to the agent must not sit behind
+/// a call that can last ten minutes. They differ in what they block *on*, and
+/// in what a result does to them.
+enum Tick {
+    /// Nothing outranks the wait: carry on.
+    Go,
+    /// A `Stop`/`Shutdown` arrived; the run ends.
+    Cancelled,
+    /// Something was said to this agent, and this is the answer.
+    Answer(String),
+}
+
+/// One tick of either wait: take in whatever the mailbox holds, and stop for
+/// the two things that outrank the wait itself. `still` says what the wait was
+/// for — `wait_tool`'s work or machine, `wait_on_tool`'s target — which is the
+/// half of the interrupted sentence only the caller knows.
+fn wait_tick(
+    actor: &Actor,
+    state: &mut ActorState,
+    cancel: &AtomicBool,
+    still: impl FnOnce(&ActorState) -> String,
+) -> Tick {
+    // This is the one tool that blocks for minutes, so it is also the one
+    // that must notice a cancellation (and a completion) promptly.
+    drain_signals(actor, cancel, state);
+    if cancel.load(Ordering::SeqCst) {
+        return Tick::Cancelled;
+    }
+    // And it must notice anything said to it. Parking those words is not
+    // enough when the wait can last the whole timeout: the model would not
+    // see them until the thing it was waiting on finished, which is the
+    // opposite of steering. The wait ends, the words stay parked for the
+    // next message boundary, and the model answers them in this run.
+    if let Some(waiting) = parked_message(state) {
+        let who = match waiting {
+            Waiting::Human => "the human wrote to you",
+            Waiting::Parent => "your parent sent you a message",
+        };
+        return Tick::Answer(format!(
+            "interrupted — {who} while you waited; it is in your transcript. Answer it; \
+             {}use wait again when you need it.",
+            still(state)
+        ));
+    }
+    Tick::Go
+}
+
+/// `wait({ on })`: wait for one thing while the rest runs (finding H34). The
+/// shape comes from the model's own report — `wait` blocks on everything it
+/// owns, `status` is a listing, and a `sleep` was the only "look at just this
+/// one" it could find.
+///
+/// What it blocks *on* is the target alone: the rest of the books run on, and
+/// the machine lock is never this call's business (bare `wait` remains the one
+/// road back the lock refusal names). What it does *not* narrow is its
+/// attention: a cancellation, a message, and above all a result nobody has
+/// read — a child that failed, a job that ended — all end the wait and are
+/// handed over, so a targeted wait can never sit on news for ten minutes.
+fn wait_on_tool(
+    actor: &Actor,
+    state: &mut ActorState,
+    cancel: &AtomicBool,
+    target: Target,
+) -> Result<String, String> {
+    if !target.owned(state) {
+        return Err(target.unknown());
+    }
+    let label = target.label();
+    let clock = actor.ctx.clock.as_ref();
+    let deadline = clock.now() + Duration::from_secs(WAIT_TIMEOUT_SECS);
+    loop {
+        match wait_tick(actor, state, cancel, |state| {
+            if target.running(state) {
+                format!("{label} is still running; ")
+            } else {
+                String::new()
+            }
+        }) {
+            Tick::Go => {}
+            Tick::Cancelled => return Err(CANCELLED.to_string()),
+            Tick::Answer(answer) => return Ok(answer),
+        }
+        // The target is what the call named, so its result is the answer even
+        // when the model has read it before: a named target may say "already
+        // read" — the once-only rule is about unsolicited replays (H34), not
+        // about answering a question.
+        if target.ready(state) && !target.running(state) {
+            let mut answers = wait_digest(actor, state, true);
+            if answers.is_empty() {
+                answers.push(target.read_answer(state));
+            }
+            return Ok(answers.join("\n"));
+        }
+        // And anything else that needs attention: a result nobody has read
+        // ends the wait whatever the target is doing, with the target's own
+        // state named beside it so the answer can never be mistaken for its.
+        let news = wait_digest(actor, state, true);
+        if !news.is_empty() {
+            return Ok(if target.running(state) {
+                format!("{}\n{label} is still running", news.join("\n"))
+            } else {
+                news.join("\n")
+            });
+        }
+        if !target.running(state) {
+            // Neither running nor holding a result: the books cannot move, and
+            // a wait here would be ten minutes spent on a row that will never
+            // change (the listing may still call a seeded child running — H30).
+            return Ok(format!(
+                "nothing to wait for: {label} is not running and has no result"
+            ));
+        }
+        if clock.now() >= deadline {
+            return Ok(format!("wait timed out — {label} still running"));
+        }
         state.waited = true;
         clock.sleep(Duration::from_millis(50));
     }
@@ -3901,6 +4011,90 @@ enum Target {
     Job(JobId),
 }
 
+impl Target {
+    /// The name `status` prints, so every answer about a target can carry it.
+    fn label(&self) -> String {
+        match self {
+            Target::Agent(id) => format!("#{id}"),
+            Target::Job(id) => id.to_string(),
+        }
+    }
+
+    /// Whether this label names something of *this* agent's at all. A
+    /// `control` target is looked up when the action runs and the sentence it
+    /// gets is the action's; a wait must refuse before it sleeps.
+    fn owned(&self, state: &ActorState) -> bool {
+        match self {
+            Target::Agent(id) => state.children.contains_key(id),
+            Target::Job(id) => state.running_jobs.contains(id) || state.done_jobs.contains_key(id),
+        }
+    }
+
+    /// Whether the target is working right now. A child that was resumed reads
+    /// as running even though an older outcome is still recorded, and that
+    /// outcome is history — the listing says the same (audit row 1).
+    fn running(&self, state: &ActorState) -> bool {
+        match self {
+            Target::Agent(id) => state.running.contains(id),
+            Target::Job(id) => state.running_jobs.contains(id),
+        }
+    }
+
+    /// Whether the target has a result to hand over.
+    fn ready(&self, state: &ActorState) -> bool {
+        match self {
+            Target::Agent(id) => state.completed.contains_key(id),
+            Target::Job(id) => state.done_jobs.contains_key(id),
+        }
+    }
+
+    /// The refusal for a target this agent owns nothing under — the sentences
+    /// `control` gives, because it is the same mistake.
+    fn unknown(&self) -> String {
+        match self {
+            Target::Agent(id) => unknown_child(*id),
+            Target::Job(id) => jobs::unknown_job(*id),
+        }
+    }
+
+    /// The answer about a result the model has already read: the child's
+    /// digest or the job's line, marked. It is named, so it is not a recap.
+    fn read_answer(&self, state: &ActorState) -> String {
+        match self {
+            Target::Agent(id) => match state.completed.get(id) {
+                Some(completion) => already_read(&completion.outcome.digest(*id)),
+                None => NOTHING_TO_WAIT_FOR.to_string(),
+            },
+            Target::Job(id) => match state.done_jobs.get(id) {
+                Some(report) => already_read(&report.line),
+                None => NOTHING_TO_WAIT_FOR.to_string(),
+            },
+        }
+    }
+}
+
+/// `wait`'s one optional argument: the single target the call is narrowed to,
+/// named the way `status` prints it (`2` a child, `c2` a job), or nothing,
+/// which is what the call always meant. A wrong *type* is refused rather than
+/// ignored: H15's trap was a shape a model could reason into another meaning,
+/// and a list here would leave "everything" as a silent default.
+fn wait_target(args: &Value) -> Result<Option<Target>, String> {
+    match args.get("on") {
+        None => Ok(None),
+        Some(Value::String(raw)) => Ok(Some(parse_target(raw)?)),
+        Some(other) => Err(format!(
+            "`on` must be one target as status names it (`2` a child, `c2` a job); got {other}"
+        )),
+    }
+}
+
+/// The refusal for a child this agent does not own — one sentence for the
+/// three callers that can be handed an id that is not theirs (`control`'s two
+/// roads and a targeted `wait`).
+fn unknown_child(id: u64) -> String {
+    format!("no such child agent #{id} — status lists yours")
+}
+
 /// Read `control`'s `id`: `#c2`/`c2` names a job, `#2`/`2` a child agent. The
 /// leading `#` is optional because `status` prints one and a model often copies
 /// it; the `c` is not, because a bare number could be either.
@@ -3929,7 +4123,7 @@ pub(crate) fn gone(id: AgentId) -> String {
 /// context and work, and a later `control message` resumes it.
 fn stop_agent(actor: &Actor, state: &mut ActorState, id: u64) -> Result<String, String> {
     let Some(cmd) = state.children.get(&id) else {
-        return Err(format!("no such child agent #{id} — status lists yours"));
+        return Err(unknown_child(id));
     };
     // An empty mailbox is a child whose *actor* is gone, never a child that is
     // gone: parking reclaims the thread of a finished child and leaves the row
@@ -3985,7 +4179,7 @@ fn message_agent(
     id: u64,
 ) -> Result<String, String> {
     let Some(cmd) = state.children.get(&id) else {
-        return Err(format!("no such child agent #{id} — status lists yours"));
+        return Err(unknown_child(id));
     };
     // An isolated child's worktree is where a run would write; a *shared* child
     // has none of its own and runs in this workspace, which is still here.
@@ -8053,6 +8247,166 @@ mod tests {
         assert!(
             !mixed.contains("#c3"),
             "the read job is not recapped beside it: {mixed}"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// `wait({ on })`: one named target while the rest of the books run on, and
+    /// the machine lock out of it (finding H34). What the call does *not*
+    /// narrow is its attention — a result nobody has read, a failure first
+    /// among them, and the human's words all end it the way they end a bare
+    /// wait, so sitting on news for ten minutes is not a shape it has.
+    #[test]
+    fn an_optional_target_waits_for_one_thing_and_lets_the_rest_run() {
+        let clock = Arc::new(Advanceable::new());
+        let (actor, mailbox) =
+            scripted_tools_actor("wait-on", Arc::new(ScriptedMachine::new()), clock.clone());
+        let cancel = AtomicBool::new(false);
+        let mut state = ActorState::default();
+
+        // One name, or nothing: a wrong shape is refused where it stands — a
+        // list can never fall back to "everything" — and an id this agent owns
+        // nothing under gets the sentence `control` gives, not a timeout.
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Wait,
+            &json!({ "on": ["c3"] }),
+            &cancel,
+        )
+        .unwrap_err();
+        assert!(
+            refused.text().contains("`on` must be one target"),
+            "{}",
+            refused.text()
+        );
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Wait,
+            &json!({ "on": "c9" }),
+            &cancel,
+        )
+        .unwrap_err();
+        assert_eq!(refused.text(), "no such job #c9 — status lists yours");
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Wait,
+            &json!({ "on": "9" }),
+            &cancel,
+        )
+        .unwrap_err();
+        assert_eq!(
+            refused.text(),
+            "no such child agent #9 — status lists yours"
+        );
+
+        // #1 and #2 work, and a failed child and a failed job are already in
+        // the books. The call names #1; the failures end the wait anyway, with
+        // the target's own state named beside them.
+        let (one, _one_rx) = crossbeam_channel::unbounded();
+        let (two, _two_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, one);
+        state.children.insert(2, two);
+        state.running.insert(1);
+        state.running.insert(2);
+        note_completion(&mut state, 2, 1, Outcome::Failed("the gate is red".into()));
+        note_job(
+            &mut state,
+            JobId(3),
+            "#c3 done: exit 1 · 4s · cargo test — 2 failed".into(),
+            true,
+        );
+        let news = wait_on_tool(&actor, &mut state, &cancel, Target::Agent(1)).unwrap();
+        assert!(news.contains("#2 failed: the gate is red"), "{news}");
+        assert!(news.contains("#c3 done: exit 1"), "{news}");
+        assert!(news.contains("#1 is still running"), "{news}");
+        assert!(
+            state.delivered_jobs.contains(&JobId(3)),
+            "the line is read now"
+        );
+
+        // A named child that finished and was read: the answer is its digest
+        // wearing the mark — the model asked by name, so it is not a recap.
+        let mut state = ActorState::default();
+        let (one, _one_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, one);
+        note_completion(&mut state, 1, 1, Outcome::Finished("the parser".into()));
+        state.delivered.insert(1, 1);
+        let again = wait_on_tool(&actor, &mut state, &cancel, Target::Agent(1)).unwrap();
+        assert!(again.contains("#1 ✓ the parser"), "{again}");
+        assert!(again.contains("already read"), "{again}");
+
+        // The same for a job target: its line is the answer when it ends, and
+        // the second call says it has been read.
+        let mut state = ActorState::default();
+        state.running_jobs.insert(JobId(5));
+        note_job(
+            &mut state,
+            JobId(5),
+            "#c5 done: exit 0 · 2s · cargo fmt".into(),
+            true,
+        );
+        let answer = wait_on_tool(&actor, &mut state, &cancel, Target::Job(JobId(5))).unwrap();
+        assert_eq!(answer, "#c5 done: exit 0 · 2s · cargo fmt");
+        let again = wait_on_tool(&actor, &mut state, &cancel, Target::Job(JobId(5))).unwrap();
+        assert!(again.contains("already read"), "{again}");
+
+        // The human's words end it, and the sentence names what was waited on.
+        let mut state = ActorState::default();
+        let (one, _one_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, one);
+        state.running.insert(1);
+        mailbox.send(AgentMsg::Nudge("status?".into())).unwrap();
+        let started = Instant::now();
+        let told = wait_on_tool(&actor, &mut state, &cancel, Target::Agent(1)).unwrap();
+        assert!(told.contains("interrupted"), "{told}");
+        assert!(told.contains("#1 is still running"), "{told}");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the message ends it, not the timeout: {:?}",
+            started.elapsed()
+        );
+
+        // A sibling's lock is not this call's business: a ready target answers
+        // without the clock moving while the machine is held.
+        let mut state = ActorState::default();
+        let (one, _one_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, one);
+        note_completion(&mut state, 1, 1, Outcome::Finished("done it".into()));
+        actor.ctx.registry.take_machine(2, "cargo bench").unwrap();
+        let before = clock.elapsed();
+        let answer = wait_on_tool(&actor, &mut state, &cancel, Target::Agent(1)).unwrap();
+        assert!(answer.contains("#1 done: done it"), "{answer}");
+        assert_eq!(clock.elapsed(), before, "the lock is not waited for");
+        actor.ctx.registry.release_machine(2);
+
+        // A row the books cannot move — a seeded child (H30) — is named for
+        // what it is instead of being slept on for ten minutes.
+        let mut state = ActorState::default();
+        let (one, _one_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, one);
+        let before = clock.elapsed();
+        let answer = wait_on_tool(&actor, &mut state, &cancel, Target::Agent(1)).unwrap();
+        assert_eq!(
+            answer,
+            "nothing to wait for: #1 is not running and has no result"
+        );
+        assert_eq!(clock.elapsed(), before);
+
+        // With nothing to hand over it still blocks on the target alone, and
+        // the clock is what ends it — naming the one name.
+        let mut state = ActorState::default();
+        let (one, _one_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, one);
+        state.running.insert(1);
+        let answer = wait_on_tool(&actor, &mut state, &cancel, Target::Agent(1)).unwrap();
+        assert_eq!(answer, "wait timed out — #1 still running");
+        assert!(
+            clock.elapsed() >= Duration::from_secs(600),
+            "the deadline ended it: {:?}",
+            clock.elapsed()
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }

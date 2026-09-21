@@ -365,24 +365,29 @@ fn normalize_url(url: &str) -> String {
 }
 
 /// Tokens every request reserves for the tool schemas. Ten schemas measure
-/// ~5.6 KB (~1.9 K tokens at the 3 bytes/token heuristic), so the reserve
+/// ~5.9 KB (~2 K tokens at the 3 bytes/token heuristic), so the reserve
 /// rounds up; `prompt` tests that they keep fitting.
 ///
 /// The schemas are context paid on *every* request, so this is a real cost.
 /// Ownership keeps it down: the prompts carry how to work (the rules, the
 /// delegation policy, what the machine is like), and a schema carries only its
 /// own call — arguments, defaults, and what comes back. The number has moved
-/// twice, and both times for a reason rather than a drift. A cut from twelve
-/// tools to six took the payload from ~5.1 KB to ~3.5 KB on the premise that the
-/// shell reads, lists and writes better than a bespoke tool; three of those
-/// tools are back, because that premise fails in two places the shell cannot
-/// reach — the machine lock refuses every `run_command` while a sibling holds it
-/// (finding H31), and a shell cannot carry an image — and `search` came with
-/// them. `edit_file` earned the other direction: its second, top-level
-/// `old_string`/`new_string` shape is gone, which is where the schema and the
-/// code had drifted (H20 item 3). The `schemas_fit_the_budget_reserve` test is
-/// what makes growth a decision rather than a silent drift.
-pub const SCHEMA_TOKENS: usize = 1_900;
+/// three times, and each time for a reason rather than a drift. A cut from
+/// twelve tools to six took the payload from ~5.1 KB to ~3.5 KB on the premise
+/// that the shell reads, lists and writes better than a bespoke tool; three of
+/// those tools are back, because that premise fails in two places the shell
+/// cannot reach — the machine lock refuses every `run_command` while a sibling
+/// holds it (finding H31), and a shell cannot carry an image — and `search`
+/// came with them. `edit_file` earned the other direction: its second,
+/// top-level `old_string`/`new_string` shape is gone, which is where the schema
+/// and the code had drifted (H20 item 3). The third move is `wait`'s one
+/// optional `on`: between "block on everything I own" and `sleep` there was no
+/// spelling for "wake me when this one is done", and the model reached for the
+/// only thing left (H34); the call keeps its meaning without the argument, and
+/// a target that is not one name is refused rather than
+/// defaulted. The `schemas_fit_the_budget_reserve` test is what makes growth a
+/// decision rather than a silent drift.
+pub const SCHEMA_TOKENS: usize = 2_000;
 
 impl Config {
     /// Built-in defaults with the `MUSH_*` environment applied.
@@ -1545,8 +1550,9 @@ mod tests {
         // tools), 1750 (what the waits hand over, H15), 1700 when the dedup
         // pass fit the same rules in fewer bytes, 1200 after the cut to six
         // tools took the shell's work off the schema list, 1300 when `wait`
-        // took on the machine lock and named its cap, and 1900 when the file
-        // tools came back and `edit_file` lost its second shape (H31). See
+        // took on the machine lock and named its cap, 1900 when the file
+        // tools came back and `edit_file` lost its second shape (H31), and
+        // 2000 when `wait` gained its one optional target (H34). See
         // `SCHEMA_TOKENS`.
         let small = Config::new("http://x:1", "m", None);
         assert_eq!(small.context_tokens, DEFAULT_CONTEXT_TOKENS);
@@ -1560,7 +1566,7 @@ mod tests {
             max_completion_tokens: false,
             ..small.clone()
         };
-        assert_eq!(big.history_budget(), 315_300);
+        assert_eq!(big.history_budget(), 315_000);
 
         // A tiny window shrinks the reserve to half the window instead of
         // ignoring it: history still gets 1536 bytes, and the cap — which has

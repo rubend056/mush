@@ -276,13 +276,19 @@ pub fn tool_schemas() -> Vec<Value> {
             ToolName::Wait,
             "Block until nothing you own is still running \u{2014} every child and every job \u{2014} then \
              answer with one digest: a result you have not read comes in full, an already-read one as a \
-             line. A result nobody has read is handed over first, whatever the machine is doing; \
-             otherwise a subagent's wait also waits while another agent holds the machine, which is how \
-             a command refused with `#N holds the machine` is retried. Returns at once when you have \
-             nothing to wait for \u{2014} nothing of yours running or unread, and no other agent \
-             holding the machine; gives up after 10 minutes, naming what still runs; a message to you \
-             ends the wait early and says so.",
-            json!({ "type": "object", "properties": {} }),
+             line. With `on`, wait for that one thing only \u{2014} the rest keeps running \u{2014} though a \
+             result you have not read still ends the wait. A result nobody has read is handed over \
+             first, whatever the machine is doing; otherwise a subagent's wait also waits while another \
+             agent holds the machine, which is how a command refused with `#N holds the machine` is \
+             retried. Returns at once when you have nothing to wait for \u{2014} nothing of yours running \
+             or unread, and no other agent holding the machine; gives up after 10 minutes, naming what \
+             still runs; a message to you ends the wait early and says so.",
+            json!({
+                "type": "object",
+                "properties": {
+                    "on": { "type": "string", "description": "Wait for this one thing only, named as status prints it: `2` for child agent #2, `c2` for job #c2; with `on` the machine lock is not waited for." }
+                }
+            }),
         ),
     ]
 }
@@ -372,28 +378,58 @@ mod tests {
         );
     }
 
-    /// `wait` takes no arguments: it is "everything I own has finished", and a
-    /// parameter is exactly the reasoning (ids? all? timeout?) H15 found a
-    /// model getting wrong. The two parameterless listings take none either.
+    /// `wait`'s one argument, and its shape: a single target named as `status`
+    /// prints it, optional (a bare wait is still everything), with a wrong type
+    /// refused rather than defaulted — the one shape H15's trap allows. The
+    /// listing takes none, and `control` still names its target the same way.
     #[test]
-    fn the_control_and_wait_schemas_are_parameterless_where_they_promise() {
-        let schema = |tool: &str| {
+    fn a_wait_target_is_one_optional_thing_and_the_listings_take_none() {
+        let function = |tool: &str| {
             tool_schemas()
                 .into_iter()
                 .find(|schema| schema["function"]["name"] == tool)
-                .expect("the tool has a schema")["function"]["parameters"]
+                .expect("the tool has a schema")["function"]
                 .clone()
         };
-        for tool in ["wait", "status"] {
-            assert_eq!(
-                schema(tool)["properties"].as_object().map(|p| p.len()),
-                Some(0),
-                "{tool} takes no arguments"
-            );
-        }
+        assert_eq!(
+            function("status")["parameters"]["properties"]
+                .as_object()
+                .map(|p| p.len()),
+            Some(0),
+            "status takes no arguments"
+        );
+        let wait = function("wait");
+        let properties = wait["parameters"]["properties"]
+            .as_object()
+            .expect("wait has properties");
+        assert_eq!(
+            properties.len(),
+            1,
+            "wait takes the one target: {properties:?}"
+        );
+        let on = &properties["on"];
+        assert_eq!(on["type"], "string");
+        let on_description = on["description"].as_str().unwrap();
+        assert!(
+            on_description.contains("`2`") && on_description.contains("`c2`"),
+            "the target is named the way status prints it: {on_description}"
+        );
+        assert!(
+            on_description.contains("machine"),
+            "the machine lock stays bare wait's road back: {on_description}"
+        );
+        assert!(
+            wait["parameters"].get("required").is_none(),
+            "the target is optional — a bare wait is still everything"
+        );
+        let call = wait["description"].as_str().unwrap();
+        assert!(
+            call.contains("still ends the wait"),
+            "the yield rule is said where the call is chosen: {call}"
+        );
         // `control` names its target as `status` prints it, and `message` says
         // it is the agent-only action.
-        let control = schema("control");
+        let control = function("control")["parameters"].clone();
         assert_eq!(control["properties"]["id"]["type"], "string");
         assert_eq!(control["properties"]["action"]["enum"][1], "message");
         assert!(control["properties"]["text"]["description"]

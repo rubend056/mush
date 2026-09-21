@@ -85,6 +85,13 @@ const JOB_LINE_TAIL: usize = 400;
 /// anyone asks about.
 const JOB_HISTORY: usize = 8;
 
+/// The refusal for a job this agent owns nothing under — one home for a
+/// sentence `control` and a targeted `wait` both need, because it is the same
+/// mistake in both hands.
+pub fn unknown_job(id: JobId) -> String {
+    format!("no such job {id} — status lists yours")
+}
+
 /// How much of the jobs' own windows one `status` result carries, in total:
 /// every job's headline plus this much output, however many jobs there are.
 ///
@@ -1103,7 +1110,7 @@ impl Registry {
     pub fn stop(&self, owner: u64, id: JobId) -> Result<String, String> {
         let record = self.jobs().into_iter().find(|record| record.id == id);
         match record {
-            None => Err(format!("no such job {id} — status lists yours")),
+            None => Err(unknown_job(id)),
             Some(record) if record.owner != owner => {
                 Err(format!("job {id} belongs to agent #{}", record.owner))
             }
