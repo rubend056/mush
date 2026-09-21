@@ -217,9 +217,9 @@ pub fn tool_schemas() -> Vec<Value> {
              line. A result nobody has read is handed over first, whatever the machine is doing; \
              otherwise a subagent's wait also waits while another agent holds the machine, which is how \
              a command refused with `#N holds the machine` is retried. Returns at once when you have \
-             nothing to wait for \u{2014} no children, no jobs, no other agent holding the machine; \
-             gives up after 10 minutes and names what is still running; a message to you ends the wait \
-             early and says so.",
+             nothing to wait for \u{2014} nothing of yours running or unread, and no other agent \
+             holding the machine; gives up after 10 minutes, naming what still runs; a message to you \
+             ends the wait early and says so.",
             json!({ "type": "object", "properties": {} }),
         ),
     ]
@@ -473,9 +473,12 @@ mod tests {
         assert!(description.contains("ends the wait early"), "{description}");
         // And what "nothing to wait for" means, since the immediate return is
         // the one clause a locked-out agent could read as "the wait the refusal
-        // named comes straight back".
+        // named comes straight back": a read result is nothing to wait for, and
+        // the machine is named as what would otherwise be one.
         assert!(
-            description.contains("no children, no jobs, no other agent holding the machine"),
+            description.contains(
+                "nothing of yours running or unread, and no other agent holding the machine"
+            ),
             "{description}"
         );
     }

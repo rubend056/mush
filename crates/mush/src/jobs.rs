@@ -594,9 +594,15 @@ impl Refused {
                 held.agent,
                 truncate(&held.command, REFUSAL_COMMAND_COLUMNS)
             ),
+            // The budget is machine-wide, so the two moves are not always the
+            // asker's to make: a sibling's jobs are neither its to stop
+            // (`Registry::stop` refuses another agent's job) nor its to wait for
+            // (`wait` covers what the agent owns). Saying so is the difference
+            // between an instruction and a wild goose chase.
             Refused::Budget => format!(
-                "cannot detach: {MAX_JOBS} commands are already running as jobs (the limit). \
-                 Stop one with control, or wait for one with wait."
+                "cannot detach: {MAX_JOBS} commands are already running as jobs (the limit is \
+                 machine-wide). Stop one of your own with control, or wait for one of your own with \
+                 wait; a sibling's job is neither — work without it until a slot frees"
             ),
             Refused::Thread(error) => format!("could not start the job: {error}"),
         }

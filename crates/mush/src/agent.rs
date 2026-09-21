@@ -842,6 +842,12 @@ struct ActorState {
     /// resume the agent instead of repeating the call that stopped it
     /// (finding H14).
     loop_stop: Option<usize>,
+    /// Set by a `wait` that slept, taken by the loop guard: a wait that spent
+    /// time is not "the same call with nothing changed in between". The one
+    /// call whose whole job is to spend time must not be the one call the guard
+    /// kills a run for making — a hold can outlast a wait many times over, so
+    /// "wait again" is an instruction the guard has to survive (`count_round`).
+    waited: bool,
 }
 
 /// One child's run ending, as its parent keeps it: which run it was, and how it
@@ -1901,14 +1907,19 @@ fn ask(
 /// One round of the loop guard: did this batch repeat the last one, and does
 /// that make the run a loop?
 ///
-/// A batch that asked for something and was *refused* before anything ran is
-/// not a repeat — nothing happened, so nothing is being repeated, and counting
-/// it is what killed a fixer and an integrator whose only crime was retrying a
-/// locked machine (finding H13). A refusal also clears the count: rounds that
-/// did run before it are not evidence about this one.
-fn count_round(last_batch: &mut String, repeats: &mut usize, batch: &str, refused: bool) {
+/// A round that did nothing is not a repeat — nothing happened, so nothing is
+/// being repeated — and there are two of them. One is a batch that asked for
+/// something and was *refused* before anything ran: counting it is what killed a
+/// fixer and an integrator whose only crime was retrying a locked machine
+/// (finding H13). The other is a `wait` that slept (`state.waited`): the call
+/// asked the world to move on and the world answered "not yet", which is the one
+/// answer that is not "nothing changed in between". An exclusive hold can
+/// outlast a single wait many times over, so the road back the refusal names has
+/// to survive being taken more than once. Either way the count is cleared:
+/// rounds that did run before it are not evidence about this one.
+fn count_round(last_batch: &mut String, repeats: &mut usize, batch: &str, did_nothing: bool) {
     if batch == last_batch {
-        if refused {
+        if did_nothing {
             *repeats = 0;
         } else {
             *repeats += 1;
@@ -1952,9 +1963,12 @@ fn run_loop(
     // progress, not a turn count.
     let mut last_batch = String::new();
     let mut repeats = 0usize;
-    // Whether the batch just run was refused before anything ran — the one
-    // thing the guard must not read as a model repeating itself (finding H13).
+    // Whether the batch just run was refused before anything ran, and whether a
+    // blocking `wait` in it actually slept — the two rounds the guard must not
+    // read as a model repeating itself (finding H13, and the road back from a
+    // lock: a hold can outlive many waits).
     let mut refused_round = false;
+    let mut waited_round = false;
     // Consecutive replies the endpoint cut off at the token cap.
     let mut cut_offs = 0usize;
     // What the endpoint itself counted, when it says: the UI's meter is an
@@ -2204,15 +2218,22 @@ fn run_loop(
         // The same batch of calls, twice in a row with nothing changed in
         // between, means the model is repeating itself rather than working.
         // This — not a turn count — is the honest reason to stop a run early.
-        // A batch the machine *refused* is the exception: nothing ran, so
-        // nothing is repeating (finding H13).
+        // Two rounds are exceptions, because neither one moved the world: a
+        // batch the machine *refused* (nothing ran, so nothing is repeating —
+        // finding H13) and a batch whose `wait` slept (the call spent the round
+        // and was told "not yet", which is the whole road back from a lock).
         if !tool_calls.is_empty() {
             let batch = tool_calls
                 .iter()
                 .map(|call| format!("{}:{}", call.function.name, call.function.arguments))
                 .collect::<Vec<_>>()
                 .join("\n");
-            count_round(&mut last_batch, &mut repeats, &batch, refused_round);
+            count_round(
+                &mut last_batch,
+                &mut repeats,
+                &batch,
+                refused_round || waited_round,
+            );
             if repeats >= LOOP_ROUNDS {
                 for call in &tool_calls {
                     let message = Message::tool(
@@ -2302,10 +2323,12 @@ fn run_loop(
         // assistant message whose tool calls dangle — which most servers then
         // reject for the rest of the conversation.
         //
-        // Whether every call in this batch was refused *before it ran* is the
-        // loop guard's business (H13), so it is collected as the batch runs and
-        // handed to the next round's guard.
+        // Whether every call in this batch was refused *before it ran*, and
+        // whether a blocking `wait` in it actually waited, are the loop guard's
+        // business (H13), so both are collected as the batch runs and handed to
+        // the next round's guard.
         let mut all_refused = true;
+        waited_round = false;
         for (index, call) in tool_calls.iter().enumerate() {
             // Keep watching for a Stop/Shutdown between calls, and answer the
             // rest of the batch before leaving: a cancellation must not leave
@@ -2341,6 +2364,11 @@ fn run_loop(
                 Err(ToolError::Refused(why)) => (format!("error: {why}"), true),
                 Err(ToolError::Failed(error)) => (format!("error: {error}"), false),
             };
+            // A `wait` that slept says so in the state it set; taking it here
+            // is what keeps the guard from reading the same blocking call again
+            // as a loop (see [`count_round`]). Every other call leaves it
+            // false, so a round of them counts as it always did.
+            waited_round |= std::mem::take(&mut state.waited);
             // Every call in this batch refused before it ran: the round counts
             // as nothing attempted, which is what keeps the loop guard from
             // condemning a model waiting on a locked machine (H13).
@@ -3391,10 +3419,14 @@ fn parked_message(state: &ActorState) -> Option<Waiting> {
     said
 }
 
-/// The answer to a `wait` that was asked with nothing behind it — no children
-/// and no jobs, and no other agent holding the machine. One spelling, two
-/// roads out of `wait_tool`.
-const NOTHING_TO_WAIT_FOR: &str = "nothing to wait for: no children and no jobs";
+/// The answer to a `wait` that was asked with nothing behind it — nothing of
+/// this agent's running and no result nobody has read, and (for everyone but the
+/// root, which is exempt from the lock) no other agent holding the machine. One
+/// spelling, two roads out of `wait_tool`: the entry guard, and the digest that
+/// came back empty. It does *not* claim "no children": a child whose result the
+/// model has already read is nothing to wait for, and the entry guard tests the
+/// books that can still move, not the rows on the screen.
+const NOTHING_TO_WAIT_FOR: &str = "nothing to wait for: nothing of yours is running or unread";
 
 /// Why a `wait` keeps waiting after everything the agent owns has finished:
 /// another agent holds the machine.
@@ -3425,10 +3457,13 @@ fn machine_holding(held: &jobs::Held) -> String {
 }
 
 /// What a wait says when the machine it was waiting on comes free: the fact the
-/// model needs, because the call it was refused can now run.
+/// model needs next. The sentence does not say "the call that was refused …",
+/// because nothing ties a wait to a refusal — an agent that waited for its own
+/// results while a sibling benchmarked reads this too — and a model told about a
+/// refusal it never made may re-issue a command it had already given up on.
 fn machine_free(held: &jobs::Held) -> String {
     format!(
-        "the machine is free now — {} ended; the call that was refused for the lock can run",
+        "the machine is free now — {} ended; the lock is free for your next command",
         machine_holding(held)
     )
 }
@@ -3447,8 +3482,14 @@ fn machine_timed_out(held: &jobs::Held, mine: bool) -> String {
             held.agent
         )
     } else {
-        "nothing you can call ends it — do work that needs no shell, or finish this run and say \
-         you are blocked"
+        // Not "nothing you can call ends it": the hold is not ended, but it is
+        // *waited out*, and a hold can outlive many waits (`WAIT_TIMEOUT_SECS`
+        // against a job's four hours), so a sentence that named only "do other
+        // work" and "give up" would send the model away from the road the
+        // refusal just named — and the loop guard lets a repeated wait through
+        // for exactly this reason ([`count_round`]).
+        "nothing you can call ends it — wait again (a hold can outlive many waits), or do work that \
+         needs no shell, or finish this run and say you are blocked"
             .to_string()
     };
     format!(
@@ -3576,6 +3617,12 @@ fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Resu
             let note = format!("wait timed out — {} still running", running.join(", "));
             return Ok(with_digest(actor, state, note));
         }
+        // The wait slept: it asked the world to move on and the world said "not
+        // yet", so the loop guard must not read the next identical `wait` as a
+        // repeat of this one (see [`count_round`]). Set on the way into the
+        // sleep rather than on the way out, because the answer that ends it —
+        // the deadline, the release, a message — all of them follow a sleep.
+        state.waited = true;
         clock.sleep(Duration::from_millis(50));
     }
 }
@@ -7092,7 +7139,7 @@ mod tests {
                 &cancel
             )
             .unwrap(),
-            "nothing to wait for: no children and no jobs"
+            "nothing to wait for: nothing of yours is running or unread"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
         let _ = fs::remove_dir_all(idle.ws.root());
@@ -8610,7 +8657,7 @@ mod tests {
         assert!(answer.contains("#2's exclusive command"), "{answer}");
         assert!(answer.contains("cargo bench"), "{answer}");
         assert!(
-            answer.contains("the call that was refused for the lock can run"),
+            answer.contains("the lock is free for your next command"),
             "the answer is the fact the model needs next: {answer}"
         );
         assert!(
@@ -8620,12 +8667,13 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
-    /// And a hold that outlasts the wait: the timeout names the holder and the
-    /// two moves it has left, because nothing it can call ends *another
-    /// agent's* hold — the holder here is a sibling, which no `control` of
-    /// this agent's reaches (the holder that is its own child is the one road
-    /// with a call, pinned below). The clock, not a real ten minutes, is what
-    /// reaches the deadline.
+    /// And a hold that outlasts the wait: the timeout names the holder, the road
+    /// back (`wait` again — a hold can outlive many waits) and the two moves for
+    /// when it cannot: work that needs no shell, or an honest end to the run.
+    /// Nothing this agent can call ends *another agent's* hold — the holder here
+    /// is a sibling, which no `control` of this agent's reaches (the holder that
+    /// is its own child is the one road with a call, pinned below). The clock,
+    /// not a real ten minutes, is what reaches the deadline.
     #[test]
     fn a_wait_that_no_holder_ends_times_out_and_names_it() {
         let clock = Arc::new(Advanceable::new());
@@ -8643,9 +8691,13 @@ mod tests {
         assert!(answer.contains("#2's exclusive command"), "{answer}");
         assert!(answer.contains("still holds the machine"), "{answer}");
         assert!(
+            answer.contains("wait again"),
+            "the road back the refusal named is not withdrawn at the timeout: {answer}"
+        );
+        assert!(
             answer.contains("do work that needs no shell")
                 && answer.contains("finish this run and say you are blocked"),
-            "the two moves left are named: {answer}"
+            "and the two moves for when it cannot are named: {answer}"
         );
         assert!(
             clock.elapsed() >= Duration::from_secs(WAIT_TIMEOUT_SECS),
@@ -11408,12 +11460,13 @@ mod tests {
     }
 
     /// A stored conversation arrives in whatever shape the process that wrote
-    /// it left behind: a call whose result was never recorded (the run was cut
-    /// off between the assistant's message and its results), and the human's
-    /// own words between a call and the results (they typed while it ran). A
-    /// fold is the first request a restored transcript ever travels in, and a
-    /// strict endpoint rejects both shapes with a complaint about
-    /// `tool_call_ids` — so the hand-over repairs them, exactly as a `Run` does.
+    /// it left behind: the human's own words between a call and its results
+    /// (they typed while it ran — the UI stores them where they arrived), and a
+    /// call whose result was never recorded at all (the run was cut off between
+    /// the assistant's message and its results). A fold is the first request a
+    /// restored transcript ever travels in, and a strict endpoint rejects both
+    /// shapes with a complaint about `tool_call_ids` — so the hand-over repairs
+    /// them, exactly as a `Run` does.
     #[test]
     fn a_compact_request_repairs_the_call_pairs_a_stored_transcript_is_missing() {
         let root = scratch_dir("compact-repaired");
@@ -11442,15 +11495,16 @@ mod tests {
         };
         // No `Run` first: this is the actor a restart leaves behind, and the
         // transcript is one a process that went away mid-batch would write —
-        // one call answered late, one never answered at all.
+        // the human's words between a call and its result, and one call never
+        // answered at all.
         root_tx
             .send(AgentMsg::Compact(vec![
                 Message::system("you are mush"),
                 Message::user("the old task".to_string()),
                 calls("call_1"),
                 Message::user("typed while the batch ran".to_string()),
+                Message::tool("call_1", "the late result"),
                 calls("call_2"),
-                Message::tool("call_2", "the result"),
                 Message::assistant("done"),
             ]))
             .unwrap();
@@ -11484,19 +11538,25 @@ mod tests {
             index += 1 + batch.len();
         }
         // The unanswered call got the sentence a missing result is given, not
-        // silence; the answered one kept its own result; and the human's words
-        // still reached the model, after the batch they interrupted.
+        // silence; the interrupted batch kept the result that did arrive (in the
+        // place the repair put it, behind the human's words); and those words
+        // still reached the model.
+        assert!(
+            messages.iter().any(|message| message
+                .tool_call_id
+                .as_deref()
+                .is_some_and(|id| id == "call_2")
+                && message.text().contains("no result was recorded")),
+            "the dangling call is answered: {messages:?}"
+        );
         assert!(
             messages.iter().any(|message| message
                 .tool_call_id
                 .as_deref()
                 .is_some_and(|id| id == "call_1")
-                && message.text().contains("no result was recorded")),
-            "the dangling call is answered: {messages:?}"
+                && message.text() == "the late result"),
+            "the result that arrived late is handed to the call it answers: {messages:?}"
         );
-        assert!(messages
-            .iter()
-            .any(|message| message.role == "tool" && message.text() == "the result"));
         assert!(asked[0].saw("typed while the batch ran"));
         let _ = fs::remove_dir_all(&root);
     }
@@ -11932,9 +11992,84 @@ mod tests {
             count_round(&mut last, &mut repeats, "run_command:{}", false);
         }
         assert_eq!(repeats, LOOP_ROUNDS, "a real repeat still trips it");
+        // A `wait` that slept is the other round that did nothing: the model is
+        // not repeating itself, it is waiting out a hold that can outlast many
+        // waits, so the count is cleared the same way.
+        for _ in 0..LOOP_ROUNDS + 3 {
+            count_round(&mut last, &mut repeats, "wait:{}", true);
+        }
+        assert_eq!(repeats, 0, "a wait that waited never accumulates");
+        // A wait that came straight back is a different round: nothing moved,
+        // nothing was asked of the world, and it counts like any other repeat.
+        for _ in 0..LOOP_ROUNDS {
+            count_round(&mut last, &mut repeats, "wait:{}", false);
+        }
+        assert_eq!(repeats, LOOP_ROUNDS, "a spinning wait still trips it");
         // And a different batch starts over, refusals or not.
         count_round(&mut last, &mut repeats, "edit_file:{}", false);
         assert_eq!(repeats, 0);
+    }
+
+    /// The road back has to survive being taken more than once. An exclusive
+    /// hold can outlive a single wait many times over — a job's four hours
+    /// against the wait's ten minutes — so a model that waits again and again for
+    /// a locked machine is doing what the refusal and the `MACHINE` block told it
+    /// to do, and the loop guard, which counts identical batches, used to stop it
+    /// as a loop after five. A wait that slept is a round in which the world was
+    /// asked to move on and answered "not yet": not a repeat. The same call with
+    /// nothing to wait for still counts, because that one comes straight back and
+    /// changes nothing at all.
+    #[test]
+    fn a_repeated_blocking_wait_is_not_a_loop() {
+        let waits = LOOP_ROUNDS + 3;
+        let script = || {
+            let mut scripted = Scripted::new();
+            for _ in 0..waits {
+                scripted = scripted.calls(vec![tool_call("call", "wait", json!({}))]);
+            }
+            Arc::new(scripted.says("the machine never came free"))
+        };
+        let run = |label: &str, scripted: &Arc<Scripted>, held: bool| {
+            let clock = Arc::new(Advanceable::new());
+            let (actor, _events, _mailbox) =
+                scripted_actor_on_clock(label, scripted, clock.clone());
+            if held {
+                // A sibling, not this agent: the wait has something to wait for.
+                actor.ctx.registry.take_machine(42, "cargo bench").unwrap();
+            }
+            let mut state = ActorState::default();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let mut messages = vec![
+                Message::system("you are mush"),
+                Message::user("wait for the machine"),
+            ];
+            let outcome = run_loop(&actor, &mut state, &mut messages, &cancel);
+            let timeouts = messages
+                .iter()
+                .filter(|message| message.text().contains("wait timed out"))
+                .count();
+            let _ = fs::remove_dir_all(actor.ws.root());
+            (outcome, timeouts)
+        };
+
+        let held = script();
+        let (outcome, timeouts) = run("wait-loop-held", &held, true);
+        assert_eq!(
+            outcome.unwrap().as_deref(),
+            Some("the machine never came free"),
+            "a run that waits the hold out is not a loop"
+        );
+        assert_eq!(
+            timeouts, waits,
+            "every wait spent its ten fake minutes and gave up"
+        );
+
+        // The other direction: with nothing to wait for, the same call comes
+        // back at once and the guard does what it is for.
+        let empty = script();
+        let (outcome, _) = run("wait-loop-empty", &empty, false);
+        let error = outcome.expect_err("a spinning wait is still a loop");
+        assert!(error.contains("stopped as a loop"), "{error}");
     }
 
     /// A run stopped as a loop can be resumed. The next run opens with the
