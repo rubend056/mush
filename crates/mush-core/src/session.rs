@@ -315,7 +315,18 @@ impl Session {
     /// `session_save`), so the save can consume it instead of borrowing it
     /// back. Same path, same fields, same format, still read by
     /// [`Self::load`].
-    pub fn save(self, root: &Path) -> std::io::Result<()> {
+    ///
+    /// Image bytes are not written. Every message carrying one has its payload
+    /// replaced, before serialization, by the placeholder that names its path
+    /// ([`Message::drop_images`]) — on the value this call owns, never on the
+    /// live conversation the snapshot was cloned from. A screenshot is
+    /// megabytes of base64 that no human wants to find in `.mush/session.json`,
+    /// and what a resumed agent needs is the path: with it the model can read
+    /// the file again. [`Self::load`] therefore returns the placeholder and no
+    /// images, and because the drop is idempotent a loaded session saved again
+    /// cannot stack a second placeholder on the first one's text.
+    pub fn save(mut self, root: &Path) -> std::io::Result<()> {
+        self.shed_images();
         let path = session_path(root);
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -326,11 +337,27 @@ impl Session {
         let json = serde_json::to_vec_pretty(&self).map_err(std::io::Error::other)?;
         crate::workspace::atomic_write(&path, &json)
     }
+
+    /// Replace every image payload in this conversation — the root transcript's
+    /// and every subagent's — with the placeholder that names it. Called only
+    /// on the value [`Self::save`] owns; its comment says why the bytes never
+    /// reach the file.
+    fn shed_images(&mut self) {
+        for message in &mut self.messages {
+            message.drop_images();
+        }
+        for agent in &mut self.agents {
+            for message in &mut agent.messages {
+                message.drop_images();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::message::Image;
 
     /// An `absent` session and one mush *cannot read* are two different facts,
     /// and telling them apart is what stops the second from being silently
@@ -560,6 +587,100 @@ mod tests {
         assert_eq!(loaded.notices[0].agent, 3);
         assert_eq!(loaded.notices[0].at, 1_700_000_000);
         assert!(loaded.notices[0].text.contains("could not compact"));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A session file is a conversation, not an image store: before anything is
+    /// written, every message's payload — the root transcript's and every
+    /// subagent's — becomes the placeholder that names its path. Loading yields
+    /// the placeholder and no images, and saving what was loaded again must not
+    /// stack a second placeholder (the bug this shape invites: the file is
+    /// written on every flush, so a placeholder added unconditionally would
+    /// grow a new copy each save).
+    #[test]
+    fn a_session_keeps_the_path_and_not_the_bytes() {
+        let root = std::env::temp_dir().join(format!("mush-session-image-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        ensure_mush_dir(&root).unwrap();
+
+        let mut session = saying("look at this");
+        session.messages[0].images.push(Image {
+            path: "shots/a.png".into(),
+            mime: "image/png".into(),
+            bytes: vec![0x41; 4_096],
+        });
+        session.agents.push(AgentSession {
+            id: 1,
+            messages: vec![Message {
+                images: vec![Image {
+                    path: "shots/b.jpg".into(),
+                    mime: "image/jpeg".into(),
+                    bytes: vec![0x42; 4_096],
+                }],
+                ..Message::user("and this one")
+            }],
+            ..Default::default()
+        });
+
+        session.save(&root).unwrap();
+
+        // The payload is absent in every spelling: a 4 KB run of 0x41 is
+        // `QUFB…` in base64, and the field itself has no name on the wire.
+        let raw = fs::read_to_string(session_path(&root)).unwrap();
+        assert!(
+            !raw.contains("QUFBQUFB"),
+            "the image bytes are not in the file: {raw}"
+        );
+        assert!(
+            !raw.contains("\"images\""),
+            "the bytes have no field of their own in the file: {raw}"
+        );
+        assert!(
+            raw.len() < 2_000,
+            "the placeholder is text, not payload: {} bytes",
+            raw.len()
+        );
+
+        let loaded = Session::load(&root).unwrap();
+        assert!(
+            loaded.messages[0].images.is_empty(),
+            "loading brings no bytes back"
+        );
+        let text = loaded.messages[0].text().to_string();
+        assert!(text.starts_with("look at this"), "{text}");
+        assert!(
+            text.contains("shots/a.png"),
+            "the placeholder names the path: {text}"
+        );
+        assert_eq!(
+            text.matches("[image:").count(),
+            1,
+            "one image, one placeholder: {text}"
+        );
+        assert!(
+            loaded.agents[0].messages[0].images.is_empty(),
+            "a subagent's transcript is shed too"
+        );
+        let child_text = loaded.agents[0].messages[0].text().to_string();
+        assert!(
+            child_text.contains("shots/b.jpg"),
+            "and its placeholder names its path: {child_text}"
+        );
+
+        loaded.save(&root).unwrap();
+        let again = Session::load(&root).unwrap();
+        assert_eq!(
+            again.messages[0].text(),
+            text,
+            "the second save does not append a second placeholder"
+        );
+        assert_eq!(
+            again.agents[0].messages[0].text(),
+            child_text,
+            "nor a second one for the subagent"
+        );
+        assert_eq!(again.messages[0].text().matches("[image:").count(), 1);
         let _ = fs::remove_dir_all(&root);
     }
 

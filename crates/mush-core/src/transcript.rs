@@ -1,11 +1,11 @@
 //! The transcript algebra: the rules that decide the *shape* of a request.
 //!
 //! Pairing tool calls with their results, repairing arguments a model sent as
-//! something other than JSON, dropping the oldest turns to fit a budget (and
-//! saying so in the request), and deciding when a conversation should be
-//! folded into a summary. Nothing here calls a model or touches an actor —
-//! these are pure functions over `Message`s, which is why they live in core
-//! and not in the run loop that applies them.
+//! something other than JSON, shedding image payloads and dropping the oldest
+//! turns to fit a budget (and saying so in the request), and deciding when a
+//! conversation should be folded into a summary. Nothing here calls a model or
+//! touches an actor — these are pure functions over `Message`s, which is why
+//! they live in core and not in the run loop that applies them.
 
 use serde_json::Value;
 
@@ -273,11 +273,20 @@ may have been dropped rather than never said.";
 /// user message keeps assistant/tool pairs intact, which servers validate.
 /// The budget comes from the endpoint's context window.
 ///
+/// Image payloads are shed first, oldest message first, each replaced by the
+/// placeholder that names its path ([`Message::drop_images`]). An image is what
+/// an over-budget transcript is usually made of, and the cheapest thing to
+/// lose: the placeholder says which file it came from, so the model can read it
+/// again if it needs it, where a dropped turn is gone with its words. Only once
+/// no image is left does the drain below start dropping turns — which run still
+/// happens when the words alone are over budget.
+///
 /// A transcript that lost turns says so once, in `DROPPED_TURNS_NOTE`'s line.
 /// The note is built here, counted against the budget like any other message,
 /// and kept out of the draining below — a `user` line would otherwise read as
 /// a turn boundary — and a later drain replaces it along with the turns it was
-/// explaining.
+/// explaining. A transcript that only lost image payloads carries no note: its
+/// turns are all there, and the placeholders say what happened.
 pub fn trim_history(messages: &mut Vec<Message>, budget: usize) {
     // Whatever an earlier call left comes out first: the arithmetic below
     // counts `user` lines as turns, and the note is not one.
@@ -295,6 +304,17 @@ pub fn trim_history(messages: &mut Vec<Message>, budget: usize) {
             + if carried || dropped { note.weight() } else { 0 };
         if total <= budget {
             break;
+        }
+        // The bytes go before the words. Each pass sheds the oldest message
+        // still carrying one, so the replay below re-weighs what is left — the
+        // placeholder the drop leaves is counted like any other text — and only
+        // a transcript with no images left reaches the drain.
+        if let Some(message) = messages
+            .iter_mut()
+            .find(|message| !message.images.is_empty())
+        {
+            message.drop_images();
+            continue;
         }
         let user_indices: Vec<usize> = messages
             .iter()
@@ -336,7 +356,7 @@ fn is_dropped_note(message: &Message) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FunctionCall, ToolCall};
+    use crate::{FunctionCall, Image, ToolCall};
 
     /// A one-message transcript weighing exactly `weight` bytes. `Message::weight`
     /// counts the role plus the text, so the text is sized to land on the
@@ -533,6 +553,122 @@ mod tests {
         trim_history(&mut messages, 100);
         assert_eq!(messages.len(), 4);
         assert_eq!(note_count(&messages), 0);
+    }
+
+    /// An image of `bytes` bytes whose path says which one it is, for the trim
+    /// tests: big enough to sway a budget, small enough to read.
+    fn image(path: &str, bytes: usize) -> Image {
+        Image {
+            path: path.into(),
+            mime: "image/png".into(),
+            bytes: vec![0x41; bytes],
+        }
+    }
+
+    /// A transcript over budget *only because of an image* keeps every turn:
+    /// the payload is shed first, the placeholder names the path so the image
+    /// can be read again, and no note is written because no turn was dropped.
+    /// Without that order the drain would have thrown away the turn the image
+    /// arrived in — losing the model's words to protect the endpoint from bytes
+    /// that are exactly what a placeholder can stand in for.
+    #[test]
+    fn an_image_is_dropped_before_any_turn_is() {
+        let mut messages = vec![Message::system("you are mush"), Message::user("first")];
+        let mut reply = Message::assistant("here it is");
+        reply.images.push(image("shots/huge.png", 40_000));
+        messages.push(reply);
+        messages.push(Message::tool("call_0", "rendered"));
+        messages.push(Message::user("next"));
+        messages.push(Message::assistant("done"));
+        messages.push(Message::user("last"));
+        let before: Vec<String> = messages.iter().map(|m| m.role.clone()).collect();
+        let words: usize = messages
+            .iter()
+            .filter(|message| message.images.is_empty())
+            .map(Message::weight)
+            .sum();
+        let budget = words + 1_000;
+        assert!(
+            messages.iter().map(Message::weight).sum::<usize>() > budget,
+            "the fixture is over budget because of the image, not the words"
+        );
+
+        trim_history(&mut messages, budget);
+
+        let after: Vec<String> = messages.iter().map(|m| m.role.clone()).collect();
+        assert_eq!(after, before, "every turn survives the trim");
+        assert!(messages[2].images.is_empty(), "the payload is what went");
+        assert!(
+            messages[2].text().contains("shots/huge.png"),
+            "the placeholder names the path: {}",
+            messages[2].text()
+        );
+        assert_eq!(
+            note_count(&messages),
+            0,
+            "no turn was dropped, so the note about dropped turns would be a lie"
+        );
+        assert!(
+            messages.iter().map(Message::weight).sum::<usize>() <= budget,
+            "the transcript now fits"
+        );
+    }
+
+    /// Shedding an image is not an escape from the drain: when the words alone
+    /// are over budget, turns drop exactly as they did before images existed,
+    /// and no payload survives to be sent.
+    #[test]
+    fn the_turn_drain_still_runs_when_the_words_alone_are_over_budget() {
+        let mut messages = long_transcript(50);
+        for (i, message) in messages.iter_mut().enumerate() {
+            if message.role == "assistant" {
+                message.images.push(image(&format!("shots/{i}.png"), 200));
+            }
+        }
+        trim_history(&mut messages, 8_000);
+
+        assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE);
+        assert!(
+            messages.iter().all(|message| message.images.is_empty()),
+            "no payload survives a trim that had to drop turns"
+        );
+        assert!(messages.iter().map(Message::weight).sum::<usize>() <= 8_000);
+    }
+
+    /// Oldest first, and only as many as the budget needs: the payload the
+    /// transcript has carried the longest is what goes, and a newer image is
+    /// not thrown away for room the older one's drop already made.
+    #[test]
+    fn the_oldest_image_payload_is_shed_before_a_newer_one() {
+        let mut messages = vec![Message::system("you are mush"), Message::user("first")];
+        for (i, path) in ["shots/one.png", "shots/two.png"].into_iter().enumerate() {
+            let mut reply = Message::assistant(format!("here {i}"));
+            reply.images.push(image(path, 7_000));
+            messages.push(reply);
+            messages.push(Message::user(format!("again {i}")));
+        }
+        // Room for the words and one of the two payloads, not both.
+        let budget = 8_000;
+        assert!(messages.iter().map(Message::weight).sum::<usize>() > budget);
+
+        trim_history(&mut messages, budget);
+
+        assert!(
+            messages[2].images.is_empty(),
+            "the oldest message with an image is the one that pays"
+        );
+        assert_eq!(
+            messages[4].images.len(),
+            1,
+            "the newer payload stays: the budget can hold it"
+        );
+        assert!(
+            messages[2].text().contains("shots/one.png"),
+            "the placeholder names the older path: {}",
+            messages[2].text()
+        );
+        assert_eq!(note_count(&messages), 0, "no turn was dropped");
+        assert!(messages.iter().map(Message::weight).sum::<usize>() <= budget);
     }
 
     fn call(id: &str) -> ToolCall {

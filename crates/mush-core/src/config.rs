@@ -16,7 +16,9 @@ use crate::CMD_CAP;
 /// Re-exported so a caller reads the whole provider vocabulary from one crate
 /// path. Every vendor fact behind it lives in [`crate::provider`], the only
 /// module that names one.
-pub use crate::provider::{known_context, ModelSpec, Provider, ProviderSpec, PROVIDERS};
+pub use crate::provider::{
+    known_context, vision_capable, ModelSpec, Provider, ProviderSpec, PROVIDERS,
+};
 
 /// Context window assumed when nothing better is known: `MUSH_CONTEXT`, an
 /// endpoint's own metadata, or the provider's per-model table all beat it.

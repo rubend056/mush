@@ -17,12 +17,22 @@
 
 use crate::config::DEFAULT_CONTEXT_TOKENS;
 
-/// A model id and the context window its provider documents for it. Used when
-/// the endpoint does not advertise one (`api.deepseek.com` answers with ids
-/// only). Keep these honest: the value is shown wherever the model is chosen.
+/// A model id and the facts its provider documents about it. Used when the
+/// endpoint does not advertise them (`api.deepseek.com` answers with ids
+/// only). Keep these honest: they are shown wherever the model is chosen.
 pub struct ModelSpec {
     pub id: &'static str,
     pub context_tokens: usize,
+    /// Whether this model's endpoint documents that it accepts image content
+    /// parts. Off for everything the table does not state — including every
+    /// model mush has never heard of — because a guess of "on" is not free:
+    /// an endpoint that has never documented vision may reject the bytes, and a
+    /// rejected request costs a whole turn (the actor hands the endpoint's
+    /// complaint back and the run stops there). A model nobody has written a
+    /// row for can still be asked, by text alone; if a human ever needs to
+    /// override this the way they override a window, that switch belongs
+    /// beside the other per-model facts, not as a default.
+    pub vision: bool,
 }
 
 /// Everything vendor-specific about one selectable provider.
@@ -79,10 +89,13 @@ pub const PROVIDERS: &[ProviderSpec] = &[
             ModelSpec {
                 id: "deepseek-flash",
                 context_tokens: 500_000,
+                // The one model mush talks to that documents image parts.
+                vision: true,
             },
             ModelSpec {
                 id: "deepseek-v4-pro",
                 context_tokens: 500_000,
+                vision: false,
             },
         ],
         // 120000 is the number the human stated for this provider, and it is
@@ -252,6 +265,20 @@ pub fn known_context(model: &str) -> Option<usize> {
         .map(|known| known.context_tokens)
 }
 
+/// Whether a model id is documented to accept image content parts
+/// ([`ModelSpec::vision`]). `false` is the answer for a model no provider row
+/// names: see the field — a capability mush cannot point at a document for is
+/// not assumed, because being wrong about it costs a rejected request. The id
+/// is compared without its namespace (`vendor/model`), like [`known_context`].
+pub fn vision_capable(model: &str) -> bool {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    PROVIDERS
+        .iter()
+        .flat_map(|spec| spec.models)
+        .find(|known| known.id == model)
+        .is_some_and(|known| known.vision)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,6 +351,45 @@ mod tests {
         assert_eq!(known_context("deepseek-flash"), Some(500_000));
         assert_eq!(known_context("vendor/deepseek-v4-pro"), Some(500_000));
         assert_eq!(known_context("qwen2.5-coder"), None);
+    }
+
+    /// Vision is a per-model fact the table states, and a row that carries it is
+    /// the only way to get a `true`. Everything else — a model the table names
+    /// without vision, and every model it has never heard of — is `false`,
+    /// because bytes sent to an endpoint that cannot take them cost a whole
+    /// turn; being wrong in this direction costs an image, which a human can
+    /// ask for by other means.
+    #[test]
+    fn vision_is_a_row_fact_and_unknown_models_are_not_assumed_to_see() {
+        assert!(vision_capable("deepseek-flash"), "the table says so");
+        assert!(
+            vision_capable("vendor/deepseek-flash"),
+            "the namespace is not part of the id"
+        );
+        assert!(
+            !vision_capable("deepseek-v4-pro"),
+            "named by the table, and not documented for images"
+        );
+        assert!(
+            !vision_capable("qwen2.5-coder"),
+            "a model no row names does not default on"
+        );
+        assert!(
+            !vision_capable(""),
+            "and neither does a model id that is nothing"
+        );
+
+        let seeing: Vec<&str> = PROVIDERS
+            .iter()
+            .flat_map(|spec| spec.models)
+            .filter(|model| model.vision)
+            .map(|model| model.id)
+            .collect();
+        assert_eq!(
+            seeing,
+            ["deepseek-flash"],
+            "and exactly one row documents it today"
+        );
     }
 
     /// The guard this module exists for: production code outside this file
