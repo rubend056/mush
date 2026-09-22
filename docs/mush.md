@@ -1240,10 +1240,11 @@ transitions.
   a nudge that arrives mid-reply and must be answered, a root that ends its turn
   while a child still runs and is woken by its result, a stop acknowledged as a
   stop, and a run that goes past two hundred turns and ends only because the
-  model stopped calling tools. The model is scripted; the work — git worktrees, files, the commit, the merge — is
-  real, so they need no socket and no `python3`, though they do need `git`, and one
-  scenario waits on a real shell sleep. `scripts/mock_llm.py` is kept for
-  hand-driven runs; no test and no script refers to it.
+  model stopped calling tools. The model is scripted; the work — git worktrees,
+  files, the commit, the merge — is real, so they need no socket and no
+  `python3`, though they do need `git`, and one scenario waits on a real shell
+  sleep. `scripts/mock_llm.py` is kept for hand-driven runs; no test and no
+  script refers to it.
 - **Live.** Three `#[ignore]`d tests keep the default suite green offline: two
 talk to the configured endpoint (the model list and the shipped reply cap), and
 one makes a TLS handshake against `https://api.deepseek.com`.
