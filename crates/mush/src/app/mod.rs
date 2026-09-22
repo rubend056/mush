@@ -3364,6 +3364,15 @@ impl App {
     /// the path's existence, because that promise is the *same picture*: a
     /// worktree can hold an older commit of the file the human pasted.
     ///
+    /// The comparison is the receiving workspace's own reader
+    /// ([`Workspace::read_image`]), not a raw read of the path: the reader
+    /// stats before it opens, so a FIFO named like the picture answers
+    /// `Ok(None)` instead of blocking this call — which runs on the UI thread
+    /// at every attach and every send — and its whole read is bounded by the
+    /// transport cap whatever the file claims or grows to. A file that is not
+    /// there, not a regular file, not an image, or not these bytes is "the
+    /// receiver does not hold it", and the copy is what it gets.
+    ///
     /// `Err` is a picture whose copy cannot be written: the line names the path
     /// and the reason, and the caller refuses the attachment rather than hand
     /// an agent a path that resolves nowhere.
@@ -3381,11 +3390,15 @@ impl App {
         images
             .into_iter()
             .map(|image| {
+                // The receiver's own reader answers, not a raw `fs::read`: it
+                // stats before it opens (a FIFO is `Ok(None)`, never a blocked
+                // open) and bounds its read by the transport cap
+                // ([`Workspace::read_image`], this method's doc).
                 let same = ws
-                    .resolve(&image.path)
+                    .read_image(&image.path)
                     .ok()
-                    .and_then(|path| std::fs::read(path).ok())
-                    .is_some_and(|bytes| bytes == image.bytes);
+                    .flatten()
+                    .is_some_and(|seen| seen.bytes == image.bytes);
                 if same {
                     return Ok(image);
                 }
@@ -7364,6 +7377,39 @@ mod tests {
         assert_eq!(seen.bytes, sent.images[0].bytes);
     }
 
+    /// A FIFO named like the picture must not freeze the pane. The carry asks
+    /// whether the receiving workspace already holds the image's bytes, and a
+    /// raw `fs::read` answers that by *opening* the path: on a FIFO with no
+    /// writer that open blocks until one appears — on the UI thread, at every
+    /// attach and every send. The carry goes through the workspace's own
+    /// reader, which stats before it opens (finding #15's rule, and its
+    /// watchdog test); the old read never answers, and a hang must fail here
+    /// rather than hang the suite.
+    #[test]
+    fn the_carry_never_opens_a_name_that_is_not_a_regular_file() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut app, _rx) = test_app("carry-fifo");
+            let_the_model_see(&mut app);
+            let fifo = app.ws.root().join("x.png");
+            let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+            let made = made.is_ok_and(|status| status.success());
+            let attached = made && app.attach_image(image("x.png"));
+            let path = app.chat.attachments().first().map(|i| i.path.clone());
+            let _ = tx.send((made, attached, path));
+        });
+        let (made, attached, path) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a FIFO must answer, not hold an open until a writer appears");
+        assert!(made, "this test needs `mkfifo` to build the shape it pins");
+        assert!(attached, "the picture is carried into .mush/paste");
+        let path = path.expect("the box holds it");
+        assert!(
+            path.starts_with(".mush/paste/"),
+            "the FIFO was not the picture; the copy is: {path}"
+        );
+    }
+
     /// A paste of several paths is atomic the way one path is: one word that
     /// is not an image makes the whole paste the words it is — nothing
     /// attaches, nothing is swallowed.
@@ -7751,9 +7797,18 @@ mod tests {
     }
 
     /// The gate measures what the endpoint charges, not what the file weighs: a
-    /// 6 MiB image of 8×8 pixels is nowhere near the room it has, and a small
-    /// file claiming 20,000×20,000 pixels is past the whole window. File bytes
-    /// are the transport's ruler (the cap on a read); pixels are the budget's.
+    /// file at the transport's 2 MB cap whose 8×8 pixels are nowhere near the
+    /// room it has, and a small file claiming 20,000×20,000 pixels past the
+    /// whole window. File bytes are the transport's ruler (the cap on a read);
+    /// pixels are the budget's.
+    ///
+    /// The big-file side is a file at the transport's own 2 MB cap — the
+    /// largest a picture mush can carry — because the merge that made the
+    /// reader stat before it opens also made a past-cap file unreadable to the
+    /// workspace it lies in, and the gate will not hand an agent a path its own
+    /// tools refuse (`carry_images`). The cap-sized file still weighs a few
+    /// tokens: the contrast the test is about is between the file and the
+    /// picture, not between two file sizes.
     #[test]
     fn the_attach_gate_counts_pixels_not_file_bytes() {
         let (mut app, _rx) = test_app("attach-measures");
@@ -7761,16 +7816,17 @@ mod tests {
         app.cell.edit(|cfg| cfg.set_context(500_000));
         let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId::ROOT);
 
+        let cap = mush_core::workspace::IMAGE_FILE_CAP as usize;
         let bytes_heavy = Image {
-            bytes: png(6 * 1024 * 1024),
+            bytes: png(cap - 8),
             pixels: Some((8, 8)),
             ..image("huge.png")
         };
         std::fs::write(app.ws.root().join("huge.png"), &bytes_heavy.bytes).unwrap();
-        assert!(bytes_heavy.bytes.len() > 6 * 1024 * 1024);
+        assert_eq!(bytes_heavy.bytes.len(), cap, "the transport's whole cap");
         assert!(
             bytes_heavy.weight() < room,
-            "six megabytes of file, a few tokens of picture"
+            "a full cap of file, a few tokens of picture"
         );
         assert!(app.attach_image(bytes_heavy), "it fits");
         assert_eq!(
