@@ -1,9 +1,9 @@
 //! The transcript algebra: the rules that decide the *shape* of a request.
 //!
 //! Pairing tool calls with their results, repairing arguments a model sent as
-//! something other than JSON, shedding image payloads and dropping the oldest
-//! turns to fit a budget (and saying so in the request), and deciding when a
-//! conversation should be folded into a summary. Nothing here calls a model or
+//! something other than JSON, dropping the oldest turns to fit a budget (and
+//! saying so in the request), and deciding when a conversation should be
+//! folded into a summary. Nothing here calls a model or
 //! touches an actor — these are pure functions over `Message`s, which is why
 //! they live in core and not in the run loop that applies them.
 
@@ -53,6 +53,32 @@ just the summary, as plain text, and end your turn: call no tool.";
 /// (`docs/findings.md` §8.30).
 pub fn compaction_trigger(budget_bytes: usize) -> usize {
     budget_bytes.saturating_mul(9) / 10
+}
+
+/// Where a trim stops: four fifths of the budget, saturating.
+///
+/// The trim is the last resort, and a trim that stops at the very brim is one
+/// that has to be made again: the next request a turn later is over the budget
+/// once more, so it cuts once more — and every cut rewrites the front of the
+/// prompt, which is exactly the prefix a provider's cache had warmed. Four
+/// fifths leaves a tenth of the budget between the watermark and the fold's own
+/// trigger ([`compaction_trigger`], nine tenths), so a conversation that grows
+/// past the watermark and on across that trigger is folded — one re-send that
+/// keeps the prompt's prefix and re-bases the conversation on a summary —
+/// rather than cut again at the brim.
+///
+/// The trade sits on the other scale: a conversation with no fold available
+/// gives up more of its oldest turns than the request in front of it strictly
+/// needed. That is what the cache-warm prefix and the room the next growth
+/// needs are worth.
+///
+/// `budget_bytes` is in bytes, the unit [`Message::weight`] counts and the unit
+/// [`Config::history_budget`](crate::config::Config::history_budget) returns.
+/// The multiply saturates for the same reason [`compaction_trigger`]'s does: a
+/// caller that never made the conversion hands over `usize::MAX`, and `* 4`
+/// must not wrap to a watermark nearly every transcript exceeds.
+pub fn trim_target(budget_bytes: usize) -> usize {
+    budget_bytes.saturating_mul(4) / 5
 }
 
 /// Approaching the context window: fold the conversation into a summary
@@ -269,25 +295,33 @@ The oldest turns of this conversation were dropped to fit the context window, \
 so this transcript is not the whole conversation: a fact you cannot find here \
 may have been dropped rather than never said.";
 
-/// Drop the oldest turns until the conversation fits the budget. Trimming at a
-/// user message keeps assistant/tool pairs intact, which servers validate.
-/// The budget comes from the endpoint's context window.
+/// Drop the oldest turns until the conversation fits `target`, cutting at a
+/// user message so assistant/tool pairs stay intact: that is the shape servers
+/// validate.
 ///
-/// Image payloads are shed first, oldest message first, each replaced by the
-/// placeholder that names its path ([`Message::drop_images`]). An image is what
-/// an over-budget transcript is usually made of, and the cheapest thing to
-/// lose: the placeholder says which file it came from, so the model can read it
-/// again if it needs it, where a dropped turn is gone with its words. Only once
-/// no image is left does the drain below start dropping turns — which run still
-/// happens when the words alone are over budget.
+/// `target` is the trimmer's own watermark — [`trim_target`] of the window's
+/// budget — and not the budget itself. The budget is the hard ceiling the
+/// endpoint enforces on a request; the watermark is where this policy chooses
+/// to stop, so a cut leaves the conversation room to grow instead of having to
+/// be made again next turn (the reasoning, and its price, is on
+/// [`trim_target`]). A transcript that cannot be cut further — the minimum
+/// shape is system + task + the newest turn — comes back as it was: over the
+/// watermark, and inside the window that is the endpoint's to enforce.
+///
+/// An image is not a thing a trim sheds on its own: it is part of the turn it
+/// arrived in, and a turn the drain drops takes its pictures with it. The pass
+/// that used to shed image payloads *before* dropping a turn was a workaround
+/// for the byte-priced image — a 700 KB screenshot read as 247k tokens, so it
+/// was the first thing to go — and the pixel pricing killed it: a picture now
+/// weighs its own pixels ([`Image::weight`](crate::message::Image::weight)), a
+/// normal-sized part of the turn that carries it.
 ///
 /// A transcript that lost turns says so once, in `DROPPED_TURNS_NOTE`'s line.
-/// The note is built here, counted against the budget like any other message,
-/// and kept out of the draining below — a `user` line would otherwise read as
-/// a turn boundary — and a later drain replaces it along with the turns it was
-/// explaining. A transcript that only lost image payloads carries no note: its
-/// turns are all there, and the placeholders say what happened.
-pub fn trim_history(messages: &mut Vec<Message>, budget: usize) {
+/// The note is built here, counted against `target` like any other message, and
+/// kept out of the draining below — a `user` line would otherwise read as a
+/// turn boundary — and a later drain replaces it along with the turns it was
+/// explaining.
+pub fn trim_history(messages: &mut Vec<Message>, target: usize) {
     // Whatever an earlier call left comes out first: the arithmetic below
     // counts `user` lines as turns, and the note is not one.
     let carried = messages.get(2).is_some_and(is_dropped_note);
@@ -297,30 +331,19 @@ pub fn trim_history(messages: &mut Vec<Message>, budget: usize) {
     let note = Message::user(DROPPED_TURNS_NOTE);
     let mut dropped = false;
     loop {
-        // Once a drop happens the request will carry the note, so the budget
+        // Once a drop happens the request will carry the note, so the target
         // has to hold the note too, or the line explaining the trim would be
-        // what pushes the request past the window. The sum saturates: a header
-        // can claim a picture whose estimate is as large as a `usize`
-        // (`Image::weight`), and a transcript of them has to read as over
-        // budget rather than wrap to a small number that says it fits.
+        // what pushes the request past the watermark. The sum saturates: a
+        // header can claim a picture whose estimate is as large as a `usize`
+        // (`Image::weight`), and a transcript of them has to read as over the
+        // watermark rather than wrap to a small number that says it fits.
         let total: usize = messages
             .iter()
             .map(Message::weight)
             .fold(0, usize::saturating_add)
             .saturating_add(if carried || dropped { note.weight() } else { 0 });
-        if total <= budget {
+        if total <= target {
             break;
-        }
-        // The bytes go before the words. Each pass sheds the oldest message
-        // still carrying one, so the replay below re-weighs what is left — the
-        // placeholder the drop leaves is counted like any other text — and only
-        // a transcript with no images left reaches the drain.
-        if let Some(message) = messages
-            .iter_mut()
-            .find(|message| !message.images.is_empty())
-        {
-            message.drop_images();
-            continue;
         }
         let user_indices: Vec<usize> = messages
             .iter()
@@ -381,6 +404,19 @@ mod tests {
         assert_eq!(compaction_trigger(7_501), 6_750);
     }
 
+    /// The watermark too is computed, not written a second time: four fifths of
+    /// the budget, saturating — the same hostile budget the trigger is tested
+    /// with wraps `* 4` as well, and a wrapped answer would have the trimmer cut
+    /// a conversation down to a watermark of nearly nothing.
+    #[test]
+    fn the_watermark_is_four_fifths_of_the_budget() {
+        assert_eq!(trim_target(0), 0);
+        assert_eq!(trim_target(1_000), 800);
+        assert_eq!(trim_target(7_501), 6_000);
+        assert_eq!(trim_target(usize::MAX), usize::MAX / 5);
+        assert_eq!(trim_target(6_148_914_691_236_517_206), usize::MAX / 5);
+    }
+
     /// A budget that is not bytes at all — `usize::MAX`, what a caller that
     /// skipped the bytes-per-token conversion in `Config::history_budget`
     /// hands over — must neither panic nor lie. `budget * 3 / 4` panicked here
@@ -425,6 +461,61 @@ mod tests {
         assert!(!needs_compaction(&transcript_of_weight(budget + 1), budget));
     }
 
+    /// The sequence the watermark exists for, run the way the caller runs it: a
+    /// trim lands the transcript at or under four fifths, and the growth after
+    /// it has the tenth up to the fold's trigger to cross. When it does, the
+    /// boundary is the fold's — the summarize request still fits the window —
+    /// and the trim that runs after the fold has nothing to cut, because the
+    /// fold left the system prompt and the summary. A trim to the brim would
+    /// have left the next request over again instead, and cut again: every cut
+    /// rewrites the front of the prompt, which is the prefix a provider's cache
+    /// had warmed.
+    #[test]
+    fn a_trim_lands_where_the_next_growth_folds_instead_of_being_cut() {
+        let budget = 40_000;
+        let target = trim_target(budget);
+        let mut messages = long_transcript(50);
+
+        trim_history(&mut messages, target);
+        let trimmed: usize = messages.iter().map(Message::weight).sum();
+        assert!(trimmed <= target, "a trim stops at four fifths: {trimmed}");
+
+        // The conversation's next growth: one turn heavier than the room the
+        // watermark left, so the transcript crosses the fold's trigger while
+        // still fitting inside the budget the summarize request is sent to.
+        messages.push(Message::user(
+            "x".repeat(compaction_trigger(budget) - trimmed + 1),
+        ));
+        let grown: usize = messages.iter().map(Message::weight).sum();
+        assert!(grown <= budget, "the summarize request still fits: {grown}");
+        assert!(
+            needs_compaction(&messages, budget),
+            "so the fold fires: {grown}"
+        );
+
+        // Both mechanisms would act on this transcript — the watermark alone
+        // would cut it — and the caller's order is what gives the fold the
+        // first say.
+        let mut cut = messages.clone();
+        trim_history(&mut cut, target);
+        assert!(cut.len() < messages.len(), "the watermark alone would cut");
+
+        // What the fold leaves — the system prompt and the summary — is a
+        // transcript the trimmer walks past: the two never cut the same
+        // history twice.
+        messages.truncate(1);
+        messages.push(Message::user(crate::prompt::compaction_message(
+            "the story so far",
+        )));
+        let folded = serde_json::to_string(&messages).unwrap();
+        trim_history(&mut messages, target);
+        assert_eq!(
+            serde_json::to_string(&messages).unwrap(),
+            folded,
+            "nothing left for the trim: the fold's transcript is under the watermark"
+        );
+    }
+
     #[test]
     fn trim_history_keeps_recent_turns_and_pairs() {
         let mut messages = vec![Message::system("you are mush"), Message::user("first")];
@@ -433,7 +524,8 @@ mod tests {
             messages.push(Message::tool(format!("call{i}"), "result"));
             messages.push(Message::user(format!("again {i}")));
         }
-        // Mirror the 8K-context default budget from Config::history_budget.
+        // A target in the range an 8K-context window's own watermark lands in;
+        // the drain is what this test is about.
         trim_history(&mut messages, 15_000);
         assert_eq!(messages[0].role, "system");
         assert!(messages.iter().map(Message::weight).sum::<usize>() <= 15_000);
@@ -493,7 +585,7 @@ mod tests {
         assert_eq!(note_count(&messages), 1, "one line, however much was cut");
         assert!(
             messages.iter().map(Message::weight).sum::<usize>() <= 8_000,
-            "the explanation fits the budget it explains"
+            "the explanation fits the watermark it explains"
         );
     }
 
@@ -549,8 +641,8 @@ mod tests {
         assert_eq!(messages.len(), 3, "nothing can be trimmed without a pair");
         assert_eq!(note_count(&messages), 0);
 
-        // Exactly two turns and over budget: the guard refuses the drain, so
-        // there is no drop to explain and no note to add either.
+        // Exactly two turns and over the watermark: the guard refuses the
+        // drain, so there is no drop to explain and no note to add either.
         let mut messages = vec![
             Message::system("you are mush"),
             Message::user("first"),
@@ -583,153 +675,179 @@ mod tests {
         }
     }
 
-    /// A transcript over budget *only because of an image* keeps every turn:
-    /// the payload is shed first, the placeholder names the path so the image
-    /// can be read again, and no note is written because no turn was dropped.
-    /// Without that order the drain would have thrown away the turn the image
-    /// arrived in — losing the model's words to protect the endpoint from bytes
-    /// that are exactly what a placeholder can stand in for.
+    /// A transcript over the watermark because of an image does not lose the
+    /// image on its own any more: it is part of the turn it arrived in, and the
+    /// oldest turns are what go — the picture with them, words and bytes
+    /// together. No placeholder is left where it was: nothing of the turn is.
     #[test]
-    fn an_image_is_dropped_before_any_turn_is() {
+    fn an_image_goes_with_the_turn_it_arrived_in() {
         let mut messages = vec![Message::system("you are mush"), Message::user("first")];
         let mut reply = Message::assistant("here it is");
-        reply.images.push(image("shots/huge.png", 40_000));
+        reply
+            .images
+            .push(picture("shots/huge.png", 4_000, 4_000, 40_000));
         messages.push(reply);
         messages.push(Message::tool("call_0", "rendered"));
         messages.push(Message::user("next"));
         messages.push(Message::assistant("done"));
         messages.push(Message::user("last"));
-        let before: Vec<String> = messages.iter().map(|m| m.role.clone()).collect();
         let words: usize = messages
             .iter()
             .filter(|message| message.images.is_empty())
             .map(Message::weight)
             .sum();
-        let budget = words + 1_000;
+        let target = 24_000;
+        assert!(words <= target, "the words alone fit: {words} > {target}");
         assert!(
-            messages.iter().map(Message::weight).sum::<usize>() > budget,
-            "the fixture is over budget because of the image, not the words"
+            messages.iter().map(Message::weight).sum::<usize>() > target,
+            "the fixture is over the watermark because of the picture, not the words"
         );
 
-        trim_history(&mut messages, budget);
+        trim_history(&mut messages, target);
 
-        let after: Vec<String> = messages.iter().map(|m| m.role.clone()).collect();
-        assert_eq!(after, before, "every turn survives the trim");
-        assert!(messages[2].images.is_empty(), "the payload is what went");
-        assert!(
-            messages[2].text().contains("shots/huge.png"),
-            "the placeholder names the path: {}",
-            messages[2].text()
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].text(), "first", "the opening task survives");
+        assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE);
+        assert_eq!(
+            messages.len(),
+            4,
+            "the oldest turns went whole: {messages:?}"
         );
         assert_eq!(
-            note_count(&messages),
-            0,
-            "no turn was dropped, so the note about dropped turns would be a lie"
+            messages[3].text(),
+            "last",
+            "and the cut landed on the newest turn's own user line"
         );
         assert!(
-            messages.iter().map(Message::weight).sum::<usize>() <= budget,
-            "the transcript now fits"
+            messages.iter().all(|message| message.images.is_empty()),
+            "and the picture with it"
         );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.text().contains("shots/huge.png")),
+            "no placeholder: the picture is not left behind without its turn"
+        );
+        assert!(messages.iter().map(Message::weight).sum::<usize>() <= target);
     }
 
-    /// Shedding an image is not an escape from the drain: when the words alone
-    /// are over budget, turns drop exactly as they did before images existed,
-    /// and no payload survives to be sent.
+    /// A turn the drain never reached keeps its picture whole: bytes and all,
+    /// no placeholder. The drain takes whole turns off the front; it does not
+    /// reach into the ones it keeps.
     #[test]
-    fn the_turn_drain_still_runs_when_the_words_alone_are_over_budget() {
+    fn a_surviving_turn_keeps_its_image_whole() {
         let mut messages = long_transcript(50);
         for (i, message) in messages.iter_mut().enumerate() {
             if message.role == "assistant" {
-                message.images.push(image(&format!("shots/{i}.png"), 200));
+                message
+                    .images
+                    .push(picture(&format!("shots/{i}.png"), 200, 200, 300));
             }
         }
         trim_history(&mut messages, 8_000);
 
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].text(), "first", "the opening task survives");
         assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE);
+        let kept: Vec<&Message> = messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .collect();
+        assert!(!kept.is_empty(), "the newest turn survives every drain");
         assert!(
-            messages.iter().all(|message| message.images.is_empty()),
-            "no payload survives a trim that had to drop turns"
+            kept.iter().all(|message| message.images.len() == 1),
+            "a turn the drain kept keeps its picture: {kept:?}"
+        );
+        assert!(
+            kept.iter()
+                .all(|message| message.images[0].bytes.len() == 300),
+            "bytes and all"
         );
         assert!(messages.iter().map(Message::weight).sum::<usize>() <= 8_000);
     }
 
-    /// Oldest first, and only as many as the budget needs: the payload the
-    /// transcript has carried the longest is what goes, and a newer image is
-    /// not thrown away for room the older one's drop already made.
+    /// Oldest first, and whole turns: the turn the transcript has carried the
+    /// longest is the one that pays, and the newest turn — picture, bytes and
+    /// words entire — stays.
     #[test]
-    fn the_oldest_image_payload_is_shed_before_a_newer_one() {
+    fn the_oldest_turn_goes_before_a_newer_one() {
         let mut messages = vec![Message::system("you are mush"), Message::user("first")];
-        for (i, path) in ["shots/one.png", "shots/two.png"].into_iter().enumerate() {
+        for (i, path) in ["shots/one.png", "shots/two.png", "shots/three.png"]
+            .into_iter()
+            .enumerate()
+        {
             let mut reply = Message::assistant(format!("here {i}"));
             reply.images.push(image(path, 7_000));
             messages.push(reply);
             messages.push(Message::user(format!("again {i}")));
         }
-        // Room for the words and one of the two payloads, not both.
-        let budget = 8_000;
-        assert!(messages.iter().map(Message::weight).sum::<usize>() > budget);
+        // Room for the words and the newest of the three turns, not for more.
+        let target = 7_600;
+        assert!(messages.iter().map(Message::weight).sum::<usize>() > target);
 
-        trim_history(&mut messages, budget);
+        trim_history(&mut messages, target);
 
+        assert_eq!(messages[1].text(), "first", "the opening task survives");
+        assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE);
         assert!(
-            messages[2].images.is_empty(),
-            "the oldest message with an image is the one that pays"
+            !messages
+                .iter()
+                .any(|message| message.text().contains("shots/one.png")
+                    || message.text().contains("shots/two.png")),
+            "the two oldest turns went whole: {messages:?}"
         );
-        assert_eq!(
-            messages[4].images.len(),
-            1,
-            "the newer payload stays: the budget can hold it"
-        );
-        assert!(
-            messages[2].text().contains("shots/one.png"),
-            "the placeholder names the older path: {}",
-            messages[2].text()
-        );
-        assert_eq!(note_count(&messages), 0, "no turn was dropped");
-        assert!(messages.iter().map(Message::weight).sum::<usize>() <= budget);
+        let kept: Vec<&Message> = messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .collect();
+        assert_eq!(kept.len(), 1, "only the newest turn's reply survives");
+        assert!(kept[0].text().contains("here 2"), "and it is the newest");
+        assert_eq!(kept[0].images.len(), 1, "with its picture");
+        assert_eq!(kept[0].images[0].bytes.len(), 7_000, "bytes and all");
+        assert!(messages.iter().map(Message::weight).sum::<usize>() <= target);
     }
 
-    /// The other half of the pixels ruling: the estimate changed, the order
-    /// did not. A transcript over budget because of pixel-weighed pictures
-    /// still sheds the oldest one first, and keeps the newer one the budget
-    /// can hold.
+    /// The pixels are the budget's ruler, and a picture the budget can hold is
+    /// a turn the trimmer leaves alone: 6 MiB of file whose header says 8×8 is
+    /// a few bytes of weight, not the six megabytes the old byte count read —
+    /// so no turn is dropped for it, where the byte pricing would have thrown
+    /// the oldest one away.
     #[test]
-    fn a_picture_over_budget_is_still_shed_oldest_first() {
+    fn an_image_a_kept_turn_is_weighed_by_pixels_not_bytes() {
         let mut messages = vec![Message::system("you are mush"), Message::user("first")];
-        for (i, path) in ["shots/one.png", "shots/two.png"].into_iter().enumerate() {
-            let mut reply = Message::assistant(format!("here {i}"));
-            reply.images.push(picture(path, 1_920, 1_080, 700));
-            messages.push(reply);
-            messages.push(Message::user(format!("again {i}")));
-        }
-        // Room for the words and one 1920×1080 screenshot (~8.3 KB of weight
-        // each), not both.
-        let budget = 10_000;
-        assert!(messages.iter().map(Message::weight).sum::<usize>() > budget);
-
-        trim_history(&mut messages, budget);
-
+        let mut reply = Message::assistant("here it is");
+        reply
+            .images
+            .push(picture("shots/bytes.png", 8, 8, 6 * 1024 * 1024));
+        messages.push(reply);
+        messages.push(Message::user("next"));
+        let target = 10_000;
+        let weighed: usize = messages.iter().map(Message::weight).sum();
+        assert!(weighed <= target, "the pixels fit the watermark: {weighed}");
         assert!(
-            messages[2].images.is_empty(),
-            "the oldest picture is the one that pays"
+            weighed + 6 * 1024 * 1024 > target,
+            "the old byte count would have been over it"
         );
+        let before = serde_json::to_string(&messages).unwrap();
+
+        trim_history(&mut messages, target);
+
         assert_eq!(
-            messages[4].images.len(),
-            1,
-            "the newer picture stays: the budget can hold it"
+            serde_json::to_string(&messages).unwrap(),
+            before,
+            "nothing to trim: the picture weighs its pixels, and they fit"
         );
-        assert!(messages[2].text().contains("shots/one.png"));
-        assert_eq!(note_count(&messages), 0, "no turn was dropped");
-        assert!(messages.iter().map(Message::weight).sum::<usize>() <= budget);
     }
 
-    /// The human's own numbers, and the defect this fixes: a ~300k-token
-    /// conversation (~900 KB of weight) plus a 724 KiB 1920×1080 screenshot
-    /// fits a 500k-token window's budget, because the picture costs ~2.8k
-    /// tokens by its pixels where its bytes read as ~247k. The screenshot they
-    /// had just attached is not shed before the model ever looks at it.
+    /// The human's own numbers, and the defect the pixel pricing fixed: a
+    /// ~300k-token conversation (~900 KB of weight) plus a 724 KiB 1920×1080
+    /// screenshot fits a 500k-token window's budget *and* the trimmer's
+    /// watermark — the picture costs ~2.8k tokens by its pixels where its bytes
+    /// read as ~247k, which is what once made the picture the first thing a
+    /// trim shed. Under the watermark, the conversation is left alone: the
+    /// screenshot reaches the model, and the turn it arrived in survives.
     #[test]
-    fn the_humans_screenshot_fits_and_is_not_shed() {
+    fn the_humans_screenshot_fits_and_is_not_dropped() {
         let mut cfg = Config::new("http://127.0.0.1:1", "test", None);
         cfg.set_context(500_000);
         let budget = cfg.history_budget();
@@ -757,75 +875,71 @@ mod tests {
             total <= budget,
             "the pixels count fits it: {total} > {budget}"
         );
+        assert!(
+            total <= trim_target(budget),
+            "and the watermark holds it too: {total} > {}",
+            trim_target(budget)
+        );
 
-        trim_history(&mut messages, budget);
+        trim_history(&mut messages, trim_target(budget));
 
         assert_eq!(
             messages.last().unwrap().images.len(),
             1,
-            "the newest image is not shed before the model can see it"
+            "the newest image is not dropped with its turn"
         );
         assert_eq!(note_count(&messages), 0, "and no turn was dropped either");
     }
 
-    /// The placeholder weighs its own text and nothing else: once a payload is
-    /// shed, neither the pixels nor the bytes are in the budget any more. A
-    /// trimmer that still counted them would shed the same image forever and
-    /// never get under a budget its picture is no longer part of.
+    /// A transcript of impossible pictures is over the watermark, not wrapped
+    /// under it: a header that claims `u32::MAX × u32::MAX` pixels weighs as
+    /// much as there is, and the drain reads that saturated total as over on
+    /// every pass — a plain sum would panic in a debug build and wrap to a
+    /// small, fitting-looking number in a release one, and the trimmer would
+    /// leave the transcript alone. The picture on the newest line is kept: the
+    /// drain takes turns, it does not shed payloads.
     #[test]
-    fn a_shed_payload_leaves_only_the_placeholders_weight() {
-        let mut message = Message::assistant("here it is");
-        message
-            .images
-            .push(picture("shots/screen.png", 1_920, 1_080, 741_396));
-        let with_image = message.weight();
-
-        message.drop_images();
-
-        let text = message.text().to_string();
-        assert_eq!(
-            message.weight(),
-            "assistant".len() + text.len(),
-            "role and placeholder text, and no payload: {text}"
-        );
-        assert!(message.weight() < with_image, "the picture is gone");
-        assert!(
-            with_image - message.weight() > 8_000,
-            "and its ~8.3 KB of weight with it: {with_image} -> {}",
-            message.weight()
-        );
-        assert!(
-            text.contains("shots/screen.png"),
-            "and the path that replaces it is there: {text}"
-        );
-    }
-
-    /// A transcript of impossible pictures is over budget, not wrapped under
-    /// it: 260 headers that each claim `u32::MAX × u32::MAX` pixels sum past a
-    /// `usize`, and the saturating total still says "shed" — a plain sum would
-    /// panic in a debug build and wrap to a small, fitting-looking number in a
-    /// release one.
-    #[test]
-    fn a_transcript_of_impossible_pictures_still_reads_as_over_budget() {
-        let mut messages = vec![Message::system("you are mush"), Message::user("first")];
-        for i in 0..260 {
-            let mut reply = Message::assistant(format!("here {i}"));
-            reply.images.push(Image {
-                path: format!("shots/{i}.png"),
-                mime: "image/png".into(),
-                bytes: vec![],
-                pixels: Some((u32::MAX, u32::MAX)),
-            });
-            messages.push(reply);
+    fn a_transcript_of_impossible_pictures_still_reads_as_over_the_watermark() {
+        let mut messages = long_transcript(260);
+        for (i, message) in messages.iter_mut().enumerate() {
+            if message.role == "assistant" {
+                message.images.push(Image {
+                    path: format!("shots/{i}.png"),
+                    mime: "image/png".into(),
+                    bytes: vec![],
+                    pixels: Some((u32::MAX, u32::MAX)),
+                });
+            }
         }
+        // The newest turn is what survives every drain, so it carries the one
+        // picture that can prove the drain did not shed payloads on its way.
+        messages.last_mut().unwrap().images.push(Image {
+            path: "shots/newest.png".into(),
+            mime: "image/png".into(),
+            bytes: vec![],
+            pixels: Some((u32::MAX, u32::MAX)),
+        });
+        let before = messages.len();
 
         trim_history(&mut messages, 1_000);
 
         assert!(
-            messages.iter().all(|message| message.images.is_empty()),
-            "every payload is shed, so the total was read as over budget"
+            messages.len() < before,
+            "the drain ran: the saturated total read as over the watermark"
         );
-        assert!(messages.len() > 2, "the words are not what was dropped");
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+        assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE);
+        assert_eq!(
+            messages.len(),
+            4,
+            "and it stopped when the text left fit: {messages:?}"
+        );
+        assert_eq!(
+            messages[3].images.len(),
+            1,
+            "a picture in a surviving turn stays: nothing is shed on its own"
+        );
     }
 
     fn call(id: &str) -> ToolCall {

@@ -92,7 +92,7 @@ pub const BYTES_PER_TOKEN: usize = 3;
 /// about `width × height / 750`, and OpenAI tiles one into 512 px patches at
 /// roughly 1,500 px per token after the first — so 750 counts a picture as
 /// *more* expensive than either, which is the safe direction for a budget that
-/// sheds over-weight history ([`Config::history_budget`]).
+/// has to drop over-weight history ([`Config::history_budget`]).
 ///
 /// What it does not model: an endpoint that tokenized a `data:` URL's base64
 /// text as text would pay for the spelling as well as the picture. No endpoint
