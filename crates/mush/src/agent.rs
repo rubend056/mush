@@ -686,7 +686,33 @@ pub enum AgentEvent {
     Running {
         cancel: Arc<AtomicBool>,
     },
+    /// The label of what the agent is doing now: a tool call's own name and
+    /// summarized arguments, emitted just before the tool runs, or the run's
+    /// closing line about its worktree.
+    ///
+    /// It is the truth about a machine busy *locally*, which is why a parked
+    /// `wait` and a long `run_command` keep it: the tool's own label is the
+    /// fact the row is for. It holds until the next label — or until the
+    /// model's turn starts ([`AgentEvent::Thinking`]), which is what a run
+    /// wears between a finished tool and the request that follows it.
     Status(String),
+    /// The model's turn is starting: the request fits the window and is about
+    /// to go on the wire, so nothing is running locally any more.
+    ///
+    /// A reader can conclude both halves from it: the tool named before it has
+    /// finished — its result is in the transcript — and what is being waited on
+    /// now is the model's answer. The row and the pane's foot wear `thinking…`
+    /// between this event and the next [`Status`](Self::Status); without it
+    /// they kept the finished tool's label through the whole model call, which
+    /// read as a machine still busy with work that was over.
+    ///
+    /// Emitted at the one place a request is asked (`run_loop`), after the fit
+    /// test and immediately before the ask, so a request refused before the
+    /// wire paints no phase for a request that never went out. A tool that
+    /// blocks locally — a parked `wait`, a long `run_command` — emits none:
+    /// those are tool calls, and the tool's own label is what the row should
+    /// say while the machine is busy with them.
+    Thinking,
     /// A line for the transcript that is not a message and not a failure: a
     /// limit the run reached, say. Unlike `Status` it stays visible, and unlike
     /// `Error` it does not mark the run failed.
@@ -1215,6 +1241,22 @@ pub(crate) fn spawn_scripted(
 ) -> RootHandle {
     let conversation = next_conversation();
     root_actor(ConfigHandle::own(cfg), model, events, conversation, root)
+}
+
+/// The same actor, reporting through the UI's own channel instead of a sink a
+/// test reads: how an `App` test drives a *real* run's events into the window —
+/// [`spawn_scripted`] is for the tests that read what the model was asked,
+/// which the UI channel would not carry.
+#[cfg(test)]
+pub(crate) fn spawn_scripted_ui(
+    cfg: Config,
+    tx: Sender<Msg>,
+    root: PathBuf,
+    model: Arc<dyn ModelClient>,
+) -> RootHandle {
+    let conversation = next_conversation();
+    let ui: Arc<dyn Events> = Arc::new(Ui::new(tx, conversation));
+    root_actor(ConfigHandle::own(cfg), model, ui, conversation, root)
 }
 
 /// One conversation per Ctrl-N, so stale events can be told apart: an actor
@@ -2497,6 +2539,17 @@ fn run_loop(
         // `tool_schemas`). `auto` keeps models that ignore tools working: they
         // simply answer, and a model that answers is a run that has finished.
         let request = request(&cfg, &visible, &schemas, cfg.reply_cap());
+
+        // The model's turn is starting, and the tools before it are done: no
+        // other event says so. The last `Status` named a tool *before* it ran,
+        // so without this the row and the foot kept `run_command …` — the
+        // label of a command that had already exited — through the whole model
+        // call that followed it. Said here, after the fold, the trim and the
+        // fit test, so a request refused before the wire paints no phase for
+        // one that never went out. A tool that blocks locally (`wait`, a long
+        // `run_command`) emits none: it is a tool call, and the tool's own
+        // label is the truth while it runs.
+        actor.ctx.emit(actor.id, AgentEvent::Thinking);
 
         // One turn's ask: the retry policy and the retry line are [`ask`]'s,
         // the error arms below are the run's own.
@@ -12404,6 +12457,111 @@ mod tests {
             "the command ran; it wrote no output for the tool result to carry"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The human's report, at the actor: a tool finished and the model was
+    /// asked again, but nothing said the tool was over — the row and the foot
+    /// kept `run_command …`, the label of work that had already exited, through
+    /// the whole model call. The actor now announces the model's turn at the
+    /// one place a request goes out, after the tool's own result and before the
+    /// ask; the second reply is held, so the moment the assertion reads is
+    /// provably a request in flight.
+    #[test]
+    fn a_run_says_it_is_thinking_before_the_request_that_follows_a_tool() {
+        let root = scratch_dir("thinking-between-tools");
+        let gate = Arc::new(Gate::new());
+        let scripted = Arc::new(
+            Scripted::new()
+                .calls(vec![tool_call(
+                    "call_1",
+                    "run_command",
+                    json!({ "command": "printf hello > note.txt" }),
+                )])
+                .held(gate.clone())
+                .says("wrote note.txt"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("write note.txt".to_string()),
+            ]))
+            .unwrap();
+
+        // The second request is on the wire and the model has not answered it.
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the request after the tool must reach the model"
+        );
+        let recorded = events.events_for(AgentId::ROOT);
+        let at = |wanted: fn(&AgentEvent) -> bool| {
+            recorded
+                .iter()
+                .position(&wanted)
+                .unwrap_or_else(|| panic!("no such event in {recorded:?}"))
+        };
+        // The tool's label before the tool ran, then its result, then the
+        // model's turn: the order those three have to arrive in for the row to
+        // never claim a finished tool is still working.
+        let label = at(
+            |event| matches!(event, AgentEvent::Status(what) if what.starts_with("run_command")),
+        );
+        let result =
+            at(|event| matches!(event, AgentEvent::Message(message) if message.role == "tool"));
+        let thinkings: Vec<usize> = recorded
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| matches!(event, AgentEvent::Thinking))
+            .map(|(index, _)| index)
+            .collect();
+        assert_eq!(
+            thinkings.len(),
+            2,
+            "one announcement per request — the opening one and the one after the tool: \
+             {recorded:?}"
+        );
+        assert!(
+            thinkings[0] < label,
+            "the run opens thinking, before any tool names itself: {recorded:?}"
+        );
+        assert!(
+            label < result,
+            "the label is announced before the tool runs: {recorded:?}"
+        );
+        assert!(
+            result < thinkings[1],
+            "the tool's result is in before the model is asked again: {recorded:?}"
+        );
+        assert_eq!(
+            thinkings[1] + 1,
+            recorded.len(),
+            "nothing else is said between the model's turn starting and the \
+             request going out: {recorded:?}"
+        );
+        assert_eq!(
+            scripted.asked().len(),
+            2,
+            "the held ask is the turn after the tool's result"
+        );
+
+        gate.release();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done > 0
+                || !seen.errors.is_empty()),
+            "the held reply must end the run: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new(), "{seen:?}");
+        assert_eq!(seen.done, 1);
+        assert_eq!(seen.replies, vec!["wrote note.txt".to_string()]);
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A parent that keeps calling tools still hears its child. The completion
