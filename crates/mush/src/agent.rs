@@ -20,7 +20,7 @@ use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
 
 use mush_core::config::parse_context_hint;
-use mush_core::config::vision_capable;
+use mush_core::config::{vision_capable, BYTES_PER_TOKEN, SCHEMA_TOKENS};
 use mush_core::git;
 use mush_core::message::{ChatRequest, ChatResponse};
 use mush_core::text::{first_line, sanitize, truncate, truncate_flag};
@@ -973,6 +973,13 @@ struct ActorState {
     /// kills a run for making — a hold can outlast a wait many times over, so
     /// "wait again" is an instruction the guard has to survive (`count_round`).
     waited: bool,
+    /// Whether a fold of this transcript has already been refused for the
+    /// window and the human told. The automatic trigger fires on every turn at
+    /// the same unchanging transcript, and the same line every turn is not
+    /// news; an asked `/compact` always gets its answer, because a human typed a
+    /// command. Cleared when a fold fits again (a bigger window, a shorter
+    /// transcript), so the next refusal can speak.
+    fold_refused: bool,
     /// What is left of one turn's *results* room: the bytes the whole batch of
     /// tool results may still add to this turn's transcript. It is set when a
     /// batch starts, spent by each result as it is stored, and `None` outside a
@@ -2135,6 +2142,52 @@ fn request_weight(messages: &[Message]) -> usize {
         .fold(0, usize::saturating_add)
 }
 
+/// The same weight in tokens — the unit a window is stated in — at the
+/// bytes-per-token heuristic, rounded *up* so a prompt never reads as fitting
+/// on a rounding.
+fn request_tokens(messages: &[Message]) -> usize {
+    request_weight(messages).div_ceil(BYTES_PER_TOKEN)
+}
+
+/// The reply cap a summarize request may ask for: the summary's own ceiling
+/// ([`COMPACT_REPLY_TOKENS`]), never more than the window has left once the
+/// prompt is paid for — the tool schemas that head it, then the history and the
+/// instruction — and floored at the same 1,024 tokens [`Config::reply_cap`] is
+/// floored at, so a fold that fits at all asks for a summary rather than for
+/// nothing. The floor is what makes "does not fit" reachable: a window with
+/// less than that left under the prompt is one [`fold_request_fits`] refuses.
+fn compaction_reply_cap(cfg: &Config, prompt_tokens: usize) -> u32 {
+    let left = cfg
+        .context_tokens
+        .saturating_sub(SCHEMA_TOKENS)
+        .saturating_sub(prompt_tokens);
+    (COMPACT_REPLY_TOKENS as usize).min(left).max(1_024) as u32
+}
+
+/// Whether a summarize request fits the window it would be sent to: the three
+/// parts the endpoint counts are the schemas, the prompt's messages, and the
+/// reply the cap asks for. False means the fold is not attempted — a request
+/// over the window is one a strict endpoint refuses, with the money already
+/// spent — and it is a fact about the window, not about the request's own
+/// arithmetic: past the floor, nothing smaller is worth asking for.
+fn fold_request_fits(cfg: &Config, prompt_tokens: usize, cap: u32) -> bool {
+    SCHEMA_TOKENS + prompt_tokens + cap as usize <= cfg.context_tokens
+}
+
+/// The one line a fold that cannot fit carries: what the request would need,
+/// what the window has, and the roads that change it. One spelling for the
+/// automatic arm and the asked one, because it is one fact.
+fn fold_does_not_fit_line(cfg: &Config, prompt_tokens: usize, cap: u32) -> String {
+    format!(
+        "cannot fold: the summarize request would need about {} tokens against a {}-token window \
+         ({prompt_tokens} of history and instruction, {SCHEMA_TOKENS} for the tool schemas, \
+         {cap} for the summary), so it was not sent — `/context N` states a bigger window, and \
+         Ctrl-N starts a new conversation",
+        SCHEMA_TOKENS + prompt_tokens + cap as usize,
+        cfg.context_tokens
+    )
+}
+
 /// What a tool result says when the window took its bytes. The call is still
 /// answered — a dangling call is a shape a strict server rejects — and the road
 /// back is the tools' own: the same output is one narrower call away.
@@ -2901,10 +2954,37 @@ fn compact_history(
     // Sampling and length parameters are a separate matter: they are not prompt
     // text, so the summary's own cap costs no cache miss.
     let schemas = tool_schemas(actor);
-    // The fold's cap is its own (`COMPACT_REPLY_TOKENS`) and it leaves
-    // `tool_choice` at `auto`; everything else — the field the cap travels
-    // under included — is [`request`]'s, shared with the run's own ask.
-    let request = request(cfg, &folded, &schemas, "auto", COMPACT_REPLY_TOKENS);
+    // The fold's cap is its own (`COMPACT_REPLY_TOKENS`, as far as the window
+    // allows) and it leaves `tool_choice` at `auto`; everything else — the field
+    // the cap travels under included — is [`request`]'s, shared with the run's
+    // own ask. The cap is what the window has left once the *whole* prompt is
+    // paid for — the schemas that head it and the history and instruction
+    // behind them — and the fit test is the whole request: a summarize request
+    // over the window is one a strict endpoint refuses with a 400, and the
+    // automatic arm has no line of its own, so paying for that refusal every
+    // turn is the silent hole this closes.
+    let prompt_tokens = request_tokens(&folded);
+    let cap = compaction_reply_cap(cfg, prompt_tokens);
+    if !fold_request_fits(cfg, prompt_tokens, cap) {
+        // Nothing is attempted: folded over the window is the one shape a
+        // summary cannot help with, and the transcript is left exactly as it
+        // was for the trim and the next road. The automatic arm says it once
+        // per state — the same unchanging shape retried every turn is not news
+        // — while a human who typed `/compact` is owed the answer every time.
+        if asked || !state.fold_refused {
+            actor.ctx.emit(
+                actor.id,
+                AgentEvent::Notice(fold_does_not_fit_line(cfg, prompt_tokens, cap)),
+            );
+        }
+        state.fold_refused = true;
+        actor
+            .ctx
+            .emit(actor.id, AgentEvent::CompactingEnded { in_run });
+        return Ok(false);
+    }
+    state.fold_refused = false;
+    let request = request(cfg, &folded, &schemas, "auto", cap);
     let reply = match ask(actor, &request, cancel) {
         Ok(reply) => reply,
         // A cancelled run is already ending; do not report a network failure.
@@ -13071,8 +13151,12 @@ mod tests {
 
         let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
         // Tight window: the reserve scales with it, so the budget is 3 * (ctx
-        // - ctx/2) = 6000 bytes.
-        cfg.context_tokens = 4_000;
+        // - ctx/2) bytes. Small enough that the trim's trigger arrives after a
+        // few turns, big enough that the fold's own request fits it: below
+        // ~5.5k tokens the prompt plus the summary floor does not fit any window
+        // this size, and the fold is refused rather than attempted
+        // (`a_fold_the_window_cannot_hold_is_not_attempted` pins that road).
+        cfg.context_tokens = 6_000;
         let budget = cfg.history_budget();
         let events = Recorder::new();
         let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
@@ -13142,6 +13226,215 @@ mod tests {
             Some("isolated work")
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The fold's reply cap is a function of the window, not a constant: the
+    /// summary may ask for its own ceiling ([`COMPACT_REPLY_TOKENS`]) only while
+    /// the window has that much left under the prompt it is about to send — the
+    /// schemas that head it, the history, and the instruction — and otherwise
+    /// for exactly what is left. Raising `COMPACT_REPLY_TOKENS` to 200,000 fails
+    /// this test at the 32k window, which is the blind spot the audit named.
+    /// Both requests are measured against the window they were built from,
+    /// because the cap and the prompt are one relation.
+    #[test]
+    fn the_folds_cap_is_what_the_window_leaves() {
+        let run = |label: &str, context: usize| -> (usize, Vec<Asked>) {
+            let root = scratch_dir(label);
+            let summary = "the task was done";
+            let scripted = Arc::new(
+                Scripted::new()
+                    .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                    .says(summary)
+                    .says("carried on"),
+            );
+            let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
+            cfg.context_tokens = context;
+            let budget = cfg.history_budget();
+            let events = Recorder::new();
+            let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
+            // A transcript at the fold's own trigger, built from the formula so
+            // the test does not encode it.
+            let mut messages = vec![
+                Message::system("you are mush"),
+                Message::user("task".to_string()),
+            ];
+            let mut total: usize = messages.iter().map(Message::weight).sum();
+            let mut index = 0;
+            while total <= compaction_trigger(budget) {
+                let assistant = Message::assistant(format!("reply {index} {}", "x".repeat(280)));
+                let user = Message::user(format!("again {index}"));
+                total += assistant.weight() + user.weight();
+                messages.push(assistant);
+                messages.push(user);
+                index += 1;
+            }
+            root_tx.send(AgentMsg::Run(messages)).unwrap();
+            let mut seen = Watched::default();
+            assert!(
+                seen.wait(&events, WAIT, |seen| seen.done >= 1),
+                "{label}: the run must finish: {seen:?}"
+            );
+            assert_eq!(seen.errors, Vec::<String>::new(), "{label}");
+            let _ = fs::remove_dir_all(&root);
+            (context, scripted.asked())
+        };
+
+        // The window binds: the cap is exactly what is left under the prompt.
+        let (context, asked) = run("fold-cap-window", 16_000);
+        let fold = asked
+            .iter()
+            .find(|asked| asked.saw(COMPACT_INSTRUCTION))
+            .expect("the fold was asked");
+        let prompt = request_tokens(&fold.messages);
+        assert!(
+            fold.max_tokens < COMPACT_REPLY_TOKENS,
+            "a 16k window has less left than the summary's ceiling: {}",
+            fold.max_tokens
+        );
+        assert_eq!(
+            fold.max_tokens as usize,
+            context - SCHEMA_TOKENS - prompt,
+            "the cap is what the window leaves"
+        );
+        assert!(SCHEMA_TOKENS + prompt + fold.max_tokens as usize <= context);
+
+        // The ceiling binds: a window with room keeps the summary's own cap.
+        let (context, asked) = run("fold-cap-ceiling", 32_000);
+        let fold = asked
+            .iter()
+            .find(|asked| asked.saw(COMPACT_INSTRUCTION))
+            .expect("the fold was asked");
+        let prompt = request_tokens(&fold.messages);
+        assert_eq!(
+            fold.max_tokens, COMPACT_REPLY_TOKENS,
+            "a window with room keeps the summary's own ceiling"
+        );
+        assert!(SCHEMA_TOKENS + prompt + fold.max_tokens as usize <= context);
+    }
+
+    /// A fold the window cannot hold is not attempted: at the trigger the
+    /// summarize request's own prompt *plus* the floored summary cap is more
+    /// than the window, so the only thing a wire call would buy is an
+    /// endpoint's 400 — with the money already spent, and nothing said. Measured
+    /// at the 4,000-token window and the fold's own trigger: 1,985 tokens of
+    /// history and instruction, 2,000 for the tool schemas, 1,024 for the
+    /// summary — 5,009 against 4,000. The line is said once per state, not once
+    /// per turn: the automatic trigger fires on the same unchanging transcript
+    /// every run, and the second run proves it — its own request went out, and
+    /// the fold was not mentioned again.
+    #[test]
+    fn a_fold_the_window_cannot_hold_is_not_attempted() {
+        let root = scratch_dir("fold-cannot-fit");
+        let scripted = Arc::new(Scripted::new().says("first answer").says("second answer"));
+        let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
+        cfg.context_tokens = 4_000;
+        let budget = cfg.history_budget();
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("say something".to_string()),
+        ];
+        let mut total: usize = messages.iter().map(Message::weight).sum();
+        let mut index = 0;
+        while total <= compaction_trigger(budget) {
+            let assistant = Message::assistant(format!("reply {index} {}", "x".repeat(280)));
+            let user = Message::user(format!("again {index}"));
+            total += assistant.weight() + user.weight();
+            messages.push(assistant);
+            messages.push(user);
+            index += 1;
+        }
+        assert!(
+            total > compaction_trigger(budget) && total <= budget,
+            "the transcript sits in the fold's window (total {total}, budget {budget})"
+        );
+
+        root_tx.send(AgentMsg::Run(messages.clone())).unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the first run must finish: {seen:?}"
+        );
+        root_tx.send(AgentMsg::Run(messages)).unwrap();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 2),
+            "the second run must finish: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 2, "the two runs' own requests, and no fold");
+        assert!(
+            !asked.iter().any(|asked| asked.saw(COMPACT_INSTRUCTION)),
+            "no summarize request went over the wire"
+        );
+        let refusals: Vec<&String> = seen
+            .notices
+            .iter()
+            .filter(|line| line.contains("cannot fold"))
+            .collect();
+        assert_eq!(
+            refusals.len(),
+            1,
+            "one line per state, not per turn: {refusals:?}"
+        );
+        assert!(
+            refusals[0].contains("4000-token window"),
+            "the line says the window it does not fit: {}",
+            refusals[0]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An asked `/compact` obeys exactly the same fit test as the automatic
+    /// arm: a transcript that cannot be summarized by a request that fits the
+    /// window is not summarized at all, and the human gets one line instead of a
+    /// wasted call. Measured before the fix: an idle `/compact` over a
+    /// 37,210-byte transcript sent 37,568 bytes ≈ 14,494 tokens with a
+    /// 10,240-token cap, one wasted request and a red line — the transcript was
+    /// over the window three times over.
+    #[test]
+    fn an_asked_compact_the_window_cannot_hold_is_not_attempted() {
+        let scripted = Arc::new(Scripted::new().says("summarized"));
+        let (actor, events, _mailbox) = build_actor_about(
+            "asked-fold-cannot-fit",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        // The human typed `/compact`: the flag the idle fold reads.
+        let mut state = ActorState {
+            compact_requested: true,
+            ..ActorState::default()
+        };
+        let mut transcript = vec![
+            Message::system("s".repeat(3_247)),
+            Message::user("task"),
+            Message::user("x".repeat(37_210)),
+        ];
+
+        compact_now(&actor, &mut state, &mut transcript);
+
+        assert!(
+            scripted.asked().is_empty(),
+            "a fold that cannot fit costs no call"
+        );
+        let refusals: Vec<AgentEvent> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter(
+                |event| matches!(event, AgentEvent::Notice(line) if line.contains("cannot fold")),
+            )
+            .collect();
+        assert_eq!(refusals.len(), 1, "one line: {refusals:?}");
+        assert_eq!(
+            transcript[2].text().len(),
+            37_210,
+            "the transcript is untouched: a refused fold is not a trim"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// `/compact` on an idle agent: the conversation is folded into a summary
@@ -13889,6 +14182,7 @@ mod tests {
         );
         let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
         cfg.max_completion_tokens = true;
+        let context = cfg.context_tokens;
         let events = Recorder::new();
         let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
         root_tx
@@ -13912,10 +14206,17 @@ mod tests {
         let asked = scripted.asked();
         let fold = asked.last().expect("the fold asked the model");
         assert!(fold.saw(COMPACT_INSTRUCTION), "the last ask is the fold");
-        assert_eq!(
-            fold.max_completion_tokens,
-            Some(COMPACT_REPLY_TOKENS),
-            "the fold's cap, under the field this endpoint requires"
+        let prompt = request_tokens(&fold.messages);
+        let cap = fold
+            .max_completion_tokens
+            .expect("the fold's cap travels, under the field this endpoint requires");
+        assert!(
+            SCHEMA_TOKENS + prompt + cap as usize <= context,
+            "the cap leaves the window its own prompt: {SCHEMA_TOKENS} + {prompt} + {cap} > {context}"
+        );
+        assert!(
+            cap < COMPACT_REPLY_TOKENS,
+            "an 8k window has less left than the summary's ceiling: {cap}"
         );
         assert_eq!(
             fold.max_tokens, 0,
