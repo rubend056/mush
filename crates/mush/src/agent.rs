@@ -26,8 +26,8 @@ use mush_core::message::{ChatRequest, ChatResponse};
 use mush_core::text::{first_line, sanitize, truncate, truncate_flag};
 use mush_core::tools::ToolName;
 use mush_core::transcript::{
-    needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
-    COMPACT_REPLY_TOKENS,
+    needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, trim_target,
+    COMPACT_INSTRUCTION, COMPACT_REPLY_TOKENS,
 };
 use mush_core::workspace::{truncate_for_model, SEARCH_FILE_CAP};
 use mush_core::{prompt, tools, Config, Image, Message, Workspace, CMD_TIMEOUT_SECS};
@@ -973,6 +973,19 @@ struct ActorState {
     /// kills a run for making — a hold can outlast a wait many times over, so
     /// "wait again" is an instruction the guard has to survive (`count_round`).
     waited: bool,
+    /// What is left of one turn's *results* room: the bytes the whole batch of
+    /// tool results may still add to this turn's transcript. It is set when a
+    /// batch starts, spent by each result as it is stored, and `None` outside a
+    /// batch — then [`result_cap`]'s config half is the whole bound.
+    ///
+    /// A per-result cap is not enough: a `run_command` batch is unbounded in
+    /// count, so four results each answering to [`Config::cmd_cap`] would add
+    /// four fifths of the budget to a transcript with a fifth of room. The
+    /// first result takes its share of that fifth first, and each later one
+    /// gets what is left, so one turn's results cannot push a just-cut
+    /// transcript back over the ceiling — the request that goes out over the
+    /// window instead of being folded.
+    turn_room: Option<usize>,
 }
 
 /// One child's run ending, as its parent keeps it: which run it was, and how it
@@ -2568,6 +2581,15 @@ fn run_loop(
         // the next round's guard.
         let mut all_refused = true;
         waited_round = false;
+        // One turn's results share the room the ceiling leaves above the trim's
+        // stopping point: a batch is unbounded in count, and four results each
+        // answering to `Config::cmd_cap` would add four fifths of the budget to
+        // a transcript with a fifth of room — the request that goes out over
+        // the window, or the cut-again shape the per-result cap was just fixed
+        // for. The first result takes its share first; each later one gets what
+        // is left (`result_cap`), and every result stored spends its own weight
+        // from the room below.
+        state.turn_room = Some(budget.saturating_sub(trim_target(budget)));
         for (index, call) in tool_calls.iter().enumerate() {
             // Keep watching for a Stop/Shutdown between calls, and answer the
             // rest of the batch before leaving: a cancellation must not leave
@@ -2613,9 +2635,13 @@ fn run_loop(
             // condemning a model waiting on a locked machine (H13).
             all_refused &= refused;
             let tool_message = Message::tool_with_images(call.id.clone(), output, images);
+            state.turn_room = state
+                .turn_room
+                .map(|room| room.saturating_sub(tool_message.weight()));
             messages.push(tool_message.clone());
             actor.ctx.emit(actor.id, AgentEvent::Message(tool_message));
         }
+        state.turn_room = None;
         refused_round = all_refused;
         // Fold mailbox commands in at the message boundary, and honour a
         // cancellation now that every call has a result.
@@ -3455,7 +3481,7 @@ fn exec_tool(
         ToolName::RunCommand => {
             return run_command(actor, state, args, cancel).map(ToolOutput::from)
         }
-        ToolName::ReadFile => return read_tool(actor, args).map_err(ToolError::Failed),
+        ToolName::ReadFile => return read_tool(actor, state, args).map_err(ToolError::Failed),
         ToolName::SpawnAgent => spawn_tool(actor, state, args),
         ToolName::Status => status_tool(actor, state),
         ToolName::Control => control_tool(actor, state, args),
@@ -3467,9 +3493,9 @@ fn exec_tool(
         // that keep working while another agent holds the machine, and the only
         // road that can carry an image (finding H31).
         ToolName::EditFile => edit_tool(&actor.ws, args),
-        ToolName::WriteFile => write_tool(actor, args),
-        ToolName::ListFiles => list_tool(actor, args),
-        ToolName::Search => search_tool(actor, args),
+        ToolName::WriteFile => write_tool(actor, state, args),
+        ToolName::ListFiles => list_tool(actor, state, args),
+        ToolName::Search => search_tool(actor, state, args),
     };
     answer.map_err(ToolError::Failed).map(ToolOutput::from)
 }
@@ -4503,7 +4529,7 @@ fn commit_worktree(
 /// after the six-tool cut assumed the shell would always be there to read. It is
 /// also the one road an image can travel by: a shell hands back bytes as text,
 /// and a picture is not text.
-fn read_tool(actor: &Actor, args: &Value) -> Result<ToolOutput, String> {
+fn read_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<ToolOutput, String> {
     let path = tools::arg_string(args, "path")?;
     if let Some(image) = actor.ws.read_image(&path)? {
         // Vision is a per-model fact ([`Config::model`]'s row in the provider
@@ -4540,16 +4566,16 @@ fn read_tool(actor: &Actor, args: &Value) -> Result<ToolOutput, String> {
     let limit = tools::arg_usize(args, "limit", usize::MAX)?;
     actor
         .ws
-        .read_window(&path, offset, limit, result_cap(actor))
+        .read_window(&path, offset, limit, result_cap(actor, state))
         .map(ToolOutput::from)
 }
 
 /// `write_file`: create or replace a whole file. The answer is one line naming
 /// what changed, because the model already knows what it wrote.
-fn write_tool(actor: &Actor, args: &Value) -> Result<String, String> {
+fn write_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String, String> {
     let path = tools::arg_string(args, "path")?;
     let content = tools::arg_string(args, "content")?;
-    let cap = result_cap(actor);
+    let cap = result_cap(actor, state);
     if content.len() > cap {
         return Err(format!(
             "content is {} bytes — over the {cap}-byte cap on one write; write the first part, \
@@ -4583,7 +4609,7 @@ fn write_tool(actor: &Actor, args: &Value) -> Result<String, String> {
 }
 
 /// `list_files`: the workspace's files under a path, one per line.
-fn list_tool(actor: &Actor, args: &Value) -> Result<String, String> {
+fn list_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String, String> {
     let rel = tools::arg_path(args, "path")?;
     let (files, truncated) = actor.ws.list_files(&rel, LIST_LIMIT)?;
     if files.is_empty() {
@@ -4595,11 +4621,11 @@ fn list_tool(actor: &Actor, args: &Value) -> Result<String, String> {
             "\n[mush: the first {LIST_LIMIT} files — list a narrower path to see the rest]"
         ));
     }
-    Ok(truncate_for_model(out, result_cap(actor)))
+    Ok(truncate_for_model(out, result_cap(actor, state)))
 }
 
 /// `search`: a literal string in the workspace's text files.
-fn search_tool(actor: &Actor, args: &Value) -> Result<String, String> {
+fn search_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String, String> {
     let pattern = tools::arg_string(args, "pattern")?;
     let rel = tools::arg_path(args, "path")?;
     let ignore_case = tools::arg_bool(args, "ignore_case", false)?;
@@ -4631,7 +4657,7 @@ fn search_tool(actor: &Actor, args: &Value) -> Result<String, String> {
     if !notes.is_empty() {
         out.push_str(&format!("\n[mush: {}]", notes.join("; ")));
     }
-    Ok(truncate_for_model(out, result_cap(actor)))
+    Ok(truncate_for_model(out, result_cap(actor, state)))
 }
 
 /// The files a search did not open, as a sentence. One function for both
@@ -4942,22 +4968,26 @@ fn detached_line(id: JobId) -> String {
 /// `crate::jobs` beside the other rule a job and a tool call share.
 use crate::jobs::CMD_OUTPUT_LIMIT;
 
-/// The bytes one tool result may carry.
+/// The bytes one tool result may carry *now*.
 ///
 /// Every big-text road uses it — a command's output, a file read, a listing, a
 /// search — so a result is bounded by the context budget rather than by a fixed
-/// number: the room a cut leaves between its stopping point and the ceiling (a
-/// fifth of what the history can hold), capped at `CMD_CAP` (see
-/// `Config::cmd_cap`). A result that hits it says so and says what to do
-/// (`truncate_for_model`), and the file tools' windows are cut to it as they
-/// are built, so the sentence names the way on rather than a lost tail.
-fn result_cap(actor: &Actor) -> usize {
-    actor
+/// number: `Config::cmd_cap` is the room a cut leaves between its stopping point
+/// and the ceiling (a fifth of what the history can hold, capped at `CMD_CAP`),
+/// and a result of a batch is additionally bounded by what is left of this
+/// turn's room (`ActorState::turn_room`) — the same fifth, shared out among
+/// every result the turn has not stored yet. A result that hits the cap says so
+/// and says what to do (`truncate_for_model`), and the file tools' windows are
+/// cut to it as they are built, so the sentence names the way on rather than a
+/// lost tail.
+fn result_cap(actor: &Actor, state: &ActorState) -> usize {
+    let config = actor
         .ctx
         .cfg
         .config()
         .map(|cfg| cfg.cmd_cap())
-        .unwrap_or(mush_core::CMD_CAP)
+        .unwrap_or(mush_core::CMD_CAP);
+    config.min(state.turn_room.unwrap_or(usize::MAX))
 }
 
 /// Why a command stopped running.
@@ -5020,7 +5050,7 @@ fn run_shell(
             // its refusal kills the process group, and the launch owns the only
             // handle to the output — a report built after that would have
             // nothing to show (audit row 2).
-            let (stdout, stderr) = running.output(result_cap(actor));
+            let (stdout, stderr) = running.output(result_cap(actor, state));
             match detach_now(
                 actor,
                 registry,
@@ -5047,7 +5077,7 @@ fn run_shell(
     // finding S4 is about, or the registry's half of a `Stop` — must not be
     // reported as the command's own exit: `-1` is a signal nobody asked about.
     let ended = ending(ended, running.stopped());
-    let cap = result_cap(actor);
+    let cap = result_cap(actor, state);
     let (stdout, stderr) = running.output(cap);
     let mut report = command_report(&stdout, &stderr);
     report.push_str(&end_note(
@@ -7481,7 +7511,7 @@ mod tests {
 
         assert!(report.contains("output passed"), "{report}");
         assert_eq!(machine.kills(), 1, "the runaway writer was killed");
-        let cap = result_cap(&actor);
+        let cap = result_cap(&actor, &state);
         assert!(report.len() < cap * 2, "report grew: {}", report.len());
         assert!(
             clock.elapsed() < Duration::from_secs(30),
@@ -7517,12 +7547,119 @@ mod tests {
             report.contains("output truncated at"),
             "cap was not marked: {report}"
         );
-        let cap = result_cap(&actor);
+        let cap = result_cap(&actor, &state);
         assert!(
             report.len() < cap * 2,
             "report grew past the cap: {}",
             report.len()
         );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// One turn's results share the room under the ceiling.
+    ///
+    /// A `run_command` batch is unbounded in count, and a per-result cap is no
+    /// bound on the batch: four results each answering to `Config::cmd_cap` add
+    /// four fifths of the budget to a transcript with a fifth of room, so the
+    /// request that carries them goes out over the window — or, on a transcript
+    /// a trim can cut, is cut again. Measured through `run_loop` on the shape
+    /// the audit used (a first turn: one user line, no older turn to drop, the
+    /// real 3,247-byte system prompt) and the 8k default: four results at the
+    /// cap left the next request carrying 13,768 bytes against a 12,288-byte
+    /// budget, with no cut, no note and no fold: a transcript with one user line
+    /// has no older turn to drop, and a transcript over the budget cannot fold.
+    /// Now the first result takes what it can and each later
+    /// one gets what is left of the fifth, so the request that carries the
+    /// whole batch fits.
+    #[test]
+    fn one_turns_results_share_the_room_under_the_ceiling() {
+        let big = "x".repeat(100_000);
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::exits(0).says(&big))
+                .runs(Script::exits(0).says(&big))
+                .runs(Script::exits(0).says(&big))
+                .runs(Script::exits(0).says(&big)),
+        );
+        let scripted = Arc::new(
+            Scripted::new()
+                .calls(
+                    ["one", "two", "three", "four"]
+                        .iter()
+                        .enumerate()
+                        .map(|(index, command)| {
+                            tool_call(
+                                &format!("c{}", index + 1),
+                                "run_command",
+                                json!({ "command": command }),
+                            )
+                        })
+                        .collect(),
+                )
+                .says("done"),
+        );
+        let cfg = test_cfg();
+        let budget = cfg.config().unwrap().history_budget();
+        let (actor, _events, _mailbox) = build_actor_about(
+            "turn-results",
+            scripted.clone(),
+            cfg,
+            machine,
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        // The shape the audit measured: a first turn, so a transcript with one
+        // user line and no older turn a trim could drop, under a prompt the
+        // size of the real one rather than the tests' stand-in.
+        let mut messages = vec![
+            Message::system("s".repeat(3_247)),
+            Message::user("run the four checks"),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("done"), "the run finished");
+
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 2, "the batch, then the answer");
+        let second = &asked[1];
+        let results: Vec<&Message> = second
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .collect();
+        assert_eq!(
+            results.len(),
+            4,
+            "every call in the batch is still answered"
+        );
+        let room = budget - trim_target(budget);
+        assert_eq!(room, 2_458, "the fifth the ceiling leaves");
+        let carried: usize = second.messages.iter().map(Message::weight).sum();
+        assert!(
+            carried <= budget,
+            "the request carrying the batch weighs {carried} against a {budget}-byte budget"
+        );
+        // The sharing, in the results the model reads: the first took the room
+        // and each later one was answered with what was left of it — mush's own
+        // cut note, never the output the cap would have let through.
+        assert!(
+            results[0].text().contains("output truncated at") && results[0].weight() >= room,
+            "the first result took its share of the room: {}",
+            results[0].weight()
+        );
+        for later in &results[1..] {
+            assert!(
+                later.text().contains("truncated at 0 bytes"),
+                "a later result is cut to what was left: {:?}",
+                later.text()
+            );
+            assert!(
+                later.weight() < 200,
+                "and it is only mush's note: {}",
+                later.weight()
+            );
+        }
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -7902,6 +8039,8 @@ mod tests {
         let (actor, _mailbox) = test_actor("write-file");
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
+        // Before the closure borrows the state: what one result may carry now.
+        let cap = result_cap(&actor, &state);
         let mut write =
             |args: Value| exec_tool(&actor, &mut state, ToolName::WriteFile, &args, &cancel);
 
@@ -7920,9 +8059,7 @@ mod tests {
 
         let root = write(json!({ "path": ".", "content": "x" })).unwrap_err();
         assert!(root.text().contains("workspace root"), "{}", root.text());
-        let big =
-            write(json!({ "path": "big.txt", "content": "x".repeat(result_cap(&actor) + 1) }))
-                .unwrap_err();
+        let big = write(json!({ "path": "big.txt", "content": "x".repeat(cap + 1) })).unwrap_err();
         assert!(big.text().contains("cap"), "{}", big.text());
         assert!(
             !actor.ws.root().join("big.txt").exists(),
@@ -8112,6 +8249,8 @@ mod tests {
         fs::write(actor.ws.root().join("blob.bin"), b"\0\0\0\0").unwrap();
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
+        // Before the closure borrows the state: what one result may carry now.
+        let cap = result_cap(&actor, &state);
         let mut write =
             |args: Value| exec_tool(&actor, &mut state, ToolName::WriteFile, &args, &cancel);
 
@@ -8121,9 +8260,7 @@ mod tests {
             "wrote blob.bin — 1 line (replaced a file that is not text)"
         );
 
-        let over =
-            write(json!({ "path": "big.txt", "content": "x".repeat(result_cap(&actor) + 1) }))
-                .unwrap_err();
+        let over = write(json!({ "path": "big.txt", "content": "x".repeat(cap + 1) })).unwrap_err();
         assert!(
             over.text().contains("write the first part"),
             "the road is a split, not a repeat: {}",
