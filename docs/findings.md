@@ -264,6 +264,33 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   (`AgentEvent::ParentAsleep`) instead of vanishing. The tree's `✉` marks can
   re-light over a result the parent has read (recorded in §8.39, not fixed
   there); the end-to-end test asserts the books instead.
+- **H36** — ✅ fixed by `be26cdb` + `8dd29e5` (§8.42), reported live: an image
+  was priced by its **file bytes** (`Message::weight` added
+  `bytes.len() + path + mime`) at the budget's 3 bytes per token, so a 724 KB
+  screenshot counted as **247,132 tokens** where a 1920×1080 picture costs
+  ≈2,765 — about 90× over, in the one direction that hurts. The trimmer sheds
+  images *before* it drops turns, so a picture that fit a 500k window's budget
+  was stripped before the model ever looked at it (the model received the
+  placeholder and nothing else), and the meter a human watches jumped by a
+  quarter of a million for one screenshot: "ctx jumped from 300k to 598.7k with
+  just a single 700kb image", "nope, I restarted just now so this is after the
+  images change". Images are now priced by the pixels their own header names
+  (`PIXELS_PER_TOKEN`, `Image::pixels`: png `IHDR`, jpeg `SOFn`, gif's screen
+  descriptor, webp's three chunk shapes), the fallback is the byte count (which
+  errs high, the safe way), the attach gate compares the picture against the
+  room the conversation has *left* rather than the whole budget, and the 2 MB
+  cap stays what it always was — a transport measure, not a token one.
+- **H37** — ✅ fixed by `3aaf284`..`7013015` (§8.42), reported live in the same
+  message: the box's images could not be taken back. `Backspace` popped one
+  only on an *empty* box, so with a draft in progress the only key that removed
+  an image was `Esc`, which took the words with it — and nothing remembered
+  either loss ("once an image is pasted into the input there's really no way to
+  remove it... and really no easy way to clear what you've typed into the
+  input"). Now `Backspace` at the very start of the box pops the newest
+  attachment (the empty box is that same rule with nothing above the cursor),
+  `Ctrl-U` clears the words and keeps the images, and `Ctrl-Z` puts back what
+  the box last lost — one slot, spent by a send — while `Esc` names what it
+  cleared and the road back.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -2729,3 +2756,157 @@ tests 24,963 · comments 14,980 — 180 lines: 32 production, 69 test, 75 commen
 the two races are what a later reader has to be told, and the code that carries
 them is a dozen lines. Twenty-two of the test lines are `cargo fmt`'s reflow of
 calls that grew a payload, not assertions.
+
+---
+
+## 8.42 Four asks in one sitting: a meter that lied about images, a box with no way back, dots, and the root's job
+
+The human pasted a screenshot, read the meter, and asked two questions in one
+message — "how are we counting ctx for images" and "how are we measuring image
+sizing to drop images" — then, while the wave that answered them was in flight,
+three more things: remove the spinner the working line turned over, make a
+pasted picture removable and a typed draft clearable, and make the root's system
+message say its job is to orchestrate rather than to work. Three of the four
+were defects this file should have caught; one is a policy the human owns.
+
+**The meter lied about images (`be26cdb`, `8dd29e5`; H36).** `Message::weight`
+priced an image by its **file bytes** — `bytes.len() + path + mime` — and
+`BYTES_PER_TOKEN` (3) turned that into "tokens", so the 741,396-byte png the
+human pasted read as **247,132 tokens**. A 1920×1080 picture is 2,073,600
+pixels, and at the vision endpoints' own rule (≈ pixels/750; OpenAI's tiling
+works out near 1,500 px per token) it costs **≈2,765** — the estimate was about
+90× over, and in the one direction that does damage. The trimmer sheds image
+payloads *before* it drops a turn, so on a 500k-token window (budget
+`(500,000 − 69,500) × 3 = 1,291,500` bytes of weight: `SCHEMA_TOKENS` 2,000 +
+the reply cap's 62,500 + the 5,000 margin) a ~300k-token conversation left
+≈390 KB of room, the picture claimed 741 KB, and **the newest image — the one
+just attached — was stripped before the model ever looked at it**: the model
+received the placeholder and nothing else. Their meter reading is that same
+arithmetic seen from the other side: 598.7k − 247.1k = 351.6k, so the
+conversation was ≈350k tokens, not the 300k they rounded to, and one picture
+accounted for 247k of the 298.7k jump. (The brief that opened this wave said the
+budget was ≈1.44 MB — wrong, because it read `request_reserve` as an eighth of
+the window rather than `SCHEMA_TOKENS + reply_cap + MARGIN`; the defect is the
+same either way. §8.30's own numbers are the record.)
+
+The fix prices a picture by what it *is*: `Image` gained
+`pixels: Option<(u32, u32)>`, filled by a new `Workspace::image_dimensions` at
+both doors that read bytes from disk (png's `IHDR`, a jpeg `SOFn` found by
+walking marker segments, gif's logical screen descriptor, webp's `VP8 `/`VP8L`/
+`VP8X`) and left `None` for anything whose header cannot be read — and then
+`Image::weight` charges `tokens(pixels) × BYTES_PER_TOKEN` with the byte count
+as the fallback, which *over*counts, the safe direction. `PIXELS_PER_TOKEN`
+(750, `tokens_for_pixels` rounding up) is one constant with its reasoning, and
+the caveat it does not model is stated there: an endpoint that tokenized the
+`data:` URL's base64 as text would pay for the spelling too. Three sizes now
+have three names instead of one: **pixels** price the context, **file bytes**
+are the `IMAGE_FILE_CAP` transport gate (2 MB, unchanged), and the room *left*
+(`history_budget() − used_weight_for`, the meter's own sum, split out so the two
+cannot drift) is what the attach line warns about — with `/compact` and a
+downscale as the two roads, and equality counting as fitting, the same
+`total <= budget` the trimmer stops on.
+
+**What the widened test wave found (three real defects, all in the parsers and
+the arithmetic it was told to be robust about).** A jpeg cut off *inside* its
+`SOFn` segment still answered `Some` when the walk only bounds-checked its
+reads: the segment's declared length is now checked (≥ 8, and the bytes it
+names must be there), which the every-prefix test caught. A webp chunk whose
+length field lied (`0xFFFFFFFF`, or fewer bytes than the shape reads) still
+parsed: the declared size is validated against the buffer. And a header
+claiming `u32::MAX × u32::MAX` pixels could overflow the attach path's
+`cost + pending`, the image's own `payload + path + mime`, and the trimmer's
+total: every one of those sums is saturating now, with the exact 64-bit weight
+(73,786,976,260,478,491, checked against a `u128` expectation) pinned by a test
+and 260 such headers still reading as over budget. `cargo test` at the tip is
+647 + 172 (from 621 + 153 at §8.41's landing), and the image tests are
+load-bearing: forcing `Image::weight` back to the byte count fails six of them,
+including both of the human's.
+
+The parser's own probe was scratch and stays out of the suite, because it needs
+real files: seven ImageMagick-written images — png, baseline and progressive
+jpeg, gif, and lossy, lossless and alpha webp — all named their size, and
+**every prefix** of all seven (1,239,137 truncations, down to the empty slice)
+came back `None` or a size without a single panic. The hand-built byte arrays
+that *are* in the suite carry the same shapes, including a large APP1 whose
+payload is marker-shaped bytes (the walk steps over segments by their declared
+length, so it cannot read a fake frame out of EXIF).
+
+**The box's losses (`3aaf284`..`7013015`; H37).** The human's words: "once an
+image is pasted into the input there's really no way to remove it... and really
+no easy way to clear what you've typed into the input ... so how do we solve
+this?" `Backspace` popped an attachment only on an *empty* box, so with a draft
+in progress the one key that removed a picture was `Esc` — which took the words
+with it and remembered nothing. The ruling is three keys and one rule:
+`Backspace` **at the very start of the box** (index zero, not the start of the
+wrapped line) pops the newest attachment, so the empty box is that same rule
+with nothing above the cursor rather than a second rule; `Ctrl-U` clears the
+words and keeps the images (readline's habit, the whole draft rather than the
+visual line, because the box soft-wraps); `Ctrl-Z` puts back what the box last
+lost — a pop restores the image, `Ctrl-U` the words, `Esc` the words and every
+image — one slot, not a history. `Esc` now says what it took and names the road
+back (`cleared the box and 2 images · Ctrl-Z puts it back`), which is the one
+loss a human cannot retype.
+
+Two decisions the implementation made explicit. The slot holds **what the loss
+took**, not a snapshot of the whole box: a snapshot would clone every image's
+bytes on a pop, and restoring one wholesale would delete whatever was typed or
+attached *after* the loss while spending the road back — so `Ctrl-Z` adds the
+lost words and images back and never removes anything newer. And a **send spends
+the slot**, so a message that has been sent cannot be brought back by a
+keystroke; it is spent in `send_message` rather than where the box is emptied,
+because an `Enter` that sends nothing (an empty box) must not spend it. Found
+and left alone: `Chat::clear`'s doc says "the box and the scrollback with it",
+but `Ctrl-N` in fact keeps whatever draft is in the box — the slot is dropped
+there, since a draft from the dead conversation should not come back, and
+clearing the box on `Ctrl-N` would be a one-key draft loss nobody asked for.
+
+**The working line (`0e7614f`).** "remove the working spinning animation and
+instead just do `working.` -> `working..` -> `working...` looping with 1s
+between dots." The spinner was ten braille frames advanced by `App::tick` — the
+event loop's 30 ms poll, so thirty turns a second: a flicker, not a pulse, and a
+repaint a frame for a decoration. `App::spin` is now a *beat*, advanced at most
+once a second (`DOT_PERIOD`, `spin_at` the clock), and the word carries its own
+dots (`chat::working_dots`, one, two, three, looping). A fold still says its own
+words on that row and a run parked in a `wait` still paints no activity line at
+all (U7). The ramification was in the tests, not the code: nine assertions
+needed the needle `working.` instead of `working…` — and *not* the bar's own
+`agents · 1 working`, which is a different fact and must not satisfy them.
+
+**The root's job (`5bb809d`).** The human's ruling: the root's system message
+should say "their job is mainly to orchestrate subagents (most of the work
+should be done by subagents, they should refrain as much as possible from doing
+editing, their sole job is maintaining a high level overview AND interacting
+with the human/user)". `system_prompt` now opens with `ROOT_ROLE` — hold the
+overview, decide what happens next, talk to the human; the work belongs to
+subagents, and an edit the root makes itself lands in this checkout with no
+brief, no branch and no second reader, at the cost of the picture it was
+holding — and it is the one block the subagent prompt does not read, because a
+child is handed a brief rather than a role. The policy bullet that said the
+opposite ("do single edits and lookups yourself") was rewritten rather than left
+standing beside it: delegate the work itself and keep the overview — lookups a
+single call answers, the briefs, the decisions. One test came out of it
+(`the_root_is_told_its_job_is_the_overview_and_the_human`), and one test had to
+be repaired: `the_context_meter_shows_used_over_window` was passing on a
+rounding boundary — its 43-byte question moved the 0.1k label only because the
+system prompt's weight happened to sit just under one — and ~100 tokens of new
+prompt moved the boundary, so the question is now long enough that its weight
+must show at the label's own granularity.
+
+**The harness's own ruling, recorded here because this file keeps the harness's
+findings too.** The human's first reaction to this wave was that the dots change
+should have been a subagent's, then the rule: "that's ok when the work is
+delicate and minimal (specifically from a user's ask they could do the work
+themselves BUT there's always the question of... will the edit have
+ramifications... and IF it likely will [not likely in this case] then it should
+be spawned)". So the dots, the prompt ruling and the box work were the
+orchestrator's only where the edit was small and its blast radius could be
+named — and the two that *were* spawned (the image accounting, the box's keys)
+came back with branches, commits and tests of their own, which is the shape the
+ruling is for.
+
+**Census** at this landing (`scripts/census.py`), against §8.41's (total 57,994 ·
+prod 14,459 · tests 24,963 · comments 14,980): total 60,841 · **prod 14,770** ·
+tests 26,447 · comments 15,856 — 2,847 lines: 311 production, 1,484 test, 876
+comment, 176 blank. Half the wave is tests on purpose: the ruling was "enough
+tests to make sure we're handling images the most robust way possible", and the
+three defects above were found by exactly those tests rather than by the feature.

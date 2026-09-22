@@ -388,7 +388,7 @@ elided, and the cursor is always on screen.
 | anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning |
 | picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End`, `PgUp`/`PgDn` move the list, `Enter` take the row, `Esc` close |
 | agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them, `←` the row's parent, `→` its first child, `Enter` show its transcript, `c` cancel that agent, `Esc` back to the root |
-| chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `Ctrl-V` attach the image on the clipboard, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete` (Backspace on an empty box pops the newest attachment), `↑`/`↓`/`PgUp`/`PgDn` scroll, `Esc` clear the box and its attachments · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/compact` `/notes` `/help` `/quit` |
+| chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `Ctrl-V` attach the image on the clipboard, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete` (at the start of the box, Backspace pops the newest attachment), `Ctrl-U` clear the words and keep the images, `Ctrl-Z` put back what the box last lost, `↑`/`↓`/`PgUp`/`PgDn` scroll, `Esc` clear the box and its attachments · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/compact` `/notes` `/help` `/quit` |
 
 A paste that is nothing but an image's path attaches the image; anything else
 is text and lands in the box as it always did (§3). The attachments are painted
@@ -398,6 +398,20 @@ how many — and they travel with the send: `Enter` on an empty box with an imag
 attached is still a send, because the picture *is* the message. A send that
 does not land puts the words and the images back in the box, and `Esc` clears
 both.
+
+The box's losses have roads back. `Backspace` at the very start of the box —
+index zero, not the start of the wrapped line the cursor happens to be on — pops
+the newest attachment, so a picture can be taken back while the words that go
+with it stay; an empty box is the same rule with nothing above the cursor, which
+is the rule it has always been. `Ctrl-U` clears the words and keeps the images,
+for the draft that is wrong and the picture that is not. `Ctrl-Z` puts back what
+the box last lost, wherever it went: a pop restores the image, `Ctrl-U` the
+words, and `Esc` the words and every image — one slot, not a history, and a send
+spends it, so a message that has been sent cannot come back on a keystroke.
+Nothing that arrived after a loss is taken away by the key that restores it.
+`Esc` says what it cleared and names the road back (`cleared the box and 2
+images · Ctrl-Z puts it back`), because a one-key loss of something that cannot
+be retyped is the one that has to say so.
 
 `Enter` in the agents pane moves the *view*, not the keyboard: the row's
 transcript replaces the chat pane while the keys stay in the tree, and `Tab` is
