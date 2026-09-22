@@ -542,10 +542,14 @@ impl Config {
     /// window shrinks it (half the window is always history) instead of leaving
     /// no budget at all.
     ///
-    /// So `history + schemas + reply + margin == window`, and a request that
-    /// spends its whole reply cap still fits the window it is sent to. That is
-    /// what keeps a long conversation from being cut off as a context-length
-    /// complaint: the trimmer and the cap are two halves of one budget.
+    /// So while the reserve is the three numbers and not the cap,
+    /// `history + schemas + reply + margin == window`, and a request that spends
+    /// its whole reply cap fits the window it is sent to. Under the cap the
+    /// window is split in two instead: half for history, half for everything a
+    /// request pays besides it (the cap binds below ~18.7k tokens — see
+    /// [`Self::request_reserve`]). Either way the trimmer and the cap are two
+    /// halves of one budget, which is what keeps a long conversation from being
+    /// cut off as a context-length complaint.
     pub fn history_budget(&self) -> usize {
         self.context_tokens
             .saturating_sub(self.request_reserve())
