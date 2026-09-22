@@ -4185,10 +4185,14 @@ what turns a reading into a document renderer — the version the human named as
 the rabbit hole — and the deliberate seam is visible in the heading rule: a
 marker inside a heading *is* read (`## **Title**` does not paint its asterisks)
 but the heading's style is the only one it wears. One corner inside the accepted
-rules is half-read rather than refused: `***bold***` comes out as a strong span
-holding `*bold` plus a stray `*`, because the inline scanner takes the first two
-asterisks for the opener — no character is lost, and it is recorded as the code
-does it rather than promised away. Nothing else moved: no schema, prompt,
+rules was half-read rather than refused: `***bold***` came out as a strong span
+holding `*bold` plus a stray `*`, because the inline scanner took the first two
+asterisks for the opener. That is fixed in `da50f6c`: a run of a marker is
+all-or-nothing — the whole run opens and the whole run closes, a one-marker rule
+pairs only with a one-marker run, and a run that is not a matched pair is text
+exactly as it was typed — so `***bold***` is a strong `bold` and no row carries
+a marker left over from a half-read run. The refused set above did not move,
+`__strong__` and `___x___` among it. Nothing else moved: no schema, prompt,
 message or session byte changed, because the view is a paint and not a rewrite —
 which is exactly why §8.49's copy road is unaffected by it.
 

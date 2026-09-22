@@ -262,17 +262,27 @@ pub enum RunStyle {
 ///
 /// Inline, within one line:
 ///
-/// - `**strong**` → [`RunStyle::Strong`]
+/// - `**strong**` → [`RunStyle::Strong`]. Two or more asterisks are the strong
+///   form and the whole run is spent: `***bold***` is a strong `bold`, not a
+///   pair of markers and a stray.
 /// - `*emphasis*` and `_emphasis_` → [`RunStyle::Emphasis`]. An `_` inside or
 ///   beside a word is not one, so `snake_case_name` survives; `__strong__` has
-///   no rule here and stays text rather than being half-read.
-/// - `` `code` `` → [`RunStyle::Code`]
+///   no rule here and stays text rather than being half-read. A lone `*` or `_`
+///   pairs only with another lone one, so `*a**` is text: the emphasis rule
+///   cannot spend the closer's two.
+/// - `` `code` `` → [`RunStyle::Code`]. A run of backticks is one span, opened
+///   and closed whole, so `` ``code`` `` is a code `code`.
 /// - `~~strike~~` → [`RunStyle::Strike`]. Worth one rule: a model uses it to
 ///   mark its own correction, and on a terminal that cannot strike it out the
-///   words still read.
+///   words still read. A run of two or more is spent whole, as strong is.
 /// - `[text](url)` → the text in [`RunStyle::Link`] and ` (url)` in
 ///   [`RunStyle::Url`]. The URL's own parentheses are counted, so a wiki link's
 ///   tail is not cut off.
+///
+/// A **run** of a marker is all-or-nothing: a rule spends every marker in the
+/// run it opens or closes with, and a run no rule can spend as a pair is text
+/// exactly as it was typed. So no row ever paints a marker left over from a run
+/// half-read.
 ///
 /// Block, at the start of a line:
 ///
@@ -391,9 +401,10 @@ fn list_marker(line: &str) -> Option<(&str, &str)> {
 
 /// One source line's inline markers: plain text, spans, and links, in order.
 ///
-/// No nesting and no escapes: inside a span the text is the text, so `**a *b*`
-/// is strong text that happens to hold stars. That is the small version on
-/// purpose — a recursive parser is where a chat reply stops being a reading.
+/// No nesting and no escapes: inside a span the text is the text, so
+/// `**a *b**` is strong text that happens to hold a star. That is the small
+/// version on purpose — a recursive parser is where a chat reply stops being a
+/// reading.
 fn inline(line: &str) -> Vec<Run> {
     let chars: Vec<char> = line.chars().collect();
     let mut runs: Vec<Run> = Vec::new();
@@ -426,61 +437,87 @@ fn inline(line: &str) -> Vec<Run> {
     runs
 }
 
-/// The marker at `chars[i]`, if there is one: the runs it paints and the index
-/// the scanner goes on at. `None` means the character is text, which is what an
-/// unterminated marker gets.
+/// The marker run at `chars[i]`, if there is one: the runs it paints and the
+/// index the scanner goes on at. `None` means the character is text, which is
+/// what an unterminated marker, and a run no rule can spend whole, get.
+///
+/// A **run** of a marker is the unit: the scanner only ever asks a rule at the
+/// first character of one, a rule spends every marker in the run it names, and
+/// a run that is not a matched pair is text in full — so no row can carry a
+/// marker left over from a run half-read as an opener or a closer.
+/// `***bold***` is a strong `bold`; `*a**` is the four characters it is,
+/// because the one-`*` rule cannot spend the closer's two.
 fn span(chars: &[char], i: usize) -> Option<(usize, Vec<Run>)> {
-    match chars[i] {
-        '`' => close(chars, i + 1, &['`']).map(|end| {
-            (
-                end + 1,
-                vec![Run {
-                    text: chars[i + 1..end].iter().collect(),
-                    style: RunStyle::Code,
-                }],
-            )
-        }),
-        '*' if chars.get(i + 1) == Some(&'*') => close(chars, i + 2, &['*', '*']).map(|end| {
-            (
-                end + 2,
-                vec![Run {
-                    text: chars[i + 2..end].iter().collect(),
-                    style: RunStyle::Strong,
-                }],
-            )
-        }),
-        '*' => close(chars, i + 1, &['*']).map(|end| {
-            (
-                end + 1,
-                vec![Run {
-                    text: chars[i + 1..end].iter().collect(),
-                    style: RunStyle::Emphasis,
-                }],
-            )
-        }),
-        '~' if chars.get(i + 1) == Some(&'~') => close(chars, i + 2, &['~', '~']).map(|end| {
-            (
-                end + 2,
-                vec![Run {
-                    text: chars[i + 2..end].iter().collect(),
-                    style: RunStyle::Strike,
-                }],
-            )
-        }),
-        '_' if underscore_opens(chars, i) => close(chars, i + 1, &['_']).and_then(|end| {
-            // The closing `_` must end a word too, or an `_` inside an
-            // identifier could close a span it never opened.
-            if matches!(chars.get(end + 1), Some(ch) if *ch == '_' || ch.is_alphanumeric()) {
+    let marker = chars[i];
+    // Only the first character of a run is ever a marker: the rest are the
+    // text of the run the first one was read as, so a second `*` of a `***`
+    // is not an opener of its own.
+    if matches!(marker, '`' | '*' | '~' | '_') && i > 0 && chars[i - 1] == marker {
+        return None;
+    }
+    match marker {
+        '`' => {
+            let open = run_len(chars, i, '`');
+            close(chars, i + open, '`', Closer::Any).map(|(end, len)| {
+                (
+                    end + len,
+                    vec![Run {
+                        text: chars[i + open..end].iter().collect(),
+                        style: RunStyle::Code,
+                    }],
+                )
+            })
+        }
+        '*' => {
+            let open = run_len(chars, i, '*');
+            // One asterisk is emphasis, two or more are strong: the closer
+            // must be a run of the same form, and that run is spent whole.
+            let (style, closer) = if open == 1 {
+                (RunStyle::Emphasis, Closer::Single)
+            } else {
+                (RunStyle::Strong, Closer::Run)
+            };
+            close(chars, i + open, '*', closer).map(|(end, len)| {
+                (
+                    end + len,
+                    vec![Run {
+                        text: chars[i + open..end].iter().collect(),
+                        style,
+                    }],
+                )
+            })
+        }
+        '~' => {
+            let open = run_len(chars, i, '~');
+            if open < 2 {
                 return None;
             }
-            Some((
-                end + 1,
-                vec![Run {
-                    text: chars[i + 1..end].iter().collect(),
-                    style: RunStyle::Emphasis,
-                }],
-            ))
-        }),
+            close(chars, i + open, '~', Closer::Run).map(|(end, len)| {
+                (
+                    end + len,
+                    vec![Run {
+                        text: chars[i + open..end].iter().collect(),
+                        style: RunStyle::Strike,
+                    }],
+                )
+            })
+        }
+        '_' if underscore_opens(chars, i) => {
+            close(chars, i + 1, '_', Closer::Single).and_then(|(end, len)| {
+                // The closing `_` must end a word too, or an `_` inside an
+                // identifier could close a span it never opened.
+                if matches!(chars.get(end + len), Some(ch) if *ch == '_' || ch.is_alphanumeric()) {
+                    return None;
+                }
+                Some((
+                    end + len,
+                    vec![Run {
+                        text: chars[i + 1..end].iter().collect(),
+                        style: RunStyle::Emphasis,
+                    }],
+                ))
+            })
+        }
         '[' => link(chars, i).map(|(end, text, url)| {
             (
                 end + 1,
@@ -512,21 +549,64 @@ fn underscore_opens(chars: &[char], i: usize) -> bool {
     }
 }
 
-/// The index of the next `marker` after `from` that would close a span, or
-/// `None` if there is none. The content must be non-empty and must not begin or
-/// end in whitespace, which is what keeps `a * b * c` and `** **` as the text
-/// they are rather than a span of spaces.
-fn close(chars: &[char], from: usize, marker: &[char]) -> Option<usize> {
-    let mut i = from;
-    while i + marker.len() <= chars.len() {
-        if chars[i..i + marker.len()] == *marker
-            && i > from
-            && !chars[from].is_whitespace()
-            && !chars[i - 1].is_whitespace()
-        {
-            return Some(i);
+/// The length of the maximal run of `marker` at `chars[i]` — zero when
+/// `chars[i]` is some other character. A run is the unit an inline marker is
+/// read in ([`span`]).
+fn run_len(chars: &[char], i: usize, marker: char) -> usize {
+    chars[i..].iter().take_while(|ch| **ch == marker).count()
+}
+
+/// Which runs of a marker may close a span, by the rule that opened it: the
+/// one-marker rules pair with one marker, a run of two or more pairs with a run
+/// of two or more, and a code span's backticks with any run of backticks at
+/// all. A run of another form is skipped whole by [`close`] — it is the text
+/// inside the span, as the lone `*` of `**a *b**` is — never half-read.
+#[derive(Clone, Copy)]
+enum Closer {
+    /// Exactly one marker: the `**` of `*a**` cannot close the one-`*` rule,
+    /// so that line is the characters it is, not an emphasis and a stray.
+    Single,
+    /// Two or more, every one of them: `**a***` is a strong `a` with the
+    /// opening run and the closing run both spent.
+    Run,
+    /// Any run at all: `` ``code`` `` is one code span, not a code span holding
+    /// a backtick and a stray.
+    Any,
+}
+
+impl Closer {
+    /// Whether a run of this length closes the span.
+    fn fits(self, len: usize) -> bool {
+        match self {
+            Closer::Single => len == 1,
+            Closer::Run => len >= 2,
+            Closer::Any => true,
         }
-        i += 1;
+    }
+}
+
+/// The next run of `marker` after `from` that closes a span, as its index and
+/// its length — or `None` if there is none. The run must fit the opener's form
+/// ([`Closer`]); a run that does not is skipped whole, never half-read. The
+/// content must be non-empty and must not begin or end in whitespace, which is
+/// what keeps `a * b * c` and `** **` as the text they are rather than a span
+/// of spaces.
+fn close(chars: &[char], from: usize, marker: char, closer: Closer) -> Option<(usize, usize)> {
+    let mut i = from;
+    while i < chars.len() {
+        if chars[i] == marker {
+            let len = run_len(chars, i, marker);
+            if closer.fits(len)
+                && i > from
+                && !chars[from].is_whitespace()
+                && !chars[i - 1].is_whitespace()
+            {
+                return Some((i, len));
+            }
+            i += len;
+        } else {
+            i += 1;
+        }
     }
     None
 }
@@ -1506,5 +1586,119 @@ mod tests {
                 "the URL lost its tail at {width}: {flat:?}"
             );
         }
+    }
+
+    /// A run of a marker is all-or-nothing: a rule spends every marker in the
+    /// run it opens or closes with, and a run that is not a matched pair is
+    /// text exactly as it was typed — so no row ever carries a marker left over
+    /// from a run half-read as an opener or a closer. `***bold***` is a strong
+    /// `bold` with both three-marker runs spent, the reading a model means; a
+    /// one-marker rule pairs only with one marker, so `*a**` is the four
+    /// characters it is; an underscore run of two or more is not a rule here
+    /// (`__strong__` is text), so `___x___` is too; and a run beside a space,
+    /// at a row's edge, inside code or a fence is text where it stands.
+    #[test]
+    fn a_run_of_a_marker_is_all_or_nothing() {
+        // Three or more: the whole run opens and the whole run closes.
+        assert_eq!(
+            runs("***bold***"),
+            vec![("bold".to_string(), RunStyle::Strong)]
+        );
+        assert_eq!(runs("****x****"), vec![("x".to_string(), RunStyle::Strong)]);
+        // A run of two opens strong, and a run of two or more — however long —
+        // closes it whole.
+        assert_eq!(runs("**a***"), vec![("a".to_string(), RunStyle::Strong)]);
+        assert_eq!(runs("***a**"), vec![("a".to_string(), RunStyle::Strong)]);
+        // A one-marker rule closes only on one marker: these are the characters
+        // they are, not half a span and a stray.
+        for text in ["*a**", "**a*", "***x*", "*a***"] {
+            assert_eq!(
+                runs(text),
+                vec![(text.to_string(), RunStyle::Plain)],
+                "{text:?} was read as a span"
+            );
+        }
+        // A run beside a space is text, whichever side the space is on; so is a
+        // run of nothing but markers, at the start or the end of a row.
+        for text in [
+            "** a**", "**a **", "~~a ~~", "***a ***", "***", "****", "******",
+        ] {
+            assert_eq!(
+                runs(text),
+                vec![(text.to_string(), RunStyle::Plain)],
+                "{text:?} was read as a span"
+            );
+        }
+        // A run at the edge of a row that does open leaves no marker behind.
+        assert_eq!(
+            runs("a ***x*** b"),
+            vec![
+                ("a ".to_string(), RunStyle::Plain),
+                ("x".to_string(), RunStyle::Strong),
+                (" b".to_string(), RunStyle::Plain),
+            ]
+        );
+        // A run that closes mid-line spends itself: `b***` is text, not a stray.
+        assert_eq!(
+            runs("**a**b***"),
+            vec![
+                ("a".to_string(), RunStyle::Strong),
+                ("b***".to_string(), RunStyle::Plain),
+            ]
+        );
+        // An underscore run of two or more is not a rule — `__strong__` stays
+        // text — and a run of two opening on a run of one is the same refusal,
+        // so `___x___` and `___x__` are the characters they are.
+        for text in ["___x___", "___x__"] {
+            assert_eq!(
+                runs(text),
+                vec![(text.to_string(), RunStyle::Plain)],
+                "{text:?} was read as a span"
+            );
+        }
+        // Strike spends the whole run too.
+        assert_eq!(runs("~~x~~~"), vec![("x".to_string(), RunStyle::Strike)]);
+        assert_eq!(runs("~~~x~~~"), vec![("x".to_string(), RunStyle::Strike)]);
+        assert_eq!(runs("~~~x~~"), vec![("x".to_string(), RunStyle::Strike)]);
+        // A run of backticks is one code span, opened and closed whole.
+        for text in ["``x``", "``x`", "`x``"] {
+            assert_eq!(
+                runs(text),
+                vec![("x".to_string(), RunStyle::Code)],
+                "{text:?}"
+            );
+        }
+        // Inside a code span, or a fence's body, inline parsing is off: a run of
+        // asterisks there is the code's own characters.
+        assert_eq!(
+            runs("say `***x***` now"),
+            vec![
+                ("say ".to_string(), RunStyle::Plain),
+                ("***x***".to_string(), RunStyle::Code),
+                (" now".to_string(), RunStyle::Plain),
+            ]
+        );
+        assert_eq!(
+            markdown_rows("```\n***x***\n```", 40),
+            vec![vec![Run {
+                text: "***x***".to_string(),
+                style: RunStyle::Fence,
+            }]]
+        );
+        // A run split across a wrap was spent before the wrap: both rows carry
+        // the whole strong span, and no marker comes back inside it.
+        assert_eq!(
+            markdown_rows("***alpha beta***", 6),
+            vec![
+                vec![Run {
+                    text: "alpha".to_string(),
+                    style: RunStyle::Strong,
+                }],
+                vec![Run {
+                    text: "beta".to_string(),
+                    style: RunStyle::Strong,
+                }],
+            ]
+        );
     }
 }
