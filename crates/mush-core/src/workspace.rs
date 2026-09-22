@@ -3,12 +3,12 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 
 use crate::message::Image;
 use crate::session;
 use crate::text;
-use tempfile::NamedTempFile;
 
 /// Directories a walk never descends into: VCS metadata and build output, whose
 /// contents are never the workspace's work. Hidden names are *not* skipped —
@@ -986,16 +986,33 @@ impl Workspace {
     }
 
     /// Atomically create or replace a file, creating parent directories.
+    ///
+    /// A file with no owner-write bit is refused with the mode it has, so a
+    /// `0444` file the human marked read-only is a sentence the model can read
+    /// instead of an override it cannot see. That refusal lives here, at the
+    /// model's door, and not in [`atomic_write`], which `session::save` and the
+    /// human's own `config.json` writer also use: they may replace a file
+    /// whatever its mode, but a model may not.
     pub fn write_file(&self, rel: &str, content: &str) -> Result<(), String> {
         let path = self.resolve(rel)?;
         if path == self.root {
             return Err("refusing to write to the workspace root".to_string());
         }
+        if let Ok(meta) = fs::metadata(&path) {
+            let mode = meta.permissions().mode() & 0o7777;
+            if mode & 0o200 == 0 {
+                return Err(format!(
+                    "{rel} is mode {mode:04o} — it has no owner-write bit, and mush will not \
+                     override that: `chmod u+w {rel}` first"
+                ));
+            }
+        }
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)
                 .map_err(|e| format!("cannot create {}: {e}", self.rel(parent)))?;
         }
-        atomic_write(&path, content.as_bytes()).map_err(|e| format!("cannot write {rel}: {e}"))
+        atomic_write(&path, content.as_bytes(), Fresh::Box)
+            .map_err(|e| format!("cannot write {rel}: {e}"))
     }
 }
 
@@ -1310,12 +1327,70 @@ pub fn tail_for_model(text: &str, cap: usize) -> String {
     )
 }
 
+/// Who a *new* file is made for, when [`atomic_write`] has no mode to keep.
+///
+/// An existing target's mode is copied across the rename whatever this says;
+/// this decides only what a name that did not exist comes out as. The two
+/// values are the two facts a write road knows about its file:
+///
+/// - [`Fresh::Box`] — a workspace file, which belongs to the box: `0o666` with
+///   the human's umask applied by the kernel at creation, the way `>`, `vim`
+///   and `git` make one. The umask is the human's own decision about new files
+///   and no safe way to read it exists (`umask(2)` is both a process-wide write
+///   and unsafe, and this tree forbids `unsafe`), so spelling `0o644` here
+///   would be a second guess at a number the kernel already knows — and a wrong
+///   one on a box that chose `002` or `077`.
+/// - [`Fresh::Private`] — mush's own store: the session file and the
+///   key-bearing home `config.json`, which hold the whole conversation and the
+///   human's secrets. `0o600`, because a human's `022` umask is about the files
+///   the box shares and must not hand mush's private ones to the group.
+///
+/// One decision in one place: the difference is this match and the reason
+/// beside it, never two copies of `0666 & !umask`.
+pub enum Fresh {
+    Box,
+    Private,
+}
+
+impl Fresh {
+    /// The mode a new file is *created* with. The kernel still applies the
+    /// human's umask to it — which is the point for [`Fresh::Box`]: `0o666`
+    /// becomes `0o644` under the usual `022` and `0o600` under a `077`.
+    /// [`Fresh::Private`]'s `0o600` has no group or other bits for an umask to
+    /// take, so mush's own stores come out `0600` whatever the human chose.
+    fn mode(self) -> u32 {
+        match self {
+            Fresh::Box => 0o666,
+            Fresh::Private => 0o600,
+        }
+    }
+}
+
 /// Write via a same-directory temp file plus `rename`, so readers never observe
 /// a half-written file and a crash cannot corrupt the original.
-pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
+///
+/// The mode is a fact of the file, not of this function. `tempfile` makes its
+/// scratch file `0600` and the rename would carry that onto the target, so an
+/// existing target's mode is copied onto the temp file before the rename
+/// (finding B1: an executable script stopped being executable, and `git`
+/// recorded the mode change); a name that did not exist is made the way
+/// `fresh` says. A mode the file already had is copied exactly, not created
+/// through the umask: the umask decides *new* modes, and this one is not new.
+pub fn atomic_write(path: &Path, bytes: &[u8], fresh: Fresh) -> io::Result<()> {
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let mut tmp = NamedTempFile::new_in(dir)?;
+    let existing = fs::metadata(path)
+        .ok()
+        .map(|meta| meta.permissions().mode() & 0o7777);
+    let mut tmp = tempfile::Builder::new()
+        .permissions(fs::Permissions::from_mode(
+            existing.unwrap_or_else(|| fresh.mode()),
+        ))
+        .tempfile_in(dir)?;
     tmp.write_all(bytes)?;
+    if let Some(mode) = existing {
+        tmp.as_file()
+            .set_permissions(fs::Permissions::from_mode(mode))?;
+    }
     tmp.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
@@ -1329,6 +1404,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).unwrap();
         Workspace::new(&dir).unwrap()
+    }
+
+    /// A path's permission bits as a human reads them (`0755`): the low twelve,
+    /// without the file-type bits `Permissions::mode` also carries.
+    fn mode_of(path: &Path) -> u32 {
+        fs::metadata(path).unwrap().permissions().mode() & 0o7777
     }
 
     /// A picture file *outside* every test workspace — the paste road's own
@@ -2335,6 +2416,76 @@ mod tests {
             refused.contains("notes.txt is not a regular file"),
             "and a directory is not read either: {refused}"
         );
+    }
+
+    /// A write changes the bytes and nothing else: the mode is a fact of the
+    /// file, not of the temp file the rename carries it from. This is finding
+    /// B1's whole failure — every `write_file` rebuilt the inode at `0600`, so a
+    /// `0755` script stopped running and `git` recorded the mode change — and
+    /// the two edges the repair draws: a new file is made the way the box makes
+    /// one (`0666 & !umask`, measured against `fs::write`'s own file rather
+    /// than spelled as `0644`), and a file with no owner-write bit is a refusal
+    /// the model can read, naming the mode it found.
+    #[test]
+    fn a_write_keeps_the_files_mode() {
+        let ws = temp_workspace("write-mode");
+        let run = ws.root().join("run.sh");
+        let data = ws.root().join("data.txt");
+        fs::write(&run, "#!/bin/sh\n").unwrap();
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(&data, "a\n").unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o644)).unwrap();
+
+        ws.write_file("run.sh", "#!/bin/sh\necho hi\n").unwrap();
+        ws.write_file("data.txt", "b\n").unwrap();
+        assert_eq!(mode_of(&run), 0o755, "the executable bit survives");
+        assert_eq!(mode_of(&data), 0o644, "group and other readability survive");
+
+        // A new file is the box's, not mush's: `fs::write` makes one out of the
+        // same `0666 & !umask`, so the oracle is measured here, not spelled.
+        fs::write(ws.root().join("oracle.txt"), "x\n").unwrap();
+        ws.write_file("new.txt", "y\n").unwrap();
+        assert_eq!(
+            mode_of(&ws.root().join("new.txt")),
+            mode_of(&ws.root().join("oracle.txt")),
+            "a new file is the way the rest of the box makes one"
+        );
+
+        // The read-only bit is not overridden: the door refuses, names the mode
+        // and leaves the file as it was.
+        fs::set_permissions(&run, fs::Permissions::from_mode(0o444)).unwrap();
+        let refused = ws.write_file("run.sh", "replaced\n").unwrap_err();
+        assert!(refused.contains("0444"), "the mode is named: {refused}");
+        assert!(refused.contains("owner-write"), "{refused}");
+        assert_eq!(fs::read_to_string(&run).unwrap(), "#!/bin/sh\necho hi\n");
+        assert_eq!(mode_of(&run), 0o444);
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The other half of [`Fresh`]: a store mush writes for itself — the
+    /// session, the key-bearing home config — is not the box's file, so a new
+    /// one is `0600` whatever the human's umask says. `atomic_write` is the one
+    /// road both audiences travel, and this pins the one decision they differ
+    /// on; the session and userconfig tests pin their own road's call.
+    #[test]
+    fn a_private_store_is_made_0600() {
+        let ws = temp_workspace("fresh-private");
+        let path = ws.root().join("session.json");
+        atomic_write(&path, b"{}", Fresh::Private).unwrap();
+        assert_eq!(
+            mode_of(&path),
+            0o600,
+            "mush's own file is the owner's alone"
+        );
+
+        // An existing file keeps whatever it has, private or not: `Fresh`
+        // decides new files only, and a mode a file already has is not the
+        // umask's business.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o640)).unwrap();
+        atomic_write(&path, b"{\"a\":1}", Fresh::Private).unwrap();
+        assert_eq!(mode_of(&path), 0o640);
+        assert_eq!(fs::read(&path).unwrap(), b"{\"a\":1}");
+        let _ = fs::remove_dir_all(ws.root());
     }
 
     /// A file far past the cap is refused from what the stat said, not by being

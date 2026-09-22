@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-use crate::workspace::atomic_write;
+use crate::workspace::{atomic_write, Fresh};
 
 /// The key the self-documenting header travels under. A plain JSON key, not a
 /// JSONC dialect: `_` sorts it to the top, every parser survives it, and it is
@@ -193,7 +193,9 @@ impl UserConfig {
             fields.insert(COMMENT_KEY.to_string(), json!(comment()));
         }
         let json = serde_json::to_vec_pretty(&merged).unwrap_or_else(|_| b"{}".to_vec());
-        atomic_write(path, &json)
+        // A new file is the human's alone ([`Fresh::Private`]): it carries the
+        // API key, and a `022` umask must not make it group-readable.
+        atomic_write(path, &json, Fresh::Private)
     }
 }
 
