@@ -299,9 +299,15 @@ pub fn trim_history(messages: &mut Vec<Message>, budget: usize) {
     loop {
         // Once a drop happens the request will carry the note, so the budget
         // has to hold the note too, or the line explaining the trim would be
-        // what pushes the request past the window.
-        let total: usize = messages.iter().map(Message::weight).sum::<usize>()
-            + if carried || dropped { note.weight() } else { 0 };
+        // what pushes the request past the window. The sum saturates: a header
+        // can claim a picture whose estimate is as large as a `usize`
+        // (`Image::weight`), and a transcript of them has to read as over
+        // budget rather than wrap to a small number that says it fits.
+        let total: usize = messages
+            .iter()
+            .map(Message::weight)
+            .fold(0, usize::saturating_add)
+            .saturating_add(if carried || dropped { note.weight() } else { 0 });
         if total <= budget {
             break;
         }
@@ -356,6 +362,7 @@ fn is_dropped_note(message: &Message) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
     use crate::{FunctionCall, Image, ToolCall};
 
     /// A one-message transcript weighing exactly `weight` bytes. `Message::weight`
@@ -556,12 +563,23 @@ mod tests {
     }
 
     /// An image of `bytes` bytes whose path says which one it is, for the trim
-    /// tests: big enough to sway a budget, small enough to read.
+    /// tests: big enough to sway a budget, small enough to read. No pixels, so
+    /// it weighs its bytes — the fallback those tests exercise.
     fn image(path: &str, bytes: usize) -> Image {
         Image {
             path: path.into(),
             mime: "image/png".into(),
             bytes: vec![0x41; bytes],
+            pixels: None,
+        }
+    }
+
+    /// A picture `width × height` big stored in `bytes` bytes: what the budget
+    /// weighs by its pixels, whatever the file happens to be.
+    fn picture(path: &str, width: u32, height: u32, bytes: usize) -> Image {
+        Image {
+            pixels: Some((width, height)),
+            ..image(path, bytes)
         }
     }
 
@@ -669,6 +687,145 @@ mod tests {
         );
         assert_eq!(note_count(&messages), 0, "no turn was dropped");
         assert!(messages.iter().map(Message::weight).sum::<usize>() <= budget);
+    }
+
+    /// The other half of the pixels ruling: the estimate changed, the order
+    /// did not. A transcript over budget because of pixel-weighed pictures
+    /// still sheds the oldest one first, and keeps the newer one the budget
+    /// can hold.
+    #[test]
+    fn a_picture_over_budget_is_still_shed_oldest_first() {
+        let mut messages = vec![Message::system("you are mush"), Message::user("first")];
+        for (i, path) in ["shots/one.png", "shots/two.png"].into_iter().enumerate() {
+            let mut reply = Message::assistant(format!("here {i}"));
+            reply.images.push(picture(path, 1_920, 1_080, 700));
+            messages.push(reply);
+            messages.push(Message::user(format!("again {i}")));
+        }
+        // Room for the words and one 1920×1080 screenshot (~8.3 KB of weight
+        // each), not both.
+        let budget = 10_000;
+        assert!(messages.iter().map(Message::weight).sum::<usize>() > budget);
+
+        trim_history(&mut messages, budget);
+
+        assert!(
+            messages[2].images.is_empty(),
+            "the oldest picture is the one that pays"
+        );
+        assert_eq!(
+            messages[4].images.len(),
+            1,
+            "the newer picture stays: the budget can hold it"
+        );
+        assert!(messages[2].text().contains("shots/one.png"));
+        assert_eq!(note_count(&messages), 0, "no turn was dropped");
+        assert!(messages.iter().map(Message::weight).sum::<usize>() <= budget);
+    }
+
+    /// The human's own numbers, and the defect this fixes: a ~300k-token
+    /// conversation (~900 KB of weight) plus a 724 KiB 1920×1080 screenshot
+    /// fits a 500k-token window's budget, because the picture costs ~2.8k
+    /// tokens by its pixels where its bytes read as ~247k. The screenshot they
+    /// had just attached is not shed before the model ever looks at it.
+    #[test]
+    fn the_humans_screenshot_fits_and_is_not_shed() {
+        let mut cfg = Config::new("http://127.0.0.1:1", "test", None);
+        cfg.set_context(500_000);
+        let budget = cfg.history_budget();
+
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("first"),
+            Message::assistant("x".repeat(900_000)),
+        ];
+        let words: usize = messages.iter().map(Message::weight).sum();
+        messages.last_mut().unwrap().images.push(picture(
+            "shots/screen.png",
+            1_920,
+            1_080,
+            741_396,
+        ));
+        let total: usize = messages.iter().map(Message::weight).sum();
+
+        assert!(
+            words + 741_396 > budget,
+            "the old byte count put the fixture over budget: {} > {budget}",
+            words + 741_396
+        );
+        assert!(
+            total <= budget,
+            "the pixels count fits it: {total} > {budget}"
+        );
+
+        trim_history(&mut messages, budget);
+
+        assert_eq!(
+            messages.last().unwrap().images.len(),
+            1,
+            "the newest image is not shed before the model can see it"
+        );
+        assert_eq!(note_count(&messages), 0, "and no turn was dropped either");
+    }
+
+    /// The placeholder weighs its own text and nothing else: once a payload is
+    /// shed, neither the pixels nor the bytes are in the budget any more. A
+    /// trimmer that still counted them would shed the same image forever and
+    /// never get under a budget its picture is no longer part of.
+    #[test]
+    fn a_shed_payload_leaves_only_the_placeholders_weight() {
+        let mut message = Message::assistant("here it is");
+        message
+            .images
+            .push(picture("shots/screen.png", 1_920, 1_080, 741_396));
+        let with_image = message.weight();
+
+        message.drop_images();
+
+        let text = message.text().to_string();
+        assert_eq!(
+            message.weight(),
+            "assistant".len() + text.len(),
+            "role and placeholder text, and no payload: {text}"
+        );
+        assert!(message.weight() < with_image, "the picture is gone");
+        assert!(
+            with_image - message.weight() > 8_000,
+            "and its ~8.3 KB of weight with it: {with_image} -> {}",
+            message.weight()
+        );
+        assert!(
+            text.contains("shots/screen.png"),
+            "and the path that replaces it is there: {text}"
+        );
+    }
+
+    /// A transcript of impossible pictures is over budget, not wrapped under
+    /// it: 260 headers that each claim `u32::MAX × u32::MAX` pixels sum past a
+    /// `usize`, and the saturating total still says "shed" — a plain sum would
+    /// panic in a debug build and wrap to a small, fitting-looking number in a
+    /// release one.
+    #[test]
+    fn a_transcript_of_impossible_pictures_still_reads_as_over_budget() {
+        let mut messages = vec![Message::system("you are mush"), Message::user("first")];
+        for i in 0..260 {
+            let mut reply = Message::assistant(format!("here {i}"));
+            reply.images.push(Image {
+                path: format!("shots/{i}.png"),
+                mime: "image/png".into(),
+                bytes: vec![],
+                pixels: Some((u32::MAX, u32::MAX)),
+            });
+            messages.push(reply);
+        }
+
+        trim_history(&mut messages, 1_000);
+
+        assert!(
+            messages.iter().all(|message| message.images.is_empty()),
+            "every payload is shed, so the total was read as over budget"
+        );
+        assert!(messages.len() > 2, "the words are not what was dropped");
     }
 
     fn call(id: &str) -> ToolCall {

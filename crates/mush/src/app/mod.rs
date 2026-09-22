@@ -3302,12 +3302,23 @@ impl App {
     ///   request — a whole turn and the human's money — so it is refused
     ///   *before* the wire, and `Ctrl-P` is named as the road: the one road
     ///   that changes the fact.
-    /// - **An image bigger than the whole request budget.** This one is
-    ///   attached anyway — the human decides what to send — but the fact they
-    ///   cannot see is said: [`mush_core::transcript::trim_history`] sheds image
-    ///   payloads *before* it drops a turn, so a picture larger than the whole
-    ///   budget is stripped before the model ever looks at it. A screenshot
-    ///   that silently never arrived is the defect, so the downscale is named.
+    /// - **An image with no room left in the budget.** This one is attached
+    ///   anyway — the human decides what to send — but the fact they cannot see
+    ///   is said: [`mush_core::transcript::trim_history`] sheds image payloads
+    ///   *before* it drops a turn, so a picture that does not fit the room the
+    ///   conversation has left is stripped before the model ever looks at it,
+    ///   which is the defect this line exists for. The room is what remains of
+    ///   [`mush_core::Config::history_budget`] once the system prompt and the
+    ///   transcript are weighed, and the images already in the box count
+    ///   against it too: they are not in the transcript yet. The line names
+    ///   the two roads that make the picture arrive — `/compact`, which folds
+    ///   the history into a summary, and a downscale, which makes the picture
+    ///   cost less.
+    ///
+    /// A picture whose weight exactly equals the room left fits: this gate
+    /// asks the same question the trimmer does (`cost + pending > room`, where
+    /// [`mush_core::transcript::trim_history`] stops at `total <= budget`), so
+    /// the two cannot disagree about a picture parked on the boundary.
     ///
     /// Everything else attaches, and the line says the image, its format and
     /// its size, and how to send it.
@@ -3324,15 +3335,33 @@ impl App {
         }
         let label = image_label(&image);
         let path = image.path.clone();
-        let size = image.bytes.len();
-        let budget = self.cfg().history_budget();
+        // What this picture costs, weighed the one way the trimmer weighs it:
+        // pixels when its header named them, bytes when it did not
+        // ([`Image::weight`]). The images already in the box are added by hand
+        // — they are not in the transcript yet, and two pictures that each fit
+        // can still not fit together.
+        let cost = image.weight();
+        // Saturating, both ways: a header can claim a picture larger than any
+        // `usize`, and the sum of what is pending must not be the thing that
+        // panics on the way to "it does not fit".
+        let pending: usize = self
+            .chat
+            .attachments()
+            .iter()
+            .map(Image::weight)
+            .fold(0, usize::saturating_add);
+        let room = self
+            .cfg()
+            .history_budget()
+            .saturating_sub(self.chat.used_weight_for(AgentId::ROOT));
         self.chat.attach(image);
-        if size > budget {
+        if cost.saturating_add(pending) > room {
             self.fail(format!(
-                "{label} is bigger than the whole request budget ({}) — trim_history sheds an \
+                "{label} will not fit the room left for history ({}) — trim_history sheds an \
                  image's bytes before it drops a turn, so the model would never look at it. \
-                 Downscale it (`convert {path} -resize 50% small.png`) and attach that",
-                size_label(budget)
+                 `/compact` makes room, or downscale it (`convert {path} -resize 50% small.png`) \
+                 and attach that",
+                size_label(room)
             ));
             return true;
         }
@@ -6767,11 +6796,14 @@ mod tests {
     }
 
     /// A saved image, as a test attaches one without going through a paste.
+    /// Its header names no size, so it weighs its bytes — the fallback the
+    /// budget tests below exercise.
     fn image(path: &str) -> Image {
         Image {
             path: path.to_string(),
             mime: "image/png".to_string(),
             bytes: png(0),
+            pixels: None,
         }
     }
 
@@ -6875,19 +6907,24 @@ mod tests {
         assert!(line.contains("Ctrl-P"), "and the road is: {line}");
     }
 
-    /// The gate's third arm attaches *and* refuses a line: an image bigger than
-    /// the whole request budget rides — the human decides what to send — but
-    /// the fact they cannot see is said, because `trim_history` sheds image
+    /// The gate's third arm attaches *and* refuses a line: an image with no
+    /// room left in the budget rides — the human decides what to send — but the
+    /// fact they cannot see is said, because `trim_history` sheds image
     /// payloads before it drops a turn and those bytes would never reach the
-    /// model.
+    /// model. The room is the budget minus what the conversation already
+    /// weighs, not the whole budget.
     #[test]
-    fn an_image_bigger_than_the_whole_budget_attaches_with_the_fact_said() {
+    fn an_image_with_no_room_left_attaches_with_the_fact_said() {
         let (mut app, _rx) = test_app("attach-over-budget");
         let_the_model_see(&mut app);
         app.cell.edit(|cfg| cfg.set_context(1_024));
         let budget = app.cfg().history_budget();
+        // A transcript that fills the budget: whatever the picture weighs, the
+        // room left for it is nothing.
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("x".repeat(budget)));
         let big = Image {
-            bytes: png(budget * 2),
+            bytes: png(4),
             ..image("shot.png")
         };
 
@@ -6896,8 +6933,159 @@ mod tests {
         assert_eq!(app.chat.attachments().len(), 1, "the human decides");
         let (line, kind) = app.status_line().expect("the fact is said");
         assert_eq!(kind, StatusKind::Error);
-        assert!(line.contains("request budget"), "{line}");
-        assert!(line.contains("convert"), "the downscale road: {line}");
+        assert!(line.contains("room left for history"), "{line}");
+        assert!(line.contains("/compact"), "one road to make room: {line}");
+        assert!(line.contains("convert"), "and the downscale: {line}");
+    }
+
+    /// The room runs out whatever order the pictures arrived in: the images
+    /// already waiting in the box are not in the transcript yet, so the gate
+    /// counts them by hand — two pictures that each fit can still not fit
+    /// together.
+    #[test]
+    fn the_images_already_in_the_box_count_against_the_room_left() {
+        let (mut app, _rx) = test_app("attach-pending");
+        let_the_model_see(&mut app);
+        app.cell.edit(|cfg| cfg.set_context(120_000));
+        let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId::ROOT);
+        // A hair over half the room each, with the path and mime on top: one
+        // fits alone, the second makes the pair too heavy.
+        let each = room / 2 + 64;
+        for path in ["shots/one.png", "shots/two.png"] {
+            let pending = Image {
+                bytes: png(each),
+                ..image(path)
+            };
+            assert!(app.attach_image(pending), "{path} is attached either way");
+        }
+
+        assert_eq!(app.chat.attachments().len(), 2, "both are in the box");
+        let (line, kind) = app.status_line().expect("the second says why");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("room left for history"), "{line}");
+    }
+
+    /// The human's own case, at the gate: a 724 KiB 1920×1080 screenshot
+    /// dropped into a ~300k-token conversation on a 500k-token window attaches
+    /// with the plain line. The room left is ~550 KB of weight and the picture
+    /// costs ~2.8k tokens — not the ~247k its bytes used to read as, which is
+    /// what made the gate silent while `trim_history` shed the picture.
+    #[test]
+    fn the_humans_screenshot_attaches_with_the_plain_line() {
+        let (mut app, _rx) = test_app("attach-screenshot");
+        let_the_model_see(&mut app);
+        app.cell.edit(|cfg| cfg.set_context(500_000));
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("x".repeat(900_000)));
+        let shot = Image {
+            bytes: png(741_388),
+            pixels: Some((1_920, 1_080)),
+            ..image("shots/screen.png")
+        };
+
+        assert!(app.attach_image(shot), "it fits the room left");
+
+        assert_eq!(app.chat.attachments().len(), 1);
+        let (line, kind) = app.status_line().expect("the plain line");
+        assert_eq!(kind, StatusKind::Info);
+        assert!(line.contains("shots/screen.png"), "{line}");
+        assert!(line.contains("Enter sends"), "{line}");
+        assert!(!line.contains("/compact"), "no warning: {line}");
+    }
+
+    /// The boundary is the trimmer's, not a second one: a picture that weighs
+    /// *exactly* the room left attaches with the plain line (the trimmer stops
+    /// at `total <= budget`, and this gate asks the same question), and one
+    /// byte more warns. Two apps, because an attachment changes the room the
+    /// next call sees.
+    #[test]
+    fn a_picture_exactly_at_the_room_left_fits_and_one_byte_more_does_not() {
+        for (label, extra) in [("fits", 0usize), ("one-over", 1)] {
+            let (mut app, _rx) = test_app(&format!("attach-boundary-{label}"));
+            let_the_model_see(&mut app);
+            app.cell.edit(|cfg| cfg.set_context(500_000));
+            let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId::ROOT);
+            // A headerless png weighs its bytes (8 + padding) plus its path
+            // (8) and mime (9); size it to land on the boundary or a byte past.
+            let image = Image {
+                bytes: png(room - 8 - 8 - 9 + extra),
+                ..image("shot.png")
+            };
+            assert_eq!(image.weight(), room + extra);
+
+            assert!(app.attach_image(image), "the human decides");
+            let (line, kind) = app.status_line().expect("a line about the attach");
+            if extra == 0 {
+                assert_eq!(kind, StatusKind::Info, "exactly at the boundary: {line}");
+                assert!(line.contains("attached"), "{line}");
+            } else {
+                assert_eq!(kind, StatusKind::Error, "one byte past: {line}");
+                assert!(line.contains("room left for history"), "{line}");
+            }
+        }
+    }
+
+    /// The gate measures what the endpoint charges, not what the file weighs: a
+    /// 6 MiB image of 8×8 pixels is nowhere near the room it has, and a small
+    /// file claiming 20,000×20,000 pixels is past it. File bytes are the
+    /// transport's ruler (the cap on a read); pixels are the budget's.
+    #[test]
+    fn the_attach_gate_counts_pixels_not_file_bytes() {
+        let (mut app, _rx) = test_app("attach-measures");
+        let_the_model_see(&mut app);
+        app.cell.edit(|cfg| cfg.set_context(500_000));
+        let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId::ROOT);
+
+        let bytes_heavy = Image {
+            bytes: png(6 * 1024 * 1024),
+            pixels: Some((8, 8)),
+            ..image("huge.png")
+        };
+        assert!(bytes_heavy.bytes.len() > 6 * 1024 * 1024);
+        assert!(
+            bytes_heavy.weight() < room,
+            "six megabytes of file, a few tokens of picture"
+        );
+        assert!(app.attach_image(bytes_heavy), "it fits");
+        assert_eq!(
+            app.status_line().map(|(_, kind)| kind),
+            Some(StatusKind::Info)
+        );
+
+        let pixel_heavy = Image {
+            bytes: png(4),
+            pixels: Some((20_000, 20_000)),
+            ..image("big.png")
+        };
+        assert!(
+            pixel_heavy.weight() > room,
+            "a small file whose pixels do not fit"
+        );
+        assert!(app.attach_image(pixel_heavy), "attached anyway");
+        let (line, kind) = app.status_line().expect("the fact is said");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("room left for history"), "{line}");
+    }
+
+    /// Nothing in the accounting panics on a header that claims the biggest
+    /// picture there is: the gate warns because no room can hold it, rather
+    /// than wrapping around to "it fits".
+    #[test]
+    fn the_attach_gate_survives_a_header_that_claims_every_pixel() {
+        let (mut app, _rx) = test_app("attach-overflow");
+        let_the_model_see(&mut app);
+        app.cell.edit(|cfg| cfg.set_context(500_000));
+        let impossible = Image {
+            bytes: png(4),
+            pixels: Some((u32::MAX, u32::MAX)),
+            ..image("huge.png")
+        };
+
+        assert!(app.attach_image(impossible), "attached anyway");
+
+        let (line, kind) = app.status_line().expect("the fact is said");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("room left for history"), "{line}");
     }
 
     /// An image that *is* an image and cannot ride — past the cap — says so and

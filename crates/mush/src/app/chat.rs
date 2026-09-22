@@ -571,6 +571,17 @@ impl Chat {
     /// because the pane a human is looking at can be a subagent's, and its own
     /// next request is what this number measures.
     pub fn used_tokens_for(&self, id: AgentId) -> usize {
+        self.used_weight_for(id) / mush_core::config::BYTES_PER_TOKEN
+    }
+
+    /// The same sum in the budget's own currency: the system prompt plus one
+    /// agent's transcript, weighed the one way [`mush_core::transcript::trim_history`]
+    /// weighs them. Split out of [`Self::used_tokens_for`] so a caller that
+    /// needs the number in bytes — the attach gate, asking how much room a
+    /// picture has left — reads the same sum the meter divides instead of
+    /// adding the two up again (two spellings of one arithmetic is how the
+    /// budget and the meter drift apart).
+    pub fn used_weight_for(&self, id: AgentId) -> usize {
         let transcript = if id == AgentId::ROOT {
             &self.root
         } else {
@@ -579,8 +590,12 @@ impl Chat {
                 None => return 0,
             }
         };
-        let bytes = self.system.weight() + transcript.iter().map(Message::weight).sum::<usize>();
-        bytes / mush_core::config::BYTES_PER_TOKEN
+        self.system.weight().saturating_add(
+            transcript
+                .iter()
+                .map(Message::weight)
+                .fold(0, usize::saturating_add),
+        )
     }
 
     /// Ctrl-N: the conversation is gone, the box and the scrollback with it.

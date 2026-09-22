@@ -35,11 +35,17 @@ const SKIP_DIRS: &[&str] = &[
 /// so; a window of a 200 MB log is `run_command`'s job (`tail`, `sed -n`).
 pub const READ_FILE_CAP: u64 = 32 * 1024 * 1024;
 
-/// The largest image a read will hand to a model, in bytes. An image's real
-/// cost is its pixels and the tokens they become — a 4 MB screenshot is a page
-/// of context on most endpoints — so the cap is a size a picture is worth and
-/// not the whole-read cap: past it the refusal names a downscale, which is the
-/// one road that makes the picture readable at all.
+/// The largest image a read will hand to a model, in *file* bytes — the
+/// transport's cap, not the context budget's.
+///
+/// Two rulers measure an image and both are real. This one bounds what mush is
+/// willing to base64 and put on the wire at all: past it the refusal names the
+/// downscale, which is the one road that makes the picture readable. What the
+/// picture *costs* the window is its pixels, a different number entirely (see
+/// `Image::weight`, and `config::PIXELS_PER_TOKEN`): a picture under this cap
+/// can still be too big for the room a transcript has left, and the app's
+/// attach gate says so before it is sent — where the old code compared one
+/// ruler against the other and got both cases wrong.
 pub const IMAGE_FILE_CAP: u64 = 2 * 1024 * 1024;
 
 /// The longest file `search` opens. A pattern that matches inside a 200 MB log
@@ -76,6 +82,206 @@ pub fn image_mime(bytes: &[u8]) -> Option<&'static str> {
         return Some("image/webp");
     }
     None
+}
+
+/// The pixel size an image's own header names, in the format `mime` claims —
+/// `None` when it cannot be read: a truncated file, a header that lies (a zero
+/// dimension, a length past the end of the bytes), bytes that are not that
+/// format at all, or a format whose header carries no size.
+///
+/// Hand-rolled, because the dependency budget (§7 of the design doc) has no
+/// image crate to lean on and the four headers are arithmetic: png's IHDR
+/// chunk, jpeg's SOFn frame header, gif's logical screen descriptor, webp's
+/// three chunk shapes. The number is what `Message::weight` prices a picture
+/// by, so a picture's real size decides its share of the context window
+/// instead of its file size — which a screenshot's compression can move by
+/// 10×.
+///
+/// `mime` is what the caller sniffed with [`image_mime`]; every parser checks
+/// its own signature anyway, because a mime is a claim like an extension is.
+/// Every read is bounds-checked and every field that could lie is rejected, so
+/// any byte string at all — `&[]`, a three-byte slice, a length past the end —
+/// is a `None` and never a panic.
+pub fn image_dimensions(mime: &str, bytes: &[u8]) -> Option<(u32, u32)> {
+    match mime {
+        "image/png" => png_dimensions(bytes),
+        "image/jpeg" => jpeg_dimensions(bytes),
+        "image/gif" => gif_dimensions(bytes),
+        "image/webp" => webp_dimensions(bytes),
+        _ => None,
+    }
+}
+
+/// A `width, height` pair worth returning: zero is not a size in any of the
+/// four formats (a zero-sized frame is a header that lies), and treating it as
+/// unknown sends the caller to the byte-count fallback rather than making an
+/// image free.
+fn nonzero(width: u32, height: u32) -> Option<(u32, u32)> {
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+/// `bytes[at..at + 2]` as the big-endian `u16` it is, or `None` when the slice
+/// is shorter than that. Every read of a header field goes through one of the
+/// five helpers here or below, so a truncated header is a `None` and never a
+/// panic.
+fn be16(bytes: &[u8], at: usize) -> Option<u16> {
+    let field = bytes.get(at..at + 2)?;
+    Some(u16::from_be_bytes([field[0], field[1]]))
+}
+
+/// [`be16`]'s little-endian twin.
+fn le16(bytes: &[u8], at: usize) -> Option<u16> {
+    let field = bytes.get(at..at + 2)?;
+    Some(u16::from_le_bytes([field[0], field[1]]))
+}
+
+/// A `u32` field, big-endian.
+fn be32(bytes: &[u8], at: usize) -> Option<u32> {
+    let field = bytes.get(at..at + 4)?;
+    Some(u32::from_be_bytes([field[0], field[1], field[2], field[3]]))
+}
+
+/// A `u32` field, little-endian.
+fn le32(bytes: &[u8], at: usize) -> Option<u32> {
+    let field = bytes.get(at..at + 4)?;
+    Some(u32::from_le_bytes([field[0], field[1], field[2], field[3]]))
+}
+
+/// A 24-bit little-endian field, the width webp's extended header stores —
+/// the fourth byte the format does not spend.
+fn le24(bytes: &[u8], at: usize) -> Option<u32> {
+    let field = bytes.get(at..at + 3)?;
+    Some(u32::from_le_bytes([field[0], field[1], field[2], 0]))
+}
+
+/// PNG: the eight-byte signature, then the IHDR chunk, whose first eight
+/// payload bytes are width and height, each a big-endian `u32`. IHDR is
+/// required to be the first chunk and to be 13 bytes long, so a file that
+/// disagrees with either is not one this can read.
+fn png_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    const SIGNATURE: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+    if !bytes.starts_with(SIGNATURE) || be32(bytes, 8)? != 13 || bytes.get(12..16)? != b"IHDR" {
+        return None;
+    }
+    nonzero(be32(bytes, 16)?, be32(bytes, 20)?)
+}
+
+/// JPEG: an SOI marker, then a walk over the marker segments to the frame
+/// header (SOFn), whose payload carries precision, height and then width,
+/// each two bytes big-endian.
+///
+/// The walk has to skip the right things: the standalone markers (`RSTn`,
+/// `TEM`, and the begin/end-of-image pair) carry no length field, the SOFn
+/// range has three non-frame members (`DHT`, `JPG`, `DAC`), and any run of
+/// `0xff` fill bytes before a marker is legal. `SOS` means the frame header
+/// never came — the compressed data follows it — so a file whose header was
+/// cut off answers `None` rather than reading a size out of the entropy data.
+fn jpeg_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if !bytes.starts_with(&[0xff, 0xd8]) {
+        return None;
+    }
+    let mut at = 2;
+    loop {
+        while bytes.get(at) == Some(&0xff) {
+            at += 1;
+        }
+        let marker = *bytes.get(at)?;
+        at += 1;
+        match marker {
+            // Start of scan: everything after this is entropy-coded data.
+            0xda => return None,
+            // A stuffed byte where a marker should be: this is scan data, not
+            // a header, and a walk that read on would be reading pixels.
+            0x00 => return None,
+            // The frame headers, less the three the range also holds: DHT
+            // (0xc4), JPG (0xc8) and DAC (0xcc). The length counts itself, so
+            // precision sits two bytes later, then height and width.
+            0xc0..=0xcf if !matches!(marker, 0xc4 | 0xc8 | 0xcc) => {
+                // The frame's own length is checked like any other claim: it
+                // has to be long enough to hold the height and width, and the
+                // bytes it names have to be there — a header cut off inside
+                // itself is no size, not half a size.
+                let length = be16(bytes, at)? as usize;
+                if length < 8 || at.checked_add(length)? > bytes.len() {
+                    return None;
+                }
+                let header = bytes.get(at + 2..at + 7)?;
+                let height = u16::from_be_bytes([header[1], header[2]]) as u32;
+                let width = u16::from_be_bytes([header[3], header[4]]) as u32;
+                return nonzero(width, height);
+            }
+            // Standalone markers: no length field to read.
+            0x01 | 0xd0..=0xd7 | 0xd8 | 0xd9 => {}
+            _ => {
+                let length = be16(bytes, at)? as usize;
+                // A length under 2 cannot add up to a segment (it counts
+                // itself), and trusting one would leave the walk standing
+                // still.
+                if length < 2 {
+                    return None;
+                }
+                at = at.checked_add(length)?;
+            }
+        }
+    }
+}
+
+/// GIF: the six-byte version signature, then the logical screen descriptor,
+/// whose first four bytes are width and height, each a little-endian `u16`.
+fn gif_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if !(bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a")) {
+        return None;
+    }
+    nonzero(le16(bytes, 6)? as u32, le16(bytes, 8)? as u32)
+}
+
+/// WebP: a RIFF container holding one of the three chunk shapes, each of which
+/// names the canvas in its own header —
+///
+/// - `VP8 ` (lossy): a three-byte start code, then width and height, each a
+///   16-bit little-endian field whose low 14 bits are the dimension; the top
+///   two bits are a scale hint, so they are masked off.
+/// - `VP8L` (lossless): a signature byte, then a 32-bit little-endian word
+///   whose low 14 bits are width - 1 and next 14 are height - 1.
+/// - `VP8X` (extended): a flag byte and three reserved, then width - 1 and
+///   height - 1, each a 24-bit little-endian field.
+///
+/// The chunk's declared payload size is checked, not trusted: the payload it
+/// names has to be there, and each shape has to have room for the fields it
+/// reads, or the "chunk" is a header with nothing behind it.
+fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.get(0..4)? != b"RIFF" || bytes.get(8..12)? != b"WEBP" {
+        return None;
+    }
+    let chunk = bytes.get(12..16)?;
+    let length = le32(bytes, 16)? as usize;
+    if 20usize.checked_add(length)? > bytes.len() {
+        return None;
+    }
+    let payload = bytes.get(20..)?;
+    if chunk == b"VP8 " {
+        // The start code exists to keep a decoder from mistaking a frame's
+        // first bytes for something else; without it this is not a VP8 frame.
+        if length < 10 || payload.get(3..6)? != b"\x9d\x01\x2a" {
+            return None;
+        }
+        let width = (le16(payload, 6)? & 0x3fff) as u32;
+        let height = (le16(payload, 8)? & 0x3fff) as u32;
+        nonzero(width, height)
+    } else if chunk == b"VP8L" {
+        if length < 5 || payload.first() != Some(&0x2f) {
+            return None;
+        }
+        let bits = le32(payload, 1)?;
+        nonzero((bits & 0x3fff) + 1, ((bits >> 14) & 0x3fff) + 1)
+    } else if chunk == b"VP8X" {
+        if length < 10 {
+            return None;
+        }
+        nonzero(le24(payload, 4)? + 1, le24(payload, 7)? + 1)
+    } else {
+        None
+    }
 }
 
 /// A single workspace root. All agent file access goes through here, which is
@@ -161,8 +367,9 @@ impl Workspace {
     }
 
     /// Read `rel` as an image, when it is one: the mime its own first bytes
-    /// name, and the bytes whole — or `None` when the file is not an image, so
-    /// the caller reads it as text.
+    /// name, the pixel size its header names ([`image_dimensions`]), and the
+    /// bytes whole — or `None` when the file is not an image, so the caller
+    /// reads it as text.
     ///
     /// The format comes from the magic number and never from the name. An
     /// extension is a claim by whoever wrote the file; the sniff is the file
@@ -288,17 +495,21 @@ impl Workspace {
         let path = dir.join(&name);
         fs::write(&path, &bytes)
             .map_err(|e| format!("cannot write {}/{name}: {e}", session::MUSH_DIR))?;
+        let pixels = image_dimensions(mime, &bytes);
         Ok(Image {
             path: format!("{}/paste/{name}", session::MUSH_DIR),
             mime: mime.to_string(),
             bytes,
+            pixels,
         })
     }
 
     /// The image at `path`, named `name` in the refusal and in the returned
-    /// [`Image`]: the mime its own first bytes name, and the bytes whole — or
-    /// `Ok(None)` when they are not an image's, so a caller reads the file as
-    /// text (or, in [`Self::pasted_image`]'s case, as the words the paste is).
+    /// [`Image`]: the mime its own first bytes name, the pixel size its own
+    /// header names (what the picture costs the context window, as distinct
+    /// from how large the file is), and the bytes whole — or `Ok(None)` when
+    /// they are not an image's, so a caller reads the file as text (or, in
+    /// [`Self::pasted_image`]'s case, as the words the paste is).
     ///
     /// One reader for the two doors a picture comes in by — the model's
     /// `read_file` and the human's paste — because a cap, a sniff and a
@@ -327,10 +538,12 @@ impl Workspace {
         if size > IMAGE_FILE_CAP {
             return Err(image_too_big(name, mime, size));
         }
+        let pixels = image_dimensions(mime, &bytes);
         Ok(Some(Image {
             path: name.to_string(),
             mime: mime.to_string(),
             bytes,
+            pixels,
         }))
     }
 
@@ -842,6 +1055,441 @@ mod tests {
         let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
         bytes.resize(8 + padding, 0);
         bytes
+    }
+
+    /// A png with a real IHDR, the size the dimension parser reads, plus
+    /// whatever payload a test sizes it with.
+    fn png_of(width: u32, height: u32, padding: usize) -> Vec<u8> {
+        let mut bytes = vec![
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, // signature
+            0, 0, 0, 13, b'I', b'H', b'D', b'R', // the IHDR chunk and its length
+        ];
+        bytes.extend(width.to_be_bytes());
+        bytes.extend(height.to_be_bytes());
+        // depth, colour type, compression, filter, interlace: the rest of the
+        // 13-byte IHDR payload.
+        bytes.extend([8, 6, 0, 0, 0]);
+        bytes.resize(33 + padding, 0);
+        bytes
+    }
+
+    /// A webp file around one chunk's payload: the RIFF/WEBP head, then the
+    /// chunk's fourcc and a length field, then the payload. The RIFF size
+    /// field is written as the format counts it, length included.
+    fn webp_chunk(fourcc: &[u8; 4], payload: &[u8]) -> Vec<u8> {
+        let mut bytes = b"RIFF".to_vec();
+        bytes.extend((4 + 8 + payload.len() as u32).to_le_bytes());
+        bytes.extend(b"WEBP");
+        bytes.extend(fourcc);
+        bytes.extend((payload.len() as u32).to_le_bytes());
+        bytes.extend(payload);
+        bytes
+    }
+
+    /// A jpeg marker segment: the `ff`, the marker, then a big-endian length
+    /// that counts itself, then the payload.
+    fn jpeg_segment(marker: u8, payload: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0xff, marker];
+        bytes.extend(((payload.len() + 2) as u16).to_be_bytes());
+        bytes.extend(payload);
+        bytes
+    }
+
+    /// A jpeg frame header (SOFn): the precision, then height and width, each
+    /// two bytes big-endian, then one component — the layout every member of
+    /// the SOFn range has.
+    fn jpeg_frame(marker: u8, width: u16, height: u16) -> Vec<u8> {
+        let mut payload = vec![8];
+        payload.extend(height.to_be_bytes());
+        payload.extend(width.to_be_bytes());
+        payload.push(1); // one component…
+        payload.extend([1, 0x11, 0]); // …and its id, sampling and table
+        jpeg_segment(marker, &payload)
+    }
+
+    /// A whole jpeg header: SOI, an APP1 segment carrying `app` bytes of
+    /// metadata (EXIF is one, and it is large), then the frame itself.
+    fn jpeg_header(marker: u8, width: u16, height: u16, app: &[u8]) -> Vec<u8> {
+        let mut bytes = vec![0xff, 0xd8];
+        if !app.is_empty() {
+            bytes.extend(jpeg_segment(0xe1, app));
+        }
+        bytes.extend(jpeg_frame(marker, width, height));
+        bytes
+    }
+
+    /// A gif's screen descriptor at `width × height`: the version signature,
+    /// then the logical screen descriptor's first four bytes.
+    fn gif_of(width: u16, height: u16) -> Vec<u8> {
+        let mut bytes = b"GIF89a".to_vec();
+        bytes.extend(width.to_le_bytes());
+        bytes.extend(height.to_le_bytes());
+        bytes.extend([0xf7, 0x00, 0x00]);
+        bytes
+    }
+
+    /// A lossy webp at `width × height`: the frame tag, the start code, then
+    /// the two little-endian size fields.
+    fn vp8_of(width: u16, height: u16) -> Vec<u8> {
+        let mut payload = vec![0x00, 0x00, 0x00];
+        payload.extend([0x9d, 0x01, 0x2a]);
+        payload.extend(width.to_le_bytes());
+        payload.extend(height.to_le_bytes());
+        webp_chunk(b"VP8 ", &payload)
+    }
+
+    /// A lossless webp at `width × height`: the signature byte, then `width - 1`
+    /// and `height - 1` packed into one little-endian word.
+    fn vp8l_of(width: u32, height: u32) -> Vec<u8> {
+        let mut payload = vec![0x2f];
+        payload.extend(((width - 1) | ((height - 1) << 14)).to_le_bytes());
+        webp_chunk(b"VP8L", &payload)
+    }
+
+    /// An extended webp at `width × height`: the flag byte and three reserved,
+    /// then the two 24-bit `- 1` fields.
+    fn vp8x_of(width: u32, height: u32) -> Vec<u8> {
+        let mut payload = vec![0x10, 0x00, 0x00, 0x00];
+        for side in [width - 1, height - 1] {
+            payload.extend([side as u8, (side >> 8) as u8, (side >> 16) as u8]);
+        }
+        webp_chunk(b"VP8X", &payload)
+    }
+
+    /// Each of the four formats names its size in its own header, and the
+    /// parser reads all four: png big-endian in IHDR, jpeg in an SOFn frame
+    /// reached by walking the marker segments, gif little-endian in the screen
+    /// descriptor, and webp in whichever of its three chunk shapes it is.
+    #[test]
+    fn every_image_format_names_its_size_in_its_header() {
+        assert_eq!(
+            image_dimensions("image/png", &png_of(1_920, 1_080, 0)),
+            Some((1_920, 1_080))
+        );
+        assert_eq!(
+            image_dimensions("image/jpeg", &jpeg_header(0xc0, 800, 600, &[])),
+            Some((800, 600))
+        );
+        assert_eq!(
+            image_dimensions("image/gif", &gif_of(320, 200)),
+            Some((320, 200))
+        );
+        assert_eq!(
+            image_dimensions("image/webp", &vp8_of(640, 480)),
+            Some((640, 480))
+        );
+        assert_eq!(
+            image_dimensions("image/webp", &vp8l_of(256, 128)),
+            Some((256, 128))
+        );
+        assert_eq!(
+            image_dimensions("image/webp", &vp8x_of(1_024, 768)),
+            Some((1_024, 768))
+        );
+
+        // A lossy frame's size fields carry a scale hint in their top two
+        // bits: a hint is not part of the dimension, so it is masked off.
+        let mut payload = vec![0x00, 0x00, 0x00];
+        payload.extend([0x9d, 0x01, 0x2a]);
+        payload.extend((640u16 | 0xc000).to_le_bytes());
+        payload.extend((480u16 | 0x8000).to_le_bytes());
+        assert_eq!(
+            image_dimensions("image/webp", &webp_chunk(b"VP8 ", &payload)),
+            Some((640, 480))
+        );
+    }
+
+    /// A jpeg walk steps over a segment by the length that segment declares,
+    /// so a large APP1 — EXIF is one — whose payload is marker-shaped bytes is
+    /// skipped whole. A walk that scanned for `ff c0` would read the wrong
+    /// frame out of the metadata and never reach the real one.
+    #[test]
+    fn a_jpeg_walk_skips_a_segment_by_its_own_length() {
+        let mut exif = vec![0x00; 4 * 1024];
+        // A plausible SOF0, size and all, buried in the metadata.
+        exif[1_000..1_010]
+            .copy_from_slice(&[0xff, 0xc0, 0x00, 0x11, 0x08, 0x20, 0x00, 0x10, 0x00, 0x00]);
+        let jpeg = jpeg_header(0xc0, 800, 600, &exif);
+        assert_eq!(image_dimensions("image/jpeg", &jpeg), Some((800, 600)));
+    }
+
+    /// The frame header is read whatever member of the SOFn range it is —
+    /// baseline, extended, progressive and arithmetic alike — and the three
+    /// markers in the same range that are not frames (DHT, JPG, DAC) are
+    /// stepped over like any other segment.
+    #[test]
+    fn a_jpeg_frame_is_read_whatever_its_sof_variant_is() {
+        for marker in [
+            0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf,
+        ] {
+            let jpeg = jpeg_header(marker, 640, 480, &[0x00; 32]);
+            assert_eq!(
+                image_dimensions("image/jpeg", &jpeg),
+                Some((640, 480)),
+                "SOF marker {marker:02x}"
+            );
+        }
+
+        let mut jpeg = vec![0xff, 0xd8];
+        jpeg.extend(jpeg_segment(0xc4, &[0x00; 64])); // DHT, not a frame
+        jpeg.extend(jpeg_segment(0xc8, &[0x00; 64])); // JPG, not a frame
+        jpeg.extend(jpeg_segment(0xcc, &[0x00; 64])); // DAC, not a frame
+        jpeg.extend(jpeg_frame(0xc2, 320, 240));
+        assert_eq!(image_dimensions("image/jpeg", &jpeg), Some((320, 240)));
+
+        // Fill bytes: any run of `ff` before a marker is legal, so the walk
+        // skips the run instead of assuming exactly one.
+        let frame = jpeg_frame(0xc0, 640, 480);
+        let mut filled = vec![0xff, 0xd8, 0xff, 0xff, 0xff, 0xc0];
+        filled.extend_from_slice(&frame[2..]);
+        assert_eq!(image_dimensions("image/jpeg", &filled), Some((640, 480)));
+    }
+
+    /// Every format's header, cut at every length before it is complete, is no
+    /// size at all: there is no offset where a prefix of a real header can be
+    /// mistaken for the whole of one.
+    #[test]
+    fn a_header_cut_anywhere_before_its_size_is_no_size() {
+        let png = png_of(1_920, 1_080, 0);
+        assert_eq!(image_dimensions("image/png", &png), Some((1_920, 1_080)));
+        for cut in 0..24 {
+            assert_eq!(
+                image_dimensions("image/png", &png[..cut]),
+                None,
+                "png cut at {cut}"
+            );
+        }
+
+        let jpeg = jpeg_header(0xc0, 800, 600, &[0x00; 32]);
+        assert_eq!(image_dimensions("image/jpeg", &jpeg), Some((800, 600)));
+        for cut in 0..jpeg.len() {
+            assert_eq!(
+                image_dimensions("image/jpeg", &jpeg[..cut]),
+                None,
+                "jpeg cut at {cut}"
+            );
+        }
+
+        let gif = gif_of(320, 200);
+        assert_eq!(image_dimensions("image/gif", &gif), Some((320, 200)));
+        for cut in 0..10 {
+            assert_eq!(
+                image_dimensions("image/gif", &gif[..cut]),
+                None,
+                "gif cut at {cut}"
+            );
+        }
+
+        for webp in [vp8_of(640, 480), vp8l_of(256, 128), vp8x_of(1_024, 768)] {
+            assert!(image_dimensions("image/webp", &webp).is_some());
+            for cut in 0..webp.len() {
+                assert_eq!(
+                    image_dimensions("image/webp", &webp[..cut]),
+                    None,
+                    "webp cut at {cut}"
+                );
+            }
+        }
+    }
+
+    /// A signature is not a header: a png whose IHDR length lies, a jpeg whose
+    /// segment length is zero or runs past the bytes, and a webp whose chunk
+    /// length claims payload the file does not hold all answer `None`.
+    #[test]
+    fn a_header_whose_length_field_lies_is_no_size() {
+        // IHDR is required to be 13 bytes long; 0xffff_ffff or 12 is not a
+        // header this can read, however plausible the bytes after it look.
+        let mut png = png_of(1_920, 1_080, 0);
+        png[8..12].copy_from_slice(&0xffff_ffffu32.to_be_bytes());
+        assert_eq!(image_dimensions("image/png", &png), None);
+        let mut png = png_of(1_920, 1_080, 0);
+        png[8..12].copy_from_slice(&12u32.to_be_bytes());
+        assert_eq!(image_dimensions("image/png", &png), None);
+
+        // A zero length would leave the walk standing still; one that runs
+        // past the end is not a segment either.
+        let still = [0xff, 0xd8, 0xff, 0xe0, 0x00, 0x00, 0x00, 0x00];
+        assert_eq!(image_dimensions("image/jpeg", &still), None);
+        let past = [0xff, 0xd8, 0xff, 0xe0, 0xff, 0xf0, 0x00, 0x00];
+        assert_eq!(image_dimensions("image/jpeg", &past), None);
+        // A frame segment whose length lies: too short to hold its own fields,
+        // or claiming more bytes than the file holds.
+        let mut short = jpeg_header(0xc0, 800, 600, &[]);
+        short[4..6].copy_from_slice(&7u16.to_be_bytes());
+        assert_eq!(image_dimensions("image/jpeg", &short), None);
+        let mut long = jpeg_header(0xc0, 800, 600, &[]);
+        long[4..6].copy_from_slice(&0xffffu16.to_be_bytes());
+        assert_eq!(image_dimensions("image/jpeg", &long), None);
+
+        // gif's screen descriptor has no length field before its size, so the
+        // only lies it can tell are a short file and a zero side.
+
+        // The chunk length has to name payload that is there, and to be big
+        // enough for the fields the shape reads.
+        let mut webp = vp8x_of(1_024, 768);
+        webp[16..20].copy_from_slice(&0xffff_ffffu32.to_le_bytes());
+        assert_eq!(image_dimensions("image/webp", &webp), None);
+        let mut webp = vp8x_of(1_024, 768);
+        webp[16..20].copy_from_slice(&4u32.to_le_bytes());
+        assert_eq!(
+            image_dimensions("image/webp", &webp),
+            None,
+            "a chunk too short for what VP8X stores"
+        );
+    }
+
+    /// A zero side is not a picture in any format that can spell one, and it
+    /// is `None` rather than `Some((0, width))`: a zero would make an image
+    /// weight nothing, where "unknown" walks the bytes.
+    #[test]
+    fn a_zero_dimension_is_no_size() {
+        assert_eq!(image_dimensions("image/png", &png_of(0, 1_080, 0)), None);
+        assert_eq!(image_dimensions("image/png", &png_of(1_920, 0, 0)), None);
+        assert_eq!(
+            image_dimensions("image/jpeg", &jpeg_header(0xc0, 0, 600, &[])),
+            None
+        );
+        assert_eq!(image_dimensions("image/gif", &gif_of(0, 0)), None);
+        let empty = webp_chunk(b"VP8 ", &[0x00, 0x00, 0x00, 0x9d, 0x01, 0x2a, 0, 0, 1, 0]);
+        assert_eq!(image_dimensions("image/webp", &empty), None);
+        // The other two webp shapes store size - 1, so the smallest they can
+        // name is 1×1 — and 1×1 is a picture.
+        assert_eq!(image_dimensions("image/webp", &vp8l_of(1, 1)), Some((1, 1)));
+        assert_eq!(image_dimensions("image/webp", &vp8x_of(1, 1)), Some((1, 1)));
+    }
+
+    /// Junk is junk: the empty slice, a three-byte slice, several KB of `ff`,
+    /// a text file and a bare signature are all no size for every format —
+    /// nothing panics, and nothing guesses.
+    #[test]
+    fn junk_is_no_size_for_every_format() {
+        let flood = vec![0xffu8; 8 * 1024];
+        let junk: [&[u8]; 6] = [
+            &[],
+            &[0xff, 0xd8, 0x00],
+            &flood,
+            b"GIF8",
+            b"not an image at all",
+            &[0x89, b'P', b'N', b'G'],
+        ];
+        for bytes in junk {
+            for mime in ["image/png", "image/jpeg", "image/gif", "image/webp"] {
+                assert_eq!(
+                    image_dimensions(mime, bytes),
+                    None,
+                    "{mime} on {} bytes of junk",
+                    bytes.len()
+                );
+            }
+        }
+
+        // The signature decides, not the mime name: one format's bytes under
+        // another format's name are no size, and so is a name with no parser.
+        for mime in ["image/jpeg", "image/gif", "image/webp"] {
+            assert_eq!(image_dimensions(mime, &png_of(8, 8, 0)), None, "{mime}");
+        }
+        assert_eq!(image_dimensions("image/tiff", &png_of(8, 8, 0)), None);
+        assert_eq!(image_dimensions("", &png_of(8, 8, 0)), None);
+    }
+
+    /// The parser does not shrink a claim it can read: a png that says
+    /// `0xffff_ffff × 0xffff_ffff` is that size, and every other format reads
+    /// up to its own ceiling — the weight arithmetic is what keeps the biggest
+    /// of them from wrapping (the message tests pin that side).
+    #[test]
+    fn the_largest_dimensions_a_header_can_claim_parse_as_themselves() {
+        assert_eq!(
+            image_dimensions("image/png", &png_of(u32::MAX, u32::MAX, 0)),
+            Some((u32::MAX, u32::MAX))
+        );
+        let full = u16::MAX as u32;
+        assert_eq!(
+            image_dimensions("image/jpeg", &jpeg_header(0xc0, u16::MAX, u16::MAX, &[])),
+            Some((full, full))
+        );
+        assert_eq!(
+            image_dimensions("image/gif", &gif_of(u16::MAX, u16::MAX)),
+            Some((full, full))
+        );
+        // webp's lossy shape spends 14 bits on a side, its lossless one names
+        // size - 1 in 14 bits, and its extended one spends 24 bits on size - 1.
+        assert_eq!(
+            image_dimensions("image/webp", &vp8_of(0x3fff, 0x3fff)),
+            Some((0x3fff, 0x3fff))
+        );
+        assert_eq!(
+            image_dimensions("image/webp", &vp8l_of(1 << 14, 1 << 14)),
+            Some((1 << 14, 1 << 14))
+        );
+        assert_eq!(
+            image_dimensions("image/webp", &vp8x_of(1 << 24, 1 << 24)),
+            Some((1 << 24, 1 << 24))
+        );
+    }
+
+    /// The three measures are three measures. File bytes decide the transport
+    /// cap — an 8×8 picture stored in over 2 MB is still refused — while the
+    /// pixels decide what the window pays, which for that picture is nothing.
+    #[test]
+    fn the_file_cap_counts_file_bytes_whatever_the_pixels_are() {
+        let ws = temp_workspace("cap-measures");
+        let heavy = png_of(8, 8, IMAGE_FILE_CAP as usize);
+        assert!(
+            heavy.len() as u64 > IMAGE_FILE_CAP,
+            "a small picture, a big file"
+        );
+        fs::write(ws.root().join("heavy.png"), &heavy).unwrap();
+
+        let refused = ws.pasted_image("heavy.png").unwrap_err();
+        assert!(refused.contains("past the 2 MB cap"), "{refused}");
+        let refused = ws.save_pasted_image(heavy).unwrap_err();
+        assert!(refused.contains("past the 2 MB cap"), "{refused}");
+
+        // Under the cap, the same 8×8 picture rides — and its weight is its
+        // pixels, not its file size.
+        fs::write(ws.root().join("small.png"), png_of(8, 8, 1_000_000)).unwrap();
+        let image = ws.pasted_image("small.png").unwrap().unwrap();
+        assert_eq!(image.pixels, Some((8, 8)));
+        assert!(image.bytes.len() > 1_000_000);
+        assert!(
+            image.weight() < 64,
+            "a megabyte of file, one token of picture: {}",
+            image.weight()
+        );
+    }
+
+    /// The size travels with the image, so everything downstream — the
+    /// context budget, the attach gate, an image read again after its bytes
+    /// were shed — counts the picture by what it is, not by how it was stored.
+    /// Both doors that build one fill it in.
+    #[test]
+    fn a_pasted_image_carries_the_size_its_header_names() {
+        let ws = temp_workspace("paste-pixels");
+        fs::write(ws.root().join("screen.png"), png_of(1_920, 1_080, 500)).unwrap();
+        let image = ws.pasted_image("screen.png").unwrap().unwrap();
+        assert_eq!(image.pixels, Some((1_920, 1_080)));
+
+        let pasted = ws.save_pasted_image(png_of(800, 600, 4)).unwrap();
+        assert_eq!(pasted.pixels, Some((800, 600)));
+    }
+
+    /// The fallback is a promise: an image that sniffs as a picture but whose
+    /// header names no size weighs its bytes — the erring-high road — so a
+    /// truncated screenshot is never counted as free.
+    #[test]
+    fn an_image_with_no_readable_size_weighs_its_bytes() {
+        let ws = temp_workspace("unknown-pixels");
+        // A png signature, then padding: an image by `image_mime`, no IHDR to
+        // read a size from.
+        fs::write(ws.root().join("shot.png"), png(4_000)).unwrap();
+        let image = ws.pasted_image("shot.png").unwrap().unwrap();
+        assert_eq!(image.mime, "image/png");
+        assert_eq!(image.pixels, None);
+        assert_eq!(
+            image.weight(),
+            image.bytes.len() + image.path.len() + image.mime.len(),
+            "no size to read, so the bytes are the estimate"
+        );
     }
 
     /// The shapes a human's paste arrives in and the name each one keeps: a

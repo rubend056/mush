@@ -137,12 +137,65 @@ pub struct ToolCall {
 /// workspace-relative, the name the producer read it from — the one fact that
 /// makes the image findable again once the bytes are gone (a trimmed history
 /// or a saved session keeps the path and drops the bytes). `mime` is what the
-/// `data:` URL tells the endpoint the bytes are.
+/// `data:` URL tells the endpoint the bytes are. `pixels` is what the picture
+/// *costs*, which is a different fact from how many bytes it took to write:
+/// [`Image::weight`] prices an image by this, so a 70 KB and a 724 KB
+/// screenshot of the same size weigh the same.
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Image {
     pub path: String,
     pub mime: String,
     pub bytes: Vec<u8>,
+    /// The picture's width and height, read from its own header
+    /// ([`crate::workspace::image_dimensions`]) when it was read from disk.
+    ///
+    /// `None` when no size could be read — a truncated file, a format whose
+    /// header carries none, bytes that are not what the mime claims — and then
+    /// [`Image::weight`] falls back to the raw byte count, which errs high for
+    /// a picture: the safe direction, because an over-weight estimate sheds an
+    /// image's payload before it drops a turn.
+    ///
+    /// `serde(default)` so an `Image` stored before this field existed still
+    /// reads as "size unknown" instead of failing. Nothing mush writes carries
+    /// one today — a session sheds images before saving, and a request spells
+    /// them as `data:` URLs — so this is a shape for hand-built payloads, and
+    /// a missing field must never be the thing that loses a session.
+    #[serde(default)]
+    pub pixels: Option<(u32, u32)>,
+}
+
+impl Image {
+    /// What this picture costs the context budget, in the byte-shaped currency
+    /// [`Message::weight`] counts — its pixels at the
+    /// [`PIXELS_PER_TOKEN`](crate::config::PIXELS_PER_TOKEN) rule, or its raw
+    /// bytes when no header named a size, plus the path and mime that travel
+    /// with it.
+    ///
+    /// Pixels are the estimate because pixels are what a vision endpoint's
+    /// price is made of: a 1920×1080 screenshot is ~2.8k tokens whether it is
+    /// written as a 724 KB png or a 70 KB one, where its file size alone used
+    /// to read as ~247k ([`crate::config::tokens_for_pixels`] turns the
+    /// picture into tokens, and [`BYTES_PER_TOKEN`](crate::config::BYTES_PER_TOKEN)
+    /// turns them back, so text and pictures stay in one currency).
+    pub fn weight(&self) -> usize {
+        let payload = match self.pixels {
+            Some((width, height)) => {
+                crate::config::tokens_for_pixels(u64::from(width) * u64::from(height))
+                    .saturating_mul(crate::config::BYTES_PER_TOKEN)
+            }
+            // No size to read: the bytes are the fallback, and for a picture
+            // they overcount, which is the safe direction (see the field).
+            None => self.bytes.len(),
+        };
+        // Saturating, because a header may claim `u32::MAX × u32::MAX` pixels:
+        // the estimate is then as large as a `usize` can hold on a 32-bit
+        // target, and adding the path on top must not be the thing that
+        // panics. A number that saturates still says "too big to fit" as
+        // clearly as one that does not.
+        payload
+            .saturating_add(self.path.len())
+            .saturating_add(self.mime.len())
+    }
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -340,14 +393,13 @@ impl Message {
 
     /// Rough size in bytes, used for history budgeting. The reasoning is
     /// counted: it goes back out with the turn, so it is part of what the
-    /// request costs. An image is counted as its bytes plus the path and mime
-    /// that travel with it, because those are what have to fit the window.
-    /// Base64's 4/3 inflation is deliberately *not* modeled: the budget's
-    /// bytes-per-token heuristic was measured on text, and an image's real
-    /// token cost is a function of its pixels, not of its byte count or its
-    /// spelling — so this is an estimate that errs toward counting an image as
-    /// too big, which is the safe direction (an over-budget transcript sheds
-    /// image payloads before it drops turns).
+    /// request costs. An image is counted by [`Image::weight`] — its pixels at
+    /// the [`PIXELS_PER_TOKEN`](crate::config::PIXELS_PER_TOKEN) rule, or its
+    /// raw bytes when its header named no size — plus the path and mime that
+    /// travel with it. Base64's 4/3 inflation is deliberately *not* modeled:
+    /// that is what the transport carries, not what the endpoint charges (the
+    /// one caveat, an endpoint that tokenized the `data:` text itself, is
+    /// stated on the constant and not modeled).
     pub fn weight(&self) -> usize {
         let mut n = self.role.len() + self.text().len();
         if let Some(reasoning) = &self.reasoning_content {
@@ -357,7 +409,7 @@ impl Message {
             n += call.function.name.len() + call.function.arguments.len() + 16;
         }
         for image in &self.images {
-            n += image.bytes.len() + image.path.len() + image.mime.len();
+            n = n.saturating_add(image.weight());
         }
         n
     }
@@ -548,6 +600,7 @@ pub struct ApiError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::{BYTES_PER_TOKEN, PIXELS_PER_TOKEN};
 
     /// A spec-legal reply whose `content` is an array of parts must parse: a
     /// server that sends the newer shape is not a broken endpoint, and dying
@@ -966,15 +1019,17 @@ mod tests {
         );
     }
 
-    /// The budget has to see the image: its bytes and the path and mime that
-    /// travel with them. A transcript that carried a screenshot is not the
-    /// size of its text, and a trimmer that thought it was would never shed the
-    /// payload that actually exceeds the window.
+    /// The fallback: an image whose header named no size is the bytes it took
+    /// to write, plus the path and mime that travel with them — which
+    /// overcounts a picture, the safe direction. A transcript that carried
+    /// such an image is not the size of its text, and a trimmer that thought
+    /// it was would never shed the payload that actually exceeds the window.
     #[test]
-    fn an_image_weighs_its_bytes_and_the_path_and_mime_with_them() {
+    fn an_image_with_no_size_in_its_header_weighs_its_bytes_and_the_path_and_mime() {
         let mut message = Message::user("look");
         let text_only = message.weight();
         let image = tiny_image();
+        assert_eq!(image.pixels, None, "there is no header in these bytes");
         let extra = image.bytes.len() + image.path.len() + image.mime.len();
         message.images.push(image);
         assert_eq!(
@@ -984,13 +1039,108 @@ mod tests {
         );
     }
 
+    /// The ruling this shape exists for: a 724 KiB, 1920×1080 screenshot reads
+    /// as ~2.8k tokens, not the ~247k its file size used to charge — pixels
+    /// are what a vision endpoint prices, and the file's bytes are what the
+    /// transport carries. The margin covers the path and mime that ride on
+    /// top; the comparison against the old count is what makes the fix a fix.
+    #[test]
+    fn a_screenshot_weighs_its_pixels_not_its_bytes() {
+        let mut message = Message::user("look");
+        let text_only = message.weight();
+        message.images.push(Image {
+            path: "shots/screen.png".into(),
+            mime: "image/png".into(),
+            bytes: vec![0x41; 741_396],
+            pixels: Some((1_920, 1_080)),
+        });
+
+        let tokens = (message.weight() - text_only) / BYTES_PER_TOKEN;
+        let by_pixels = (1_920 * 1_080) / PIXELS_PER_TOKEN;
+        let by_bytes = 741_396 / BYTES_PER_TOKEN;
+        assert!(
+            (by_pixels..=by_pixels + 16).contains(&tokens),
+            "{tokens} tokens for a 1920×1080 screenshot, not ~{by_pixels} plus its path"
+        );
+        assert!(
+            tokens * 50 < by_bytes,
+            "the old byte count was ~100× high ({by_bytes}), and this is {tokens}"
+        );
+    }
+
+    /// The fallback is a promise, said in its own words: an image whose header
+    /// named no size weighs its bytes — the erring-high road — so nothing a
+    /// truncated file can say makes a picture cheap.
+    #[test]
+    fn an_image_with_unknown_pixels_weighs_its_bytes_the_erring_high_road() {
+        let image = Image {
+            path: "shots/cut.png".into(),
+            mime: "image/png".into(),
+            bytes: vec![0x41; 500_000],
+            pixels: None,
+        };
+        assert_eq!(
+            image.weight(),
+            image.bytes.len() + image.path.len() + image.mime.len(),
+            "unknown pixels fall back to the bytes, and the fallback errs high"
+        );
+        // The pixels rule would have said ~2k tokens; the bytes say ~166k.
+        assert!(image.weight() / BYTES_PER_TOKEN > 160_000);
+    }
+
+    /// A header can claim the largest size a pair of `u32`s can hold, and the
+    /// accounting must not wrap around it: the pixel count is taken in `u64`,
+    /// the product and the sums in saturating `usize`, so the picture weighs
+    /// "as much as there is" rather than a small number come around again.
+    /// The expectation is computed in `u128`, so the test does not repeat the
+    /// arithmetic it is checking.
+    #[test]
+    fn the_largest_pixels_a_header_can_claim_do_not_overflow_the_weight() {
+        let image = Image {
+            path: "shots/max.png".into(),
+            mime: "image/png".into(),
+            bytes: vec![],
+            pixels: Some((u32::MAX, u32::MAX)),
+        };
+        let pixels = u128::from(u32::MAX) * u128::from(u32::MAX);
+        let tokens = pixels.div_ceil(PIXELS_PER_TOKEN as u128);
+        let expected = usize::try_from(tokens * BYTES_PER_TOKEN as u128)
+            .unwrap_or(usize::MAX)
+            .saturating_add(image.path.len() + image.mime.len());
+        assert_eq!(image.weight(), expected);
+        // On a 64-bit target the number is exact, and it is not small.
+        #[cfg(target_pointer_width = "64")]
+        assert_eq!(image.weight(), 73_786_976_260_478_491);
+
+        // In a message, and in a transcript-sized sum, the same image cannot
+        // take the total around either.
+        let mut message = Message::user("x".repeat(1_000));
+        message.images.push(image.clone());
+        assert_eq!(
+            message.weight(),
+            "user".len() + 1_000 + image.weight(),
+            "the image is added to the text, not wrapped into it"
+        );
+        let total: usize = std::iter::repeat(message)
+            .take(4)
+            .map(|message| message.weight())
+            .fold(0, usize::saturating_add);
+        assert!(total >= image.weight(), "four of them are at least one");
+
+        // The conversion at the top of its own range: saturating, never a
+        // wrap to zero.
+        assert!(crate::config::tokens_for_pixels(u64::MAX) > 0);
+    }
+
     /// The one image the image tests are about: two bytes, a path and a mime,
-    /// small enough to read in an assertion.
+    /// small enough to read in an assertion. Its header names no size (there
+    /// is not one in those bytes), so it weighs its bytes — the fallback.
     fn tiny_image() -> Image {
         Image {
             path: "shots/tiny.png".into(),
             mime: "image/png".into(),
             bytes: vec![0xFF, 0xFE],
+            pixels: None,
         }
     }
 }
