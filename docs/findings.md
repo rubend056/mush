@@ -2343,3 +2343,101 @@ name and the bar's word differ by design (`waiting` and the tool's own `wait`). 
 them): total 57,278 · **prod 14,397** · tests 24,579 · comments 14,745. The wave
 itself is 80 lines: 4 production (the glyph arm, the label arm, the roster
 branch, the `waiting` field doc), 31 test, 44 comment, 1 blank.
+
+## 8.40 Four holes of one class: a report, a sweep, a sentence, a tick (`3a3f474`, `5e93f5b`, `d482ab9`, `cbed322`)
+
+A read-only audit at `faa658d` confirmed one bug — a restored child's dead
+parent channel, whose fix lands beside this wave — and listed four more of the
+same class: a fact one hand knows and another drops, mis-times or mis-words.
+They are independent, and each is its own commit below, with its test and what
+fails when the fix is reverted. This is §8.40 and not §8.39 because the parental
+half of the same audit — a restored parent woken with the children the tree
+shows it — is §8.39, written in parallel; the file order settles when the two
+branches land together. The audit's two residual ordering notes are recorded at
+the end, not changed.
+
+**1 — a cut-off report dropped into a parked parent** (`3a3f474`).
+`App::report_cut_off` (`app/mod.rs:3481`) sent `ChildDone { run: CUT_OFF_RUN,
+outcome: CutOff }` with a raw `let _ = tx.send`, so when the parent's actor was
+parked — a node whose mailbox has no thread behind it (`App::park_history`) —
+the one report of a run that never ended was dropped, although the message's own
+doc says it wakes a napping parent. The send now goes through
+`App::deliver_to_actor`, the door `AgentEvent::ChildAsleep` already uses: it
+rebuilds the parent's actor and hands it the completion. A parent whose node is
+gone, and the root — nobody's child, never revived — still have nobody to tell;
+their row and pane still say it.
+`a_cut_off_child_wakes_a_parked_parent_through_the_ui` (`app/mod.rs:11546`)
+parks the parent by dropping its receiver, has a dead child mid-run, and asserts
+that `stop_one` leaves the tree holding a mailbox with an actor behind it — the
+parent begins the run that folds the report. Reverting the one line fails it at
+"the parked parent has an actor again".
+
+**2 — the sweep that ran after the actor was built** (`5e93f5b`). `App::new`
+restored the stored agents first and ran `discover_worktrees` after, so a
+restored child's actor was built on `.mush/wt/<id>` (`agent::revive`) and the
+sweep deleted the directory only then. A restored agent has no stored fork
+revision, so a branch with no commit of its own reads as `Landed::Merged` — the
+H21 lie — and the node was frozen as merged by `App::worktree_gone` while its
+actor still pointed at the dead path. The startup reclaim is now its own method,
+`App::reclaim_isolated` (`app/mod.rs:1064`), called once *before*
+`restore_agents` and again by `discover_worktrees` for the repository as it
+stands; the restored agent derives its branch through `agent::live_branch` after
+the sweep, gets no branch and no landing it never had, and is revived in the
+root. `a_restored_actor_is_built_after_the_sweep_that_takes_its_worktree`
+(`app/mod.rs:5621`) restores a stored child at a real zero-commit `mush/2`
+worktree, then asserts the row claims no merge, nothing refuses a nudge, and the
+actor's first request — read off a recording loopback endpoint — names the root,
+not `.mush/wt/2`. Dropping the pre-restore call fails it at
+`landed == Some(Merged)`.
+
+**3 — a leftover answering "agent #N is gone"** (`d482ab9`).
+`discover_worktrees` registers a leftover worktree with `parent: None, tx: None`,
+and `deliver_to_actor` answers `false` for a missing mailbox by design — but
+`App::deliver` then said `agent::gone(id)` (`agent #7 is gone`) about a row on
+screen whose worktree and branch exist. `App::no_actor_line` (`app/mod.rs:2219`)
+is now the one place a refused message picks its words: a mailbox-less leftover
+says it was found on disk and never given an actor, and names the two roads that
+work; every other absent actor keeps `agent::gone`. The refusal itself is
+unchanged. `a_message_to_a_leftover_says_it_was_never_given_an_actor`
+(`app/mod.rs:4366`) points at a real unmerged `mush/7` leftover on disk, sends it
+a message, and asserts the bar's line says which absence this is and not "is
+gone"; reverting to `agent::gone` fails it with the old sentence printed.
+
+**4 — the tick that could park a child a `control` just resumed** (`cbed322`).
+A parent's `control message` sends into the child's mailbox without touching the
+tree, and the tree hears the run only from the child's own `Running` event — a
+moment behind. A `tick` in that window ran `park_history`, whose `Shutdown`
+cancelled the run the words just started; the child then reported `Stopped`
+about a run nobody stopped, while the parent's books already said running.
+`AgentEvent::ChildResumed` (`agent.rs:677`) now travels with the send:
+`message_agent` emits it when a live mailbox took words that resume a child it
+found at rest (`agent.rs:4229`), and the UI marks the row with the same
+optimistic `AgentTree::nudge` the human's own message sets (`app/mod.rs:1488`).
+The parked half takes it too: the `ChildAsleep` road, where the UI rebuilds the
+actor, marks the child when the command it just delivered is a `Steer`
+(`app/mod.rs:1477`). `may_park` was left alone — a pending field there is a
+second place to get out of step with the phase it describes, while the nudge
+mark already means "words are on their way" everywhere the human's own message
+goes. Three tests: `a_control_message_keeps_a_child_out_of_the_parking_tick`
+(`app/mod.rs:4181`) drives a real root, whose stub endpoint answers the first
+request with a `control` tool call, into a child past `WARM_CHILDREN`, applies
+the UI's events and takes one `tick` — the child's mailbox must hold the words
+and no `Shutdown`; `a_woken_child_is_not_parked_before_its_own_running_lands`
+(`app/mod.rs:4277`) is the parked half through `ChildAsleep`;
+`resuming_a_child_reports_the_mark_the_tree_needs` (`agent.rs:5748`) is the
+actor-side emission. Removing the emit fails the first at the Shutdown; skipping
+the UI nudge fails both app tests.
+
+**Recorded, not changed.** The audit's two residual ordering notes stand.
+(a) `note_completion` (`agent.rs:2874`) has no run-monotonic guard, so a
+`ChildParked` applied on the UI thread can reach a parent before the child's own
+`ChildDone` and overwrite a newer record. (b) A completion drained by a run that
+is then cancelled in the same batch waits for a later boundary. Both are the B24
+delivery questions, not these four holes.
+
+**Census** on this landing (`scripts/census.py`), against §8.38's (`19b0810`:
+total 57,278 · prod 14,397 · tests 24,579 · comments 14,745): total 57,797 ·
+**prod 14,427** · tests 24,882 · comments 14,901 — 519 lines: 30 production, 303
+test, 156 comment, 30 blank. The production lines are `reclaim_isolated`,
+`no_actor_line`, the `ChildResumed` variant and its two marks, and
+`report_cut_off`'s one road.
