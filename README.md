@@ -28,8 +28,9 @@ cargo build --release
 
 `mush --version` (or `-V`) prints the version and exits.
 
-`Tab` moves between the **agents** tree and the **chat**. Type in the message
-box and press `Enter`. The agent works the workspace through ten tools —
+`Tab` moves between the **agents** tree and the **chat**, and `Ctrl-F` hands
+the focused one the whole screen — `Tab` switches which that is. Type in the
+message box and press `Enter`. The agent works the workspace through ten tools —
 `edit_file`, `read_file`, `write_file`, `list_files`, `search`, `run_command`,
 `spawn_agent`, `status`, `control`, `wait`: five touch files (`edit_file`
 replaces exact text, because an exact-and-unique match is a safety property
@@ -185,9 +186,10 @@ not fit is refused before the wire. Nothing goes out over the window.
 
 | Context | Keys |
 |---|---|
-| anywhere | `Tab`/`Shift-Tab` cycle panes (agents, chat) · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent, restarts the root) · `Ctrl-C` stop the focused agent — an idle one is left alone, and a cancel reaches a model that is still thinking · `Ctrl-X` stop every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning |
+| anywhere | `Tab`/`Shift-Tab` cycle panes (agents, chat) · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent, restarts the root) · `Ctrl-C` stop the focused agent — an idle one is left alone, and a cancel reaches a model that is still thinking · `Ctrl-X` stop every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning · `Ctrl-F` the focused pane takes the whole screen, and back · `Ctrl-Y` select the transcript: `Enter` copies, `Esc` leaves |
+| selecting | `↑`/`↓` move the cursor one transcript line, `Shift` holding the selection while it moves · `PgUp`/`PgDn` ten lines · `Home`/`End` the oldest / newest · `Enter` copy the selection, or the cursor's own line · `Esc` leave without copying · a letter is not typing while this is open: the mode has the keyboard, and `Tab` leaves it |
 | agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them · `←`/`→` the row's parent / its first child · `Enter` show its transcript, keys staying in the tree · `c` cancel it · `Esc` back to the root |
-| chat | typing · `Enter` send · `Shift`/`Alt-Enter` a new line · `Ctrl-V` attach the image on the clipboard · a paste whose every word is an image's path attaches them all (a picture from outside the workspace is copied into `.mush/paste/` first) · `←`/`→`, `Home`/`End` move the box cursor · `Backspace`/`Delete` (at the start of the box, `Backspace` pops the newest attachment) · `Ctrl-U` clear the words, keeping the images · `Ctrl-Z` put back what the box last lost · `↑`/`↓`, `PgUp`/`PgDn` scroll the transcript · `Esc` clear the box and its attachments |
+| chat | typing · `Enter` send · `Shift`/`Alt-Enter` a new line · `Ctrl-V` attach the image on the clipboard · a paste whose every word is an image's path attaches them all (a picture from outside the workspace is copied into `.mush/paste/` first) · `←`/`→`, `Home`/`End` move the box cursor · `Backspace`/`Delete` (at the start of the box, `Backspace` pops the newest attachment) · `Ctrl-U` clear the words, keeping the images · `Ctrl-Z` put back what the box last lost · `↑`/`↓`, `PgUp`/`PgDn` scroll the transcript (the select mode's cursor while it is open) · `Esc` clear the box and its attachments |
 | picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move, `PgUp`/`PgDn` page the list · `Enter` take the row · `Esc` close |
 
 Chat commands: `/provider`, `/model`, `/url`, `/key`, `/models`, `/compact`,

@@ -424,6 +424,43 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   a later trim sheds the turn) and the human's Stop. Pinned by
   `a_write_past_the_old_cap_lands_whole` and
   `a_write_over_the_window_ends_the_turn_and_leaves_the_file`.
+- **H47** — ✅ fixed by `f954cfb` + `ccd9766` + `7bd7f9b`, merged by `5e296b1`
+  (§8.49): reported live — "selection of text/paragraphs that are scoped to
+  conversation output or to whatever pane is currently rendering", because a
+  drag "get[s] all the lines from agents pane along with whatever paragraph I
+  want from the right conversation pane". The cause is that mush never captures
+  the mouse (finding K3), so the terminal's own selection is a rectangle of
+  screen cells and cannot be scoped to a pane. Now `Ctrl-F` gives the focused
+  pane the whole screen (`ccd9766`; `Tab` still cycles which one) and `Ctrl-Y`
+  (`7bd7f9b`) opens a modal cursor over the conversation's *source* lines,
+  whose `Enter` copies `Message::text()` exactly to the system clipboard
+  through `f954cfb`'s new `clipboard::write_text` (`wl-copy` / `xclip` /
+  `pbcopy`, the image readers' own 2 s deadline). Pinned by
+  `zen_gives_the_focused_pane_the_two_panes_width_at_every_size`,
+  `zen_tabs_between_the_full_screen_panes`,
+  `zen_keeps_the_agents_counts_in_the_conversation_panes_title`,
+  `ctrl_y_opens_the_select_mode_and_a_letter_is_not_typing`,
+  `a_reply_is_copied_as_the_message_wrote_it`,
+  `a_tool_result_is_copied_byte_exact` and
+  `the_select_mode_takes_the_keyboard_from_both_panes_and_not_the_box`.
+- **H48** — ✅ fixed by `4cfab77` + `f3e55c2` + `a617686`, merged by `a5b327f`
+  (§8.50): the human's question — "what about MD rendering on TUI (ik this is a
+  rabbit hole so the simplest way we could implement it, is it even worth
+  it?)" — against a pane that painted a reply's `**important**`, `## Section`
+  and `[text](url)` as the markers themselves. The answer is the small one:
+  `markdown_rows` reads each source line on its own into styled runs (strong,
+  emphasis, code, strike, one to three `#` headings, list markers kept, fenced
+  code, links as `text (url)`), and only the model's reply is read that way —
+  tool results, `run_command` output, the human's own lines, briefs, notices
+  and reasoning rows stay byte-identical. Nothing is rewritten, so the copy
+  road copies the model's own bytes. The work found and fixed a wrap bug on
+  the way (`4cfab77`: `wrap_text(" bcd日", 4)` painted five columns in a
+  four-column body). Pinned by
+  `a_reply_is_read_as_markdown_and_its_bytes_are_left_alone`,
+  `a_tool_result_is_painted_byte_for_byte_as_data`,
+  `only_the_reply_is_read_as_markdown`,
+  `a_markdown_reply_never_paints_past_the_pane` and
+  `a_wrapped_row_never_outgrows_its_width`.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -3847,3 +3884,319 @@ comment lines more (the `write_tool` doc comment the removal owes, and the new
 tests' own), 78 test lines more (two new tests), 7 blanks. `cargo test --workspace`: 682 + 4 ignored
 in the mush bin, 202 in mush-core; clippy and fmt clean; both endpoint-free pty
 scenarios (`--resize`, `--cancel`) pass.
+
+---
+
+## 8.49 A drag is a rectangle: zen, and a transcript copied as its own lines (`f954cfb`..`7bd7f9b`, merged `5e296b1`)
+
+> "selection of text/paragraphs that are scoped to conversation output or to
+> whatever pane is currently rendering (since now I try selecting and I get all
+> the lines from agents pane along with whatever paragraph I want from the right
+> conversation pane)"
+
+The terminal's own selection is what the human was using, and the reason it
+cannot be scoped is a rule mush had already decided: it never captures the mouse
+(finding K3), so a drag is the terminal's rectangle of screen cells. At 80
+columns the chat pane shares the frame with the tree, so a paragraph dragged out
+of the conversation arrives with the agents pane's lines in front of it — and,
+inside the pane, soft-wrapped at the terminal's width rather than at the line the
+model wrote. Three commits answered it: the write half of the clipboard
+(`f954cfb`), the zen view (`ccd9766`) and the select mode (`7bd7f9b`), merged by
+`5e296b1`; H47 is their row.
+
+**The clipboard could only be read (`f954cfb`).** `clipboard.rs` had the whole
+read road — `wl-paste`, `xclip`, `pngpaste`, a 2 s `DEADLINE`, one `POLL` — and
+no way at all to put text on the clipboard: the write half of the same machine
+facility had no road, so a path, a message or a selection a human meant to paste
+elsewhere had nowhere to go. `write_text` adds it in the readers' own shape: the
+programs a human would use, tried in one order — wayland's `wl-copy`, X11's
+`xclip -selection clipboard -i`, macOS's `pbcopy` — first success wins, with one
+shared deadline for the whole sequence (three writers cannot each spend two
+seconds of a frozen keyboard) and the bodies in `run_writers`, so a test hands
+in a writer instead of installing one on the machine's `PATH`. The text goes in
+exactly: multi-line, tabs, a trailing newline neither added nor lost. That is why
+`wl-copy` gets no `-n`: on the write side `-n` is `--trim-newline`, the opposite
+of the rule, while the reader's `--no-newline` is `wl-paste`'s flag against the
+newline *it* appends. The write itself runs on a thread of its own — the mirror
+of the readers' drain thread — because a program that stops reading fills the
+pipe and a caller who wrote the text itself would block in `write`; the result
+travels back over a channel, because an exit status cannot say whether the text
+landed (a program can exit 0 with the pipe closed under it). A writer still
+running at the deadline is killed and reaped and earns its own sentence
+(`xclip did not take the text within 2s — it may be waiting on a clipboard owner
+that never speaks`); a writer that exits without the text is passed over for the
+next; and no writer at all is a third fact, naming what to install the way the
+readers' sentence does. It landed `pub` and uncalled — measured, the binary
+target reports five dead items without an attribute, the whole road hanging off
+it — so it carried one `allow(dead_code)`, with the comment saying it leaves with
+the key that will call it; that key is the select mode, the last commit of the
+landing. Pinned by `the_text_arrives_byte_for_byte` (both trailing-newline cases,
+the tabbed multi-line text), `the_first_writer_that_takes_the_text_wins`,
+`a_writer_that_exits_without_taking_the_text_is_not_a_success` (1 MiB into
+`sh -c 'exit 0'`: the write cannot land and the road falls through),
+`a_text_no_writer_took_did_not_reach_the_clipboard`,
+`no_writer_at_all_names_what_to_install`,
+`a_writer_that_never_takes_the_text_is_killed_at_the_deadline` (1 MiB into a
+`sh -c 'echo $$ > …; sleep 30'` at a 50 ms deadline: the caller returns in well
+under a second, and on Linux the writer's own `$$` has no `/proc` entry — killed
+and reaped, not a zombie) and
+`the_writers_are_the_three_programs_in_the_documented_order`.
+
+**Zen: the focused pane takes the screen (`ccd9766`).** `Ctrl-F` toggles a view
+where the focused pane covers the frame. Chat focused, the chat takes the rows
+above the bar whole and the agents pane is a zero rect, so nothing can paint in
+it; agents focused, the message box and the bar keep their rows and the tree
+takes everything above the box, leaving the chat's transcript no rows at all
+(`ChatPane::transcript` is `None`). The layout is derived *after* the two-pane
+one and hands the box the very rect that layout gave it, so the view moves the
+frame and not the conversation; and because `Tab` already cycles the focus and
+the layout reads it, `Tab` is what switches which pane is full-screen. It is a
+view like `Ctrl-T`: not said, not stored — `dirty_screen` is the whole record —
+and `Ctrl-N` leaves it as the human set it, because the view is the human's and
+not the conversation's. A hidden pane's fact does not vanish with it: while the
+agents pane is a zero rect, its `N working` / `N jobs` / `N waiting` clauses are
+appended to the conversation pane's title, from the same `agent_count_cells` the
+pane's own title is built from, dropped whole to the columns the pane has. The
+`▲N`/`▼N` hidden-row counts stay behind — and, by the same rule, the chat's own
+`+N more lines` goes with the transcript when the tree is the full-screen pane —
+because they are arithmetic about a list this view does not paint. The key is one
+row in `KEYS` (both help surfaces render it) and one arm in the app-wide `Ctrl-`
+block, so it works from either pane. Pinned by
+`zen_gives_the_focused_pane_the_two_panes_width_at_every_size` (the layout at
+80×24 and 200×40 in both focuses: the focused pane's width, the box's and the
+bar's rows, `assert_shape` over the frame),
+`zen_keeps_the_agents_counts_in_the_conversation_panes_title` (at 80×24, where
+the agents pane's own title had dropped `1 waiting`),
+`zen_tabs_between_the_full_screen_panes`, `toggling_zen_back_restores_the_two_panes`,
+`ctrl_f_toggles_zen_from_both_panes` (and across `Ctrl-N`) and `zen_title`'s
+whole-clause elision.
+
+**The select mode: a transcript is copied as its source lines (`7bd7f9b`).**
+`Ctrl-Y` opens a modal cursor over the focused conversation's *source* lines —
+the lines `Message::text()` has — and `Enter` copies them to the system
+clipboard. The keys are the pane's own reading keys, moved onto the cursor:
+`↑`/`↓` one source line, `Shift-↑`/`Shift-↓` the same step with the selection
+kept (the anchor planted where the first extended step began), `PgUp`/`PgDn`
+ten, `Home`/`End` the oldest and newest, `Enter` copies and leaves, `Esc` leaves
+without copying. The mode is modal the way a picker is — `keys::key` asks the
+caller for `Chat::selecting()` and routes the whole keyboard to `fn select`
+before either pane — so a letter is not typing, `Esc` is not the box's clear,
+and the mode is safe to open with a draft in the box. The app-wide `Ctrl-` block
+is decided above it, so `Ctrl-Q`/`Ctrl-C`/`Ctrl-N` still work and `Ctrl-Y` is a
+no-op while the mode is on; `Tab` (the pane cycle) leaves the mode rather than
+being dropped behind it. A pane with no source line says so in the bar instead
+of opening a cursor over nothing, and a fold that takes the cursor's line drops
+the mode rather than leaving it over a line that is gone.
+
+What lands on the clipboard is **`Message::text()`, exactly**: the selected
+source lines joined with the `\n`s they have between them. A whole message is
+byte for byte; a soft wrap at the pane's width never becomes a newline; a tab is
+a tab; a tool result is copied *whole* even past the eight rows the pane paints
+of it (the ninth row is the `…`, and a line the cap hides still has that row to
+stand on); and a picture whose bytes the session file shed copies as its
+placeholder, because the placeholder is what that message's text says. A selection
+over two messages joins them at the lines it starts and ends on, and the line the
+bar then says is built with the copy, because only there are the counts —
+`copied 12 lines from #1's reply — 1,284 bytes`, with the thousands grouped, or
+`your message` / `#N's tool result` / `N messages` for *what* was copied. The
+pane's window follows the cursor, not the bottom: the mode carries the window's
+top (a `Cell`, because only the frame knows the pane's measure) and the frame
+places the cursor's line at the top when it is above the window, at the bottom
+when below, with the transcript's own blank-trimming rule kept. `Enter`'s write
+is subprocesses with a deadline, so it happens on a thread of its own and the
+answer comes back as `Msg::Copied`, stamped with the conversation that asked for
+it the way `Msg::Clipboard` is: a copy that outlives a `Ctrl-N` reports nothing
+into the new chat, and the bar says the line only when the clipboard took the
+text. Paint: the mode hands the frame *which* rows (`Painted.select`) and `ui.rs`
+says what they wear — the selection is the theme's hue as a background patched
+onto every span, so a dim result stays dim inside it and nothing wears the agents
+pane's selected row (`Black` on the accent), and the cursor is the terminal's own
+`REVERSED` cell, the attribute a terminal paints its cursor with; a row that is
+both reads as the cursor inside the selection.
+
+**The seam, and why it exists.** The write road is a value `App` holds —
+`App::write_clipboard`, a `Fn(&str) -> Result<(), String>` defaulting to the real
+`wl-copy`/`xclip`/`pbcopy` sequence — so the key can be pressed in a test without
+writing the human's real clipboard or depending on which programs the machine
+happens to have on `PATH`. The seam is not symmetry for its own sake: `Enter`
+is a *key*, and a key mush can press is a key a test can press, while the read
+road needs no such seam because its answer is a message a test hands in directly
+(`Msg::Clipboard`). Pinned by
+`enter_in_the_select_mode_hands_the_text_to_the_writer_and_says_what_copied`
+(the text the writer was handed is the source lines joined, and the line is
+`copied 2 lines from #0's reply — 12 bytes`),
+`ctrl_y_opens_the_select_mode_and_a_letter_is_not_typing`,
+`a_copy_answer_from_a_chat_that_is_gone_is_dropped`,
+`the_select_mode_takes_the_keyboard_from_both_panes_and_not_the_box`,
+`ctrl_y_is_the_same_key_while_the_mode_is_on`,
+`a_reply_is_copied_as_the_message_wrote_it`,
+`a_tool_result_is_copied_byte_exact`,
+`the_humans_own_message_is_copied_as_it_was_typed`,
+`a_message_that_dropped_its_images_carries_its_placeholder`,
+`a_selection_spanning_two_messages_joins_them_at_their_own_lines`,
+`the_copied_line_marks_the_thousands_of_a_big_number`,
+`moving_the_cursor_past_either_end_does_not_panic`,
+`esc_leaves_the_mode_without_copying_and_the_box_alone`,
+`the_cursor_and_the_selection_are_painted_on_their_own_lines`,
+`the_panes_window_follows_the_cursor_and_not_the_bottom`,
+`a_line_behind_a_tool_results_cap_stands_on_the_ellipsis`,
+`a_new_chat_leaves_the_select_mode_behind` and
+`the_select_mode_paints_its_cursor_and_its_selection_on_their_own_cells`.
+
+**What this supersedes.** Nothing in this record called the clipboard read-only
+or named the terminal's own selection as mush's selection, so no older section
+is rewritten; the manual's key table, its file map and its transcript paragraph
+are living prose and are repaired by the drift commit that follows this record,
+not superseded by it.
+
+**Recorded, not changed.** Three boundaries of the mode, stated rather than
+built: it selects inside the one conversation the chat pane shows, so a selection
+never spans agents (the tree is not a text); it copies *text*, so a message whose
+picture is still attached copies its words and not the bytes (a picture that was
+dropped copies as its placeholder, which is the transcript's own line); and it
+holds one selection, not several. The mouse road was not taken: mush never
+captures the mouse (K3) — that is what leaves the terminal's own selection and
+its scroll wheel to the terminal — so this mode is the road that copies the
+source instead of a drag, and the rectangle a drag takes remains the terminal's.
+And one piece of prose inside `crates/`: `7bd7f9b` removed the `allow(dead_code)`
+attribute over `clipboard::write_text` but left the comment that describes it
+("The write road's primitive, waiting for the key that will call it…") — the key
+has called it since, so the comment describes a state that is gone. It is left
+as it is: the comment lives under `crates/`, and a prose repair belongs with the
+code it describes rather than with this record.
+
+---
+
+## 8.50 The reply is read, not painted: a line-local markdown view (`4cfab77`..`a617686`, merged `a5b327f`)
+
+> "what about MD rendering on TUI (ik this is a rabbit hole so the simplest way
+> we could implement it, is it even worth it?)"
+
+The human's own framing was the ruling: the smallest honest version, and no more.
+The pane painted a model's markdown as the sentence — `**important**` read as
+asterisks, a `## Section` as two hashes, a link as its own punctuation — and the
+reply is the one piece of prose in the pane, the words a model wrote *for the
+human*. Three commits landed it: the wrap bug found on the way (`4cfab77`), the
+parser (`f3e55c2`) and the pane's one call site (`a617686`), merged by `a5b327f`;
+H48 is their row. The branch that became `5e296b1` carried the two content
+commits again as `2114efd`/`482e2db` on top of this merge — the same patches,
+with the wrap fix below them already in place.
+
+**A wrapped row could paint wider than the width it was given (`4cfab77`).**
+Found while building the view, and it is a bug in the panes' own past rather than
+in the new code: the break that ends a row at its last space appended the
+character that had not fit to the tail, unchecked. When the row had ended exactly
+at the width, that tail plus one more thing could be wider than the pane —
+`wrap_text(" bcd日", 4)` painted `bcd日`, five columns in a four-column body,
+and a tab, four columns at once, did it too (`wrap_text("ab c\t", 4)`) — and the
+terminal cuts what a row paints past its edge, so the last glyph of the line was
+silently gone. The break is a loop now: while the tail itself is too full for the
+character, the tail is a row of its own. A row that already fit is untouched, so
+no caller's rows moved; the only rows that change are the ones that were
+over-wide. Pinned by `a_wrapped_row_never_outgrows_its_width` (`" bcd日"`,
+`"ab c\t"`, `"日本語 日本語"`, a tabbed line and a CJK sentence among them, at
+4..=12 columns).
+
+**The parser (`f3e55c2`).** `mush_core::text` gained `markdown_rows`, `Run` and
+`RunStyle`: plain data — a piece of the source's text and one name from a small
+vocabulary, no ratatui and no colour — because the parser must never learn what
+an accent is and a new surface must never learn the parser's words. It is
+**line-local**: every source line is read on its own, so nothing here can reflow
+a paragraph, join two lines, re-indent a list or turn `- a\n- b` into a layout
+the source did not have. That boundary is the point — the human called the full
+version a rabbit hole, and a chat reply needs a reading, not a document
+renderer. It is **additive** too: the only text a rule removes is scaffolding a
+human does not read in a view — the `#`s of a heading and the two fence lines of
+a code block. Every word is kept; a list keeps its marker and only styles it,
+because the marker is information; a link always shows its URL beside its text
+(`text (url)`, the URL's own parentheses counted so a wiki link keeps its tail),
+because a dropped URL is data loss. An unterminated marker is text (`**bold` is
+`**bold`, a lone `*` is a lone `*`, a `[link](` with no `)` is the characters it
+is), and a fence that never closes runs to the end of the message: an
+unterminated block is still a block, and the code in it is still code.
+
+The rules, in the whole: `**strong**`; `*emphasis*` and `_emphasis_` — an `_` at
+a word boundary and alone, so `snake_case_name` survives and `__strong__`, which
+is not a rule here, is not half-read; `` `code` ``; `~~strike~~`; one, two or
+three `#`s and a space for a heading, with the `#`s and the one space not painted
+because the style says what they said (a fourth `#`, or a `#` with no space, is
+text); `- `, `* `, `+ ` and `1. `–`99. ` list markers, kept and styled — a marker
+needs its space, an ordered one is at most two digits because `1998. It was a
+good year` opens a sentence, and an indented marker is not a marker because
+there is no nested-list layout; fenced blocks, where three backticks open and
+close, the fence lines are not rows, and the body is one style with no inline
+parsing, so `**` in code stays code; and links. The view's wrap mirrors
+`wrap_text`'s arithmetic — per source line, explicit newlines honoured, a tab
+four columns, every line `sanitize`d, a word broken only when it cannot fit a row
+by itself — with the styles attached, and
+`a_plain_message_wraps_exactly_like_wrap_text` pins the two against each other
+for text that is not markdown at every width, so the view and the text beside it
+cannot drift. Pinned by
+`a_span_is_read_and_an_unterminated_marker_is_text`,
+`an_underscore_inside_a_word_is_not_emphasis`,
+`a_heading_is_its_text_and_only_one_to_three_hashes_are_headings`,
+`a_list_marker_stays_as_its_text_and_only_a_marker_is_styled`,
+`a_fence_hides_its_lines_and_marks_the_code_between_them`,
+`a_link_keeps_its_text_and_its_url`, `a_line_of_only_markers_is_text`,
+`a_block_line_never_reflows_the_lines_around_it`,
+`an_empty_message_is_one_empty_row`, `a_span_that_wraps_keeps_its_style` and
+`every_row_of_the_view_fits_its_width`.
+
+**One call site, and the boundary (`a617686`).** `chat.rs`'s `marked` gained
+the reply arm: the mark it is handed decides the view, and `mush › ` is the one
+mark that reaches the parser. Every other caller keeps the plain path byte for
+byte — the human's own message, a brief, a parent's steering, mush's notices and
+footnotes — and three more kinds of text never reach the function at all: a tool
+result and a `run_command` transcript (a diff, a test log, a shell session,
+where a `#` is a comment, an `*` a glob and backticks quoting), a `Ctrl-T`
+reasoning row (a working note and not prose), and a tool-call label (the call's
+own JSON). Only a reply is a document. The view wraps inside the columns the mark
+leaves, exactly as the plain path does, so no row of it can outgrow the pane (the
+mark itself is dropped when the pane cannot afford the mark and a few words),
+and nothing is written back: `markdown_rows` reads the reply's own bytes, so what
+the human copies — with §8.49's select mode, or out of `.mush/session.json` — is
+still the model's text, markers and all. The parser's vocabulary is spent in this
+function and `reply_style` beside it: bold, italic, strike, a dim code/fence/URL,
+the reply's green accent for a heading and a bullet's marker, a link underlined.
+Pinned by `a_reply_is_read_as_markdown_and_its_bytes_are_left_alone` (the rows
+and the palette, and `message.text()` still the source),
+`a_tool_result_is_painted_byte_for_byte_as_data` (the boundary: the same markers
+in a result paint exactly the rows the plain wrapper painted before there was a
+view), `only_the_reply_is_read_as_markdown` (a human's line, a brief and a notice
+all keep their `#`s and `*`s) and `a_markdown_reply_never_paints_past_the_pane`
+(seven widths, a CJK heading, an unbreakable URL and a fence: no row wider than
+the pane, and no `**` or `` ``` `` surviving it). No existing fixture moved: the
+rows the plain wrapper made for text that is not markdown are the rows the view
+makes.
+
+**What this supersedes.** The grep for an older section or row that described a
+reply as painted raw — or that promised a markdown renderer — found none: the
+view is the manual's first account of what a reply's rows are, so it repairs
+living prose rather than superseding a recorded claim. The wrap fix supersedes
+nothing either: it changes only rows that were already painting past their
+width.
+
+**Recorded, not changed.** What the view refuses is the boundary, not a backlog:
+reflow, tables, block quotes, setext headings, reference and auto links, HTML,
+nested lists, indented code blocks, task checkboxes, thematic breaks (`---` and
+`***` stay the characters they are), escapes (a backslash protects no marker) and
+four or more `#`s are all simply the text they are. Adding any one of them is
+what turns a reading into a document renderer — the version the human named as
+the rabbit hole — and the deliberate seam is visible in the heading rule: a
+marker inside a heading *is* read (`## **Title**` does not paint its asterisks)
+but the heading's style is the only one it wears. One corner inside the accepted
+rules is half-read rather than refused: `***bold***` comes out as a strong span
+holding `*bold` plus a stray `*`, because the inline scanner takes the first two
+asterisks for the opener — no character is lost, and it is recorded as the code
+does it rather than promised away. Nothing else moved: no schema, prompt,
+message or session byte changed, because the view is a paint and not a rewrite —
+which is exactly why §8.49's copy road is unaffected by it.
+
+**Census** at this landing (`scripts/census.py`), against §8.48's (total 65,469
+· prod 15,272 · tests 28,915 · comments 17,316): total 69,226 · **prod 16,509** ·
+tests 30,248 · comments 18,345 — 3,757 lines more: 1,237 production, 1,333 test,
+1,029 comment, 158 blank. Measured at `5e296b1`, where both merges are in; the
+census reads only `crates/**/*.rs`, so this record's own prose moves no column.
+`cargo test --workspace`: 717 + 4 ignored in the mush bin, 215 in mush-core;
+clippy (`--all-targets -D warnings`) and `cargo fmt --all --check` clean; both
+endpoint-free pty scenarios (`--resize`, `--cancel`) pass.
