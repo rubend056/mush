@@ -1275,25 +1275,26 @@ impl App {
                 if self.picker.is_none() && !self.below_floor() {
                     // Terminals disagree about line endings in a paste.
                     let text = text.replace("\r\n", "\n").replace('\r', "\n");
-                    // A paste that is nothing but an image's path attaches the
-                    // image — that is what drag-and-drop and a file manager's
-                    // "copy" produce — and one that is anything else is the
-                    // words it is.
-                    match self.ws.pasted_image(&text) {
+                    // A paste that is nothing but image paths attaches the
+                    // images — that is what drag-and-drop and a file manager's
+                    // "copy" produce, and four dragged files are one such
+                    // gesture — and one that is anything else is the words it
+                    // is.
+                    match self.ws.pasted_images(&text) {
                         // A refused attachment is not a swallowed paste: the
-                        // path goes in as text, which is also the road to the
+                        // paths go in as text, which is also the road to the
                         // downscale a refusal may name.
-                        Ok(Some(image)) => {
-                            if !self.attach_image(image) {
+                        Ok(Some(images)) => {
+                            if !self.attach_images(images) {
                                 self.chat.insert(&text);
                             }
                         }
                         Ok(None) => self.chat.insert(&text),
-                        // It *is* an image, and it cannot ride. The words go in
-                        // anyway — a paste is never swallowed, and the path is
-                        // still useful, since the model can be asked to
-                        // downscale it — and the reason is said as the refusal
-                        // it is.
+                        // It *is* an image (or a batch holding one), and it
+                        // cannot ride. The words go in anyway — a paste is
+                        // never swallowed, and the paths are still useful,
+                        // since the model can be asked to downscale one — and
+                        // the reason is said as the refusal it is.
                         Err(line) => {
                             self.chat.insert(&text);
                             self.fail(line);
@@ -3301,6 +3302,100 @@ impl App {
                 result,
             });
         });
+    }
+
+    /// The gate for a paste that named several images: the same facts
+    /// [`Self::attach_image`] weighs, asked once for the gesture instead of
+    /// once per picture.
+    ///
+    /// A paste of four paths is one "these pictures" the way one path is one
+    /// "this picture", and the box's lines are one row: four `attached` lines
+    /// would be noise fighting for it. So a one-image batch *is*
+    /// [`Self::attach_image`] — the single paste keeps every line it has —
+    /// and a batch of several says one line naming the count
+    /// (`attached 4 images — Enter sends them with the message`).
+    ///
+    /// The two facts that stop an image before it is attached are asked once,
+    /// of the batch: with no model at all, or a model not documented to see,
+    /// nothing attaches and the whole paste lands as text with the one refusal
+    /// [`Self::attach_image`] says. The room warning is one line too — the
+    /// room is the budget minus the transcript, the same arithmetic
+    /// [`Self::attach_image`] does, with the images already in the box counted
+    /// by hand — and it carries the count a single picture's line cannot: how
+    /// many of the batch's pictures the room left cannot hold, each asked at
+    /// its turn the question [`Self::attach_image`] asks of one
+    /// (`cost + pending > room`). Every picture is attached whatever the room
+    /// says: the human decides what to send.
+    ///
+    /// Nothing here caps the count. What bounds a paste of a hundred pictures
+    /// is what bounds one image — this gate's room and the window behind it,
+    /// and the reader's [`mush_core::workspace::IMAGE_FILE_CAP`] per file —
+    /// not a batch limit invented at this door.
+    ///
+    /// Answers whether the batch was attached, so the paste arm inserts the
+    /// words as text when it was not.
+    fn attach_images(&mut self, mut images: Vec<Image>) -> bool {
+        if images.len() == 1 {
+            let only = images.pop().expect("a batch of one holds one image");
+            return self.attach_image(only);
+        }
+        let model = self.cfg().model.clone();
+        if model.is_empty() {
+            let line = "no model yet — /model picks one, /url points mush at an endpoint";
+            self.fail(line);
+            return false;
+        }
+        if !vision_capable(&model) {
+            self.fail(blind_model_line(&model));
+            return false;
+        }
+        let room = self
+            .cfg()
+            .history_budget()
+            .saturating_sub(self.chat.used_weight_for(AgentId::ROOT));
+        let pending: usize = self
+            .chat
+            .attachments()
+            .iter()
+            .map(Image::weight)
+            .fold(0, usize::saturating_add);
+        // The count the warning says: each picture, in paste order, is asked
+        // the question [`Self::attach_image`] asks of one — does its cost fit
+        // the room left once the pictures before it have had theirs? Every
+        // sum saturates, because a header can claim a picture larger than any
+        // `usize`.
+        let mut running = pending;
+        let mut at_stake = 0usize;
+        let mut first_at_stake: Option<String> = None;
+        for image in &images {
+            let cost = image.weight();
+            if cost.saturating_add(running) > room {
+                at_stake += 1;
+                if first_at_stake.is_none() {
+                    first_at_stake = Some(image.path.clone());
+                }
+            }
+            running = running.saturating_add(cost);
+        }
+        let count = images.len();
+        for image in images {
+            self.chat.attach(image);
+        }
+        if at_stake > 0 {
+            let first = first_at_stake.unwrap_or_default();
+            self.fail(format!(
+                "{at_stake} of {count} images will not fit the room left for history ({}) — \
+                 trim_history sheds an image's bytes before it drops a turn, so the model would \
+                 never look at them. `/compact` makes room, or downscale them (`convert \
+                 {first} -resize 50% small.png`) and paste them again",
+                size_label(room)
+            ));
+            return true;
+        }
+        self.say(format!(
+            "attached {count} images — Enter sends them with the message"
+        ));
+        true
     }
 
     /// The one gate an image goes through, whichever road it came by — a paste
@@ -6878,6 +6973,166 @@ mod tests {
         assert!(line.contains("png"), "the format is named: {line}");
         assert!(line.contains("Enter sends"), "and how to send it: {line}");
         assert!(app.chat.transcript(AgentId::ROOT).is_empty());
+    }
+
+    /// The human's report: four paths pasted at once are four pictures, not
+    /// text. One gesture — nothing lands in the box — the four attach in the
+    /// order pasted, the box paints the rows it allows with the last counting
+    /// the rest, and the title counts all four.
+    #[test]
+    fn a_paste_of_four_image_paths_attaches_four_images() {
+        let (mut app, _rx) = test_app("paste-four");
+        let_the_model_see(&mut app);
+        std::fs::create_dir_all(app.ws.root().join("shots")).unwrap();
+        for i in 0..4 {
+            std::fs::write(app.ws.root().join(format!("shots/{i}.png")), png(i)).unwrap();
+        }
+        let paste = "shots/0.png shots/1.png shots/2.png shots/3.png";
+
+        app.update(Msg::Paste(paste.into()));
+
+        assert_eq!(app.chat.input().text(), "", "four pictures, no text");
+        let attached = app.chat.attachments();
+        assert_eq!(attached.len(), 4, "one paste, four images");
+        for (i, image) in attached.iter().enumerate() {
+            assert_eq!(image.path, format!("shots/{i}.png"), "paste order");
+            assert_eq!(image.bytes, png(i), "each picture's own bytes");
+        }
+        // One line for the gesture: the count, and how to send it.
+        let (line, kind) = app.status_line().expect("one line for the gesture");
+        assert_eq!(kind, StatusKind::Info);
+        assert!(line.contains("attached 4 images"), "{line}");
+        assert!(line.contains("Enter sends"), "{line}");
+        assert!(!line.contains(".png"), "no per-picture line: {line}");
+
+        // The box paints the rows it allows — the first two name their
+        // pictures, the third counts the rest — and the title carries the
+        // whole count.
+        let Screen::Panes(panes) = app.screen(Rect::new(0, 0, 120, 32)) else {
+            panic!("a terminal with room for the panes");
+        };
+        let input = panes.chat.input.as_ref().expect("the message box");
+        assert_eq!(input.attachment_count, 4, "the title's count");
+        assert_eq!(input.attachments.len(), 3, "the rows the box allows");
+        assert!(
+            input.attachments[0].contains("shots/0.png"),
+            "{:?}",
+            input.attachments
+        );
+        assert!(
+            input.attachments[1].contains("shots/1.png"),
+            "{:?}",
+            input.attachments
+        );
+        assert!(
+            input.attachments[2].contains("+2 more"),
+            "{:?}",
+            input.attachments
+        );
+        let text = shot(&mut app, 120, 32).text();
+        assert!(text.contains("message · 4 images"), "{text}");
+        assert!(text.contains("▣ +2 more"), "{text}");
+    }
+
+    /// A paste of several paths is atomic the way one path is: one word that
+    /// is not an image makes the whole paste the words it is — nothing
+    /// attaches, nothing is swallowed.
+    #[test]
+    fn a_paste_with_a_word_that_is_not_an_image_lands_whole_as_text() {
+        let (mut app, _rx) = test_app("paste-four-text");
+        let_the_model_see(&mut app);
+        std::fs::create_dir_all(app.ws.root().join("shots")).unwrap();
+        std::fs::write(app.ws.root().join("shots/a.png"), png(0)).unwrap();
+        std::fs::write(app.ws.root().join("shots/b.png"), png(4)).unwrap();
+        let paste = "shots/a.png notes.txt shots/b.png";
+
+        app.update(Msg::Paste(paste.into()));
+
+        assert_eq!(app.chat.input().text(), paste, "the whole paste, as pasted");
+        assert!(
+            app.chat.attachments().is_empty(),
+            "not even the image words"
+        );
+        assert!(app.chat.transcript(AgentId::ROOT).is_empty());
+    }
+
+    /// A batch the model may not see is refused as one gesture: the single
+    /// picture's refusal, said once for the whole paste, nothing attached, and
+    /// every word landing in the box as text.
+    #[test]
+    fn a_paste_of_images_that_cannot_ride_lands_whole_as_text() {
+        let (mut app, _rx) = test_app("paste-four-blind");
+        std::fs::write(app.ws.root().join("shot-a.png"), png(0)).unwrap();
+        std::fs::write(app.ws.root().join("shot-b.png"), png(4)).unwrap();
+        let paste = "shot-a.png shot-b.png";
+
+        app.update(Msg::Paste(paste.into()));
+
+        assert_eq!(app.chat.input().text(), paste);
+        assert!(app.chat.attachments().is_empty());
+        let (line, kind) = app.status_line().expect("the refusal stays on the bar");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("test-model"), "the model is named: {line}");
+        assert!(line.contains("Ctrl-P"), "and the road is: {line}");
+        assert_eq!(line.matches("Ctrl-P").count(), 1, "said once: {line}");
+    }
+
+    /// One member over the cap is a refusal, not the text fallback, and the
+    /// batch is atomic the way one name is: every word — the small path
+    /// included — lands in the box as text, nothing attaches, and one line
+    /// says why.
+    #[test]
+    fn a_paste_with_a_member_past_the_cap_lands_whole_as_text() {
+        let (mut app, _rx) = test_app("paste-four-big");
+        let_the_model_see(&mut app);
+        std::fs::write(app.ws.root().join("small.png"), png(0)).unwrap();
+        let big = mush_core::workspace::IMAGE_FILE_CAP as usize;
+        std::fs::write(app.ws.root().join("big.png"), png(big)).unwrap();
+        let paste = "small.png big.png";
+
+        app.update(Msg::Paste(paste.into()));
+
+        assert_eq!(
+            app.chat.input().text(),
+            paste,
+            "both words, not only the one that could not ride"
+        );
+        assert!(app.chat.attachments().is_empty());
+        let (line, kind) = app.status_line().expect("a refusal");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("2 MB cap"), "{line}");
+        assert!(line.contains("convert"), "the downscale road: {line}");
+    }
+
+    /// The room warning for a batch is one line, and it carries the count a
+    /// single picture's line cannot: how many of the pictures are at stake.
+    /// Two of these four weigh half the room each, so the third is the first
+    /// past it — and all four are still attached, because the human decides
+    /// what to send.
+    #[test]
+    fn the_room_warning_for_a_batch_names_the_count_at_stake() {
+        let (mut app, _rx) = test_app("paste-four-room");
+        let_the_model_see(&mut app);
+        app.cell.edit(|cfg| cfg.set_context(500_000));
+        let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId::ROOT);
+        // Each picture weighs half the room: bytes + path (11) + mime (9).
+        let each = room / 2;
+        std::fs::create_dir_all(app.ws.root().join("shots")).unwrap();
+        for i in 0..4 {
+            std::fs::write(app.ws.root().join(format!("shots/{i}.png")), png(each - 28)).unwrap();
+        }
+        let paste = "shots/0.png shots/1.png shots/2.png shots/3.png";
+
+        app.update(Msg::Paste(paste.into()));
+
+        assert_eq!(app.chat.attachments().len(), 4, "the human decides");
+        let (line, kind) = app.status_line().expect("the fact is said");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("room left for history"), "{line}");
+        assert!(line.contains("2 of 4 images"), "the count at stake: {line}");
+        assert!(line.contains("/compact"), "one road to make room: {line}");
+        assert!(line.contains("convert"), "and the downscale: {line}");
+        assert_eq!(line.matches("room left").count(), 1, "said once: {line}");
     }
 
     /// Everything else a paste can be is still text: prose, and the path of a

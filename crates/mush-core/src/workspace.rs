@@ -386,7 +386,8 @@ impl Workspace {
     }
 
     /// The image a paste names, when the paste is nothing but the name of one.
-    /// `Ok(None)` = "this is text, not an image".
+    /// `Ok(None)` = "this is text, not an image". A paste that names several
+    /// images — one drag of four files — is [`Self::pasted_images`]'s door.
     ///
     /// This is the *human's* door, and it is deliberately not the model's:
     /// [`Self::resolve`] refuses an absolute path because a run-away model
@@ -452,10 +453,80 @@ impl Workspace {
         let Some(name) = pasted_name(paste) else {
             return Ok(None);
         };
-        let path = if Path::new(&name).is_absolute() {
-            PathBuf::from(&name)
+        self.image_named(&name)
+    }
+
+    /// The images a paste names, when the paste is nothing but names of
+    /// images — one or several. `Ok(None)` = "this is text, not images".
+    ///
+    /// This is [`Self::pasted_image`]'s rule generalised from one name to the
+    /// words of a paste, because one gesture may name four: dragging four
+    /// files out of a file manager is one paste, and one paste of image paths
+    /// is one "these pictures" gesture the same way one path is one "this
+    /// picture". What a name may be is [`Self::pasted_image`]'s rules, word by
+    /// word; the one thing new here is where a word ends. A word is a run no
+    /// *bare* whitespace interrupts: a space, tab or newline separates words,
+    /// while `\ `, a quoted span (`"my shot.png"`), and a `file://` URL's own
+    /// `%20` are the spellings a tool uses for a file's own space and stay
+    /// inside the word they spell. A paste of one name is one word, and reads
+    /// exactly as it did.
+    ///
+    /// The gesture is atomic, exactly as one name's is: a word that is not an
+    /// image makes the *whole* paste text — `Ok(None)` — so prose is not
+    /// hijacked by a path-shaped word in it, and a typo is visible rather than
+    /// half the batch attaching. The words are tried in the order pasted, and
+    /// reading stops at the first that is not an image (a sentence's first
+    /// word usually is not a path, so the filesystem cost stays one failed
+    /// open). An image past [`IMAGE_FILE_CAP`] is the same `Err` refusal the
+    /// one-name door reads, and it stops the batch the same way: no image is
+    /// attached, and the caller lands the words as text — a copy made from an
+    /// outside name read before the word that made the paste text stays in
+    /// `.mush/paste/`, which is where pastes live.
+    ///
+    /// The images keep the paste's order, so the box's rows — and the message
+    /// that reaches the model — read the way the human pasted them. Nothing
+    /// here caps the *count*: what bounds a paste of a hundred pictures is what
+    /// bounds one image — the room the conversation has left and the window
+    /// (the app's attach gate, whose lines say so), and the per-file cap above
+    /// — not a batch limit invented at this door.
+    ///
+    /// Each image takes [`Self::pasted_image`]'s road, the copy included: a
+    /// name outside the root is read where the human keeps it and written into
+    /// `.mush/paste/` through [`Self::write_pasted_image`], so every picture in
+    /// the batch carries a path the model's own tools can resolve.
+    pub fn pasted_images(&self, paste: &str) -> Result<Option<Vec<Image>>, String> {
+        let Some(names) = pasted_names(paste) else {
+            return Ok(None);
+        };
+        let mut images = Vec::with_capacity(names.len());
+        for name in names {
+            match self.image_named(&name)? {
+                Some(image) => images.push(image),
+                // One word that is not an image makes the whole paste the
+                // words it is; the words after it are not even tried.
+                None => return Ok(None),
+            }
+        }
+        Ok(Some(images))
+    }
+
+    /// The image one word of a paste names, or `Ok(None)` when that word is
+    /// not an image. The word arrives as [`pasted_name`] read it — one pair of
+    /// surrounding quotes stripped, `file://` and `%XX` decoded, backslashes
+    /// unescaped — and this is the rest of the parse, one name's worth: an
+    /// absolute name is used as it is, a relative one goes through
+    /// [`Self::resolve`] (a refused escape or `..` is text, not an image that
+    /// cannot ride), and a name outside the root has its bytes copied into
+    /// `.mush/paste/` through [`Self::write_pasted_image`] — the *copy* is the
+    /// image's path, the one the model's own tools can read again.
+    ///
+    /// One helper for the one-name and the several-names doors, so a batch can
+    /// never read a name differently from the single paste it generalises.
+    fn image_named(&self, name: &str) -> Result<Option<Image>, String> {
+        let path = if Path::new(name).is_absolute() {
+            PathBuf::from(name)
         } else {
-            match self.resolve(&name) {
+            match self.resolve(name) {
                 Ok(path) => path,
                 // An escape or a `..` is not a name this door opens; the paste
                 // goes in the box as the words it is.
@@ -533,8 +604,9 @@ impl Workspace {
     /// name and the [`Image`] that points at it — so there is one. `.mush/`
     /// ignores itself via its own `.gitignore` ([`session::ensure_mush_dir`]),
     /// so neither paste can dirty the tree, and the name carries the moment it
-    /// was pasted rather than the clipboard or the source file, so a second
-    /// paste cannot overwrite the first.
+    /// was pasted rather than the clipboard or the source file; a name already
+    /// taken moves to `-2`, `-3`, …, so neither a second paste nor the next
+    /// picture of one batch can overwrite the one before it.
     ///
     /// Both callers have already refused a payload that is no image and one
     /// past [`IMAGE_FILE_CAP`], each with the sentence its own road can act on
@@ -547,10 +619,10 @@ impl Workspace {
         let dir = self.root().join(session::MUSH_DIR).join("paste");
         fs::create_dir_all(&dir)
             .map_err(|e| format!("cannot create {}/paste: {e}", session::MUSH_DIR))?;
-        let name = format!("pasted-{}.{}", now_millis(), pasted_extension(mime));
-        let path = dir.join(&name);
-        fs::write(&path, &bytes)
+        let (name, mut file) = create_paste_file(&dir, now_millis(), mime)?;
+        file.write_all(&bytes)
             .map_err(|e| format!("cannot write {}/{name}: {e}", session::MUSH_DIR))?;
+        drop(file);
         let pixels = image_dimensions(mime, &bytes);
         Ok(Image {
             path: format!("{}/paste/{name}", session::MUSH_DIR),
@@ -880,10 +952,11 @@ fn image_too_big(name: &str, mime: &str, size: u64) -> String {
     )
 }
 
-/// The name a paste may be, or `None` when the paste is text. The whole parse
-/// of a pasted path lives here so [`Workspace::pasted_image`] reads as its
-/// rules rather than as their arithmetic; see there for why each rule is what
-/// it is.
+/// The name one *word* of a paste may be, or `None` when that word is no name.
+/// The whole parse of a pasted path lives here, so [`Workspace::pasted_image`]
+/// (one name) and [`Workspace::pasted_images`] (the words [`pasted_names`]
+/// splits) read as their rules rather than as their arithmetic; see
+/// [`Workspace::pasted_image`] for why each rule is what it is.
 fn pasted_name(paste: &str) -> Option<String> {
     let trimmed = paste.trim();
     if trimmed.is_empty() || trimmed.contains(['\n', '\r']) {
@@ -908,6 +981,67 @@ fn pasted_name(paste: &str) -> Option<String> {
     };
     let name = unescape_backslashes(&name);
     (!name.is_empty()).then_some(name)
+}
+
+/// The names a paste holds, or `None` when the paste is text: the split is
+/// [`split_words`]'s, and every word is parsed by [`pasted_name`] — the
+/// one-name rules, word by word — so a paste of several names can never read a
+/// word differently from the single-name door. An empty paste, and a word that
+/// is no name at all (an empty pair of quotes, a newline inside one), make the
+/// whole paste text.
+fn pasted_names(paste: &str) -> Option<Vec<String>> {
+    let words = split_words(paste.trim());
+    if words.is_empty() {
+        return None;
+    }
+    words.into_iter().map(pasted_name).collect()
+}
+
+/// Split a paste at the whitespace *between* its words: a space, tab or
+/// newline no backslash escaped and no quote holds separates two words, which
+/// is the one-name door's whitespace rule — "interior whitespace that no
+/// backslash escaped makes it prose" — read as the separator it is once more
+/// than one name is allowed.
+///
+/// The words come back as the paste spelled them — quotes, escapes and all —
+/// because each is parsed by the one-name rules, which strip and unescape what
+/// they find. A quote opens a span wherever a word could start or continue
+/// (`'` in `it's.png` holds the rest of the paste, which makes it one word
+/// where a lone name would be one), and only whitespace *outside* a span and
+/// unescaped splits.
+fn split_words(paste: &str) -> Vec<&str> {
+    let mut words = Vec::new();
+    let mut start = None;
+    let mut quote: Option<char> = None;
+    let mut escaped = false;
+    for (at, ch) in paste.char_indices() {
+        if escaped {
+            // The character a backslash escaped: part of the word, never a
+            // separator or a quote (`start` was set when the backslash was
+            // read).
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+            start.get_or_insert(at);
+        } else if let Some(open) = quote {
+            if ch == open {
+                quote = None;
+            }
+        } else if ch == '"' || ch == '\'' {
+            quote = Some(ch);
+            start.get_or_insert(at);
+        } else if ch.is_whitespace() {
+            if let Some(begin) = start.take() {
+                words.push(&paste[begin..at]);
+            }
+        } else {
+            start.get_or_insert(at);
+        }
+    }
+    if let Some(begin) = start {
+        words.push(&paste[begin..]);
+    }
+    words
 }
 
 /// One pair of matching surrounding quotes, and whether they were there.
@@ -1002,6 +1136,38 @@ fn now_millis() -> u128 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis())
         .unwrap_or(0)
+}
+
+/// Create the file a paste's bytes go in under `dir` (`.mush/paste/`), and
+/// hand back the name it took: `pasted-<unix millis>.<ext>`, or
+/// `pasted-<millis>-2.<ext>` and on when that name is already there.
+///
+/// A paste of four pictures is four of these in the same millisecond, and
+/// every image must keep the bytes that rode with it — a name taken is not a
+/// name to overwrite. `create_new` is what makes the test and the create one
+/// step, so two pastes can never land in one file however they interleave.
+/// `millis` is a parameter rather than `now_millis()` inside because the
+/// naming rule is a fact a test can pin: same millisecond, second name.
+fn create_paste_file(dir: &Path, millis: u128, mime: &str) -> Result<(String, fs::File), String> {
+    let extension = pasted_extension(mime);
+    let mut taken = 0u32;
+    loop {
+        taken += 1;
+        let name = if taken == 1 {
+            format!("pasted-{millis}.{extension}")
+        } else {
+            format!("pasted-{millis}-{taken}.{extension}")
+        };
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(dir.join(&name))
+        {
+            Ok(file) => return Ok((name, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(format!("cannot write {}/{name}: {e}", session::MUSH_DIR)),
+        }
+    }
 }
 
 /// Cap text handed to a model, cutting on a char boundary and marking the
@@ -1744,6 +1910,216 @@ mod tests {
             !ws.root().join(".mush").exists(),
             "no copy and no `.mush/paste/`: the paste wrote nothing"
         );
+    }
+
+    /// One paste may name several pictures: four paths separated by the bare
+    /// spaces a terminal pastes are four images, in the order pasted, each
+    /// with its own bytes. This is the human's report at the door it failed —
+    /// the one-name parse read the whole paste as prose.
+    #[test]
+    fn a_paste_of_several_image_names_reads_as_several_images() {
+        let ws = temp_workspace("paste-many");
+        fs::create_dir_all(ws.root().join("shots")).unwrap();
+        let names = ["shot-1.png", "shot-2.png", "shot-3.png", "shot-4.png"];
+        for (i, name) in names.iter().enumerate() {
+            fs::write(ws.root().join("shots").join(name), png(i)).unwrap();
+        }
+        let paste = names
+            .iter()
+            .map(|name| format!("shots/{name}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let images = ws
+            .pasted_images(&paste)
+            .unwrap()
+            .expect("four names, four images");
+        assert_eq!(images.len(), 4);
+        for (i, image) in images.iter().enumerate() {
+            assert_eq!(image.path, format!("shots/{}", names[i]), "paste order");
+            assert_eq!(image.bytes, png(i), "the {}th file's own bytes", i + 1);
+        }
+        // The same string through the one-name door is not one name, and is
+        // text: the single-image contract is untouched.
+        assert!(ws.pasted_image(&paste).unwrap().is_none());
+    }
+
+    /// The one-name rule's intent, for a list: one word that is not an image
+    /// makes the whole paste the words it is — `Ok(None)`, nothing attached —
+    /// so prose is not hijacked by a path-shaped word in it and a typo cannot
+    /// half-attach a batch.
+    #[test]
+    fn a_paste_with_a_word_that_is_not_an_image_is_text() {
+        let ws = temp_workspace("paste-many-text");
+        fs::create_dir_all(ws.root().join("shots")).unwrap();
+        fs::write(ws.root().join("shots/a.png"), png(0)).unwrap();
+        fs::write(ws.root().join("shots/b.png"), png(4)).unwrap();
+
+        for paste in [
+            "shots/a.png notes.txt",
+            "notes.txt shots/a.png",
+            "shots/a.png missing.png",
+            "shots/a.png shots/b.png and look at this",
+            "look at shots/a.png",
+            "shots/a.png ../secret.png",
+        ] {
+            assert!(
+                ws.pasted_images(paste).unwrap().is_none(),
+                "{paste:?} is text, not images"
+            );
+        }
+    }
+
+    /// The shapes compose in one paste: a quoted name among several (a file's
+    /// own space), newline-separated names, `\ `-escaped spaces, and a
+    /// `file://` URL with `%20` — each batch attaches what it names, in the
+    /// order pasted.
+    #[test]
+    fn every_shape_of_a_name_composes_in_one_paste() {
+        let ws = temp_workspace("paste-many-shapes");
+        fs::create_dir_all(ws.root().join("shots")).unwrap();
+        fs::write(ws.root().join("shots/a.png"), png(0)).unwrap();
+        fs::write(ws.root().join("shots/b.png"), png(4)).unwrap();
+        fs::write(ws.root().join("shots/c.png"), png(6)).unwrap();
+        fs::write(ws.root().join("my shot.png"), png(8)).unwrap();
+        fs::write(ws.root().join("my other shot.png"), png(12)).unwrap();
+        let paths = |paste: &str| -> Vec<String> {
+            ws.pasted_images(paste)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{paste:?} names images"))
+                .into_iter()
+                .map(|image| image.path)
+                .collect()
+        };
+
+        // A quoted name between two bare ones: the spaces inside the quotes
+        // are the name's, the spaces outside them are separators.
+        assert_eq!(
+            paths("shots/a.png \"my shot.png\" shots/b.png"),
+            ["shots/a.png", "my shot.png", "shots/b.png"]
+        );
+
+        // Newline-separated names, the shape four paths from a file manager's
+        // "copy" arrive in.
+        assert_eq!(
+            paths("shots/a.png\nshots/c.png\nshots/b.png"),
+            ["shots/a.png", "shots/c.png", "shots/b.png"]
+        );
+
+        // The two spellings of a file's own space, each a whole word: the
+        // backslash a terminal escapes it with, and a `%20` inside a
+        // `file://` URL.
+        assert_eq!(
+            paths("shots/a.png my\\ shot.png shots/b.png"),
+            ["shots/a.png", "my shot.png", "shots/b.png"]
+        );
+        let url = format!("file://{}/my%20other%20shot.png", ws.root().display());
+        assert_eq!(
+            paths(&format!("shots/a.png {url} shots/b.png")),
+            ["shots/a.png", "my other shot.png", "shots/b.png"]
+        );
+    }
+
+    /// Every member named from outside the root is copied into `.mush/paste/`,
+    /// and the copy — never the human's path — is the image's path: the rule
+    /// the single-image paste landed, reused for the batch rather than
+    /// re-implemented, so every picture ends up one the model's own tools can
+    /// reach. Four outside pictures pasted at once get four *distinct* copies,
+    /// each holding its own bytes.
+    #[test]
+    fn every_outside_member_of_a_paste_is_copied_into_the_workspace() {
+        let ws = temp_workspace("paste-many-outside");
+        let originals: Vec<Vec<u8>> = (0..4)
+            .map(|i| png_of(100 + i, 50, 4 + i as usize))
+            .collect();
+        let outside: Vec<PathBuf> = originals
+            .iter()
+            .enumerate()
+            .map(|(i, bytes)| outside_image(&format!("paste-many-outside-{i}"), bytes))
+            .collect();
+        let paste = outside
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+
+        let images = ws
+            .pasted_images(&paste)
+            .unwrap()
+            .expect("four outside pictures, four images");
+        assert_eq!(images.len(), 4);
+        for (i, (image, original)) in images.iter().zip(&originals).enumerate() {
+            assert!(
+                image.path.starts_with(".mush/paste/pasted-"),
+                "the copy, not the human's path: {}",
+                image.path
+            );
+            assert_eq!(image.bytes, *original, "picture {i} rides its own bytes");
+            assert_eq!(
+                fs::read(ws.root().join(&image.path)).unwrap(),
+                *original,
+                "and the copy on disk is byte for byte its own original"
+            );
+        }
+        let paths: Vec<&str> = images.iter().map(|image| image.path.as_str()).collect();
+        let unique: std::collections::HashSet<&str> = paths.iter().copied().collect();
+        assert_eq!(
+            unique.len(),
+            4,
+            "four copies, not one overwritten three times: {paths:?}"
+        );
+    }
+
+    /// Several pictures written in one millisecond — a paste of four is exactly
+    /// that — must not take one another's name: the first is
+    /// `pasted-<millis>.png`, the next `-2`, the next `-3`, and each file keeps
+    /// its own bytes. The rule is the writer's, shared by the clipboard road
+    /// and the pasted-path road, so neither can disagree about it.
+    #[test]
+    fn pastes_in_one_millisecond_take_distinct_names() {
+        let ws = temp_workspace("paste-same-millisecond");
+        let dir = ws.root().join(".mush/paste");
+        fs::create_dir_all(&dir).unwrap();
+
+        let (first, mut file) = create_paste_file(&dir, 1_700_000_000_000, "image/png").unwrap();
+        file.write_all(&png(0)).unwrap();
+        let (second, mut file) = create_paste_file(&dir, 1_700_000_000_000, "image/png").unwrap();
+        file.write_all(&png(4)).unwrap();
+        let (third, _file) = create_paste_file(&dir, 1_700_000_000_000, "image/png").unwrap();
+
+        assert_eq!(first, "pasted-1700000000000.png");
+        assert_eq!(second, "pasted-1700000000000-2.png");
+        assert_eq!(third, "pasted-1700000000000-3.png");
+        assert_eq!(
+            fs::read(dir.join(&first)).unwrap(),
+            png(0),
+            "the first keeps its bytes"
+        );
+        assert_eq!(
+            fs::read(dir.join(&second)).unwrap(),
+            png(4),
+            "and the second its own"
+        );
+    }
+
+    /// An image past the cap is a refusal, not the text fallback, whichever
+    /// way it was named: a batch holding one says the read's own sentence and
+    /// attaches nothing — the app lands the whole paste as text.
+    #[test]
+    fn a_paste_member_past_the_cap_is_refused() {
+        let ws = temp_workspace("paste-many-big");
+        fs::write(ws.root().join("small.png"), png(0)).unwrap();
+        fs::write(ws.root().join("big.png"), png(IMAGE_FILE_CAP as usize)).unwrap();
+
+        let refused = ws
+            .pasted_images("small.png big.png")
+            .expect_err("the big member is refused");
+        assert!(
+            refused.contains("big.png"),
+            "the member is named: {refused}"
+        );
+        assert!(refused.contains("past the 2 MB cap"), "{refused}");
+        assert!(refused.contains("convert"), "the downscale road: {refused}");
     }
 
     /// A paste that is text, in every shape that is not an image's: prose, a
