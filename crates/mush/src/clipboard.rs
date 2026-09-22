@@ -341,11 +341,11 @@ fn saved(ws: &Workspace, drained: Drained) -> Result<Option<Image>, String> {
 /// The bodies live in [`run_writers`] because a test has to be able to hand in a
 /// writer that never reads its stdin; putting one on the machine's PATH would be
 /// the test's own lie about the machine.
-// The write road's primitive, waiting for the key that will call it: a `pub` fn
-// in a binary crate that no `main` can reach is dead code. Measured, it is:
-// without this attribute the binary target reports five dead items — this
-// function and the four below it, the whole road hanging off it. The attribute
-// leaves with the binding that uses it.
+// The write road's primitive, bound by `App::write_clipboard`'s default: the
+// select mode's `Enter` reaches the writers through this function. The value
+// seam exists so a test can press that key without writing the human's real
+// clipboard, or depending on which of the three writers the machine has on
+// `PATH`.
 pub fn write_text(text: &str) -> Result<(), String> {
     run_writers(writers(), text, Instant::now() + DEADLINE)
 }
