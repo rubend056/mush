@@ -156,9 +156,56 @@ const WAIT_TIMEOUT_SECS: u64 = 600;
 /// travels through the delivery roads, once (see [`Outcome::digest`]).
 const DIGEST_COLUMNS: usize = 100;
 /// Why a cancelled run ends. Internal to the actor: a run that ends with this
-/// becomes `Outcome::Stopped` at the actor boundary, so no other layer has to
-/// compare result text to know what happened.
+/// becomes `Outcome::Stopped(..)` at the actor boundary, so no other layer has
+/// to compare result text to know what happened.
 const CANCELLED: &str = "cancelled";
+
+/// Who or what ended a run that a stop cut short.
+///
+/// Three roads set the same cancel flag, and the parent reading `#30 stopped:`
+/// has to be able to tell them apart, because they mean three different things
+/// to it: the human's own key is an intervention it did not ask for, its own
+/// `control stop` is a decision it has already made, and mush reclaiming the
+/// actor's thread (a park, `Ctrl-N`) is bookkeeping — that run did not *end*,
+/// its thread was taken away, and nothing about it is news.
+///
+/// Before this existed the child could say only "stopped", and the rule was
+/// built on that gap: no stop woke a napping parent, on the reasoning that a
+/// stop is the human's doing. The human's own words, watching a root miss two
+/// children it was depending on: "even if a parent is depending on that child
+/// for information — which they usually are — it SHOULD be news". It is now,
+/// and the line says which hand did it; a park still is not.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Stop {
+    /// The human stopped it: `Ctrl-C` in the tree.
+    Human,
+    /// The agent's own parent stopped it: `control stop`.
+    Parent,
+    /// Mush ended the run itself: `App::park_history` reclaimed the thread, or
+    /// the whole tree is going away (`Ctrl-N`). Not an ending, and not news.
+    Reclaimed,
+    /// A stop that came back from a stored session, where who asked is not
+    /// recorded — the session keeps how a run *ended*, not the hand that ended
+    /// it. Its line names no stopper rather than guessing one.
+    Unrecorded,
+}
+
+impl Stop {
+    /// The words the parent's line carries: what this does to the result it was
+    /// waiting for, and whose doing it was. One home, so the sentence a parent
+    /// reads and the sentence a listing reports cannot describe one stop two
+    /// ways.
+    fn words(self) -> &'static str {
+        match self {
+            Stop::Human => "the human stopped the run before it finished, so no result is coming",
+            Stop::Parent => "you stopped the run before it finished, so no result is coming",
+            Stop::Reclaimed => {
+                "mush reclaimed its thread while the run was in flight — it is parked, not ended"
+            }
+            Stop::Unrecorded => "the run ended before it finished, so no result is coming",
+        }
+    }
+}
 
 /// How a run ended, as the actor reports it to its parent and to its own row.
 ///
@@ -175,10 +222,11 @@ const CANCELLED: &str = "cancelled";
 pub enum Outcome {
     /// The run finished; the string is its summary.
     Finished(String),
-    /// The run was stopped (Ctrl-C, `control stop`, or the tree being shut
-    /// down by Ctrl-N). Not a result and not a failure: the actor is idle and
-    /// resumable.
-    Stopped,
+    /// The run was stopped, by the hand [`Stop`] names. Not a result and not a
+    /// failure: the actor is idle and resumable, and whether a napping parent is
+    /// woken for it depends on who asked — a park is not news, the human's own
+    /// key is (`is_news`).
+    Stopped(Stop),
     /// The run never ended: mush went away with it in flight, and nothing was
     /// committed by it. Not `Stopped` — there is no actor left to resume — and
     /// not `Failed` — nothing the model or the endpoint did broke.
@@ -258,7 +306,7 @@ impl From<&Outcome> for Committed {
     fn from(outcome: &Outcome) -> Self {
         match outcome {
             Outcome::Finished(_) => Committed::Finished,
-            Outcome::Stopped => Committed::Stopped,
+            Outcome::Stopped(_) => Committed::Stopped,
             Outcome::CutOff => Committed::CutOff,
             Outcome::Failed(error) => Committed::Failed(error.clone()),
         }
@@ -372,9 +420,9 @@ impl Outcome {
     pub(crate) fn line(&self, id: u64) -> String {
         match self {
             Outcome::Finished(summary) => format!("#{id} done: {summary}"),
-            Outcome::Stopped => format!(
-                "#{id} stopped: the run ended before it finished — this agent is idle, \
-                 not done; control message resumes it"
+            Outcome::Stopped(whose) => format!(
+                "#{id} stopped: {} — this agent is idle, not done; `control message` resumes it",
+                whose.words()
             ),
             Outcome::CutOff => format!(
                 "#{id} cut off: the run never ended — nothing was committed; \
@@ -384,13 +432,24 @@ impl Outcome {
         }
     }
 
-    /// Whether this is news worth waking a napping parent for. A stop is the
-    /// human's doing, not news, so it waits in the transcript instead of
-    /// paying for a fresh run. A cut-off *is* news: the parent is waiting for a
-    /// result that will never come, and the work it was waiting on may be
-    /// sitting uncommitted, so it has to be told rather than left to assume.
+    /// Whether this is news worth waking a napping parent for.
+    ///
+    /// Every ending is. A finished run produced a result the parent is waiting
+    /// for; a failed or cut-off one means the result is not coming, and the work
+    /// may be sitting uncommitted; and a *stop* is that same shape — the parent
+    /// delegated a task and the task will not answer. This used to be false for
+    /// a stop, on the reasoning that stopping is the human's doing and the line
+    /// would keep until the parent ran again. The human's ruling is the other
+    /// one: a parent depending on that child has to be told, whichever hand
+    /// ended it — and the line names the hand ([`Stop::words`]).
+    ///
+    /// The one stop that is not news is the one no hand asked for. A park is
+    /// mush's own bookkeeping: `App::park_history` reclaims a thread the window
+    /// is not using, the agent is at rest and resumable, and the run it was
+    /// holding was not lost — waking a parent for that would be waking it for
+    /// memory management.
     fn is_news(&self) -> bool {
-        !matches!(self, Outcome::Stopped)
+        !matches!(self, Outcome::Stopped(Stop::Reclaimed))
     }
 
     /// A bounded rendering of this outcome for a *listing* (`status`):
@@ -410,7 +469,7 @@ impl Outcome {
         let (mark, body) = match self {
             Outcome::Finished(summary) => ("✓", summary.as_str()),
             Outcome::Failed(error) => ("✗", error.as_str()),
-            Outcome::Stopped => {
+            Outcome::Stopped(_) => {
                 return format!(
                     "#{id} ⊘ stopped — idle and resumable (control message resumes it)"
                 );
@@ -497,8 +556,11 @@ pub enum AgentMsg {
     /// ever hand it over — the request folded nothing at all, silently.
     Compact(Vec<Message>),
     /// Cancel the current run. An idle agent ignores it — Stop cancels work,
-    /// it does not end an agent.
-    Stop,
+    /// it does not end an agent. It carries *who* asked, because the child's
+    /// `#N stopped:` line is read by its parent, and "the human stopped it",
+    /// "you stopped it" and "mush parked it" are three different pieces of news
+    /// ([`Stop`]).
+    Stop(Stop),
     /// End this actor for good (Ctrl-N). A `Stop` cannot do this: an
     /// actor holds its own mailbox open, so it never learns that everyone else
     /// let go — it has to be told.
@@ -860,6 +922,12 @@ struct ActorState {
     /// A `Stop` arrived with the work this actor is about to start; the run it
     /// points at is born cancelled (finding B6).
     stop_requested: bool,
+    /// Who asked for the stop that ended the run, when a stop did: read by the
+    /// outcome the parent is told ([`Stop`]). `None` means the cancel flag was
+    /// the road — the human's own key sets the flag *and* sends the message, and
+    /// the run can end before the message is drained, which is the one road that
+    /// reaches the flag alone, and the one road that is the human's.
+    stop: Option<Stop>,
     /// How many identical rounds the previous run repeated before the loop
     /// guard stopped it. The next run opens by saying so, so a nudge can
     /// resume the agent instead of repeating the call that stopped it
@@ -1335,7 +1403,16 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         let outcome = match result {
             Ok(Some(text)) => Outcome::Finished(text),
             Ok(None) => Outcome::Finished("(finished)".to_string()),
-            Err(error) if error == CANCELLED => Outcome::Stopped,
+            // Which of the three stops this was decides one thing to the books
+            // and three things to the parent: a park is not an ending and not
+            // news, while the human's own key is an intervention the parent has
+            // to hear about (`Stop`, `Outcome::is_news`). `shutdown` first: an
+            // actor that is going away is mush's doing whatever else arrived.
+            Err(error) if error == CANCELLED => Outcome::Stopped(if state.shutdown {
+                Stop::Reclaimed
+            } else {
+                state.stop.take().unwrap_or(Stop::Human)
+            }),
             Err(error) => Outcome::Failed(error),
         };
         // An isolated agent's branch *is* the deliverable — the thing a human
@@ -1385,7 +1462,7 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         });
         match outcome {
             Outcome::Failed(error) => actor.ctx.emit(actor.id, AgentEvent::Error(error)),
-            Outcome::Stopped => actor.ctx.emit(actor.id, AgentEvent::Stopped),
+            Outcome::Stopped(_) => actor.ctx.emit(actor.id, AgentEvent::Stopped),
             Outcome::Finished(_) => actor.ctx.emit(actor.id, AgentEvent::Done),
             // Unreachable from here, and deliberately listed rather than
             // swallowed by a wildcard: a cut-off run is one whose actor is
@@ -1462,10 +1539,16 @@ fn wait_for_work(
                 // it is the one way a Ctrl-C does nothing at all: the run pays
                 // for its model calls and the human waits for the row to stop
                 // saying `⊘` on its own (finding B6).
-                let aimed_at_this_run = matches!(command, AgentMsg::Stop);
+                let aimed_at_this_run = match &command {
+                    AgentMsg::Stop(whose) => Some(*whose),
+                    _ => None,
+                };
                 match absorb(actor, state, transcript, command) {
                     Fold::End => return false,
-                    _ if aimed_at_this_run => state.stop_requested = true,
+                    _ if aimed_at_this_run.is_some() => {
+                        state.stop = aimed_at_this_run;
+                        state.stop_requested = true;
+                    }
                     Fold::Run | Fold::Idle => {}
                 }
             }
@@ -1545,8 +1628,11 @@ fn absorb(
 ) -> Fold {
     match command {
         // An idle agent has nothing to cancel — but it may still own a job,
-        // and a Stop aimed at an agent means "stop the work in flight".
-        AgentMsg::Stop => {
+        // and a Stop aimed at an agent means "stop the work in flight". It
+        // records no cause: nothing is running, and a stop that labels a run
+        // which has not started yet would name the wrong hand at the next
+        // cancellation.
+        AgentMsg::Stop(_) => {
             actor.ctx.registry.kill_owned(actor.id);
             Fold::Idle
         }
@@ -2717,8 +2803,11 @@ fn compact_now(actor: &Actor, state: &mut ActorState, transcript: &mut Vec<Messa
 fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
     for command in actor.rx.try_iter() {
         match command {
-            AgentMsg::Stop => {
+            AgentMsg::Stop(whose) => {
                 cancel.store(true, Ordering::SeqCst);
+                // The hand that asked travels with the cancellation: the
+                // outcome the parent is told has to name it ([`Stop`]).
+                state.stop = Some(whose);
                 // A Stop means "stop the work in flight", and a job is work in
                 // flight: whatever this agent started keeps running otherwise.
                 actor.ctx.registry.kill_owned(actor.id);
@@ -2803,8 +2892,9 @@ fn drain_mailbox(
             // is for an actor that has none (see `absorb`); mid-run, the
             // transcript this actor owns is the newer one.
             AgentMsg::Compact(_) => state.compact_requested = true,
-            AgentMsg::Stop => {
+            AgentMsg::Stop(whose) => {
                 cancel.store(true, Ordering::SeqCst);
+                state.stop = Some(whose);
                 actor.ctx.registry.kill_owned(actor.id);
             }
             AgentMsg::Shutdown => {
@@ -3113,9 +3203,9 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
         news |= job_news;
     }
     // A child's completion is always worth a turn: the model has to read a
-    // summary it asked for, even of a child that was stopped (`Outcome::is_news`
-    // decides that only for an *idle* actor, where the run it wakes has a
-    // price).
+    // summary it asked for, even of a child that was stopped. `Outcome::is_news`
+    // decides only whether a *napping* parent is woken into a fresh run — this
+    // fold happens inside a run somebody already paid for.
     let children: Vec<(u64, u64, Outcome)> = state
         .completed
         .iter()
@@ -4152,10 +4242,14 @@ fn stop_agent(actor: &Actor, state: &mut ActorState, id: u64) -> Result<String, 
     // the UI, the only hand that can rebuild the actor a Stop needs — and the
     // revival is what takes it, since a parked child is at rest by the window's
     // own condition.
-    match cmd.send(AgentMsg::Stop) {
+    //
+    // A parent's stop says so (`Stop::Parent`): the child's line is read by this
+    // very agent, and "you stopped it" is the one reading that tells a parent
+    // what it did rather than what happened to it.
+    match cmd.send(AgentMsg::Stop(Stop::Parent)) {
         Ok(()) => Ok(format!("stopping agent #{id}")),
         Err(_) => {
-            hand_to_ui(actor, id, AgentMsg::Stop);
+            hand_to_ui(actor, id, AgentMsg::Stop(Stop::Parent));
             Ok(format!(
                 "stopping agent #{id} — its actor was parked, so mush is waking one to take the stop"
             ))
@@ -5183,7 +5277,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
         let mut state = ActorState::default();
         let outcomes = [
-            Outcome::Stopped,
+            Outcome::Stopped(Stop::Human),
             Outcome::CutOff,
             Outcome::Finished("did the thing".into()),
             Outcome::Failed("no route".into()),
@@ -5232,7 +5326,7 @@ mod tests {
             first,
             format!(
                 "✉ {}{}",
-                Outcome::Stopped.digest(1),
+                Outcome::Stopped(Stop::Human).digest(1),
                 Work::Clean {
                     branch: "mush/1".into()
                 }
@@ -5361,11 +5455,30 @@ mod tests {
             Outcome::Finished("wrote the parser".into()).line(3),
             "#3 done: wrote the parser"
         );
-        let stopped = Outcome::Stopped.line(3);
+        let stopped = Outcome::Stopped(Stop::Human).line(3);
         assert!(stopped.starts_with("#3 stopped"), "{stopped}");
         // It must not be *formatted* as a done line. (The words "not done" do
         // appear, deliberately: they are what tells the parent it is not one.)
         assert!(!stopped.starts_with("#3 done"), "{stopped}");
+        // And it names the hand that stopped it: the parent is being told what
+        // happened to a task it delegated, and "the human did it" is not the
+        // same fact as "you did it" (a park's line says neither, because mush
+        // did it — see `is_news`).
+        assert!(stopped.contains("the human stopped"), "{stopped}");
+        assert!(
+            Outcome::Stopped(Stop::Parent)
+                .line(3)
+                .contains("you stopped"),
+            "a parent's own stop is read by that parent"
+        );
+        let parked = Outcome::Stopped(Stop::Reclaimed).line(3);
+        assert!(parked.contains("mush reclaimed its thread"), "{parked}");
+        assert!(
+            Outcome::Stopped(Stop::Unrecorded)
+                .line(3)
+                .contains("the run ended before it finished"),
+            "a restored stop names no hand rather than guessing one"
+        );
         let failed = Outcome::Failed("no route".into()).line(3);
         assert!(failed.starts_with("#3 failed"), "{failed}");
         // A run that never ended names itself too, and says the one thing the
@@ -5378,16 +5491,21 @@ mod tests {
         assert!(!cut_off.starts_with("#3 stopped"), "{cut_off}");
     }
 
-    /// A stop is the human's doing, not news: it must not wake a napping parent
-    /// into a fresh (paid) run. A finish is news and must wake it.
+    /// A stop is news now, whichever hand asked for it: a parent that delegated a
+    /// task is depending on that child for information, and the result is not
+    /// coming — so it is woken and told, and the line says who stopped it. The
+    /// one stop that still is not news is mush's own: a park reclaims a thread
+    /// the window is not using, and waking a parent for memory management would
+    /// be waking it for nothing. A finish is news, unchanged.
     #[test]
-    fn a_stop_does_not_wake_a_napping_parent_but_a_finish_does() {
+    fn a_stop_wakes_a_napping_parent_but_a_park_does_not() {
         let (actor, _mailbox) = test_actor("napping");
         let (tx, _rx) = crossbeam_channel::unbounded::<AgentMsg>();
         let mut state = ActorState::default();
         state.children.insert(1, tx.clone());
         let mut messages = vec![Message::system("you are mush")];
 
+        // The human's key.
         assert!(matches!(
             absorb(
                 &actor,
@@ -5396,13 +5514,17 @@ mod tests {
                 AgentMsg::ChildDone {
                     id: 1,
                     run: 1,
-                    outcome: Outcome::Stopped
+                    outcome: Outcome::Stopped(Stop::Human)
                 }
             ),
-            Fold::Idle
+            Fold::Run
         ));
-        assert!(messages.last().unwrap().text().contains("stopped"));
+        let line = messages.last().unwrap().text().to_string();
+        assert!(line.contains("#1 stopped"), "{line}");
+        assert!(line.contains("the human stopped"), "{line}");
 
+        // The parent's own `control stop` is news too, and reads as its own
+        // doing rather than as somebody else's.
         assert!(matches!(
             absorb(
                 &actor,
@@ -5411,6 +5533,42 @@ mod tests {
                 AgentMsg::ChildDone {
                     id: 1,
                     run: 2,
+                    outcome: Outcome::Stopped(Stop::Parent)
+                }
+            ),
+            Fold::Run
+        ));
+        assert!(messages.last().unwrap().text().contains("you stopped"));
+
+        // A park: the line is in the transcript for the next run, and no run is
+        // paid for.
+        assert!(matches!(
+            absorb(
+                &actor,
+                &mut state,
+                &mut messages,
+                AgentMsg::ChildDone {
+                    id: 1,
+                    run: 3,
+                    outcome: Outcome::Stopped(Stop::Reclaimed)
+                }
+            ),
+            Fold::Idle
+        ));
+        assert!(
+            messages.last().unwrap().text().contains("parked"),
+            "a park says what it was: {}",
+            messages.last().unwrap().text()
+        );
+
+        assert!(matches!(
+            absorb(
+                &actor,
+                &mut state,
+                &mut messages,
+                AgentMsg::ChildDone {
+                    id: 1,
+                    run: 4,
                     outcome: Outcome::Finished("all done".into())
                 }
             ),
@@ -5453,7 +5611,7 @@ mod tests {
     fn a_commit_subject_round_trips_through_git() {
         let cases = [
             (Outcome::Finished("done".into()), Committed::Finished),
-            (Outcome::Stopped, Committed::Stopped),
+            (Outcome::Stopped(Stop::Human), Committed::Stopped),
             (Outcome::CutOff, Committed::CutOff),
             (
                 Outcome::Failed("no route".into()),
@@ -5863,8 +6021,8 @@ mod tests {
         assert_eq!(handed.len(), 1, "one command, one hand-over: {handed:?}");
         assert_eq!(handed[0].0, 1);
         assert!(
-            matches!(handed[0].1, AgentMsg::Stop),
-            "the stop is what the child is woken to take"
+            matches!(handed[0].1, AgentMsg::Stop(Stop::Parent)),
+            "the stop is what the child is woken to take, and it says who asked"
         );
         assert!(
             !state.running.contains(&1),
@@ -5918,8 +6076,8 @@ mod tests {
     #[test]
     fn a_later_finish_replaces_a_stale_stop() {
         let mut state = ActorState::default();
-        note_completion(&mut state, 1, 1, Outcome::Stopped);
-        assert_eq!(state.outcome(1), Some(&Outcome::Stopped));
+        note_completion(&mut state, 1, 1, Outcome::Stopped(Stop::Human));
+        assert_eq!(state.outcome(1), Some(&Outcome::Stopped(Stop::Human)));
         let line = note_completion(&mut state, 1, 2, Outcome::Finished("done now".into()));
         assert_eq!(
             state.outcome(1),
@@ -6858,7 +7016,7 @@ mod tests {
         let (actor, _mailbox) = test_actor("adopt-shapes");
         let mut state = ActorState::default();
         note_completion(&mut state, 2, 1, Outcome::Failed("no route".into()));
-        note_completion(&mut state, 3, 1, Outcome::Stopped);
+        note_completion(&mut state, 3, 1, Outcome::Stopped(Stop::Human));
         note_completion(&mut state, 4, 1, Outcome::CutOff);
         let mut messages = Vec::new();
         let fresh = vec![
@@ -6870,7 +7028,7 @@ mod tests {
             // a real session stores.
             assistant_calling(&["a", "b", "c"]),
             Message::tool("a", "#2 failed: no route"),
-            Message::tool("b", Outcome::Stopped.line(3)),
+            Message::tool("b", Outcome::Stopped(Stop::Human).line(3)),
             Message::tool("c", Outcome::CutOff.line(4)),
         ];
         assert!(matches!(
@@ -7136,7 +7294,7 @@ mod tests {
         let (actor, mailbox) = scripted_tools_actor("stop-command", machine.clone(), clock.clone());
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
-        mailbox.send(AgentMsg::Stop).unwrap();
+        mailbox.send(AgentMsg::Stop(Stop::Human)).unwrap();
 
         let report = run_shell(
             "echo starting; sleep 30",
@@ -9271,7 +9429,7 @@ mod tests {
         );
 
         // A stray Stop is not work, and must not wake anyone.
-        state.deferred.push(AgentMsg::Stop);
+        state.deferred.push(AgentMsg::Stop(Stop::Human));
         assert_eq!(
             fold_parked(&actor, &mut state, &mut messages),
             Some(Fold::Idle)
@@ -9328,7 +9486,7 @@ mod tests {
         // Both arrive while the model is thinking: the cancel is honoured as
         // soon as the reply comes back, and the fold is left parked.
         root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
-        root_tx.send(AgentMsg::Stop).unwrap();
+        root_tx.send(AgentMsg::Stop(Stop::Human)).unwrap();
         gate.release();
 
         let folded = |events: &Recorder| {
@@ -9358,7 +9516,7 @@ mod tests {
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
         mailbox.send(AgentMsg::Nudge("steer left".into())).unwrap();
-        mailbox.send(AgentMsg::Stop).unwrap();
+        mailbox.send(AgentMsg::Stop(Stop::Human)).unwrap();
 
         drain_signals(&actor, &cancel, &mut state);
         assert!(cancel.load(Ordering::SeqCst), "a Stop is honoured at once");
@@ -9386,7 +9544,7 @@ mod tests {
         let mut state = ActorState::default();
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
 
-        mailbox.send(AgentMsg::Stop).unwrap();
+        mailbox.send(AgentMsg::Stop(Stop::Human)).unwrap();
         let cancel = Arc::new(AtomicBool::new(false));
         drain_mailbox(&actor, &cancel, &mut messages, &mut state);
         assert!(cancel.load(Ordering::SeqCst), "a Stop cancels the run");
@@ -9402,7 +9560,12 @@ mod tests {
         // Idle: the same split, expressed as what the actor should do next.
         let mut state = ActorState::default();
         assert!(matches!(
-            absorb(&actor, &mut state, &mut messages, AgentMsg::Stop),
+            absorb(
+                &actor,
+                &mut state,
+                &mut messages,
+                AgentMsg::Stop(Stop::Human)
+            ),
             Fold::Idle
         ));
         assert!(matches!(
@@ -9431,7 +9594,7 @@ mod tests {
                 Message::user("do the work"),
             ]))
             .unwrap();
-        mailbox.send(AgentMsg::Stop).unwrap();
+        mailbox.send(AgentMsg::Stop(Stop::Human)).unwrap();
 
         assert!(
             wait_for_work(&actor, &mut state, &mut transcript, false),
@@ -9447,7 +9610,12 @@ mod tests {
         // stopped while it was idle must still run when they later ask it to.
         let mut state = ActorState::default();
         assert!(matches!(
-            absorb(&actor, &mut state, &mut transcript, AgentMsg::Stop),
+            absorb(
+                &actor,
+                &mut state,
+                &mut transcript,
+                AgentMsg::Stop(Stop::Human)
+            ),
             Fold::Idle
         ));
         assert!(
@@ -10616,7 +10784,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         // The human's Ctrl-C, in the actor's own terms: the mailbox is drained
         // by the watcher's next pass, which is the latency a Stop has.
-        mailbox.send(AgentMsg::Stop).unwrap();
+        mailbox.send(AgentMsg::Stop(Stop::Human)).unwrap();
 
         let report = exec_tool(
             &actor,
@@ -13451,7 +13619,7 @@ mod tests {
         let (child, _child_rx) = crossbeam_channel::unbounded();
         state.children.insert(1, child);
         state.running.insert(1);
-        note_completion(&mut state, 1, 1, Outcome::Stopped);
+        note_completion(&mut state, 1, 1, Outcome::Stopped(Stop::Human));
         absorb(
             &actor,
             &mut state,
@@ -13459,7 +13627,7 @@ mod tests {
             AgentMsg::ChildDone {
                 id: 1,
                 run: 2,
-                outcome: Outcome::Stopped,
+                outcome: Outcome::Stopped(Stop::Human),
             },
         );
         assert!(
@@ -13676,7 +13844,7 @@ mod tests {
 
         spawn(&mut state, "first").unwrap();
         // The child reported and is at rest: a second shared child is fine.
-        note_completion(&mut state, 1, 1, Outcome::Stopped);
+        note_completion(&mut state, 1, 1, Outcome::Stopped(Stop::Human));
         spawn(&mut state, "second").unwrap();
 
         // The parent resumes the first with a message. It is running again,
@@ -13724,9 +13892,9 @@ mod tests {
             json!({ "brief": "port the parser", "title": "  parser port  " }),
         )
         .unwrap();
-        note_completion(&mut state, 1, 1, Outcome::Stopped);
+        note_completion(&mut state, 1, 1, Outcome::Stopped(Stop::Human));
         spawn(&mut state, json!({ "brief": "port the lexer" })).unwrap();
-        note_completion(&mut state, 2, 1, Outcome::Stopped);
+        note_completion(&mut state, 2, 1, Outcome::Stopped(Stop::Human));
         spawn(
             &mut state,
             json!({ "brief": "port the loader", "title": "   " }),
@@ -13808,7 +13976,7 @@ mod tests {
         let cancel = AtomicBool::new(false);
         let (child, _child_rx) = crossbeam_channel::unbounded();
         state.children.insert(1, child);
-        note_completion(&mut state, 1, 1, Outcome::Stopped);
+        note_completion(&mut state, 1, 1, Outcome::Stopped(Stop::Human));
         state.delivered.insert(1, 1);
 
         // The human nudged it: the parent's books are told.

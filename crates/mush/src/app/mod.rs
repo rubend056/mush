@@ -282,7 +282,7 @@ fn seeded_outcome(phase: &Phase, summary: Option<&str>) -> Option<agent::Outcome
         Phase::Done => Some(agent::Outcome::Finished(
             summary.unwrap_or("(finished)").to_string(),
         )),
-        Phase::Stopped => Some(agent::Outcome::Stopped),
+        Phase::Stopped => Some(agent::Outcome::Stopped(agent::Stop::Unrecorded)),
         Phase::CutOff => Some(agent::Outcome::CutOff),
         Phase::Failed(error) => Some(agent::Outcome::Failed(error.clone())),
         Phase::Idle
@@ -4054,7 +4054,9 @@ mod tests {
             "the newest child's thread is untouched"
         );
         assert!(
-            app.tree.agent_tx[&AgentId(3)].send(AgentMsg::Stop).is_ok(),
+            app.tree.agent_tx[&AgentId(3)]
+                .send(AgentMsg::Stop(agent::Stop::Human))
+                .is_ok(),
             "and so is the third-newest: the window is the newest eight"
         );
         // The parent's books need the fact the child's actor can no longer
@@ -4106,7 +4108,9 @@ mod tests {
             "and the transcript it resumes from is the one on screen"
         );
         assert!(
-            app.tree.agent_tx[&AgentId(2)].send(AgentMsg::Stop).is_ok(),
+            app.tree.agent_tx[&AgentId(2)]
+                .send(AgentMsg::Stop(agent::Stop::Human))
+                .is_ok(),
             "the mailbox has an actor behind it again"
         );
         assert!(
@@ -4154,7 +4158,9 @@ mod tests {
         });
 
         assert!(
-            app.tree.agent_tx[&AgentId(2)].send(AgentMsg::Stop).is_ok(),
+            app.tree.agent_tx[&AgentId(2)]
+                .send(AgentMsg::Stop(agent::Stop::Human))
+                .is_ok(),
             "the mailbox has an actor behind it again"
         );
         assert!(
@@ -4439,7 +4445,7 @@ mod tests {
         app.tree.finish(AgentId(2), Some("did it".to_string()));
 
         assert!(
-            app.deliver_to_actor(AgentId(2), AgentMsg::Stop),
+            app.deliver_to_actor(AgentId(2), AgentMsg::Stop(agent::Stop::Human)),
             "the revival took the command"
         );
 
@@ -4452,11 +4458,13 @@ mod tests {
             })
             .unwrap_or_else(|| panic!("the parent is handed the live mailbox: {told:?}"));
         assert!(
-            live.send(AgentMsg::Stop).is_ok(),
+            live.send(AgentMsg::Stop(agent::Stop::Human)).is_ok(),
             "and it is the sender the revived actor is listening on"
         );
         assert!(
-            app.tree.agent_tx[&AgentId(2)].send(AgentMsg::Stop).is_ok(),
+            app.tree.agent_tx[&AgentId(2)]
+                .send(AgentMsg::Stop(agent::Stop::Human))
+                .is_ok(),
             "the tree's own copy is the same live mailbox"
         );
     }
@@ -11594,7 +11602,9 @@ mod tests {
         // The mailbox the tree holds for #1 is a newer one, with an actor
         // behind it: the wake the report itself asked for.
         assert!(
-            app.tree.agent_tx[&AgentId(1)].send(AgentMsg::Stop).is_ok(),
+            app.tree.agent_tx[&AgentId(1)]
+                .send(AgentMsg::Stop(agent::Stop::Human))
+                .is_ok(),
             "the parked parent has an actor again"
         );
         // And it is this report that woke it: a parent with empty books folds

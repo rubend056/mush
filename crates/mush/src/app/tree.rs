@@ -21,7 +21,7 @@ use mush_core::prompt;
 use mush_core::text::truncate;
 use mush_core::tools::ToolName;
 
-use crate::agent::{AgentMsg, RootHandle, TreeHandles};
+use crate::agent::{AgentMsg, RootHandle, Stop, TreeHandles};
 use crate::ids::{AgentId, Ids};
 use crate::jobs::{self, JobView};
 
@@ -1094,10 +1094,12 @@ impl AgentTree {
         if let Some(flag) = self.agent_cancel.get(&id) {
             flag.store(true, Ordering::SeqCst);
         }
+        // The human's own key, and the only road that is (`Stop::Human`): the
+        // child's line names the hand, because its parent reads it.
         let heard = self
             .agent_tx
             .get(&id)
-            .map(|tx| tx.send(AgentMsg::Stop).is_ok())
+            .map(|tx| tx.send(AgentMsg::Stop(Stop::Human)).is_ok())
             .unwrap_or(false);
         let mut cut_off = false;
         if let Some(node) = self.node_mut(id) {
@@ -2554,7 +2556,7 @@ mod tests {
         let id = opened.id;
 
         assert!(!tree.cancel_requested(id), "a live mailbox hears the Stop");
-        assert!(matches!(rx.try_recv(), Ok(AgentMsg::Stop)));
+        assert!(matches!(rx.try_recv(), Ok(AgentMsg::Stop(Stop::Human))));
         assert_eq!(tree.node(id).unwrap().phase, Phase::Cancelling);
 
         tree.agent_tx.remove(&id);
@@ -2633,7 +2635,7 @@ mod tests {
         assert!(!tree.cancel_requested(id), "a run is in flight");
         assert_eq!(tree.node(id).unwrap().phase, Phase::Cancelling);
         assert!(tree.busy(), "and the run is still on");
-        assert!(matches!(rx.try_recv(), Ok(AgentMsg::Stop)));
+        assert!(matches!(rx.try_recv(), Ok(AgentMsg::Stop(Stop::Human))));
 
         // The actor yields with no result: `Stopped`, not `Idle` and not `Done`.
         tree.stopped(id);

@@ -644,13 +644,15 @@ below, all now fixed but the last:
 | "cut off … 4 times in a row" | the counter never reset, so scattered truncations were called consecutive | `00571b4` |
 | a child at rest, for one drain, while it has resumed | the run-start report the last wave added announces a resume to the parent's `running` book (`AgentMsg::ChildRunning`, sent as the run begins), but leans on the parent draining the child's `ChildDone` first and the ordering is not enforced: a child ends run N with its result unread, the human nudges it (a `Steer` is sent), the parent's boundary drains the completion and clears the running mark, and the child's `ChildRunning(N+1)` lands one drain later — `drain_mailbox` takes whatever `try_iter` holds and the report was not in that snapshot, so a drain between the two clears the mark for one drain (a momentary wrong `status` and one-shared-child guard answer, no crash) | ⬜ **open** — a run sequence the parent can compare (`ChildDone` already carries one) or a drain that settles before it acts |
 
-**Deliberately left, each for a stated reason:** a *stopped* child does not wake
-its parent (`Outcome::is_news` — the human's stop is not news, and the line is
-in the transcript for the next run); the loop guard still counts a timed-out
-wait as an unchanged repeat (no result changed, which is what the guard is for,
-and a run gets six waits, not one); the root's lock exemption is learned from
-the result note rather than stated in advance; and `RUNAWAY_TURNS`'s wrap-up
-turn explains itself when it fires.
+**Deliberately left, each for a stated reason:** the loop guard still counts a
+timed-out wait as an unchanged repeat (no result changed, which is what the
+guard is for, and a run gets six waits, not one); the root's lock exemption is
+learned from the result note rather than stated in advance; and
+`RUNAWAY_TURNS`'s wrap-up turn explains itself when it fires. One entry left
+this list later: a *stopped* child now wakes its parent (§8.41 — the human's
+ruling, on the ground that a parent depending on a child has to hear that the
+result is not coming, whichever hand stopped it; the line names the hand, and
+only a park stays quiet).
 
 **Census at `00571b4`** (the six commits above plus the dedup): total 42,417
 (was 41,844), **prod 12,149 (+99)**, tests 17,724 (+300), comments 9,804
@@ -2441,3 +2443,69 @@ total 57,278 · prod 14,397 · tests 24,579 · comments 14,745): total 57,797 ·
 test, 156 comment, 30 blank. The production lines are `reclaim_isolated`,
 `no_actor_line`, the `ChildResumed` variant and its two marks, and
 `report_cut_off`'s one road.
+
+## 8.41 A stop is news, and it says who asked
+
+The rule this changes was written down as deliberate: "a *stopped* child does not
+wake its parent (`Outcome::is_news` — the human's stop is not news, and the line
+is in the transcript for the next run)". The human who hit it in a live session
+ruled the other way, and the argument is the one the code already makes for a
+*cut-off* run — "the parent is waiting for a result that will never come … so it
+has to be told rather than left to assume":
+
+> even if a parent is depending on that child for information (which they usually
+> are) regardless of whether it's a human that stopped them it SHOULD be news no?
+> perhaps a hint that the human was the one that stopped the child no?
+
+Both halves landed. `AgentMsg::Stop` now carries a `Stop` — `Human` (the tree's
+`Ctrl-C`), `Parent` (`control stop`), `Reclaimed` (mush's own doing: a park, or
+`Ctrl-N` taking the tree down), and `Unrecorded` for a stop that came back from a
+stored session — and the outcome the parent is told carries the same value
+(`Outcome::Stopped(Stop)`), so the line can name the hand: `#30 stopped: the human
+stopped the run before it finished, so no result is coming — this agent is idle,
+not done; control message resumes it`. `Parent` reads as "you stopped", because
+the line is read by the agent that did it, and `Unrecorded` names no hand rather
+than guessing one.
+
+`Outcome::is_news` is now false for exactly one ending: a park. Parking is mush
+reclaiming a thread the window is not using — the agent is at rest and resumable,
+the run was not lost, and waking a parent into a fresh (paid) run for memory
+management would be waking it for nothing. Every other ending is news, so a
+napping parent is woken when its child stops, fails, is cut off, or finishes.
+
+Two details the implementation had to get right, both documented where they live.
+The cancel flag has two roads: the human's `Ctrl-C` sets the flag *and* sends the
+message, and a run can end between the two — so `ActorState.stop` is an
+`Option<Stop>` and `None` resolves to `Human`, the only cause that reaches the
+flag alone. And a stop that arrives while the actor is idle records nothing: it
+cancels work that is not running, and a cause stored there would name the wrong
+hand at the *next* cancellation.
+
+**Verification.** `a_stop_wakes_a_napping_parent_but_a_park_does_not` — the test
+that used to be `a_stop_does_not_wake_a_napping_parent_but_a_finish_does` — walks
+all four causes through `absorb`: `Human` and `Parent` fold `Fold::Run` and their
+lines name the hand, `Reclaimed` folds `Fold::Idle` with the parked sentence, and
+a finish still wakes. `only_a_finished_run_reports_itself_as_done` asserts each
+line's words. Reverting `is_news` to `!matches!(self, Outcome::Stopped(_))` fails
+the first; collapsing the payload to one cause fails the words. The mechanical
+rewrite of the stop road was caught by a test doing its job:
+`a_stop_aimed_at_a_parked_child_is_handed_over_rather_than_called_gone` asserts
+that a *parent's* stop arrives as `Stop::Parent`, and failed when the rewrite
+said `Human`.
+
+**Consequences, stated.** A human stopping a child now wakes a napping parent
+into a run — one run for a batch, since the first completion starts it and the
+rest fold in at its boundaries. `Ctrl-N` still wakes nobody: every actor that
+ends under it ends with `shutdown` set, which is `Reclaimed`. A park that lands
+*mid-run* (the window's race, §8.40 item 4) is the one road that produces a
+`Reclaimed` line for a parent, and it reads as what it is — "it is parked, not
+ended". `prompt.rs`'s DELEGATION still says only that "a finish wakes you": true,
+and now incomplete; the human owns that file, so it is recorded rather than
+edited.
+
+**Census** at this landing (`scripts/census.py`), against §8.40's (total 57,814 ·
+prod 14,427 · tests 24,894 · comments 14,905): total 57,972 · **prod 14,459** ·
+tests 24,941 · comments 14,980 — 158 lines: 32 production, 47 test, 75 comment,
+4 blank. The wave is comment-heavy on purpose: the ruling, the four hands and
+the two races are what a later reader has to be told, and the code that carries
+them is a dozen lines.
