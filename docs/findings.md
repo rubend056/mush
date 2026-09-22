@@ -2342,9 +2342,12 @@ name and the bar's word differ by design (`waiting` and the tool's own `wait`). 
 
 **Census** at this landing (against §8.37's `076e164`: total 55,548 · prod
 13,915 · tests 24,003 · comments 14,187; the image-paste wave sits between
-them): total 57,278 · **prod 14,397** · tests 24,579 · comments 14,745. The wave
-itself is 80 lines: 4 production (the glyph arm, the label arm, the roster
-branch, the `waiting` field doc), 31 test, 44 comment, 1 blank.
+them): total 57,285 · **prod 14,397** · tests 24,582 · comments 14,749. The wave
+itself is 87 lines: 4 production (the glyph arm, the label arm, the roster
+branch, the `waiting` field doc), 34 test, 48 comment, 1 blank. (The first
+written numbers here were 7 short — they were measured before the last two test
+extensions of the same wave landed; corrected against the commit itself, which
+is what a census is for.)
 
 ## 8.40 Four holes of one class: a report, a sweep, a sentence, a tick (`3a3f474`, `5e93f5b`, `d482ab9`, `cbed322`)
 
@@ -2437,10 +2440,11 @@ the UI nudge fails both app tests.
 is then cancelled in the same batch waits for a later boundary. Both are the B24
 delivery questions, not these four holes.
 
-**Census** on this landing (`scripts/census.py`), against §8.38's (`19b0810`:
-total 57,278 · prod 14,397 · tests 24,579 · comments 14,745): total 57,797 ·
-**prod 14,427** · tests 24,882 · comments 14,901 — 519 lines: 30 production, 303
-test, 156 comment, 30 blank. The production lines are `reclaim_isolated`,
+**Census** on this landing (`scripts/census.py`), against §8.38's (its own
+landing, `19b0810` plus the sweep-test follow-up `8dd66ad`: total 57,302 ·
+prod 14,397 · tests 24,594 · comments 14,753): total 57,814 · **prod 14,427** ·
+tests 24,894 · comments 14,905 — 512 lines: 30 production, 300 test, 152
+comment, 30 blank. The production lines are `reclaim_isolated`,
 `no_actor_line`, the `ChildResumed` variant and its two marks, and
 `report_cut_off`'s one road.
 
