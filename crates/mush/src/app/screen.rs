@@ -706,9 +706,9 @@ fn bar_word(status: Option<(&str, StatusKind)>, tree: Option<&str>) -> Option<(R
     Rank::last_word(alert, tree, said).map(|(rank, text)| (rank, text.to_string()))
 }
 
-/// `⌂ ~/p/demo │ master ±3 +12 −3 │ qwen2.5-coder · ctx ~500k │ /help` — the
-/// stable facts, in the order that matters, cut from the right when the
-/// terminal is narrow.
+/// `⌂ ~/p/demo │ master ±3 +12 −3 │ qwen2.5-coder · ctx 3.1k/6.4k (fold 5.8k) ~8k
+/// │ /help` — the stable facts, in the order that matters, cut from the right
+/// when the terminal is narrow.
 fn facts_line(app: &App, width: usize) -> String {
     let root = app.ws.root_str();
     let home = std::env::var("HOME").unwrap_or_default();

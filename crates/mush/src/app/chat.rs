@@ -647,21 +647,23 @@ impl Chat {
     ///
     /// Derived on read, per agent, and never counted beside the transcript:
     /// there is no push site left to forget, and the human's own words weigh as
-    /// soon as they are in the transcript they are in (finding B8). Per agent
-    /// because the pane a human is looking at can be a subagent's, and its own
-    /// next request is what this number measures.
+    /// soon as they are in the transcript they are in (finding B8). The meter
+    /// itself reads the bytes ([`Self::used_weight_for`], against the history
+    /// budget, whose boundary is one byte); this is the same sum in the unit a
+    /// window is stated in, for a reader that wants that number on its own.
+    #[cfg(test)]
     pub fn used_tokens_for(&self, id: AgentId) -> usize {
         self.used_weight_for(id) / mush_core::config::BYTES_PER_TOKEN
     }
 
     /// The same sum in the budget's own currency: one agent's **own** system
     /// prompt plus its transcript, weighed the one way
-    /// [`mush_core::transcript::trim_history`] weighs them. Split out of
-    /// [`Self::used_tokens_for`] so a caller that needs the number in bytes —
-    /// the attach gate, asking how much room a picture has left — reads the
-    /// same sum the meter divides instead of adding the two up again (two
-    /// spellings of one arithmetic is how the budget and the meter drift
-    /// apart).
+    /// [`mush_core::transcript::trim_history`] weighs them. Split from the
+    /// token spelling of the same sum so a caller that needs the number in
+    /// bytes — the attach gate, asking how much room a picture has left, and
+    /// the meter, comparing against the byte boundary every decision uses —
+    /// reads the one sum instead of adding the parts up again (two spellings
+    /// of one arithmetic is how the budget and the meter drift apart).
     ///
     /// The prompt is the agent's own: the root's is the conversation's
     /// ([`Self::system`], which the root actor is handed with every run), and a

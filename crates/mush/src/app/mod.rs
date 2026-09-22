@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 use ratatui::crossterm::event::KeyEvent;
 
-use mush_core::config::vision_capable;
+use mush_core::config::{vision_capable, BYTES_PER_TOKEN};
 use mush_core::message::{Image, Message};
 use mush_core::{
     git, prompt, session, text::mask_key, userconfig, Config, Provider, Session, UserConfig,
@@ -1090,8 +1090,13 @@ impl App {
             .unwrap_or_else(|| "HEAD".to_string())
     }
 
-    /// The window in tokens, for the meter. The number is the conversation's,
-    /// not a copy of it: nothing can go stale between a push and a draw.
+    /// What the open conversation weighs in tokens — the unit the window is
+    /// stated in, divided once from the one sum. The meter works in the
+    /// budget's own bytes (`Chat::used_weight_for`, compared against
+    /// `history_budget`), so this is for callers that want the number in
+    /// tokens; either way it is derived on read, not counted beside the
+    /// transcript, so nothing can go stale between a push and a draw.
+    #[cfg(test)]
     pub fn context_used_tokens(&self) -> usize {
         self.chat.used_tokens_for(self.tree.focused)
     }
@@ -1788,27 +1793,42 @@ impl App {
         }
     }
 
-    /// How full the conversation in the open pane is, against the window it is
-    /// being sent to: `ctx 3.1k/500k`. The window alone says how much room there
-    /// is, never how much of it this conversation has taken — and the pane can
-    /// be a subagent's, whose own next request is what this number measures.
+    /// How full the conversation in the open pane is, against the number every
+    /// decision uses: `ctx 3.1k/6.4k (fold 5.8k) ~8k` — what this conversation
+    /// weighs against the history budget, where the fold's trigger sits inside
+    /// it, and the window itself. The pane can be a subagent's, whose own next
+    /// request is what this number measures.
     ///
-    /// At the window and past it there is no longer a fraction to print: a
+    /// The mark is the budget ([`mush_core::Config::history_budget`]): the
+    /// trimmer cuts a transcript past it, the fold fires at nine tenths of it
+    /// ([`mush_core::transcript::compaction_trigger`], printed at its own
+    /// place), and the attach gate measures its room from it. Comparing the
+    /// same `used` to the *window* instead made the marks unreachable in
+    /// normal operation: on the 8 K default the fold fires at ≈3.7k of the
+    /// budget, which the old meter read as 45 % — so `full` never happened,
+    /// and the human had no way to see a fold or a cut coming (the audit's
+    /// finding). The window keeps its own number, with the `~` that says it is
+    /// the assumed one, so what the budget is a reserve off stays visible.
+    ///
+    /// At the budget and past it there is no longer a fraction to print: a
     /// learned window can be smaller than the transcript already held, so the
     /// meter read `ctx 1.2k/1k` — a ratio greater than one with nothing saying
     /// so (finding P9). At the limit it says `full`; past it, it says `over`.
     pub fn context_meter(&self) -> String {
-        let used = self.context_used_tokens();
-        let window = self.cfg().context_tokens;
+        let budget = self.cfg().history_budget();
+        let fold = mush_core::transcript::compaction_trigger(budget);
+        let used = self.chat.used_weight_for(self.tree.focused);
         let mark = if self.cfg().context_explicit { "" } else { "~" };
-        let used_label = tokens_label(used);
-        let window_label = tokens_label(window);
-        let state = match used.cmp(&window) {
+        let used_label = tokens_label(used / BYTES_PER_TOKEN);
+        let budget_label = tokens_label(budget / BYTES_PER_TOKEN);
+        let fold_label = tokens_label(fold / BYTES_PER_TOKEN);
+        let window_label = tokens_label(self.cfg().context_tokens);
+        let state = match used.cmp(&budget) {
             std::cmp::Ordering::Greater => " over",
             std::cmp::Ordering::Equal => " full",
             std::cmp::Ordering::Less => "",
         };
-        format!("ctx {used_label}/{mark}{window_label}{state}")
+        format!("ctx {used_label}/{budget_label}{state} (fold {fold_label}) {mark}{window_label}")
     }
 
     /// The conversation this workspace was left holding could not be read, and
@@ -5147,24 +5167,70 @@ mod tests {
 
     /// Over-full is a real state — a learned window smaller than the transcript
     /// already held — and the meter must not print a ratio greater than one
-    /// with no mark (finding P9).
+    /// with no mark (finding P9). The mark is the history budget's, the number
+    /// every decision uses: at it `full`, past it `over`.
     #[test]
-    fn the_context_meter_says_full_and_over_at_the_window() {
+    fn the_context_meter_says_full_and_over_at_the_budget() {
         let (mut app, _rx) = test_app("meter-full");
-        // The smallest window the cell will hold, 1,024 tokens.
-        app.cell.edit(|cfg| cfg.set_context(1_024));
-        app.chat.insert(&"z".repeat(3_000));
-        app.send_message();
-        let used = app.context_used_tokens();
-        assert!(used > 1_024, "the message passed the window: {used}");
-        let over = app.context_meter();
-        assert!(over.ends_with(" over"), "{over}");
-
-        // Exactly at the window is `full`, not an over-full ratio.
-        app.cell.edit(|cfg| cfg.set_context(used));
+        app.cell.edit(|cfg| cfg.set_context(32_768));
+        let budget = app.cfg().history_budget();
+        let system = app.chat.system().weight();
+        // Exactly the budget: `full`, not an over-full ratio.
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message::user("x".repeat(budget - system - "user".len())),
+        );
+        assert_eq!(app.chat.used_weight_for(AgentId::ROOT), budget);
         let full = app.context_meter();
-        assert!(full.ends_with(" full"), "{full}");
+        assert!(full.contains(" full"), "{full}");
         assert!(!full.contains(" over"), "{full}");
+
+        // One byte past it: the trimmer will cut, and the meter says so. The
+        // transcript is still well inside the window this time — which is the
+        // point: the old meter compared the same number to the *window*, so it
+        // read this state as ordinary and the mark could not be reached in
+        // normal operation (the audit's finding).
+        app.chat.push_message(AgentId::ROOT, Message::user("!"));
+        assert!(app.chat.used_weight_for(AgentId::ROOT) > budget);
+        assert!(budget < app.cfg().context_tokens * BYTES_PER_TOKEN);
+        let over = app.context_meter();
+        assert!(over.contains(" over"), "{over}");
+    }
+
+    /// The meter prints the three numbers the run's decisions are made of:
+    /// what the conversation weighs, the history budget it is measured
+    /// against (the cut), and the fold's trigger inside that budget — so the
+    /// human can see a fold or a cut coming. The window keeps its own number
+    /// beside them, marked `~` when it is the assumed one.
+    #[test]
+    fn the_context_meter_shows_the_budget_the_fold_and_the_window() {
+        let (mut app, _rx) = test_app("meter-marks");
+        app.cell.edit(|cfg| cfg.set_context(32_768));
+        let budget = app.cfg().history_budget();
+        let fold = mush_core::transcript::compaction_trigger(budget);
+        let used = app.chat.used_weight_for(AgentId::ROOT);
+        let meter = app.context_meter();
+
+        assert!(
+            meter.contains(&tokens_label(used / BYTES_PER_TOKEN)),
+            "what the conversation weighs: {meter}"
+        );
+        assert!(
+            meter.contains(&format!("/{}", tokens_label(budget / BYTES_PER_TOKEN))),
+            "the budget it is measured against: {meter}"
+        );
+        assert!(
+            meter.contains(&tokens_label(fold / BYTES_PER_TOKEN)),
+            "where the fold fires: {meter}"
+        );
+        assert!(
+            !meter.contains('~'),
+            "a window the human stated is not marked as derived: {meter}"
+        );
+        assert!(
+            meter.ends_with(&tokens_label(app.cfg().context_tokens)),
+            "the window's own number: {meter}"
+        );
     }
 
     /// Below the floor the screen is one notice, so a key whose effect the
