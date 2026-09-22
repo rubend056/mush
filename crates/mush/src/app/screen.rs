@@ -548,9 +548,9 @@ impl App {
 
         let label = self.cfg().label();
         let room = inner(transcript_area);
-        // One lookup of the focused node for the two facts the pane's activity
-        // line is built from: `busy` and `compacting` are projections of the
-        // same node, and asking the tree twice is one thing more to keep in
+        // One lookup of the focused node for the pane's activity line: what the
+        // run is doing is a projection of the same node the row beside the pane
+        // is built from, and asking the tree twice is one thing more to keep in
         // step (finding R9).
         let node = self.tree.node(self.tree.focused);
         let transcript = (room.height > 0 && room.width > 0).then(|| {
@@ -559,19 +559,14 @@ impl App {
             let width = (room.width as usize).min(MAX_TRANSCRIPT as usize);
             let pane = Pane {
                 agent: self.tree.focused,
-                // A run in flight is what the pane's own activity line is
-                // derived from, and the beat it counts its dots from is the one
-                // `App::tick` advanced.
-                //
-                // A run parked in a wait is *not* one: the foot's `working` may
-                // only claim a model call, and `wait` is not one — the
-                // agent is waiting for somebody else's result, and the row says
-                // so (`waiting on agents 3s`). Painting the working line over that
-                // was exactly the lie finding U7 named.
-                busy: node
-                    .map(|node| node.phase.is_busy() && node.phase.waiting().is_none())
-                    .unwrap_or(false),
-                compacting: node.and_then(|node| node.phase.compacting()),
+                // The run's own words, the same derivation the row paints
+                // (`phase_detail`): the foot can no longer spell a phase
+                // differently from the row, and a run parked in a `wait` gets a
+                // line naming what it waits on instead of the old silence
+                // (finding U7, superseded).
+                words: node.and_then(|node| node.phase.words()),
+                // The beat the foot counts its dots from is the one `App::tick`
+                // advanced.
                 spin: self.spin,
                 label: &label,
             };

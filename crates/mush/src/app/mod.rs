@@ -377,13 +377,14 @@ pub enum StatusKind {
 /// command, short enough that it never becomes furniture.
 const INFO_TTL: Duration = Duration::from_secs(5);
 
-/// How often the transcript foot's dots move: `working.`, `working..`,
-/// `working...`, one a second while anything is in flight.
+/// How often the transcript foot's dots move: `thinking.`, `thinking..`,
+/// `thinking...`, one a second while anything is in flight, with the run's own
+/// words ([`Phase::words`]) in front of them.
 ///
 /// The cadence *is* the animation. [`App::tick`] runs on the event loop's 30 ms
 /// poll — that is the heartbeat for the clock, the git snapshot and the lines
 /// that age off the screen — and an animation driven by it turned over thirty
-/// times a second: a flicker, not a pulse (`chat::working_dots`).
+/// times a second: a flicker, not a pulse (`chat::dotted`).
 const DOT_PERIOD: Duration = Duration::from_secs(1);
 
 /// What a stop key answers with when there is no work to stop.
@@ -567,8 +568,8 @@ pub struct App {
     term_height: u16,
     /// The beat the transcript foot's dots are on ([`DOT_PERIOD`]), and the
     /// clock that says when the next one is owed. [`App::tick`] advances it
-    /// while anything is in flight; the dots read it as `working.`,
-    /// `working..`, `working...`.
+    /// while anything is in flight; the dots read it as `thinking.`,
+    /// `thinking..`, `thinking...` — or the phase's own words in front of them.
     pub spin: u64,
     spin_at: Instant,
 }
@@ -8845,11 +8846,16 @@ mod tests {
         );
     }
 
-    /// A run parked in a wait is not a model call. The transcript foot's
-    /// working line may only claim work in flight, so `wait` must not paint
-    /// `working` over an agent that is waiting for a child's result — and the
-    /// row says what it is waiting for instead (finding U7), with an icon that
-    /// is not the working one (finding U14).
+    /// A run parked in a wait is not a model call, and it is not silent either:
+    /// the transcript foot says what the wait is on, in the row's own words
+    /// (`waiting on results.`), and never claims `working` while it is parked.
+    ///
+    /// Finding U7's ruling — `working` may not claim a model call that is not
+    /// happening — stands. Its mechanism (paint nothing) is superseded: a line
+    /// that says `waiting on results.` cannot be mistaken for a model call, and
+    /// the old silence made the pane tell a human less than the row beside it,
+    /// which has always named what it waits on. The `wait` noun is the same
+    /// derivation on all three surfaces (finding U14's glyph rides it too).
     #[test]
     fn a_waiting_agent_is_not_drawn_working() {
         let (mut app, _rx) = test_app("waiting-foot");
@@ -8859,9 +8865,14 @@ mod tests {
         app.tree.age(AgentId::ROOT, Duration::from_secs(5));
 
         let rows = screen(&mut app, 120, 32);
+        let painted = rows.join("\n");
         assert!(
-            !rows.join("\n").contains("working."),
-            "nothing is being computed, so nothing spins: {rows:?}"
+            painted.contains("waiting on results."),
+            "the foot says what the run waits on, in the row's own words: {rows:?}"
+        );
+        assert!(
+            !painted.contains("working."),
+            "and nothing claims a model call is in flight: {rows:?}"
         );
         let waiting = rows
             .iter()
@@ -8880,11 +8891,15 @@ mod tests {
         app.tree.begin(AgentId::ROOT, None);
         app.tree.age(AgentId::ROOT, Duration::from_secs(2));
         let rows = screen(&mut app, 120, 32);
+        let painted = rows.join("\n");
         assert!(
-            rows.iter().any(|row| row.contains("thinking 2s")),
-            "{rows:?}"
+            painted.contains("thinking 2s"),
+            "the row says the model has not answered: {rows:?}"
         );
-        assert!(rows.join("\n").contains("working."), "{rows:?}");
+        assert!(
+            painted.contains("thinking."),
+            "and the foot names that call the same way: {rows:?}"
+        );
         assert!(rows[0].contains("1 working"), "{}", rows[0]);
     }
 
@@ -10646,6 +10661,10 @@ mod tests {
                 .any(|row| row.contains("⊘ #0") && row.contains("cancelling")),
             "the row is where a cancel in flight is drawn: {rows:?}"
         );
+        assert!(
+            rows.join("\n").contains("cancelling."),
+            "and the foot says the same word, dots and all: {rows:?}"
+        );
     }
 
     /// The cancel mark lasts exactly as long as the cancel does: the actor
@@ -11411,7 +11430,9 @@ mod tests {
         });
         keep.push(rx);
 
-        // A run in flight, naming the tool it is running.
+        // A run in flight, naming the tool it is running — on the row and in the
+        // foot, in the same words, and never the old generic `working.` (the
+        // foot reads the same `Phase::words` the row does).
         let (mut run, rx) = test_app("sweep-run");
         begin_run(&mut run, AgentId::ROOT);
         run.on_agent(
@@ -11421,24 +11442,29 @@ mod tests {
         states.push(Sweep {
             name: "a run in flight",
             app: run,
-            words: vec!["◐ #0", "edit_file src/lib.rs", "working.", " chat "],
+            words: vec![
+                "◐ #0",
+                "edit_file src/lib.rs",
+                "edit_file src/lib.rs.",
+                " chat ",
+            ],
             roomy: vec![" agents · 1 working"],
-            absent: Vec::new(),
+            absent: vec!["working."],
             reopen: None,
         });
         keep.push(rx);
 
-        // A run parked on somebody else's result: the hourglass, and never the
-        // working icon or the foot's working line — the one state three surfaces
-        // read (finding U14). Painted at every size, because the glyph is a
-        // column the rows are fitted with.
+        // A run parked on somebody else's result: the hourglass, never the
+        // working icon, and a foot that *says* what the wait is on in the row's
+        // own words (finding U14; finding U7's silence superseded). Painted at
+        // every size, because the glyph is a column the rows are fitted with.
         let (mut waiting, rx) = test_app("sweep-waiting");
         begin_run(&mut waiting, AgentId::ROOT);
         waiting.on_agent(AgentId::ROOT, AgentEvent::Status("wait ".into()));
         states.push(Sweep {
             name: "a run parked in a wait",
             app: waiting,
-            words: vec!["⧗ #0", "waiting on results"],
+            words: vec!["⧗ #0", "waiting on results", "waiting on results."],
             roomy: vec![" agents · 1 waiting"],
             absent: vec!["◐ #0", "working."],
             reopen: None,
@@ -11469,22 +11495,30 @@ mod tests {
         });
         keep.push(rx);
 
-        // The three folds the tree can be doing, each in its own words. The
-        // transcript is left empty on purpose: at 40×10 a pane with messages
-        // protects its last row, and the foot that carries the fold's longer
-        // spelling is the row it protects it *from* — the existing fold test
-        // keeps the message case.
-        for (label, why, words) in [
-            ("sweep-fold-requested", Compacting::Requested, "compacting"),
+        // The three folds the tree can be doing, each in its own words on the
+        // row and in the foot (the foot's dots land behind the fold's sentence,
+        // never `working` over it). The transcript is left empty on purpose: at
+        // 40×10 a pane with messages protects its last row, and the foot that
+        // carries the fold's longer spelling is the row it protects it *from* —
+        // the existing fold test keeps the message case.
+        for (label, why, words, foot) in [
+            (
+                "sweep-fold-requested",
+                Compacting::Requested,
+                "compacting",
+                "compacting.",
+            ),
             (
                 "sweep-fold-parked",
                 Compacting::Parked,
                 "folding at the next step",
+                "folding at the next step.",
             ),
             (
                 "sweep-fold-nearly-full",
                 Compacting::NearlyFull,
                 "context nearly full",
+                "context nearly full — compacting.",
             ),
         ] {
             let (mut fold, rx) = test_app(label);
@@ -11492,9 +11526,9 @@ mod tests {
             states.push(Sweep {
                 name: "a fold",
                 app: fold,
-                words: vec!["≡ #0", words, "keep typing"],
+                words: vec!["≡ #0", words, foot, "keep typing"],
                 roomy: vec!["your message is answered after the fold"],
-                absent: Vec::new(),
+                absent: vec!["working."],
                 reopen: None,
             });
             keep.push(rx);
@@ -11681,8 +11715,9 @@ mod tests {
 
         // A busy root whose one message the pane protects at the smallest
         // sizes: the foot has no row there, so the frame must not claim hidden
-        // lines anywhere — a derived working line is not a line `/notes` can
-        // answer (finding V7).
+        // lines anywhere — a derived activity line is not a line `/notes` can
+        // answer (finding V7). The line the foot *would* paint is the phase's
+        // own word, not the old generic `working.`.
         let (mut spinner, rx) = test_app("sweep-spinner");
         spinner
             .chat
@@ -11692,7 +11727,7 @@ mod tests {
             name: "a working line with no foot row",
             app: spinner,
             words: vec!["◐ #0"],
-            roomy: vec!["working."],
+            roomy: vec!["thinking."],
             absent: vec!["more lines"],
             reopen: None,
         });
@@ -12095,7 +12130,7 @@ mod tests {
     }
 
     /// A derived line is not a hidden line: a busy agent with nothing written
-    /// about it must not claim `+1 more lines` for its own working line — a
+    /// about it must not claim `+1 more lines` for its own activity line — a
     /// count `/notes` cannot answer.
     #[test]
     fn the_sweep_never_counts_a_derived_line_as_hidden() {
@@ -12104,15 +12139,15 @@ mod tests {
             .push_message(AgentId::ROOT, Message::user("what is happening"));
         begin_run(&mut app, AgentId::ROOT);
         // At 40×10 the pane has one row of transcript, it protects it for the
-        // message, and the foot therefore has no row at all: the working line
+        // message, and the foot therefore has no row at all: the activity line
         // is not painted, and a pane that counted it would say so in its title.
         let text = shot(&mut app, 40, 10).text();
-        assert!(!text.contains("working."), "no row for it here: {text}");
+        assert!(!text.contains("thinking."), "no row for it here: {text}");
         assert!(
             !text.contains("more lines"),
             "a derived line is not a hidden line: {text}"
         );
-        // Where the foot has a row, the working line is painted and still
+        // Where the foot has a row, the activity line is painted and still
         // nothing is counted as hidden.
         for &(width, height) in SWEEP_SIZES {
             if is_below_floor(width, height) || (width, height) == (40, 10) {
@@ -12120,12 +12155,12 @@ mod tests {
             }
             let text = shot(&mut app, width, height).text();
             assert!(
-                text.contains("working."),
-                "the working line is the pane's activity at {width}×{height}: {text}"
+                text.contains("thinking."),
+                "the activity line is the pane's own words at {width}×{height}: {text}"
             );
             assert!(
                 !text.contains("more lines"),
-                "the working line is not a hidden line at {width}×{height}: {text}"
+                "the activity line is not a hidden line at {width}×{height}: {text}"
             );
         }
     }
