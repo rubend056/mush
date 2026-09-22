@@ -1535,6 +1535,31 @@ fn reasoning_rows(out: &mut Vec<Line<'static>>, message: &Message, width: usize)
     }
 }
 
+/// The rows a message's pictures get, one dim row each: `▣ path (format ·
+/// size)`, named exactly the way the box names an attachment.
+///
+/// Every arm that paints message rows calls this, and there is one copy of it
+/// because the reading must not depend on the role: a picture the human sent
+/// and a picture the model read — `read_file` hands a png back *inside the tool
+/// result*, so the turn that read it carries it — are one fact about a message.
+/// These rows used to live in the `"user"` arm alone, so a turn where the model
+/// looked at a screenshot read exactly like one where it did not, and the human
+/// had no way to tell the difference.
+///
+/// The row is the reading of the bytes the message still holds. A picture whose
+/// bytes are gone — the session writer turns them into one placeholder line in
+/// the text (`Message::drop_images`), and a transcript restored from
+/// `.mush/session.json` carries that line — is read there; this paints the ones
+/// that still have them.
+fn image_rows(out: &mut Vec<Line<'static>>, message: &Message) {
+    for image in &message.images {
+        out.push(Line::from(Span::styled(
+            format!("  ▣ {}", image_label(image)),
+            dim(),
+        )));
+    }
+}
+
 /// The rows of one marked line: the mark on the first row, its own width of
 /// blank under it, and the words wrapped *inside* the columns the mark leaves.
 ///
@@ -1668,20 +1693,11 @@ fn render_message(
             // of that mark as it is of every speaker's.
             let (mark, style) = voice.unwrap_or(Voice::Human).mark();
             // The mark is painted even for a message that is only an
-            // attachment: the `▣` rows below are *what* was said, and the mark
-            // is *who* said it. Without it, a picture the human sent would read
-            // exactly like a dim line of mush's own.
+            // attachment: the `▣` rows below are *what* was said, whoever said
+            // it, and the mark is *who* said it. Without it, a picture the
+            // human sent would read exactly like a dim line of mush's own.
             marked(out, mark, style, message.text(), width);
-            // The images of a live message, one dim row each, named the way the
-            // box names them: a picture whose bytes are gone (a trim, a saved
-            // session) is a placeholder in the text, and this is the reading of
-            // one that still has them.
-            for image in &message.images {
-                out.push(Line::from(Span::styled(
-                    format!("  ▣ {}", image_label(image)),
-                    dim(),
-                )));
-            }
+            image_rows(out, message);
             out.push(Line::from(""));
         }
         "assistant" => {
@@ -1710,6 +1726,7 @@ fn render_message(
                     Style::default().fg(Color::Yellow),
                 )));
             }
+            image_rows(out, message);
             out.push(Line::from(""));
         }
         "tool" => {
@@ -1750,6 +1767,7 @@ fn render_message(
                     style,
                 )));
             }
+            image_rows(out, message);
             out.push(Line::from(""));
         }
         _ => {}
@@ -2154,6 +2172,47 @@ mod tests {
         assert!(
             rows.iter().any(|row| row == "  ⚙ read_file src/a.rs"),
             "{rows:?}"
+        );
+    }
+
+    /// A message's pictures are named in the pane whatever said it. A `read_file`
+    /// that answers with a png carries it inside the tool *result*, and that
+    /// result painted its text and nothing about the picture — so a turn where
+    /// the model looked at a screenshot read exactly like one where it did not.
+    /// The row is the one the human's own attachment already got: a picture is a
+    /// picture whichever side of the turn read it.
+    #[test]
+    fn a_tool_result_carrying_a_picture_paints_its_row() {
+        let mut chat = Chat::bare();
+        let read = image("shots/a.png");
+        chat.push_message(
+            AgentId::ROOT,
+            Message::tool_with_images("call_1", "read shots/a.png", vec![read.clone()]),
+        );
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 8));
+        assert!(
+            rows.iter()
+                .any(|row| *row == format!("  ▣ {}", image_label(&read))),
+            "the model's own reading is named: {rows:?}"
+        );
+
+        // And the human's picture is still the row it was: one reading, not one
+        // per role.
+        let sent = image("shots/sent.png");
+        chat.push_message(
+            AgentId::ROOT,
+            Message::user_with_images("look", vec![sent.clone()]),
+        );
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 10));
+        assert!(
+            rows.iter()
+                .any(|row| *row == format!("  ▣ {}", image_label(&sent))),
+            "the human's message is unchanged: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| *row == format!("  ▣ {}", image_label(&read))),
+            "and both pictures are in one pane: {rows:?}"
         );
     }
 
