@@ -36,7 +36,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::Sender;
 use ratatui::crossterm::event::KeyEvent;
 
-use mush_core::config::vision_capable;
+use mush_core::config::{vision_capable, BYTES_PER_TOKEN};
 use mush_core::message::{Image, Message};
 use mush_core::{
     git, prompt, session, text::mask_key, userconfig, Config, Provider, Session, UserConfig,
@@ -1090,8 +1090,13 @@ impl App {
             .unwrap_or_else(|| "HEAD".to_string())
     }
 
-    /// The window in tokens, for the meter. The number is the conversation's,
-    /// not a copy of it: nothing can go stale between a push and a draw.
+    /// What the open conversation weighs in tokens — the unit the window is
+    /// stated in, divided once from the one sum. The meter works in the
+    /// budget's own bytes (`Chat::used_weight_for`, compared against
+    /// `history_budget`), so this is for callers that want the number in
+    /// tokens; either way it is derived on read, not counted beside the
+    /// transcript, so nothing can go stale between a push and a draw.
+    #[cfg(test)]
     pub fn context_used_tokens(&self) -> usize {
         self.chat.used_tokens_for(self.tree.focused)
     }
@@ -1471,6 +1476,15 @@ impl App {
                 // restart comes back with the same tree.
                 self.mark_session_dirty();
             }
+            AgentEvent::SystemPrompt(prompt) => {
+                // The actor built its own prompt — a child's names the workspace
+                // its tools resolve paths in — and the app weighs it for the
+                // meter and the attach gate (`Chat::used_weight_for`). It is not
+                // stored: a prompt names a workspace that may have moved, so a
+                // session leaves the system message out and the actor builds a
+                // fresh one on the way back in.
+                self.chat.learn_system(id, prompt);
+            }
             AgentEvent::Running { cancel } => {
                 // A run started, possibly one the UI did not ask for (an idle
                 // agent woken by a child's result). Mark it so `busy`, the
@@ -1779,27 +1793,42 @@ impl App {
         }
     }
 
-    /// How full the conversation in the open pane is, against the window it is
-    /// being sent to: `ctx 3.1k/500k`. The window alone says how much room there
-    /// is, never how much of it this conversation has taken — and the pane can
-    /// be a subagent's, whose own next request is what this number measures.
+    /// How full the conversation in the open pane is, against the number every
+    /// decision uses: `ctx 3.1k/6.4k (fold 5.8k) ~8k` — what this conversation
+    /// weighs against the history budget, where the fold's trigger sits inside
+    /// it, and the window itself. The pane can be a subagent's, whose own next
+    /// request is what this number measures.
     ///
-    /// At the window and past it there is no longer a fraction to print: a
+    /// The mark is the budget ([`mush_core::Config::history_budget`]): the
+    /// trimmer cuts a transcript past it, the fold fires at nine tenths of it
+    /// ([`mush_core::transcript::compaction_trigger`], printed at its own
+    /// place), and the attach gate measures its room from it. Comparing the
+    /// same `used` to the *window* instead made the marks unreachable in
+    /// normal operation: on the 8 K default the fold fires at ≈3.7k of the
+    /// budget, which the old meter read as 45 % — so `full` never happened,
+    /// and the human had no way to see a fold or a cut coming (the audit's
+    /// finding). The window keeps its own number, with the `~` that says it is
+    /// the assumed one, so what the budget is a reserve off stays visible.
+    ///
+    /// At the budget and past it there is no longer a fraction to print: a
     /// learned window can be smaller than the transcript already held, so the
     /// meter read `ctx 1.2k/1k` — a ratio greater than one with nothing saying
     /// so (finding P9). At the limit it says `full`; past it, it says `over`.
     pub fn context_meter(&self) -> String {
-        let used = self.context_used_tokens();
-        let window = self.cfg().context_tokens;
+        let budget = self.cfg().history_budget();
+        let fold = mush_core::transcript::compaction_trigger(budget);
+        let used = self.chat.used_weight_for(self.tree.focused);
         let mark = if self.cfg().context_explicit { "" } else { "~" };
-        let used_label = tokens_label(used);
-        let window_label = tokens_label(window);
-        let state = match used.cmp(&window) {
+        let used_label = tokens_label(used / BYTES_PER_TOKEN);
+        let budget_label = tokens_label(budget / BYTES_PER_TOKEN);
+        let fold_label = tokens_label(fold / BYTES_PER_TOKEN);
+        let window_label = tokens_label(self.cfg().context_tokens);
+        let state = match used.cmp(&budget) {
             std::cmp::Ordering::Greater => " over",
             std::cmp::Ordering::Equal => " full",
             std::cmp::Ordering::Less => "",
         };
-        format!("ctx {used_label}/{mark}{window_label}{state}")
+        format!("ctx {used_label}/{budget_label}{state} (fold {fold_label}) {mark}{window_label}")
     }
 
     /// The conversation this workspace was left holding could not be read, and
@@ -5138,24 +5167,70 @@ mod tests {
 
     /// Over-full is a real state — a learned window smaller than the transcript
     /// already held — and the meter must not print a ratio greater than one
-    /// with no mark (finding P9).
+    /// with no mark (finding P9). The mark is the history budget's, the number
+    /// every decision uses: at it `full`, past it `over`.
     #[test]
-    fn the_context_meter_says_full_and_over_at_the_window() {
+    fn the_context_meter_says_full_and_over_at_the_budget() {
         let (mut app, _rx) = test_app("meter-full");
-        // The smallest window the cell will hold, 1,024 tokens.
-        app.cell.edit(|cfg| cfg.set_context(1_024));
-        app.chat.insert(&"z".repeat(3_000));
-        app.send_message();
-        let used = app.context_used_tokens();
-        assert!(used > 1_024, "the message passed the window: {used}");
-        let over = app.context_meter();
-        assert!(over.ends_with(" over"), "{over}");
-
-        // Exactly at the window is `full`, not an over-full ratio.
-        app.cell.edit(|cfg| cfg.set_context(used));
+        app.cell.edit(|cfg| cfg.set_context(32_768));
+        let budget = app.cfg().history_budget();
+        let system = app.chat.system().weight();
+        // Exactly the budget: `full`, not an over-full ratio.
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message::user("x".repeat(budget - system - "user".len())),
+        );
+        assert_eq!(app.chat.used_weight_for(AgentId::ROOT), budget);
         let full = app.context_meter();
-        assert!(full.ends_with(" full"), "{full}");
+        assert!(full.contains(" full"), "{full}");
         assert!(!full.contains(" over"), "{full}");
+
+        // One byte past it: the trimmer will cut, and the meter says so. The
+        // transcript is still well inside the window this time — which is the
+        // point: the old meter compared the same number to the *window*, so it
+        // read this state as ordinary and the mark could not be reached in
+        // normal operation (the audit's finding).
+        app.chat.push_message(AgentId::ROOT, Message::user("!"));
+        assert!(app.chat.used_weight_for(AgentId::ROOT) > budget);
+        assert!(budget < app.cfg().context_tokens * BYTES_PER_TOKEN);
+        let over = app.context_meter();
+        assert!(over.contains(" over"), "{over}");
+    }
+
+    /// The meter prints the three numbers the run's decisions are made of:
+    /// what the conversation weighs, the history budget it is measured
+    /// against (the cut), and the fold's trigger inside that budget — so the
+    /// human can see a fold or a cut coming. The window keeps its own number
+    /// beside them, marked `~` when it is the assumed one.
+    #[test]
+    fn the_context_meter_shows_the_budget_the_fold_and_the_window() {
+        let (mut app, _rx) = test_app("meter-marks");
+        app.cell.edit(|cfg| cfg.set_context(32_768));
+        let budget = app.cfg().history_budget();
+        let fold = mush_core::transcript::compaction_trigger(budget);
+        let used = app.chat.used_weight_for(AgentId::ROOT);
+        let meter = app.context_meter();
+
+        assert!(
+            meter.contains(&tokens_label(used / BYTES_PER_TOKEN)),
+            "what the conversation weighs: {meter}"
+        );
+        assert!(
+            meter.contains(&format!("/{}", tokens_label(budget / BYTES_PER_TOKEN))),
+            "the budget it is measured against: {meter}"
+        );
+        assert!(
+            meter.contains(&tokens_label(fold / BYTES_PER_TOKEN)),
+            "where the fold fires: {meter}"
+        );
+        assert!(
+            !meter.contains('~'),
+            "a window the human stated is not marked as derived: {meter}"
+        );
+        assert!(
+            meter.ends_with(&tokens_label(app.cfg().context_tokens)),
+            "the window's own number: {meter}"
+        );
     }
 
     /// Below the floor the screen is one notice, so a key whose effect the
@@ -6866,7 +6941,10 @@ mod tests {
     }
 
     /// Opening mush is not a request. A restored agent comes back with its
-    /// transcript and its mailbox and does nothing until the human asks.
+    /// transcript and its mailbox and does nothing until the human asks — the
+    /// one thing it says at startup is the prompt its own history opens with
+    /// ([`AgentEvent::SystemPrompt`]), which is a fact about the history the
+    /// meter weighs, not a run.
     ///
     /// Reviving an agent by *running* it replayed every stored task against the
     /// endpoint the moment mush opened — thirteen agents, thirteen requests
@@ -6885,9 +6963,18 @@ mod tests {
         let (app, rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
 
         let seen = events_from(&rx, AgentId(2), Duration::from_millis(300));
+        let ran: Vec<&String> = seen
+            .iter()
+            .filter(|event| !event.starts_with("SystemPrompt("))
+            .collect();
         assert!(
-            seen.is_empty(),
-            "a restored agent must not run at startup: {seen:?}"
+            ran.is_empty(),
+            "a restored agent must not run at startup: {ran:?}"
+        );
+        assert_eq!(
+            seen.len(),
+            1,
+            "and its own prompt is the one thing it says: {seen:?}"
         );
         assert_eq!(
             app.tree.node(AgentId(2)).map(|node| node.phase.clone()),
@@ -10475,6 +10562,102 @@ mod tests {
             root,
             "the root's own number is unchanged by a child's"
         );
+    }
+
+    /// The note a trim hands the model is one the human reads too: the actor
+    /// emits it as a [`AgentEvent::Message`], and that road is the pane, the
+    /// meter and the file. Before, the sentence lived in the actor's list
+    /// alone, so the stored session and the number the human read were a note
+    /// short of what the model was told.
+    #[test]
+    fn the_dropped_turns_note_reaches_the_pane_and_the_session() {
+        let (mut app, _rx) = test_app("dropped-note");
+        let note = {
+            let mut messages = vec![
+                Message::system("you are mush"),
+                Message::user("first"),
+                Message::assistant("x".repeat(500)),
+                Message::user("second"),
+                Message::assistant("more"),
+                Message::user("third"),
+            ];
+            mush_core::transcript::trim_history(&mut messages, 300).expect("a trim that had to cut")
+        };
+
+        app.on_agent(AgentId::ROOT, AgentEvent::Message(note.clone()));
+
+        assert_eq!(
+            app.chat.transcript(AgentId::ROOT).last().map(Message::text),
+            Some(note.text()),
+            "the pane holds the sentence the model was given"
+        );
+        assert_eq!(
+            app.session_snapshot().messages.last().map(Message::text),
+            Some(note.text()),
+            "and a restart resumes with it"
+        );
+    }
+
+    /// One arithmetic per agent: the number `used_weight_for` returns is the
+    /// agent's **own** system prompt plus its transcript — the history its
+    /// actor sends.
+    ///
+    /// For the root that is the conversation the next `Run` hands the actor:
+    /// the root's prompt is the conversation's own. For a child it is the
+    /// prompt its actor published (only the actor that built it knows the
+    /// workspace it names, its depth and its isolation) plus everything the
+    /// child has said. The audit's blind spot: the old sum added the root's
+    /// prompt for *every* id — 3,247 B against a shared leaf's 1,634 — so a
+    /// focused leaf read 1,613 B ≈ 537 tokens heavier than the run it was
+    /// about, and a 4× prompt weight would have passed every meter test.
+    #[test]
+    fn an_agents_weight_is_its_own_prompt_plus_its_transcript() {
+        let (mut app, _rx) = test_app("own-prompt");
+        // The root: exactly the conversation the actor is handed.
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("x".repeat(300)));
+        let conversation: usize = app.chat.conversation().iter().map(Message::weight).sum();
+        assert_eq!(
+            app.chat.used_weight_for(AgentId::ROOT),
+            conversation,
+            "the root's number is the conversation it sends"
+        );
+
+        // A child: what its own actor published, plus the transcript it holds —
+        // its parent's brief as the opening line, and everything since.
+        let (child_root, _mailbox) = isolate_child(&mut app, 1);
+        assert_eq!(
+            app.chat.transcript(AgentId(1))[0].text(),
+            "task 1",
+            "the brief opens the child's transcript, as it opens the actor's history"
+        );
+        app.chat
+            .push_message(AgentId(1), Message::user("do the thing"));
+        let prompt = Message::system(prompt::subagent_prompt(
+            child_root.to_str().unwrap(),
+            1,
+            true,
+            1 < crate::agent::MAX_DEPTH,
+        ));
+        assert_ne!(
+            prompt.weight(),
+            app.chat.system().weight(),
+            "the child's prompt is not the root's; the test can tell them apart"
+        );
+        app.on_agent(AgentId(1), AgentEvent::SystemPrompt(prompt.clone()));
+
+        let transcript: usize = app
+            .chat
+            .transcript(AgentId(1))
+            .iter()
+            .map(Message::weight)
+            .sum();
+        assert_eq!(
+            app.chat.used_weight_for(AgentId(1)),
+            prompt.weight() + transcript,
+            "the child's number is its own prompt plus its transcript"
+        );
+        let _ = std::fs::remove_dir_all(child_root);
     }
 
     /// The facts line says how full the conversation is as well as how big the

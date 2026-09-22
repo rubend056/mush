@@ -299,18 +299,23 @@ pub fn sanitize_tool_calls(mut message: Message) -> Message {
 /// The one line a request carries when trimming had to drop the oldest turns:
 /// without it a model continues as if it held the whole conversation and can
 /// contradict a fact it "already read", with nothing to say why the fact is
-/// gone. The note travels in the request only — the vec [`trim_history`] trims
-/// is the actor's working copy, while the copy a session stores is the UI's,
-/// which learns a line only from an emitted [`Message`] event — so it is not
-/// accumulated in `.mush/session.json`.
+/// gone.
+///
+/// The sentence the model reads is one the human can read too: the call to
+/// [`trim_history`] that first adds the note returns it, and the actor emits it
+/// as a [`Message`] — the one road into the UI's copy — so the pane shows it,
+/// the session stores it, and the meter and the attach gate weigh it. Before,
+/// it lived in the actor's list alone: the pane, the file and the number the
+/// human reads were all one sentence short of what the model was told.
 ///
 /// It speaks in the user's voice, the voice mush's other out-of-band notes use
 /// (`COMPACT_INSTRUCTION`, `TRUNCATION_INSTRUCTION`, a folded completion): the
 /// assistant's would be a fabricated turn, and a thinking endpoint refuses a
 /// replayed assistant turn that carries no `reasoning_content`. [`trim_history`]
 /// keeps it out of the `user_indices` arithmetic, which counts user lines as
-/// turn boundaries.
-const DROPPED_TURNS_NOTE: &str = "\
+/// turn boundaries — and the pane must not paint it as the human's own words,
+/// so [`is_dropped_note`] is the one spelling of its shape for that reader too.
+pub const DROPPED_TURNS_NOTE: &str = "\
 The oldest turns of this conversation were dropped to fit the context window, \
 so this transcript is not the whole conversation: a fact you cannot find here \
 may have been dropped rather than never said.";
@@ -359,12 +364,24 @@ may have been dropped rather than never said.";
 /// number the loop is stopping at, and kept out of the draining below — a
 /// `user` line would otherwise read as a turn boundary — and a later drain
 /// replaces it along with the turns it was explaining.
-pub fn trim_history(messages: &mut Vec<Message>, budget: usize) {
-    // Whatever an earlier call left comes out first: the arithmetic below
-    // counts `user` lines as turns, and the note is not one.
-    let carried = messages.get(2).is_some_and(is_dropped_note);
+///
+/// A note the transcript already carries is *moved back* to its place rather
+/// than stacked, wherever the copy came from: the UI appends the line it is
+/// told to the end of its copy, and the actor's list is the one a request is
+/// built from, so a note sitting after the newest message would read as the
+/// newest thing said instead of as a statement about the front of the
+/// transcript ([`place_dropped_note`]).
+///
+/// The return is the note on the call that first adds it — the actor emits that
+/// one, so the UI's copy learns the sentence exactly once — and `None` when
+/// nothing was cut or the transcript already carried it.
+#[must_use]
+pub fn trim_history(messages: &mut Vec<Message>, budget: usize) -> Option<Message> {
+    // Whatever a copy of this transcript carried comes out first: the arithmetic
+    // below counts `user` lines as turns, and the note is not one.
+    let carried = messages.iter().any(is_dropped_note);
     if carried {
-        messages.remove(2);
+        messages.retain(|message| !is_dropped_note(message));
     }
     let note = Message::user(DROPPED_TURNS_NOTE);
     let target = trim_target(budget);
@@ -417,16 +434,44 @@ pub fn trim_history(messages: &mut Vec<Message>, budget: usize) {
         dropped = true;
     }
     if carried || dropped {
-        // Where the dropped turns were: after the system prompt and the
-        // opening task, before the oldest turn that was kept.
-        messages.insert(2, note);
+        insert_dropped_note(messages);
     }
+    (dropped && !carried).then_some(note)
+}
+
+/// Put a carried note back where the dropped turns were, instead of leaving it
+/// where a copy of the transcript left it.
+///
+/// The UI's copy is the one that needs this: a line reaches it by an emitted
+/// [`Message`], which appends, so the human's copy holds the note at the end —
+/// while the actor's list is what a request is built from, and a note *after*
+/// the newest message reads as the newest thing said rather than as a statement
+/// about the front of the transcript. A transcript with no note is left exactly
+/// as it is; one carrying several (a file no version of mush wrote) is left
+/// with one, in the note's own place.
+pub fn place_dropped_note(messages: &mut Vec<Message>) {
+    if !messages.iter().any(is_dropped_note) {
+        return;
+    }
+    messages.retain(|message| !is_dropped_note(message));
+    insert_dropped_note(messages);
+}
+
+/// Where the dropped turns were: after the system prompt and the opening task,
+/// before the oldest turn that was kept — index 2 in the system+task shape a
+/// request has, and the end of a shorter one. One spelling, so the trim that
+/// places the note and the copy that puts it back cannot disagree.
+fn insert_dropped_note(messages: &mut Vec<Message>) {
+    let at = 2.min(messages.len());
+    messages.insert(at, Message::user(DROPPED_TURNS_NOTE));
 }
 
 /// Whether a message is the note [`trim_history`] leaves behind when it drops
-/// turns. One shape, compared in the one place that has to tell the note from
-/// a turn.
-fn is_dropped_note(message: &Message) -> bool {
+/// turns. One shape, compared by the two places that have to tell the note from
+/// a turn: the trimmer — whose arithmetic counts `user` lines as turn
+/// boundaries — and the pane, which paints it in mush's voice rather than the
+/// human's.
+pub fn is_dropped_note(message: &Message) -> bool {
     message.role == "user" && message.text() == DROPPED_TURNS_NOTE
 }
 
@@ -535,7 +580,7 @@ mod tests {
         );
         let before = serde_json::to_string(&messages).unwrap();
 
-        trim_history(&mut messages, budget);
+        let _ = trim_history(&mut messages, budget);
 
         assert_eq!(
             serde_json::to_string(&messages).unwrap(),
@@ -555,7 +600,7 @@ mod tests {
         let before: usize = messages.iter().map(Message::weight).sum();
         assert!(before > budget, "the fixture is over the ceiling: {before}");
 
-        trim_history(&mut messages, budget);
+        let _ = trim_history(&mut messages, budget);
 
         let after: usize = messages.iter().map(Message::weight).sum();
         assert!(
@@ -592,7 +637,7 @@ mod tests {
             assert_eq!(total, budget + extra, "the fixture lands on the boundary");
 
             let before = serde_json::to_string(&messages).unwrap();
-            trim_history(&mut messages, budget);
+            let _ = trim_history(&mut messages, budget);
 
             if extra == 0 {
                 assert_eq!(
@@ -628,7 +673,7 @@ mod tests {
         let over: usize = messages.iter().map(Message::weight).sum();
         assert!(over > budget, "the fixture is over the ceiling: {over}");
 
-        trim_history(&mut messages, budget);
+        let _ = trim_history(&mut messages, budget);
         let cut: usize = messages.iter().map(Message::weight).sum();
         assert!(cut <= target, "the cut stops at four fifths: {cut}");
 
@@ -648,7 +693,7 @@ mod tests {
         // The trim before the fold would leave the grown transcript alone: it
         // is inside the ceiling, and the stopping point is not a trigger.
         let grown_before = serde_json::to_string(&messages).unwrap();
-        trim_history(&mut messages, budget);
+        let _ = trim_history(&mut messages, budget);
         assert_eq!(
             serde_json::to_string(&messages).unwrap(),
             grown_before,
@@ -663,7 +708,7 @@ mod tests {
             "the story so far",
         )));
         let folded = serde_json::to_string(&messages).unwrap();
-        trim_history(&mut messages, budget);
+        let _ = trim_history(&mut messages, budget);
         assert_eq!(
             serde_json::to_string(&messages).unwrap(),
             folded,
@@ -681,7 +726,7 @@ mod tests {
         }
         // A budget in the range an 8K-context window's own lands in; the drain
         // is what this test is about.
-        trim_history(&mut messages, 15_000);
+        let _ = trim_history(&mut messages, 15_000);
         assert_eq!(messages[0].role, "system");
         assert!(messages.iter().map(Message::weight).sum::<usize>() <= trim_target(15_000));
         // The first kept entry must be a user message so pairs stay valid.
@@ -693,7 +738,7 @@ mod tests {
     #[test]
     fn trim_history_terminates_on_a_system_less_transcript() {
         let mut messages = vec![Message::user("a"), Message::user("b"), Message::user("c")];
-        trim_history(&mut messages, 0);
+        let _ = trim_history(&mut messages, 0);
         assert_eq!(
             messages.len(),
             3,
@@ -724,12 +769,16 @@ mod tests {
     /// A drain is not silent: the request carries one line saying the oldest
     /// turns were dropped, where they used to be — after the system prompt and
     /// the opening task — so a model cannot read a fact out of a transcript
-    /// that no longer holds it.
+    /// that no longer holds it. The call returns that line, which is how the
+    /// actor tells the UI what the model was handed.
     #[test]
     fn a_trimmed_request_says_the_oldest_turns_were_dropped() {
         let mut messages = long_transcript(50);
-        trim_history(&mut messages, 8_000);
+        let told = trim_history(&mut messages, 8_000)
+            .expect("the call that adds the note returns it for the UI");
 
+        assert_eq!(told.text(), DROPPED_TURNS_NOTE);
+        assert_eq!(told.role, "user");
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].role, "user", "the opening task survives");
         assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE);
@@ -746,11 +795,12 @@ mod tests {
 
     /// A second drain on the same transcript replaces the line and keeps its
     /// place: a long run carries exactly one note about what it lost, never a
-    /// pile of them.
+    /// pile of them. Nothing new is returned the second time — the note the
+    /// human was already told is not news again.
     #[test]
     fn a_second_drain_replaces_the_note_instead_of_stacking_it() {
         let mut messages = long_transcript(50);
-        trim_history(&mut messages, 8_000);
+        assert!(trim_history(&mut messages, 8_000).is_some());
         assert_eq!(note_count(&messages), 1);
 
         for i in 50..100 {
@@ -758,7 +808,10 @@ mod tests {
             messages.push(Message::tool(format!("call{i}"), "result"));
             messages.push(Message::user(format!("again {i}")));
         }
-        trim_history(&mut messages, 8_000);
+        assert!(
+            trim_history(&mut messages, 8_000).is_none(),
+            "the note was already rendered; the human reads it once"
+        );
         assert_eq!(note_count(&messages), 1, "replaced, not stacked");
         assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE, "and still in place");
         assert_eq!(messages[1].role, "user");
@@ -770,15 +823,68 @@ mod tests {
     #[test]
     fn a_note_is_carried_when_a_later_trim_can_cut_no_further() {
         let mut messages = long_transcript(50);
-        trim_history(&mut messages, 8_000);
+        assert!(trim_history(&mut messages, 8_000).is_some());
         assert_eq!(note_count(&messages), 1);
         // Below the minimum shape's own weight: the drain reaches system +
         // task + one turn and stops, and the note has to survive that.
-        trim_history(&mut messages, 0);
+        assert!(trim_history(&mut messages, 0).is_none());
         assert_eq!(note_count(&messages), 1, "kept, not lost or stacked");
         assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE);
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].role, "user");
+    }
+
+    /// A transcript that lost turns says so once, and a copy of it that came
+    /// back with the note at the end — the place the UI appends what it is
+    /// told — gets it moved back where the dropped turns were, not stacked
+    /// beside it. A note after the newest message would read as the newest
+    /// thing said rather than as a statement about the front of the transcript.
+    #[test]
+    fn a_note_that_came_back_is_put_in_its_place() {
+        let mut messages = long_transcript(50);
+        let _ = trim_history(&mut messages, 8_000);
+        let note = messages.remove(2);
+        messages.push(note);
+        assert_eq!(note_count(&messages), 1, "the UI's copy holds one too");
+
+        // Over the ceiling again: the drain runs and the carried note is
+        // normalized, and the call has nothing new to tell the UI.
+        for i in 50..100 {
+            messages.push(Message::assistant(format!("reply {i} {}", "x".repeat(500))));
+            messages.push(Message::tool(format!("call{i}"), "result"));
+            messages.push(Message::user(format!("again {i}")));
+        }
+        assert!(trim_history(&mut messages, 8_000).is_none());
+        assert_eq!(note_count(&messages), 1, "moved, not stacked");
+        assert_eq!(
+            messages[2].text(),
+            DROPPED_TURNS_NOTE,
+            "where the dropped turns were"
+        );
+    }
+
+    /// The note's place is one spelling, shared by the trim that puts it there
+    /// and the copy that puts it back: after the system prompt and the opening
+    /// task. A transcript with no note is untouched, and one carrying several
+    /// (a file no version of mush wrote) is left with one.
+    #[test]
+    fn place_dropped_note_puts_it_after_the_opening_task() {
+        let mut untouched = vec![Message::system("you are mush"), Message::user("task")];
+        let before = serde_json::to_string(&untouched).unwrap();
+        place_dropped_note(&mut untouched);
+        assert_eq!(serde_json::to_string(&untouched).unwrap(), before);
+
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("task"),
+            Message::assistant("working"),
+            Message::user(DROPPED_TURNS_NOTE),
+            Message::user(DROPPED_TURNS_NOTE),
+        ];
+        place_dropped_note(&mut messages);
+        assert_eq!(note_count(&messages), 1, "one note, however many came back");
+        assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE);
+        assert_eq!(messages[3].text(), "working");
     }
 
     /// Nothing dropped means nothing said: a transcript that already fits is
@@ -788,11 +894,11 @@ mod tests {
     fn an_untouched_transcript_carries_no_note() {
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
         let before = serde_json::to_string(&messages).unwrap();
-        trim_history(&mut messages, 10_000);
+        assert!(trim_history(&mut messages, 10_000).is_none());
         assert_eq!(serde_json::to_string(&messages).unwrap(), before);
 
         let mut messages = vec![Message::user("a"), Message::user("b"), Message::user("c")];
-        trim_history(&mut messages, 0);
+        assert!(trim_history(&mut messages, 0).is_none());
         assert_eq!(messages.len(), 3, "nothing can be trimmed without a pair");
         assert_eq!(note_count(&messages), 0);
 
@@ -804,7 +910,7 @@ mod tests {
             Message::assistant("done"),
             Message::user("x".repeat(10_000)),
         ];
-        trim_history(&mut messages, 100);
+        assert!(trim_history(&mut messages, 100).is_none());
         assert_eq!(messages.len(), 4);
         assert_eq!(note_count(&messages), 0);
     }
@@ -858,7 +964,7 @@ mod tests {
             "the fixture is over the ceiling because of the picture, not the words"
         );
 
-        trim_history(&mut messages, budget);
+        let _ = trim_history(&mut messages, budget);
 
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].text(), "first", "the opening task survives");
@@ -899,7 +1005,7 @@ mod tests {
                     .push(picture(&format!("shots/{i}.png"), 200, 200, 300));
             }
         }
-        trim_history(&mut messages, 8_000);
+        let _ = trim_history(&mut messages, 8_000);
 
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].text(), "first", "the opening task survives");
@@ -940,7 +1046,7 @@ mod tests {
         let budget = 12_000;
         assert!(messages.iter().map(Message::weight).sum::<usize>() > budget);
 
-        trim_history(&mut messages, budget);
+        let _ = trim_history(&mut messages, budget);
 
         assert_eq!(messages[1].text(), "first", "the opening task survives");
         assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE);
@@ -985,7 +1091,7 @@ mod tests {
         );
         let before = serde_json::to_string(&messages).unwrap();
 
-        trim_history(&mut messages, budget);
+        let _ = trim_history(&mut messages, budget);
 
         assert_eq!(
             serde_json::to_string(&messages).unwrap(),
@@ -1036,7 +1142,7 @@ mod tests {
             compaction_trigger(budget)
         );
 
-        trim_history(&mut messages, budget);
+        let _ = trim_history(&mut messages, budget);
 
         assert_eq!(
             messages.last().unwrap().images.len(),
@@ -1076,7 +1182,7 @@ mod tests {
         });
         let before = messages.len();
 
-        trim_history(&mut messages, 1_000);
+        let _ = trim_history(&mut messages, 1_000);
 
         assert!(
             messages.len() < before,

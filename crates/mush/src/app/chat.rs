@@ -50,6 +50,7 @@ use unicode_width::UnicodeWidthStr;
 use mush_core::message::{Image, Message};
 use mush_core::session;
 use mush_core::text::{truncate, wrap_text, wrap_text_capped};
+use mush_core::transcript;
 
 use crate::agent::summarize_args;
 use crate::app::image_label;
@@ -388,6 +389,20 @@ pub struct Chat {
     /// the session — it names a workspace that may have moved — so it lives
     /// here, next to the transcript it opens.
     system: Message,
+    /// Each *subagent's* own system prompt, keyed by id: the prompt its actor
+    /// was built with, published once per actor ([`AgentEvent::SystemPrompt`]).
+    ///
+    /// The root's is `system` above. A child's cannot be rebuilt here: it names
+    /// the workspace the child's own tools resolve paths in, its depth, and
+    /// whether it is isolated — facts decided where the child is built, and a
+    /// second derivation here would be a second answer to "which prompt does
+    /// this agent send". The audit measured what that cost while the root's
+    /// prompt stood in for every agent: 3,247 B against a shared leaf's 1,634,
+    /// so a focused leaf's meter read 1,613 B ≈ 537 tokens heavier than the
+    /// history its actor sends. An agent whose actor has not published one
+    /// weighs no prompt: the number is the actor's fact, not this table's
+    /// guess.
+    systems: HashMap<AgentId, Message>,
     /// The root conversation: what the chat pane shows by default, what the
     /// root actor is sent, and what the context meter weighs.
     root: Vec<Message>,
@@ -459,6 +474,7 @@ impl Chat {
     pub fn new(system: Message, root: Vec<Message>) -> Self {
         Self {
             system,
+            systems: HashMap::new(),
             root,
             agents: HashMap::new(),
             notices: Vec::new(),
@@ -516,6 +532,31 @@ impl Chat {
         &self.system
     }
 
+    /// `id`'s actor says what its own history opens with: the prompt it was
+    /// built with, and the one every request it sends starts from.
+    ///
+    /// One writer, one reader: the actor emits it ([`AgentEvent::SystemPrompt`]
+    /// when its thread is built) and [`Self::used_weight_for`] weighs it. It is
+    /// not stored in the session — a prompt names a workspace that may have
+    /// moved, so `session_snapshot` leaves a child's system message out of what
+    /// it stores and the actor builds a fresh one on the way back in
+    /// (`agent::revive`).
+    pub fn learn_system(&mut self, id: AgentId, prompt: Message) {
+        self.systems.insert(id, prompt);
+    }
+
+    /// The system prompt `id`'s history opens with: the root's own, or the one
+    /// the agent's actor published. `None` is "no actor has said yet" — the
+    /// root never has to (its prompt is the conversation's) and a child's actor
+    /// says it before its first run.
+    fn system_for(&self, id: AgentId) -> Option<&Message> {
+        if id == AgentId::ROOT {
+            Some(&self.system)
+        } else {
+            self.systems.get(&id)
+        }
+    }
+
     /// The root conversation exactly as the actor wants it: the system prompt
     /// first, then what has been said.
     pub fn conversation(&self) -> Vec<Message> {
@@ -551,7 +592,7 @@ impl Chat {
             let index = self.transcript(agent).len();
             let voice = match self.pending.take() {
                 Some(words) if words == message.text().trim() => Voice::Human,
-                _ => elsewhere(agent, index, message.text()),
+                _ => elsewhere(agent, index, &message),
             };
             if voice != Voice::Human {
                 self.spoken.entry(agent).or_default().insert(index, voice);
@@ -597,7 +638,7 @@ impl Chat {
                 .get(&agent)
                 .and_then(|voices| voices.get(&index))
                 .copied()
-                .unwrap_or_else(|| unrecorded(agent, index, message.text())),
+                .unwrap_or_else(|| unrecorded(agent, index, message)),
         )
     }
 
@@ -606,20 +647,38 @@ impl Chat {
     ///
     /// Derived on read, per agent, and never counted beside the transcript:
     /// there is no push site left to forget, and the human's own words weigh as
-    /// soon as they are in the transcript they are in (finding B8). Per agent
-    /// because the pane a human is looking at can be a subagent's, and its own
-    /// next request is what this number measures.
+    /// soon as they are in the transcript they are in (finding B8). The meter
+    /// itself reads the bytes ([`Self::used_weight_for`], against the history
+    /// budget, whose boundary is one byte); this is the same sum in the unit a
+    /// window is stated in, for a reader that wants that number on its own.
+    #[cfg(test)]
     pub fn used_tokens_for(&self, id: AgentId) -> usize {
         self.used_weight_for(id) / mush_core::config::BYTES_PER_TOKEN
     }
 
-    /// The same sum in the budget's own currency: the system prompt plus one
-    /// agent's transcript, weighed the one way [`mush_core::transcript::trim_history`]
-    /// weighs them. Split out of [`Self::used_tokens_for`] so a caller that
-    /// needs the number in bytes — the attach gate, asking how much room a
-    /// picture has left — reads the same sum the meter divides instead of
-    /// adding the two up again (two spellings of one arithmetic is how the
-    /// budget and the meter drift apart).
+    /// The same sum in the budget's own currency: one agent's **own** system
+    /// prompt plus its transcript, weighed the one way
+    /// [`mush_core::transcript::trim_history`] weighs them. Split from the
+    /// token spelling of the same sum so a caller that needs the number in
+    /// bytes — the attach gate, asking how much room a picture has left, and
+    /// the meter, comparing against the byte boundary every decision uses —
+    /// reads the one sum instead of adding the parts up again (two spellings
+    /// of one arithmetic is how the budget and the meter drift apart).
+    ///
+    /// The prompt is the agent's own: the root's is the conversation's
+    /// ([`Self::system`], which the root actor is handed with every run), and a
+    /// child's is the one its actor published ([`Self::learn_system`]) — a
+    /// child's prompt names the child's own workspace, so only the actor that
+    /// built it can say what it weighs. An agent whose prompt has not been
+    /// published, or that has no transcript at all, weighs nothing.
+    ///
+    /// The pane's copy can be heavier than the actor's list, and that is
+    /// deliberate: a trim drops turns the pane keeps — the pane is the human's
+    /// record of the conversation, and the dropped-turns note is in both — and
+    /// a shed replaces a result in the actor's list while the pane still shows
+    /// what the tool produced. The difference is one-directional: the actor's
+    /// list is never the heavier of the two, so the room the attach gate
+    /// computes is never larger than the room the next request has.
     pub fn used_weight_for(&self, id: AgentId) -> usize {
         let transcript = if id == AgentId::ROOT {
             &self.root
@@ -629,7 +688,8 @@ impl Chat {
                 None => return 0,
             }
         };
-        self.system.weight().saturating_add(
+        let prompt = self.system_for(id).map_or(0, Message::weight);
+        prompt.saturating_add(
             transcript
                 .iter()
                 .map(Message::weight)
@@ -645,6 +705,7 @@ impl Chat {
     pub fn clear(&mut self) {
         self.root.clear();
         self.agents.clear();
+        self.systems.clear();
         self.notices.clear();
         self.reading.clear();
         self.spoken.clear();
@@ -702,6 +763,7 @@ impl Chat {
     /// reads is not this method's to empty.
     pub fn forget(&mut self, agent: AgentId) {
         self.agents.remove(&agent);
+        self.systems.remove(&agent);
         self.spoken.remove(&agent);
         self.revisions.remove(&agent);
         self.reading.remove(&agent);
@@ -1633,16 +1695,18 @@ const LOOP_STOP: &str = "the run was stopped as a loop";
 /// Who said a user line when nothing recorded it: a transcript restored from the
 /// session file, or the one a fold just replaced. Everything mush writes into a
 /// conversation has a shape — a child's `#1 done: …` / `#1 stopped: …` /
-/// `#1 failed: …`, a job's `#c2 done: …`, a fold's carried summary — and a child's
-/// transcript opens with the brief its parent spawned it with. What is left is
-/// the human's, because that is what most of a transcript is.
+/// `#1 failed: …`, a job's `#c2 done: …`, a fold's carried summary, the line
+/// that says the oldest turns were dropped ([`transcript::is_dropped_note`]) —
+/// and a child's transcript opens with the brief its parent spawned it with.
+/// What is left is the human's, because that is what most of a transcript is.
 ///
 /// The one line this cannot place is a parent's steering after a restart: the
 /// words look exactly like the human's own nudge, and nothing in the file says
 /// which they were. It reads as the human's until the process is new again —
 /// the alternative would be painting the human's question as somebody else's.
-fn unrecorded(agent: AgentId, index: usize, text: &str) -> Voice {
-    if report(text) || text.starts_with(FOLDED) {
+fn unrecorded(agent: AgentId, index: usize, message: &Message) -> Voice {
+    let text = message.text();
+    if report(text) || text.starts_with(FOLDED) || transcript::is_dropped_note(message) {
         return Voice::Mush;
     }
     if agent != AgentId::ROOT && index == 0 {
@@ -1654,8 +1718,8 @@ fn unrecorded(agent: AgentId, index: usize, text: &str) -> Voice {
 /// Who said a line that is known *not* to be the human's: [`unrecorded`] read at
 /// the one moment the answer is certain, so what it cannot place is another
 /// agent — a parent's steering, the only other speaker a transcript has.
-fn elsewhere(agent: AgentId, index: usize, text: &str) -> Voice {
-    match unrecorded(agent, index, text) {
+fn elsewhere(agent: AgentId, index: usize, message: &Message) -> Voice {
+    match unrecorded(agent, index, message) {
         Voice::Human => Voice::Parent,
         voice => voice,
     }
@@ -2617,6 +2681,32 @@ mod tests {
             rows.iter().filter(|row| row.contains("you ›")).count(),
             1,
             "only the human's own words carry the human's voice: {rows:?}"
+        );
+    }
+
+    /// The line that says the oldest turns were dropped is mush's, not the
+    /// human's: it reaches the pane through the same `Message` road every line
+    /// takes, and a human reading `you ›` over it would think they said it —
+    /// while the model was told it by mush.
+    #[test]
+    fn the_dropped_turns_note_reads_as_mushs_line() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::user(transcript::DROPPED_TURNS_NOTE));
+        say(&mut chat, AgentId::ROOT, "a question of my own");
+
+        let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 12));
+        let note_rows: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.contains("oldest turns"))
+            .collect();
+        assert!(!note_rows.is_empty(), "the note is painted: {rows:?}");
+        assert!(
+            note_rows.iter().all(|row| row.starts_with("· ")),
+            "in mush's voice, not the human's: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row == "you › a question of my own"),
+            "and the human keeps their own: {rows:?}"
         );
     }
 

@@ -27,8 +27,8 @@ use mush_core::message::{ChatRequest, ChatResponse};
 use mush_core::text::{first_line, sanitize, truncate, truncate_flag};
 use mush_core::tools::ToolName;
 use mush_core::transcript::{
-    needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, trim_target,
-    COMPACT_INSTRUCTION, COMPACT_REPLY_TOKENS,
+    needs_compaction, place_dropped_note, repair_tool_pairs, sanitize_tool_calls, trim_history,
+    trim_target, COMPACT_INSTRUCTION, COMPACT_REPLY_TOKENS,
 };
 use mush_core::workspace::{truncate_for_model, SEARCH_FILE_CAP};
 use mush_core::{prompt, tools, Config, Image, Message, Workspace, CMD_TIMEOUT_SECS};
@@ -673,6 +673,19 @@ pub enum AgentEvent {
         title: Option<String>,
         cmd: Sender<AgentMsg>,
     },
+    /// The prompt this agent's history *opens with*, as its actor built it —
+    /// emitted by the actor itself, before its thread runs, so an agent the UI
+    /// only ever learns about through its events still says it.
+    ///
+    /// A subagent's prompt names the workspace its own tools resolve paths in,
+    /// its depth and whether it is isolated; those are decided where the child
+    /// is built, so the app cannot rebuild the prompt without a second spelling
+    /// of the rules — and the agent's weight, the number the meter prints and
+    /// the attach gate reads, is its own prompt plus its transcript
+    /// ([`Chat::used_weight_for`](crate::app::Chat::used_weight_for)). The root
+    /// never emits this: its prompt is the conversation's own and travels with
+    /// every [`Run`](AgentMsg::Run) the UI hands it.
+    SystemPrompt(Message),
     /// A run began — including one the UI did not ask for, because an idle
     /// agent was woken by a child's result. Keeps `busy` and the tree honest.
     /// `cancel` is this run's flag, and the UI keeps a clone: it is the one the
@@ -1466,6 +1479,14 @@ fn tell_parent(ctx: &AgentCtx, id: u64, parent_tx: Option<&Sender<AgentMsg>>, co
 fn start(actor: Actor, initial: Vec<Message>, start_immediately: bool) {
     let id = actor.id;
     let ctx = actor.ctx.clone();
+    // The prompt this actor's history opens with is published before the thread
+    // runs: it is what the app weighs for this agent (`Chat::learn_system`),
+    // and only the actor that built it knows it — a child's prompt names its
+    // own workspace. The root's history arrives with the UI's first `Run` and
+    // is empty here, so there is nothing to publish for it.
+    if let Some(prompt) = initial.first().filter(|message| message.role == "system") {
+        ctx.emit(id, AgentEvent::SystemPrompt(prompt.clone()));
+    }
     let parent_tx = actor.parent_tx.clone();
     let builder = std::thread::Builder::new().name(format!("mush-agent-{id}"));
     if let Err(error) = builder.spawn(move || actor_main(actor, initial, start_immediately)) {
@@ -1728,6 +1749,13 @@ fn fold_parked(
 /// travels in; one helper, so no door can repair differently from another.
 fn adopted(mut messages: Vec<Message>) -> Vec<Message> {
     repair_tool_pairs(&mut messages);
+    // The copy can also carry the dropped-turns note, in the one place the UI
+    // puts what it is told: the end. The actor's list is what a request is
+    // built from, so the note goes back where the dropped turns were before
+    // anything reads it — the fold included, whose own request must carry the
+    // sentence where the model expects a statement about the transcript's
+    // front (`mush_core::transcript::place_dropped_note`).
+    place_dropped_note(&mut messages);
     messages
 }
 
@@ -2232,6 +2260,14 @@ fn fold_does_not_fit_line(cfg: &Config, prompt_tokens: usize, cap: u32) -> Strin
 /// What a tool result says when the window took its bytes. The call is still
 /// answered — a dangling call is a shape a strict server rejects — and the road
 /// back is the tools' own: the same output is one narrower call away.
+///
+/// The rewrite lands in the *actor's* copy, so every later request in this
+/// conversation says what happened to the result. The UI's copy — the pane and
+/// the session file — keeps what the tool produced: that is the human's record,
+/// and the difference is deliberate and one-directional, the request the lighter
+/// of the two (see [`Chat::used_weight_for`](crate::app::Chat::used_weight_for)).
+/// Nothing is silent about it either: the run emits one line naming how many
+/// results went and how many bytes they gave back.
 const SHED_RESULT_NOTE: &str = "\
 [mush: this result was dropped to fit the window — the call it answers is not lost; ask again in \
 a smaller piece (a narrower command, a smaller read) if you need the output]";
@@ -2245,7 +2281,8 @@ a smaller piece (a narrower command, a smaller read) if you need the output]";
 /// never ahead of it. "The newest turn" is everything after the last user
 /// message, which is also the part [`trim_history`] can never cut, so this is
 /// the room the last resort has left. Largest first: the fewest results pay for
-/// the room, and each one says in its own text what happened to it.
+/// the room, and each one says in its own text what happened to it — in this
+/// actor's copy, while the pane keeps the output (see [`SHED_RESULT_NOTE`]).
 fn shed_newest_results(messages: &mut [Message], budget: usize) -> (usize, usize) {
     let start = messages
         .iter()
@@ -2424,7 +2461,16 @@ fn run_loop(
         // stops, not where it starts — and then cuts down to `trim_target`,
         // four fifths, so the tenth below the fold's trigger is room the next
         // growth is folded in rather than cut.
-        trim_history(messages, budget);
+        //
+        // A cut is not silent, and the sentence is not the actor's alone: the
+        // note the request now opens with is emitted, so the pane shows what
+        // the model was told, the session stores it, and the meter and the
+        // attach gate weigh it ([`AgentEvent::Message`] is the one road into
+        // the UI's copy). `trim_history` returns it on the call that adds it
+        // and `None` on every later one, so the human reads it once.
+        if let Some(note) = trim_history(messages, budget) {
+            actor.ctx.emit(actor.id, AgentEvent::Message(note));
+        }
 
         // Nothing goes over the wire over the window's budget, and
         // `trim_history` is not the last hand that can make room: it cannot cut
@@ -7894,6 +7940,70 @@ mod tests {
                 later.weight()
             );
         }
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A trim is not silent to the human either: the note the request opens
+    /// with is emitted as a [`AgentEvent::Message`], the one road into the UI's
+    /// copy, so the pane and the session hold the sentence the model was given.
+    /// Before, only the actor's list carried it — the human's number, the
+    /// pane's transcript and the stored file were all one sentence short of
+    /// what the model was told.
+    #[test]
+    fn a_trim_emits_the_note_the_model_was_given() {
+        let scripted = Arc::new(Scripted::new().says("carried on"));
+        let (actor, events, _mailbox) = build_actor_about(
+            "trim-note",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let budget = test_cfg().config().unwrap().history_budget();
+        // The shape a long run builds: the opening pair and then turns, over
+        // the ceiling so the drain has to cut.
+        let mut messages = vec![Message::system("you are mush"), Message::user("first")];
+        for i in 0..50 {
+            messages.push(Message::assistant(format!("reply {i} {}", "x".repeat(500))));
+            messages.push(Message::tool(format!("call{i}"), "result"));
+            messages.push(Message::user(format!("again {i}")));
+        }
+        let before: usize = messages.iter().map(Message::weight).sum();
+        assert!(before > budget, "the shape is over the window: {before}");
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("carried on"));
+
+        // Where the model reads it: after the system prompt and the opening
+        // task, before the oldest turn that was kept.
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 1, "one request");
+        assert_eq!(
+            asked[0].messages[2].text(),
+            mush_core::transcript::DROPPED_TURNS_NOTE,
+            "the request carries the note where the dropped turns were"
+        );
+        // And the human was handed the same sentence, exactly once.
+        let told: Vec<Message> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Message(message)
+                    if message.text() == mush_core::transcript::DROPPED_TURNS_NOTE =>
+                {
+                    Some(message)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told.len(), 1, "one line, however much was cut: {told:?}");
+        assert_eq!(
+            messages[2].text(),
+            told[0].text(),
+            "the actor's own list too"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -15079,6 +15189,53 @@ mod tests {
             "the worktree forked from the named commit, not from HEAD"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A child actor publishes the prompt its own history opens with, before
+    /// its thread runs: the app weighs that prompt for the child — the meter
+    /// and the attach gate read it — and only the child's builder knows it,
+    /// because it names the child's workspace, its depth and its isolation.
+    /// The parent's prompt standing in for a child's made the app weigh a
+    /// history the child never sends.
+    #[test]
+    fn a_child_publishes_the_prompt_its_own_history_opens_with() {
+        let (actor, events, _mailbox) = recording_actor("child-prompt");
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "do it" }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(report.contains("#1"), "the child is named: {report}");
+
+        // A shared child: this workspace, depth 1, no isolation, and young
+        // enough to delegate — the facts its prompt is built from.
+        let expected = prompt::subagent_prompt(&actor.ws.root_str(), 1, false, 1 < MAX_DEPTH);
+        let published: Vec<Message> = events
+            .events_for(AgentId(1))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::SystemPrompt(prompt) => Some(prompt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(published.len(), 1, "one prompt, published once");
+        assert_eq!(published[0].role, "system");
+        assert_eq!(
+            published[0].text(),
+            expected,
+            "the prompt is the child's own"
+        );
+        assert_ne!(
+            published[0].text(),
+            prompt::system_prompt(&actor.ws.root_str()),
+            "not the root's prompt, which is what the app used to weigh"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// A named base is resolved to a commit before anything is created: a
