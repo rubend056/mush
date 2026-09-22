@@ -37,6 +37,15 @@ impl Input {
         self.text.is_empty()
     }
 
+    /// Whether the cursor is at the very start of the box — index 0, not the
+    /// start of the cursor's own line. The question Backspace asks before it
+    /// pops an attachment when there *is* text: the pictures are painted above
+    /// the words, so at index 0 the newest one is the thing immediately before
+    /// the cursor, where a plain backspace would have deleted nothing.
+    pub fn is_at_start(&self) -> bool {
+        self.cursor == 0
+    }
+
     /// The box's text, newlines included.
     #[cfg(test)]
     pub fn text(&self) -> &str {
@@ -229,6 +238,25 @@ mod tests {
     /// The whole text, however wide the window has to be.
     fn text_of(input: &Input) -> String {
         input.view(1, 10_000).0.join("\n")
+    }
+
+    /// "At the start" is the box's first grapheme, not the cursor's own line:
+    /// a multi-line draft with the cursor at the start of its second line must
+    /// not read as the start of the box.
+    #[test]
+    fn the_cursor_knows_the_start_of_the_box_from_the_start_of_its_line() {
+        // Cursor 4 is the start of the second line, with "one\n" before it.
+        let mut typed = input("one\ntwo", 4);
+        assert!(!typed.is_at_start(), "the start of a line is not the box's");
+        typed.move_home();
+        assert!(
+            !typed.is_at_start(),
+            "Home is the line's start, not the box's"
+        );
+        typed.move_end();
+        assert!(!typed.is_at_start());
+        assert!(input("one\ntwo", 0).is_at_start(), "index 0 is the start");
+        assert!(Input::default().is_at_start(), "an empty box starts at 0");
     }
 
     #[test]

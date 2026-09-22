@@ -236,14 +236,24 @@ fn draw_chat(frame: &mut Frame, pane: &ChatPane, focus: Focus, theme: &Theme) {
     }
 }
 
+/// `1 image` / `2 images`, the way the box's title counts them. Shared with
+/// the line a clear says ([`crate::app::Chat::apply`]), so the same count
+/// cannot be spelled two ways on one screen.
+pub(crate) fn image_count(images: usize) -> String {
+    if images == 1 {
+        "1 image".to_string()
+    } else {
+        format!("{images} images")
+    }
+}
+
 /// The message box's title: ` message `, and how many images are attached when
 /// any are. The count is the whole one, not the rows': past the row cap the box
 /// shows `▣ +2 more`, and a title that repeated that number would be counting
 /// the abbreviation instead of the message.
 fn input_title(pane: &ChatPane) -> String {
     match pane.input.as_ref().map(|input| input.attachment_count) {
-        Some(1) => " message · 1 image ".to_string(),
-        Some(count) if count > 1 => format!(" message · {count} images "),
+        Some(count) if count > 0 => format!(" message · {} ", image_count(count)),
         _ => " message ".to_string(),
     }
 }

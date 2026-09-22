@@ -58,7 +58,7 @@ use crate::app::short_age;
 use crate::app::tree::Compacting;
 use crate::ids::AgentId;
 use crate::input::Input;
-use crate::ui::dim;
+use crate::ui::{dim, image_count};
 
 /// The pane's own line while a run is in flight: `working.`, `working..`,
 /// `working...`, one dot a second, looping.
@@ -349,6 +349,37 @@ impl Reading {
     }
 }
 
+/// What the box last lost, waiting for `Ctrl-Z`.
+///
+/// It holds *what went*, not a copy of the whole box: a pop takes one image and
+/// leaves the words, a `Ctrl-U` takes the words and leaves the images — so the
+/// slot is the half that is gone, and a restore puts it back without touching
+/// the half that never left. That is also what keeps it cheap: a snapshot of
+/// the box would copy every image's bytes on a keystroke, and a restore from one
+/// would silently overwrite a draft typed after the loss.
+#[derive(Debug, Default)]
+struct Lost {
+    /// The words the loss took, if the loss took any.
+    words: String,
+    /// The images the loss took: the newest one for a `Backspace` pop, every
+    /// one for Esc, none for a `Ctrl-U`.
+    images: Vec<Image>,
+}
+
+/// The line the bar reads after Esc cleared the box: what went, and the one key
+/// that puts it back. `None` when the box had nothing to lose — Esc on an empty
+/// box clears nothing, so there is nothing to name and no road to offer — which
+/// is also the caller's guard against taking down a draft that is not there.
+fn cleared_line(had_words: bool, images: usize) -> Option<String> {
+    let what = match (had_words, images) {
+        (false, 0) => return None,
+        (true, 0) => "the box".to_string(),
+        (true, n) => format!("the box and {}", image_count(n)),
+        (false, n) => image_count(n),
+    };
+    Some(format!("cleared {what} · Ctrl-Z puts it back"))
+}
+
 /// One conversation: what has been said, what mush added to it, and what the
 /// human is typing.
 pub struct Chat {
@@ -372,6 +403,12 @@ pub struct Chat {
     /// the send — [`Chat::take_attachments`] is the send's half — and a
     /// refused send hands them back the way it hands the words back.
     attachments: Vec<Image>,
+    /// The draft the box last lost — Esc's clear, a `Backspace` pop, or a
+    /// `Ctrl-U` — for `Ctrl-Z` to put back. One slot, not a stack: the key
+    /// answers the loss that just happened or nothing at all, and the slot is
+    /// spent by the restore, by the send, and by a new chat, so nothing the
+    /// human has let go of comes back on a keystroke later.
+    lost: Option<Lost>,
     /// Where each conversation's pane is reading from, keyed by the agent whose
     /// transcript it shows. Per conversation because the position is the
     /// human's *reading of one pane*: news about another agent must not move
@@ -426,6 +463,7 @@ impl Chat {
             notices: Vec::new(),
             input: Input::default(),
             attachments: Vec::new(),
+            lost: None,
             reading: HashMap::new(),
             spoken: HashMap::new(),
             revisions: HashMap::new(),
@@ -610,6 +648,10 @@ impl Chat {
         self.reading.clear();
         self.spoken.clear();
         self.pending = None;
+        // The road back goes with the conversation the loss was in: a Ctrl-N
+        // that handed a keystroke a draft from the chat that just went would be
+        // the same surprise as a sent message coming back.
+        self.lost = None;
         // Every counter steps forward rather than resetting to nothing: a
         // client that read a revision before Ctrl-N must not see the same
         // number come back for a different conversation, where its next edit
@@ -1261,6 +1303,16 @@ impl Chat {
         text
     }
 
+    /// Forget what `Ctrl-Z` would put back, because the draft has been sent: a
+    /// message that has left the box must not come back on a keystroke.
+    ///
+    /// [`crate::app::App::send_message`] calls this once the send has something
+    /// to send and nothing to do with the words it took — so Enter on an empty
+    /// box, which sends nothing, is not a loss of its own.
+    pub fn forget_lost(&mut self) {
+        self.lost = None;
+    }
+
     /// Queue the words the human just sent, so the line that echoes them is
     /// painted as theirs — the mark a typed message gets. `take_input` does this
     /// on the typing path; an attach client's `edit send` has no box to take, so
@@ -1297,39 +1349,105 @@ impl Chat {
     /// private key table that drifts from the app's. `<Enter>` never arrives
     /// here: sending is the agents' business, and the keymap asks the pane
     /// that question first.
-    pub fn apply(&mut self, on: AgentId, key: ChatKey) {
+    ///
+    /// The `Some` a few arms return is a line for the bar — the one thing a key
+    /// here says to the human rather than to the box ([`cleared_line`]); every
+    /// other arm is box state and returns `None`.
+    pub fn apply(&mut self, on: AgentId, key: ChatKey) -> Option<String> {
         match key {
             // A new line instead of sending. Only terminals that report the
             // modifier can deliver Shift+Enter (kitty, WezTerm, foot, Ghostty,
             // recent Alacritty); elsewhere it arrives as a plain Enter, which
             // is why Alt+Enter does the same thing and is the reliable one.
-            ChatKey::Newline => self.input.insert("\n"),
-            // Backspace on an empty box deletes the newest attachment instead
-            // of doing nothing: the box is what the human is looking at, and
-            // the attachment is the newest thing in it. With text in the box
-            // the key is the text's, because deleting the picture while words
-            // are being edited would be a surprise with an undo of none.
+            ChatKey::Newline => {
+                self.input.insert("\n");
+                None
+            }
+            // Backspace takes the thing immediately before the cursor. The
+            // pictures are painted above the words, so at the very start of the
+            // box that thing is the newest attachment, and a plain backspace
+            // had nothing to delete there while the box held text. Several
+            // images go newest first, one per press; anywhere else in the box
+            // the key is the text's, as it always was. An empty box is the same
+            // rule with no text: the newest picture is what it means.
             ChatKey::Backspace => {
-                if self.input.is_empty() && !self.attachments.is_empty() {
-                    self.attachments.pop();
+                if self.input.is_at_start() && !self.attachments.is_empty() {
+                    self.lost = self.attachments.pop().map(|newest| Lost {
+                        images: vec![newest],
+                        ..Lost::default()
+                    });
                 } else {
                     self.input.backspace();
                 }
+                None
             }
-            ChatKey::Delete => self.input.delete_forward(),
-            ChatKey::Left => self.input.move_left(),
-            ChatKey::Right => self.input.move_right(),
-            ChatKey::Home => self.input.move_home(),
-            ChatKey::End => self.input.move_end(),
-            ChatKey::Insert(c) => self.input.insert(&c.to_string()),
-            ChatKey::Scroll(rows) => self.scroll_by(on, rows),
+            ChatKey::Delete => {
+                self.input.delete_forward();
+                None
+            }
+            ChatKey::Left => {
+                self.input.move_left();
+                None
+            }
+            ChatKey::Right => {
+                self.input.move_right();
+                None
+            }
+            ChatKey::Home => {
+                self.input.move_home();
+                None
+            }
+            ChatKey::End => {
+                self.input.move_end();
+                None
+            }
+            ChatKey::Insert(c) => {
+                self.input.insert(&c.to_string());
+                None
+            }
+            ChatKey::Scroll(rows) => {
+                self.scroll_by(on, rows);
+                None
+            }
             // Esc empties the box, and everything waiting to be sent with it:
             // what the human asked to clear is the message they were writing,
             // and half of that message left behind would be a picture they
-            // thought they had let go of.
+            // thought they had let go of. The draft goes into the `Ctrl-Z` slot
+            // on its way out, so this one-key loss has a road back, and Esc
+            // with nothing to lose is not a loss: it sets nothing and says
+            // nothing.
             ChatKey::Clear => {
-                self.input.clear();
-                self.attachments.clear();
+                let said = cleared_line(!self.input.is_empty(), self.attachments.len())?;
+                self.lost = Some(Lost {
+                    words: self.input.take(),
+                    images: std::mem::take(&mut self.attachments),
+                });
+                Some(said)
+            }
+            // Ctrl-U: readline's `unix-line-discard`, which is the habit a
+            // terminal input is allowed to have. It clears the whole draft, not
+            // "the cursor's line" — the box soft-wraps, so the line a human
+            // sees is not a line the text has. The images stay: they are not
+            // what the key is about.
+            ChatKey::ClearWords => {
+                if !self.input.is_empty() {
+                    self.lost = Some(Lost {
+                        words: self.input.take(),
+                        ..Lost::default()
+                    });
+                }
+                None
+            }
+            // Ctrl-Z puts back what the box last lost — the words, the images,
+            // or both, whichever the loss took ([`Lost`]). The slot is spent by
+            // the restore: the key answers the loss that just happened, not a
+            // history of them.
+            ChatKey::Undo => {
+                if let Some(lost) = self.lost.take() {
+                    self.input.insert(&lost.words);
+                    self.attachments.extend(lost.images);
+                }
+                None
             }
         }
     }
@@ -1643,6 +1761,23 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// A `Ctrl-` key as a terminal delivers it.
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// An attached image, as `Ctrl-V` or a pasted path produces one. Its bytes
+    /// are what a pop and a restore move around; nothing here looks at them,
+    /// and it names no pixel size, so it weighs the bytes.
+    fn image(path: &str) -> Image {
+        Image {
+            path: path.to_string(),
+            mime: "image/png".to_string(),
+            bytes: vec![1, 2, 3],
+            pixels: None,
+        }
     }
 
     /// Press a key the way the app does: the pure keymap decides which pane
@@ -3063,5 +3198,179 @@ mod tests {
         assert!(press(&mut chat, key(KeyCode::Left)));
         assert!(press(&mut chat, key(KeyCode::Char('A'))));
         assert_eq!(chat.input().text(), "Ax");
+    }
+
+    /// Backspace takes the thing immediately before the cursor, and at the very
+    /// start of the box that is the newest attachment — the pictures are
+    /// painted above the words. The key that did nothing there while the box
+    /// held text now takes the picture overhead.
+    #[test]
+    fn backspace_at_the_boxes_start_pops_the_newest_attachment() {
+        let mut chat = Chat::bare();
+        chat.attach(image("a.png"));
+        chat.attach(image("b.png"));
+        chat.insert("words");
+        assert!(
+            press(&mut chat, key(KeyCode::Home)),
+            "Home is the box's start"
+        );
+
+        // The newest image goes; the words are untouched.
+        press(&mut chat, key(KeyCode::Backspace));
+        assert_eq!(chat.attachments().len(), 1);
+        assert_eq!(chat.attachments()[0].path, "a.png", "the newest goes first");
+        assert_eq!(chat.input().text(), "words");
+
+        // A second press takes the next one; a third, with none left, leaves
+        // the box alone — at index 0 plain backspace has nothing to delete.
+        press(&mut chat, key(KeyCode::Backspace));
+        assert!(chat.attachments().is_empty());
+        press(&mut chat, key(KeyCode::Backspace));
+        assert_eq!(chat.input().text(), "words", "the words stay");
+
+        // From inside the text the key is the text's, as it always was.
+        press(&mut chat, key(KeyCode::End));
+        press(&mut chat, key(KeyCode::Backspace));
+        assert_eq!(chat.input().text(), "word");
+    }
+
+    /// Ctrl-U clears the words and keeps the images: the images are not what the
+    /// key is about, and Esc is still the one key that takes both.
+    #[test]
+    fn ctrl_u_clears_the_words_and_keeps_the_images() {
+        let mut chat = Chat::bare();
+        chat.attach(image("shot.png"));
+        chat.insert("a draft");
+
+        assert!(press(&mut chat, ctrl('u')));
+        assert_eq!(chat.input().text(), "");
+        assert_eq!(chat.attachments().len(), 1, "the image stays");
+        assert_eq!(chat.attachments()[0].path, "shot.png");
+
+        // The images' rows are still the box's to paint, and Esc takes them.
+        chat.insert("again");
+        press(&mut chat, key(KeyCode::Esc));
+        assert_eq!(chat.input().text(), "");
+        assert!(chat.attachments().is_empty(), "Esc clears both");
+    }
+
+    /// Ctrl-Z puts back what the box last lost, on each of the three roads: Esc
+    /// takes the words and the images, a pop takes one image, Ctrl-U takes the
+    /// words — and each key restores exactly that.
+    #[test]
+    fn ctrl_z_puts_back_what_the_box_lost_each_way_it_can_be_lost() {
+        // Esc: both halves go and both come back.
+        let mut chat = Chat::bare();
+        chat.attach(image("a.png"));
+        chat.attach(image("b.png"));
+        chat.insert("draft");
+        press(&mut chat, key(KeyCode::Esc));
+        assert!(chat.input().is_empty() && chat.attachments().is_empty());
+        press(&mut chat, ctrl('z'));
+        assert_eq!(chat.input().text(), "draft");
+        assert_eq!(chat.attachments().len(), 2, "both images are back");
+
+        // A pop: the image the key took is back, newest again; the words, which
+        // never went, are still there.
+        let mut chat = Chat::bare();
+        chat.attach(image("a.png"));
+        chat.attach(image("b.png"));
+        chat.insert("words");
+        press(&mut chat, key(KeyCode::Home));
+        press(&mut chat, key(KeyCode::Backspace));
+        assert_eq!(chat.attachments().len(), 1);
+        press(&mut chat, ctrl('z'));
+        assert_eq!(chat.attachments().len(), 2);
+        assert_eq!(chat.attachments()[1].path, "b.png");
+        assert_eq!(chat.input().text(), "words");
+
+        // Ctrl-U: the words go round the trip; the image never leaves the box.
+        let mut chat = Chat::bare();
+        chat.attach(image("a.png"));
+        chat.insert("words");
+        press(&mut chat, ctrl('u'));
+        press(&mut chat, ctrl('z'));
+        assert_eq!(chat.input().text(), "words");
+        assert_eq!(chat.attachments().len(), 1, "the image never left");
+    }
+
+    /// Ctrl-Z with nothing lost does nothing — and the slot is spent by a
+    /// restore: one slot, not a stack.
+    #[test]
+    fn ctrl_z_with_nothing_to_put_back_does_nothing() {
+        let mut chat = Chat::bare();
+        press(&mut chat, ctrl('z'));
+        assert!(chat.input().is_empty() && chat.attachments().is_empty());
+
+        chat.insert("typed");
+        press(&mut chat, key(KeyCode::Esc));
+        press(&mut chat, ctrl('z'));
+        assert_eq!(chat.input().text(), "typed");
+        press(&mut chat, ctrl('z'));
+        assert_eq!(
+            chat.input().text(),
+            "typed",
+            "the first restore spent the slot"
+        );
+    }
+
+    /// A send drops the slot ([`Chat::forget_lost`], which `send_message`
+    /// calls): the message the human sent must not come back on a keystroke,
+    /// even when an earlier loss is what the slot was holding.
+    #[test]
+    fn a_sent_draft_does_not_come_back() {
+        let mut chat = Chat::bare();
+        chat.insert("lost");
+        press(&mut chat, key(KeyCode::Esc));
+        chat.insert("sent");
+        assert_eq!(chat.take_input(), "sent");
+        chat.forget_lost();
+        press(&mut chat, ctrl('z'));
+        assert_eq!(chat.input().text(), "", "the sent words stay sent");
+    }
+
+    /// A new chat drops the slot too: a draft from the conversation that just
+    /// went does not land in the next one on a keystroke.
+    #[test]
+    fn a_new_chat_drops_the_slot() {
+        let mut chat = Chat::bare();
+        chat.insert("before Ctrl-N");
+        press(&mut chat, key(KeyCode::Esc));
+        chat.clear();
+        press(&mut chat, ctrl('z'));
+        assert_eq!(chat.input().text(), "");
+    }
+
+    /// The words Esc leaves on the bar name what went and the one key that puts
+    /// it back — and an empty box is not a loss, so it says nothing at all.
+    #[test]
+    fn esc_says_what_it_took_and_the_way_back() {
+        let cleared = |chat: &mut Chat| chat.apply(AgentId::ROOT, ChatKey::Clear);
+
+        let mut chat = Chat::bare();
+        chat.attach(image("a.png"));
+        chat.attach(image("b.png"));
+        chat.insert("draft");
+        assert_eq!(
+            cleared(&mut chat).as_deref(),
+            Some("cleared the box and 2 images · Ctrl-Z puts it back")
+        );
+
+        let mut chat = Chat::bare();
+        chat.insert("draft");
+        assert_eq!(
+            cleared(&mut chat).as_deref(),
+            Some("cleared the box · Ctrl-Z puts it back")
+        );
+
+        let mut chat = Chat::bare();
+        chat.attach(image("a.png"));
+        assert_eq!(
+            cleared(&mut chat).as_deref(),
+            Some("cleared 1 image · Ctrl-Z puts it back")
+        );
+
+        let mut chat = Chat::bare();
+        assert_eq!(cleared(&mut chat), None, "an empty box is not a loss");
     }
 }
