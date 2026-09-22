@@ -349,7 +349,12 @@ impl Workspace {
             .replace('\\', "/")
     }
 
-    /// Read a text file whole. Binary files are refused.
+    /// Read a text file whole. Binary files are refused, and so is anything
+    /// that is not a regular file: `fs::read` on a FIFO blocks until a writer
+    /// appears — an actor parked forever on a name as innocent as `x.png` — and
+    /// a device may never end at all. The metadata answers what the path *is*
+    /// before anything is opened, the same shape of check [`Self::image_at`]
+    /// makes, so the two roads cannot disagree about which paths can be read.
     ///
     /// It used to take a `cap`, keep the head of a long file and mark the cut
     /// with a sentence of its own — then the six-tool cut took the file tools
@@ -359,6 +364,10 @@ impl Workspace {
     /// machine lock, so the cut lives there and this stays the whole-file read.
     pub fn read_file(&self, rel: &str) -> Result<String, String> {
         let path = self.resolve(rel)?;
+        let meta = fs::metadata(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!("{rel} is not a regular file — cannot read it"));
+        }
         let bytes = fs::read(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
         if bytes.contains(&0) {
             return Err(format!("{rel} looks like a binary file"));
@@ -426,7 +435,8 @@ impl Workspace {
     ///   meaning a bare relative name has here.
     ///
     /// The file must exist and its first bytes must sniff as an image. Not
-    /// existing, not being a file at all, and not being an image are all
+    /// existing, not being a regular file (a FIFO is never opened — its open
+    /// would block until a writer appeared), and not being an image are all
     /// `Ok(None)`: the paste is inserted as the text it is. Past
     /// [`IMAGE_FILE_CAP`] it is an image that cannot ride, and the `Err` is the
     /// read tool's own refusal sentence — one file refused at either door is
@@ -642,29 +652,65 @@ impl Workspace {
     /// One reader for the two doors a picture comes in by — the model's
     /// `read_file` and the human's paste — because a cap, a sniff and a
     /// refusal sentence that differed between them would be the same decision
-    /// made twice, and the copies would drift. The head is read before the
-    /// whole file so a 200 MB blob that is not an image is not loaded to find
-    /// that out; the file is only whole here once its own bytes said "image".
+    /// made twice, and the copies would drift.
+    ///
+    /// The order of the decisions is load-bearing, and each is made from a fact
+    /// already in hand rather than from the read:
+    ///
+    /// - the file's *shape* comes from `fs::metadata` before anything is
+    ///   opened. `File::open` on a FIFO blocks until a writer appears, and this
+    ///   runs on the UI thread (the human's paste) and in an actor (the model's
+    ///   read): a name as innocent as `x.png` must not be able to freeze
+    ///   either. Only a regular file can be an image, and anything else is
+    ///   `Ok(None)` before an open is attempted;
+    /// - the *cap* comes from the metadata's length, before any whole read: a
+    ///   256 MB blob that starts with a png signature is refused from its size,
+    ///   not after being loaded to find the size out;
+    /// - the sixteen-byte head is still sniffed before the whole file, because
+    ///   an over-cap file that is *not* an image is text — the head decides
+    ///   that, and the cap must not turn it into a refusal;
+    /// - and the whole read is bounded by [`IMAGE_FILE_CAP`] + 1 bytes whatever
+    ///   the stat said, because a file can grow between the stat and the read.
+    ///   A read that hits the bound is refused without a size named
+    ///   ([`image_too_big`]): the length in hand is the buffer's, not the
+    ///   picture's.
     fn image_at(&self, path: &Path, name: &str) -> Result<Option<Image>, String> {
-        let mut head = [0u8; 16];
-        let Ok(mut file) = fs::File::open(path) else {
-            // Not there, or not openable: not an image, so the caller's other
+        // A directory opens but does not read (or does not open at all,
+        // depending on the platform), and a FIFO's open blocks until a writer
+        // appears. Neither is an image, and the stat says so without opening
+        // anything.
+        let Ok(meta) = fs::metadata(path) else {
+            // Not there, or not statable: not an image, so the caller's other
             // reading of the path is the answer.
             return Ok(None);
         };
-        // A directory opens but does not read (or does not open at all,
-        // depending on the platform): either way it is `Ok(None)`, not an
-        // image.
+        if !meta.is_file() {
+            return Ok(None);
+        }
+        let mut head = [0u8; 16];
+        let Ok(mut file) = fs::File::open(path) else {
+            return Ok(None);
+        };
         let Ok(read) = file.read(&mut head) else {
             return Ok(None);
         };
         let Some(mime) = image_mime(&head[..read]) else {
             return Ok(None);
         };
-        let bytes = fs::read(path).map_err(|e| format!("cannot read {name}: {e}"))?;
-        let size = bytes.len() as u64;
-        if size > IMAGE_FILE_CAP {
-            return Err(image_too_big(name, mime, size));
+        if meta.len() > IMAGE_FILE_CAP {
+            return Err(image_too_big(name, mime, Some(meta.len())));
+        }
+        // The head is already read, so the rest is bounded to what is left of
+        // the cap: `read_to_end` on a `take` never asks the disk for more than
+        // that. A file that grew past the stat is caught by the length rather
+        // than loaded.
+        let mut bytes = head[..read].to_vec();
+        let room = IMAGE_FILE_CAP + 1 - read as u64;
+        file.take(room)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("cannot read {name}: {e}"))?;
+        if bytes.len() as u64 > IMAGE_FILE_CAP {
+            return Err(image_too_big(name, mime, None));
         }
         let pixels = image_dimensions(mime, &bytes);
         Ok(Some(Image {
@@ -943,13 +989,26 @@ impl Workspace {
 /// came in by. One spelling, because it is one fact — the picture is too big
 /// to travel — and one road, because `offset`/`limit` are lines and an image
 /// has none: nothing but a downscale makes it readable.
-fn image_too_big(name: &str, mime: &str, size: u64) -> String {
+///
+/// `size` is the picture's length when the caller knows it — the file's own
+/// stat, or the whole of a buffer — and `None` when a read stopped at the cap
+/// before the file's end, where the length in hand is the buffer's and naming
+/// it would put a number on the human's picture that is not its own.
+fn image_too_big(name: &str, mime: &str, size: Option<u64>) -> String {
     let cap = IMAGE_FILE_CAP / (1024 * 1024);
     let format = mime.strip_prefix("image/").unwrap_or(mime);
-    format!(
-        "{name} is a {format} image of {size} bytes — past the {cap} MB cap on an image. \
-         Downscale it with run_command (`convert {name} -resize 50% small.png`) and read that"
-    )
+    let road = format!(
+        "Downscale it with run_command (`convert {name} -resize 50% small.png`) and read that"
+    );
+    match size {
+        Some(size) => format!(
+            "{name} is a {format} image of {size} bytes — past the {cap} MB cap on an image. {road}"
+        ),
+        None => format!(
+            "{name} is a {format} image past the {cap} MB cap on an image — the read stopped at \
+             the cap before the file's end, so its size is not known. {road}"
+        ),
+    }
 }
 
 /// The name one *word* of a paste may be, or `None` when that word is no name.
@@ -2120,6 +2179,80 @@ mod tests {
         );
         assert!(refused.contains("past the 2 MB cap"), "{refused}");
         assert!(refused.contains("convert"), "the downscale road: {refused}");
+    }
+
+    /// A FIFO named like an image is not an image, and is never opened:
+    /// `File::open` on a FIFO with no writer blocks until one appears, so the
+    /// old order — open, sniff, decide — froze the pane on the human's paste
+    /// and parked an actor on the model's read, on a name as innocent as
+    /// `x.png`. Both roads answer from the metadata now, and the watchdog is
+    /// the test: the old code never answers, and a hang must fail here rather
+    /// than hang the suite.
+    #[test]
+    fn a_fifo_named_like_an_image_is_never_opened() {
+        let ws = temp_workspace("fifo");
+        let fifo = ws.root().join("x.png");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(
+            made.is_ok_and(|status| status.success()),
+            "this test needs `mkfifo` to build the shape it pins"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (paste_ws, read_ws) = (ws.clone(), ws.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((
+                paste_ws.pasted_image("x.png"),
+                read_ws.read_window("x.png", 1, 10, 1024),
+            ));
+        });
+        let (image, text) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a FIFO must answer, not hold an open until a writer appears");
+        assert!(
+            image.unwrap().is_none(),
+            "a FIFO is not an image, so the paste is the text it is"
+        );
+        assert!(text.is_err(), "and there are no bytes to read: {text:?}");
+    }
+
+    /// A file far past the cap is refused from what the stat said, not by being
+    /// read. The 8 GiB here is sparse — a few blocks on disk, cheap on ext4 and
+    /// tmpfs — so the old code's read-the-whole-file first would have allocated
+    /// gigabytes to say what the metadata already said: a probe on a 128 MiB
+    /// sparse png drove the test process's peak RSS from 3,172 kB to 134,136 kB
+    /// before the refusal.
+    #[test]
+    fn a_sparse_file_far_past_the_cap_is_refused_without_a_whole_read() {
+        let ws = temp_workspace("sparse-big");
+        let path = ws.root().join("huge.png");
+        let mut file = fs::File::create(&path).unwrap();
+        file.set_len(8 * 1024 * 1024 * 1024).unwrap();
+        file.write_all(&png(0)).unwrap();
+        drop(file);
+
+        let refused = ws.read_image("huge.png").unwrap_err();
+        assert!(
+            refused.contains("8589934592 bytes"),
+            "the sentence names the size the stat saw: {refused}"
+        );
+        assert!(refused.contains("past the 2 MB cap"), "{refused}");
+    }
+
+    /// The cap is the transport's, not the sniffer's: a file past it that is
+    /// not an image is still text. The head decides that before any whole read
+    /// — the cap must not turn "this is not a picture" into a refusal, or a
+    /// long log with a `PNG`-looking start would stop being readable.
+    #[test]
+    fn an_over_cap_file_that_is_not_an_image_is_still_text() {
+        let ws = temp_workspace("over-cap-text");
+        let body = "not a picture\n".repeat(200_000);
+        assert!(body.len() as u64 > IMAGE_FILE_CAP, "past the cap");
+        fs::write(ws.root().join("notes.txt"), &body).unwrap();
+
+        assert!(ws.read_image("notes.txt").unwrap().is_none());
+        assert!(ws.pasted_image("notes.txt").unwrap().is_none());
+        assert_eq!(ws.read_file("notes.txt").unwrap(), body);
     }
 
     /// A paste that is text, in every shape that is not an image's: prose, a
