@@ -3306,8 +3306,8 @@ impl App {
     /// that named a file, or `Ctrl-V`. Answers whether it was attached, so the
     /// paste arm knows to insert the path as text when it was not.
     ///
-    /// Three facts stop an image, and each gets its own line because each needs
-    /// a different move from the human:
+    /// Four facts are said here, and each gets its own line because each needs
+    /// a different move from the human. The first two refuse the attachment:
     ///
     /// - **No model at all.** Sending would be a guaranteed refusal, and it is
     ///   said in the words [`Self::deliver`] already uses for the same state.
@@ -3315,23 +3315,32 @@ impl App {
     ///   request — a whole turn and the human's money — so it is refused
     ///   *before* the wire, and `Ctrl-P` is named as the road: the one road
     ///   that changes the fact.
-    /// - **An image with no room left in the budget.** This one is attached
-    ///   anyway — the human decides what to send — but the fact they cannot see
-    ///   is said: [`mush_core::transcript::trim_history`] sheds image payloads
-    ///   *before* it drops a turn, so a picture that does not fit the room the
-    ///   conversation has left is stripped before the model ever looks at it,
-    ///   which is the defect this line exists for. The room is what remains of
-    ///   [`mush_core::Config::history_budget`] once the system prompt and the
-    ///   transcript are weighed, and the images already in the box count
-    ///   against it too: they are not in the transcript yet. The line names
-    ///   the two roads that make the picture arrive — `/compact`, which folds
-    ///   the history into a summary, and a downscale, which makes the picture
-    ///   cost less.
     ///
-    /// A picture whose weight exactly equals the room left fits: this gate
-    /// asks the same question the trimmer does (`cost + pending > room`, where
-    /// [`mush_core::transcript::trim_history`] stops at `total <= budget`), so
-    /// the two cannot disagree about a picture parked on the boundary.
+    /// The other two attach anyway — the human decides what to send — and say
+    /// the fact they cannot see:
+    ///
+    /// - **A picture too big for the window.** It outweighs the whole history
+    ///   budget, and the system prompt and the opening task cannot be dropped,
+    ///   so no trim makes room for it: a request carrying it would go out over
+    ///   the window and the endpoint would refuse it. The one road that
+    ///   changes that is a downscale, and the line names it.
+    /// - **A picture with no room left in the conversation.** The room is what
+    ///   remains of [`mush_core::Config::history_budget`] once the system
+    ///   prompt and the transcript are weighed, and the images already in the
+    ///   box count against it too: they are not in the transcript yet.
+    ///   Attaching it costs the oldest turns —
+    ///   [`mush_core::transcript::trim_history`] drops them at the next
+    ///   request to make room — so the line says so and names the two roads
+    ///   that spare them: `/compact`, which folds those turns into a summary,
+    ///   and a downscale, which makes the picture cost less.
+    ///
+    /// A picture whose weight exactly equals the room left fits: this gate asks
+    /// whether the request would still be inside the window
+    /// (`cost + pending > room` warns, equality does not), which is the same
+    /// inclusive comparison the trimmer makes at the ceiling
+    /// ([`mush_core::transcript::trim_history`]: a transcript at `budget` is
+    /// inside, one byte more is cut), so a picture parked on the boundary is
+    /// not warned about by one rule and sent by another.
     ///
     /// Everything else attaches, and the line says the image, its format and
     /// its size, and how to send it.
@@ -3348,32 +3357,49 @@ impl App {
         }
         let label = image_label(&image);
         let path = image.path.clone();
-        // What this picture costs, weighed the one way the trimmer weighs it:
-        // pixels when its header named them, bytes when it did not
+        // What this picture costs, weighed the one way the budget weighs a
+        // picture: pixels when its header named them, bytes when it did not
         // ([`Image::weight`]). The images already in the box are added by hand
         // — they are not in the transcript yet, and two pictures that each fit
-        // can still not fit together.
+        // can still not fit together. Saturating, both ways: a header can claim
+        // a picture larger than any `usize`, and the sum must not be the thing
+        // that panics on the way to "it does not fit".
         let cost = image.weight();
-        // Saturating, both ways: a header can claim a picture larger than any
-        // `usize`, and the sum of what is pending must not be the thing that
-        // panics on the way to "it does not fit".
         let pending: usize = self
             .chat
             .attachments()
             .iter()
             .map(Image::weight)
             .fold(0, usize::saturating_add);
-        let room = self
-            .cfg()
-            .history_budget()
-            .saturating_sub(self.chat.used_weight_for(AgentId::ROOT));
+        let budget = self.cfg().history_budget();
+        let room = budget.saturating_sub(self.chat.used_weight_for(AgentId::ROOT));
         self.chat.attach(image);
-        if cost.saturating_add(pending) > room {
+        if cost.saturating_add(pending) > budget {
+            // The picture outweighs the whole history budget. The conservative
+            // reading of "no room, even trimmed": the system prompt and the
+            // opening task are not droppable, so a transcript can never be
+            // trimmed into carrying this request — it would go out over the
+            // window and come back refused. `/compact` cannot help: the picture
+            // itself is the fact, and the downscale is the road.
             self.fail(format!(
-                "{label} will not fit the room left for history ({}) — trim_history sheds an \
-                 image's bytes before it drops a turn, so the model would never look at it. \
-                 `/compact` makes room, or downscale it (`convert {path} -resize 50% small.png`) \
+                "{label} is bigger than the whole history budget ({}) — even with every older \
+                 turn dropped, a request carrying it would go out over the window, and the \
+                 endpoint would refuse it. Downscale it (`convert {path} -resize 50% small.png`) \
                  and attach that",
+                size_label(budget)
+            ));
+            return true;
+        }
+        if cost.saturating_add(pending) > room {
+            // Room for it in the window, none left in the conversation: a trim
+            // makes room by dropping the oldest turns at the next request. The
+            // line says what attaching it costs, and names the two roads that
+            // spare those turns.
+            self.fail(format!(
+                "{label} will not fit the room left for history ({}) — attaching it costs the \
+                 oldest turns of the conversation, which are dropped at the next request to make \
+                 room. `/compact` folds them into a summary instead, or downscale it (`convert \
+                 {path} -resize 50% small.png`) and attach that",
                 size_label(room)
             ));
             return true;
@@ -6922,10 +6948,11 @@ mod tests {
 
     /// The gate's third arm attaches *and* refuses a line: an image with no
     /// room left in the budget rides — the human decides what to send — but the
-    /// fact they cannot see is said, because `trim_history` sheds image
-    /// payloads before it drops a turn and those bytes would never reach the
-    /// model. The room is the budget minus what the conversation already
-    /// weighs, not the whole budget.
+    /// fact they cannot see is said: attaching it costs the oldest turns of the
+    /// conversation, which the trimmer drops at the next request to make room.
+    /// The line names `/compact`, which folds those turns into a summary
+    /// instead, and the downscale. The room is the budget minus what the
+    /// conversation already weighs, not the whole budget.
     #[test]
     fn an_image_with_no_room_left_attaches_with_the_fact_said() {
         let (mut app, _rx) = test_app("attach-over-budget");
@@ -6947,7 +6974,8 @@ mod tests {
         let (line, kind) = app.status_line().expect("the fact is said");
         assert_eq!(kind, StatusKind::Error);
         assert!(line.contains("room left for history"), "{line}");
-        assert!(line.contains("/compact"), "one road to make room: {line}");
+        assert!(line.contains("oldest turns"), "what it costs: {line}");
+        assert!(line.contains("/compact"), "one road to spare them: {line}");
         assert!(line.contains("convert"), "and the downscale: {line}");
     }
 
@@ -6982,7 +7010,7 @@ mod tests {
     /// dropped into a ~300k-token conversation on a 500k-token window attaches
     /// with the plain line. The room left is ~550 KB of weight and the picture
     /// costs ~2.8k tokens — not the ~247k its bytes used to read as, which is
-    /// what made the gate silent while `trim_history` shed the picture.
+    /// what once made the picture the first thing a trim shed.
     #[test]
     fn the_humans_screenshot_attaches_with_the_plain_line() {
         let (mut app, _rx) = test_app("attach-screenshot");
@@ -7006,11 +7034,11 @@ mod tests {
         assert!(!line.contains("/compact"), "no warning: {line}");
     }
 
-    /// The boundary is the trimmer's, not a second one: a picture that weighs
-    /// *exactly* the room left attaches with the plain line (the trimmer stops
-    /// at `total <= budget`, and this gate asks the same question), and one
-    /// byte more warns. Two apps, because an attachment changes the room the
-    /// next call sees.
+    /// The boundary is the window's, not a second one: a picture that weighs
+    /// *exactly* the room left fits (the gate warns only above
+    /// `cost + pending > room`, the inclusive comparison the trimmer makes at
+    /// the ceiling), and one byte more warns. Two apps, because an attachment
+    /// changes the room the next call sees.
     #[test]
     fn a_picture_exactly_at_the_room_left_fits_and_one_byte_more_does_not() {
         for (label, extra) in [("fits", 0usize), ("one-over", 1)] {
@@ -7040,8 +7068,8 @@ mod tests {
 
     /// The gate measures what the endpoint charges, not what the file weighs: a
     /// 6 MiB image of 8×8 pixels is nowhere near the room it has, and a small
-    /// file claiming 20,000×20,000 pixels is past it. File bytes are the
-    /// transport's ruler (the cap on a read); pixels are the budget's.
+    /// file claiming 20,000×20,000 pixels is past the whole window. File bytes
+    /// are the transport's ruler (the cap on a read); pixels are the budget's.
     #[test]
     fn the_attach_gate_counts_pixels_not_file_bytes() {
         let (mut app, _rx) = test_app("attach-measures");
@@ -7072,17 +7100,33 @@ mod tests {
         };
         assert!(
             pixel_heavy.weight() > room,
-            "a small file whose pixels do not fit"
+            "a small file whose pixels do not fit the room left"
+        );
+        assert!(
+            pixel_heavy.weight() > app.cfg().history_budget(),
+            "and they outweigh the whole window too"
         );
         assert!(app.attach_image(pixel_heavy), "attached anyway");
         let (line, kind) = app.status_line().expect("the fact is said");
         assert_eq!(kind, StatusKind::Error);
-        assert!(line.contains("room left for history"), "{line}");
+        assert!(
+            line.contains("whole history budget"),
+            "the window cannot hold it: {line}"
+        );
+        assert!(
+            !line.contains("/compact"),
+            "and no fold makes room for it: {line}"
+        );
+        assert!(
+            line.contains("convert"),
+            "the downscale is the road: {line}"
+        );
     }
 
     /// Nothing in the accounting panics on a header that claims the biggest
-    /// picture there is: the gate warns because no room can hold it, rather
-    /// than wrapping around to "it fits".
+    /// picture there is: the picture outweighs the whole window, so the gate
+    /// says so — and names the downscale — rather than wrapping around to "it
+    /// fits".
     #[test]
     fn the_attach_gate_survives_a_header_that_claims_every_pixel() {
         let (mut app, _rx) = test_app("attach-overflow");
@@ -7098,7 +7142,11 @@ mod tests {
 
         let (line, kind) = app.status_line().expect("the fact is said");
         assert_eq!(kind, StatusKind::Error);
-        assert!(line.contains("room left for history"), "{line}");
+        assert!(line.contains("whole history budget"), "{line}");
+        assert!(
+            line.contains("convert"),
+            "the downscale is the road: {line}"
+        );
     }
 
     /// An image that *is* an image and cannot ride — past the cap — says so and

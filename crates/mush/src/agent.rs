@@ -2245,7 +2245,12 @@ fn run_loop(
             // tool it names.
             compact_history(actor, &cfg, messages, cancel, state, true)?;
         }
-        // Keep the whole request inside the endpoint's context window.
+        // Keep the whole request inside the endpoint's context window. The
+        // trimmer is the fallback the fold cannot help with: it bites only when
+        // the transcript is *over* the budget — the watermark is where a cut
+        // stops, not where it starts — and then cuts down to `trim_target`,
+        // four fifths, so the tenth below the fold's trigger is room the next
+        // growth is folded in rather than cut.
         trim_history(messages, budget);
 
         // The wrap-up turn asks for a summary, appended only to the request so
@@ -4520,8 +4525,8 @@ fn read_tool(actor: &Actor, args: &Value) -> Result<ToolOutput, String> {
         let format = image.mime.strip_prefix("image/").unwrap_or(&image.mime);
         // The text is a label for the transcript, not a description of the
         // picture: the bytes are what the model looks at. It is what survives
-        // when they are shed (a trim, a saved session), so it must say which
-        // file they came from.
+        // when the session writer sheds them, so it must say which file they
+        // came from.
         let text = format!(
             "read {path} — a {format} image, {} bytes",
             image.bytes.len()
@@ -7731,7 +7736,7 @@ mod tests {
     /// The reason the file tools came back: `read_file` is the one road an
     /// image can travel by. A png is sniffed from its own first bytes — never
     /// from its name, which is a claim — and the result carries both the bytes
-    /// and the one line the transcript keeps when they are shed.
+    /// and the one line a saved session keeps when it sheds them.
     #[test]
     fn read_file_hands_back_an_image_when_the_model_can_see() {
         const PNG: &[u8] = &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3, 4];
