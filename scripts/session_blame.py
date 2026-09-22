@@ -50,7 +50,7 @@ import sys
 # tenths. Change one there and one here, or this tool starts lying again —
 # which is why the constants it used are printed in `--json`, to be compared
 # against what `mush --print-config` reports.
-SCHEMA_TOKENS = 1200
+SCHEMA_TOKENS = 2_000
 REPLY_SHARE_DIVISOR = 8
 MAX_REPLY_TOKENS = 120_000
 REPLY_CAP_FLOOR = 1024
