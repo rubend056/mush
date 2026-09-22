@@ -2295,6 +2295,48 @@ mod tests {
         assert!(text.is_err(), "and there are no bytes to read: {text:?}");
     }
 
+    /// `read_file`'s own regular-file guard, pinned apart from the image road
+    /// that happened to exercise it: a path that is not a regular file is
+    /// refused from the metadata — `"{rel} is not a regular file — cannot read
+    /// it"` — before anything is opened, the same shape of check
+    /// [`Self::image_at`] makes. The FIFO test above reads `read_window`, so
+    /// deleting this guard would leave `read_file` free to open a FIFO with no
+    /// writer and park an actor forever; the watchdog is the test here too,
+    /// because the old code never answers and a hang must fail rather than hang
+    /// the suite. A directory named like a file is the cheap half of the same
+    /// rule.
+    #[test]
+    fn read_file_refuses_a_path_that_is_not_a_regular_file() {
+        let ws = temp_workspace("read-file-guard");
+        let fifo = ws.root().join("x.log");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(
+            made.is_ok_and(|status| status.success()),
+            "this test needs `mkfifo` to build the shape it pins"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let read_ws = ws.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(read_ws.read_file("x.log"));
+        });
+        let refused = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a FIFO must be refused, not held open until a writer appears")
+            .unwrap_err();
+        assert!(
+            refused.contains("x.log is not a regular file"),
+            "the guard's own sentence: {refused}"
+        );
+
+        fs::create_dir_all(ws.root().join("notes.txt")).unwrap();
+        let refused = ws.read_file("notes.txt").unwrap_err();
+        assert!(
+            refused.contains("notes.txt is not a regular file"),
+            "and a directory is not read either: {refused}"
+        );
+    }
+
     /// A file far past the cap is refused from what the stat said, not by being
     /// read. The 8 GiB here is sparse — a few blocks on disk, cheap on ext4 and
     /// tmpfs — so the old code's read-the-whole-file first would have allocated
