@@ -10477,6 +10477,40 @@ mod tests {
         );
     }
 
+    /// The note a trim hands the model is one the human reads too: the actor
+    /// emits it as a [`AgentEvent::Message`], and that road is the pane, the
+    /// meter and the file. Before, the sentence lived in the actor's list
+    /// alone, so the stored session and the number the human read were a note
+    /// short of what the model was told.
+    #[test]
+    fn the_dropped_turns_note_reaches_the_pane_and_the_session() {
+        let (mut app, _rx) = test_app("dropped-note");
+        let note = {
+            let mut messages = vec![
+                Message::system("you are mush"),
+                Message::user("first"),
+                Message::assistant("x".repeat(500)),
+                Message::user("second"),
+                Message::assistant("more"),
+                Message::user("third"),
+            ];
+            mush_core::transcript::trim_history(&mut messages, 300).expect("a trim that had to cut")
+        };
+
+        app.on_agent(AgentId::ROOT, AgentEvent::Message(note.clone()));
+
+        assert_eq!(
+            app.chat.transcript(AgentId::ROOT).last().map(Message::text),
+            Some(note.text()),
+            "the pane holds the sentence the model was given"
+        );
+        assert_eq!(
+            app.session_snapshot().messages.last().map(Message::text),
+            Some(note.text()),
+            "and a restart resumes with it"
+        );
+    }
+
     /// The facts line says how full the conversation is as well as how big the
     /// window is: the window alone cannot tell a human whether the next message
     /// will compact.
