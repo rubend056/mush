@@ -195,6 +195,452 @@ fn wrap_capped(text: &str, width: usize, max_lines: Option<usize>) -> Vec<String
     out
 }
 
+/// One styled run of one rendered markdown row.
+///
+/// Runs are plain data: a piece of the source's text and one name from
+/// [`RunStyle`]'s vocabulary. No colour and no terminal lives here — the app
+/// maps the vocabulary onto its own palette in one place, so the parser never
+/// learns what an accent is and a new surface never learns the parser's words.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Run {
+    /// The characters, exactly as the source wrote them. A run never rewrites
+    /// text; it only says how the text was marked.
+    pub text: String,
+    pub style: RunStyle,
+}
+
+/// What a run is, in the markdown view's whole vocabulary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunStyle {
+    /// Untouched text.
+    Plain,
+    /// `**strong**`.
+    Strong,
+    /// `*emphasis*` or `_emphasis_`.
+    Emphasis,
+    /// `~~strike~~`.
+    Strike,
+    /// `` `code` `` — an inline span.
+    Code,
+    /// The body of a fenced block.
+    Fence,
+    /// `#`/`##`/`###`, with the level.
+    Heading(u8),
+    /// A list's own marker (`-`, `*`, `+`, `1.`), kept rather than hidden.
+    Bullet,
+    /// The text of `[text](url)`.
+    Link,
+    /// The ` (url)` beside it. A URL is never dropped: this is a coding tool,
+    /// and the human may have to copy it out of the pane.
+    Url,
+}
+
+/// The model's prose read as a view: markdown parsed into styled runs, wrapped
+/// to a width. The pane paints the rows; nothing here writes anything back.
+///
+/// A model writes markdown — headings, bullets, `**emphasis**`, code fences —
+/// and the pane painted the markers as if they were the sentence. This is the
+/// answer, and it is deliberately the small one. The parse is **line-local**:
+/// every source line is read on its own, so nothing here can reflow a
+/// paragraph, join two lines, re-indent a list or turn `- a\n- b` into a layout
+/// the source did not have. That boundary is the point — the human called the
+/// full version a rabbit hole, and a chat reply needs a reading, not a document
+/// renderer. Tables, block quotes, setext headings, reference links, HTML,
+/// task-list checkboxes, nested lists and indented code blocks are all *not*
+/// rules; a line that uses one is simply the text it is.
+///
+/// It is **additive** too. The only text a rule removes is scaffolding a human
+/// does not read in a view — the `#`s of a heading and the two fence lines of a
+/// code block. Every word is kept; a list keeps its marker and only styles it,
+/// because the marker is information; and a link always shows its URL beside
+/// its text, because a dropped URL is data loss. Above all this is a *view*:
+/// what the human copies out of the pane is still the model's own bytes,
+/// because nothing here rewrites the transcript — it only decides how a frame
+/// paints it.
+///
+/// # What is a rule
+///
+/// Inline, within one line:
+///
+/// - `**strong**` → [`RunStyle::Strong`]
+/// - `*emphasis*` and `_emphasis_` → [`RunStyle::Emphasis`]. An `_` inside or
+///   beside a word is not one, so `snake_case_name` survives; `__strong__` has
+///   no rule here and stays text rather than being half-read.
+/// - `` `code` `` → [`RunStyle::Code`]
+/// - `~~strike~~` → [`RunStyle::Strike`]. Worth one rule: a model uses it to
+///   mark its own correction, and on a terminal that cannot strike it out the
+///   words still read.
+/// - `[text](url)` → the text in [`RunStyle::Link`] and ` (url)` in
+///   [`RunStyle::Url`]. The URL's own parentheses are counted, so a wiki link's
+///   tail is not cut off.
+///
+/// Block, at the start of a line:
+///
+/// - one, two or three `#`s and a space → [`RunStyle::Heading`]. The `#`s and
+///   that one space are not painted: the heading's style says what they said.
+///   Four or more `#`s, or a `#` with no space after it, are text.
+/// - `- `, `* `, `+ `, or `1. `–`99. ` → the marker keeps its place and is
+///   styled [`RunStyle::Bullet`]. A marker with no space after it is not one,
+///   and an ordered marker is at most two digits, because `1998. It was a good
+///   year` opens a sentence, not a list.
+/// - a line whose first non-space text is three backticks opens a fenced block,
+///   and the next such line closes it. The fence lines are not painted and
+///   everything between them is [`RunStyle::Fence`], one style with no inline
+///   parsing, so `**` in code stays code. A fence that never closes runs to the
+///   end of the message: an unterminated block is still a block, and the code
+///   in it is still code.
+///
+/// An mark that never closes is **text**: `**bold` is `**bold`, a lone `*` is a
+/// lone `*`, and a `[link](` with no `)` is the characters it is. Nothing is
+/// guessed, and nothing is dropped on the way.
+///
+/// # The wrap
+///
+/// [`wrap_text`]'s rules over runs instead of characters: each source line
+/// wraps on its own, the source's own newlines are honoured, a tab is four
+/// columns, every line is [`sanitize`]d, and a word is broken only when it
+/// cannot fit a row by itself. A rendered row therefore does not outgrow
+/// `width` — one glyph (or one tab, four columns at once) wider than the whole
+/// width is the only thing a row cannot honour, and a pane's body is never that
+/// narrow. The rows this returns are the rows the plain wrapper would have
+/// made for the same text, with the styles attached.
+pub fn markdown_rows(text: &str, width: usize) -> Vec<Vec<Run>> {
+    let width = width.max(1);
+    let mut out = Vec::new();
+    let mut fence = false;
+    for raw in text.split('\n') {
+        let line = sanitize(raw);
+        if fence_line(&line) {
+            // The fence is scaffolding, not content: it is a block boundary,
+            // and a row of backticks is not something a human reads. The code
+            // inside is untouched — see the never-closing fence above.
+            fence = !fence;
+            continue;
+        }
+        let runs = if fence {
+            vec![Run {
+                text: line,
+                style: RunStyle::Fence,
+            }]
+        } else {
+            block(&line)
+        };
+        out.extend(wrap_runs(&runs, width));
+    }
+    out
+}
+
+/// Whether a line is a fence, opening or closing one. The run of backticks is
+/// not counted: three or more at the start of the line toggle the block, and an
+/// info string after them is part of the fence, not of the code.
+fn fence_line(line: &str) -> bool {
+    line.trim_start().starts_with("```")
+}
+
+/// One source line, parsed before it is wrapped: a heading, a list item, or
+/// whatever the inline rules make of it.
+fn block(line: &str) -> Vec<Run> {
+    if let Some((level, text)) = heading(line) {
+        // The heading's style is the whole heading: a marker inside it is read
+        // (so `## **Title**` does not paint its asterisks) but the runs all
+        // come out as the heading, because that is the only style it wears.
+        let mut runs = inline(text);
+        for run in &mut runs {
+            run.style = RunStyle::Heading(level);
+        }
+        return runs;
+    }
+    if let Some((marker, text)) = list_marker(line) {
+        let mut runs = vec![Run {
+            text: marker.to_string(),
+            style: RunStyle::Bullet,
+        }];
+        runs.extend(inline(text));
+        return runs;
+    }
+    inline(line)
+}
+
+/// `# Title`, `## Title`, `### Title`: the level and the text after one space.
+fn heading(line: &str) -> Option<(u8, &str)> {
+    let hashes = line.chars().take_while(|ch| *ch == '#').count();
+    if !(1..=3).contains(&hashes) {
+        return None;
+    }
+    let rest = &line[hashes..];
+    if rest.is_empty() {
+        return Some((hashes as u8, rest));
+    }
+    rest.strip_prefix(' ').map(|text| (hashes as u8, text))
+}
+
+/// `- item`, `* item`, `+ item`, `1. item`: the marker and the text after it.
+fn list_marker(line: &str) -> Option<(&str, &str)> {
+    let first = line.chars().next()?;
+    if matches!(first, '-' | '*' | '+') && line[1..].starts_with(' ') {
+        return Some((&line[..1], &line[1..]));
+    }
+    if first.is_ascii_digit() {
+        let digits = line.chars().take_while(char::is_ascii_digit).count();
+        if digits <= 2 && line[digits..].starts_with(". ") {
+            return Some((&line[..digits + 1], &line[digits + 1..]));
+        }
+    }
+    None
+}
+
+/// One source line's inline markers: plain text, spans, and links, in order.
+///
+/// No nesting and no escapes: inside a span the text is the text, so `**a *b*`
+/// is strong text that happens to hold stars. That is the small version on
+/// purpose — a recursive parser is where a chat reply stops being a reading.
+fn inline(line: &str) -> Vec<Run> {
+    let chars: Vec<char> = line.chars().collect();
+    let mut runs: Vec<Run> = Vec::new();
+    let mut plain = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match span(&chars, i) {
+            Some((next, span)) => {
+                if !plain.is_empty() {
+                    runs.push(Run {
+                        text: std::mem::take(&mut plain),
+                        style: RunStyle::Plain,
+                    });
+                }
+                runs.extend(span);
+                i = next;
+            }
+            None => {
+                plain.push(chars[i]);
+                i += 1;
+            }
+        }
+    }
+    if !plain.is_empty() {
+        runs.push(Run {
+            text: plain,
+            style: RunStyle::Plain,
+        });
+    }
+    runs
+}
+
+/// The marker at `chars[i]`, if there is one: the runs it paints and the index
+/// the scanner goes on at. `None` means the character is text, which is what an
+/// unterminated marker gets.
+fn span(chars: &[char], i: usize) -> Option<(usize, Vec<Run>)> {
+    match chars[i] {
+        '`' => close(chars, i + 1, &['`']).map(|end| {
+            (
+                end + 1,
+                vec![Run {
+                    text: chars[i + 1..end].iter().collect(),
+                    style: RunStyle::Code,
+                }],
+            )
+        }),
+        '*' if chars.get(i + 1) == Some(&'*') => close(chars, i + 2, &['*', '*']).map(|end| {
+            (
+                end + 2,
+                vec![Run {
+                    text: chars[i + 2..end].iter().collect(),
+                    style: RunStyle::Strong,
+                }],
+            )
+        }),
+        '*' => close(chars, i + 1, &['*']).map(|end| {
+            (
+                end + 1,
+                vec![Run {
+                    text: chars[i + 1..end].iter().collect(),
+                    style: RunStyle::Emphasis,
+                }],
+            )
+        }),
+        '~' if chars.get(i + 1) == Some(&'~') => close(chars, i + 2, &['~', '~']).map(|end| {
+            (
+                end + 2,
+                vec![Run {
+                    text: chars[i + 2..end].iter().collect(),
+                    style: RunStyle::Strike,
+                }],
+            )
+        }),
+        '_' if underscore_opens(chars, i) => close(chars, i + 1, &['_']).and_then(|end| {
+            // The closing `_` must end a word too, or an `_` inside an
+            // identifier could close a span it never opened.
+            if matches!(chars.get(end + 1), Some(ch) if *ch == '_' || ch.is_alphanumeric()) {
+                return None;
+            }
+            Some((
+                end + 1,
+                vec![Run {
+                    text: chars[i + 1..end].iter().collect(),
+                    style: RunStyle::Emphasis,
+                }],
+            ))
+        }),
+        '[' => link(chars, i).map(|(end, text, url)| {
+            (
+                end + 1,
+                vec![
+                    Run {
+                        text,
+                        style: RunStyle::Link,
+                    },
+                    Run {
+                        text: format!(" ({url})"),
+                        style: RunStyle::Url,
+                    },
+                ],
+            )
+        }),
+        _ => None,
+    }
+}
+
+/// Whether the `_` at `i` opens emphasis: at a word boundary, and alone. That
+/// is the whole defence of `snake_case_name` and of `__strong__`, which is not
+/// a rule here.
+fn underscore_opens(chars: &[char], i: usize) -> bool {
+    let before = if i == 0 { None } else { Some(chars[i - 1]) };
+    match before {
+        // Beside a word or beside another `_` it is the text's own character.
+        Some(ch) if ch == '_' || ch.is_alphanumeric() => false,
+        _ => chars.get(i + 1) != Some(&'_'),
+    }
+}
+
+/// The index of the next `marker` after `from` that would close a span, or
+/// `None` if there is none. The content must be non-empty and must not begin or
+/// end in whitespace, which is what keeps `a * b * c` and `** **` as the text
+/// they are rather than a span of spaces.
+fn close(chars: &[char], from: usize, marker: &[char]) -> Option<usize> {
+    let mut i = from;
+    while i + marker.len() <= chars.len() {
+        if chars[i..i + marker.len()] == *marker
+            && i > from
+            && !chars[from].is_whitespace()
+            && !chars[i - 1].is_whitespace()
+        {
+            return Some(i);
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `[text](url)`, or `None` for anything that is not one: the index of the
+/// closing `)`, the text and the URL. The URL's own parentheses are counted, so
+/// `[a](https://en.wikipedia.org/wiki/Foo_(bar))` keeps its tail, and a URL is
+/// never empty — a link with nothing to show is just its text.
+fn link(chars: &[char], open: usize) -> Option<(usize, String, String)> {
+    let end_text = open + 1 + chars[open + 1..].iter().position(|ch| *ch == ']')?;
+    let text: String = chars[open + 1..end_text].iter().collect();
+    if text.trim().is_empty() || chars.get(end_text + 1) != Some(&'(') {
+        return None;
+    }
+    let mut depth = 1usize;
+    let mut i = end_text + 2;
+    while i < chars.len() {
+        match chars[i] {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    let url: String = chars[end_text + 2..i].iter().collect();
+                    if url.trim().is_empty() {
+                        return None;
+                    }
+                    return Some((i, text, url));
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// [`wrap_text`] over styled runs: the same rows, each row split into runs of
+/// one style. The arithmetic is `wrap_capped`'s, tab expansion included, and a
+/// test pins the two against each other — one rule, two spellings, and no drift
+/// between the view and the text beside it.
+fn wrap_runs(runs: &[Run], width: usize) -> Vec<Vec<Run>> {
+    let width = width.max(1);
+    let chars: Vec<(char, RunStyle)> = runs
+        .iter()
+        .flat_map(|run| run.text.chars().map(|ch| (ch, run.style)))
+        .collect();
+
+    let mut out: Vec<Vec<(char, RunStyle)>> = Vec::new();
+    let mut current: Vec<(char, RunStyle)> = Vec::new();
+    let mut current_width = 0usize;
+    let mut last_space: Option<usize> = None;
+
+    for (ch, style) in chars {
+        let (char_width, tab) = if ch == '\t' {
+            (4, true)
+        } else {
+            (UnicodeWidthChar::width(ch).unwrap_or(1).max(1), false)
+        };
+        // The break is a loop, exactly as in `wrap_capped`: the tail a space
+        // break leaves can itself be too full for this character, and a row
+        // must not outgrow the width it was given.
+        loop {
+            if current_width + char_width <= width || current.is_empty() {
+                break;
+            }
+            if let Some(space) = last_space {
+                let rest = current.split_off(space);
+                out.push(std::mem::take(&mut current));
+                current = rest;
+                while matches!(current.first(), Some((' ', _))) {
+                    current.remove(0);
+                }
+            } else {
+                out.push(std::mem::take(&mut current));
+            }
+            current_width = current
+                .iter()
+                .map(|(ch, _)| UnicodeWidthChar::width(*ch).unwrap_or(1).max(1))
+                .sum();
+            last_space = None;
+        }
+        if tab {
+            // Four columns of layout, `wrap_text`'s tab stop, in the style of
+            // the character that asked for them. A tab is not a break point:
+            // the spaces it becomes never set `last_space`.
+            current.extend([(' ', style); 4]);
+        } else {
+            current.push((ch, style));
+        }
+        current_width += char_width;
+        if ch == ' ' {
+            last_space = Some(current.len() - 1);
+        }
+    }
+    out.push(current);
+
+    out.into_iter().map(runs_of).collect()
+}
+
+/// One row's characters, gathered back into runs of one style.
+fn runs_of(chars: Vec<(char, RunStyle)>) -> Vec<Run> {
+    let mut runs: Vec<Run> = Vec::new();
+    for (ch, style) in chars {
+        match runs.last_mut() {
+            Some(run) if run.style == style => run.text.push(ch),
+            _ => runs.push(Run {
+                text: ch.to_string(),
+                style,
+            }),
+        }
+    }
+    runs
+}
+
 /// Shorten to at most `max` display columns *including* the ellipsis, so a
 /// caller budgeting columns gets text that really fits (finding B9: counting
 /// characters made a CJK row twice as wide as its budget).
@@ -674,5 +1120,391 @@ mod tests {
         assert_eq!(mask_key("short"), "••••");
         assert_eq!(mask_key("aéééééééé"), "aééé…éééé");
         assert_eq!(mask_key(&"é".repeat(9)), "éééé…éééé");
+    }
+
+    /// The view's rows flattened to `(text, style)` pairs: for the tests that
+    /// read the parse rather than the wrap.
+    fn runs(text: &str) -> Vec<(String, RunStyle)> {
+        markdown_rows(text, 80)
+            .into_iter()
+            .flatten()
+            .map(|run| (run.text, run.style))
+            .collect()
+    }
+
+    /// The view's rows as they are painted, styles dropped.
+    fn rows(text: &str, width: usize) -> Vec<String> {
+        markdown_rows(text, width)
+            .into_iter()
+            .map(|row| row.into_iter().map(|run| run.text).collect())
+            .collect()
+    }
+
+    /// A marker marks, and a marker that never closes is text — the characters
+    /// as they were written, not half a span and not a dropped character. The
+    /// same guard keeps a `*` used for arithmetic and a span of spaces as the
+    /// text they are.
+    #[test]
+    fn a_span_is_read_and_an_unterminated_marker_is_text() {
+        assert_eq!(
+            runs("a **strong** word"),
+            vec![
+                ("a ".to_string(), RunStyle::Plain),
+                ("strong".to_string(), RunStyle::Strong),
+                (" word".to_string(), RunStyle::Plain),
+            ]
+        );
+        assert_eq!(
+            runs("a *light* word"),
+            vec![
+                ("a ".to_string(), RunStyle::Plain),
+                ("light".to_string(), RunStyle::Emphasis),
+                (" word".to_string(), RunStyle::Plain),
+            ]
+        );
+        assert_eq!(
+            runs("a _light_ word"),
+            vec![
+                ("a ".to_string(), RunStyle::Plain),
+                ("light".to_string(), RunStyle::Emphasis),
+                (" word".to_string(), RunStyle::Plain),
+            ]
+        );
+        assert_eq!(
+            runs("call `wrap_text` now"),
+            vec![
+                ("call ".to_string(), RunStyle::Plain),
+                ("wrap_text".to_string(), RunStyle::Code),
+                (" now".to_string(), RunStyle::Plain),
+            ]
+        );
+        assert_eq!(
+            runs("~~old~~ new"),
+            vec![
+                ("old".to_string(), RunStyle::Strike),
+                (" new".to_string(), RunStyle::Plain),
+            ]
+        );
+
+        // Unterminated: every character is the text it was.
+        for text in [
+            "a **strong word",
+            "a *light word",
+            "a _light word",
+            "a `code word",
+            "a ~~struck word",
+            "2 * 3 * 4",
+            "a ** ** b",
+        ] {
+            assert_eq!(
+                runs(text),
+                vec![(text.to_string(), RunStyle::Plain)],
+                "{text:?} was read as a marker"
+            );
+        }
+    }
+
+    /// An underscore is a marker only at a word boundary and only alone:
+    /// `snake_case_name` is one word, and `__strong__` — which is not a rule
+    /// here — stays text rather than being read as half of one.
+    #[test]
+    fn an_underscore_inside_a_word_is_not_emphasis() {
+        for text in ["snake_case_name", "a_x_", "__strong__", "x__y"] {
+            assert_eq!(
+                runs(text),
+                vec![(text.to_string(), RunStyle::Plain)],
+                "{text:?} was read as emphasis"
+            );
+        }
+        assert_eq!(
+            runs("_a_ and _(b)_"),
+            vec![
+                ("a".to_string(), RunStyle::Emphasis),
+                (" and ".to_string(), RunStyle::Plain),
+                ("(b)".to_string(), RunStyle::Emphasis),
+            ]
+        );
+    }
+
+    /// A heading is its text in the heading's style: the `#`s and the one space
+    /// after them are not painted, because the style says what they said. One
+    /// to three `#`s are a heading; a fourth is text, and so is a `#` with no
+    /// space after it.
+    #[test]
+    fn a_heading_is_its_text_and_only_one_to_three_hashes_are_headings() {
+        assert_eq!(
+            runs("# Title"),
+            vec![("Title".to_string(), RunStyle::Heading(1))]
+        );
+        assert_eq!(
+            runs("### Deep"),
+            vec![("Deep".to_string(), RunStyle::Heading(3))]
+        );
+        // A marker inside a heading is read, but the heading's style is the
+        // only one it wears.
+        assert_eq!(
+            runs("## **Title**"),
+            vec![("Title".to_string(), RunStyle::Heading(2))]
+        );
+        for text in ["#### Not a heading", "#nospace"] {
+            assert_eq!(
+                runs(text),
+                vec![(text.to_string(), RunStyle::Plain)],
+                "{text:?} was read as a heading"
+            );
+        }
+        // A heading with no words is still a line: one empty row, not none.
+        assert_eq!(rows("#", 20), vec![String::new()]);
+    }
+
+    /// A list keeps its marker and only styles it: the marker is information —
+    /// `1.` is where the item sits — so hiding it would lose what the line
+    /// said. A marker needs its space, an ordered one is at most two digits,
+    /// and an indented one is not a marker at all, because there is no nested
+    /// list layout here.
+    #[test]
+    fn a_list_marker_stays_as_its_text_and_only_a_marker_is_styled() {
+        for (text, marker) in [("- item", "-"), ("+ item", "+"), ("* item", "*")] {
+            assert_eq!(
+                runs(text),
+                vec![
+                    (marker.to_string(), RunStyle::Bullet),
+                    (" item".to_string(), RunStyle::Plain),
+                ],
+                "{text:?} is a bullet"
+            );
+        }
+        for (text, marker) in [("1. first", "1."), ("99. last", "99.")] {
+            assert_eq!(
+                runs(text),
+                vec![
+                    (marker.to_string(), RunStyle::Bullet),
+                    (text[marker.len()..].to_string(), RunStyle::Plain),
+                ],
+                "{text:?} is an item"
+            );
+        }
+        // `1998.` opens a sentence, `-item` is a hyphenated word, and two
+        // columns of indent are not a nesting this view has a layout for.
+        for text in [
+            "1998. It was a good year",
+            "-item",
+            "1.item",
+            "  - item",
+            "+not a bullet",
+        ] {
+            assert_eq!(
+                runs(text),
+                vec![(text.to_string(), RunStyle::Plain)],
+                "{text:?} was read as a list"
+            );
+        }
+    }
+
+    /// A fence is a block, and the fence lines are not painted: everything
+    /// between them is code, one style, with no inline parsing — so the markers
+    /// a model writes in code stay the characters they are. A fence that never
+    /// closes runs to the end of the message, because an unterminated block is
+    /// still a block and the code in it is still code.
+    #[test]
+    fn a_fence_hides_its_lines_and_marks_the_code_between_them() {
+        let text = "before\n```rust\nlet x = **1**;\t// tab\n```\nafter";
+        assert_eq!(
+            rows(text, 40),
+            vec!["before", "let x = **1**;    // tab", "after"]
+        );
+        assert_eq!(
+            markdown_rows(text, 40),
+            vec![
+                vec![Run {
+                    text: "before".to_string(),
+                    style: RunStyle::Plain,
+                }],
+                vec![Run {
+                    text: "let x = **1**;    // tab".to_string(),
+                    style: RunStyle::Fence,
+                }],
+                vec![Run {
+                    text: "after".to_string(),
+                    style: RunStyle::Plain,
+                }],
+            ]
+        );
+
+        let never_closed = "before\n```\nlet x = 1;\nstill code";
+        assert_eq!(
+            rows(never_closed, 40),
+            vec!["before", "let x = 1;", "still code"]
+        );
+        assert_eq!(
+            markdown_rows(never_closed, 40)
+                .into_iter()
+                .flatten()
+                .map(|run| run.style)
+                .collect::<Vec<_>>(),
+            vec![RunStyle::Plain, RunStyle::Fence, RunStyle::Fence]
+        );
+
+        // The fence line itself is not a row: a message that is only a fence
+        // paints nothing at all.
+        assert_eq!(markdown_rows("```", 40), Vec::<Vec<Run>>::new());
+    }
+
+    /// A link renders as its text and its URL, both: this is a coding tool, and
+    /// a URL a model gave is data the human may have to copy out of the pane.
+    /// The URL's own parentheses are counted, so a wiki link keeps its tail.
+    #[test]
+    fn a_link_keeps_its_text_and_its_url() {
+        assert_eq!(
+            runs("see [the docs](https://example.com/a) now"),
+            vec![
+                ("see ".to_string(), RunStyle::Plain),
+                ("the docs".to_string(), RunStyle::Link),
+                (" (https://example.com/a)".to_string(), RunStyle::Url),
+                (" now".to_string(), RunStyle::Plain),
+            ]
+        );
+        assert_eq!(
+            runs("[wiki](https://en.wikipedia.org/wiki/Foo_(bar))"),
+            vec![
+                ("wiki".to_string(), RunStyle::Link),
+                (
+                    " (https://en.wikipedia.org/wiki/Foo_(bar))".to_string(),
+                    RunStyle::Url
+                ),
+            ]
+        );
+        // A link that never closes, one with no `(`, and one with no URL to
+        // show are all the text they are.
+        for text in [
+            "[docs](https://example.com/a",
+            "[docs] https://example.com/a",
+            "[docs]()",
+        ] {
+            assert_eq!(
+                runs(text),
+                vec![(text.to_string(), RunStyle::Plain)],
+                "{text:?} was read as a link"
+            );
+        }
+    }
+
+    /// A line of nothing but markers is a line of text: the parser guesses
+    /// nothing, so a lone `*` and a bare `~~` paint exactly those characters.
+    #[test]
+    fn a_line_of_only_markers_is_text() {
+        for text in ["**", "*", "~~", "`", "_"] {
+            assert_eq!(
+                runs(text),
+                vec![(text.to_string(), RunStyle::Plain)],
+                "{text:?} was read as a marker"
+            );
+        }
+    }
+
+    /// A block line is still its own line: a heading, a bullet and a blank line
+    /// never merge, split or re-indent the lines around them. The view is a
+    /// reading of the source's own lines, never a reflow of them.
+    #[test]
+    fn a_block_line_never_reflows_the_lines_around_it() {
+        let text = "# Title\n\n- one\n- two\n\n### Deep\nplain";
+        assert_eq!(
+            rows(text, 40),
+            vec!["Title", "", "- one", "- two", "", "Deep", "plain"]
+        );
+    }
+
+    /// An empty message is one empty row, exactly as `wrap_text` reads it: the
+    /// view says the same thing the plain wrapper said rather than inventing or
+    /// losing a row.
+    #[test]
+    fn an_empty_message_is_one_empty_row() {
+        assert_eq!(markdown_rows("", 40), vec![Vec::<Run>::new()]);
+        assert_eq!(
+            markdown_rows("\n", 40),
+            vec![Vec::<Run>::new(), Vec::<Run>::new()]
+        );
+    }
+
+    /// The view's wrap is `wrap_text`'s wrap: for text that is not markdown the
+    /// two make the same rows, character for character, at every width — one
+    /// rule with two spellings, and this is the test that says they cannot
+    /// drift.
+    #[test]
+    fn a_plain_message_wraps_exactly_like_wrap_text() {
+        let texts = [
+            "the quick brown fox jumps over the lazy dog",
+            "one\n\ntwo three\nfour",
+            "a\tb\tc and some words",
+            "日本語のテキストと english words",
+            "and then\rREPLACED \x1b]0;PWNED\x07 tail",
+            "w00 w01 w02 w03 w04 w05",
+            "  leading and trailing  ",
+            "spaces  between  words",
+            "bcd日 after a full row",
+            "",
+        ];
+        for text in texts {
+            for width in 1..=24usize {
+                assert_eq!(
+                    rows(text, width),
+                    wrap_text(text, width),
+                    "{text:?} @ {width}"
+                );
+            }
+        }
+    }
+
+    /// A span that wraps keeps its style on both rows: the emphasis is a fact
+    /// about the words, not about a row.
+    #[test]
+    fn a_span_that_wraps_keeps_its_style() {
+        assert_eq!(
+            markdown_rows("**alpha beta** gamma", 6),
+            vec![
+                vec![Run {
+                    text: "alpha".to_string(),
+                    style: RunStyle::Strong,
+                }],
+                vec![Run {
+                    text: "beta".to_string(),
+                    style: RunStyle::Strong,
+                }],
+                vec![Run {
+                    text: "gamma".to_string(),
+                    style: RunStyle::Plain,
+                }],
+            ]
+        );
+    }
+
+    /// A row of the view never outgrows the width it was given: a wide glyph is
+    /// two columns, a tab four, and an unbroken URL or path has no spaces to
+    /// break at — it is cut at the width like any long word, and every piece of
+    /// it is still painted.
+    #[test]
+    fn every_row_of_the_view_fits_its_width() {
+        let text = "# 見出し\n\n- 项目 one two\n\nsee [the docs](https://example.com/a/very/long/path/that/never/breaks/anywhere) and 日本語\n\n```\nlet x = 1;\t// tab\n```\n\n**strong 日本語** tail";
+        for width in 4..=40usize {
+            for row in markdown_rows(text, width) {
+                let painted: String = row.iter().map(|run| run.text.as_str()).collect();
+                assert!(
+                    UnicodeWidthStr::width(painted.as_str()) <= width,
+                    "{painted:?} @ {width} is {} columns",
+                    UnicodeWidthStr::width(painted.as_str())
+                );
+            }
+        }
+
+        // And the URL survives the cut whole, at every width.
+        let url = "https://example.com/a/very/long/path/that/never/breaks/anywhere";
+        let text = format!("see [the docs]({url})");
+        for width in 4..=24usize {
+            let flat: String = rows(&text, width).concat();
+            assert!(
+                flat.contains(url),
+                "the URL lost its tail at {width}: {flat:?}"
+            );
+        }
     }
 }
