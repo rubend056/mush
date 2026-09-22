@@ -562,25 +562,32 @@ impl Workspace {
             .map_err(|e| format!("cannot copy {label} into .mush/paste: {e}"))
     }
 
-    /// Write bytes that came from outside the workspace (the clipboard) into
+    /// Write bytes that came from outside the workspace — the clipboard, or a
+    /// picture the app is carrying to the agent that will receive it — into
     /// `.mush/paste/` and hand back the image that names them.
     ///
     /// A clipboard image has no path — the clipboard is a buffer, not a file —
     /// and [`Image`] carries one: it is the name a shed payload's placeholder
-    /// keeps, so the bytes are given one here. `.mush/` ignores itself via its
-    /// own `.gitignore` ([`session::ensure_mush_dir`]), so a pasted screenshot
-    /// cannot dirty the tree, and the file is named for the moment it was
-    /// pasted rather than for the clipboard, which would let a second paste
-    /// overwrite the first. The write itself is [`Self::write_pasted_image`],
-    /// shared with the copy [`Self::pasted_image`] makes of a file outside the
-    /// root, so the two roads cannot drift in where the bytes land or what the
-    /// image is called.
+    /// keeps, so the bytes are given one here. A picture the app carries *has* a
+    /// path, but one the receiving agent's own workspace does not resolve; what
+    /// it needs is the same thing a clipboard image needs — a name under this
+    /// root — so it is given one by the same call. `.mush/` ignores itself via
+    /// its own `.gitignore` ([`session::ensure_mush_dir`]), so a pasted
+    /// screenshot cannot dirty the tree, and the file is named for the moment
+    /// it was pasted rather than for the clipboard, which would let a second
+    /// paste overwrite the first. The write itself is
+    /// [`Self::write_pasted_image`], shared with the copy
+    /// [`Self::pasted_image`] makes of a file outside the root, so no road
+    /// into that directory can drift in where the bytes land or what the image
+    /// is called.
     ///
     /// `Err` is "these bytes are an image, and they cannot ride": bytes that
     /// sniff as no image at all, or one past [`IMAGE_FILE_CAP`], whose refusal
     /// names the clipboard's own road (`wl-paste -t image/png > shot.png`,
     /// then a `convert` downscale) because that is the only one a clipboard
-    /// image has.
+    /// image has. The app's carry cannot reach either refusal: it holds a
+    /// picture a road has already sniffed and read whole within the cap, and
+    /// passes `false` for `cut_at_the_cap`.
     ///
     /// `cut_at_the_cap` is the caller's own fact: true when its read stopped
     /// at its cap before the bytes ended, so `bytes` is a prefix of the picture
@@ -607,24 +614,29 @@ impl Workspace {
     /// Write `bytes` — sniffed by the caller as `mime` — into `.mush/paste/`
     /// and hand back the image that names the copy.
     ///
-    /// The one write of that directory, shared by the two roads bytes from
-    /// outside the workspace arrive by: the clipboard
-    /// ([`Self::save_pasted_image`]), which has no file behind the bytes, and
-    /// a paste naming a file outside the root ([`Self::pasted_image`]), which
-    /// the model's own tools cannot reach. Two writes would be two spellings of
-    /// one rule — the directory, the `pasted-<unix millis>.<png|jpg|gif|webp>`
-    /// name and the [`Image`] that points at it — so there is one. `.mush/`
-    /// ignores itself via its own `.gitignore` ([`session::ensure_mush_dir`]),
-    /// so neither paste can dirty the tree, and the name carries the moment it
-    /// was pasted rather than the clipboard or the source file; a name already
-    /// taken moves to `-2`, `-3`, …, so neither a second paste nor the next
-    /// picture of one batch can overwrite the one before it.
+    /// The one write of that directory, shared by every road bytes from outside
+    /// the workspace arrive by: the clipboard
+    /// ([`Self::save_pasted_image`]), which has no file behind the bytes; a
+    /// paste naming a file outside the root ([`Self::pasted_image`]), which
+    /// the model's own tools cannot reach; and the app's carry, which reaches
+    /// the write through [`Self::save_pasted_image`] with a picture a road has
+    /// already read whole. Two writes would be two spellings of one rule — the
+    /// directory, the `pasted-<unix millis>.<png|jpg|gif|webp>` name and the
+    /// [`Image`] that points at it — so there is one. `.mush/` ignores itself
+    /// via its own `.gitignore` ([`session::ensure_mush_dir`]), so neither
+    /// paste can dirty the tree, and the name carries the moment it was pasted
+    /// rather than the clipboard or the source file; a name already taken
+    /// moves to `-2`, `-3`, …, so neither a second paste nor the next picture
+    /// of one batch can overwrite the one before it.
     ///
-    /// Both callers have already refused a payload that is no image and one
-    /// past [`IMAGE_FILE_CAP`], each with the sentence its own road can act on
-    /// (the clipboard names `wl-paste`, a file names the `convert` downscale);
-    /// what must not differ is where under-cap bytes land. `Err` here is "the
-    /// copy cannot be written": the IO problem the directory or the file named.
+    /// The two doors that read files have already refused a payload that is no
+    /// image and one past [`IMAGE_FILE_CAP`], each with the sentence its own
+    /// road can act on (the clipboard names `wl-paste`, a file names the
+    /// `convert` downscale); the app's carry cannot reach either refusal,
+    /// because it holds a picture a road has already sniffed and read whole
+    /// within the cap. What must not differ is where under-cap bytes land.
+    /// `Err` here is "the copy cannot be written": the IO problem the directory
+    /// or the file named.
     fn write_pasted_image(&self, bytes: Vec<u8>, mime: &str) -> Result<Image, String> {
         session::ensure_mush_dir(self.root())
             .map_err(|e| format!("cannot create {}: {e}", session::MUSH_DIR))?;
