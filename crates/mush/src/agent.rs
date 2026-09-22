@@ -7843,14 +7843,13 @@ mod tests {
     /// four fifths of the budget to a transcript with a fifth of room, so the
     /// request that carries them goes out over the window — or, on a transcript
     /// a trim can cut, is cut again. Measured through `run_loop` on the shape
-    /// the audit used (a first turn: one user line, no older turn to drop, the
-    /// real 3,247-byte system prompt) and the 8k default: four results at the
-    /// cap left the next request carrying 13,768 bytes against a 12,288-byte
-    /// budget, with no cut, no note and no fold: a transcript with one user line
-    /// has no older turn to drop, and a transcript over the budget cannot fold.
-    /// Now the first result takes what it can and each later
-    /// one gets what is left of the fifth, so the request that carries the
-    /// whole batch fits.
+    /// the audit used (a first turn: one user line, the real 3,247-byte system
+    /// prompt) and the 8k default: four results at the cap left the next
+    /// request carrying 13,768 bytes against a 12,288-byte budget, with no cut,
+    /// no note and no fold: a transcript with one user line has no older turn
+    /// to drop, and a transcript over the budget cannot fold. Now the first
+    /// result takes what it can and each later one gets what is left of the
+    /// fifth, so the request that carries the whole batch fits.
     #[test]
     fn one_turns_results_share_the_room_under_the_ceiling() {
         let big = "x".repeat(100_000);
