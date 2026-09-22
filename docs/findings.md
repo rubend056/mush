@@ -4008,11 +4008,19 @@ answer comes back as `Msg::Copied`, stamped with the conversation that asked for
 it the way `Msg::Clipboard` is: a copy that outlives a `Ctrl-N` reports nothing
 into the new chat, and the bar says the line only when the clipboard took the
 text. Paint: the mode hands the frame *which* rows (`Painted.select`) and `ui.rs`
-says what they wear — the selection is the theme's hue as a background patched
-onto every span, so a dim result stays dim inside it and nothing wears the agents
-pane's selected row (`Black` on the accent), and the cursor is the terminal's own
-`REVERSED` cell, the attribute a terminal paints its cursor with; a row that is
-both reads as the cursor inside the selection.
+says what they wear — the selection is the theme's hue as a band behind the
+text, `Color::Black` on the accent, patched onto the row's spans and never onto
+the line's own style, so the cells past a line's text and a blank row inside a
+selection stay the pane's background, and a dense selection reads as bands under
+its lines; that is the same pair the bar's badge and the agents pane's selected
+row wear, because mush has exactly one way of putting a colour behind text,
+though that row is a place in the tree and this is a band under a range of
+lines. The cursor is that band's inverse, the hue's characters on
+`Color::Black`, span-only too, so a cursor-only row is a dark band rather than a
+block and a row that is both reads as the cursor. `99d9305` gave the old mark's
+"a dim result and a green reply stay themselves inside the band" up on purpose:
+the hue is chosen for `Black` text on it, and a light band under the
+transcript's own light ink is mud.
 
 **The seam, and why it exists.** The write road is a value `App` holds —
 `App::write_clipboard`, a `Fn(&str) -> Result<(), String>` defaulting to the real
