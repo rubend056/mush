@@ -55,28 +55,36 @@ pub fn compaction_trigger(budget_bytes: usize) -> usize {
     budget_bytes.saturating_mul(9) / 10
 }
 
-/// Where a trim stops: four fifths of the budget, saturating.
+/// Where a cut stops: four fifths of the budget, saturating.
 ///
-/// The trim is the last resort, and a trim that stops at the very brim is one
-/// that has to be made again: the next request a turn later is over the budget
-/// once more, so it cuts once more — and every cut rewrites the front of the
-/// prompt, which is exactly the prefix a provider's cache had warmed. Four
-/// fifths leaves a tenth of the budget between the watermark and the fold's own
-/// trigger ([`compaction_trigger`], nine tenths), so a conversation that grows
-/// past the watermark and on across that trigger is folded — one re-send that
-/// keeps the prompt's prefix and re-bases the conversation on a summary —
-/// rather than cut again at the brim.
+/// A cut is a rewrite of the prompt's front — exactly the prefix a provider's
+/// cache had warmed — so it is the last resort and it is made once, deeply:
+/// [`trim_history`] cuts only a transcript already over the window's ceiling,
+/// and then all the way down here. That leaves a tenth of the budget between
+/// the stopping point and the fold's own trigger ([`compaction_trigger`], nine
+/// tenths), which is room the conversation grows back through: the growth that
+/// crosses the trigger is folded — one re-send that keeps the prompt's prefix
+/// and re-bases the conversation on a summary — rather than cut again at the
+/// brim.
 ///
-/// The trade sits on the other scale: a conversation with no fold available
+/// This is a stopping point and not a trigger, and the difference is measured:
+/// a trimmer that started cutting as soon as a transcript passed four fifths
+/// parked a steadily growing conversation just under the watermark, never let
+/// it reach nine tenths, and cut once a turn forever (5,000 quiet turns at a
+/// 40,000-byte budget: 0 folds, 3,932 cuts, parked at 31,989). The ceiling owns
+/// the trigger; this number owns where the knife stops.
+///
+/// The cost sits on the other scale: a conversation with no fold available
 /// gives up more of its oldest turns than the request in front of it strictly
 /// needed. That is what the cache-warm prefix and the room the next growth
 /// needs are worth.
 ///
-/// `budget_bytes` is in bytes, the unit [`Message::weight`] counts and the unit
-/// [`Config::history_budget`](crate::config::Config::history_budget) returns.
-/// The multiply saturates for the same reason [`compaction_trigger`]'s does: a
-/// caller that never made the conversion hands over `usize::MAX`, and `* 4`
-/// must not wrap to a watermark nearly every transcript exceeds.
+/// `budget_bytes` is in bytes, the unit [`Message::weight`] counts, the unit
+/// [`Config::history_budget`](crate::config::Config::history_budget) returns,
+/// and the unit `trim_history`'s `budget` is in. The multiply saturates for the
+/// same reason [`compaction_trigger`]'s does: a caller that never made the
+/// conversion hands over `usize::MAX`, and `* 4` must not wrap to a stopping
+/// point nearly every transcript is already past.
 pub fn trim_target(budget_bytes: usize) -> usize {
     budget_bytes.saturating_mul(4) / 5
 }
@@ -295,18 +303,34 @@ The oldest turns of this conversation were dropped to fit the context window, \
 so this transcript is not the whole conversation: a fact you cannot find here \
 may have been dropped rather than never said.";
 
-/// Drop the oldest turns until the conversation fits `target`, cutting at a
-/// user message so assistant/tool pairs stay intact: that is the shape servers
-/// validate.
+/// Drop the oldest turns from a transcript over the window until it fits four
+/// fifths of it, cutting at a user message so assistant/tool pairs stay intact:
+/// that is the shape servers validate.
 ///
-/// `target` is the trimmer's own watermark — [`trim_target`] of the window's
-/// budget — and not the budget itself. The budget is the hard ceiling the
-/// endpoint enforces on a request; the watermark is where this policy chooses
-/// to stop, so a cut leaves the conversation room to grow instead of having to
-/// be made again next turn (the reasoning, and its price, is on
-/// [`trim_target`]). A transcript that cannot be cut further — the minimum
-/// shape is system + task + the newest turn — comes back as it was: over the
-/// watermark, and inside the window that is the endpoint's to enforce.
+/// `budget` is the window's budget — the hard ceiling the endpoint enforces on
+/// a request, in bytes ([`Message::weight`]'s unit, the number
+/// [`Config::history_budget`](crate::config::Config::history_budget) returns).
+/// The two numbers here are a pair, and the pair is the whole policy:
+///
+/// - **over the ceiling, cut**: only a transcript past `budget` is touched at
+///   all, and it is cut all the way down to [`trim_target`] — four fifths —
+///   rather than just back under the ceiling, so the request has room to grow;
+/// - **back up, fold**: the tenth between four fifths and the fold's trigger
+///   ([`compaction_trigger`], nine tenths) is what the next growth crosses,
+///   and the fold is what meets it.
+///
+/// The watermark is a *stopping point, not a trigger*: a transcript inside the
+/// window is left exactly as it is, even one over four fifths. That shape is
+/// measured, not preferred — a trimmer that cut whenever a transcript passed
+/// its watermark parks a steadily growing conversation just under four fifths,
+/// never lets it reach the fold's trigger, and cuts once a turn forever: 5,000
+/// quiet turns at a 40,000-byte budget folded 0 times and cut 3,932 times, the
+/// transcript parked at 31,989. The watermark would invert its own purpose and
+/// make the cache-busting cuts *more* frequent than the brim-trim it replaced.
+///
+/// A transcript that cannot be cut further — the minimum shape is system +
+/// task + the newest turn — comes back as it was; a request still over the
+/// ceiling after that is the endpoint's to refuse.
 ///
 /// An image is not a thing a trim sheds on its own: it is part of the turn it
 /// arrived in, and a turn the drain drops takes its pictures with it. The pass
@@ -317,11 +341,11 @@ may have been dropped rather than never said.";
 /// normal-sized part of the turn that carries it.
 ///
 /// A transcript that lost turns says so once, in `DROPPED_TURNS_NOTE`'s line.
-/// The note is built here, counted against `target` like any other message, and
-/// kept out of the draining below — a `user` line would otherwise read as a
-/// turn boundary — and a later drain replaces it along with the turns it was
-/// explaining.
-pub fn trim_history(messages: &mut Vec<Message>, target: usize) {
+/// The note is built here, counted like any other message against whichever
+/// number the loop is stopping at, and kept out of the draining below — a
+/// `user` line would otherwise read as a turn boundary — and a later drain
+/// replaces it along with the turns it was explaining.
+pub fn trim_history(messages: &mut Vec<Message>, budget: usize) {
     // Whatever an earlier call left comes out first: the arithmetic below
     // counts `user` lines as turns, and the note is not one.
     let carried = messages.get(2).is_some_and(is_dropped_note);
@@ -329,20 +353,30 @@ pub fn trim_history(messages: &mut Vec<Message>, target: usize) {
         messages.remove(2);
     }
     let note = Message::user(DROPPED_TURNS_NOTE);
+    let target = trim_target(budget);
     let mut dropped = false;
     loop {
-        // Once a drop happens the request will carry the note, so the target
-        // has to hold the note too, or the line explaining the trim would be
-        // what pushes the request past the watermark. The sum saturates: a
-        // header can claim a picture whose estimate is as large as a `usize`
+        // Once a drop happens the request will carry the note, so the total has
+        // to hold the note too, or the line explaining the trim would be what
+        // pushed the request past the ceiling. The sum saturates: a header can
+        // claim a picture whose estimate is as large as a `usize`
         // (`Image::weight`), and a transcript of them has to read as over the
-        // watermark rather than wrap to a small number that says it fits.
+        // ceiling rather than wrap to a small number that says it fits.
         let total: usize = messages
             .iter()
             .map(Message::weight)
             .fold(0, usize::saturating_add)
             .saturating_add(if carried || dropped { note.weight() } else { 0 });
-        if total <= target {
+        // The hysteresis, in one line: inside the ceiling the stopping point is
+        // the ceiling itself, so nothing is cut; once a transcript has crossed
+        // it, `dropped` is set and every later pass measures against the
+        // watermark.
+        let stop = if total > budget || dropped {
+            target
+        } else {
+            budget
+        };
+        if total <= stop {
             break;
         }
         let user_indices: Vec<usize> = messages
@@ -404,12 +438,12 @@ mod tests {
         assert_eq!(compaction_trigger(7_501), 6_750);
     }
 
-    /// The watermark too is computed, not written a second time: four fifths of
-    /// the budget, saturating — the same hostile budget the trigger is tested
-    /// with wraps `* 4` as well, and a wrapped answer would have the trimmer cut
-    /// a conversation down to a watermark of nearly nothing.
+    /// The stopping point too is computed, not written a second time: four
+    /// fifths of the budget, saturating — the same hostile budget the trigger is
+    /// tested with wraps `* 4` as well, and a wrapped answer would have a cut go
+    /// down to nearly nothing instead of to the watermark.
     #[test]
-    fn the_watermark_is_four_fifths_of_the_budget() {
+    fn the_stopping_point_is_four_fifths_of_the_budget() {
         assert_eq!(trim_target(0), 0);
         assert_eq!(trim_target(1_000), 800);
         assert_eq!(trim_target(7_501), 6_000);
@@ -461,30 +495,128 @@ mod tests {
         assert!(!needs_compaction(&transcript_of_weight(budget + 1), budget));
     }
 
-    /// The sequence the watermark exists for, run the way the caller runs it: a
-    /// trim lands the transcript at or under four fifths, and the growth after
-    /// it has the tenth up to the fold's trigger to cross. When it does, the
-    /// boundary is the fold's — the summarize request still fits the window —
-    /// and the trim that runs after the fold has nothing to cut, because the
-    /// fold left the system prompt and the summary. A trim to the brim would
-    /// have left the next request over again instead, and cut again: every cut
-    /// rewrites the front of the prompt, which is the prefix a provider's cache
-    /// had warmed.
+    /// The watermark is a stopping point, not a trigger: a transcript over four
+    /// fifths but inside the ceiling comes back byte for byte — no cut, no
+    /// note — even though there are turns the trimmer could cut. That is the
+    /// park case the watermark's own doc measures: cutting here is what kept a
+    /// quiet conversation at the watermark and starved the fold forever.
     #[test]
-    fn a_trim_lands_where_the_next_growth_folds_instead_of_being_cut() {
+    fn a_transcript_just_over_four_fifths_is_left_exactly_as_it_is() {
+        let budget = 40_000;
+        let mut messages = long_transcript(50);
+        let words: usize = messages.iter().map(Message::weight).sum();
+        messages.push(Message::user(
+            "x".repeat(trim_target(budget) - words + 5 - "user".len()),
+        ));
+        let total: usize = messages.iter().map(Message::weight).sum();
+        assert!(
+            total > trim_target(budget) && total <= budget,
+            "the fixture sits between the stopping point and the ceiling: {total}"
+        );
+        let before = serde_json::to_string(&messages).unwrap();
+
+        trim_history(&mut messages, budget);
+
+        assert_eq!(
+            serde_json::to_string(&messages).unwrap(),
+            before,
+            "inside the ceiling, nothing is cut — the watermark is not a trigger"
+        );
+    }
+
+    /// Over the ceiling, the cut goes all the way down to the stopping point,
+    /// not just back under the ceiling: that headroom is the room the fold's
+    /// trigger is reached through.
+    #[test]
+    fn a_transcript_over_the_ceiling_is_cut_to_four_fifths() {
         let budget = 40_000;
         let target = trim_target(budget);
-        let mut messages = long_transcript(50);
+        let mut messages = long_transcript(200);
+        let before: usize = messages.iter().map(Message::weight).sum();
+        assert!(before > budget, "the fixture is over the ceiling: {before}");
 
-        trim_history(&mut messages, target);
-        let trimmed: usize = messages.iter().map(Message::weight).sum();
-        assert!(trimmed <= target, "a trim stops at four fifths: {trimmed}");
+        trim_history(&mut messages, budget);
+
+        let after: usize = messages.iter().map(Message::weight).sum();
+        assert!(
+            after <= target,
+            "cut down to four fifths: {after} > {target}"
+        );
+        assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE);
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user", "the opening task survives");
+    }
+
+    /// The ceiling's boundary is inclusive and the cut starts one byte past it:
+    /// a transcript *at* the budget is inside the window and comes back byte for
+    /// byte, and one byte more is cut to the stopping point. This is the
+    /// comparison the attach gate leans on for its own boundary.
+    #[test]
+    fn a_transcript_at_the_ceiling_is_left_alone_and_one_byte_over_is_cut() {
+        for (label, extra) in [("at", 0usize), ("over", 1)] {
+            let budget = 1_000;
+            let target = trim_target(budget);
+            // A cuttable shape — three user lines — whose text lands on the
+            // ceiling or a byte past it. The padded turn is the oldest one, so
+            // the drain can take it.
+            let mut messages = vec![Message::system("you are mush"), Message::user("first")];
+            messages.push(Message::assistant("one"));
+            messages.push(Message::user("two"));
+            messages.push(Message::assistant("three"));
+            messages.push(Message::user("four"));
+            // Weighed, not counted by hand: the replacement text is sized to
+            // land the total on the boundary, the length delta included.
+            let base: usize = messages.iter().map(Message::weight).sum();
+            messages[2].content = Some("x".repeat(budget + extra - base + "one".len()));
+            let total: usize = messages.iter().map(Message::weight).sum();
+            assert_eq!(total, budget + extra, "the fixture lands on the boundary");
+
+            let before = serde_json::to_string(&messages).unwrap();
+            trim_history(&mut messages, budget);
+
+            if extra == 0 {
+                assert_eq!(
+                    serde_json::to_string(&messages).unwrap(),
+                    before,
+                    "at the ceiling is inside: {label}"
+                );
+            } else {
+                assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE, "one byte over cuts");
+                assert_eq!(messages.len(), 4, "and the oldest turn went: {messages:?}");
+                assert!(
+                    messages.iter().map(Message::weight).sum::<usize>() <= target,
+                    "down to the stopping point"
+                );
+            }
+        }
+    }
+
+    /// The pair, start to finish, run the way the caller runs it: a transcript
+    /// over the ceiling is cut down to four fifths; the growth after that has
+    /// the tenth up to the fold's trigger to cross; when it does, the boundary
+    /// is the fold's — the summarize request still fits the window — and the
+    /// trim that runs after the fold has nothing to cut, because the fold left
+    /// the system prompt and the summary. Cutting only over the ceiling is what
+    /// keeps that tenth reachable: a trimmer triggered at the watermark would
+    /// park the conversation just under it and cut every turn (see
+    /// [`trim_target`]).
+    #[test]
+    fn a_cut_leaves_the_room_the_next_growth_folds_in() {
+        let budget = 40_000;
+        let target = trim_target(budget);
+        let mut messages = long_transcript(200);
+        let over: usize = messages.iter().map(Message::weight).sum();
+        assert!(over > budget, "the fixture is over the ceiling: {over}");
+
+        trim_history(&mut messages, budget);
+        let cut: usize = messages.iter().map(Message::weight).sum();
+        assert!(cut <= target, "the cut stops at four fifths: {cut}");
 
         // The conversation's next growth: one turn heavier than the room the
-        // watermark left, so the transcript crosses the fold's trigger while
-        // still fitting inside the budget the summarize request is sent to.
+        // cut left, so the transcript crosses the fold's trigger while still
+        // fitting inside the budget the summarize request is sent to.
         messages.push(Message::user(
-            "x".repeat(compaction_trigger(budget) - trimmed + 1),
+            "x".repeat(compaction_trigger(budget) - cut + 1),
         ));
         let grown: usize = messages.iter().map(Message::weight).sum();
         assert!(grown <= budget, "the summarize request still fits: {grown}");
@@ -493,12 +625,15 @@ mod tests {
             "so the fold fires: {grown}"
         );
 
-        // Both mechanisms would act on this transcript — the watermark alone
-        // would cut it — and the caller's order is what gives the fold the
-        // first say.
-        let mut cut = messages.clone();
-        trim_history(&mut cut, target);
-        assert!(cut.len() < messages.len(), "the watermark alone would cut");
+        // The trim before the fold would leave the grown transcript alone: it
+        // is inside the ceiling, and the stopping point is not a trigger.
+        let grown_before = serde_json::to_string(&messages).unwrap();
+        trim_history(&mut messages, budget);
+        assert_eq!(
+            serde_json::to_string(&messages).unwrap(),
+            grown_before,
+            "inside the ceiling, the trim has nothing to do"
+        );
 
         // What the fold leaves — the system prompt and the summary — is a
         // transcript the trimmer walks past: the two never cut the same
@@ -508,11 +643,11 @@ mod tests {
             "the story so far",
         )));
         let folded = serde_json::to_string(&messages).unwrap();
-        trim_history(&mut messages, target);
+        trim_history(&mut messages, budget);
         assert_eq!(
             serde_json::to_string(&messages).unwrap(),
             folded,
-            "nothing left for the trim: the fold's transcript is under the watermark"
+            "nothing left for the trim: the fold's transcript is small again"
         );
     }
 
@@ -524,11 +659,11 @@ mod tests {
             messages.push(Message::tool(format!("call{i}"), "result"));
             messages.push(Message::user(format!("again {i}")));
         }
-        // A target in the range an 8K-context window's own watermark lands in;
-        // the drain is what this test is about.
+        // A budget in the range an 8K-context window's own lands in; the drain
+        // is what this test is about.
         trim_history(&mut messages, 15_000);
         assert_eq!(messages[0].role, "system");
-        assert!(messages.iter().map(Message::weight).sum::<usize>() <= 15_000);
+        assert!(messages.iter().map(Message::weight).sum::<usize>() <= trim_target(15_000));
         // The first kept entry must be a user message so pairs stay valid.
         assert_eq!(messages[1].role, "user");
     }
@@ -584,8 +719,8 @@ mod tests {
         );
         assert_eq!(note_count(&messages), 1, "one line, however much was cut");
         assert!(
-            messages.iter().map(Message::weight).sum::<usize>() <= 8_000,
-            "the explanation fits the watermark it explains"
+            messages.iter().map(Message::weight).sum::<usize>() <= trim_target(8_000),
+            "the explanation fits the stopping point it explains"
         );
     }
 
@@ -607,7 +742,7 @@ mod tests {
         assert_eq!(note_count(&messages), 1, "replaced, not stacked");
         assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE, "and still in place");
         assert_eq!(messages[1].role, "user");
-        assert!(messages.iter().map(Message::weight).sum::<usize>() <= 8_000);
+        assert!(messages.iter().map(Message::weight).sum::<usize>() <= trim_target(8_000));
     }
 
     /// A trim that can cut no further keeps the line it already carries:
@@ -641,7 +776,7 @@ mod tests {
         assert_eq!(messages.len(), 3, "nothing can be trimmed without a pair");
         assert_eq!(note_count(&messages), 0);
 
-        // Exactly two turns and over the watermark: the guard refuses the
+        // Exactly two turns and over the ceiling: the guard refuses the
         // drain, so there is no drop to explain and no note to add either.
         let mut messages = vec![
             Message::system("you are mush"),
@@ -675,7 +810,7 @@ mod tests {
         }
     }
 
-    /// A transcript over the watermark because of an image does not lose the
+    /// A transcript over the ceiling because of an image does not lose the
     /// image on its own any more: it is part of the turn it arrived in, and the
     /// oldest turns are what go — the picture with them, words and bytes
     /// together. No placeholder is left where it was: nothing of the turn is.
@@ -696,14 +831,14 @@ mod tests {
             .filter(|message| message.images.is_empty())
             .map(Message::weight)
             .sum();
-        let target = 24_000;
-        assert!(words <= target, "the words alone fit: {words} > {target}");
+        let budget = 24_000;
+        assert!(words <= budget, "the words alone fit: {words} > {budget}");
         assert!(
-            messages.iter().map(Message::weight).sum::<usize>() > target,
-            "the fixture is over the watermark because of the picture, not the words"
+            messages.iter().map(Message::weight).sum::<usize>() > budget,
+            "the fixture is over the ceiling because of the picture, not the words"
         );
 
-        trim_history(&mut messages, target);
+        trim_history(&mut messages, budget);
 
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].text(), "first", "the opening task survives");
@@ -728,7 +863,7 @@ mod tests {
                 .any(|message| message.text().contains("shots/huge.png")),
             "no placeholder: the picture is not left behind without its turn"
         );
-        assert!(messages.iter().map(Message::weight).sum::<usize>() <= target);
+        assert!(messages.iter().map(Message::weight).sum::<usize>() <= trim_target(budget));
     }
 
     /// A turn the drain never reached keeps its picture whole: bytes and all,
@@ -763,7 +898,7 @@ mod tests {
                 .all(|message| message.images[0].bytes.len() == 300),
             "bytes and all"
         );
-        assert!(messages.iter().map(Message::weight).sum::<usize>() <= 8_000);
+        assert!(messages.iter().map(Message::weight).sum::<usize>() <= trim_target(8_000));
     }
 
     /// Oldest first, and whole turns: the turn the transcript has carried the
@@ -782,10 +917,10 @@ mod tests {
             messages.push(Message::user(format!("again {i}")));
         }
         // Room for the words and the newest of the three turns, not for more.
-        let target = 7_600;
-        assert!(messages.iter().map(Message::weight).sum::<usize>() > target);
+        let budget = 12_000;
+        assert!(messages.iter().map(Message::weight).sum::<usize>() > budget);
 
-        trim_history(&mut messages, target);
+        trim_history(&mut messages, budget);
 
         assert_eq!(messages[1].text(), "first", "the opening task survives");
         assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE);
@@ -804,7 +939,7 @@ mod tests {
         assert!(kept[0].text().contains("here 2"), "and it is the newest");
         assert_eq!(kept[0].images.len(), 1, "with its picture");
         assert_eq!(kept[0].images[0].bytes.len(), 7_000, "bytes and all");
-        assert!(messages.iter().map(Message::weight).sum::<usize>() <= target);
+        assert!(messages.iter().map(Message::weight).sum::<usize>() <= trim_target(budget));
     }
 
     /// The pixels are the budget's ruler, and a picture the budget can hold is
@@ -821,16 +956,16 @@ mod tests {
             .push(picture("shots/bytes.png", 8, 8, 6 * 1024 * 1024));
         messages.push(reply);
         messages.push(Message::user("next"));
-        let target = 10_000;
+        let budget = 10_000;
         let weighed: usize = messages.iter().map(Message::weight).sum();
-        assert!(weighed <= target, "the pixels fit the watermark: {weighed}");
+        assert!(weighed <= budget, "the pixels fit the window: {weighed}");
         assert!(
-            weighed + 6 * 1024 * 1024 > target,
+            weighed + 6 * 1024 * 1024 > budget,
             "the old byte count would have been over it"
         );
         let before = serde_json::to_string(&messages).unwrap();
 
-        trim_history(&mut messages, target);
+        trim_history(&mut messages, budget);
 
         assert_eq!(
             serde_json::to_string(&messages).unwrap(),
@@ -841,10 +976,10 @@ mod tests {
 
     /// The human's own numbers, and the defect the pixel pricing fixed: a
     /// ~300k-token conversation (~900 KB of weight) plus a 724 KiB 1920×1080
-    /// screenshot fits a 500k-token window's budget *and* the trimmer's
-    /// watermark — the picture costs ~2.8k tokens by its pixels where its bytes
-    /// read as ~247k, which is what once made the picture the first thing a
-    /// trim shed. Under the watermark, the conversation is left alone: the
+    /// screenshot fits a 500k-token window's budget — the picture costs ~2.8k
+    /// tokens by its pixels where its bytes read as ~247k, which is what once
+    /// made the picture the first thing a trim shed. It is under the fold's
+    /// trigger too, so neither mechanism touches the conversation: the
     /// screenshot reaches the model, and the turn it arrived in survives.
     #[test]
     fn the_humans_screenshot_fits_and_is_not_dropped() {
@@ -876,12 +1011,12 @@ mod tests {
             "the pixels count fits it: {total} > {budget}"
         );
         assert!(
-            total <= trim_target(budget),
-            "and the watermark holds it too: {total} > {}",
-            trim_target(budget)
+            total <= compaction_trigger(budget),
+            "and it is under the fold's trigger too: {total} > {}",
+            compaction_trigger(budget)
         );
 
-        trim_history(&mut messages, trim_target(budget));
+        trim_history(&mut messages, budget);
 
         assert_eq!(
             messages.last().unwrap().images.len(),
@@ -891,7 +1026,7 @@ mod tests {
         assert_eq!(note_count(&messages), 0, "and no turn was dropped either");
     }
 
-    /// A transcript of impossible pictures is over the watermark, not wrapped
+    /// A transcript of impossible pictures is over the ceiling, not wrapped
     /// under it: a header that claims `u32::MAX × u32::MAX` pixels weighs as
     /// much as there is, and the drain reads that saturated total as over on
     /// every pass — a plain sum would panic in a debug build and wrap to a
@@ -899,7 +1034,7 @@ mod tests {
     /// leave the transcript alone. The picture on the newest line is kept: the
     /// drain takes turns, it does not shed payloads.
     #[test]
-    fn a_transcript_of_impossible_pictures_still_reads_as_over_the_watermark() {
+    fn a_transcript_of_impossible_pictures_still_reads_as_over_the_ceiling() {
         let mut messages = long_transcript(260);
         for (i, message) in messages.iter_mut().enumerate() {
             if message.role == "assistant" {
@@ -925,7 +1060,7 @@ mod tests {
 
         assert!(
             messages.len() < before,
-            "the drain ran: the saturated total read as over the watermark"
+            "the drain ran: the saturated total read as over the ceiling"
         );
         assert_eq!(messages[0].role, "system");
         assert_eq!(messages[1].role, "user");

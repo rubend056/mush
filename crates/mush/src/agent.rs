@@ -26,8 +26,8 @@ use mush_core::message::{ChatRequest, ChatResponse};
 use mush_core::text::{first_line, sanitize, truncate, truncate_flag};
 use mush_core::tools::ToolName;
 use mush_core::transcript::{
-    needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, trim_target,
-    COMPACT_INSTRUCTION, COMPACT_REPLY_TOKENS,
+    needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
+    COMPACT_REPLY_TOKENS,
 };
 use mush_core::workspace::{truncate_for_model, SEARCH_FILE_CAP};
 use mush_core::{prompt, tools, Config, Image, Message, Workspace, CMD_TIMEOUT_SECS};
@@ -2246,13 +2246,12 @@ fn run_loop(
             compact_history(actor, &cfg, messages, cancel, state, true)?;
         }
         // Keep the whole request inside the endpoint's context window. The
-        // trimmer stops at its watermark — `trim_target` of the budget, not the
-        // budget itself: a cut to the brim is one the next turn's growth makes
-        // again, and every cut rewrites the front of the prompt, which is the
-        // prefix a provider's cache warmed. The room the watermark leaves below
-        // the fold's trigger is room the next growth is folded in rather than
-        // cut.
-        trim_history(messages, trim_target(budget));
+        // trimmer is the fallback the fold cannot help with: it bites only when
+        // the transcript is *over* the budget — the watermark is where a cut
+        // stops, not where it starts — and then cuts down to `trim_target`,
+        // four fifths, so the tenth below the fold's trigger is room the next
+        // growth is folded in rather than cut.
+        trim_history(messages, budget);
 
         // The wrap-up turn asks for a summary, appended only to the request so
         // the stored transcript does not carry a turn-limit notice. A stop that

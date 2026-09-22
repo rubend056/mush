@@ -3337,9 +3337,10 @@ impl App {
     /// A picture whose weight exactly equals the room left fits: this gate asks
     /// whether the request would still be inside the window
     /// (`cost + pending > room` warns, equality does not), which is the same
-    /// inclusive comparison [`mush_core::transcript::trim_history`] makes at
-    /// its own stopping point (`total <= target`), so a picture parked on the
-    /// boundary is not warned about by one rule and sent by another.
+    /// inclusive comparison the trimmer makes at the ceiling
+    /// ([`mush_core::transcript::trim_history`]: a transcript at `budget` is
+    /// inside, one byte more is cut), so a picture parked on the boundary is
+    /// not warned about by one rule and sent by another.
     ///
     /// Everything else attaches, and the line says the image, its format and
     /// its size, and how to send it.
@@ -7035,9 +7036,9 @@ mod tests {
 
     /// The boundary is the window's, not a second one: a picture that weighs
     /// *exactly* the room left fits (the gate warns only above
-    /// `cost + pending > room`, the inclusive comparison the trimmer's own
-    /// stopping point uses), and one byte more warns. Two apps, because an
-    /// attachment changes the room the next call sees.
+    /// `cost + pending > room`, the inclusive comparison the trimmer makes at
+    /// the ceiling), and one byte more warns. Two apps, because an attachment
+    /// changes the room the next call sees.
     #[test]
     fn a_picture_exactly_at_the_room_left_fits_and_one_byte_more_does_not() {
         for (label, extra) in [("fits", 0usize), ("one-over", 1)] {
