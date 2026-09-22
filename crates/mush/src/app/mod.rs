@@ -6969,30 +6969,28 @@ mod tests {
         );
     }
 
-    /// Backspace deletes in the box while there is text, and on an empty box it
-    /// pops the newest attachment. Esc clears both: what the human asked to
-    /// clear is the message they were writing, pictures included.
+    /// Backspace takes the thing immediately before the cursor, and at the very
+    /// start of the box that is the newest attachment — the pictures are painted
+    /// above the words. Esc clears both halves of the box.
     #[test]
-    fn backspace_pops_an_attachment_only_on_an_empty_box_and_esc_clears_both() {
+    fn backspace_at_the_boxes_start_pops_the_newest_attachment_and_esc_clears_both() {
         let (mut app, _rx) = test_app("box-keys");
         app.focus = Focus::Chat;
         app.chat.attach(image("a.png"));
         app.chat.attach(image("b.png"));
-
-        // With text in the box, Backspace is the text's.
         app.chat.insert("hi");
-        backspace(&mut app);
-        assert_eq!(app.chat.input().text(), "h");
-        assert_eq!(
-            app.chat.attachments().len(),
-            2,
-            "the pictures are untouched"
-        );
 
-        // Empty the box, and the next Backspace takes the newest picture.
+        // With the cursor at the very start and words in the box, the key takes
+        // the picture overhead: a plain backspace had nothing to delete there.
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)));
+        let bar = text_of(&app).to_string();
         backspace(&mut app);
-        assert_eq!(app.chat.input().text(), "");
-        backspace(&mut app);
+        assert_eq!(
+            text_of(&app),
+            bar.as_str(),
+            "a pop says nothing: the row vanishing is the feedback"
+        );
+        assert_eq!(app.chat.input().text(), "hi", "the words are untouched");
         assert_eq!(app.chat.attachments().len(), 1);
         assert_eq!(
             app.chat.attachments()[0].path,
@@ -7000,7 +6998,14 @@ mod tests {
             "the newest goes first"
         );
         backspace(&mut app);
-        assert!(app.chat.attachments().is_empty());
+        assert!(app.chat.attachments().is_empty(), "one press, one image");
+
+        // With no pictures left, Backspace is the text's, wherever it lands.
+        backspace(&mut app);
+        assert_eq!(app.chat.input().text(), "hi", "index 0 deletes nothing");
+        app.update(Msg::Key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE)));
+        backspace(&mut app);
+        assert_eq!(app.chat.input().text(), "h");
 
         // Attach again, type, and Esc: both halves of the box go.
         app.chat.attach(image("c.png"));

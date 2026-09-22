@@ -216,7 +216,7 @@ pub const KEYS: &[Binding] = &[
     Binding {
         context: Context::Chat,
         keys: "Backspace / Delete",
-        help: "delete in the box; on an empty box, Backspace pops the newest attachment",
+        help: "delete in the box; at the start of the box, Backspace pops the newest attachment",
     },
     Binding {
         context: Context::Chat,
@@ -815,6 +815,19 @@ mod tests {
             !table.contains("wheel"),
             "`--help` advertised a wheel it never scrolls:\n{table}"
         );
+    }
+
+    /// The Backspace row states the rule as it now is: the key takes the newest
+    /// attachment at the start of the box, with words maybe still in it — not
+    /// only on an empty box.
+    #[test]
+    fn the_backspace_row_states_where_the_attachment_rule_bites() {
+        let help = KEYS
+            .iter()
+            .find(|binding| binding.keys == "Backspace / Delete")
+            .expect("the Backspace row")
+            .help;
+        assert!(help.contains("the start of the box"), "{help}");
     }
 
     /// The two stop keys name their scope, so the help cannot repeat the doc's

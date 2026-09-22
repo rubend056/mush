@@ -1289,13 +1289,15 @@ impl Chat {
             // recent Alacritty); elsewhere it arrives as a plain Enter, which
             // is why Alt+Enter does the same thing and is the reliable one.
             ChatKey::Newline => self.input.insert("\n"),
-            // Backspace on an empty box deletes the newest attachment instead
-            // of doing nothing: the box is what the human is looking at, and
-            // the attachment is the newest thing in it. With text in the box
-            // the key is the text's, because deleting the picture while words
-            // are being edited would be a surprise with an undo of none.
+            // Backspace takes the thing immediately before the cursor. The
+            // pictures are painted above the words, so at the very start of the
+            // box that thing is the newest attachment, and a plain backspace
+            // had nothing to delete there while the box held text. Several
+            // images go newest first, one per press; anywhere else in the box
+            // the key is the text's, as it always was. An empty box is the same
+            // rule with no text: the newest picture is what it means.
             ChatKey::Backspace => {
-                if self.input.is_empty() && !self.attachments.is_empty() {
+                if self.input.is_at_start() && !self.attachments.is_empty() {
                     self.attachments.pop();
                 } else {
                     self.input.backspace();
@@ -1628,6 +1630,16 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// An attached image, as `Ctrl-V` or a pasted path produces one. Its bytes
+    /// are what a pop and a restore move around; nothing here looks at them.
+    fn image(path: &str) -> Image {
+        Image {
+            path: path.to_string(),
+            mime: "image/png".to_string(),
+            bytes: vec![1, 2, 3],
+        }
     }
 
     /// Press a key the way the app does: the pure keymap decides which pane
@@ -3048,5 +3060,39 @@ mod tests {
         assert!(press(&mut chat, key(KeyCode::Left)));
         assert!(press(&mut chat, key(KeyCode::Char('A'))));
         assert_eq!(chat.input().text(), "Ax");
+    }
+
+    /// Backspace takes the thing immediately before the cursor, and at the very
+    /// start of the box that is the newest attachment — the pictures are
+    /// painted above the words. The key that did nothing there while the box
+    /// held text now takes the picture overhead.
+    #[test]
+    fn backspace_at_the_boxes_start_pops_the_newest_attachment() {
+        let mut chat = Chat::bare();
+        chat.attach(image("a.png"));
+        chat.attach(image("b.png"));
+        chat.insert("words");
+        assert!(
+            press(&mut chat, key(KeyCode::Home)),
+            "Home is the box's start"
+        );
+
+        // The newest image goes; the words are untouched.
+        press(&mut chat, key(KeyCode::Backspace));
+        assert_eq!(chat.attachments().len(), 1);
+        assert_eq!(chat.attachments()[0].path, "a.png", "the newest goes first");
+        assert_eq!(chat.input().text(), "words");
+
+        // A second press takes the next one; a third, with none left, leaves
+        // the box alone — at index 0 plain backspace has nothing to delete.
+        press(&mut chat, key(KeyCode::Backspace));
+        assert!(chat.attachments().is_empty());
+        press(&mut chat, key(KeyCode::Backspace));
+        assert_eq!(chat.input().text(), "words", "the words stay");
+
+        // From inside the text the key is the text's, as it always was.
+        press(&mut chat, key(KeyCode::End));
+        press(&mut chat, key(KeyCode::Backspace));
+        assert_eq!(chat.input().text(), "word");
     }
 }
