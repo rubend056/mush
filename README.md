@@ -117,9 +117,8 @@ tend to flatten the chain and do the leaf work themselves. Prefer a capable
 model for orchestration.
 
 A run ends when the model stops calling tools; a repeated tool batch ends it
-early as a *loop*, and the runaway guard ends with a **wrap-up turn** instead of
-an error: tools are withdrawn, the model summarizes what was done and what is
-left, and that summary is the run's result.
+early as a *loop*. Nothing counts turns, so a run that keeps making *different*
+calls goes until you stop it.
 
 ## The agents pane
 

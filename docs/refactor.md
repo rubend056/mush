@@ -287,7 +287,7 @@ no generics threading through the actor.
 
 | Seam | Signature (sketch) | Fake | Unlocks |
 |---|---|---|---|
-| `ModelClient` | `fn chat(&self, req: &ChatRequest, cancel: &AtomicBool) -> Result<ChatResponse, ModelError>` | scripted reply queue, including errors and cancellation | `run_loop`, compaction, the learned-context retry, cancel mid-reply, `MAX_TURNS` wrap-up (N1) — all in-process |
+| `ModelClient` | `fn chat(&self, req: &ChatRequest, cancel: &AtomicBool) -> Result<ChatResponse, ModelError>` | scripted reply queue, including errors and cancellation | `run_loop`, compaction, the learned-context retry, cancel mid-reply, a run kept past the old 200-turn ceiling (H45) — all in-process |
 | `Machine` + `Job` | `fn spawn(&self, cmd: &ShellCommand) -> Result<Box<dyn Job>, String>`; `Job::{poll, written, output, kill}` | scripted end states, output sizes, kills | timeout, cancel, output cap, and M2.8's detach/exclusive lock without `sh`, `yes` or sleeps — landed in 2.3, with the timeout still decided by the watcher in `agent.rs` |
 | `Clock` | `fn now(&self) -> Instant; fn sleep(&self, d: Duration)` | advanceable by hand, `sleep` returns at once | `wait_tool`'s 50 ms poll, `wait_bounded`'s 10 ms poll, `Watch`'s deadline — landed in 2.3; `INFO_TTL` ageing still reads the wall clock in `app/mod.rs` |
 | `Events` | `fn emit(&self, id: AgentId, event: AgentEvent)` | recording sink | exactly-once completion delivery, fan-out refusal, dispatch, cancel mid-batch — asserted, instead of `mem::forget(ui_rx)` |
@@ -351,11 +351,12 @@ releases it — which is what makes "the nudge arrived while the reply was in
 flight" and "the parent's turn ended before its child finished" facts rather
 than races. The work stayed real: git worktrees, files, the commit, the merge
 and the discard the UI advertises, and one file write per turn in the
-turn-limit scenario. The tests now wait on the `Done`/`Compact`/`Message` events
+long-run scenario. The tests now wait on the `Done`/`Compact`/`Message` events
 they assert on instead of polling for a file, and each one asserts what it
 pinned before — the child's work on `mush/1` in `.mush/wt/1`, `mush/2` based on
 `mush/1`, the folded summary as the next request's only user message, the nudge
-in the second request, a wrap-up summary rather than a bare failure. Gone with
+in the second request, a run kept past the old 200-turn ceiling that ends on the
+model's own stop (H45). Gone with
 them: `start_mock*`, `stop_mock`, the four port constants (18731–18735), the
 `python3` readiness probe, and every sleep over 20 ms in these tests.
 `scripts/mock_llm.py` stays in the tree for the pty smoke scenarios; no test
@@ -455,7 +456,7 @@ invariant knows its home. The `A1`–`A8` here are the starting audit's, not
 | B17 | the layout sweep asserts "does not panic", not painted text | `app/screen.rs` + `ui::draw(frame, &Screen)`; `the_draw_sweep_asserts_painted_text_not_that_it_did_not_panic` over 15 sizes × 14 states, plus seven focused `the_sweep_*` tests (`7e123e1`) |
 | B18 | `~` elision matches a prefix, not a directory | `app/screen.rs::facts_line` (moved from `ui.rs` by B17) |
 | B19 | global notices render into every transcript | `Notice.agent` + `Chat::notices_for` — no unscoped read exists |
-| N1 | `MAX_TURNS` turns "long" into "failed" | `agent/run.rs`: `RUNAWAY_TURNS` + `LOOP_ROUNDS` (a run ends when it stops calling tools; only a *loop* ends it early) |
+| N1 | `MAX_TURNS` turns "long" into "failed" | `agent/run.rs`: `LOOP_ROUNDS` (a run ends when it stops calling tools; only a *loop* ends it early) — the 200-turn ceiling and its wrap-up turn were removed later (H45, §8.47) |
 | N2 | message box is append-only and clips at the right edge | `Input` (grapheme cursor + window), `Chat::key` owns the editing keys |
 | N3 | a stopped child is reported to its parent as `#N done: cancelled` | `agent::Outcome` (one enum, not a `summary == CANCELLED` string sentinel) |
 | N4 | Ctrl-C stopped *every* busy agent, and blanked a stopped one to `Idle` | `App::interrupt` (focused) + `Ctrl-X` (`interrupt_all`); `Phase::Stopped` |
