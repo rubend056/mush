@@ -560,13 +560,13 @@ impl App {
             let pane = Pane {
                 agent: self.tree.focused,
                 // A run in flight is what the pane's own activity line is
-                // derived from, and the spinner is the frame `App::tick`
-                // advanced.
+                // derived from, and the beat it counts its dots from is the one
+                // `App::tick` advanced.
                 //
-                // A run parked in a wait is *not* one: the foot's `working…` may
+                // A run parked in a wait is *not* one: the foot's `working` may
                 // only claim a model call, and `wait` is not one — the
                 // agent is waiting for somebody else's result, and the row says
-                // so (`waiting on agents 3s`). Painting the spinner over that
+                // so (`waiting on agents 3s`). Painting the working line over that
                 // was exactly the lie finding U7 named.
                 busy: node
                     .map(|node| node.phase.is_busy() && node.phase.waiting().is_none())

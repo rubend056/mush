@@ -60,8 +60,19 @@ use crate::ids::AgentId;
 use crate::input::Input;
 use crate::ui::dim;
 
-/// A spinner's frames, so a run in flight looks alive in the pane.
-const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+/// The pane's own line while a run is in flight: `working.`, `working..`,
+/// `working...`, one dot a second, looping.
+///
+/// The dots are the whole animation. They replaced a ten-frame braille spinner
+/// (`⠋⠙⠹…`) that `App::tick` advanced once per event-loop pass: a 30 ms poll
+/// turned that glyph over thirty times a second, which is a flicker rather than
+/// a pulse — and a decoration that repaints a frame is not free. The word was
+/// already `working`, so the animation is its own punctuation, and the beat
+/// comes from the caller ([`Pane::spin`]) rather than from each tool call, so a
+/// run that changes tools does not restart mid-dot.
+fn working_dots(beats: u64) -> String {
+    format!("working{}", ".".repeat(1 + (beats % 3) as usize))
+}
 
 /// The most rows the foot may take from the transcript: two rows of notes and
 /// the one that says how many lines are not shown. The transcript is the point
@@ -290,17 +301,19 @@ struct Foot {
 
 /// What a pane knows that the conversation does not: which agent it is showing,
 /// whether that agent's run is in flight, whether it is folding its
-/// conversation, where the animation is, and the endpoint/model line the empty
-/// state names.
+/// conversation, which beat its dots are on, and the endpoint/model line the
+/// empty state names.
 #[derive(Clone, Copy)]
 pub struct Pane<'a> {
     pub agent: AgentId,
     pub busy: bool,
     /// The fold this agent is doing, if any: the pane's own activity line says
-    /// *that*, not `working…`, because a fold is not the run's model call and
+    /// *that*, not `working`, because a fold is not the run's model call and
     /// the human waiting for it should see which of the two is moving (finding
     /// U11).
     pub compacting: Option<Compacting>,
+    /// The beat [`working_dots`] counts from: one a second while anything is in
+    /// flight (`DOT_PERIOD`), not one a frame.
     pub spin: u64,
     pub label: &'a str,
 }
@@ -1116,14 +1129,14 @@ impl Chat {
         if pane.busy {
             worth.push(1);
             // A fold says so: the row and the bar already do, and a pane that
-            // said `working…` while the conversation is being summarized would
+            // said `working.` while the conversation is being summarized would
             // be the third surface disagreeing about one fact (finding U11).
             let what = match pane.compacting {
                 Some(kind) => kind.words().to_string(),
-                None => "working…".to_string(),
+                None => working_dots(pane.spin),
             };
             blocks.push(vec![Line::from(Span::styled(
-                format!("{} {what}", SPINNER[(pane.spin as usize) % SPINNER.len()]),
+                what,
                 Style::default().fg(Color::Cyan),
             ))]);
             // Derived from a phase, so not a note: hiding it promises nothing
@@ -2532,7 +2545,7 @@ mod tests {
             "the failure is never the line the cap gives up: {rows:?}"
         );
         assert!(
-            rows.iter().any(|row| row.contains("working…")),
+            rows.iter().any(|row| row.contains("working")),
             "and the run in flight is still shown, ranked below the failure"
         );
         assert!(
@@ -2550,6 +2563,35 @@ mod tests {
             vec!["· reading the lexer", "! no route to host"],
             "the foot reads in the order the lines were written, oldest first"
         );
+    }
+
+    /// The foot's animation is the word's own dots: `working.`, `working..`,
+    /// `working...`, and round again — one a second (`DOT_PERIOD`), not one a
+    /// frame, and no glyph in front of it.
+    #[test]
+    fn the_working_line_counts_its_dots() {
+        assert_eq!(working_dots(0), "working.");
+        assert_eq!(working_dots(1), "working..");
+        assert_eq!(working_dots(2), "working...");
+        assert_eq!(working_dots(3), "working.");
+
+        // The same spellings on the row a human reads, painted from the beat
+        // the pane was handed. The whole line is the assertion: no glyph in
+        // front of the word, only the dots behind it.
+        let chat = Chat::bare();
+        for (beat, row) in [(0, "working."), (1, "working.."), (2, "working...")] {
+            let busy = Pane {
+                busy: true,
+                spin: beat,
+                ..pane(AgentId(1))
+            };
+            let painted = chat.painted(&busy, 40, 4);
+            assert!(
+                shown(&painted.lines).iter().any(|line| line == row),
+                "at beat {beat}: {:?}",
+                shown(&painted.lines)
+            );
+        }
     }
 
     /// The order is a decision and not an accident: a list of notices is a
@@ -2666,8 +2708,8 @@ mod tests {
         };
 
         // One row of pane, and no notes: the transcript keeps the row, the
-        // hidden spinner is not a line something wrote, and the title claims
-        // nothing.
+        // hidden working line is not a line something wrote, and the title
+        // claims nothing.
         let painted = chat.painted(&busy, 40, 1);
         assert_eq!(shown(&painted.lines), vec!["mush › the newest reply"]);
         assert_eq!(painted.title, " mush ", "{:?}", painted.title);
@@ -2677,7 +2719,7 @@ mod tests {
         );
 
         // With one note the count is that note and only that note, whether the
-        // spinner is shown beside it or not.
+        // working line is shown beside it or not.
         chat.note_for(AgentId::ROOT, "reading the lexer");
         let painted = chat.painted(&busy, 40, 1);
         assert_eq!(painted.title, " mush · +1 more lines · /notes ");

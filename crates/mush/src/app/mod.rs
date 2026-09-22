@@ -377,6 +377,15 @@ pub enum StatusKind {
 /// command, short enough that it never becomes furniture.
 const INFO_TTL: Duration = Duration::from_secs(5);
 
+/// How often the transcript foot's dots move: `working.`, `working..`,
+/// `working...`, one a second while anything is in flight.
+///
+/// The cadence *is* the animation. [`App::tick`] runs on the event loop's 30 ms
+/// poll — that is the heartbeat for the clock, the git snapshot and the lines
+/// that age off the screen — and an animation driven by it turned over thirty
+/// times a second: a flicker, not a pulse (`chat::working_dots`).
+const DOT_PERIOD: Duration = Duration::from_secs(1);
+
 /// What a stop key answers with when there is no work to stop.
 ///
 /// The same words from both stop keys — `Ctrl-C` on an idle tree and `Ctrl-X`
@@ -556,7 +565,12 @@ pub struct App {
     /// (finding P11 / refactor B3).
     term_width: u16,
     term_height: u16,
+    /// The beat the transcript foot's dots are on ([`DOT_PERIOD`]), and the
+    /// clock that says when the next one is owed. [`App::tick`] advances it
+    /// while anything is in flight; the dots read it as `working.`,
+    /// `working..`, `working...`.
     pub spin: u64,
+    spin_at: Instant,
 }
 
 impl App {
@@ -621,6 +635,7 @@ impl App {
             term_width: 80,
             term_height: 24,
             spin: 0,
+            spin_at: Instant::now(),
         };
         // The failures come back before the agents do, because the agent that
         // went back to idle takes its line with it (see `restore_agents`).
@@ -1334,13 +1349,20 @@ impl App {
         self.dirty_screen = true;
     }
 
-    /// Called once per event-loop pass so the status spinner animates, and so
+    /// Called once per event-loop pass so the foot's dots move on time, and so
     /// a line that has outlived its welcome leaves the screen even when nothing
     /// else is happening.
     pub fn tick(&mut self) {
         if self.busy() {
-            self.spin = self.spin.wrapping_add(1);
-            self.dirty_screen = true;
+            // One dot a second, not one per pass: the poll is every 30 ms and
+            // the animation is a second hand ([`DOT_PERIOD`]). The repaint is
+            // owed when a beat lands — the dots moved, and the ages beside them
+            // did too — rather than thirty times a second for a decoration.
+            if self.spin_at.elapsed() >= DOT_PERIOD {
+                self.spin = self.spin.wrapping_add(1);
+                self.spin_at = Instant::now();
+                self.dirty_screen = true;
+            }
             // A long run keeps changing the workspace; the bar and the rows
             // should not need a keystroke to notice.
             if self
@@ -8512,8 +8534,8 @@ mod tests {
     }
 
     /// A run parked in a wait is not a model call. The transcript foot's
-    /// spinner may only claim work in flight, so `wait` must not paint
-    /// `working…` over an agent that is waiting for a child's result — and the
+    /// working line may only claim work in flight, so `wait` must not paint
+    /// `working` over an agent that is waiting for a child's result — and the
     /// row says what it is waiting for instead (finding U7), with an icon that
     /// is not the working one (finding U14).
     #[test]
@@ -8526,7 +8548,7 @@ mod tests {
 
         let rows = screen(&mut app, 120, 32);
         assert!(
-            !rows.join("\n").contains("working…"),
+            !rows.join("\n").contains("working."),
             "nothing is being computed, so nothing spins: {rows:?}"
         );
         let waiting = rows
@@ -8550,7 +8572,7 @@ mod tests {
             rows.iter().any(|row| row.contains("thinking 2s")),
             "{rows:?}"
         );
-        assert!(rows.join("\n").contains("working…"), "{rows:?}");
+        assert!(rows.join("\n").contains("working."), "{rows:?}");
         assert!(rows[0].contains("1 working"), "{}", rows[0]);
     }
 
@@ -9741,7 +9763,7 @@ mod tests {
     /// the audit photographs: the row wears its own glyph and words, the bar
     /// says what happens to the words they are about to type — in the same verb
     /// the row uses, whatever kind of fold it is — and the transcript's foot
-    /// repeats the fold rather than `working…` (finding U11, refactor R8).
+    /// repeats the fold rather than `working` (finding U11, refactor R8).
     #[test]
     fn a_fold_in_flight_is_painted_on_every_surface() {
         let (mut app, _rx) = test_app("compact-painted");
@@ -9798,7 +9820,7 @@ mod tests {
                     "and the human's question answered at {width}×{height}: {rows:?}"
                 );
                 assert!(
-                    !painted.contains("working…"),
+                    !painted.contains("working."),
                     "a fold is not the run's own model call at {width}×{height}: {rows:?}"
                 );
             }
@@ -11083,7 +11105,7 @@ mod tests {
         states.push(Sweep {
             name: "a run in flight",
             app: run,
-            words: vec!["◐ #0", "edit_file src/lib.rs", "working…", " chat "],
+            words: vec!["◐ #0", "edit_file src/lib.rs", "working.", " chat "],
             roomy: vec![" agents · 1 working"],
             absent: Vec::new(),
             reopen: None,
@@ -11091,9 +11113,9 @@ mod tests {
         keep.push(rx);
 
         // A run parked on somebody else's result: the hourglass, and never the
-        // working icon or the foot's spinner — the one state three surfaces read
-        // (finding U14). Painted at every size, because the glyph is a column
-        // the rows are fitted with.
+        // working icon or the foot's working line — the one state three surfaces
+        // read (finding U14). Painted at every size, because the glyph is a
+        // column the rows are fitted with.
         let (mut waiting, rx) = test_app("sweep-waiting");
         begin_run(&mut waiting, AgentId::ROOT);
         waiting.on_agent(AgentId::ROOT, AgentEvent::Status("wait ".into()));
@@ -11102,7 +11124,7 @@ mod tests {
             app: waiting,
             words: vec!["⧗ #0", "waiting on results"],
             roomy: vec![" agents · 1 waiting"],
-            absent: vec!["◐ #0", "working…"],
+            absent: vec!["◐ #0", "working."],
             reopen: None,
         });
         keep.push(rx);
@@ -11343,18 +11365,18 @@ mod tests {
 
         // A busy root whose one message the pane protects at the smallest
         // sizes: the foot has no row there, so the frame must not claim hidden
-        // lines anywhere — a derived spinner is not a line `/notes` can answer
-        // (finding V7).
+        // lines anywhere — a derived working line is not a line `/notes` can
+        // answer (finding V7).
         let (mut spinner, rx) = test_app("sweep-spinner");
         spinner
             .chat
             .push_message(AgentId::ROOT, Message::user("what is happening"));
         begin_run(&mut spinner, AgentId::ROOT);
         states.push(Sweep {
-            name: "a spinner with no foot row",
+            name: "a working line with no foot row",
             app: spinner,
             words: vec!["◐ #0"],
-            roomy: vec!["working…"],
+            roomy: vec!["working."],
             absent: vec!["more lines"],
             reopen: None,
         });
@@ -11730,9 +11752,35 @@ mod tests {
         );
     }
 
+    /// The dots move once a second, and the poll is not the animation: a frame's
+    /// worth of ticks leaves both the beat and the painted line alone, where the
+    /// braille spinner this replaced turned over on every one of them.
+    #[test]
+    fn the_working_dots_move_once_a_second() {
+        let (mut app, _rx) = test_app("dot-beat");
+        begin_run(&mut app, AgentId::ROOT);
+        app.spin = 0;
+        app.spin_at = Instant::now();
+        // A fresh git read would schedule a repaint of its own, and this test is
+        // about what the beat does.
+        app.git_at = Some(Instant::now());
+
+        app.dirty_screen = false;
+        for _ in 0..30 {
+            app.tick();
+        }
+        assert_eq!(app.spin, 0, "thirty passes of a 30 ms poll are not a beat");
+        assert!(!app.dirty_screen, "nothing moved, so nothing is repainted");
+
+        app.spin_at = Instant::now() - DOT_PERIOD;
+        app.tick();
+        assert_eq!(app.spin, 1, "a second on, the dot lands");
+        assert!(app.dirty_screen, "and the frame is owed one");
+    }
+
     /// A derived line is not a hidden line: a busy agent with nothing written
-    /// about it must not claim `+1 more lines` for its own spinner — a count
-    /// `/notes` cannot answer.
+    /// about it must not claim `+1 more lines` for its own working line — a
+    /// count `/notes` cannot answer.
     #[test]
     fn the_sweep_never_counts_a_derived_line_as_hidden() {
         let (mut app, _rx) = test_app("sweep-spinner-count");
@@ -11740,28 +11788,28 @@ mod tests {
             .push_message(AgentId::ROOT, Message::user("what is happening"));
         begin_run(&mut app, AgentId::ROOT);
         // At 40×10 the pane has one row of transcript, it protects it for the
-        // message, and the foot therefore has no row at all: the spinner is not
-        // painted, and a pane that counted it would say so in its title.
+        // message, and the foot therefore has no row at all: the working line
+        // is not painted, and a pane that counted it would say so in its title.
         let text = shot(&mut app, 40, 10).text();
-        assert!(!text.contains("working…"), "no row for it here: {text}");
+        assert!(!text.contains("working."), "no row for it here: {text}");
         assert!(
             !text.contains("more lines"),
             "a derived line is not a hidden line: {text}"
         );
-        // Where the foot has a row, the spinner is painted and still nothing is
-        // counted as hidden.
+        // Where the foot has a row, the working line is painted and still
+        // nothing is counted as hidden.
         for &(width, height) in SWEEP_SIZES {
             if is_below_floor(width, height) || (width, height) == (40, 10) {
                 continue;
             }
             let text = shot(&mut app, width, height).text();
             assert!(
-                text.contains("working…"),
-                "the spinner is the pane's activity at {width}×{height}: {text}"
+                text.contains("working."),
+                "the working line is the pane's activity at {width}×{height}: {text}"
             );
             assert!(
                 !text.contains("more lines"),
-                "the spinner is not a hidden line at {width}×{height}: {text}"
+                "the working line is not a hidden line at {width}×{height}: {text}"
             );
         }
     }

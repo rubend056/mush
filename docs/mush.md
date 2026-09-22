@@ -566,6 +566,17 @@ the count in its title. `/notes` reads the whole list, opening on the head of th
 newest note (the row that says *when* it happened) and labelling itself `line
 n/m`, so a long note that wrapped is read from its start rather than its middle.
 
+While a run is in flight the foot's lowest row is the pane's own activity line:
+`working.`, `working..`, `working...`, one dot a second, looping. The word was
+always `working`; the dots are its punctuation, and the beat is a second because
+that is what a human reads — the ten-frame braille spinner it replaced was
+advanced by the event loop's 30 ms poll, so it turned over thirty times a second,
+which is a flicker rather than a pulse and a repaint per frame for a decoration
+(`DOT_PERIOD`, `chat::working_dots`). A fold in flight says its own words on that
+row instead, and a run parked in a `wait` paints no activity line at all: nothing
+is being computed, and the row's `⧗` says what it is waiting for (§3, finding
+U7).
+
 What this replaced — one plain list, every notice painted under the newest
 message with one lifetime for all of them, `/forget` keeping a forgotten agent's
 lines invisibly, and a failure from twenty runs ago reading as the newest thing
@@ -962,7 +973,7 @@ version, audit, and wait for.
 | Cold start | < 20 ms | ~2 ms; model discovery is only fetched when no model is named |
 | Model discovery | < 50 ms | one `GET /v1/models` (~20 ms cold, ~4 ms warm), or on `/model`, `/models`, `/url` |
 | Keypress → screen | < 5 ms | `update` touches only UI state; draw only when dirty |
-| Idle CPU | ~0% | blocked on a 30 ms poll, no spinner unless an agent is running |
+| Idle CPU | ~0% | blocked on a 30 ms poll, no repaint unless an agent is running |
 | Memory | < 15 MB | the agent tree, the transcripts, and one message box |
 
 An unreachable endpoint cannot hang startup: connections are bounded by a 5 s
@@ -998,7 +1009,7 @@ a live one. Release profile uses `lto = "thin"`, `codegen-units = 1`,
 - **M1 — Editor.** `[REMOVED v0.2]` open/edit/save, modal keys, panes. mush is not
   an editor; the message box of §4 is what remains of it.
 - **M2 — Agent.** OpenAI function-calling loop, a file-editing tool and the shell
-  on the agent thread, streaming-free status spinner, cancellation, history
+  on the agent thread, streaming-free status line, cancellation, history
   trimming, context compaction.
 - **M2.5 — Subagents.** actor-per-agent with mailboxes, delegation tools, the
   agent tree, isolated git worktrees, wake-on-completion, bounded depth and
