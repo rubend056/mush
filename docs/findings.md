@@ -387,6 +387,22 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   window's leftover floored at 1,024 with a fold that cannot fit not attempted,
   and request assembly asks the vision gate — a blind model's request gets the
   placeholders.
+- **H44** — ✅ fixed by `70d1d9c` + `38f07cc` + `6e3ba79` + `9738a37` (+
+  `b435331`, `556498e`), merged by `1608de9` (§8.46): the meter's own numbers
+  were not the run's. `trim_history`'s dropped-turns note lived in the actor's
+  list alone — the pane, `.mush/session.json` and `used_weight_for` were short
+  of the request by 205 B (68 tokens), and the human never saw the sentence the
+  model was given; `used_weight_for` added the *root's* system prompt for every
+  agent id, over-reporting a focused leaf by 1,613 B ≈ 537 tokens; and
+  `context_meter` marked `full`/`over` against the window while the trim, the
+  fold and the attach room all cut at `history_budget()`, so on the 8 K default
+  the fold fired at what read as 45 % of the window and the marks were
+  unreachable. Now the note is emitted as a `Message` and put back in its place
+  by `place_dropped_note`, the actor publishes its own prompt
+  (`AgentEvent::SystemPrompt`) and the meter weighs `system_for(id)`, the line
+  is `ctx {used}/{budget}{ full| over} (fold {trigger}) {~}{window}`, and
+  `--print-config` prints the schemas and the history budget beside the reply
+  cap.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -3469,3 +3485,138 @@ prod 14,937 · tests 27,253 · comments 16,339): total 64,807 · **prod 15,279**
 tests 28,526 · comments 17,066 — 2,435 lines: 342 production, 1,273 test, 727
 comment, 93 blank. `cargo test --workspace`: 674 + 4 ignored in the mush bin,
 199 in mush-core; clippy and fmt clean.
+
+---
+
+## 8.46 The number the human reads, audited: a sentence nobody forwarded, a prompt that was every agent's, and a mark the run could not reach (`70d1d9c`..`9738a37`, merged `1608de9`)
+
+The blind audit whose trimmer-and-budget findings became §8.45 had one left
+(T5): the number the human reads and the number the run acts on were not always
+the same number, and one sentence the model was given had never been said to the
+human at all. Six commits landed it — three fixes, one dump, and two that are
+prose and test clarity (`b435331`, `556498e`) — merged by `1608de9`; H44 is
+their row.
+
+**The sentence a cut gives the model reached the pane and nobody else
+(`70d1d9c`; H44).** `trim_history` inserted `DROPPED_TURNS_NOTE` into the
+actor's own message list, and `AgentEvent::Message` is the only road a line
+takes into the UI's copy — nothing emitted it. So after any cut the pane showed
+a transcript the model was never sent, `.mush/session.json` stored one, and the
+number the human reads (`Chat::used_weight_for`, which the meter and the attach
+gate both read) was short of the request by the note: 205 B, 4 of `user` plus
+201 of text, 68 tokens. Now the call that first adds the note returns it (`Some`
+once, `None` on every later call, `#[must_use]`) and the actor emits it as a
+`Message`; the UI appends what it is told, and `place_dropped_note` — called
+from `adopted` — moves a carried note back to its place (after the opening task,
+before the oldest turn kept) instead of leaving it where the append put it,
+because a note after the newest message reads as the newest thing said rather
+than as a statement about the front of the transcript. `DROPPED_TURNS_NOTE` and
+`is_dropped_note` are public, and the pane paints the line in mush's own voice
+(`· …`), not the human's. Pinned by `a_trim_emits_the_note_the_model_was_given`
+(the request opens with the note at index 2 and exactly one `Message` event
+carries it; with the emit removed it was the bin suite's only failure),
+`a_trimmed_request_says_the_oldest_turns_were_dropped` (the return: `Some` on
+the call that adds the note, `None` after),
+`a_note_that_came_back_is_put_in_its_place`,
+`place_dropped_note_puts_it_after_the_opening_task`,
+`the_dropped_turns_note_reads_as_mushs_line` (the pane's `· …`) and
+`the_dropped_turns_note_reaches_the_pane_and_the_session` (the pane and
+`session_snapshot` both hold it, so a restart resumes with it).
+
+**A child was weighed with the root's prompt (`38f07cc`; H44).**
+`Chat::used_weight_for` added `self.system` — the *root's* system prompt — for
+every agent id: right for the root, whose actor is handed the conversation's own
+prompt with every run, and wrong for a child, whose history never carries it.
+Measured on a probe root: the root's prompt is 3,260 B, a depth-1 isolated
+delegating child's 3,139 B, a depth-1 shared child's 2,912 B and a depth-2/3
+leaf's 1,647 B — so a focused leaf's meter, and the attach gate's room,
+over-reported by 1,613 B ≈ 537 tokens. The audit's own numbers (3,247 / 3,126 /
+1,634) no longer reproduce byte-for-byte, because the prompts have moved since;
+the 1,613 B over-report is the one it no longer makes. The actor now publishes
+the prompt its history opens with: `start` emits `AgentEvent::SystemPrompt`
+before the thread runs, `Chat::systems`/`learn_system` keep it, and
+`used_weight_for` reads `system_for(id)`. An agent whose actor has not said yet
+weighs no prompt — the number is the actor's fact, not a rebuild in the UI: a
+child's prompt names the workspace its own tools resolve paths in, its depth and
+whether it is isolated, all decided where the child is built. Pinned by
+`an_agents_weight_is_its_own_prompt_plus_its_transcript` (for the root, the
+conversation the next run hands the actor; for a child, its published prompt
+plus its transcript — the audit's blind spot was that a 4× prompt for every
+non-root agent passed all five meter tests) and
+`a_child_publishes_the_prompt_its_own_history_opens_with`;
+`a_restored_agent_comes_back_at_rest` was updated because a restored agent now
+says exactly one thing at startup — its own prompt.
+
+**The meter marked a line the run does not cut at (`6e3ba79`; H44).**
+`App::context_meter` compared the used weight to `cfg().context_tokens`, while
+every decision — the trim, the fold, the refused request, the attach gate's room
+— uses `history_budget()`. On the 8 K default the budget is 12,288 B = 4,096
+tokens and the fold fires at 11,059 B = 3,686, so the fold happened when the
+meter read `3.7k/8.2k` = 45 %, and `full`/`over` needed 8,192 tokens = 24,576 B
+— past the point the trimmer cuts, so the marks were unreachable in normal
+operation and the human had no way to see a fold or a cut coming. The line is
+now `ctx {used}/{budget}{ full| over} (fold {trigger}) {~}{window}`: what the
+conversation weighs against the history budget, the fold's own trigger beside it
+(from `transcript::compaction_trigger`, the number the run compares) and the
+window last with the `~` that says it is the assumed one. `full` is at the
+budget and `over` one byte past it, compared on the weights — the unit the
+budget is stated in, so the boundary is the byte the trimmer cuts on and not a
+floor-divided token; on the default the whole line reads
+`ctx 1.1k/4.1k (fold 3.7k) ~8.2k`. Pinned by
+`the_context_meter_says_full_and_over_at_the_budget` (at the budget `full`, one
+byte past `over`, and that state is still well inside the window — the old
+comparison read it as ordinary; with the comparison put back on the window the
+test is the bin suite's only failure) and
+`the_context_meter_shows_the_budget_the_fold_and_the_window`; the two token
+spellings (`App::context_used_tokens`, `Chat::used_tokens_for`) are test-only
+now, and `screen.rs`'s facts-line example carries the real spelling.
+
+**`--print-config` prints the reserve's other numbers (`9738a37`; H44).** The
+manual's words are that the dump prints what the constants resolve to for the
+window in front of you; it printed the reply cap but not the tool schemas every
+request reserves nor the history budget those leave — the two numbers a human
+comparing windows (or reading a `cannot fold` line) had to re-derive by hand.
+Now `schemas` is `config::SCHEMA_TOKENS` (the constant `request_reserve` sums)
+and `history budget` is `Config::history_budget()` (the function the trimmer is
+handed), in the budget's own bytes and the tokens they divide into; on the
+shipped DeepSeek preset that reads `schemas  2000 tokens` and
+`history budget  1291500 bytes (430500 tokens)`. The name column widened 13 →
+15, because `history budget` is fourteen characters and a name that overflows
+its padding runs into its value (`history budget1291500 bytes`), and `--help`'s
+enumeration names the two rows, so it is not a list of ten facts with eleven in
+the output. Pinned by `describe_reports_the_request_not_the_wishes`: the schema
+row is the constant, and the budget row is `history_budget()` and its
+bytes/tokens division.
+
+**What this supersedes.** Two sentences of the record are history now and are
+not rewritten there. §8.42's parenthetical — the room left is
+`history_budget() − used_weight_for`, "the meter's own sum, split out so the two
+cannot drift" — was half right: the sum *was* one, but it added the root's
+prompt for every agent, so the meter and the attach gate could not drift apart
+from each other while both were wrong for a child; the sum stays one and is now
+the agent's own (`system_for(id)`). And §8.29's item-10 paragraph (`f34c4de`) —
+"It cannot accumulate in `session.json`: the vec is the actor's working copy,
+while the stored copy is the UI's, fed only by emitted events" — is now the
+opposite of true, as is the `DROPPED_TURNS_NOTE` doc it came from: the note is
+emitted, so it is in the UI's copy and in the stored session, and its 205 B is
+back in every number the meter and the attach gate read.
+
+**Recorded, not changed.** A one-off `lock::tests::*` failure was seen on a
+stale `/tmp` lock left by a terminated earlier run; it passed in isolation and
+on re-run, the suite's known wall-clock shape (H28), and this wave touched no
+lock. And the meter's line is longer — the budget's and the fold's segments are
+about twenty columns — so where it is painted is worth naming: the bar's second
+row (`facts_line`, from 24 rows up), where `model @ endpoint · meter` is one
+cell of a line elided whole from the right, with the `⌂` cell as its floor. The
+change does not crowd a narrow terminal — a cell goes whole, never cut
+mid-number — but it moves the width at which that cell is given up: the
+manual's own example line (`⌂ ~/p/mush │ …`) fitted 80 columns with the old
+meter and no longer does, so at the ubiquitous 80×24 the model and the meter
+are dropped where they used to read. The repository cells survive, which is what
+the elide order is for and what `the_facts_line_survives_at_80x24` pins.
+
+**Census** at this landing (`scripts/census.py`), against §8.45's (total 64,807 ·
+prod 15,279 · tests 28,526 · comments 17,066): total 65,378 · **prod 15,334** ·
+tests 28,804 · comments 17,281 — 571 lines: 55 production, 278 test, 215
+comment, 23 blank. `cargo test --workspace`: 680 + 4 ignored in the mush bin,
+201 in mush-core; clippy and fmt clean.

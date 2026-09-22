@@ -16,7 +16,7 @@ and see what changed.
 │                                  │ › _                                 │
 └──────────────────────────────────┴─────────────────────────────────────┘
  chat  Tab cycles panes · /help lists commands · Ctrl-P picks a model
- ⌂ ~/p/demo │ master ±3 +12−3 │ deepseek-flash @ deepseek.com · ctx 12k/~500k
+ ⌂ ~/p/demo │ master ±3 +12−3 │ deepseek-flash @ deepseek.com · ctx 12k/430.5k (fold 387.4k) ~500k
 ```
 
 ## Quick start
@@ -172,7 +172,8 @@ rediscovered on startup and shown in the tree, so those commands keep working
 after a restart.
 
 Long running conversations are **auto-compacted**: when the history nears the
-endpoint's context window, mush asks the model to summarize everything
+budget it is sent under — nine tenths of the window once the schemas, the reply
+and a margin are reserved — mush asks the model to summarize everything
 important and continues from `system + summary` (`MUSH_CONTEXT` sets the
 window; the summary appears in the chat). A fold the window cannot hold is not
 attempted: it says so, once per state, instead of paying for an endpoint's
@@ -204,12 +205,15 @@ transcript already show. Its **second line** (on terminals at least 24 rows tall
 is the stable facts, cut from the right when the terminal is narrow:
 
 ```
-⌂ ~/p/mush │ master ±3 +12−3 │ deepseek-flash @ deepseek.com · ctx 12k/~500k
+⌂ ~/p/mush │ master ±3 +12−3 │ deepseek-flash @ deepseek.com · ctx 12k/430.5k (fold 387.4k) ~500k
 ```
 
 `±3` counts paths with uncommitted changes, `+12−3` the line delta against
-`HEAD`, and `ctx 12k/~500k` how much of the window this conversation has taken —
-the `~` says the window was assumed rather than stated.
+`HEAD`, and the meter is the run's own numbers: `ctx 12k/430.5k (fold 387.4k)
+~500k` weighs the conversation against the history budget the run trims and
+folds at, where the fold's trigger sits inside it, and the window itself — the
+`~` says the window was assumed rather than stated, `full` marks the budget and
+`over` one byte past it.
 
 Terminals narrower than 80 columns (or shorter than 20 rows) get a
 **compact** layout: the agent strip on top, chat below. Below 40×10 mush says
@@ -260,7 +264,8 @@ One reply is capped at an eighth of that window — floored at 1 024 tokens and
 capped at 120 000 — so a thinking model has room to answer without the request
 overshooting the window it is sent to. The cap is what mush sends as `max_tokens`
 (or `max_completion_tokens`, see `/help`), and `mush --print-config` prints the
-number it resolved to.
+number it resolved to — beside the tool schemas every request reserves and the
+history budget those leave.
 
 The command cap (`CMD_CAP`, scaled to the window by `Config::cmd_cap` to the
 fifth a trim leaves, floored at 512 bytes) follows the window, so one command's

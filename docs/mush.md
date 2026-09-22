@@ -369,7 +369,9 @@ request reserves room for the tool schemas, the reply, and a margin —
 5 000 tokens for whatever a turn's tool result adds before the next request. The
 three numbers live in `crates/mush-core/src/config.rs`, and
 `mush --print-config` prints what they resolve to for the window in front of
-you. Before each request the agent folds or trims, in that order — the fold is a
+you — the reply cap's size and the name it travels under, the tool schemas every
+request reserves (`schemas`), and the history budget they leave (`history
+budget`). Before each request the agent folds or trims, in that order — the fold is a
 request itself, asked only while the whole summarize request fits the window —
 and always cuts at a **user** message boundary so assistant/tool pairs stay
 valid.
@@ -389,7 +391,11 @@ had warmed — so the watermark is what makes the next road taken the fold rathe
 than another knife-edge cut. "Trim whenever it is over four fifths" was tried
 first and measured wrong in the same sitting: five thousand quiet turns parked at
 the watermark, folded zero times and cut 3,932 times, which is the opposite of
-what the number is for (§8.43).
+what the number is for (§8.43). One line survives a cut in every copy: the
+sentence `DROPPED_TURNS_NOTE` gives the model — the oldest turns were dropped,
+so this transcript is not the whole conversation — is emitted into the pane and
+the stored session too, and a copy that appends it is moved back to the place
+the dropped turns were (§8.46).
 
 The budget weighs its two kinds of thing by their own measure: text in bytes
 (`BYTES_PER_TOKEN`), pictures in pixels (`PIXELS_PER_TOKEN` — see §3). A
@@ -577,11 +583,13 @@ are computed in `App`.
   the bar is forbidden from showing what a row or the transcript already carries.
   Line two (on terminals at least **24** rows tall)
   is the stable facts, elided from the right: `⌂ path │ branch ±dirty +add −del │
-  model @ endpoint · ctx 12k/~500k`, with the read's own age appended once it is
-  past ten seconds, so a cached fact cannot read as a live one. The meter's `~`
-  says the window was assumed rather than stated, and it says `full` at the
-  window and `over` past it. The window's size is never a mystery again, and the
-  repository survives the narrowest of them.
+  model @ endpoint · ctx 12k/430.5k (fold 387.4k) ~500k`, with the read's own
+  age appended once it is past ten seconds, so a cached fact cannot read as a
+  live one. The meter is the run's own numbers: what the conversation weighs
+  against the history budget (`full` at it, `over` one byte past it), the fold's
+  trigger inside that budget, and the window last with the `~` that says it was
+  assumed rather than stated. The window's size is never a mystery again, and
+  the repository survives the narrowest of them.
 - **R3 — Size tiers with a floor.** `[DONE]` `w<40 || h<10` → a single notice,
   centred on both axes, that falls back to a shorter spelling and always names
   40×10; below it every key is refused except `Ctrl-Q`, because a screen that is
@@ -796,9 +804,10 @@ default.
 what the stored session was (`none`, how much of a conversation it read, or that
 the file is there and *unreadable*), model, window and whether a human stated
 it, temperature, reasoning effort and thinking mode (each with whether a human
-stated it), the reply cap's size and the name it travels under, the key masked,
-`-y`, and the hue the window would wear — and exits 0 without opening the
-terminal, creating `.mush/` or taking the workspace lock.
+stated it), the reply cap's size and the name it travels under, the tool schemas
+every request reserves and the history budget those leave, the key masked, `-y`,
+and the hue the window would wear — and exits 0 without opening the terminal,
+creating `.mush/` or taking the workspace lock.
 It is the honest view of the precedence, and what makes a hand-edited file
 debuggable. The other flags a human would type are `--temperature F`,
 `--reasoning-effort LEVEL` (`low`, `high` or `max`; also
