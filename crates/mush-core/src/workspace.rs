@@ -1717,6 +1717,44 @@ mod tests {
         assert_eq!(image_dimensions("", &png_of(8, 8, 0)), None);
     }
 
+    /// A slice shorter than a signature is no image, whatever it starts with.
+    /// The sniff is four `starts_with` calls and one `len() >= 12`, and the
+    /// guard had no test of its own: `b"RIFF"`, `b"GIF8"` and a three-byte
+    /// slice must answer `None` rather than panic on the `[8..12]` the webp
+    /// branch reaches for. Not a bug today; a test that fails tomorrow is the
+    /// point.
+    #[test]
+    fn a_slice_shorter_than_a_signature_is_no_image() {
+        let short: [&[u8]; 13] = [
+            &[],
+            b"R",
+            b"RI",
+            b"RIF",
+            b"RIFF",
+            b"RIFF\x00\x00\x00\x00",
+            b"WEB",
+            b"WEBP",
+            b"GIF",
+            b"GIF8",
+            b"GIF87",
+            &[0xff, 0xd8],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a],
+        ];
+        for bytes in short {
+            assert_eq!(image_mime(bytes), None, "{bytes:?} is not an image");
+            for mime in ["image/png", "image/jpeg", "image/gif", "image/webp"] {
+                assert_eq!(image_dimensions(mime, bytes), None, "{mime} on {bytes:?}");
+            }
+        }
+
+        // The full signatures still answer, so the floor is a floor and not a
+        // ceiling: the guard may not swallow a real picture.
+        assert_eq!(image_mime(&png(0)), Some("image/png"));
+        assert_eq!(image_mime(b"GIF89a"), Some("image/gif"));
+        assert_eq!(image_mime(&[0xff, 0xd8, 0xff, 0xe0]), Some("image/jpeg"));
+        assert_eq!(image_mime(b"RIFF\x00\x00\x00\x00WEBP"), Some("image/webp"));
+    }
+
     /// The parser does not shrink a claim it can read: a png that says
     /// `0xffff_ffff × 0xffff_ffff` is that size, and every other format reads
     /// up to its own ceiling — the weight arithmetic is what keeps the biggest
@@ -2266,6 +2304,72 @@ mod tests {
             "the sentence names the size the stat saw: {refused}"
         );
         assert!(refused.contains("past the 2 MB cap"), "{refused}");
+    }
+
+    /// A file bigger than the image cap is opened and refused with its own
+    /// size: the number is the file's length — the stat's — and not a buffer's,
+    /// and the head sniff ran first, so an over-cap file that is not an image
+    /// stays text ([`Self::image_at`]'s head decides that). The audit found no
+    /// test that opened one.
+    #[test]
+    fn a_file_bigger_than_the_cap_is_refused_with_the_size_the_stat_saw() {
+        let ws = temp_workspace("over-cap-open");
+        let bytes = png(IMAGE_FILE_CAP as usize + 4096);
+        fs::write(ws.root().join("big.png"), &bytes).unwrap();
+
+        let refused = ws.read_image("big.png").unwrap_err();
+        assert!(
+            refused.contains(&format!("of {} bytes", bytes.len())),
+            "the file's own length is named: {refused}"
+        );
+        assert!(refused.contains("past the 2 MB cap"), "{refused}");
+    }
+
+    /// The other half of the same rule: when the length in hand is a buffer's
+    /// and not the picture's, the refusal names the cap and no number. The
+    /// branch that reaches this is the growth race [`Self::image_at`]'s bounded
+    /// read guards — a file that grew between the stat and the read — which a
+    /// test cannot stage, because the stat and the read are one function; so
+    /// the sentence is pinned directly, and the known-size branch beside it
+    /// keeps its exact number.
+    #[test]
+    fn a_size_nobody_knows_is_not_named_in_the_refusal() {
+        let unknown = image_too_big("shots/a.png", "image/png", None);
+        assert!(unknown.contains("past the 2 MB cap"), "{unknown}");
+        assert!(unknown.contains("its size is not known"), "{unknown}");
+        assert!(
+            !unknown.contains(" bytes"),
+            "no length is claimed: {unknown}"
+        );
+        assert!(unknown.contains("convert"), "the road stays: {unknown}");
+
+        let known = image_too_big("shots/a.png", "image/png", Some(3_000_000));
+        assert!(known.contains("of 3000000 bytes"), "{known}");
+    }
+
+    /// The whole-read cap is a different ruler from the image cap, and it had
+    /// no test either: a file past it is refused by `read_window` from the stat
+    /// before anything is opened or read, and the sentence names the road that
+    /// does work (`run_command`). The 32 MiB here are sparse — a few blocks on
+    /// disk — so the pin costs nothing to hold.
+    #[test]
+    fn a_file_bigger_than_the_read_cap_is_refused_before_any_read() {
+        let ws = temp_workspace("over-read-cap");
+        let path = ws.root().join("huge.log");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(READ_FILE_CAP + 4096).unwrap();
+        drop(file);
+
+        let refused = ws.read_window("huge.log", 1, 10, 4_000).unwrap_err();
+        assert!(
+            refused.contains(&format!("{} bytes", READ_FILE_CAP + 4096)),
+            "the file's own length is named: {refused}"
+        );
+        assert!(refused.contains("past the 32 MB cap"), "{refused}");
+        assert!(
+            refused.contains("run_command"),
+            "the road that works: {refused}"
+        );
     }
 
     /// The cap is the transport's, not the sniffer's: a file past it that is
