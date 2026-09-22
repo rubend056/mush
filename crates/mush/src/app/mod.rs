@@ -3367,6 +3367,13 @@ impl App {
     /// `Err` is a picture whose copy cannot be written: the line names the path
     /// and the reason, and the caller refuses the attachment rather than hand
     /// an agent a path that resolves nowhere.
+    ///
+    /// The bytes are the picture whole: every road that builds an [`Image`]
+    /// reads it to its end and refuses a buffer that stopped at a cap
+    /// ([`Workspace::pasted_images`], the clipboard's read), so the copy is
+    /// written from bytes the request will carry entire — never a prefix of
+    /// one — and [`Workspace::save_pasted_image`] is handed `false` for its
+    /// `cut_at_the_cap`.
     fn carry_images(&self, id: AgentId, images: Vec<Image>) -> Result<Vec<Image>, String> {
         let root = self.agent_root(id);
         let ws =
@@ -3383,7 +3390,10 @@ impl App {
                     return Ok(image);
                 }
                 let from = image.path.clone();
-                ws.save_pasted_image(image.bytes).map_err(|e| {
+                // Whole bytes, not a prefix: an `Image` exists only when a road
+                // read the picture to its end within the cap, so this is the
+                // `false` side of `cut_at_the_cap` (see this method's doc).
+                ws.save_pasted_image(image.bytes, false).map_err(|e| {
                     format!(
                         "cannot copy {from} into {}/.mush/paste: {e}",
                         root.display()
