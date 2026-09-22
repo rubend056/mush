@@ -40,11 +40,16 @@ pub struct ConversationId(pub u64);
 pub enum Phase {
     /// Nothing in flight: never ran, or its run ended without a result.
     Idle,
-    /// A request is in flight and the model has not named a tool yet.
+    /// A request is in flight and the model has not named a tool yet: the
+    /// phase a run opens with, and the one every request after a tool sets
+    /// again ([`AgentEvent::Thinking`](crate::agent::AgentEvent::Thinking)), so
+    /// it also covers the gap between a finished tool and the next tool the
+    /// model names.
     Thinking,
     /// The last thing the agent reported doing: a tool call's own label
     /// (`edit_file src/lib.rs`, `run_command cargo test`), or how the run's
-    /// worktree ended (`committed abc123 on mush/1`).
+    /// worktree ended (`committed abc123 on mush/1`). It lasts until the next
+    /// label or until the model's next turn ([`Phase::Thinking`]).
     Activity(String),
     /// The conversation is being folded into a summary (context compaction),
     /// or a request to do so is queued behind the run in flight.
@@ -950,7 +955,8 @@ impl AgentTree {
         }
     }
 
-    /// What the agent says it is doing now. Only a run in flight can report
+    /// What the agent says it is doing now: a tool call's own label, or the
+    /// closing line about its worktree. Only a run in flight can report
     /// activity: a status that arrives after the run's own end (a late or
     /// duplicated commit line) is dropped, so a finished agent is never put
     /// back to work (finding B5).
@@ -962,6 +968,10 @@ impl AgentTree {
     /// replacing `Compact`, or one of the run's own endings — and what the run
     /// was doing is still in the transcript, where every tool call writes an
     /// `⚙` line.
+    ///
+    /// The label lasts until the next label, or until the model's next turn
+    /// ([`Self::thinking`]): a tool that has finished is not what the row
+    /// should say while the model is being asked again.
     pub fn activity(&mut self, id: AgentId, label: impl Into<String>) {
         if !self.is_busy(id) {
             return;
@@ -971,6 +981,34 @@ impl AgentTree {
                 return;
             }
             node.phase = Phase::Activity(label.into());
+            node.since = Instant::now();
+        }
+    }
+
+    /// The model's turn is starting: the request fits the window and is about
+    /// to go on the wire, so nothing is running locally any more.
+    ///
+    /// The phase between one tool's label and the next one: before this event
+    /// existed, a finished tool's label stayed on the row and in the foot
+    /// through the whole model call that followed it, so a `run_command` that
+    /// had already exited still read as the machine working.
+    ///
+    /// The guards are [`Self::activity`]'s, each for its own reason: only a run
+    /// in flight can report it (a late or duplicated event must not put a
+    /// finished agent back to work — finding B5), and a fold is never replaced
+    /// by it (the run behind a *parked* fold keeps announcing its phases, and
+    /// the request the human is waiting for outranks them). `since` restarts,
+    /// so the age the pane paints is the age of *this* request — not of the
+    /// tool that finished before it.
+    pub fn thinking(&mut self, id: AgentId) {
+        if !self.is_busy(id) {
+            return;
+        }
+        if let Some(node) = self.node_mut(id) {
+            if node.phase.compacting().is_some() {
+                return;
+            }
+            node.phase = Phase::Thinking;
             node.since = Instant::now();
         }
     }
@@ -2287,6 +2325,51 @@ mod tests {
             Phase::Failed("no route to host".to_string())
         );
         tree.activity(AgentId::ROOT, "reading the tree");
+        assert_eq!(tree.node(AgentId::ROOT).unwrap().phase, Phase::Idle);
+    }
+
+    /// The model's next turn is a phase of its own: it replaces the finished
+    /// tool's label, restarts the age so the row's clock is *this* request's,
+    /// and is refused wherever a status is — a parked fold outranks it, and an
+    /// agent at rest is not put back to work (finding B5).
+    #[test]
+    fn a_thinking_event_moves_a_running_row_and_nothing_else() {
+        let mut tree = AgentTree::bare();
+        let (opened, _rx) = child(&mut tree, 1);
+        let id = opened.id;
+
+        // A tool named itself a minute and a half ago: the age the row paints
+        // is the tool's, and the next request must not inherit it.
+        tree.activity(id, "run_command cargo test");
+        tree.age(id, Duration::from_secs(90));
+        tree.thinking(id);
+        assert_eq!(tree.node(id).unwrap().phase, Phase::Thinking);
+        assert_eq!(
+            tree.node(id).unwrap().phase.words().as_deref(),
+            Some("thinking"),
+            "the row and the foot read this through `words`"
+        );
+        assert!(
+            tree.node(id).unwrap().since.elapsed() < Duration::from_secs(1),
+            "the age is this request's, not the finished tool's"
+        );
+
+        // A parked fold is what the human is waiting for; the run behind it
+        // keeps announcing its phases, and none of them may erase it.
+        tree.compacting(id, Compacting::Parked, None);
+        tree.thinking(id);
+        assert_eq!(
+            tree.node(id).unwrap().phase,
+            Phase::Compacting(Compacting::Parked),
+            "the request the human is waiting for outranks the run's own phases"
+        );
+
+        // A finished run is not put back to work, and neither is one that never
+        // ran: only work in flight can report a model call.
+        tree.finish(id, Some("did the work".to_string()));
+        tree.thinking(id);
+        assert_eq!(tree.node(id).unwrap().phase, Phase::Done);
+        tree.thinking(AgentId::ROOT);
         assert_eq!(tree.node(AgentId::ROOT).unwrap().phase, Phase::Idle);
     }
 

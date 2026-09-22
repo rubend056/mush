@@ -1576,6 +1576,14 @@ impl App {
                 // work (finding B5).
                 self.tree.activity(id, status);
             }
+            AgentEvent::Thinking => {
+                // The model's turn is starting, so the tool before it is over:
+                // what the row and the foot wear until the next tool names
+                // itself is `thinking…`, not the label of a command that has
+                // already exited. Refused for an agent at rest and for a fold,
+                // exactly as a status is (`AgentTree::thinking`).
+                self.tree.thinking(id);
+            }
             AgentEvent::Notice(text) => {
                 // A limit the run reached (it still produced a result), or a
                 // reply that was empty: a line in the transcript, tagged with
@@ -4577,6 +4585,33 @@ mod tests {
             ws,
             ConfigCell::own(cfg),
             stored,
+            handle,
+            tx,
+            session_save::fake::Recorder::new(),
+        );
+        (app, rx)
+    }
+
+    /// The same, with the actor's events travelling the UI's own channel
+    /// instead of a recorder: how a test reads a *real* run as the window does
+    /// — through `App::update`, one event at a time.
+    ///
+    /// [`app_with_scripted_root_at`] keeps them out of the app's way on purpose:
+    /// its tests read what the model was asked, which the recorder holds. A test
+    /// about what the screen says needs the road the events take to it.
+    fn app_with_live_scripted_root(
+        root: &std::path::Path,
+        scripted: Arc<Scripted>,
+    ) -> (App, Receiver<Msg>) {
+        let ws = Workspace::new(root).unwrap();
+        let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let handle =
+            agent::spawn_scripted_ui(cfg.clone(), tx.clone(), root.to_path_buf(), scripted);
+        let app = App::new(
+            ws,
+            ConfigCell::own(cfg),
+            None,
             handle,
             tx,
             session_save::fake::Recorder::new(),
@@ -12491,6 +12526,60 @@ mod tests {
         assert!(!app.busy());
         let rows = screen(&mut app, 120, 32).join("\n");
         assert!(!rows.contains("thinking"), "no `thinking` survives: {rows}");
+    }
+
+    /// The human's own report, at the surface they read it on: a tool finishes,
+    /// the model is asked again, and the row and the foot still said
+    /// `run_command …` — the label of work that was over — for the whole model
+    /// call. The run here is real and its events travel the UI's channel, so
+    /// this reads the phase the actor's own `Thinking` event leaves: the second
+    /// reply is held, which is what proves the moment is a request in flight.
+    #[test]
+    fn a_finished_tool_does_not_hold_the_row_while_the_model_is_asked_again() {
+        let root = repo("thinking-between-tools");
+        let held = Arc::new(Gate::new());
+        let scripted = Arc::new(
+            Scripted::new()
+                .calls(vec![tool_call(
+                    "c0",
+                    "run_command",
+                    serde_json::json!({ "command": "printf hello > note.txt" }),
+                )])
+                .held(held.clone())
+                .says("wrote note.txt"),
+        );
+        let (mut app, rx) = app_with_live_scripted_root(&root, scripted.clone());
+        app.chat.insert("write note.txt");
+        app.send_message();
+        assert!(
+            held.wait_until_asked(Duration::from_secs(5)),
+            "the request after the tool must reach the model"
+        );
+        // Apply everything the actor said before that request went out — the
+        // road the window takes, one `Msg::Agent` at a time.
+        while let Ok(msg) = rx.try_recv() {
+            app.update(msg);
+        }
+
+        let node = app.tree.node(AgentId::ROOT).expect("the root has a row");
+        assert_eq!(
+            node.phase,
+            Phase::Thinking,
+            "the finished tool's label is not what the row says while the model is asked again"
+        );
+        assert_eq!(node.phase.words().as_deref(), Some("thinking"));
+
+        // The held reply ends the run, so the tree is left the way the run
+        // left it.
+        held.release();
+        assert!(
+            pump(&mut app, &rx, &scripted, |app, _| app
+                .tree
+                .node(AgentId::ROOT)
+                .is_some_and(|node| node.phase == Phase::Done)),
+            "the run finishes"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The cursor row's age is derived once per frame: the footer reads the
