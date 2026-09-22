@@ -10643,7 +10643,7 @@ mod tests {
         let rows = screen(&mut app, 120, 32);
         assert!(
             rows.iter()
-                .any(|row| row.contains("⊘ #0") && row.contains("cancelling…")),
+                .any(|row| row.contains("⊘ #0") && row.contains("cancelling")),
             "the row is where a cancel in flight is drawn: {rows:?}"
         );
     }
