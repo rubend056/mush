@@ -174,8 +174,12 @@ after a restart.
 Long running conversations are **auto-compacted**: when the history nears the
 endpoint's context window, mush asks the model to summarize everything
 important and continues from `system + summary` (`MUSH_CONTEXT` sets the
-window; the summary appears in the chat). Nothing is silently dropped —
-trimming only cuts in when the model itself cannot produce a summary.
+window; the summary appears in the chat). A fold the window cannot hold is not
+attempted: it says so, once per state, instead of paying for an endpoint's
+refusal. When the trim cannot make enough room, the newest turn's tool results
+are dropped in place — each one says the call is not lost and the same output is
+one narrower call away, and you get one notice — and a request that still does
+not fit is refused before the wire. Nothing goes out over the window.
 
 ## Keys
 
@@ -252,16 +256,20 @@ first of these that knows:
    silently treated as an 8k local model.
 4. **The provider default**: 120k for DeepSeek, 8192 for a custom endpoint.
 
-One reply is capped at a quarter of that window — floored at 1 024 tokens and
+One reply is capped at an eighth of that window — floored at 1 024 tokens and
 capped at 120 000 — so a thinking model has room to answer without the request
 overshooting the window it is sent to. The cap is what mush sends as `max_tokens`
 (or `max_completion_tokens`, see `/help`), and `mush --print-config` prints the
 number it resolved to.
 
-The command cap (`CMD_CAP`, scaled to the window by `Config::cmd_cap`) follows
-the window, so one command's output can never fill an 8k transcript. If a server
-rejects a request over its context length, mush reads the number out of the
-complaint, tells the UI, and retries once.
+The command cap (`CMD_CAP`, scaled to the window by `Config::cmd_cap` to the
+fifth a trim leaves, floored at 512 bytes) follows the window, so one command's
+output can never fill an 8k transcript — nor land the next request over the
+window. A request that does not fit is refused by mush itself, one line before
+the wire, naming the roads that make room (downscale a picture, `/compact`, read
+less). If a server still rejects a request over its context length, mush reads
+the number out of the complaint, tells the UI, and retries once — a backstop,
+not the mechanism.
 
 ## What it writes
 

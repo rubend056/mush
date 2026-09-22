@@ -124,10 +124,10 @@ and never share state with the painter.
   appears more than once, so an edit can never hit the wrong occurrence.
 - **Every big-text result is capped, edits are not.** One cap bounds them all —
   a command's output, a file read, a listing, a search (`CMD_CAP = 16 000`
-  bytes, scaled down by `Config::cmd_cap()` to a quarter of the history budget,
-  floored at 512) — and a job's report is the same kind of window, a **tail**
-  (§5.6). A capped result says so and says the way past it: a result whose head
-  is kept ends with
+  bytes, scaled down by `Config::cmd_cap()` to the fifth a trim leaves — the
+  room between its stopping point and the ceiling — floored at 512) — and a
+  job's report is the same kind of window, a **tail** (§5.6). A capped result
+  says so and says the way past it: a result whose head is kept ends with
   `[mush: output truncated at {cap} bytes — rerun it narrower (rg, head, a smaller path) to see the rest]`,
   and a result whose *end* matters keeps its tail, preceded by
   `[mush: output truncated at {cap} bytes (the end is shown) — rerun it narrower to see the rest]`.
@@ -248,13 +248,16 @@ The **human has two roads of their own**, and both end in the same message:
   anyway — a paste is never swallowed, and the paths are the road to a
   downscale.
 
-  A picture whose file is **outside the workspace** is copied into
-  `.mush/paste/` as it attaches, and the copy is the path it carries from then
-  on. The human may name what the model's tools may not — they already have the
-  file — but the model has to be able to read the picture again after a restart,
-  and `read_file` resolves nothing outside the root. The bytes are read, never
-  moved: the original file is the human's, and what mush promises to keep is the
-  copy.
+  A picture whose file is **outside the workspace** is copied into the paste
+  directory of the workspace that will read it — the receiving agent's own
+  root, so an isolated agent gets a copy under its worktree — and that copy is
+  the path the message carries. The carry is asked again at the send, so a
+  focus that moved between the attach and `Enter` is copied for the agent that
+  will actually receive it. The human may name what the model's tools may not —
+  they already have the file — but the model has to be able to read the picture
+  again after a restart, and `read_file` resolves nothing outside its own root.
+  The bytes are read, never moved: the original file is the human's, and what
+  mush promises to keep is the copy.
 - **`Ctrl-V` in the chat pane** attaches the image on the system clipboard: a
   screenshot with no file behind it yet. `clipboard.rs` reads it through the
   programs a human would use (`wl-paste`, `xclip`, `pngpaste`), on a thread of
@@ -263,30 +266,52 @@ The **human has two roads of their own**, and both end in the same message:
   and naming the outside-path copy uses, because one rule covers both — which is
   what lets the model read the picture again after the session file has shed its
   payload. `.mush/` git-ignores itself, so a pasted screenshot cannot dirty the
-  tree.
+  tree. The read's failures are its own sentences: a reader still running at the
+  2 s deadline is killed, and the line names the program, the wait and the road
+  that always works (save the picture to a file and paste its path) instead of
+  pretending the clipboard was empty; and a picture past the 2 MB cap gets the
+  cap's own refusal, which names no size, because the bytes in hand stopped at
+  the reader's cap and the length they have is the buffer's, not the picture's.
 
 Both roads end in `Message::user_with_images`: the human's own message, with
-the images riding in it exactly as they ride in a tool result. Two facts can
-refuse an attachment before it is sent — no model at all, and a model the
-provider table does not document as accepting image parts (`Ctrl-P` is the road
-named) — because an endpoint that may reject image parts must not cost a turn
-to discover it. The second is asked twice, at the box that takes the attachment
-and again at the wire that sends it: `Ctrl-P` can change the model in between,
-and what must never reach a model that cannot see is the *message*. These are
-the same facts that decide whether a `read_file` image travels; the human's gate
-is the one that keeps the path as text instead of dropping the gesture, and the
-clipboard's is the one that has no path to keep.
+the images riding in it exactly as they ride in a tool result. Four facts can
+refuse an attachment before it is sent — no model at all; a model the provider
+table does not document as accepting image parts (`Ctrl-P` is the road named);
+a picture the window cannot carry; and the box's own bound on picture bytes —
+because an endpoint that may reject image parts must not cost a turn to
+discover it, and a request that could never fit must not be sent to find out.
+The seeing fact is asked at all three doors a picture passes: the box that takes
+the attachment, the wire that sends it, and the moment the request is assembled.
+The box and the wire refuse the message; assembly cannot, because the words are
+already in the transcript — it drops the image parts from the request alone,
+leaves each message's placeholder text standing where its images were, and says
+one line naming `/model`. `Ctrl-P` can change the model between any two of the
+three, and what must never reach a model that cannot see is the *message*. This
+is the same fact that decides whether a `read_file` image travels; the human's
+gate is the one that keeps the path as text instead of dropping the gesture, and
+the clipboard's is the one that has no path to keep.
 
-A third fact is said but does not refuse: an image that does not fit the room the
-conversation has left — `Config::history_budget()` minus the system prompt, the
-transcript and the images already waiting in the box — attaches, and the line
-says what attaching it costs: the trimmer drops the **oldest turns** to make room
-for it, so the words are what is at stake and never the picture. `/compact` is
-the road that folds those turns into a summary instead, and a downscale is the
-cheaper picture. A picture that outweighs the whole history budget is the one
-case with nothing to offer but the downscale: even with every older turn gone the
-request would go out over the window and the endpoint would refuse it. The human
-decides what to send; what is about to be lost is not a thing to leave unsaid.
+The window's bound and the box's own byte bound are both refused at the box,
+each in its own currency. `Config::history_budget()` is what the pictures
+waiting in the box may weigh: past it no trim can make room, because the system
+prompt and the opening task cannot be dropped and a trim shrinks no picture.
+`BOX_IMAGE_BYTES = IMAGE_FILE_CAP × 8` is what their bytes may be, because the
+window's token bound cannot bound bytes: a 100×100 png in a 2 MB file weighs
+fourteen tokens, so a hundred of them — 200 MB of bytes — pass every token bound
+the window has.
+
+A room shortage is the one fact said and not refused: an image that does not fit
+the room the conversation has left — `Config::history_budget()` minus the system
+prompt, the **focused agent's** transcript and the images already waiting in the
+box — attaches, and the line says what attaching it costs: the trimmer drops the
+**oldest turns** to make room for it, so the words are what is at stake and
+never the picture. `/compact` is the road that folds those turns into a summary
+instead, and a downscale is the cheaper picture. A picture that outweighs the
+whole history budget has nothing to offer but the downscale, and it never goes
+out to be refused: the box refuses it, and a request that is still over the
+window where it is assembled is refused with one line before the wire. The
+human decides what to send where there is a choice; what is about to be lost is
+not a thing to leave unsaid.
 
 Three facts decide whether an image travels:
 
@@ -322,7 +347,9 @@ a million for one screenshot (finding H36). The 2 MB cap above stays a
 An image's bytes leave the *stored* transcript through `Message::drop_images`,
 which replaces them in place with one line naming the path and format
 (`[image: shots/a.png (png) — bytes dropped to save room; read the file again if
-you need them]`). The session writer is its one caller, and it calls it before
+you need them]`) — one line whatever the path holds, a newline in it escaped as
+`\n` before it can break the placeholder in two. The session writer is its one
+caller, and it calls it before
 serializing, so a multi-megabyte screenshot never lands in `.mush/session.json`;
 the live transcript keeps its bytes until the turn carrying them is the turn the
 trimmer drops. Trimming used to shed payloads first — an image was the cheapest
@@ -342,13 +369,16 @@ request reserves room for the tool schemas, the reply, and a margin —
 5 000 tokens for whatever a turn's tool result adds before the next request. The
 three numbers live in `crates/mush-core/src/config.rs`, and
 `mush --print-config` prints what they resolve to for the window in front of
-you. Before each request the agent folds or trims, in that order, and always cuts
-at a **user** message boundary so assistant/tool pairs stay valid.
+you. Before each request the agent folds or trims, in that order — the fold is a
+request itself, asked only while the whole summarize request fits the window —
+and always cuts at a **user** message boundary so assistant/tool pairs stay
+valid.
 
 Trimming drops information, so it is the fallback, not the first move: once the
 transcript passes nine tenths of the budget (`compaction_trigger`) the agent asks
-the model to summarize everything important and continues from
-`system + summary`. That is what lets a long task survive a small context window.
+the model to summarize everything important — only while the summarize request
+itself fits the window (§3) — and continues from `system + summary`. That is what
+lets a long task survive a small context window.
 The trimmer's own number is a *pair* with that trigger — `trim_target`, four
 fifths of the budget — because a cut starts only when the transcript is over the
 **ceiling** (the window itself) and stops at four fifths, which leaves a tenth of
@@ -370,17 +400,20 @@ with its turn, in the same currency as everything else.
 `/compact` is the same fold, asked for by hand instead of triggered by the
 window — one routine, so the two cannot disagree about the summary message or
 about what a fold costs. It goes to the focused agent's mailbox. An idle agent
-folds at once and nothing else happens: no run is started, because there is
-nothing to answer — the summary *is* the result, and the `Compact` event the UI
-already mirrors keeps the pane, the session file and the meter in step. Mid-run
-the request parks like a nudge and is honoured at the next message boundary,
-never between an assistant's tool calls and their results.
+folds at once and nothing else happens: no run is started — the summary *is* the
+result, and the `Compact` event the UI already mirrors keeps the pane, the
+session file and the meter in step — and no trim runs beside it; the fold either
+fits the window and happens, or is refused whole. Mid-run the request parks like
+a nudge and is honoured at the next message boundary, never between an
+assistant's tool calls and their results.
 
 A transcript that is already `system + one message` is refused, with "nothing to
 compact" on the transcript and nothing on the wire: folding it would cost a
 request and can only re-summarize the summary. The refusal is said out loud
 because a human typed a command — silence there is indistinguishable from a
-fold that quietly failed. Anything longer is folded exactly as asked.
+fold that quietly failed. Anything longer is folded exactly as asked — unless
+the summarize request itself would not fit the window, in which case nothing is
+sent and one line says what the request would have needed.
 
 The fold is one ordinary request: the conversation's own — same system prompt,
 same tools, same `tool_choice`, same thinking knobs — with
@@ -393,8 +426,13 @@ the moment that history is at its largest, which is the cost the fold exists to
 avoid. What keeps the model from calling a tool is the instruction, persisted in
 the message where the model can act on it: *reply with the summary, as plain
 text, and end your turn: call no tool*. The one thing that is not the run's is
-the summary's own reply cap (`COMPACT_REPLY_TOKENS`), and that is safe — sampling
-and length parameters are not prompt text, so they cost no cache miss. A model
+the summary's own reply cap — `COMPACT_REPLY_TOKENS` only as far as the window
+has left once the tool schemas and the prompt are paid for, floored at 1 024 —
+and that is safe: sampling and length parameters are not prompt text, so they
+cost no cache miss. The whole request is weighed before it is asked — schemas,
+prompt and cap against the window — and one that does not fit is not attempted:
+one line names the three parts and the roads (`/context N`, Ctrl-N), said once
+per state on the automatic arm and every time a human typed `/compact`. A model
 that answers with a tool call instead of a summary is not a fold: mush says it
 could not compact and leaves the transcript alone.
 

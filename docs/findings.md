@@ -328,6 +328,65 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   over four fifths" — was measured wrong before it shipped: five thousand quiet
   turns parked at the watermark, folded **zero** times and cut **3,932** times.
   The trigger/cut *pair* is the fact; either number alone is a trap.
+- **H41** — ✅ fixed by `c0f8973` + `827ad1a` + `ee4db8b` + `73bfc14` + `00096c6`,
+  merged by `700fbdc` (§8.44): the image reader's edges. `image_at` opened a
+  path before it stat'ed it, so a FIFO named like an image blocked the UI
+  thread (the human's paste) and parked an actor (the model's `read_file`) — a
+  probe was still blocked after 3 s — and an over-cap file was read *whole*
+  before the 2 MB cap refused it (a 128 MiB sparse png moved the probe's peak
+  RSS 3,172 kB → 134,136 kB; after, 3,224 → 3,228 kB). The clipboard lied twice
+  about the same buffer: stdout was drained to `READ_CAP = cap + 1`, so a
+  picture of *any* size past the cap was refused as "a png of 2,097,153 bytes"
+  (a 4,194,314-byte png), and a reader killed at the 2 s `DEADLINE` read as "the
+  clipboard holds no image". And the placeholder formatted the path raw, so a
+  newline in one put a line of its own into the model's view of the transcript.
+  Now `fs::metadata` decides the shape before any open, the cap comes from the
+  stat, the whole read is bounded to cap + 1 bytes because a file can grow
+  between the two, and a read that hits the bound is refused without a size
+  (`image_too_big` takes `Option<u64>`); `Drained { bytes, filled }` carries the
+  truncation and a cut picture is refused with its true size unknown;
+  `Answer::TimedOut` has its own sentence naming the wait and the file-paste
+  road; and `one_line` runs the path through `text::sanitize` with `\n` escaped.
+- **H42** — ✅ fixed by `3a7cca0` + `31cd9d0` + `7ef2301` + `bf9b897` + `9b29e80`
+  + `7c8bd98` + `edac88f` + `5e74f8d`, merged by `c78695b` + `b6eaf91` (§8.44):
+  the attach gate. A picture attached while a **child** was focused was resolved
+  and copied by the *root's* workspace, so the placeholder named a path the
+  child's own worktree cannot read, and the room was weighed with
+  `used_weight_for(AgentId::ROOT)` whichever agent was focused. And nothing
+  bounded a batch: a paste of eight pictures at the transport's 2 MB cap put
+  16 MB in the box and 22 MB into the request JSON, while `docs/mush.md` claimed
+  the room and the window bounded it — the room only warns, and a picture is
+  priced by its pixels (a 2 MB file of a 100×100 png weighs fourteen tokens, so
+  it passes every token bound the window has). Now `App::agent_root(id)` is the
+  one answer to where an agent's tools resolve, `carry_images(id, images)`
+  re-copies through the receiving workspace's own reader unless it reads the
+  bytes back identically, both doors carry for the focused agent and `deliver`
+  asks again for the agent that actually receives the message; both attach
+  doors weigh the focused agent's room and refuse past `history_budget()` and past
+  `BOX_IMAGE_BYTES` (`IMAGE_FILE_CAP × 8`), while the room warning still warns
+  and attaches; the batch's line stopped selling the byte-priced trim; and
+  `image_rows` paints a tool result's picture in the pane.
+- **H43** — ✅ fixed by `e34e49a` + `152ad7a` + `d021dad` + `b76dbc8` + `1e8e4f5`
+  + `991be92`, merged by `48d6934` (§8.45): what goes on the wire. `cmd_cap` was
+  budget/4 while the trim leaves the fifth between its 4/5 stopping point and
+  the ceiling, so a full-size result on a just-cut transcript landed past the
+  ceiling and was cut again instead of folded (measured at 8k: 9,593 B + 3,076 B
+  = 12,669 against 12,288; with `cap = budget − trim_target` = 2,458 it lands
+  12,055 and folds); one turn's results were unbounded as a batch (four
+  `run_command`s left the next request at 13,768 B against 12,288); nothing
+  weighed the request against the window, so an over-window request went out and
+  died on the endpoint's 400 (a 2,560×1,440 png → 18,041 B against 12,288); the
+  fold's reply cap was a constant no window touched (a fold at a 16 k window
+  asked 19,595 tokens against 16,000; an idle `/compact` sent a 40,833-byte
+  request over an 8,192-token window); and `vision_capable` was never asked
+  when a request's parts were assembled, so a mid-run `Ctrl-P` replayed `[0, 1]`
+  image parts to a blind model. Now `cmd_cap` is the relation with
+  `trim_target`, `ActorState::turn_room` shares that fifth across a batch, the
+  assembled request is weighed (the newest turn's own results shed
+  largest-first, then refused before the wire), `compaction_reply_cap` is the
+  window's leftover floored at 1,024 with a fold that cannot fit not attempted,
+  and request assembly asks the vision gate — a blind model's request gets the
+  placeholders.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -3060,3 +3119,353 @@ if the mark is wanted back, `Phase::words` is the one place to put it.
 prod 14,770 · tests 26,447 · comments 15,856): total 62,372 · **prod 14,937** ·
 tests 27,253 · comments 16,339 — 1,531 lines: 167 production, 806 test, 483
 comment, 75 blank. `cargo test` 652 + 189 (four ignored), clippy and fmt clean.
+
+---
+
+## 8.44 The image road, audited: a reader that opens nothing first, and a gate that spoke for another agent (`c0f8973`..`00096c6`, `700fbdc`, `3a7cca0`..`edac88f`, `c78695b`)
+
+A blind audit of this file's own image road — ten findings, A1 to A10, read from
+the source rather than from a live run — became three branches and three
+parallel children: the reader's edges (`mush/15`, merged `700fbdc`), the attach
+gate with its carry and its bounds (`mush/16`, merged `c78695b`), and the pane's
+`▣` row (`5e74f8d`, merged `b6eaf91`). §8.42 and §8.43 built the road and
+measured it through the human's own pastes; what the audit found is what the road
+did while nobody was looking — it opened a path to ask what it was, read a file
+whole to learn it was too big, and took a reader killed at the deadline for an
+empty clipboard. H41 and H42 are its rows.
+
+**The reader looked at a path by opening it (`c0f8973`; H41).** `image_at` — the
+one reader behind the human's paste and the model's `read_file` — did
+`File::open`, sniffed a sixteen-byte head, then read the file *whole* before
+comparing its length to `IMAGE_FILE_CAP`. Two facts followed from that order. A
+FIFO named like an image **blocked the open** until a writer appeared, and this
+runs on the UI thread (the human's paste) and in an actor (the model's read): a
+probe was still blocked after three seconds, so a paste of `x.png` could freeze
+a pane or park an agent forever. And an over-cap file was read to its end to say
+what the stat already said — a 128 MiB sparse png drove the probe's peak RSS
+from 3,172 kB to 134,136 kB (after: 3,224 kB → 3,228 kB, still naming the size
+the stat saw). The order is now: `fs::metadata` first, and only a regular file
+can be an image, so anything else is `Ok(None)` **before any open**; the head is
+then sniffed, and an over-cap *non-image* is still text, because the head
+decides image-or-text and the cap must not turn prose into a refusal; only an
+image is weighed against the cap, from the metadata length, before any whole
+read; the read itself is bounded to `IMAGE_FILE_CAP + 1` bytes with `take`,
+because a file can grow between the stat and the read; and a read that hits the
+bound is refused **without a size named** — the length in hand is the buffer's,
+not the picture's, which is why `image_too_big` takes an `Option<u64>` and the
+exact-size sentence stays for the sizes that are known. The same `fs::read`
+waited one call later on the model's text road, so `read_file` carries the same
+regular-file guard: fixing only the image half would have left the actor parked.
+`00096c6` then pinned the corners the audit named as untested — `image_mime`'s
+floor (an empty slice, `RIFF`, `GIF87`, a bare png signature: no signature, no
+panic), a real over-cap image refused with the stat's exact number, a sparse
+32 MiB log refused by `read_window`'s whole-read cap before anything is read,
+and the `None`-size sentence itself. That last pin is the one the growth race
+cannot earn on its own: the stat and the read are one function, so the race
+cannot be staged, and the sentence is pinned directly where it lives.
+
+**The clipboard lied twice about the same buffer (`827ad1a`, `ee4db8b`; H41).**
+The reader's stdout is drained to `READ_CAP = IMAGE_FILE_CAP + 1` bytes so a
+runaway stays bounded — and `drain` said nothing about having dropped the rest,
+so a 4,194,314-byte png arrived at `save_pasted_image` as a 2,097,153-byte
+buffer and the refusal read the buffer's length aloud as the human's picture: "a
+png of 2097153 bytes". The picture could be of any size; the number was always
+the cap's. `Drained { bytes, filled }` now carries the truncation,
+`save_pasted_image` takes the caller's own fact (`cut_at_the_cap`), and a
+picture cut at the cap is refused as past the cap **with its true size unknown**
+— one sentence sharing every word but one clause with the whole-picture sentence
+(`clipboard_image_too_big`, another `Option<u64>`) — while a whole picture keeps
+its exact number. The other lie was `Answer::Nothing`, which covered three
+different facts — no such type on the clipboard, a reader that exited non-zero,
+and a reader killed at the shared 2 s `DEADLINE` — and `read_image` turned all
+three into `Ok(None)`, so the human read "the clipboard holds no image" when the
+picture may have been on the clipboard and only the reader was stuck (a probe:
+`sh -c 'sleep 30'`, killed at the deadline, answered `Nothing`).
+`Answer::TimedOut` is now its own answer with its own sentence — it names the
+program, the 2 s wait, and the road that always works (save the picture to a file
+and paste its path) — while a failed reader keeps "no image", whose prose now
+says why: it can serve no picture either way, and the human's move is the one an
+empty clipboard asks for.
+
+**A path with a newline put a line of its own into the model's view
+(`73bfc14`; H41).** `Message::drop_images`'s `placeholder` formatted
+`image.path` raw into the one-line `[image: …]` stand-in, and a newline is legal
+in a Linux path: a dropped image whose path was `shots/a\nb.png` came back as
+three lines where the placeholder's whole shape is one — a line the model could
+read as a message of its own, in the transcript the model is the reader of. The
+path now goes through the repo's one home for untrusted text (`text::sanitize`,
+which removes escape sequences and control characters whole), and the one break
+a sanitized path can still hold is escaped as the two characters `\n` rather
+than dropped, so the path stays nameable again; a lone `\r` sanitize already
+marks as `␍`. Two tests pin it: the newline stays one line, and a path holding
+an escape sequence leaves no command behind.
+
+**The attach gate spoke for the wrong agent (`3a7cca0`, `bf9b897`, `9b29e80`,
+`7c8bd98`, `edac88f`; H42).** A picture attached while a **child** was focused
+was resolved and copied by the *root's* workspace, and a child works in its own
+worktree (`.mush/wt/<id>`), whose tools resolve the same relative path against
+that worktree: the placeholder's "read the file again" named a file the child
+could not read (`an_image_attached_to_a_child_is_readable_from_the_childs_own_workspace`
+failed on exactly that, and passes after). The room arithmetic was the same
+mistake in numbers: `used_weight_for(AgentId::ROOT)` whichever agent was
+focused, so a child's own budget was weighed as the root's — the test that
+caught it had expected the warning and read the plain line `attached
+shots/big.png (png · 1.3 MB)` instead. `App::agent_root(id)` is now the one
+answer to where an agent's tools resolve — its worktree while it has one on
+disk, else the shared checkout, the same rule `agent::revive` gives the actor —
+and `attach_worktree` reads it too rather than repeating it (`bf9b897`).
+`App::carry_images(id, images)` re-copies the picture into *that* agent's
+`.mush/paste/`, through the one writer (`save_pasted_image`), unless the
+receiving workspace reads the bytes back identically — bytes, not the path's
+existence, because the placeholder promises the *same* picture and a worktree
+can hold an older commit. Both doors carry for the focused agent, and `deliver`
+asks again for the agent that actually receives the message, because focus can
+move between the attach and the `Enter`. `mush/15`'s signature change met
+`mush/16`'s new call at the merge and did not compile until the call site
+declared `false` for `cut_at_the_cap` (`9b29e80` — the carry holds whole bytes,
+since an `Image` only exists when a road read the picture to its end within the
+cap), and the paste writer's doc now names the carry as its third road
+(`edac88f`). The carry also carried the audit's own defect for a moment: its
+"does the receiver already hold this picture?" was a raw `fs::read`, which
+re-spelled the open-before-stat hazard `mush/15` had just fixed — a FIFO named
+like the picture would have blocked the UI thread at every attach and every
+send. It now asks the receiving workspace's own reader (`read_image`), which
+stats first and bounds its read by the transport cap whatever the file claims or
+grows to; with the raw read restored, the new watchdog test fails after 5 s ("a
+FIFO must answer, not hold an open until a writer appears: Timeout"). Six
+existing fixtures that attached a hand-built `Image` whose path named no file
+now write the file holding those bytes, which is what every real road already
+left on disk.
+
+**Nothing bounded a batch (`7ef2301`, `31cd9d0`; H42).** The gate's own prose
+said "Nothing here caps the count", and `docs/mush.md` claimed the room and the
+window bounded it — but the room is a warning, and a picture is priced by its
+**pixels**, so a 2 MB file of a small png weighs almost nothing and passes every
+token bound the window has. A paste of eight pictures at the transport's 2 MB
+cap put 16 MB in the box and 22 MB into the request JSON. Two bounds now, asked
+at both doors (the single attach and the batch paste) and both refusing —
+attaching a request the endpoint will refuse only spends a turn discovering it.
+The window's bound: the box's pending pictures, this arrival with them, may not
+pass the whole history budget; a picture or batch that would is refused (the
+batch says how many of how many are at stake, where the single picture's line
+names the picture), and this *changed* the single road, which used to attach
+with a `fail` line. The line's road is a downscale, and `/compact` is named
+only as the thing it is not — a fold of the *conversation*; the single
+picture's line names it when the pictures already in the box are part of the
+sum, because the refused weight is `pending + cost` and no fold touches the box. The box's own bound, in bytes:
+`BOX_IMAGE_BYTES = IMAGE_FILE_CAP × 8` (16.8 MB, eight of the files the
+transport already caps one at), because tokens cannot be this bound — a 2 MB
+file of a 100×100 png weighs fourteen tokens — and the box is bytes while the
+pictures wait; the refusal names which bound it was. The room warning, where a
+fold does help, keeps naming `/compact`, warns, and attaches: the human decides
+what to send. The batch's room warning also stopped selling a mechanism that no
+longer exists — "`trim_history` sheds an image's bytes before it drops a turn"
+was true while a picture was priced by its bytes, and H40 deleted the pass; the
+batch line now says what the single-picture line says, about them all
+(`31cd9d0`). Measured with both bounds disabled in turn:
+`a_picture_that_would_push_the_box_past_the_budget_is_refused` failed at "the
+sum is past the budget: refused";
+`a_batch_that_would_push_the_box_past_the_budget_attaches_nothing` at "the words
+land as text" (the attach had swallowed the four paths, leaving `""` where the
+paths should be); `a_picture_past_the_boxes_own_byte_bound_is_refused` and
+`a_batch_past_the_boxes_own_byte_bound_attaches_nothing` at "past the box's
+bound: refused"; all four pass with the bounds in.
+
+**A tool result's picture had no row (`5e74f8d`, merged `b6eaf91`; H42).** The
+dim `▣ path (format · size)` rows were painted inside the `"user"` arm of
+`render_message` alone, so a picture the model read — `read_file` hands a png
+back *inside the tool result* — left no row at all: the pane read exactly like a
+turn where the model had not looked. One helper, `image_rows`, now serves the
+user, assistant and tool arms, each before the trailing blank — one reading,
+because the human's own attachment and the picture a model read are one fact
+about a message, and a second copy of the loop would go its own way the first
+time either changed. The row is the reading of the bytes a message still holds;
+where they are gone (the session writer's `drop_images` leaves its placeholder
+in the text instead), the placeholder is what reads. The pin,
+`a_tool_result_carrying_a_picture_paints_its_row`, also pushes a
+`Message::user_with_images("look", …)` beside the tool result and asserts the
+user road is still painted.
+
+**What this supersedes of §8.43.** Two sentences of §8.43 are history now and
+are not rewritten there. "Nothing caps a batch: the room left, the window and
+the 2 MB per-file cap are what bound it" — the room left warns, and the window
+and the box's byte bound refuse, at both doors. "asks the model-level refusals
+once …, and says the room warning once" — the batch now asks four facts once —
+no model, a model that cannot see, the window's bound, the box's byte bound —
+and two of them stop the whole gesture. And §8.43's closing sentence of H40 — "a
+picture too big for the window even with every older turn gone is the one case
+whose only road is a downscale, because the endpoint would refuse the request
+outright" — still names the only road, but the gate refuses such a picture
+*before* the wire now; the endpoint is no longer the wall it hits.
+
+**Recorded, not changed.** Four things the wave saw and left. The growth race
+between `image_at`'s stat and its bounded read cannot be staged — the two are
+one function — so `image_too_big`'s no-size sentence is pinned directly instead
+of by a test that drives the race. `read_window` (and `read_file` under it) now
+stats twice per read: once for the whole-read cap and once inside `read_file`'s
+own regular-file guard; one extra `fs::metadata` beside the read it guards is
+cheaper than threading a `Metadata` through two functions so one caller authors
+the other's decision. `Workspace::save_pasted_image` gained `cut_at_the_cap` — a
+signature change with one in-tree caller (the carry, which passes `false`) — and
+its doc says why the carry cannot be the cut side. And a refused attach may
+already have carried a copy into the receiving agent's `.mush/paste/` before the
+bound says no: the same shape §8.43 recorded for "a paste that turns out to be
+text may have copied the outside names read before the word that disqualified
+it" — the copy is gitignored scratch, and the order is deliberate: the weights
+and the lines are about the pictures the box will hold, so the carry has to
+happen before the bounds are read.
+
+---
+
+## 8.45 What goes on the wire, audited: the fifth a cut leaves, and the fold's own request (`e34e49a`..`991be92`, `mush/19`)
+
+A second blind audit — the trimmer and the budget, T1 to T4 — found every bound
+asked in the wrong place: the command cap was a fraction the trim does not
+leave, a turn's results were bounded one at a time but not together, the request
+itself was never weighed, the fold's reply cap was a constant no window touched,
+and a request could replay pictures to a model the provider table calls blind.
+The six fixes are one line (`e34e49a`..`991be92`, merged `48d6934`); H43 is their
+row.
+
+**`Config::cmd_cap` overshot the fold (`e34e49a`; H43).** The one cap on a tool
+result's text was a quarter of the history budget, while `trim_history` stops at
+four fifths of it: the fifth between that stopping point and the ceiling is the
+room a result may take, and a quarter overshoots it by a twentieth, so a
+full-size result landing on a just-cut transcript pushed the next request back
+over the ceiling and the next turn cut again — one cut a turn, the prompt's
+front rewritten every turn, the shape §8.43 measured and rejected. Measured at
+the 8k default through the real functions: a transcript the trim had cut to
+9,593 bytes plus a full-size result (a 3,076-byte tool message at the old cap of
+3,072) landed at 12,669 against the 12,288-byte budget — over the ceiling and
+too big to fold; with the cap at `budget − trim_target(budget)` (2,458) the same
+cut lands at 12,055: inside the ceiling, past nine tenths, which is the fold's
+road. The cap is now that relation and not a number of its own — expressed with
+`transcript::trim_target`, so the two cannot drift apart — with the 512-byte
+floor and `CMD_CAP` untouched. A prose correction came with it: the last tenth
+before the ceiling is not "what the next growth crosses" — a turn's growth is
+the whole fifth the cap bounds, and the fold's trigger sits inside that room.
+`the_window_and_the_caps_scale_together` had pinned the quarter and is rewritten
+to the relation; `a_full_result_after_a_cut_lands_on_the_ceiling` is the new
+pin, over 2k/8k/24k/40k/120k windows plus the measured 8k numbers spelled out.
+
+**One turn's results, together, were unbounded (`152ad7a`; H43).** `cmd_cap`
+bounds one result, but a `run_command` batch is unbounded in count: four results
+each answering to the cap add four fifths of the budget to a transcript with a
+fifth of room, and nothing capped their sum. Measured through `run_loop` on the
+shape the audit used — a first turn, so one user line and no older turn a trim
+can drop, with the real 3,247-byte system prompt, under the 8k default — one
+turn asking four `run_command`s left the next request carrying 13,768 bytes
+against a 12,288-byte budget: no cut, no note and no fold, because a transcript
+with one user line has no older turn to drop and a transcript over the budget
+cannot fold. `ActorState::turn_room` is that sum's bound: set to
+`budget − trim_target` when a batch starts, spent by each result's own weight as
+it is stored, and `None` outside a batch; `result_cap` now answers
+`min(Config::cmd_cap, what is left)`, so the first result takes its share of the
+fifth and every later one is answered with what remains — mush's own cut note,
+never output the cap would have let through. The content mush stores is what is
+bounded, in the one place each tool already reads its cap; no history is
+rewritten after the fact, and a call is still answered whatever the room is, so
+the batch keeps the shape a strict server validates. The pin,
+`one_turns_results_share_the_room_under_the_ceiling`, asserts the request
+carrying the four results fits the budget, that the first result took the room,
+and that every later one says `truncated at 0 bytes`.
+
+**Nothing checked the request against the window (`d021dad`; H43).**
+`trim_history` runs once per turn and cannot cut two shapes — a transcript with
+fewer than three user lines, and the newest turn itself — and nothing after it
+compared the request to the window, so an over-window request went out and the
+endpoint answered a 400 with the money already spent. Measured through
+`run_loop` at the 8k default with the invariant check disabled: one 2,560×1,440
+png (3,686,400 px at 750 px/token) made a first turn's request weigh 18,041
+bytes against the 12,288-byte budget, and a restored transcript whose newest turn
+holds one unbounded result sent 23,318 bytes against the same budget — with no
+cut, no note and no fold. The invariant now lives where the request is assembled,
+on the messages that go out (a wrap-up instruction included): over the budget,
+one road stays open first — the newest turn's **own tool results**, mush's bytes
+and not the human's, go largest-first until the request fits, each replaced by
+`SHED_RESULT_NOTE` (the call is not lost; the same output is one narrower call
+away), with one `Notice` counting them for the human, and never a picture,
+because a picture goes with its turn. A shape that still does not fit is refused: one line naming
+what does not fit and the three roads that change it — downscale an attached
+picture, `/compact` the conversation, or read less — with no model call, and the
+actor stays alive with the transcript intact, so the next message meets whatever
+the human changed. The tests drive every shape a trim cannot cut and assert the
+invariant on each request that reached the model:
+`no_request_the_trim_cannot_cut_goes_over_the_window` (the audit's blind spot —
+no test compared a request to the window at all),
+`the_window_takes_back_the_newest_turns_results_and_says_so` (the shed stops as
+soon as it fits, a kept result is whole, and the human is told),
+`a_picture_the_window_cannot_hold_is_refused_before_the_wire`, and
+`a_transcript_that_cannot_fit_is_refused_with_one_line`; all four fail with the
+check disabled.
+
+**The fold's own request never fit a small window (`b76dbc8`; H43).** The fold's
+reply cap was the constant `COMPACT_REPLY_TOKENS` (10,240), which no window
+touched, and neither the automatic arm nor an asked `/compact` compared its
+request to the window at all. Measured with the fit test disabled: at a
+16,000-token window a fold at the trigger carried a 7,355-token prompt (the
+history, the instruction, and the 2,000-token schema bound) and asked for
+10,240 more — 19,595 tokens against 16,000, which a strict endpoint refuses —
+and an idle `/compact` over a 37,210-byte transcript sent a 40,833-byte request
+(13,611 tokens) with the same cap: 25,851 tokens against an 8,192-token window,
+one wasted request and a red line, while the automatic arm printed nothing and
+retried the same unchanging shape every turn in silence. The cap is now a
+function of the window: `compaction_reply_cap` asks for the summary's ceiling
+and no more than the window leaves under the whole prompt — the tool schemas
+that head it, then the history and the instruction — floored at the same 1,024
+tokens `reply_cap` is floored at, and `fold_request_fits` weighs the whole
+request (schemas + prompt + cap). A fold that does not fit is not attempted: no
+wire call, one line naming the three parts and the roads (`/context N`, Ctrl-N),
+said once per state on the automatic arm — the same transcript retried every
+turn is not news — and every time a human typed `/compact`, because a human
+typed a command; the transcript is left untouched, because a refused fold is not
+a trim. At the 4,000-token window the pin is 5,009 against 4,000 (1,985 of
+history and instruction + 2,000 schemas + 1,024 summary). `needs_compaction`'s
+inclusive upper bound, documented as inclusive and pinned by nothing, is pinned
+in `a_transcript_past_the_whole_budget_does_not_fold`, and its prose now says
+the whole-request fit is the caller's test — where the old sentence ("only fire
+while it still fits; beyond that, trimming stays the last resort") said a fact
+about the history where the fact is about the request.
+
+**A request could replay pictures to a model the table calls blind
+(`1e8e4f5`; H43).** `vision_capable` was asked at the attach gate, at the deliver
+gate and by `read_file` — everywhere an image *enters* a transcript — and
+nowhere a request *replays* one. A mid-run `Ctrl-P` points a conversation that
+already holds pictures at a model the table says is blind, and the request built
+for it carried the `image_url` parts anyway; the fold's request, built from the
+same transcript, did too. Measured with the gate disabled: requests carried
+`[0, 1]` image parts — one in the human's turn, one in the fold's prompt. The
+gate is now asked where the request's parts are assembled: `for_the_model`
+returns the transcript the actor holds, or — for a model `vision_capable` says
+cannot see — a copy whose image parts are shed by `Message::drop_images`, so each
+message's own placeholder stands where its pictures were, and one line tells the
+human what was dropped and that `/model` is the road. The actor's transcript
+keeps the picture whole (a picture goes with the turn it arrived in, and only
+the request is a copy), the window invariant and the fold's fit test now measure
+what actually goes out, and `read_file`'s own refusal for a blind model stays as
+the honest earlier answer rather than the thing standing between an image and a
+rejected request. Both tests fail with the gate disabled:
+`a_blind_model_is_never_sent_an_image_part` and
+`the_folds_request_is_stripped_too_for_a_blind_model`.
+
+**The reserve's identity was said flatly (`991be92`).** Prose only: `history_budget`'s
+doc claimed `history + schemas + reply + margin == window` flatly — true while
+the reserve is those three numbers, false under the reserve's own half-window
+cap, which binds below ~18.7k tokens (the 8k default's reserve is 4,096, half the
+window). The sentence now says which side of the cap it is on and where the cap
+is, instead of asserting an identity the small windows do not have.
+
+**Recorded, not changed.** The wave touched no number §8.43's ruling set:
+`trim_target` (four fifths) and `compaction_trigger` (nine tenths) keep their
+pair, and `COMPACT_REPLY_TOKENS` stays the summary's ceiling — a window clamps it
+now but does not replace it, and the constant's own number is the human's. The
+automatic arm's refused fold is still said once per state (the same unchanging
+transcript retried every turn is not news), while a typed `/compact` is answered
+every time, because a human typed a command. And a refused fold leaves the
+transcript exactly as it was: a fold that does not fit is not a trim.
+
+**Census** at this landing (`scripts/census.py`), against §8.43's (total 62,372 ·
+prod 14,937 · tests 27,253 · comments 16,339): total 64,807 · **prod 15,279** ·
+tests 28,526 · comments 17,066 — 2,435 lines: 342 production, 1,273 test, 727
+comment, 93 blank. `cargo test --workspace`: 674 + 4 ignored in the mush bin,
+199 in mush-core; clippy and fmt clean.
