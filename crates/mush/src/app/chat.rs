@@ -1633,6 +1633,25 @@ fn image_rows(out: &mut Vec<Line<'static>>, message: &Message) {
 /// the message was. The tool-call rows and the message box already budgeted
 /// their own indent this way; the marks are where the arithmetic was missing.
 fn marked(out: &mut Vec<Line<'static>>, mark: &str, style: Style, text: &str, width: usize) {
+    // The parser's vocabulary reaches the app here and nowhere else: this
+    // function and `reply_style` beside it are the only code that knows what a
+    // `Strong` or a `Heading(2)` is, and the module above never learns either.
+    use mush_core::text::markdown_rows;
+
+    // The model's reply is the pane's one piece of prose, and the only text
+    // whose markdown is read as a view: `render_message`'s assistant arm is the
+    // one caller that hands this function `mush › ` in the reply's green, and
+    // those are the words a model wrote *for the human*. Every other caller is
+    // a line somebody said, and keeps the plain path byte for byte: the human's
+    // own message (`you › `), a brief, a parent's steering, mush's notices and
+    // footnotes. Three more kinds of text never reach this function at all, and
+    // their boundary is the same one: a tool result and a `run_command`
+    // transcript are data the human copies verbatim — a diff, a test log, a
+    // shell session, where a `#` is a comment and an `*` is a glob — a `Ctrl-T`
+    // reasoning row is a working note and not prose, and a tool-call label is
+    // the call's own JSON. Only a reply is a document.
+    const REPLY_MARK: &str = "mush › ";
+    let reply = mark == REPLY_MARK;
     let lead = mark.width();
     // A pane too narrow for the mark and a few words: the mark is what the row
     // cannot afford, because a mark the pane clips is a row that says who spoke
@@ -1642,6 +1661,31 @@ fn marked(out: &mut Vec<Line<'static>>, mark: &str, style: Style, text: &str, wi
     } else {
         ("", 0)
     };
+    if reply {
+        // The view is a view: `markdown_rows` reads the reply's own bytes and
+        // writes nothing back, so what the human copies is still the model's
+        // text, markers and all. It wraps inside the columns the mark leaves,
+        // exactly as the plain path below does, so no row of the view can
+        // outgrow the pane it is painted in.
+        for (index, runs) in markdown_rows(text, width.saturating_sub(lead))
+            .into_iter()
+            .enumerate()
+        {
+            let head = if index == 0 {
+                Span::styled(mark.to_string(), style)
+            } else {
+                Span::raw(" ".repeat(lead))
+            };
+            let spans = std::iter::once(head)
+                .chain(
+                    runs.into_iter()
+                        .map(|run| Span::styled(run.text, reply_style(run.style))),
+                )
+                .collect::<Vec<Span<'static>>>();
+            out.push(Line::from(spans));
+        }
+        return;
+    }
     for (index, line) in wrap_text(text, width.saturating_sub(lead))
         .into_iter()
         .enumerate()
@@ -1652,6 +1696,34 @@ fn marked(out: &mut Vec<Line<'static>>, mark: &str, style: Style, text: &str, wi
             Span::raw(" ".repeat(lead))
         };
         out.push(Line::from(vec![head, Span::raw(line)]));
+    }
+}
+
+/// The markdown view's styles, in one place: the parser's vocabulary ends here,
+/// so nothing else in the app learns what a `Strong` or a `Heading(2)` is and a
+/// new surface cannot invent its own reading of one.
+///
+/// The palette is the pane's own. Bold, italic and strike are the modifiers a
+/// terminal already has; code, a fence and a link's URL are the dim grey the
+/// pane paints its secondary facts in; a heading is the reply's accent, in
+/// bold, because the heading is the reply's; a link is underlined, and a
+/// bullet's marker — the one part of a row that is layout rather than words —
+/// is the accent too.
+fn reply_style(style: mush_core::text::RunStyle) -> Style {
+    use mush_core::text::RunStyle;
+    use ratatui::style::Modifier;
+
+    match style {
+        RunStyle::Plain => Style::default(),
+        RunStyle::Strong => Style::default().add_modifier(Modifier::BOLD),
+        RunStyle::Emphasis => Style::default().add_modifier(Modifier::ITALIC),
+        RunStyle::Strike => Style::default().add_modifier(Modifier::CROSSED_OUT),
+        RunStyle::Code | RunStyle::Fence | RunStyle::Url => Style::default().fg(Color::DarkGray),
+        RunStyle::Heading(_) => Style::default()
+            .fg(Color::Green)
+            .add_modifier(Modifier::BOLD),
+        RunStyle::Bullet => Style::default().fg(Color::Green),
+        RunStyle::Link => Style::default().add_modifier(Modifier::UNDERLINED),
     }
 }
 
@@ -3588,5 +3660,171 @@ mod tests {
 
         let mut chat = Chat::bare();
         assert_eq!(cleared(&mut chat), None, "an empty box is not a loss");
+    }
+
+    /// The model's reply is the pane's one document: its markdown is read as a
+    /// view — the `#`s, the asterisks and the fence lines are not painted — and
+    /// the message's own bytes are left exactly as the model wrote them. What a
+    /// human copies out of a reply is the source, so nothing here rewrites the
+    /// transcript; the view only decides how one frame paints it.
+    #[test]
+    fn a_reply_is_read_as_markdown_and_its_bytes_are_left_alone() {
+        let source = "# Steps\n\n- **run** `cargo test`\n\nsee [the docs](https://example.com/a)";
+        let message = Message::assistant(source);
+        let mut rows = Vec::new();
+        render_message(&mut rows, &message, None, 60, false);
+        assert_eq!(
+            shown(&rows),
+            vec![
+                "mush › Steps".to_string(),
+                "       ".to_string(),
+                "       - run cargo test".to_string(),
+                "       ".to_string(),
+                "       see the docs (https://example.com/a)".to_string(),
+                String::new(),
+            ]
+        );
+        assert_eq!(
+            message.text(),
+            source,
+            "the transcript keeps the source bytes"
+        );
+
+        // The view's palette is decided in one place: a heading in the reply's
+        // accent and bold, a strong span bold, a code span the dim grey.
+        let heading = &rows[0].spans[1];
+        assert_eq!(heading.style.fg, Some(Color::Green));
+        assert!(heading
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD));
+        let strong = rows[2]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "run")
+            .expect("the strong span");
+        assert!(strong
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD));
+        let code = rows[2]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "cargo test")
+            .expect("the code span");
+        assert_eq!(code.style.fg, Some(Color::DarkGray));
+    }
+
+    /// A tool result is data, not prose: its bytes are what the human copies
+    /// out — a diff, a test log, a shell transcript — so the view does not
+    /// touch it. A `#` in such a line is a comment, an `*` is a glob and
+    /// backticks are quoting; the rows below are byte for byte the rows the
+    /// plain wrapper painted before there was a view.
+    #[test]
+    fn a_tool_result_is_painted_byte_for_byte_as_data() {
+        let text =
+            "# not a heading\n\n- **not strong** `not code`\n\n[not a link](https://example.com/a)";
+        let mut rows = Vec::new();
+        render_message(&mut rows, &Message::tool("call_1", text), None, 60, false);
+        assert_eq!(
+            shown(&rows),
+            vec![
+                "  # not a heading".to_string(),
+                "  ".to_string(),
+                "  - **not strong** `not code`".to_string(),
+                "  ".to_string(),
+                "  [not a link](https://example.com/a)".to_string(),
+                String::new(),
+            ]
+        );
+    }
+
+    /// Only the model's reply is a document. The human's own message, a child's
+    /// brief and mush's own notices keep the plain path byte for byte: a `#` in
+    /// them is not a heading and an `*` is not emphasis, because they are lines
+    /// somebody said and not prose to be rendered.
+    #[test]
+    fn only_the_reply_is_read_as_markdown() {
+        let source = "# **bold** `code` [link](https://x.dev/a)";
+
+        let mut rows = Vec::new();
+        render_message(
+            &mut rows,
+            &Message::user(source),
+            Some(Voice::Human),
+            80,
+            false,
+        );
+        assert_eq!(shown(&rows)[0], format!("you › {source}"));
+
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId(1), Message::user(source));
+        let painted = shown(&pane_rows(&chat, &pane(AgentId(1)), 80, 3));
+        assert_eq!(painted[0], format!("brief › {source}"));
+
+        let notice = Notice {
+            agent: AgentId::ROOT,
+            kind: NoticeKind::Info,
+            at: 0,
+            count: 1,
+            text: source.to_string(),
+        };
+        assert_eq!(
+            shown(&footnote_lines(&notice, 80))[0],
+            format!("· {source}")
+        );
+    }
+
+    /// A rendered reply is a view and not a layout change: at every width the
+    /// pane paints no row wider than itself, and every word of the reply is
+    /// still there. A CJK glyph is two columns and a URL has no space to break
+    /// at, and both are where a naive render pushes past the edge.
+    #[test]
+    fn a_markdown_reply_never_paints_past_the_pane() {
+        let text = "# 見出し\n\n- **項目** one two\n\nsee [the docs](https://example.com/a/very/long/path/that/never/breaks/anywhere)\n\n```\nlet x = 1; // 日本語\n```\n\n**strong** tail";
+        let message = Message::assistant(text);
+        for width in [10usize, 12, 14, 20, 33, 40, 80] {
+            let mut rows = Vec::new();
+            render_message(&mut rows, &message, None, width, false);
+            let painted = shown(&rows);
+            for row in &painted {
+                assert!(
+                    UnicodeWidthStr::width(row.as_str()) <= width,
+                    "a {width}-column pane painted {}: {row:?}",
+                    UnicodeWidthStr::width(row.as_str())
+                );
+            }
+            // The view's margin on a wrapped row is the mark's own columns;
+            // strip it so the check reads the reply's words and not the
+            // layout the pane wraps every voice in.
+            let lead = if width >= "mush › ".width() + MIN_BODY {
+                "mush › ".width()
+            } else {
+                0
+            };
+            let flat: String = painted
+                .iter()
+                .map(|row| row.strip_prefix(&" ".repeat(lead)).unwrap_or(row))
+                .collect::<Vec<_>>()
+                .concat();
+            assert!(
+                flat.contains("見出し"),
+                "the heading's words stay at {width}: {painted:?}"
+            );
+            assert!(
+                flat.contains("項目"),
+                "the item's words stay at {width}: {painted:?}"
+            );
+            assert!(
+                flat.contains("https://example.com/a/very/long/path/that/never/breaks/anywhere"),
+                "the URL is never dropped at {width}: {painted:?}"
+            );
+            assert!(
+                !painted
+                    .iter()
+                    .any(|row| row.contains("**") || row.contains("```")),
+                "no marker survives the view at {width}: {painted:?}"
+            );
+        }
     }
 }
