@@ -673,6 +673,19 @@ pub enum AgentEvent {
         title: Option<String>,
         cmd: Sender<AgentMsg>,
     },
+    /// The prompt this agent's history *opens with*, as its actor built it —
+    /// emitted by the actor itself, before its thread runs, so an agent the UI
+    /// only ever learns about through its events still says it.
+    ///
+    /// A subagent's prompt names the workspace its own tools resolve paths in,
+    /// its depth and whether it is isolated; those are decided where the child
+    /// is built, so the app cannot rebuild the prompt without a second spelling
+    /// of the rules — and the agent's weight, the number the meter prints and
+    /// the attach gate reads, is its own prompt plus its transcript
+    /// ([`Chat::used_weight_for`](crate::app::Chat::used_weight_for)). The root
+    /// never emits this: its prompt is the conversation's own and travels with
+    /// every [`Run`](AgentMsg::Run) the UI hands it.
+    SystemPrompt(Message),
     /// A run began — including one the UI did not ask for, because an idle
     /// agent was woken by a child's result. Keeps `busy` and the tree honest.
     /// `cancel` is this run's flag, and the UI keeps a clone: it is the one the
@@ -1466,6 +1479,14 @@ fn tell_parent(ctx: &AgentCtx, id: u64, parent_tx: Option<&Sender<AgentMsg>>, co
 fn start(actor: Actor, initial: Vec<Message>, start_immediately: bool) {
     let id = actor.id;
     let ctx = actor.ctx.clone();
+    // The prompt this actor's history opens with is published before the thread
+    // runs: it is what the app weighs for this agent (`Chat::learn_system`),
+    // and only the actor that built it knows it — a child's prompt names its
+    // own workspace. The root's history arrives with the UI's first `Run` and
+    // is empty here, so there is nothing to publish for it.
+    if let Some(prompt) = initial.first().filter(|message| message.role == "system") {
+        ctx.emit(id, AgentEvent::SystemPrompt(prompt.clone()));
+    }
     let parent_tx = actor.parent_tx.clone();
     let builder = std::thread::Builder::new().name(format!("mush-agent-{id}"));
     if let Err(error) = builder.spawn(move || actor_main(actor, initial, start_immediately)) {
@@ -15159,6 +15180,53 @@ mod tests {
             "the worktree forked from the named commit, not from HEAD"
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A child actor publishes the prompt its own history opens with, before
+    /// its thread runs: the app weighs that prompt for the child — the meter
+    /// and the attach gate read it — and only the child's builder knows it,
+    /// because it names the child's workspace, its depth and its isolation.
+    /// The parent's prompt standing in for a child's made the app weigh a
+    /// history the child never sends.
+    #[test]
+    fn a_child_publishes_the_prompt_its_own_history_opens_with() {
+        let (actor, events, _mailbox) = recording_actor("child-prompt");
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "do it" }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(report.contains("#1"), "the child is named: {report}");
+
+        // A shared child: this workspace, depth 1, no isolation, and young
+        // enough to delegate — the facts its prompt is built from.
+        let expected = prompt::subagent_prompt(&actor.ws.root_str(), 1, false, 1 < MAX_DEPTH);
+        let published: Vec<Message> = events
+            .events_for(AgentId(1))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::SystemPrompt(prompt) => Some(prompt),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(published.len(), 1, "one prompt, published once");
+        assert_eq!(published[0].role, "system");
+        assert_eq!(
+            published[0].text(),
+            expected,
+            "the prompt is the child's own"
+        );
+        assert_ne!(
+            published[0].text(),
+            prompt::system_prompt(&actor.ws.root_str()),
+            "not the root's prompt, which is what the app used to weigh"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// A named base is resolved to a commit before anything is created: a

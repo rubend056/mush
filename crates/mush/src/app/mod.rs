@@ -1471,6 +1471,15 @@ impl App {
                 // restart comes back with the same tree.
                 self.mark_session_dirty();
             }
+            AgentEvent::SystemPrompt(prompt) => {
+                // The actor built its own prompt — a child's names the workspace
+                // its tools resolve paths in — and the app weighs it for the
+                // meter and the attach gate (`Chat::used_weight_for`). It is not
+                // stored: a prompt names a workspace that may have moved, so a
+                // session leaves the system message out and the actor builds a
+                // fresh one on the way back in.
+                self.chat.learn_system(id, prompt);
+            }
             AgentEvent::Running { cancel } => {
                 // A run started, possibly one the UI did not ask for (an idle
                 // agent woken by a child's result). Mark it so `busy`, the
@@ -6866,7 +6875,10 @@ mod tests {
     }
 
     /// Opening mush is not a request. A restored agent comes back with its
-    /// transcript and its mailbox and does nothing until the human asks.
+    /// transcript and its mailbox and does nothing until the human asks — the
+    /// one thing it says at startup is the prompt its own history opens with
+    /// ([`AgentEvent::SystemPrompt`]), which is a fact about the history the
+    /// meter weighs, not a run.
     ///
     /// Reviving an agent by *running* it replayed every stored task against the
     /// endpoint the moment mush opened — thirteen agents, thirteen requests
@@ -6885,9 +6897,18 @@ mod tests {
         let (app, rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
 
         let seen = events_from(&rx, AgentId(2), Duration::from_millis(300));
+        let ran: Vec<&String> = seen
+            .iter()
+            .filter(|event| !event.starts_with("SystemPrompt("))
+            .collect();
         assert!(
-            seen.is_empty(),
-            "a restored agent must not run at startup: {seen:?}"
+            ran.is_empty(),
+            "a restored agent must not run at startup: {ran:?}"
+        );
+        assert_eq!(
+            seen.len(),
+            1,
+            "and its own prompt is the one thing it says: {seen:?}"
         );
         assert_eq!(
             app.tree.node(AgentId(2)).map(|node| node.phase.clone()),
@@ -10509,6 +10530,62 @@ mod tests {
             Some(note.text()),
             "and a restart resumes with it"
         );
+    }
+
+    /// One arithmetic per agent: the number `used_weight_for` returns is the
+    /// agent's **own** system prompt plus its transcript — the history its
+    /// actor sends.
+    ///
+    /// For the root that is the conversation the next `Run` hands the actor:
+    /// the root's prompt is the conversation's own. For a child it is the
+    /// prompt its actor published (only the actor that built it knows the
+    /// workspace it names, its depth and its isolation) plus everything the
+    /// child has said. The audit's blind spot: the old sum added the root's
+    /// prompt for *every* id — 3,247 B against a shared leaf's 1,634 — so a
+    /// focused leaf read 1,613 B ≈ 537 tokens heavier than the run it was
+    /// about, and a 4× prompt weight would have passed every meter test.
+    #[test]
+    fn an_agents_weight_is_its_own_prompt_plus_its_transcript() {
+        let (mut app, _rx) = test_app("own-prompt");
+        // The root: exactly the conversation the actor is handed.
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("x".repeat(300)));
+        let conversation: usize = app.chat.conversation().iter().map(Message::weight).sum();
+        assert_eq!(
+            app.chat.used_weight_for(AgentId::ROOT),
+            conversation,
+            "the root's number is the conversation it sends"
+        );
+
+        // A child: what its own actor published, plus what it has said.
+        let (child_root, _mailbox) = isolate_child(&mut app, 1);
+        app.chat
+            .push_message(AgentId(1), Message::user("do the thing"));
+        let prompt = Message::system(prompt::subagent_prompt(
+            child_root.to_str().unwrap(),
+            1,
+            true,
+            1 < crate::agent::MAX_DEPTH,
+        ));
+        assert_ne!(
+            prompt.weight(),
+            app.chat.system().weight(),
+            "the child's prompt is not the root's; the test can tell them apart"
+        );
+        app.on_agent(AgentId(1), AgentEvent::SystemPrompt(prompt.clone()));
+
+        let transcript: usize = app
+            .chat
+            .transcript(AgentId(1))
+            .iter()
+            .map(Message::weight)
+            .sum();
+        assert_eq!(
+            app.chat.used_weight_for(AgentId(1)),
+            prompt.weight() + transcript,
+            "the child's number is its own prompt plus its transcript"
+        );
+        let _ = std::fs::remove_dir_all(child_root);
     }
 
     /// The facts line says how full the conversation is as well as how big the

@@ -389,6 +389,20 @@ pub struct Chat {
     /// the session — it names a workspace that may have moved — so it lives
     /// here, next to the transcript it opens.
     system: Message,
+    /// Each *subagent's* own system prompt, keyed by id: the prompt its actor
+    /// was built with, published once per actor ([`AgentEvent::SystemPrompt`]).
+    ///
+    /// The root's is `system` above. A child's cannot be rebuilt here: it names
+    /// the workspace the child's own tools resolve paths in, its depth, and
+    /// whether it is isolated — facts decided where the child is built, and a
+    /// second derivation here would be a second answer to "which prompt does
+    /// this agent send". The audit measured what that cost while the root's
+    /// prompt stood in for every agent: 3,247 B against a shared leaf's 1,634,
+    /// so a focused leaf's meter read 1,613 B ≈ 537 tokens heavier than the
+    /// history its actor sends. An agent whose actor has not published one
+    /// weighs no prompt: the number is the actor's fact, not this table's
+    /// guess.
+    systems: HashMap<AgentId, Message>,
     /// The root conversation: what the chat pane shows by default, what the
     /// root actor is sent, and what the context meter weighs.
     root: Vec<Message>,
@@ -460,6 +474,7 @@ impl Chat {
     pub fn new(system: Message, root: Vec<Message>) -> Self {
         Self {
             system,
+            systems: HashMap::new(),
             root,
             agents: HashMap::new(),
             notices: Vec::new(),
@@ -515,6 +530,31 @@ impl Chat {
     #[cfg(test)]
     pub fn system(&self) -> &Message {
         &self.system
+    }
+
+    /// `id`'s actor says what its own history opens with: the prompt it was
+    /// built with, and the one every request it sends starts from.
+    ///
+    /// One writer, one reader: the actor emits it ([`AgentEvent::SystemPrompt`]
+    /// when its thread is built) and [`Self::used_weight_for`] weighs it. It is
+    /// not stored in the session — a prompt names a workspace that may have
+    /// moved, so `session_snapshot` leaves a child's system message out of what
+    /// it stores and the actor builds a fresh one on the way back in
+    /// (`agent::revive`).
+    pub fn learn_system(&mut self, id: AgentId, prompt: Message) {
+        self.systems.insert(id, prompt);
+    }
+
+    /// The system prompt `id`'s history opens with: the root's own, or the one
+    /// the agent's actor published. `None` is "no actor has said yet" — the
+    /// root never has to (its prompt is the conversation's) and a child's actor
+    /// says it before its first run.
+    fn system_for(&self, id: AgentId) -> Option<&Message> {
+        if id == AgentId::ROOT {
+            Some(&self.system)
+        } else {
+            self.systems.get(&id)
+        }
     }
 
     /// The root conversation exactly as the actor wants it: the system prompt
@@ -614,13 +654,29 @@ impl Chat {
         self.used_weight_for(id) / mush_core::config::BYTES_PER_TOKEN
     }
 
-    /// The same sum in the budget's own currency: the system prompt plus one
-    /// agent's transcript, weighed the one way [`mush_core::transcript::trim_history`]
-    /// weighs them. Split out of [`Self::used_tokens_for`] so a caller that
-    /// needs the number in bytes — the attach gate, asking how much room a
-    /// picture has left — reads the same sum the meter divides instead of
-    /// adding the two up again (two spellings of one arithmetic is how the
-    /// budget and the meter drift apart).
+    /// The same sum in the budget's own currency: one agent's **own** system
+    /// prompt plus its transcript, weighed the one way
+    /// [`mush_core::transcript::trim_history`] weighs them. Split out of
+    /// [`Self::used_tokens_for`] so a caller that needs the number in bytes —
+    /// the attach gate, asking how much room a picture has left — reads the
+    /// same sum the meter divides instead of adding the two up again (two
+    /// spellings of one arithmetic is how the budget and the meter drift
+    /// apart).
+    ///
+    /// The prompt is the agent's own: the root's is the conversation's
+    /// ([`Self::system`], which the root actor is handed with every run), and a
+    /// child's is the one its actor published ([`Self::learn_system`]) — a
+    /// child's prompt names the child's own workspace, so only the actor that
+    /// built it can say what it weighs. An agent whose prompt has not been
+    /// published, or that has no transcript at all, weighs nothing.
+    ///
+    /// The pane's copy can be heavier than the actor's list, and that is
+    /// deliberate: a trim drops turns the pane keeps — the pane is the human's
+    /// record of the conversation, and the dropped-turns note is in both — and
+    /// a shed replaces a result in the actor's list while the pane still shows
+    /// what the tool produced. The difference is one-directional: the actor's
+    /// list is never the heavier of the two, so the room the attach gate
+    /// computes is never larger than the room the next request has.
     pub fn used_weight_for(&self, id: AgentId) -> usize {
         let transcript = if id == AgentId::ROOT {
             &self.root
@@ -630,7 +686,8 @@ impl Chat {
                 None => return 0,
             }
         };
-        self.system.weight().saturating_add(
+        let prompt = self.system_for(id).map_or(0, Message::weight);
+        prompt.saturating_add(
             transcript
                 .iter()
                 .map(Message::weight)
@@ -646,6 +703,7 @@ impl Chat {
     pub fn clear(&mut self) {
         self.root.clear();
         self.agents.clear();
+        self.systems.clear();
         self.notices.clear();
         self.reading.clear();
         self.spoken.clear();
@@ -703,6 +761,7 @@ impl Chat {
     /// reads is not this method's to empty.
     pub fn forget(&mut self, agent: AgentId) {
         self.agents.remove(&agent);
+        self.systems.remove(&agent);
         self.spoken.remove(&agent);
         self.revisions.remove(&agent);
         self.reading.remove(&agent);
