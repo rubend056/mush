@@ -470,15 +470,34 @@ fn data_url(image: &Image) -> String {
 /// The line a dropped image leaves behind, in the one spelling the session
 /// writer uses (never two). It names the path, because that is what makes the
 /// image reachable again — the model can read the file — and the format, so
-/// the line cannot be mistaken for something the model said.
+/// the line cannot be mistaken for something the model said. The path goes
+/// through [`one_line`], so the placeholder is exactly one line whatever the
+/// path holds.
 fn placeholder(image: &Image) -> String {
     // `image/png` prints as `png`: the mime already leads with the fact that
     // this is an image, and the sentence has room for one noun.
     let format = image.mime.strip_prefix("image/").unwrap_or(&image.mime);
     format!(
         "[image: {} ({format}) — bytes dropped to save room; read the file again if you need them]",
-        image.path
+        one_line(&image.path)
     )
+}
+
+/// The one-line spelling of a path that goes into a line which must stay one
+/// line.
+///
+/// [`crate::text::sanitize`] is what this repo paints untrusted text through:
+/// it removes escape sequences and control characters whole, so the path cannot
+/// command the pane it is shown in. It deliberately keeps `\n` — the wrapper
+/// splits on it — and a placeholder is not wrapped but shaped: a newline in a
+/// path (legal on Linux) would otherwise put a line of its own into the model's
+/// view of the transcript, where the placeholder is a stand-in for bytes and
+/// not a message of its own. The break is escaped as the two characters `\n`
+/// rather than dropped, so the path stays readable enough to open the file
+/// again; a lone `\r` [`crate::text::sanitize`] already marks as `␍`, which is
+/// one line as well.
+fn one_line(path: &str) -> String {
+    crate::text::sanitize(path).replace('\n', "\\n")
 }
 
 /// Standard base64 (RFC 4648 §4: `A–Z a–z 0–9 + /`, `=` padding, no line
@@ -1177,6 +1196,59 @@ mod tests {
         // The conversion at the top of its own range: saturating, never a
         // wrap to zero.
         assert!(crate::config::tokens_for_pixels(u64::MAX) > 0);
+    }
+
+    /// The placeholder is one line whatever the path holds. A newline is legal
+    /// in a Linux path, and before the path was sanitized it put a line of its
+    /// own into the transcript — the placeholder is a stand-in for bytes, and a
+    /// line is the whole of its shape. The break is escaped rather than
+    /// dropped: `\n` is the two characters a model undoes to name the file
+    /// again, so the path stays readable enough to open the file.
+    #[test]
+    fn a_dropped_image_whose_path_holds_a_newline_still_leaves_one_line() {
+        let mut message = Message::user("look");
+        message.images.push(Image {
+            path: "shots/a\nb.png".into(),
+            mime: "image/png".into(),
+            bytes: vec![0xFF, 0xFE],
+            pixels: None,
+        });
+        message.drop_images();
+        let text = message.text().to_string();
+        assert_eq!(
+            text.lines().count(),
+            2,
+            "the message's own line, then one placeholder line: {text:?}"
+        );
+        assert!(
+            text.contains(r"[image: shots/a\nb.png (png) — bytes dropped"),
+            "the escaped path is still readable: {text:?}"
+        );
+    }
+
+    /// The path goes through the repo's sanitizer, so an escape sequence in a
+    /// name cannot command the pane it is painted in from inside a line that
+    /// says an image was dropped. What is not a command stays, so the line
+    /// still points at the file.
+    #[test]
+    fn a_dropped_image_whose_path_holds_an_escape_sequence_leaves_no_command() {
+        let mut message = Message::user("");
+        message.images.push(Image {
+            path: "a\x1b]0;PWNED\x07b.png".into(),
+            mime: "image/png".into(),
+            bytes: vec![0xFF, 0xFE],
+            pixels: None,
+        });
+        message.drop_images();
+        let text = message.text().to_string();
+        assert!(
+            !text.contains('\x1b') && !text.contains('\x07'),
+            "the sequence is removed whole: {text:?}"
+        );
+        assert!(
+            text.contains("ab.png"),
+            "what is not a command stays: {text:?}"
+        );
     }
 
     /// The one image the image tests are about: two bytes, a path and a mime,
