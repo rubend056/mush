@@ -291,6 +291,43 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   `Ctrl-U` clears the words and keeps the images, and `Ctrl-Z` puts back what
   the box last lost — one slot, spent by a send — while `Esc` names what it
   cleared and the road back.
+- **H38** — ✅ fixed by `3b37d38` (§8.43), reported live twice in one sitting: a
+  picture pasted by **path** from outside the workspace carried the human's own
+  path, and the placeholder left when the session file shed its bytes promised a
+  road the model does not have — `Workspace::resolve` refuses absolute paths by
+  design, so `read_file` could not reach `/home/rubend/screens/….png`, and a
+  shell cannot carry an image back. Both of the test pastes the human sent landed
+  here, and the second showed the model could not even *measure* a file it had
+  just been handed. Now a picture whose file resolves outside the root is copied
+  into `.mush/paste/` as it attaches — same writer, naming and cap as `Ctrl-V` —
+  and the copy is the path the `Image` carries, so every path a model is told to
+  re-read is one its own tools resolve.
+- **H39** — ✅ fixed by `3e184a3` + `9dfd20e` (§8.43), reported live: "what about
+  pasting MULTIPLE images it doesn't seems to be handled correctly" — four
+  space-separated paths pasted at once. The paste reader accepted exactly one
+  name (`pasted_name` answers `None` at the first bare space, which is how it
+  tells a path from prose), so the whole gesture landed in the box as text and
+  nothing attached. `Workspace::pasted_images` now splits a paste into words
+  (quoted spans, `\ ` escapes, `file://` and its `%20`s kept whole) and attaches
+  them all in paste order when **every** word names an image file; one non-image
+  word makes the whole paste text, exactly as one path's typo did. The batch
+  exposed a second defect: four copies written in the same millisecond took the
+  same `pasted-<millis>` name and overwrote one another, so an attached picture
+  could point at another's bytes (`create_new` plus a `-2` suffix now, pinned by
+  a test).
+- **H40** — ✅ fixed by `3dfcd86`, `13a0a68`, `71857d8`, `2b9c860`, `ca5c26b`
+  (§8.43), from the human's question about `trim_history` and the context cache:
+  the trimmer cut to the **brim**, so a conversation sitting at the ceiling was
+  cut again on the very next request — and every cut rewrites the front of the
+  prompt, the prefix an endpoint's cache had warmed. It also shed **image
+  payloads first**, a road that only made sense while a picture was priced by its
+  bytes (H36): with pixels it identified nothing. Now a cut starts only when the
+  transcript is over the window and stops at four fifths (`trim_target`), which
+  leaves the next pressure to the fold at nine tenths, and a picture goes with
+  its turn like any other words. The first shape tried — "trim whenever it is
+  over four fifths" — was measured wrong before it shipped: five thousand quiet
+  turns parked at the watermark, folded **zero** times and cut **3,932** times.
+  The trigger/cut *pair* is the fact; either number alone is a trap.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -325,7 +362,7 @@ the title now read that one derivation instead of each making their own.
 |---|---|---|---|
 | U5 | **The same fact is on screen three times.** The newest tool call / activity shows in the conversation pane (as the `⚙` line), again at the bottom of the agents pane, and again in the first line of the status bar — one fact, three homes, no reader. §4.5 R2 spent line one on "activity › status › hint"; the activity is already the row's and the transcript's, so line one is repeating what a human can already see, and the three surfaces need to be looked at together rather than one at a time. | ✅ | closed by `App::tree_line` — the bar's line one is the napping-root fact, or an event with no other home, ranked through `chat::Rank` — `a5f2a9f` |
 | U6 | **An agent is a bare number.** Rows read `#2`, and everything else is inferred from a message; nothing names the *task*. A short title per agent, derived from its brief (and a command label for a job), would let the human tell two children apart without opening them — the brief is already in the node and in the transcript's first line. | ✅ | closed by `AgentNode::title` (`app/tree.rs`), derived from the brief on read — `bacc48b` |
-| U7 | **A waiting agent still says `⠏ working…`.** When an orchestrator has ended its turn and is waiting on children (or on a job), the activity row claims work is in flight. It should say so differently from a model call that is actually in flight — the hourglass the human asked for — which is the same derived-facts rule as U1/U2, one surface further down. | ✅ | closed by `Phase::waiting` (`app/tree.rs`) telling a model call from `wait`; the row and the foot say which — `e47a680` |
+| U7 | **A waiting agent still says `⠏ working…`.** When an orchestrator has ended its turn and is waiting on children (or on a job), the activity row claims work is in flight. It should say so differently from a model call that is actually in flight — the hourglass the human asked for — which is the same derived-facts rule as U1/U2, one surface further down. | ✅ | closed by `Phase::waiting` (`app/tree.rs`) telling a model call from `wait`; the row and the foot say which — `e47a680`. The foot's half is superseded in §8.43: it painted *no* line for a parked run, and now paints the run's own words (`waiting on results.`), which keeps this row's point and drops the silence |
 | U8 | **A transient notice never leaves.** `· reply cut off at 20480 tokens — asking for smaller steps` and help output sit in the foot forever (until that agent runs again), so a line about *one moment* outlives it and pushes the conversation around. §4.6's per-kind lifetime answered this for failures and command answers; the "said" rank still has only one lifetime. Somebody must decide which notices are news and which are chatter — and repeated identical lines (`· model produced an empty reply` ×N) should collapse rather than repeat. | ✅ | closed by the chatter lifetime in `app/chat.rs` — `clear_notes_for`, `dismiss_said`, `SAID_TTL = 120 s` — and the `Notice.count` collapse, `b71f67e` |
 | U10 | **Walking back up a deep tree costs one keypress per ancestor.** In the agents pane the only vertical moves are `j`/`k`, arrows, `g`/`G`: with twenty children under one parent, getting from a grandchild back to the root is twenty presses, or `g`, which loses the place you were reading. `←` should put the selection on the agent's **parent** (and the natural companion, `→`, on its first child), which is a fact the node already carries (`AgentNode::parent`) and which the painted order (U4) makes meaningful. It needs the same treatment as every other binding: one `Intent` in `app/keys.rs`'s table, the module doc and `--help`'s KEYS prose updated in the same commit, and a test at three levels of depth. | ✅ | closed by `Intent::TreeWalk` on `←`/`→` in `app/keys.rs` (plus `PickerMove(±PAGE)` for a deep picker); pinned at three levels of depth — `1980588` |
 | U9 | **The default DeepSeek window/reply cap is far too small.** A real run was cut off at 20480 tokens; for the configuration mush ships, the default should be ~120k tokens (window, and the reply cap where the vendor accepts it) rather than a value that truncates ordinary work. Precedence must not change: a human-stated window still wins, and an endpoint-reported one still overrides the default. | ✅ | closed by `provider::PROVIDERS`' fallback of 120 000 and `Config::reply_cap` (a quarter of the window, floored at 1 024 and capped at 120 000) — `d84ecb6` |
@@ -333,6 +370,7 @@ the title now read that one derivation instead of each making their own.
 | U12 | **The pane title and the bar disagree about a stopped or failed root that still has a child working.** `AgentTree::roster` counts a waiting agent only when the phase is `Idle \| Done` ("a failed or stopped agent waits for nothing"), while `App::tree_line` counts `busy_children > 0 && !phase.is_busy()` — so a stopped root over a running child gets `0 waiting` in the title, `waiting on 1 subagent(s) — the root resumes as they finish` on the bar, and `⊘ … ⏸1` on its row. The bar is right: the root *does* resume when the child's completion folds in (`absorb` → `Fold::Run`), and the row's `⏸N` already says so. Found by the duplication review of `fb7265d`. | ✅ | one predicate now: `AgentTree::napping` (`!node.phase.is_busy() && busy_children(id) > 0`) is read by the title's bucket and the bar (`642fda8`), and `the_bar_and_the_title_agree_on_who_the_root_waits_for` stops the root |
 | U13 | **After a restart, a stored isolated agent whose worktree is gone keeps a branch its actor does not have.** `restore_agents` passes the stored `branch` straight to the node (`app/mod.rs`), while `revive` filters it on `worktree_path(root, id).exists()` and points the actor's workspace at the root — so the restored row offers `/diff`/`/merge` for a reclaimed directory and the footer paints a dead path, while a nudge is refused by the UI guard even though the actor would have run it in the root. Two surfaces contradicting the promise both restore paths make ("continues in the main checkout"). Found by the duplication review of `c4aa2e3`; untested (both restore tests store `branch: None`). | ✅ | one decision now: `agent::live_branch` is the one place a stored branch is filtered, shared by `restore_agents`, `revive` and the node (`642fda8`), and `a_restored_branch_whose_worktree_is_gone_is_dropped` stores one and asserts the node drops it, the nudge is delivered and `/diff` stops naming it |
 | U14 | **A run parked in a `wait` wears the working icon.** Finding U7 taught the row's *words* (`waiting on results 3s`), the transcript's foot and the row's footer to tell a model call from a run parked on somebody else's result — and stopped one surface short of the glyph, which is the surface a glance reads. Observed live in the session running this repository: the root was parked in a `wait` on a child, its row read `◐ #0 ⏸1 root  waiting on results 3s`, and the human asked why the icon said working. The same fact was wrong in two more places: `Phase::label` answered `working` to the attach roster, and `AgentTree::roster` counted a parked run in the title's `N working`. | ✅ | one derivation, four readers: `Phase::waiting` now reaches the glyph (`⧗`, the one hourglass `unicode-width` calls a single column — `⌛` measures two), `Phase::label` (`waiting`), and `roster`'s buckets, so the title counts a parked run beside the napping parents it already counted there; `busy_counts`/`is_busy` stay "a run is in flight", which is what `⏸N` and the bar's promise read (§8.38) |
+| U15 | **The foot is the one surface that does not name what the run is doing.** A tool call in flight — a twenty-minute `cargo test` — wore the same `working.` as a model call, and a run parked in a `wait`, which the row beside it names (`⧗ waiting on results 5s`), painted no foot line at all (U7's fix chose silence: it kept the point and cost the fact). | ✅ | one derivation, three surfaces: `Phase::words` (the row builds on it through `phase_detail`, the foot paints `words + the dot beat`), `Pane.words` replaces `busy`/`compacting`, and `Phase::doing` answers `waiting` for a parked wait so the roster, the quit warning and the foot share one word — `235c3bc`..`a185aa7` (§8.43) |
 
 ## 2. Observed live: a delivered completion is invisible, and can be delivered twice
 
@@ -2910,3 +2948,115 @@ tests 26,447 · comments 15,856 — 2,847 lines: 311 production, 1,484 test, 876
 comment, 176 blank. Half the wave is tests on purpose: the ruling was "enough
 tests to make sure we're handling images the most robust way possible", and the
 three defects above were found by exactly those tests rather than by the feature.
+
+---
+
+## 8.43 The paste roads, the trimmer's trigger, and the foot that said nothing
+
+The human ran what §8.42 had just landed and found three defects inside the hour,
+then ruled on a fourth design. Two of the three were in code this file had
+written that day; the third had been there since images existed.
+
+**A picture pasted by path could not survive a restart (`3b37d38`; H38).** They
+sent two test pastes in a row — a 724 KB screenshot, then a 170 KB crop — both
+by *path*, both from `/home/rubend/screens/`, which is outside the workspace. The
+bytes reached the model (that was §8.42's fix working), but the placeholder the
+session file leaves behind names the human's path, and `Workspace::resolve`
+refuses absolute paths by design: after a restart the model cannot read it, a
+shell cannot carry an image back, and the line's "read the file again" is a road
+with a wall across it. The second paste also showed the model could not even
+*measure* the file it had just been handed, which is how the wrinkle was found.
+The ruling — "we do need pastes from ANY location to work after restarts" — is
+now a rule with one home: a picture whose file resolves outside the root is
+copied into `.mush/paste/` as it attaches (the same writer, naming rule
+`pasted-<millis>.<ext>` and 2 MB cap the clipboard road already used), and the
+copy is the path the `Image` carries. The human's privilege to name any path does
+not extend to the model's tools; what mush promises to keep is the copy, and the
+original is read, never moved. The test is the restart road itself: attach →
+`Session::save` (payload shed to the placeholder) → `Session::load` → the path
+parsed out of the placeholder line resolves and reads back byte-identical, with
+its pixels. Every `Image` mush can hand a model now carries a path the model's
+own tools resolve, which is an invariant the section above can state.
+
+**Four paths in one paste attached none of them (`3e184a3`, `9dfd20e`; H39).**
+"what about pasting MULTIPLE images it doesn't seems to be handled correctly...
+example I'm pasting 4 here right now" — and the four paths arrived at the model as
+*text*, because `pasted_name` accepts exactly one name and answers `None` at the
+first bare space (that is how it tells a path from prose). Dragging four files out
+of a file manager is one paste, so the rule generalises: `Workspace::pasted_images`
+splits the paste into words — quoted spans, `\ ` escapes and `file://`'s `%20`s
+kept whole, whitespace and newlines as the separators — and attaches them all, in
+paste order, when **every** word names an image file. One non-image word (prose, a
+directory, a missing path, a `..`) makes the whole paste text, exactly as one
+path's typo did: no half-taken gesture, no hijacked paragraph. The batch says one
+line (`attached 4 images — Enter sends them with the message`), asks the
+model-level refusals once (nothing attaches, the words land in the box), and says
+the room warning once with the count at stake. Three smaller facts came out of
+the tests: four copies written in the same millisecond used to take the same
+`pasted-<millis>` name and overwrite one another (so an attached picture could
+point at another's bytes — `create_new` plus a `-2` suffix now, pinned by a
+test); a whole list wrapped in *one* pair of quotes is one name under the old
+quoted-paste rule and stays text (each path must be quoted separately); and a
+paste that turns out to be text may have copied the outside names read before
+the word that disqualified it — files in a gitignored directory, stated rather
+than swept up. Nothing caps a batch: the room left, the window and the 2 MB
+per-file cap are what bound it.
+
+**The trimmer cut to the brim (`3dfcd86`, `13a0a68`, `71857d8`, `2b9c860`,
+`ca5c26b`; H40).** The human's question about `trim_history` — "it just sounds
+like a function that would invalidate ctx cache on every subsequent message...
+making it downright bad actually" — was right about the shape if not the
+frequency: the trim is a byte-identical no-op while the transcript fits, but it
+cut back to *exactly* the budget, so a conversation sitting at the ceiling could
+be cut again on the very next request, and every cut rewrites the front of the
+prompt, the prefix an endpoint's cache had warmed. Their ruling — "why don't we
+make trim go to 80% so then fold tries kicking in again at 90%" — needs its two
+numbers read as a *pair*, which the first implementation got wrong and its own
+measurement caught: "trim whenever it is over four fifths" parks the transcript
+at the watermark, so it never reaches nine tenths, and five thousand quiet turns
+folded **zero** times while the trimmer cut **3,932** times. The hysteresis shape
+is the one that means anything — trigger at the ceiling, cut to four fifths — and
+the same simulation then folds once (at turn 1,193, when the total crosses nine
+tenths) and cuts zero times. So `trim_history` takes the window's budget, cuts
+only when the transcript is over it, and stops at `trim_target` (4/5); the fold's
+trigger stays `compaction_trigger` (9/10), and after a cut the conversation has a
+tenth of room before the fold and three tenths before the window. The same
+ruling deleted the trimmer's **image-payload-first** pass: shedding pictures
+before turns was a workaround for the byte-priced image (H36), and with pictures
+priced by their pixels it identifies nothing, so a picture goes with its turn
+like any other words and `Message::drop_images` has exactly one caller left (the
+session writer, which keeps `.mush/session.json` small). The attach gate's lines
+were rewritten with it: a picture that does not fit the room now costs the
+*oldest turns*, and the line says so and names `/compact`; a picture too big for
+the window even with every older turn gone is the one case whose only road is a
+downscale, because the endpoint would refuse the request outright.
+
+**The foot names what the run is doing (`235c3bc`..`a185aa7`; U15).** "when we're
+waiting on a tool call the screen still shows `working` VS when waiting for
+`wait` which just shows `<gear> wait` I reckon that's an inconsistency" — the
+foot was indeed the one surface that did not say what the run was doing: a
+twenty-minute `cargo test` wore the same `working.` as a model call, and a run
+parked in a `wait`, which the row beside it names, painted nothing at all (U7's
+fix chose silence; it kept U7's point and cost the fact). `Phase::words` is now
+one derivation (`thinking`, the actor's own tool label, `waiting on {noun}`, the
+fold's sentence, `cancelling`, `None` at rest); the row builds on it plus the
+age, and the foot paints it plus the dot beat, so the two cannot disagree — one
+test asserts exactly that for the same node. The parked `wait` paints
+`waiting on results.`, which supersedes U7's mechanism and keeps its point, and
+`Phase::doing` answers `waiting` rather than `wait` so the roster, the quit
+warning and the foot share one word. `Pane.busy` and `Pane.compacting` — both
+read only by the foot line — collapsed into one `Pane.words`, which is what makes
+the drift impossible rather than merely tested.
+
+**Recorded, not changed.** A parked fold still reads `folding at the next step`
+on the row, the foot and the bar while `Phase::label`/`doing` say `compacting`
+for it — the same class as U15 one phase over, left because the label is the
+attach protocol's contract. And the row's own activity no longer carries the `…`
+that `summarize_args` puts on a truncated label (`run_command cargo …` paints as
+`run_command cargo`), because the dots are now the only ellipsis on those rows;
+if the mark is wanted back, `Phase::words` is the one place to put it.
+
+**Census** at this landing (`scripts/census.py`), against §8.42's (total 60,841 ·
+prod 14,770 · tests 26,447 · comments 15,856): total 62,372 · **prod 14,937** ·
+tests 27,253 · comments 16,339 — 1,531 lines: 167 production, 806 test, 483
+comment, 75 blank. `cargo test` 652 + 189 (four ignored), clippy and fmt clean.

@@ -233,26 +233,37 @@ with the first.
 
 The **human has two roads of their own**, and both end in the same message:
 
-- **A bracketed paste that is nothing but an image's path** attaches the image
-  to the next message instead of inserting the path as text. That is what
-  drag-and-drop and a file manager's "copy file" put in a paste, and a paste
-  whose *only* word is the path is the human saying "this picture".
-  `Workspace::pasted_image` reads the shapes a terminal produces — a bare
-  workspace-relative name, an absolute path (inside the root or outside it; a
-  human may name what the model's tools may not, because they already have the
-  file), a quoted name, a `file://` URL with its `%20`s, and the `\ ` a terminal
-  uses to escape a dragged file's own space — and `Ok(None)` for anything else:
-  prose, a paragraph, a directory, a file that is not a picture. It is `Err`
-  only when the paste names an image that cannot ride, and then the path is
-  inserted as text anyway — a paste is never swallowed, and the words are the
-  road to a downscale.
+- **A bracketed paste of image paths** attaches the pictures to the next
+  message instead of inserting the paths as text. That is what drag-and-drop and
+  a file manager's "copy" put in a paste, and a paste whose *every* word is an
+  image's path — one or several, split on whitespace or newlines — is the human
+  saying "these pictures". `Workspace::pasted_images` reads the shapes a
+  terminal produces (a bare workspace-relative name, an absolute path, a quoted
+  name, a `file://` URL with its `%20`s, and the `\ ` a terminal uses to escape a
+  dragged file's own space) and answers `Ok(None)` unless *every* word names an
+  image file: one bad word — prose, a directory, a missing path, a file that is
+  not a picture — makes the whole paste the words it is, so a gesture is never
+  half-taken and a paragraph is never hijacked. It is `Err` only when a paste
+  names an image that cannot ride, and then the words are inserted as text
+  anyway — a paste is never swallowed, and the paths are the road to a
+  downscale.
+
+  A picture whose file is **outside the workspace** is copied into
+  `.mush/paste/` as it attaches, and the copy is the path it carries from then
+  on. The human may name what the model's tools may not — they already have the
+  file — but the model has to be able to read the picture again after a restart,
+  and `read_file` resolves nothing outside the root. The bytes are read, never
+  moved: the original file is the human's, and what mush promises to keep is the
+  copy.
 - **`Ctrl-V` in the chat pane** attaches the image on the system clipboard: a
   screenshot with no file behind it yet. `clipboard.rs` reads it through the
   programs a human would use (`wl-paste`, `xclip`, `pngpaste`), on a thread of
   its own with a deadline, and `Workspace::save_pasted_image` writes the bytes
-  to `.mush/paste/pasted-<unix millis>.<png|jpg|gif|webp>` so the model can read
-  the picture again after a trim or a restart. `.mush/` git-ignores itself, so a
-  pasted screenshot cannot dirty the tree.
+  to `.mush/paste/pasted-<unix millis>.<png|jpg|gif|webp>` — the same directory
+  and naming the outside-path copy uses, because one rule covers both — which is
+  what lets the model read the picture again after the session file has shed its
+  payload. `.mush/` git-ignores itself, so a pasted screenshot cannot dirty the
+  tree.
 
 Both roads end in `Message::user_with_images`: the human's own message, with
 the images riding in it exactly as they ride in a tool result. Two facts can
@@ -268,12 +279,14 @@ clipboard's is the one that has no path to keep.
 
 A third fact is said but does not refuse: an image that does not fit the room the
 conversation has left — `Config::history_budget()` minus the system prompt, the
-transcript, and the images already waiting in the box — attaches, with the line
-that says `trim_history` sheds image payloads *before* it drops a turn, so the
-picture would never reach the model, and that names the two roads that make it
-arrive: `/compact` folds the history into a summary and makes room, and a
-downscale makes the picture cost less. The human decides what to send; what the
-model will actually see is not a thing to leave unsaid.
+transcript and the images already waiting in the box — attaches, and the line
+says what attaching it costs: the trimmer drops the **oldest turns** to make room
+for it, so the words are what is at stake and never the picture. `/compact` is
+the road that folds those turns into a summary instead, and a downscale is the
+cheaper picture. A picture that outweighs the whole history budget is the one
+case with nothing to offer but the downscale: even with every older turn gone the
+request would go out over the window and the endpoint would refuse it. The human
+decides what to send; what is about to be lost is not a thing to leave unsaid.
 
 Three facts decide whether an image travels:
 
@@ -306,15 +319,19 @@ model could have looked at, and the meter a human watches jumped by a quarter of
 a million for one screenshot (finding H36). The 2 MB cap above stays a
 *transport* measure — what is worth putting on the wire — and not a token one.
 
-An image's bytes leave the transcript the same way they would leave the context:
-`Message::drop_images` replaces them, in place, with one line naming the path and
-format (`[image: shots/a.png (png) — bytes dropped to save room; read the file
-again if you need them]`). Trimming calls it **before** it drops any turn — an
-image is what an over-budget transcript is usually made of and the cheapest thing
-to lose, since the placeholder still says where it is — and the session writer
-calls it before it serializes, so a multi-megabyte screenshot never lands in
-`.mush/session.json`. The drop is idempotent, which is what keeps a session
-saved, loaded and saved again from stacking placeholder on placeholder.
+An image's bytes leave the *stored* transcript through `Message::drop_images`,
+which replaces them in place with one line naming the path and format
+(`[image: shots/a.png (png) — bytes dropped to save room; read the file again if
+you need them]`). The session writer is its one caller, and it calls it before
+serializing, so a multi-megabyte screenshot never lands in `.mush/session.json`;
+the live transcript keeps its bytes until the turn carrying them is the turn the
+trimmer drops. Trimming used to shed payloads first — an image was the cheapest
+thing to lose while a picture was priced by its bytes (H36) — and with pixels the
+estimate identifies nothing, so a picture goes with its turn like the words
+beside it (H40). The drop is idempotent, which is what keeps a session saved,
+loaded and saved again from stacking placeholder on placeholder, and the line's
+promise is true of every `Image` mush can hand to a model: each path is one the
+model's own tools resolve, which is what the outside-paste copy is for.
 
 ### History budget
 
@@ -325,19 +342,30 @@ request reserves room for the tool schemas, the reply, and a margin —
 5 000 tokens for whatever a turn's tool result adds before the next request. The
 three numbers live in `crates/mush-core/src/config.rs`, and
 `mush --print-config` prints what they resolve to for the window in front of
-you. Before each request the agent trims the oldest turns until the conversation
-fits, always cutting at a **user** message boundary so assistant/tool pairs stay
-valid.
+you. Before each request the agent folds or trims, in that order, and always cuts
+at a **user** message boundary so assistant/tool pairs stay valid.
 
 Trimming drops information, so it is the fallback, not the first move: once the
-transcript passes nine tenths of the budget the agent asks the model to
-summarize everything important and continues from `system + summary`. That is
-what lets a long task survive a small context window.
+transcript passes nine tenths of the budget (`compaction_trigger`) the agent asks
+the model to summarize everything important and continues from
+`system + summary`. That is what lets a long task survive a small context window.
+The trimmer's own number is a *pair* with that trigger — `trim_target`, four
+fifths of the budget — because a cut starts only when the transcript is over the
+**ceiling** (the window itself) and stops at four fifths, which leaves a tenth of
+room before the fold's trigger and three tenths before the window again. Cutting
+back to the brim instead leaves the next request over the ceiling a turn later,
+and every cut rewrites the front of the prompt — the prefix an endpoint's cache
+had warmed — so the watermark is what makes the next road taken the fold rather
+than another knife-edge cut. "Trim whenever it is over four fifths" was tried
+first and measured wrong in the same sitting: five thousand quiet turns parked at
+the watermark, folded zero times and cut 3,932 times, which is the opposite of
+what the number is for (§8.43).
 
 The budget weighs its two kinds of thing by their own measure: text in bytes
 (`BYTES_PER_TOKEN`), pictures in pixels (`PIXELS_PER_TOKEN` — see §3). A
 screenshot therefore costs what it shows rather than how well it compressed,
-and the trimmer sheds pictures before turns in that same currency.
+which is also why a picture is no longer the first thing a trim sheds: it goes
+with its turn, in the same currency as everything else.
 
 `/compact` is the same fold, asked for by hand instead of triggered by the
 window — one routine, so the two cannot disagree about the summary message or
@@ -390,14 +418,14 @@ elided, and the cursor is always on screen.
 | agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them, `←` the row's parent, `→` its first child, `Enter` show its transcript, `c` cancel that agent, `Esc` back to the root |
 | chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `Ctrl-V` attach the image on the clipboard, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete` (at the start of the box, Backspace pops the newest attachment), `Ctrl-U` clear the words and keep the images, `Ctrl-Z` put back what the box last lost, `↑`/`↓`/`PgUp`/`PgDn` scroll, `Esc` clear the box and its attachments · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/compact` `/notes` `/help` `/quit` |
 
-A paste that is nothing but an image's path attaches the image; anything else
-is text and lands in the box as it always did (§3). The attachments are painted
-as dim `▣ path (format · size)` rows above the text — one per image, at most
-three, the third counting the rest when there are more, with the title saying
-how many — and they travel with the send: `Enter` on an empty box with an image
-attached is still a send, because the picture *is* the message. A send that
-does not land puts the words and the images back in the box, and `Esc` clears
-both.
+A paste whose every word is an image's path attaches them all — one or several,
+split on whitespace or newlines — and anything else is text and lands in the box
+as it always did (§3). The attachments are painted as dim `▣ path (format ·
+size)` rows above the text — one per image, at most three, the third counting the
+rest when there are more, with the title saying how many — and they travel with
+the send: `Enter` on an empty box with an image attached is still a send, because
+the picture *is* the message. A send that does not land puts the words and the
+images back in the box, and `Esc` clears both.
 
 The box's losses have roads back. `Backspace` at the very start of the box —
 index zero, not the start of the wrapped line the cursor happens to be on — pops
@@ -612,16 +640,23 @@ the count in its title. `/notes` reads the whole list, opening on the head of th
 newest note (the row that says *when* it happened) and labelling itself `line
 n/m`, so a long note that wrapped is read from its start rather than its middle.
 
-While a run is in flight the foot's lowest row is the pane's own activity line:
-`working.`, `working..`, `working...`, one dot a second, looping. The word was
-always `working`; the dots are its punctuation, and the beat is a second because
-that is what a human reads — the ten-frame braille spinner it replaced was
-advanced by the event loop's 30 ms poll, so it turned over thirty times a second,
-which is a flicker rather than a pulse and a repaint per frame for a decoration
-(`DOT_PERIOD`, `chat::working_dots`). A fold in flight says its own words on that
-row instead, and a run parked in a `wait` paints no activity line at all: nothing
-is being computed, and the row's `⧗` says what it is waiting for (§3, finding
-U7).
+While a run is in flight the foot's lowest row is the pane's own activity line,
+and it names what the run is doing in the same words the row above it uses: the
+call's own label (`run_command cargo test.`, `edit_file src/lib.rs.`), `thinking.`
+while a model call is in flight, `waiting on results.` while it is parked in a
+`wait`, the fold's own sentence while it is folding, `cancelling.` while a stop is
+on its way — `Phase::words`, one derivation behind the row and the foot, so the
+two cannot disagree about what an agent is doing. The dots are the whole
+animation and the only ellipsis on that row: one a second, looping
+(`DOT_PERIOD`), because that is what a human reads — the ten-frame braille
+spinner it replaced was advanced by the event loop's 30 ms poll, so it turned
+over thirty times a second, which is a flicker rather than a pulse and a repaint
+per frame for a decoration. Nothing is painted at rest: `Idle`, `Done`,
+`Failed`, `Stopped` and `Cut Off` are states a human reads off the row, and the
+foot is for a run that is in flight or parked. A parked `wait` painting its own
+line supersedes U7's *mechanism* and keeps its point: the defect was the word
+`working` claiming a model call, and `waiting on results` cannot be mistaken for
+one — the pane no longer tells a human less than the row beside it does.
 
 What this replaced — one plain list, every notice painted under the newest
 message with one lifetime for all of them, `/forget` keeping a forgotten agent's
