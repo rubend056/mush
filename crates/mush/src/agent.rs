@@ -14583,7 +14583,7 @@ mod tests {
     /// reply is the result. The ceiling was removed because it truncated real
     /// work — a read-only docs scan was cut off mid-run — and any fixed count
     /// has the same failure mode (finding H45). Every turn does real work: one
-    /// `run_command`, with the arguments differing each turn, so the run is not
+    /// `write_file`, with the arguments differing each turn, so the run is not
     /// stopped early as a loop instead.
     #[test]
     fn a_run_past_200_turns_ends_when_the_model_stops_calling_tools() {
@@ -14596,8 +14596,8 @@ mod tests {
         for turn in 0..ROUNDS {
             scripted = scripted.calls(vec![tool_call(
                 "call",
-                "run_command",
-                json!({ "command": format!("printf 'turn {turn}' > notes.txt") }),
+                "write_file",
+                json!({ "path": "notes.txt", "content": format!("turn {turn}") }),
             )]);
         }
         let scripted = Arc::new(scripted.says(DONE));
