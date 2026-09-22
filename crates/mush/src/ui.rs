@@ -12,7 +12,7 @@
 //! body gray — stays fixed: a failure reads the same in every workspace.
 
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
@@ -184,15 +184,44 @@ pub(crate) fn agent_line(row: &AgentRow, width: usize) -> String {
 /// selection, or both.
 ///
 /// The mode hands over *which* rows ([`SelectRows`]) and the painter says what
-/// they wear, the way every other colour decision lives here. Neither mark is
-/// the agents pane's selected row (`Black` on the accent): that row is a
-/// *place* in the tree and its bar is the chrome's hue, while a selection is a
-/// *range of the transcript* — the hue as a band behind the text's own colours,
-/// so a dimmed tool result and a green reply stay themselves inside it — and
-/// the cursor is the terminal's own mark for the cell the keyboard is on
-/// (`REVERSED`, the attribute a terminal paints its cursor with). A row that is
-/// both wears both: the reversed cell inside the band reads as the cursor
-/// within the selection, which is exactly what it is.
+/// they wear, the way every other colour decision lives here.
+///
+/// A mark is **a band behind the text, and it ends where the text ends**: the
+/// row's own spans are patched and the line's own style never is. The cells a
+/// row has past its last glyph stay the pane's background, and a row holding
+/// nothing but whitespace — a blank source line, which the pane draws as the
+/// message's indent and nothing else — has no text for a band to stand behind,
+/// so it stays blank inside a selection. The mark this replaces patched every
+/// span *and* the line's own style, which put the band over the row rather than
+/// behind its text: the indent of a blank source line wore the hue, and a
+/// dense multi-paragraph selection read as one filled rectangle. What the mark
+/// is now is bands under the lines, and their ragged right edge is the honest
+/// one — it is where the words stop.
+///
+/// The selection is the theme's hue as a background with `Color::Black` on it:
+/// mush has exactly one way of putting a colour behind text, and this is it —
+/// the bar's badge and the agents pane's selected row paint the same pair, and
+/// the hue is chosen in the L* 65–84 band precisely so it works *under* black
+/// text. The old mark kept each span's own ink over the band instead, so a
+/// dimmed tool result and a green reply stayed themselves inside it; that is
+/// given up on purpose, because a light band under light text is mud.
+///
+/// The cursor is that band's inverse — the hue as the text's own colour on a
+/// `Color::Black` background — and span-only for the same reason, so a
+/// cursor-only row is a dark band carrying the hue's characters rather than a
+/// block the pane's width, and a cursor inside a selection reads as the
+/// selection's inverse: the cursor's row is never the same shade as its
+/// neighbours, and a row that wears both marks wears the cursor's, because
+/// that is where the keyboard is. A cursor is a *place* and not a range, so its
+/// row is marked even when it is blank: a blank source line has only its indent
+/// cells, and they are still its own.
+///
+/// Neither mark is the agents pane's selected row. That row is `Black` on the
+/// hue too — there is one way to put the hue behind text — but it is a whole
+/// row of a *list*, a place in the tree painted by the list's own highlight,
+/// while these are a *range of the transcript* painted under the lines it
+/// covers and the shape of the keyboard's own row. The select row's pad stays
+/// the pane's background, which is what the tree's row never does.
 fn select_painted(
     lines: &[Line<'static>],
     select: &SelectRows,
@@ -207,26 +236,41 @@ fn select_painted(
             if !selected && !cursor {
                 return line.clone();
             }
-            let mut mark = Style::default();
-            if selected {
-                mark = mark.bg(theme.accent());
+            // A row with no text has nothing for a band to stand behind, so a
+            // blank row inside a selection is left alone. The cursor's own row
+            // is marked either way: the keyboard is on it, and the blank row's
+            // indent cells are all it has to say so with.
+            if selected && !cursor && line_is_blank(line) {
+                return line.clone();
             }
-            if cursor {
-                mark = mark.add_modifier(Modifier::REVERSED);
-            }
+            let mark = if cursor {
+                // The band's inverse: the hue's characters on `Black`.
+                Style::default().fg(theme.accent()).bg(Color::Black)
+            } else {
+                // The one way mush paints text on the hue.
+                Style::default().fg(Color::Black).bg(theme.accent())
+            };
             // Patched onto every span rather than set as the line's own style:
             // a span's colour (the dim of a result, the reply's green) is what
             // the row *is*, and the mark is laid over it — the same order the
             // rest of the frame paints in, where content is chosen first and
-            // the chrome patches what it must.
+            // the chrome patches what it must. The line's own style is carried
+            // through untouched: it belongs to the row, not to the mark.
             let spans = line
                 .spans
                 .iter()
                 .map(|span| Span::styled(span.content.clone(), span.style.patch(mark)))
                 .collect::<Vec<Span<'static>>>();
-            Line::from(spans).style(line.style.patch(mark))
+            Line::from(spans).style(line.style)
         })
         .collect()
+}
+
+/// Whether a row holds nothing but whitespace — the shape a blank source line
+/// takes once the pane has drawn its message's indent under it. Such a row
+/// wears no selection band: a band is behind the text, and there is no text.
+fn line_is_blank(line: &Line<'_>) -> bool {
+    line.spans.iter().all(|span| span.content.trim().is_empty())
 }
 
 fn draw_chat(frame: &mut Frame, pane: &ChatPane, focus: Focus, theme: &Theme) {
@@ -445,11 +489,11 @@ mod tests {
         }
     }
 
-    /// A chat pane with three transcript rows and no box, so the select mode's
+    /// A chat pane with six transcript rows and no box, so the select mode's
     /// two marks can be read off the frame's own cells. The lines carry the
-    /// colours a real transcript's do — a dim result in the middle, plain text
-    /// above and below — because what the band must not do is repaint the ink
-    /// of the row it is drawn under.
+    /// shapes a real transcript's do — plain text, a dim result, the indent row
+    /// a blank source line is painted as — because the two things the mark must
+    /// never do are fill a blank row and reach past a row's text.
     fn select_pane(area: Rect, select: Option<SelectRows>) -> ChatPane {
         ChatPane {
             transcript_area: area,
@@ -460,7 +504,10 @@ mod tests {
                 lines: vec![
                     Line::from("plain"),
                     Line::from(Span::styled("dim result", dim())),
+                    Line::from(Span::raw("      ")),
                     Line::from("cursor"),
+                    Line::from("bare"),
+                    Line::from("plain again"),
                 ],
                 title: " mush ".to_string(),
                 select,
@@ -470,22 +517,22 @@ mod tests {
     }
 
     /// The select mode reaches the frame as two marks that are neither each
-    /// other nor the agents pane's selected row: the pick is the hue as a
-    /// *background* with the text's own ink left alone (a dim result stays dim
-    /// inside it, and nothing wears the tree's `Black`), and the cursor is the
-    /// terminal's own `REVERSED` cell — which is what a row that is both wears,
-    /// reading as the cursor inside the selection.
+    /// other nor the agents pane's selected row. The pick is the hue as a
+    /// *background* with `Color::Black` on it — mush's one way of putting a
+    /// colour behind text — and it is behind the text only: the cells past a
+    /// row's last word, and every cell of a blank row, stay the pane's own
+    /// background. The cursor is the pick's inverse, the hue's characters on
+    /// `Black`, and a row that carries both marks wears the cursor's.
     #[test]
     fn the_select_mode_paints_its_cursor_and_its_selection_on_their_own_cells() {
         let theme = Theme::default();
-        let area = Rect::new(0, 0, 20, 5);
+        let area = Rect::new(0, 0, 20, 8);
         let select = SelectRows {
-            // The cursor's source line is two painted rows in the pane this
-            // fixture stands for; here it is the last row and the middle one,
-            // so the frame shows a bare cursor (the last), a row that is both
-            // (the middle) and rows nobody marked (the first).
-            cursor: vec![1, 2],
-            selected: vec![1],
+            // Row 3 is both marks at once (the frame must show the cursor's own
+            // inverse, not the band) and row 4 is a bare cursor. Row 2 is a
+            // blank source line inside the selection, which wears nothing.
+            cursor: vec![3, 4],
+            selected: vec![1, 2, 3],
         };
         let painted = |pane: &ChatPane| {
             let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
@@ -497,44 +544,126 @@ mod tests {
         let buffer = painted(&select_pane(area, Some(select)));
         let ordinary = painted(&select_pane(area, None));
 
-        // The pane's border takes (0, 0), so the transcript's rows start at
-        // (1, 1).
-        assert_eq!(
-            style_at(&buffer, 1, 1),
-            style_at(&ordinary, 1, 1),
-            "a row nobody marked is the row the pane painted before the mode"
-        );
+        // The pane's border takes (0, 0), so the transcript's six rows start at
+        // (1, 1) and the cells past their text run to (18, y). A *cell's* style
+        // carries `underline_color` where a span's does not, so the two marks
+        // are read as the pair of colours they are rather than as whole styles.
+        let wears_band =
+            |style: Style| style.fg == Some(Color::Black) && style.bg == Some(theme.accent());
+        let wears_inverse =
+            |style: Style| style.fg == Some(theme.accent()) && style.bg == Some(Color::Black);
 
-        let both = style_at(&buffer, 1, 2);
-        assert_eq!(
-            both.bg,
-            Some(theme.accent()),
-            "the pick is a band of hue, here under the cursor too"
-        );
-        assert_eq!(
-            both.fg,
-            Some(Color::DarkGray),
-            "the row's own dim ink is not repainted"
-        );
+        // The rows nobody marked are the rows the pane painted before the mode.
+        for y in [1, 6] {
+            for x in 1..19 {
+                assert_eq!(
+                    style_at(&buffer, x, y),
+                    style_at(&ordinary, x, y),
+                    "row {y} is not the mode's to paint"
+                );
+            }
+        }
+
+        // "dim result": ten cells of text at (1, 2) and eight columns of pane
+        // past it. Every text cell wears the band, and no cell past the text
+        // does — the rectangle fix, read one column at a time.
+        for x in 1..=10 {
+            assert!(
+                wears_band(style_at(&buffer, x, 2)),
+                "the text at ({x}, 2) wears the band: {:?}",
+                style_at(&buffer, x, 2)
+            );
+        }
+        for x in 11..19 {
+            assert_eq!(
+                style_at(&buffer, x, 2),
+                style_at(&ordinary, x, 2),
+                "({x}, 2) is past the text and must not wear the band"
+            );
+        }
+
+        // The blank source line: six cells of indent with the selection over
+        // it. A row with no text has nothing for a band to stand behind, so it
+        // is not painted at all.
+        for x in 1..19 {
+            assert_eq!(
+                style_at(&buffer, x, 3),
+                style_at(&ordinary, x, 3),
+                "a blank row inside the selection stays blank: ({x}, 3)"
+            );
+        }
+
+        // "cursor": the pick's inverse on the six text cells, and nothing past
+        // them. The row is selected and the cursor's, and the cursor wins.
+        for x in 1..=6 {
+            assert!(
+                wears_inverse(style_at(&buffer, x, 4)),
+                "the cursor at ({x}, 4) is the band's inverse: {:?}",
+                style_at(&buffer, x, 4)
+            );
+        }
+        for x in 7..19 {
+            assert_eq!(
+                style_at(&buffer, x, 4),
+                style_at(&ordinary, x, 4),
+                "({x}, 4) is past the cursor's text"
+            );
+        }
+
+        // "bare": a cursor with no selection wears the same inverse, and it is
+        // neither the band nor the agents pane's selected row.
+        for x in 1..=4 {
+            assert!(
+                wears_inverse(style_at(&buffer, x, 5)),
+                "the bare cursor at ({x}, 5) is the band's inverse: {:?}",
+                style_at(&buffer, x, 5)
+            );
+        }
         assert!(
-            both.add_modifier.contains(Modifier::REVERSED),
-            "the cursor's own cell: {both:?}"
+            !wears_band(style_at(&buffer, 1, 5)),
+            "which is neither the selection's band nor the tree's selected row"
         );
-        assert_ne!(
-            both,
+        for x in 5..19 {
+            assert_eq!(
+                style_at(&buffer, x, 5),
+                style_at(&ordinary, x, 5),
+                "({x}, 5) is past the cursor's text"
+            );
+        }
+    }
+
+    /// A cursor's row is marked even when it is blank — a blank source line is
+    /// painted as its message's indent and nothing else, so those few cells are
+    /// all the cursor has to say where the keyboard is — while the same blank
+    /// row under the selection alone stays exactly as the pane painted it.
+    #[test]
+    fn a_blank_row_wears_the_cursor_but_not_the_selection() {
+        let theme = Theme::default();
+        let lines = vec![
+            Line::from(Span::raw("      ")),
+            Line::from(Span::raw("      ")),
+            Line::from("text"),
+        ];
+        let select = SelectRows {
+            // The first row is the cursor's own blank line; the second is a
+            // blank line the selection alone covers.
+            cursor: vec![0],
+            selected: vec![0, 1, 2],
+        };
+        let painted = select_painted(&lines, &select, &theme);
+        assert_eq!(
+            painted[0].spans[0].style,
+            Style::default().fg(theme.accent()).bg(Color::Black),
+            "the cursor's own blank row keeps the keyboard visible on its indent"
+        );
+        assert_eq!(
+            painted[1], lines[1],
+            "a blank row the selection covers keeps its own style"
+        );
+        assert_eq!(
+            painted[2].spans[0].style,
             Style::default().fg(Color::Black).bg(theme.accent()),
-            "which is not the agents pane's selected row"
-        );
-
-        let cursor = style_at(&buffer, 1, 3);
-        assert!(
-            cursor.add_modifier.contains(Modifier::REVERSED),
-            "a bare cursor is reversed too: {cursor:?}"
-        );
-        assert_ne!(
-            cursor.bg,
-            Some(theme.accent()),
-            "and wears no band of the pick: a bare cursor reverses the cell"
+            "and a row with text wears the band"
         );
     }
 
