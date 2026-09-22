@@ -581,7 +581,15 @@ impl Workspace {
     /// names the clipboard's own road (`wl-paste -t image/png > shot.png`,
     /// then a `convert` downscale) because that is the only one a clipboard
     /// image has.
-    pub fn save_pasted_image(&self, bytes: Vec<u8>) -> Result<Image, String> {
+    ///
+    /// `cut_at_the_cap` is the caller's own fact: true when its read stopped
+    /// at its cap before the bytes ended, so `bytes` is a prefix of the picture
+    /// and its length is the buffer's rather than the picture's. Such bytes are
+    /// refused whatever any cap arithmetic says (a prefix cannot ride), and the
+    /// refusal names the cap and no size, because an exact number that is
+    /// really the buffer's is a lie about the human's picture. A caller holding
+    /// the whole picture passes `false` and gets the exact-size sentence.
+    pub fn save_pasted_image(&self, bytes: Vec<u8>, cut_at_the_cap: bool) -> Result<Image, String> {
         let Some(mime) = image_mime(&bytes) else {
             return Err(
                 "the clipboard bytes are not a png, jpeg, gif or webp image — copy the picture \
@@ -589,15 +597,9 @@ impl Workspace {
                     .to_string(),
             );
         };
-        let size = bytes.len() as u64;
-        if size > IMAGE_FILE_CAP {
-            let cap = IMAGE_FILE_CAP / (1024 * 1024);
-            let format = mime.strip_prefix("image/").unwrap_or(mime);
-            return Err(format!(
-                "the clipboard image is a {format} of {size} bytes — past the {cap} MB cap on an \
-                 image. Save it to a file and downscale it (`wl-paste -t image/png > shot.png`, \
-                 then `convert shot.png -resize 50% small.png`), then copy the smaller one"
-            ));
+        if cut_at_the_cap || bytes.len() as u64 > IMAGE_FILE_CAP {
+            let size = (!cut_at_the_cap).then_some(bytes.len() as u64);
+            return Err(clipboard_image_too_big(mime, size));
         }
         self.write_pasted_image(bytes, mime)
     }
@@ -1007,6 +1009,33 @@ fn image_too_big(name: &str, mime: &str, size: Option<u64>) -> String {
         None => format!(
             "{name} is a {format} image past the {cap} MB cap on an image — the read stopped at \
              the cap before the file's end, so its size is not known. {road}"
+        ),
+    }
+}
+
+/// The one refusal clipboard bytes past [`IMAGE_FILE_CAP`] get, whatever road
+/// read them: the sentence names the clipboard's own road (`wl-paste -t
+/// image/png > shot.png`, then a `convert` downscale) because that is the only
+/// one a clipboard image has.
+///
+/// `size` is the picture's length when the caller knows it — the whole picture
+/// was held — and `None` when the caller's own read stopped at its cap before
+/// the picture ended, where the length in hand is the buffer's and naming it
+/// would put a false number on the human's picture. The two sentences share
+/// every word but that one clause, because they are one refusal.
+fn clipboard_image_too_big(mime: &str, size: Option<u64>) -> String {
+    let cap = IMAGE_FILE_CAP / (1024 * 1024);
+    let format = mime.strip_prefix("image/").unwrap_or(mime);
+    let road = "Save it to a file and downscale it (`wl-paste -t image/png > shot.png`, \
+                then `convert shot.png -resize 50% small.png`), then copy the smaller one";
+    match size {
+        Some(size) => format!(
+            "the clipboard image is a {format} of {size} bytes — past the {cap} MB cap on an \
+             image. {road}"
+        ),
+        None => format!(
+            "the clipboard image is a {format} past the {cap} MB cap on an image — it was cut \
+             off at the cap before its end, so its true size is not known. {road}"
         ),
     }
 }
@@ -1738,7 +1767,7 @@ mod tests {
 
         let refused = ws.pasted_image("heavy.png").unwrap_err();
         assert!(refused.contains("past the 2 MB cap"), "{refused}");
-        let refused = ws.save_pasted_image(heavy).unwrap_err();
+        let refused = ws.save_pasted_image(heavy, false).unwrap_err();
         assert!(refused.contains("past the 2 MB cap"), "{refused}");
 
         // Under the cap, the same 8×8 picture rides — and its weight is its
@@ -1765,7 +1794,7 @@ mod tests {
         let image = ws.pasted_image("screen.png").unwrap().unwrap();
         assert_eq!(image.pixels, Some((1_920, 1_080)));
 
-        let pasted = ws.save_pasted_image(png_of(800, 600, 4)).unwrap();
+        let pasted = ws.save_pasted_image(png_of(800, 600, 4), false).unwrap();
         assert_eq!(pasted.pixels, Some((800, 600)));
     }
 
@@ -2305,7 +2334,7 @@ mod tests {
     #[test]
     fn a_clipboard_image_is_saved_under_mush_paste() {
         let ws = temp_workspace("clipboard");
-        let image = ws.save_pasted_image(png(4)).unwrap();
+        let image = ws.save_pasted_image(png(4), false).unwrap();
         assert_eq!(image.mime, "image/png");
         assert!(image.path.starts_with(".mush/paste/pasted-"), "{image:?}");
         assert!(image.path.ends_with(".png"), "{image:?}");
@@ -2323,16 +2352,16 @@ mod tests {
         // The jpeg extension is the spelling a browser reads, and the other
         // three are the mime's own name.
         let jpeg = ws
-            .save_pasted_image(vec![0xff, 0xd8, 0xff, 0xe0, 0x00])
+            .save_pasted_image(vec![0xff, 0xd8, 0xff, 0xe0, 0x00], false)
             .unwrap();
         assert!(jpeg.path.ends_with(".jpg"), "{jpeg:?}");
 
         // Words are not an image, and an image past the cap names the
         // clipboard's own road: save it, downscale it, copy the smaller one.
-        let refused = ws.save_pasted_image(b"hello".to_vec()).unwrap_err();
+        let refused = ws.save_pasted_image(b"hello".to_vec(), false).unwrap_err();
         assert!(refused.contains("not a png"), "{refused}");
         let refused = ws
-            .save_pasted_image(png(IMAGE_FILE_CAP as usize))
+            .save_pasted_image(png(IMAGE_FILE_CAP as usize), false)
             .unwrap_err();
         assert!(refused.contains("past the 2 MB cap"), "{refused}");
         assert!(
