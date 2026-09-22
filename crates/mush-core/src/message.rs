@@ -152,8 +152,9 @@ pub struct Image {
     /// `None` when no size could be read — a truncated file, a format whose
     /// header carries none, bytes that are not what the mime claims — and then
     /// [`Image::weight`] falls back to the raw byte count, which errs high for
-    /// a picture: the safe direction, because an over-weight estimate sheds an
-    /// image's payload before it drops a turn.
+    /// a picture: the safe direction, because a transcript that weighs too
+    /// little is the request that goes out over the window, while a picture
+    /// that weighs too much costs the conversation its oldest turn.
     ///
     /// `serde(default)` so an `Image` stored before this field existed still
     /// reads as "size unknown" instead of failing. Nothing mush writes carries
@@ -370,10 +371,20 @@ impl Message {
     /// which file it came from — and the model can read that file again if it
     /// needs the image.
     ///
-    /// The one way an image leaves a live message, called by both the trimmer
-    /// (before it drops a whole turn) and the session writer (before it writes
-    /// a file). Idempotent on purpose: a message that already lost its images
-    /// has nothing left to shed, so re-saving a loaded session cannot stack a
+    /// The one way an image leaves a live message, and the session writer's
+    /// alone: [`Session::save`](crate::session::Session::save) calls it before
+    /// it writes `.mush/session.json`, because a screenshot is megabytes no
+    /// human wants to find in a file, and the path in the placeholder is what a
+    /// resumed run needs to read the picture again. Trimming used to call it
+    /// too, shedding payloads before it dropped a turn — a workaround for the
+    /// byte-priced image, which read a 700 KB screenshot as 247k tokens and
+    /// made a picture the first thing to go. With images priced by their pixels
+    /// ([`Image::pixels`], [`PIXELS_PER_TOKEN`](crate::config::PIXELS_PER_TOKEN))
+    /// a picture is a normal-sized part of the turn it arrived in, and the turn
+    /// is what a trim drops: images and words together.
+    ///
+    /// Idempotent on purpose: a message that already lost its images has
+    /// nothing left to shed, so re-saving a loaded session cannot stack a
     /// second placeholder on the first one's text.
     pub fn drop_images(&mut self) {
         if self.images.is_empty() {
@@ -456,10 +467,10 @@ fn data_url(image: &Image) -> String {
     format!("data:{};base64,{}", image.mime, base64_encode(&image.bytes))
 }
 
-/// The line a dropped image leaves behind, in the one spelling the trimmer and
-/// the session writer both use (never two). It names the path, because that is
-/// what makes the image reachable again — the model can read the file — and the
-/// format, so the line cannot be mistaken for something the model said.
+/// The line a dropped image leaves behind, in the one spelling the session
+/// writer uses (never two). It names the path, because that is what makes the
+/// image reachable again — the model can read the file — and the format, so
+/// the line cannot be mistaken for something the model said.
 fn placeholder(image: &Image) -> String {
     // `image/png` prints as `png`: the mime already leads with the fact that
     // this is an image, and the sentence has room for one noun.
@@ -985,10 +996,10 @@ mod tests {
         assert!(hand_edited.images.is_empty(), "no `images` key is a field");
     }
 
-    /// The placeholder is the one spelling both a trimmed history and a saved
-    /// session leave: it names the path (so the model can read the file again)
-    /// and the format, and dropping twice adds nothing — the idempotence a
-    /// second save of a loaded session depends on.
+    /// The placeholder is the one spelling a saved session leaves: it names the
+    /// path (so the model can read the file again) and the format, and dropping
+    /// twice adds nothing — the idempotence a second save of a loaded session
+    /// depends on.
     #[test]
     fn a_dropped_image_leaves_a_placeholder_naming_its_path() {
         let mut message = Message::user("what is this?");
@@ -1019,11 +1030,47 @@ mod tests {
         );
     }
 
+    /// The placeholder weighs its own text and nothing else: once a payload is
+    /// shed, neither its pixels nor its bytes are in the message's weight any
+    /// more. The session writer is the one caller of [`Message::drop_images`],
+    /// and this is why a saved — or reloaded — conversation is the size of its
+    /// words.
+    #[test]
+    fn a_shed_payload_leaves_only_the_placeholders_weight() {
+        let mut message = Message::assistant("here it is");
+        message.images.push(Image {
+            path: "shots/screen.png".into(),
+            mime: "image/png".into(),
+            bytes: vec![0x41; 741_396],
+            pixels: Some((1_920, 1_080)),
+        });
+        let with_image = message.weight();
+
+        message.drop_images();
+
+        let text = message.text().to_string();
+        assert_eq!(
+            message.weight(),
+            "assistant".len() + text.len(),
+            "role and placeholder text, and no payload: {text}"
+        );
+        assert!(message.weight() < with_image, "the picture is gone");
+        assert!(
+            with_image - message.weight() > 8_000,
+            "and its ~8.3 KB of weight with it: {with_image} -> {}",
+            message.weight()
+        );
+        assert!(
+            text.contains("shots/screen.png"),
+            "and the path that replaces it is there: {text}"
+        );
+    }
+
     /// The fallback: an image whose header named no size is the bytes it took
     /// to write, plus the path and mime that travel with them — which
     /// overcounts a picture, the safe direction. A transcript that carried
     /// such an image is not the size of its text, and a trimmer that thought
-    /// it was would never shed the payload that actually exceeds the window.
+    /// it was would never drop the turn that actually exceeds the window.
     #[test]
     fn an_image_with_no_size_in_its_header_weighs_its_bytes_and_the_path_and_mime() {
         let mut message = Message::user("look");
