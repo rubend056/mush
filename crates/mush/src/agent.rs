@@ -2260,6 +2260,14 @@ fn fold_does_not_fit_line(cfg: &Config, prompt_tokens: usize, cap: u32) -> Strin
 /// What a tool result says when the window took its bytes. The call is still
 /// answered — a dangling call is a shape a strict server rejects — and the road
 /// back is the tools' own: the same output is one narrower call away.
+///
+/// The rewrite lands in the *actor's* copy, so every later request in this
+/// conversation says what happened to the result. The UI's copy — the pane and
+/// the session file — keeps what the tool produced: that is the human's record,
+/// and the difference is deliberate and one-directional, the request the lighter
+/// of the two (see [`Chat::used_weight_for`](crate::app::Chat::used_weight_for)).
+/// Nothing is silent about it either: the run emits one line naming how many
+/// results went and how many bytes they gave back.
 const SHED_RESULT_NOTE: &str = "\
 [mush: this result was dropped to fit the window — the call it answers is not lost; ask again in \
 a smaller piece (a narrower command, a smaller read) if you need the output]";
@@ -2273,7 +2281,8 @@ a smaller piece (a narrower command, a smaller read) if you need the output]";
 /// never ahead of it. "The newest turn" is everything after the last user
 /// message, which is also the part [`trim_history`] can never cut, so this is
 /// the room the last resort has left. Largest first: the fewest results pay for
-/// the room, and each one says in its own text what happened to it.
+/// the room, and each one says in its own text what happened to it — in this
+/// actor's copy, while the pane keeps the output (see [`SHED_RESULT_NOTE`]).
 fn shed_newest_results(messages: &mut [Message], budget: usize) -> (usize, usize) {
     let start = messages
         .iter()
