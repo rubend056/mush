@@ -239,6 +239,17 @@ fn blind_model_line(model: &str) -> String {
     )
 }
 
+/// How many bytes of pictures the message box may hold: eight of the files the
+/// transport already caps one at ([`mush_core::workspace::IMAGE_FILE_CAP`]).
+///
+/// The window cannot be this bound, and the arithmetic is why: a picture is
+/// priced by its pixels, so a 100×100 png weighing 2 MB costs fourteen tokens —
+/// a hundred of them pass every token bound the window has while the box holds
+/// 200 MB of bytes and the copies in `.mush/paste/` grow by the same. What the
+/// box is made of is bytes, so bytes are what the box counts: eight files of
+/// the size the transport already lets one be is the queue a message may hold.
+const BOX_IMAGE_BYTES: usize = (mush_core::workspace::IMAGE_FILE_CAP * 8) as usize;
+
 /// A byte count the way a glance wants it: `900 B`, `340 KB`, `1.2 MB`. One
 /// decimal for the unit that needs one — a megabyte is where the rounding is
 /// visible, and `1.2` says more than `1258` or than a bare `1`.
@@ -2074,7 +2085,10 @@ impl App {
     /// The unit of "the human's message" is text plus images, and it is built
     /// once, here: [`Message::user_with_images`] is what the run carries, what
     /// a nudge carries and what the transcript pushes, so the three cannot
-    /// disagree about which picture went with which words.
+    /// disagree about which picture went with which words. The pictures are
+    /// carried to the focused agent before that message is built, so what each
+    /// of the three holds is a path that agent's own tools resolve
+    /// ([`Self::carry_images`]).
     fn deliver(&mut self, text: String, images: Vec<Image>) -> Result<(), String> {
         // A request without a model is a guaranteed refusal from the endpoint,
         // and since discovery runs after the first frame this state is
@@ -2101,8 +2115,25 @@ impl App {
                 return Err(line);
             }
         }
-        let message = Message::user_with_images(text, images);
         let target = self.tree.focused;
+        // The focus can move between the `Ctrl-V`/paste and the `Enter` that
+        // sends it (`Tab`, `j`/`k` in the tree), so the invariant the attach
+        // gate keeps is asked again for the agent that actually receives the
+        // message: every path must be one *its* workspace reads back as these
+        // bytes, and a picture the attach gate copied for another agent is
+        // copied here for this one ([`Self::carry_images`]).
+        let images = if images.is_empty() {
+            images
+        } else {
+            match self.carry_images(target, images) {
+                Ok(images) => images,
+                Err(line) => {
+                    self.fail(&line);
+                    return Err(line);
+                }
+            }
+        };
+        let message = Message::user_with_images(text, images);
         if target == AgentId::ROOT {
             // The root's own phase, not the tree's: a napping orchestrator is idle, and
             // idle, and its next message starts a run rather than nudging a
@@ -2475,10 +2506,24 @@ impl App {
     /// not read files or run commands from (finding A8). The same question
     /// `worktree_gone` asks, answered for the wire.
     fn attach_worktree(&self, id: AgentId) -> String {
+        self.agent_root(id).display().to_string()
+    }
+
+    /// The root of the workspace an agent's own tools resolve paths in: its
+    /// worktree while it has one on disk, else the shared checkout.
+    ///
+    /// The same answer `agent::revive` gives the actor — `live_branch` keeps a
+    /// branch only while its worktree exists, and the workspace is built on the
+    /// worktree when there is one — so the UI and the actor cannot disagree
+    /// about what a workspace-relative path means to this agent. Two surfaces
+    /// ask it: the roster's `worktree` string, through [`Self::attach_worktree`],
+    /// and the attach gate's copy of a picture for an agent that works
+    /// elsewhere ([`Self::carry_images`]).
+    fn agent_root(&self, id: AgentId) -> std::path::PathBuf {
         let path = git::worktree_path(self.ws.root(), id.0);
         match self.tree.node(id) {
-            Some(node) if node.branch.is_some() && path.exists() => path.display().to_string(),
-            _ => self.ws.root().display().to_string(),
+            Some(node) if node.branch.is_some() && path.exists() => path,
+            _ => self.ws.root().to_path_buf(),
         }
     }
 
@@ -3304,6 +3349,73 @@ impl App {
         });
     }
 
+    /// The images to carry to the agent at `id`: every one whose path that
+    /// agent's own workspace reads back as its own bytes, and a fresh copy
+    /// under its `.mush/paste/` for every one it does not.
+    ///
+    /// A picture's file is read in the shared checkout — a paste resolves there
+    /// and a clipboard copy is written there — while an agent with a worktree
+    /// of its own resolves the same relative path against that worktree, where
+    /// the file is not, or is another revision of it. The `Image` holds its
+    /// bytes, so the file the placeholder names can be written where the
+    /// receiving agent's tools look: [`Workspace::save_pasted_image`] is the
+    /// one writer of `.mush/paste/`, and the copy is what the placeholder's
+    /// "read the file again" promises to keep. The bytes are compared, not just
+    /// the path's existence, because that promise is the *same picture*: a
+    /// worktree can hold an older commit of the file the human pasted.
+    ///
+    /// The comparison is the receiving workspace's own reader
+    /// ([`Workspace::read_image`]), not a raw read of the path: the reader
+    /// stats before it opens, so a FIFO named like the picture answers
+    /// `Ok(None)` instead of blocking this call — which runs on the UI thread
+    /// at every attach and every send — and its whole read is bounded by the
+    /// transport cap whatever the file claims or grows to. A file that is not
+    /// there, not a regular file, not an image, or not these bytes is "the
+    /// receiver does not hold it", and the copy is what it gets.
+    ///
+    /// `Err` is a picture whose copy cannot be written: the line names the path
+    /// and the reason, and the caller refuses the attachment rather than hand
+    /// an agent a path that resolves nowhere.
+    ///
+    /// The bytes are the picture whole: every road that builds an [`Image`]
+    /// reads it to its end and refuses a buffer that stopped at a cap
+    /// ([`Workspace::pasted_images`], the clipboard's read), so the copy is
+    /// written from bytes the request will carry entire — never a prefix of
+    /// one — and [`Workspace::save_pasted_image`] is handed `false` for its
+    /// `cut_at_the_cap`.
+    fn carry_images(&self, id: AgentId, images: Vec<Image>) -> Result<Vec<Image>, String> {
+        let root = self.agent_root(id);
+        let ws =
+            Workspace::new(&root).map_err(|e| format!("cannot open {}: {e}", root.display()))?;
+        images
+            .into_iter()
+            .map(|image| {
+                // The receiver's own reader answers, not a raw `fs::read`: it
+                // stats before it opens (a FIFO is `Ok(None)`, never a blocked
+                // open) and bounds its read by the transport cap
+                // ([`Workspace::read_image`], this method's doc).
+                let same = ws
+                    .read_image(&image.path)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|seen| seen.bytes == image.bytes);
+                if same {
+                    return Ok(image);
+                }
+                let from = image.path.clone();
+                // Whole bytes, not a prefix: an `Image` exists only when a road
+                // read the picture to its end within the cap, so this is the
+                // `false` side of `cut_at_the_cap` (see this method's doc).
+                ws.save_pasted_image(image.bytes, false).map_err(|e| {
+                    format!(
+                        "cannot copy {from} into {}/.mush/paste: {e}",
+                        root.display()
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// The gate for a paste that named several images: the same facts
     /// [`Self::attach_image`] weighs, asked once for the gesture instead of
     /// once per picture.
@@ -3315,11 +3427,15 @@ impl App {
     /// and a batch of several says one line naming the count
     /// (`attached 4 images — Enter sends them with the message`).
     ///
-    /// The two facts that stop an image before it is attached are asked once,
-    /// of the batch: with no model at all, or a model not documented to see,
-    /// nothing attaches and the whole paste lands as text with the one refusal
-    /// [`Self::attach_image`] says. The room warning is one line too — the
-    /// room is the budget minus the transcript, the same arithmetic
+    /// Four facts can stop the whole gesture before any of it attaches, and
+    /// each is asked once, of the batch: no model at all, a model not
+    /// documented to see, the window's bound and the box's own bound. A stop
+    /// means *nothing* attaches and the whole paste lands as text with the one
+    /// refusal [`Self::attach_image`] says — a gesture is atomic, so half a
+    /// batch is not a thing this door makes.
+    ///
+    /// The room warning is one line too — the room is the budget minus the
+    /// *focused agent's* transcript, the same arithmetic
     /// [`Self::attach_image`] does, with the images already in the box counted
     /// by hand — and it carries the count a single picture's line cannot: how
     /// many of the batch's pictures the room left cannot hold, each asked at
@@ -3327,10 +3443,15 @@ impl App {
     /// (`cost + pending > room`). Every picture is attached whatever the room
     /// says: the human decides what to send.
     ///
-    /// Nothing here caps the count. What bounds a paste of a hundred pictures
-    /// is what bounds one image — this gate's room and the window behind it,
-    /// and the reader's [`mush_core::workspace::IMAGE_FILE_CAP`] per file —
-    /// not a batch limit invented at this door.
+    /// The pictures are carried to the focused agent first, because the paste
+    /// resolved them in the shared checkout and the box must hold paths that
+    /// the agent the message is sent to can read ([`Self::carry_images`]).
+    ///
+    /// What bounds a paste of a hundred pictures is what bounds one image — the
+    /// window's budget and the box's own byte bound ([`BOX_IMAGE_BYTES`]), both
+    /// of which refuse, and the per-file transport cap the reader applies
+    /// ([`mush_core::workspace::IMAGE_FILE_CAP`]) — not a batch limit invented
+    /// at this door.
     ///
     /// Answers whether the batch was attached, so the paste arm inserts the
     /// words as text when it was not.
@@ -3349,16 +3470,88 @@ impl App {
             self.fail(blind_model_line(&model));
             return false;
         }
-        let room = self
-            .cfg()
-            .history_budget()
-            .saturating_sub(self.chat.used_weight_for(AgentId::ROOT));
+        // The pictures are carried to the agent this paste is for before the
+        // weights are read, because the paths — and so the weights and the
+        // lines — are about what the box will hold: pictures that agent's own
+        // tools resolve ([`Self::carry_images`]).
+        let target = self.tree.focused;
+        let images = match self.carry_images(target, images) {
+            Ok(images) => images,
+            Err(line) => {
+                self.fail(&line);
+                return false;
+            }
+        };
+        let budget = self.cfg().history_budget();
+        let room = budget.saturating_sub(self.chat.used_weight_for(target));
         let pending: usize = self
             .chat
             .attachments()
             .iter()
             .map(Image::weight)
             .fold(0, usize::saturating_add);
+        let count = images.len();
+        // The window's bound, asked of the batch at once: the pictures already
+        // in the box plus every picture of the paste, in paste order, against
+        // the whole history budget. A paste that crosses it attaches nothing —
+        // the request could never fit however much history is trimmed, so
+        // attaching would only spend a turn on a refusal. Every sum saturates,
+        // because a header can claim a picture larger than any `usize`.
+        let mut running = pending;
+        let mut over_budget = 0usize;
+        let mut first_over: Option<String> = None;
+        for image in &images {
+            let cost = image.weight();
+            if cost.saturating_add(running) > budget {
+                over_budget += 1;
+                if first_over.is_none() {
+                    first_over = Some(image.path.clone());
+                }
+            }
+            running = running.saturating_add(cost);
+        }
+        if over_budget > 0 {
+            let first = first_over.unwrap_or_default();
+            self.fail(format!(
+                "{over_budget} of {count} images would put the box over the whole history budget \
+                 ({}) — the pictures already in the box weigh {}, and `/compact` folds the \
+                 conversation, not the pictures: a request carrying them would go out over the \
+                 window and the endpoint would refuse it. Downscale them (`convert {first} \
+                 -resize 50% small.png`) and paste them again, or send the box's pictures first",
+                size_label(budget),
+                size_label(pending)
+            ));
+            return false;
+        }
+        // The box's own bound, in the currency the window cannot weigh: the
+        // bytes the box holds while the pictures wait. Attaching this batch
+        // would keep more file than the box allows, so nothing attaches.
+        let pending_bytes: usize = self
+            .chat
+            .attachments()
+            .iter()
+            .map(|image| image.bytes.len())
+            .fold(0, usize::saturating_add);
+        let adding: usize = images
+            .iter()
+            .map(|image| image.bytes.len())
+            .fold(0, usize::saturating_add);
+        if adding.saturating_add(pending_bytes) > BOX_IMAGE_BYTES {
+            let first = images
+                .first()
+                .map(|image| image.path.clone())
+                .unwrap_or_default();
+            self.fail(format!(
+                "{count} images weighing {} would put the box over the {} of picture bytes it \
+                 may hold — the box already holds {}, and the window's token bound cannot bound \
+                 bytes. Downscale them (`convert {first} -resize 50% small.png`) and paste them \
+                 again, or send the box's pictures first",
+                size_label(adding),
+                size_label(BOX_IMAGE_BYTES),
+                size_label(pending_bytes)
+            ));
+            return false;
+        }
         // The count the warning says: each picture, in paste order, is asked
         // the question [`Self::attach_image`] asks of one — does its cost fit
         // the room left once the pictures before it have had theirs? Every
@@ -3377,7 +3570,6 @@ impl App {
             }
             running = running.saturating_add(cost);
         }
-        let count = images.len();
         for image in images {
             self.chat.attach(image);
         }
@@ -3385,9 +3577,10 @@ impl App {
             let first = first_at_stake.unwrap_or_default();
             self.fail(format!(
                 "{at_stake} of {count} images will not fit the room left for history ({}) — \
-                 trim_history sheds an image's bytes before it drops a turn, so the model would \
-                 never look at them. `/compact` makes room, or downscale them (`convert \
-                 {first} -resize 50% small.png`) and paste them again",
+                 attaching them costs the oldest turns of the conversation, which are dropped \
+                 at the next request to make room. `/compact` folds them into a summary \
+                 instead, or downscale them (`convert {first} -resize 50% small.png`) and paste \
+                 them again",
                 size_label(room)
             ));
             return true;
@@ -3402,8 +3595,8 @@ impl App {
     /// that named a file, or `Ctrl-V`. Answers whether it was attached, so the
     /// paste arm knows to insert the path as text when it was not.
     ///
-    /// Four facts are said here, and each gets its own line because each needs
-    /// a different move from the human. The first two refuse the attachment:
+    /// Five facts are said here, and each gets its own line because each needs
+    /// a different move from the human. Four refuse the attachment:
     ///
     /// - **No model at all.** Sending would be a guaranteed refusal, and it is
     ///   said in the words [`Self::deliver`] already uses for the same state.
@@ -3411,32 +3604,50 @@ impl App {
     ///   request — a whole turn and the human's money — so it is refused
     ///   *before* the wire, and `Ctrl-P` is named as the road: the one road
     ///   that changes the fact.
+    /// - **A picture the window cannot carry.** Its weight — with the pictures
+    ///   already in the box — is past the whole history budget
+    ///   ([`mush_core::Config::history_budget`]). The system prompt and the
+    ///   opening task cannot be dropped and no trim shrinks a picture, so a
+    ///   request carrying it would go out over the window and the endpoint
+    ///   would refuse it: attaching would only spend a turn discovering that.
+    ///   The line names the road: a downscale. `/compact` is named only when
+    ///   the pictures already in the box are part of the sum, and it is named
+    ///   for what it is — a fold of the *conversation*, whose room is not the
+    ///   weight over this bound. (The batch door's line says how many of how
+    ///   many are at stake.)
+    /// - **A box past its own byte bound.** [`BOX_IMAGE_BYTES`] is the box's
+    ///   memory — what is held while the pictures wait — and it is not the
+    ///   window's bound: a picture is priced by its pixels, so a 2 MB file of a
+    ///   100×100 png weighs fourteen tokens, and a hundred of them pass every
+    ///   token bound the window has while the box holds 200 MB. Also refused;
+    ///   the line names which bound it was.
     ///
-    /// The other two attach anyway — the human decides what to send — and say
+    /// The fifth attaches anyway — the human decides what to send — and says
     /// the fact they cannot see:
     ///
-    /// - **A picture too big for the window.** It outweighs the whole history
-    ///   budget, and the system prompt and the opening task cannot be dropped,
-    ///   so no trim makes room for it: a request carrying it would go out over
-    ///   the window and the endpoint would refuse it. The one road that
-    ///   changes that is a downscale, and the line names it.
     /// - **A picture with no room left in the conversation.** The room is what
     ///   remains of [`mush_core::Config::history_budget`] once the system
-    ///   prompt and the transcript are weighed, and the images already in the
-    ///   box count against it too: they are not in the transcript yet.
-    ///   Attaching it costs the oldest turns —
+    ///   prompt and the *focused agent's* transcript are weighed, and the
+    ///   images already in the box count against it too: they are not in the
+    ///   transcript yet. Attaching it costs the oldest turns —
     ///   [`mush_core::transcript::trim_history`] drops them at the next
     ///   request to make room — so the line says so and names the two roads
     ///   that spare them: `/compact`, which folds those turns into a summary,
     ///   and a downscale, which makes the picture cost less.
     ///
-    /// A picture whose weight exactly equals the room left fits: this gate asks
-    /// whether the request would still be inside the window
-    /// (`cost + pending > room` warns, equality does not), which is the same
-    /// inclusive comparison the trimmer makes at the ceiling
-    /// ([`mush_core::transcript::trim_history`]: a transcript at `budget` is
-    /// inside, one byte more is cut), so a picture parked on the boundary is
-    /// not warned about by one rule and sent by another.
+    /// A picture whose weight exactly equals the room left fits, and one that
+    /// lands exactly on the budget fits too: this gate refuses (and warns) only
+    /// *above* `cost + pending` — past the budget, past the box's bytes, past
+    /// the room — the same inclusive comparison the trimmer makes at the
+    /// ceiling ([`mush_core::transcript::trim_history`]: a transcript at
+    /// `budget` is inside, one byte more is cut), so a picture parked on a
+    /// boundary is not refused by one rule and sent by another.
+    ///
+    /// Every path that leaves this gate is one the agent the message is sent to
+    /// can read: the picture is carried to the focused agent first
+    /// ([`Self::carry_images`]), because the road that read it resolved it in
+    /// the shared checkout and an agent with a worktree of its own resolves it
+    /// against that worktree instead.
     ///
     /// Everything else attaches, and the line says the image, its format and
     /// its size, and how to send it.
@@ -3451,6 +3662,15 @@ impl App {
             self.fail(blind_model_line(&model));
             return false;
         }
+        let target = self.tree.focused;
+        let mut images = match self.carry_images(target, vec![image]) {
+            Ok(images) => images,
+            Err(line) => {
+                self.fail(&line);
+                return false;
+            }
+        };
+        let image = images.pop().expect("one image in, one image out");
         let label = image_label(&image);
         let path = image.path.clone();
         // What this picture costs, weighed the one way the budget weighs a
@@ -3461,6 +3681,7 @@ impl App {
         // a picture larger than any `usize`, and the sum must not be the thing
         // that panics on the way to "it does not fit".
         let cost = image.weight();
+        let image_bytes = image.bytes.len();
         let pending: usize = self
             .chat
             .attachments()
@@ -3468,29 +3689,67 @@ impl App {
             .map(Image::weight)
             .fold(0, usize::saturating_add);
         let budget = self.cfg().history_budget();
-        let room = budget.saturating_sub(self.chat.used_weight_for(AgentId::ROOT));
-        self.chat.attach(image);
+        // The focused agent's room, not the root's: the picture is attached to
+        // the conversation the human is looking at and will be sent to that
+        // agent, and a child's own transcript is what its next request pays for
+        // (`Chat::used_weight_for`).
+        let room = budget.saturating_sub(self.chat.used_weight_for(target));
         if cost.saturating_add(pending) > budget {
-            // The picture outweighs the whole history budget. The conservative
-            // reading of "no room, even trimmed": the system prompt and the
-            // opening task are not droppable, so a transcript can never be
-            // trimmed into carrying this request — it would go out over the
-            // window and come back refused. `/compact` cannot help: the picture
-            // itself is the fact, and the downscale is the road.
-            self.fail(format!(
-                "{label} is bigger than the whole history budget ({}) — even with every older \
-                 turn dropped, a request carrying it would go out over the window, and the \
-                 endpoint would refuse it. Downscale it (`convert {path} -resize 50% small.png`) \
-                 and attach that",
-                size_label(budget)
-            ));
-            return true;
+            // Past the whole history budget, with the pictures already in the
+            // box counted: the system prompt and the opening task are not
+            // droppable, so no trim of the conversation can bring the request
+            // inside the window, and attaching would spend a turn on the
+            // refusal. Which road to name depends on what is over: the picture
+            // alone, or the box's pictures together with it. The fold is named
+            // only in the second case, and named for what it is: a fold of the
+            // conversation, and the weight over the bound is the pictures'.
+            let line = if cost > budget {
+                format!(
+                    "{label} is bigger than the whole history budget ({}) — even with every \
+                     older turn dropped, a request carrying it would go out over the window, \
+                     and the endpoint would refuse it. Downscale it (`convert {path} -resize 50% \
+                     small.png`) and attach that",
+                    size_label(budget)
+                )
+            } else {
+                format!(
+                    "{label} would put the box over the whole history budget ({}) — the \
+                     pictures already in the box weigh {}, and `/compact` folds the conversation, \
+                     not the pictures. Downscale one (`convert {path} -resize 50% small.png`) and \
+                     attach that, or send the box's pictures first",
+                    size_label(budget),
+                    size_label(pending)
+                )
+            };
+            self.fail(line);
+            return false;
         }
+        let held: usize = self
+            .chat
+            .attachments()
+            .iter()
+            .map(|image| image.bytes.len())
+            .fold(0, usize::saturating_add);
+        if image_bytes.saturating_add(held) > BOX_IMAGE_BYTES {
+            // Past the box's own bound: the box is bytes while the pictures
+            // wait, and the window's numbers cannot be this bound. Attaching
+            // would hold more than the box allows, so it is refused.
+            self.fail(format!(
+                "{label} would put the box over the {} of picture bytes it may hold — {} is \
+                 already waiting, and the window's token bound cannot bound bytes. Downscale it \
+                 (`convert {path} -resize 50% small.png`) and attach that, or send the box's \
+                 pictures first",
+                size_label(BOX_IMAGE_BYTES),
+                size_label(held)
+            ));
+            return false;
+        }
+        self.chat.attach(image);
         if cost.saturating_add(pending) > room {
-            // Room for it in the window, none left in the conversation: a trim
-            // makes room by dropping the oldest turns at the next request. The
-            // line says what attaching it costs, and names the two roads that
-            // spare those turns.
+            // Inside the budget, none left in the conversation: a trim makes
+            // room by dropping the oldest turns at the next request. The line
+            // says what attaching it costs, and names the two roads that spare
+            // those turns.
             self.fail(format!(
                 "{label} will not fit the room left for history ({}) — attaching it costs the \
                  oldest turns of the conversation, which are dropped at the next request to make \
@@ -6948,6 +7207,34 @@ mod tests {
         app.cell.edit(|cfg| cfg.set_model("deepseek-flash"));
     }
 
+    /// Spawn child `id` as an *isolated* agent: a `mush/<id>` branch, and the
+    /// worktree on disk the branch names, so the child's own tools resolve
+    /// paths in a workspace of their own. The spawn goes through the real
+    /// `Spawned` event, so the brief opens the child's transcript. The mailbox
+    /// is live and nobody reads it: a nudge to it lands without reviving an
+    /// actor. Returns the child's workspace root and the mailbox to hold.
+    fn isolate_child(app: &mut App, id: u64) -> (std::path::PathBuf, Receiver<AgentMsg>) {
+        let (cmd, rx) = crossbeam_channel::unbounded();
+        let conversation = app.tree.conversation();
+        app.update(Msg::Agent {
+            conversation,
+            id: AgentId::ROOT,
+            event: AgentEvent::Spawned {
+                child: id,
+                parent: 0,
+                brief: format!("task {id}"),
+                depth: 1,
+                branch: Some(format!("mush/{id}")),
+                fork: None,
+                title: None,
+                cmd,
+            },
+        });
+        let root = mush_core::git::worktree_path(app.ws.root(), id);
+        std::fs::create_dir_all(&root).unwrap();
+        (root, rx)
+    }
+
     /// A bracketed paste that is nothing but an image's path attaches the image
     /// — no text is inserted — because that is what drag-and-drop and a file
     /// manager's "copy" produce. The gate is the real one, and the line the bar
@@ -7034,6 +7321,95 @@ mod tests {
         assert!(text.contains("▣ +2 more"), "{text}");
     }
 
+    /// A picture attached while a child is focused is carried to the child: the
+    /// path the `Image` carries is one the child's *own* workspace reads back
+    /// as its bytes, and the message the child receives carries the same path.
+    ///
+    /// The paste road read the human's file outside the workspace and copied it
+    /// into the shared checkout, where the human's own view resolves it; a child
+    /// with a worktree of its own resolves the same relative path against that
+    /// worktree, where the copy is not. Before, the gate attached the shared
+    /// path whatever agent was focused, so the placeholder the model was left
+    /// with named a file it could not read (audit A2/B3: no test focused a child
+    /// before attaching).
+    #[test]
+    fn an_image_attached_to_a_child_is_readable_from_the_childs_own_workspace() {
+        let (mut app, _rx) = test_app("child-carry");
+        let_the_model_see(&mut app);
+        let (child_root, _mailbox) = isolate_child(&mut app, 1);
+        // The human's file, outside the workspace mush was opened on.
+        let outside =
+            std::env::temp_dir().join(format!("mush-child-carry-outside-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&outside);
+        std::fs::create_dir_all(&outside).unwrap();
+        let shot = outside.join("shot.png");
+        std::fs::write(&shot, png(64)).unwrap();
+
+        app.tree.focus(AgentId(1));
+        app.update(Msg::Paste(shot.display().to_string()));
+
+        // The box holds the picture under a path the child's own tools resolve.
+        let attached = app.chat.attachments();
+        assert_eq!(attached.len(), 1, "the paste attached it");
+        let child = Workspace::new(&child_root).unwrap();
+        let seen = child
+            .read_image(&attached[0].path)
+            .unwrap_or_else(|e| panic!("the child cannot read {}: {e}", attached[0].path))
+            .expect("the path names an image in the child's workspace");
+        assert_eq!(
+            seen.bytes, attached[0].bytes,
+            "byte-identical to what rides"
+        );
+
+        // And the message the child is sent carries the same path.
+        app.chat.insert("look");
+        app.send_message();
+        let sent = app
+            .chat
+            .transcript(AgentId(1))
+            .last()
+            .expect("the message the child received");
+        assert_eq!(sent.role, "user");
+        let seen = child
+            .read_image(&sent.images[0].path)
+            .unwrap_or_else(|e| panic!("after the send, {}: {e}", sent.images[0].path))
+            .expect("the sent path names an image in the child's workspace");
+        assert_eq!(seen.bytes, sent.images[0].bytes);
+    }
+
+    /// A FIFO named like the picture must not freeze the pane. The carry asks
+    /// whether the receiving workspace already holds the image's bytes, and a
+    /// raw `fs::read` answers that by *opening* the path: on a FIFO with no
+    /// writer that open blocks until one appears — on the UI thread, at every
+    /// attach and every send. The carry goes through the workspace's own
+    /// reader, which stats before it opens (finding #15's rule, and its
+    /// watchdog test); the old read never answers, and a hang must fail here
+    /// rather than hang the suite.
+    #[test]
+    fn the_carry_never_opens_a_name_that_is_not_a_regular_file() {
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let (mut app, _rx) = test_app("carry-fifo");
+            let_the_model_see(&mut app);
+            let fifo = app.ws.root().join("x.png");
+            let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+            let made = made.is_ok_and(|status| status.success());
+            let attached = made && app.attach_image(image("x.png"));
+            let path = app.chat.attachments().first().map(|i| i.path.clone());
+            let _ = tx.send((made, attached, path));
+        });
+        let (made, attached, path) = rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("a FIFO must answer, not hold an open until a writer appears");
+        assert!(made, "this test needs `mkfifo` to build the shape it pins");
+        assert!(attached, "the picture is carried into .mush/paste");
+        let path = path.expect("the box holds it");
+        assert!(
+            path.starts_with(".mush/paste/"),
+            "the FIFO was not the picture; the copy is: {path}"
+        );
+    }
+
     /// A paste of several paths is atomic the way one path is: one word that
     /// is not an image makes the whole paste the words it is — nothing
     /// attaches, nothing is swallowed.
@@ -7106,17 +7482,28 @@ mod tests {
 
     /// The room warning for a batch is one line, and it carries the count a
     /// single picture's line cannot: how many of the pictures are at stake.
-    /// Two of these four weigh half the room each, so the third is the first
-    /// past it — and all four are still attached, because the human decides
-    /// what to send.
+    /// The conversation already fills a third of the budget and each picture is
+    /// a quarter of it, so the third picture is the first past the room and the
+    /// second is at stake — and all four are still attached, because the human
+    /// decides what to send. The fourth lands on the budget exactly, which the
+    /// window's bound accepts (it refuses only *past* it), so this is the
+    /// warning and not a refusal.
     #[test]
     fn the_room_warning_for_a_batch_names_the_count_at_stake() {
         let (mut app, _rx) = test_app("paste-four-room");
         let_the_model_see(&mut app);
         app.cell.edit(|cfg| cfg.set_context(500_000));
-        let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId::ROOT);
-        // Each picture weighs half the room: bytes + path (11) + mime (9).
-        let each = room / 2;
+        let budget = app.cfg().history_budget();
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("x".repeat(budget / 3)));
+        let room = budget - app.chat.used_weight_for(AgentId::ROOT);
+        // Each picture weighs a quarter of the budget: bytes + path (11) +
+        // mime (9).
+        let each = budget / 4;
+        assert!(
+            2 * each <= room && 3 * each > room,
+            "the third is the first past it"
+        );
         std::fs::create_dir_all(app.ws.root().join("shots")).unwrap();
         for i in 0..4 {
             std::fs::write(app.ws.root().join(format!("shots/{i}.png")), png(each - 28)).unwrap();
@@ -7130,6 +7517,14 @@ mod tests {
         assert_eq!(kind, StatusKind::Error);
         assert!(line.contains("room left for history"), "{line}");
         assert!(line.contains("2 of 4 images"), "the count at stake: {line}");
+        assert!(
+            line.contains("oldest turns"),
+            "what attaching them costs: {line}"
+        );
+        assert!(
+            !line.contains("shed"),
+            "a trim drops the turn a picture arrived in, not its bytes: {line}"
+        );
         assert!(line.contains("/compact"), "one road to make room: {line}");
         assert!(line.contains("convert"), "and the downscale: {line}");
         assert_eq!(line.matches("room left").count(), 1, "said once: {line}");
@@ -7262,6 +7657,78 @@ mod tests {
         assert!(line.contains("room left for history"), "{line}");
     }
 
+    /// The room the gate weighs is the *focused* agent's: the same picture, in
+    /// the same box, is warned about when the child's conversation has no room
+    /// for it and attaches with the plain line when the child's is empty but
+    /// the root's is full.
+    ///
+    /// Before, the gate asked `used_weight_for(AgentId::ROOT)` whichever agent
+    /// was focused, so a child's own window was pinned by no test at all (audit
+    /// A2: no test focused a child before attaching).
+    #[test]
+    fn the_attach_gate_weighs_the_focused_agents_room() {
+        // The child's conversation is nearly full: a picture one byte past the
+        // child's room, and nowhere near the root's.
+        let (mut app, _rx) = test_app("child-room");
+        let_the_model_see(&mut app);
+        app.cell.edit(|cfg| cfg.set_context(500_000));
+        let (child_root, _mailbox) = isolate_child(&mut app, 1);
+        let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId(1));
+        let path = "shots/big.png";
+        let bytes = png(room + 1 - 8 - path.len() - "image/png".len());
+        // The file lies in both workspaces with these bytes, so the picture is
+        // carried unchanged and the weight is exactly the room plus one.
+        for root in [app.ws.root().to_path_buf(), child_root.clone()] {
+            std::fs::create_dir_all(root.join("shots")).unwrap();
+            std::fs::write(root.join(path), &bytes).unwrap();
+        }
+        let picture = Image {
+            path: path.to_string(),
+            mime: "image/png".to_string(),
+            bytes,
+            pixels: None,
+        };
+        assert_eq!(picture.weight(), room + 1, "one byte past the child's room");
+
+        app.tree.focus(AgentId(1));
+        assert!(app.attach_image(picture.clone()), "the human decides");
+        let (line, kind) = app
+            .status_line()
+            .expect("the child's room is the fact that warning is about");
+        assert_eq!(kind, StatusKind::Error, "{line}");
+        assert!(line.contains("room left for history"), "{line}");
+
+        // The other way around, in its own app (an attachment changes the room
+        // the next call sees): the root's conversation is full, the child's is
+        // empty, and the same picture attaches with the plain line.
+        let (mut app, _rx) = test_app("root-room");
+        let_the_model_see(&mut app);
+        app.cell.edit(|cfg| cfg.set_context(500_000));
+        let (child_root, _mailbox) = isolate_child(&mut app, 1);
+        let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId(1));
+        let bytes = png(room / 2 - 8 - path.len() - "image/png".len());
+        for root in [app.ws.root().to_path_buf(), child_root] {
+            std::fs::create_dir_all(root.join("shots")).unwrap();
+            std::fs::write(root.join(path), &bytes).unwrap();
+        }
+        let budget = app.cfg().history_budget();
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("x".repeat(budget)));
+        let picture = Image {
+            path: path.to_string(),
+            mime: "image/png".to_string(),
+            bytes,
+            pixels: None,
+        };
+        assert_eq!(picture.weight(), room / 2, "half the child's room");
+
+        app.tree.focus(AgentId(1));
+        assert!(app.attach_image(picture), "the human decides");
+        let (line, kind) = app.status_line().expect("the plain line");
+        assert_eq!(kind, StatusKind::Info, "the child has the room: {line}");
+        assert!(line.contains("attached"), "{line}");
+    }
+
     /// The human's own case, at the gate: a 724 KiB 1920×1080 screenshot
     /// dropped into a ~300k-token conversation on a 500k-token window attaches
     /// with the plain line. The room left is ~550 KB of weight and the picture
@@ -7279,6 +7746,10 @@ mod tests {
             pixels: Some((1_920, 1_080)),
             ..image("shots/screen.png")
         };
+        // The picture names a file holding its own bytes, as a paste leaves it:
+        // the gate keeps a path the receiving workspace reads back identically.
+        std::fs::create_dir_all(app.ws.root().join("shots")).unwrap();
+        std::fs::write(app.ws.root().join("shots/screen.png"), &shot.bytes).unwrap();
 
         assert!(app.attach_image(shot), "it fits the room left");
 
@@ -7303,9 +7774,12 @@ mod tests {
             app.cell.edit(|cfg| cfg.set_context(500_000));
             let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId::ROOT);
             // A headerless png weighs its bytes (8 + padding) plus its path
-            // (8) and mime (9); size it to land on the boundary or a byte past.
+            // (8) and mime (9); size it to land on the boundary or a byte past
+            // — and write the file, so the gate has the path it weighs.
+            let bytes = png(room - 8 - 8 - 9 + extra);
+            std::fs::write(app.ws.root().join("shot.png"), &bytes).unwrap();
             let image = Image {
-                bytes: png(room - 8 - 8 - 9 + extra),
+                bytes,
                 ..image("shot.png")
             };
             assert_eq!(image.weight(), room + extra);
@@ -7323,9 +7797,18 @@ mod tests {
     }
 
     /// The gate measures what the endpoint charges, not what the file weighs: a
-    /// 6 MiB image of 8×8 pixels is nowhere near the room it has, and a small
-    /// file claiming 20,000×20,000 pixels is past the whole window. File bytes
-    /// are the transport's ruler (the cap on a read); pixels are the budget's.
+    /// file at the transport's 2 MB cap whose 8×8 pixels are nowhere near the
+    /// room it has, and a small file claiming 20,000×20,000 pixels past the
+    /// whole window. File bytes are the transport's ruler (the cap on a read);
+    /// pixels are the budget's.
+    ///
+    /// The big-file side is a file at the transport's own 2 MB cap — the
+    /// largest a picture mush can carry — because the merge that made the
+    /// reader stat before it opens also made a past-cap file unreadable to the
+    /// workspace it lies in, and the gate will not hand an agent a path its own
+    /// tools refuse (`carry_images`). The cap-sized file still weighs a few
+    /// tokens: the contrast the test is about is between the file and the
+    /// picture, not between two file sizes.
     #[test]
     fn the_attach_gate_counts_pixels_not_file_bytes() {
         let (mut app, _rx) = test_app("attach-measures");
@@ -7333,15 +7816,17 @@ mod tests {
         app.cell.edit(|cfg| cfg.set_context(500_000));
         let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId::ROOT);
 
+        let cap = mush_core::workspace::IMAGE_FILE_CAP as usize;
         let bytes_heavy = Image {
-            bytes: png(6 * 1024 * 1024),
+            bytes: png(cap - 8),
             pixels: Some((8, 8)),
             ..image("huge.png")
         };
-        assert!(bytes_heavy.bytes.len() > 6 * 1024 * 1024);
+        std::fs::write(app.ws.root().join("huge.png"), &bytes_heavy.bytes).unwrap();
+        assert_eq!(bytes_heavy.bytes.len(), cap, "the transport's whole cap");
         assert!(
             bytes_heavy.weight() < room,
-            "six megabytes of file, a few tokens of picture"
+            "a full cap of file, a few tokens of picture"
         );
         assert!(app.attach_image(bytes_heavy), "it fits");
         assert_eq!(
@@ -7354,6 +7839,7 @@ mod tests {
             pixels: Some((20_000, 20_000)),
             ..image("big.png")
         };
+        std::fs::write(app.ws.root().join("big.png"), &pixel_heavy.bytes).unwrap();
         assert!(
             pixel_heavy.weight() > room,
             "a small file whose pixels do not fit the room left"
@@ -7362,7 +7848,12 @@ mod tests {
             pixel_heavy.weight() > app.cfg().history_budget(),
             "and they outweigh the whole window too"
         );
-        assert!(app.attach_image(pixel_heavy), "attached anyway");
+        assert!(!app.attach_image(pixel_heavy), "refused, not attached");
+        assert_eq!(
+            app.chat.attachments().len(),
+            1,
+            "the box holds only the picture that fit"
+        );
         let (line, kind) = app.status_line().expect("the fact is said");
         assert_eq!(kind, StatusKind::Error);
         assert!(
@@ -7371,7 +7862,7 @@ mod tests {
         );
         assert!(
             !line.contains("/compact"),
-            "and no fold makes room for it: {line}"
+            "and no fold shrinks a picture: {line}"
         );
         assert!(
             line.contains("convert"),
@@ -7381,8 +7872,8 @@ mod tests {
 
     /// Nothing in the accounting panics on a header that claims the biggest
     /// picture there is: the picture outweighs the whole window, so the gate
-    /// says so — and names the downscale — rather than wrapping around to "it
-    /// fits".
+    /// refuses it — and names the downscale — rather than wrapping around to
+    /// "it fits".
     #[test]
     fn the_attach_gate_survives_a_header_that_claims_every_pixel() {
         let (mut app, _rx) = test_app("attach-overflow");
@@ -7393,8 +7884,10 @@ mod tests {
             pixels: Some((u32::MAX, u32::MAX)),
             ..image("huge.png")
         };
+        std::fs::write(app.ws.root().join("huge.png"), &impossible.bytes).unwrap();
 
-        assert!(app.attach_image(impossible), "attached anyway");
+        assert!(!app.attach_image(impossible), "refused, not attached");
+        assert!(app.chat.attachments().is_empty(), "nothing is in the box");
 
         let (line, kind) = app.status_line().expect("the fact is said");
         assert_eq!(kind, StatusKind::Error);
@@ -7402,6 +7895,221 @@ mod tests {
         assert!(
             line.contains("convert"),
             "the downscale is the road: {line}"
+        );
+    }
+
+    /// The window's bound, at the single door: a picture that fits the whole
+    /// history budget on its own, but not with the pictures already in the box,
+    /// is refused rather than attached with a warning — no trim of the
+    /// conversation shrinks a picture, so a request carrying them would go out
+    /// over the window and the endpoint would refuse it, and attaching would
+    /// only spend a turn discovering that. `/compact` is named for what it is,
+    /// a fold of the conversation: the weight over this bound is the pictures'.
+    #[test]
+    fn a_picture_that_would_push_the_box_past_the_budget_is_refused() {
+        let (mut app, _rx) = test_app("attach-window-sum");
+        let_the_model_see(&mut app);
+        app.cell.edit(|cfg| cfg.set_context(500_000));
+        let budget = app.cfg().history_budget();
+        std::fs::create_dir_all(app.ws.root().join("shots")).unwrap();
+        let first = Image {
+            bytes: png(3 * budget / 4 - 28),
+            ..image("shots/first.png")
+        };
+        std::fs::write(app.ws.root().join("shots/first.png"), &first.bytes).unwrap();
+        assert!(first.weight() <= budget, "it fits the budget alone");
+        assert!(app.attach_image(first), "and the box was empty");
+        assert_eq!(
+            app.status_line().map(|(_, kind)| kind),
+            Some(StatusKind::Info)
+        );
+
+        let second = Image {
+            bytes: png(budget / 2 - 28),
+            ..image("shots/second.png")
+        };
+        std::fs::write(app.ws.root().join("shots/second.png"), &second.bytes).unwrap();
+        assert!(second.weight() <= budget, "it also fits the budget alone");
+
+        assert!(
+            !app.attach_image(second),
+            "the sum is past the budget: refused"
+        );
+        assert_eq!(
+            app.chat.attachments().len(),
+            1,
+            "the first is all the box holds"
+        );
+        let (line, kind) = app.status_line().expect("the refusal");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("whole history budget"), "{line}");
+        assert!(
+            line.contains("pictures already in the box"),
+            "what it is too heavy with: {line}"
+        );
+        assert!(
+            line.contains("send the box's pictures first"),
+            "a road that acts on the sum: {line}"
+        );
+        assert!(
+            line.contains("`/compact` folds the conversation, not the pictures"),
+            "the fold is named for what it is: {line}"
+        );
+    }
+
+    /// The window's bound, at the batch door: a paste whose pictures, with the
+    /// box's, would pass the whole history budget attaches *nothing* — the
+    /// gesture is atomic, so half a batch is not a thing this door makes — and
+    /// one line says how many of how many are at stake. The words land in the
+    /// box as text, which is also the road to the downscale the line names.
+    #[test]
+    fn a_batch_that_would_push_the_box_past_the_budget_attaches_nothing() {
+        let (mut app, _rx) = test_app("paste-window");
+        let_the_model_see(&mut app);
+        app.cell.edit(|cfg| cfg.set_context(500_000));
+        let budget = app.cfg().history_budget();
+        // Four pictures at two fifths of the budget each: two fit (4/5), the
+        // third crosses (6/5) and so does the fourth.
+        let each = 2 * budget / 5;
+        std::fs::create_dir_all(app.ws.root().join("shots")).unwrap();
+        for i in 0..4 {
+            std::fs::write(app.ws.root().join(format!("shots/{i}.png")), png(each - 28)).unwrap();
+        }
+        let paste = "shots/0.png shots/1.png shots/2.png shots/3.png";
+
+        app.update(Msg::Paste(paste.into()));
+
+        assert_eq!(app.chat.input().text(), paste, "the words land as text");
+        assert!(app.chat.attachments().is_empty(), "nothing attaches");
+        let (line, kind) = app.status_line().expect("the refusal");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("whole history budget"), "{line}");
+        assert!(line.contains("2 of 4 images"), "the count at stake: {line}");
+        assert!(
+            line.contains("send the box's pictures first"),
+            "a road that acts on the sum: {line}"
+        );
+        assert!(
+            line.contains("`/compact` folds the conversation, not the pictures"),
+            "the fold is named for what it is: {line}"
+        );
+        assert!(line.contains("convert"), "the downscale: {line}");
+    }
+
+    /// The box's own bound is bytes, and it is not the window's: a picture of
+    /// 8×8 pixels weighs a few tokens however large its file is. Eight files at
+    /// the transport's 2 MB cap fill the box's [`BOX_IMAGE_BYTES`] exactly; the
+    /// ninth is refused, and the line names the bound it was.
+    #[test]
+    fn a_picture_past_the_boxes_own_byte_bound_is_refused() {
+        let (mut app, _rx) = test_app("attach-box-bytes");
+        let_the_model_see(&mut app);
+        app.cell.edit(|cfg| cfg.set_context(500_000));
+        let cap = mush_core::workspace::IMAGE_FILE_CAP as usize;
+        assert_eq!(BOX_IMAGE_BYTES, cap * 8, "eight of the transport's files");
+        std::fs::create_dir_all(app.ws.root().join("shots")).unwrap();
+        for i in 0..8 {
+            let path = format!("shots/{i}.png");
+            let bytes = png(cap - 8);
+            std::fs::write(app.ws.root().join(&path), &bytes).unwrap();
+            let picture = Image {
+                path,
+                bytes,
+                pixels: Some((8, 8)),
+                ..image("unused")
+            };
+            assert!(app.attach_image(picture), "picture {i} fits the box");
+        }
+        assert_eq!(app.chat.attachments().len(), 8);
+        // The ninth is a file the transport allows and the box does not: its
+        // pixels are as cheap as any of the eight, and its bytes are what the
+        // box refuses.
+        let ninth = Image {
+            path: "shots/ninth.png".to_string(),
+            bytes: png(cap - 8),
+            pixels: Some((8, 8)),
+            ..image("unused")
+        };
+        std::fs::write(app.ws.root().join("shots/ninth.png"), &ninth.bytes).unwrap();
+        assert!(ninth.weight() < 64, "a few tokens of picture");
+
+        assert!(!app.attach_image(ninth), "past the box's bound: refused");
+        assert_eq!(app.chat.attachments().len(), 8, "the box is unchanged");
+        let (line, kind) = app.status_line().expect("the refusal");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(
+            line.contains("picture bytes"),
+            "the box's bound is named: {line}"
+        );
+        assert!(
+            line.contains(&size_label(BOX_IMAGE_BYTES)),
+            "and its number: {line}"
+        );
+        assert!(
+            line.contains("token bound cannot bound bytes"),
+            "why the window cannot be it: {line}"
+        );
+        assert!(line.contains("convert"), "the downscale: {line}");
+    }
+
+    /// The box's byte bound, at the batch door: two more files at the transport
+    /// cap do not fit beside the eight the box already holds, whatever their
+    /// pixels weigh. The batch is refused whole — nothing attaches — and the
+    /// one line names the box's bound.
+    #[test]
+    fn a_batch_past_the_boxes_own_byte_bound_attaches_nothing() {
+        let (mut app, _rx) = test_app("paste-box-bytes");
+        let_the_model_see(&mut app);
+        app.cell.edit(|cfg| cfg.set_context(500_000));
+        let cap = mush_core::workspace::IMAGE_FILE_CAP as usize;
+        // The box already holds eight cap-sized pictures; their pixels are 8×8,
+        // so it is the bytes and not the window that is nearly full.
+        for i in 0..8 {
+            app.chat.attach(Image {
+                path: format!("shots/held{i}.png"),
+                bytes: png(cap - 8),
+                pixels: Some((8, 8)),
+                ..image("unused")
+            });
+        }
+        // Two more, each a file the transport allows.
+        let mut batch = Vec::new();
+        std::fs::create_dir_all(app.ws.root().join("shots")).unwrap();
+        for i in 0..2 {
+            let path = format!("shots/extra{i}.png");
+            let bytes = png(cap - 8);
+            std::fs::write(app.ws.root().join(&path), &bytes).unwrap();
+            batch.push(Image {
+                path,
+                bytes,
+                pixels: Some((8, 8)),
+                ..image("unused")
+            });
+        }
+
+        assert!(!app.attach_images(batch), "past the box's bound: refused");
+        assert_eq!(
+            app.chat.attachments().len(),
+            8,
+            "nothing of the batch attaches"
+        );
+        let (line, kind) = app.status_line().expect("the refusal");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(
+            line.contains("picture bytes"),
+            "the box's bound is named: {line}"
+        );
+        assert!(
+            line.contains("2 images weighing"),
+            "what the batch would add: {line}"
+        );
+        assert!(
+            line.contains("token bound cannot bound bytes"),
+            "why the window cannot be it: {line}"
+        );
+        assert!(
+            line.contains("send the box's pictures first"),
+            "a road that acts on the box: {line}"
         );
     }
 
@@ -7434,6 +8142,11 @@ mod tests {
         let (mut app, _rx) = test_app("clipboard");
         let_the_model_see(&mut app);
         let conversation = app.tree.conversation();
+        // The clipboard road always writes its bytes into the workspace before
+        // the gate sees them; the file is what makes the fixture one the gate
+        // can keep the path of (a picture whose file the workspace reads back
+        // with its own bytes is carried as it is).
+        std::fs::write(app.ws.root().join("shot.png"), png(0)).unwrap();
 
         app.update(Msg::Clipboard {
             conversation,
@@ -7635,6 +8348,7 @@ mod tests {
         let (mut app, _rx) = test_app("image-only");
         let_the_model_see(&mut app);
         app.focus = Focus::Chat;
+        std::fs::write(app.ws.root().join("shot.png"), png(0)).unwrap();
         app.chat.attach(image("shot.png"));
 
         app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
@@ -7698,6 +8412,11 @@ mod tests {
     fn a_delivered_message_carries_its_images() {
         let (mut app, _rx) = test_app("deliver-images");
         let_the_model_see(&mut app);
+        // The pictures name real files holding their own bytes: a picture whose
+        // file the receiving workspace reads back byte-identically is carried
+        // as the human named it, a copy is only for one it cannot read.
+        std::fs::write(app.ws.root().join("root.png"), png(0)).unwrap();
+        std::fs::write(app.ws.root().join("child.png"), png(0)).unwrap();
 
         app.chat.attach(image("root.png"));
         app.chat.insert("look");
