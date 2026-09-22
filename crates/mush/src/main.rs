@@ -549,7 +549,9 @@ fn help_text() -> String {
          \x20   --print-config     Print the resolved config (endpoint, provider, the stored\n\
          \x20                      session, model, window and whether it was stated,\n\
          \x20                      temperature, reasoning effort and thinking mode, reply-cap\n\
-         \x20                      size and name, key masked, auto-approve and theme) and exit 0\n\n\
+         \x20                      size and name, the schemas it reserves and the history\n\
+         \x20                      budget they leave, key masked, auto-approve and theme)\n\
+         \x20                      and exit 0\n\n\
          KEYS:\n{keys}\n\n\
          COMMANDS (type in the chat):\n\
          {commands}\n\
@@ -649,9 +651,13 @@ fn resolved_config(
 /// `.mush/`, no request to an endpoint. This is what makes a hand-edited home
 /// file debuggable, and the only way to see the precedence chain rather than
 /// guess at it.
+///
+/// One column, wide enough for the longest name (`history budget`): a name that
+/// overflows its padding runs into its own value, and `history budget1291500
+/// bytes` is not a line a human can read.
 fn print_config(config: &Config, stored: &session::Stored, theme: &theme::Theme) {
     for (field, value) in describe(config, auto_approve(), stored, theme) {
-        println!("{field:<13}{value}");
+        println!("{field:<15}{value}");
     }
 }
 
@@ -715,6 +721,19 @@ fn describe(
     // number a truncated run makes a human want to see. The size is derived
     // from the window, under the same name the request will carry it.
     let reply_cap = format!("{} tokens as {cap}", config.reply_cap());
+    // The other two numbers of the request reserve, resolved for this window:
+    // the schemas every request pays for ([`config::SCHEMA_TOKENS`], the
+    // constant `request_reserve` reads), and the history they leave
+    // ([`Config::history_budget`], the function the trimmer is handed). The
+    // manual's words say this dump prints what the constants resolve to;
+    // printing the reply cap alone left a human to re-derive the other two
+    // (audit D5).
+    let schemas = format!("{} tokens", config::SCHEMA_TOKENS);
+    let history_budget = format!(
+        "{} bytes ({} tokens)",
+        config.history_budget(),
+        config.history_budget() / config::BYTES_PER_TOKEN
+    );
     // Both of these are stated values with a provider default, so the line says
     // which one a request will carry *and* where it came from: a value nobody
     // stated is the provider's, not the human's. Indexed by `stated`, so the
@@ -755,6 +774,8 @@ fn describe(
         ("reasoning".to_string(), effort),
         ("thinking".to_string(), thinking),
         ("reply cap".to_string(), reply_cap),
+        ("schemas".to_string(), schemas),
+        ("history budget".to_string(), history_budget),
         ("api key".to_string(), key),
         ("auto-approve".to_string(), approve.to_string()),
         // What the chrome would look like, hue and source together: a human
@@ -1363,6 +1384,20 @@ mod tests {
             field("reply cap"),
             format!("{} tokens as max_completion_tokens", cfg.reply_cap()),
             "the cap the config derives, under the name it chose"
+        );
+        assert_eq!(
+            field("schemas"),
+            format!("{} tokens", config::SCHEMA_TOKENS),
+            "the schema reserve every request pays, from the constant the run reads"
+        );
+        assert_eq!(
+            field("history budget"),
+            format!(
+                "{} bytes ({} tokens)",
+                cfg.history_budget(),
+                cfg.history_budget() / config::BYTES_PER_TOKEN
+            ),
+            "the history those leave, from the function the trimmer is handed"
         );
         assert_eq!(field("api key"), "sk-1…7890 (masked)");
         assert_eq!(field("auto-approve"), "yes (-y recorded; nothing asks yet)");
