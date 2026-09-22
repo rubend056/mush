@@ -26,11 +26,11 @@ pub use userconfig::UserConfig;
 pub use workspace::Workspace;
 
 /// Ceiling for bytes of command output handed to a model in one result. The
-/// command is now the only road by which a big text result reaches the model —
-/// the file tools are gone — so this is the old read ceiling, and
-/// `Config::cmd_cap` scales it down to the room a cut leaves between its
-/// stopping point (four fifths of the history budget) and the ceiling for a
-/// window too small to hold it.
+/// command is no longer the only road by which a big text result reaches the
+/// model — `read_file` is back, and its window is cut to the same cap — so this
+/// is still the ceiling `Config::cmd_cap` scales down to the room a cut leaves
+/// between its stopping point (four fifths of the history budget) and the
+/// ceiling for a window too small to hold it.
 pub const CMD_CAP: usize = 16_000;
 /// How long a shell command may run before it is killed.
 pub const CMD_TIMEOUT_SECS: u64 = 120;
