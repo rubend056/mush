@@ -662,6 +662,21 @@ pub enum AgentEvent {
         child: u64,
         command: AgentMsg,
     },
+    /// A parent's `control message` sent words to a child it found *at rest*,
+    /// so a run is beginning on the child's own thread.
+    ///
+    /// The parent's books say so the moment the send lands (`ActorState::running`),
+    /// and the tree is the other reader of that fact: the child's own `Running`
+    /// event is a moment away, and until it lands the row still reads "at rest"
+    /// — which is exactly what `park_history` reclaims. One `tick` in that
+    /// window sends `Shutdown` and cancels the run the words just started (§8.21).
+    /// The mark the UI sets is the optimistic one the human's own nudge sets
+    /// ([`AgentTree::nudge`](crate::app::AgentTree::nudge)), and the child's own
+    /// events settle it a moment later. A child already mid-run needs none: its
+    /// row is busy already, and the words wait for a message boundary.
+    ChildResumed {
+        child: u64,
+    },
     Error(String),
     /// A job this agent started began running in the background. The registry
     /// is where a job lives; this is only what tells the screen to look at it.
@@ -4205,6 +4220,13 @@ fn message_agent(
             // running: a wait must not answer the old result, and the
             // shared-workspace guard must see it (audit row 1).
             state.running.insert(id);
+            // And the *tree's* row still reads "at rest" until the child's own
+            // `Running` event lands: one `tick` in that window is a
+            // `park_history` whose `Shutdown` cancels this very run. The mark
+            // travels now, with the send, because the send is the fact.
+            actor
+                .ctx
+                .emit(actor.id, AgentEvent::ChildResumed { child: id });
             Ok(format!(
                 "messaged agent #{id} — it was at rest, so this resumes it"
             ))
@@ -5714,6 +5736,43 @@ mod tests {
         .unwrap();
         assert!(sent.contains("resumes it"), "{sent}");
         assert!(state.running.contains(&1));
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A send that *resumes* a child the tree still reads as at rest travels
+    /// with its mark: the child's own `Running` event is a moment behind, and
+    /// one `tick` in between is a `park_history` whose `Shutdown` would cancel
+    /// the run the words just started (§8.21). The parent's books are one
+    /// reader of that fact; the tree's row is the other.
+    #[test]
+    fn resuming_a_child_reports_the_mark_the_tree_needs() {
+        let (actor, events, _mailbox) = recording_actor("resume-mark");
+        let mut state = ActorState::default();
+        let (child_tx, child_rx) = crossbeam_channel::unbounded();
+        state.children.insert(1, child_tx);
+        state.shared.insert(1);
+
+        exec_tool(
+            &actor,
+            &mut state,
+            ToolName::Control,
+            &json!({ "id": "1", "action": "message", "text": "carry on" }),
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(child_rx.try_recv(), Ok(AgentMsg::Steer(words)) if words == "carry on"),
+            "the words land in the child's mailbox"
+        );
+        assert!(
+            events
+                .events_for(AgentId(7))
+                .iter()
+                .any(|event| matches!(event, AgentEvent::ChildResumed { child: 1 })),
+            "and so does the mark the tree's row needs: {:?}",
+            events.events_for(AgentId(7))
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 

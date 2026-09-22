@@ -1459,11 +1459,33 @@ impl App {
                 // gone really is gone, and `deliver_to_actor` starts nothing
                 // for it.
                 //
-                // The answer is dropped rather than used: the parent wrote its
-                // model a reply before this event reached the UI thread, and
-                // what settles the parent's books from here is the child's own
-                // `ChildRunning` and `ChildDone` (finding H18).
-                let _ = self.deliver_to_actor(AgentId(child), command);
+                // The answer is dropped rather than used, but whether a
+                // *resume* just landed is not: the parent wrote its model a
+                // reply before this event reached the UI thread, and what
+                // settles the parent's books from here is the child's own
+                // `ChildRunning` and `ChildDone` (finding H18) — while the
+                // tree's row is settled by the child's `Running`, which the
+                // words this door just delivered will make it emit.
+                let resumes = matches!(command, AgentMsg::Steer(_));
+                if self.deliver_to_actor(AgentId(child), command) && resumes {
+                    // The run those words start is already walking toward the
+                    // UI: a `tick` before its `Running` lands is a
+                    // `park_history` whose `Shutdown` cancels it, and the
+                    // revived actor is exactly the thread to receive one. The
+                    // mark is the optimistic one the human's own nudge sets;
+                    // the child's own events settle it a moment later.
+                    self.tree.nudge(AgentId(child));
+                }
+            }
+            AgentEvent::ChildResumed { child } => {
+                // A parent's `control message` sent words into a child the tree
+                // still reads as at rest: the child's `Running` event is on its
+                // way, and one `tick` in between is a `park_history` whose
+                // `Shutdown` cancels the run the words started. Mark the row
+                // with the same optimistic phase the human's own nudge sets
+                // (its doc says why it is safe); the child's own events replace
+                // it as they arrive.
+                self.tree.nudge(AgentId(child));
             }
             AgentEvent::Reclaimed { landing } => {
                 // The actor's own run end swept its worktree: the checkout and
@@ -4149,6 +4171,149 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A parent's `control message` can land in a child the tree still reads as
+    /// at rest: the send succeeds the moment the tool call returns, and the
+    /// child's own `Running` event — the only thing that would mark the row —
+    /// is a moment behind. A `tick` in that window used to run `park_history`,
+    /// whose `Shutdown` cancels the run the words just started, and the child
+    /// then reported `Stopped` about a run nobody stopped (§8.21).
+    #[test]
+    fn a_control_message_keeps_a_child_out_of_the_parking_tick() {
+        let root = repo("control-park-window");
+        // The parent's one turn: message the child nothing has marked busy.
+        // A *real* root, so its events land on the UI channel this test reads —
+        // a scripted root records them instead.
+        let call = serde_json::json!({
+            "id": "#2",
+            "action": "message",
+            "text": "carry on"
+        });
+        let first = serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": "c0",
+                        "type": "function",
+                        "function": { "name": "control", "arguments": call.to_string() }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })
+        .to_string();
+        let then = r#"{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#
+            .to_string();
+        let port = two_reply_endpoint(first, then);
+        let (mut app, rx) = app_root_at(
+            &root,
+            None,
+            session_save::fake::Recorder::new(),
+            &format!("http://127.0.0.1:{port}"),
+        );
+        // Ten finished children of the root: the newest keep their threads
+        // warm, so #2 is exactly what the parking pass may reclaim.
+        let mailboxes: Vec<Receiver<AgentMsg>> =
+            (1..=10).map(|id| finished_child(&mut app, id)).collect();
+        // The rows are on screen; the books a `control` reads are the actor's,
+        // so the parent is handed them (`App::seed_children`).
+        app.seed_children();
+        assert!(
+            app.tree.parkable().contains(&AgentId(2)),
+            "the child this test messages is park-eligible to start with"
+        );
+
+        // The parent runs and messages #2, whose mailbox the test holds. There
+        // is no child actor to emit `Running` — which is exactly the moment the
+        // race lives in — so the test does not wait for one.
+        app.tree.agent_tx[&AgentId::ROOT]
+            .send(AgentMsg::Nudge("go".into()))
+            .unwrap();
+        let words = mailboxes[1].recv_timeout(Duration::from_secs(5));
+        assert!(
+            matches!(words, Ok(AgentMsg::Steer(ref text)) if text == "carry on"),
+            "the parent's message landed in the child's live mailbox: {words:?}"
+        );
+        // Everything the UI has heard before the frame: the parent's run, and
+        // the mark the send travels with.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut done = false;
+        while !done && Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(msg) => {
+                    done = matches!(
+                        &msg,
+                        Msg::Agent {
+                            id,
+                            event: AgentEvent::Done,
+                            ..
+                        } if *id == AgentId::ROOT
+                    );
+                    app.update(msg);
+                }
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        assert!(done, "the parent's run never came back");
+
+        // One frame, the one `park_history` runs on.
+        app.tick();
+
+        assert!(
+            !matches!(mailboxes[1].try_recv(), Ok(AgentMsg::Shutdown)),
+            "the parking tick must not Shutdown the run the message started"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The other door into the same window: the parent's `control` found the
+    /// child *parked*, so the UI is the hand that rebuilds its actor
+    /// (`ChildAsleep`) — and the revived actor's `Running` is again a moment
+    /// behind. One tick in between must not park the thread the words just
+    /// woke (§8.21).
+    #[test]
+    fn a_woken_child_is_not_parked_before_its_own_running_lands() {
+        let (mut app, rx) = test_app("child-wake-park-window");
+        // Ten finished children of the root, so #2 is past `WARM_CHILDREN` and
+        // the parking pass may reclaim it.
+        let mut mailboxes: Vec<Receiver<AgentMsg>> =
+            (1..=10).map(|id| finished_child(&mut app, id)).collect();
+        // #2 parked: the tree holds the mailbox and nobody holds the receiver,
+        // which is what reclaiming a finished child's thread leaves.
+        drop(mailboxes.remove(1));
+        assert!(
+            app.tree.parkable().contains(&AgentId(2)),
+            "the child the parent woke is park-eligible to start with"
+        );
+
+        // What the parent's actor emits when its send finds no actor there,
+        // and the UI revives the child to take the words.
+        app.update(Msg::Agent {
+            conversation: app.tree.conversation(),
+            id: AgentId::ROOT,
+            event: AgentEvent::ChildAsleep {
+                child: 2,
+                command: AgentMsg::Steer("carry on".into()),
+            },
+        });
+
+        // One frame, the one `park_history` runs on — taken before the woken
+        // actor's `Running` has been applied, which is the whole race.
+        app.tick();
+
+        assert!(
+            runs(&mut app, &rx, AgentId(2)),
+            "the woken child's run begins instead of being Shutdown"
+        );
+        let after = events_from(&rx, AgentId(2), Duration::from_millis(500));
+        assert!(
+            !after.iter().any(|event| event.starts_with("Stopped")),
+            "and is not cancelled a moment later: {after:?}"
+        );
+    }
+
     /// A command for a child the tree no longer has starts nothing: the UI opens
     /// doors to the agents that are here, and a message — however old — never
     /// makes it invent one (finding H18).
@@ -5117,22 +5282,34 @@ mod tests {
     /// the only reader is a tool, and `agent::revive` builds the revived actor
     /// its own `HttpModel` from the cell — so the URL is the one hand a test has
     /// on it, and this is the smallest endpoint that gets a `status` out of it
-    /// (finding H25). The answers go out in request order across connections,
-    /// because the client keeps one connection alive and reuses it; anything
-    /// past the second reply gets "done" again, so a stray retry ends the run
-    /// rather than hanging it.
+    /// (finding H25).
     fn status_endpoint() -> u16 {
+        two_reply_endpoint(
+            r#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"c0","type":"function","function":{"name":"status","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#
+                .to_string(),
+            r#"{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#
+                .to_string(),
+        )
+    }
+
+    /// A loopback endpoint that answers the first request with `first` and
+    /// every one after with `then`.
+    ///
+    /// Nothing else can put words in an actor's model: `agent::revive` — and
+    /// the root [`app_root_at`] starts — build their own `HttpModel` from the
+    /// config cell, so the URL is the one hand a test has on it. The answers go
+    /// out in request order across connections, because the client keeps one
+    /// connection alive and reuses it; anything past the second reply gets
+    /// `then` again, so a stray retry ends the run rather than hanging it.
+    fn two_reply_endpoint(first: String, then: String) -> u16 {
         use std::net::TcpListener;
 
-        let answers = [
-            r#"{"choices":[{"message":{"role":"assistant","content":"","tool_calls":[{"id":"c0","type":"function","function":{"name":"status","arguments":"{}"}}]},"finish_reason":"tool_calls"}]}"#,
-            r#"{"choices":[{"message":{"role":"assistant","content":"done"},"finish_reason":"stop"}]}"#,
-        ];
+        let answers = [first, then];
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let port = listener.local_addr().unwrap().port();
 
         /// Answer requests on one connection until the client stops writing.
-        fn answer(connection: std::net::TcpStream, answers: &[&str; 2], served: &mut usize) {
+        fn answer(connection: std::net::TcpStream, answers: &[String; 2], served: &mut usize) {
             use std::io::{BufRead, BufReader, Read, Write};
 
             let mut connection = BufReader::new(connection);
