@@ -540,6 +540,18 @@ pub struct App {
     /// screen reads and the cell every actor reads, in one owner.
     pub cell: ConfigCell,
     pub focus: Focus,
+    /// Whether the zen view is on: the focused pane takes the whole screen
+    /// (`Ctrl-F`).
+    ///
+    /// A view, so it changes what a frame paints and nothing else: no notice is
+    /// said, no session is written, no message goes out. The mouse is never
+    /// captured on purpose (finding K3), so the terminal owns selection and a
+    /// drag takes a rectangle of screen cells — at 80 columns that rectangle
+    /// starts in the agents pane, which is how a paragraph copied from the
+    /// conversation arrives with the tree's lines in front of it. `Ctrl-N`
+    /// leaves it as the human set it: the view is the human's, not the
+    /// conversation's.
+    pub zen: bool,
     /// The conversation: the transcripts the screen shows, the notices, the
     /// message box and the context meter, in one value.
     pub chat: Chat,
@@ -625,6 +637,7 @@ impl App {
             ws,
             cell,
             focus: Focus::Chat,
+            zen: false,
             chat: Chat::new(system, messages),
             // Empty until a fetch says otherwise: the model list is discovered
             // on its own thread so nothing about an endpoint delays the first
@@ -3062,6 +3075,26 @@ impl App {
         self.dirty_screen = true;
     }
 
+    /// `Ctrl-F`: the focused pane takes the whole screen, and back.
+    ///
+    /// Why the view exists: mush deliberately never captures the mouse (finding
+    /// K3), so selection belongs to the terminal and a drag takes a rectangle
+    /// of screen cells — at 80 columns and up, the left column is the agents
+    /// pane, and a drag across the conversation comes back with the tree's rows
+    /// in front of the paragraph. The cheapest honest answer is a view where
+    /// one pane covers the screen, so a rectangle can hold one pane's text and
+    /// nothing else.
+    ///
+    /// A view like [`Self::toggle_reasoning`], so it is not said and not
+    /// stored: `dirty_screen` is the whole record, and `Ctrl-N` keeps the
+    /// choice — the view is the human's and not the conversation's.
+    /// [`Self::screen`] lays the panes out from this and `self.focus`,
+    /// so `Tab` is what switches which pane is full-screen.
+    fn toggle_zen(&mut self) {
+        self.zen = !self.zen;
+        self.dirty_screen = true;
+    }
+
     /// Forget the finished children the history window is done with, and park
     /// the actor threads of the ones it keeps — the two halves of §8.21's
     /// "everything needs a cap, even a high one", run from `tick` because both
@@ -3329,6 +3362,7 @@ impl App {
             Intent::InterruptAll => self.interrupt_all(),
             Intent::OpenModelPicker => self.open_model_picker(),
             Intent::ToggleReasoning => self.toggle_reasoning(),
+            Intent::ToggleZen => self.toggle_zen(),
             Intent::CycleFocus(direction) => self.cycle_focus(direction),
             Intent::PickerClose => self.picker = None,
             Intent::PickerPick => self.pick_cursor(),
@@ -4299,6 +4333,13 @@ mod tests {
             KeyCode::Char(key),
             KeyModifiers::CONTROL,
         )));
+    }
+
+    /// A press of the pane cycle, through the key table and the arms: the key
+    /// that decides which pane is focused — and so, under zen, which pane is
+    /// full-screen.
+    fn tab(app: &mut App) {
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
     }
 
     /// A real `App` on a scratch directory, with a real (idle) root actor. The
@@ -5532,6 +5573,11 @@ mod tests {
                 panes.chat.transcript_area,
                 panes.chat.input_area,
             ] {
+                // A pane zen hid is a zero rect: it has no rows to keep
+                // intact, and no bottom border to find.
+                if rect.height == 0 {
+                    continue;
+                }
                 // The sides, from just under the top border to just above the
                 // bottom one: the top row carries the pane's title, which may
                 // reach either corner.
@@ -5677,6 +5723,32 @@ mod tests {
             })
             .collect();
         Shot { screen, cells }
+    }
+
+    /// The pane rects one frame derives, and whether the chat pane has a
+    /// transcript at all. The zen view's claims are claims about these — "the
+    /// focused pane took the width", "the box kept its rows" — so these tests
+    /// read the `Screen` the frame was derived from, not the text it painted.
+    #[derive(Debug, PartialEq)]
+    struct PaneRects {
+        agents: Rect,
+        transcript: Rect,
+        input: Rect,
+        bar: Rect,
+        transcript_painted: bool,
+    }
+
+    fn pane_rects(app: &mut App, width: u16, height: u16) -> PaneRects {
+        match painted(app, width, height).0 {
+            Screen::Panes(panes) => PaneRects {
+                agents: panes.agents.area,
+                transcript: panes.chat.transcript_area,
+                input: panes.chat.input_area,
+                bar: panes.bar.area,
+                transcript_painted: panes.chat.transcript.is_some(),
+            },
+            Screen::Floor { .. } => panic!("{width}×{height} is below the floor"),
+        }
     }
 
     /// One painted frame, cell by cell and borders included: a leak lands *on*
@@ -10459,6 +10531,220 @@ mod tests {
         assert!(
             !app.chat.shows_reasoning(),
             "the human's view outlives the chat it was set in"
+        );
+    }
+
+    /// Zen's whole promise, at the ubiquitous 80×24 and on a wide terminal:
+    /// the focused pane takes the columns the two panes shared — the rectangle
+    /// a terminal drag can take without a line of the other pane in it (finding
+    /// K3) — while the bar and the message box keep the rows they had, so the
+    /// view moves the panes' frame and not the conversation in it.
+    #[test]
+    fn zen_gives_the_focused_pane_the_two_panes_width_at_every_size() {
+        let (mut app, _rx) = test_app("zen-layout");
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("hello"));
+        for (width, height) in [(80u16, 24u16), (200, 40)] {
+            let at = format!("{width}×{height}");
+            let two = pane_rects(&mut app, width, height);
+            assert!(two.agents.width > 0, "{at}: the two-pane frame to measure");
+            assert!(
+                two.transcript.width < width,
+                "{at}: the chat shares the frame with the tree"
+            );
+
+            // Chat focused: the transcript and its box are the whole frame
+            // above the bar, and the agents pane is a zero rect — not a hidden
+            // pane, so nothing can paint in it.
+            ctrl(&mut app, 'f');
+            let zen = pane_rects(&mut app, width, height);
+            assert_eq!(
+                zen.agents,
+                Rect::new(0, 0, 0, 0),
+                "{at}: the agents pane is not painted"
+            );
+            assert_eq!(zen.transcript.x, 0, "{at}: the chat starts at the left");
+            assert_eq!(
+                zen.transcript.width, width,
+                "{at}: the chat has the two-pane width"
+            );
+            assert_eq!(zen.transcript.y, two.transcript.y, "{at}: and its rows");
+            assert_eq!(
+                zen.transcript.height + zen.input.height,
+                two.transcript.height + two.input.height,
+                "{at}: the internal split keeps its rows"
+            );
+            assert_eq!(
+                zen.transcript.bottom(),
+                zen.input.y,
+                "{at}: the transcript sits on its box"
+            );
+            assert_eq!(zen.input.y, two.input.y, "{at}: the box keeps its rows");
+            assert_eq!(
+                zen.input.height, two.input.height,
+                "{at}: the box keeps its rows"
+            );
+            assert_eq!(zen.bar, two.bar, "{at}: and so does the bar");
+            assert!(zen.transcript_painted, "{at}: the transcript still paints");
+            shot(&mut app, width, height).assert_shape("zen chat", width, height);
+            ctrl(&mut app, 'f');
+
+            // Agents focused: the tree is the whole width above the box, and
+            // the chat is reduced to its message box below it.
+            tab(&mut app);
+            assert_eq!(app.focus, Focus::Agents, "{at}: Tab moves the keyboard");
+            ctrl(&mut app, 'f');
+            let tree = pane_rects(&mut app, width, height);
+            assert_eq!(tree.agents.x, 0, "{at}: the tree starts at the left");
+            assert_eq!(
+                tree.agents.width, width,
+                "{at}: the tree has the two-pane width"
+            );
+            assert_eq!(
+                tree.agents.height + tree.input.height,
+                two.agents.height,
+                "{at}: the tree and the box take the rows the tree had"
+            );
+            assert_eq!(
+                tree.agents.bottom(),
+                tree.input.y,
+                "{at}: the tree sits on the box"
+            );
+            assert_eq!(
+                tree.transcript.height, 0,
+                "{at}: the chat's transcript has no rows"
+            );
+            assert!(
+                !tree.transcript_painted,
+                "{at}: so `ChatPane::transcript` is `None`"
+            );
+            assert_eq!(tree.input.y, two.input.y, "{at}: the box keeps its rows");
+            assert_eq!(
+                tree.input.height, two.input.height,
+                "{at}: the box keeps its rows"
+            );
+            assert_eq!(tree.input.x, 0, "{at}: and takes the width");
+            assert_eq!(tree.input.width, width, "{at}: and takes the width");
+            assert_eq!(tree.bar, two.bar, "{at}: and the bar keeps its rows");
+            shot(&mut app, width, height).assert_shape("zen tree", width, height);
+            ctrl(&mut app, 'f');
+            tab(&mut app);
+            assert_eq!(app.focus, Focus::Chat, "{at}: back where the size began");
+        }
+    }
+
+    /// With zen on, the layout reads the focus — the fact `Tab` already cycles
+    /// — so the pane cycle is the whole of "which pane is full-screen".
+    #[test]
+    fn zen_tabs_between_the_full_screen_panes() {
+        let (mut app, _rx) = test_app("zen-tab");
+        ctrl(&mut app, 'f');
+        let chat = pane_rects(&mut app, 80, 24);
+        assert_eq!(chat.transcript.width, 80, "the chat has the frame");
+        assert_eq!(chat.agents.width, 0, "and the tree has nothing");
+
+        tab(&mut app);
+        let tree = pane_rects(&mut app, 80, 24);
+        assert_eq!(tree.agents.width, 80, "Tab hands the frame to the tree");
+        assert_eq!(tree.transcript.width, 80, "the box still spans the frame");
+        assert_eq!(tree.transcript.height, 0, "with no transcript above it");
+
+        tab(&mut app);
+        assert_eq!(
+            pane_rects(&mut app, 80, 24),
+            chat,
+            "and Tab again hands it back"
+        );
+    }
+
+    /// Zen is a view, and the same key puts the frame back: the two panes, the
+    /// same rects, the same box rows.
+    #[test]
+    fn toggling_zen_back_restores_the_two_panes() {
+        let (mut app, _rx) = test_app("zen-back");
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("hello"));
+        let before = pane_rects(&mut app, 120, 32);
+        ctrl(&mut app, 'f');
+        assert_ne!(
+            pane_rects(&mut app, 120, 32),
+            before,
+            "the view changed the frame"
+        );
+        ctrl(&mut app, 'f');
+        assert_eq!(
+            pane_rects(&mut app, 120, 32),
+            before,
+            "and the same key is the road back"
+        );
+    }
+
+    /// `Ctrl-F` is a view key, so it rides the app-wide `Ctrl-` block: it works
+    /// from the chat and from the tree, it is off until asked for, and `Ctrl-N`
+    /// leaves it as the human set it — the view is the human's, not the
+    /// conversation's.
+    #[test]
+    fn ctrl_f_toggles_zen_from_both_panes() {
+        let (mut app, _rx) = test_app("zen-key");
+        assert!(!app.zen, "the zen view is off until asked for");
+        assert_eq!(app.focus, Focus::Chat, "the test starts in the chat");
+        ctrl(&mut app, 'f');
+        assert!(app.zen, "the chat pane's keyboard reaches the key");
+        ctrl(&mut app, 'f');
+        assert!(!app.zen, "and the same key takes it back");
+
+        tab(&mut app);
+        assert_eq!(app.focus, Focus::Agents);
+        ctrl(&mut app, 'f');
+        assert!(app.zen, "the agents pane's keyboard reaches it too");
+        ctrl(&mut app, 'n');
+        assert!(app.zen, "a new chat leaves the view as the human set it");
+    }
+
+    /// The counts of who is working are the one fact that lives only in the
+    /// agents pane's title, so zen moves them to the title of the pane that is
+    /// still on screen: the conversation pane's. The hidden-row counts stay
+    /// behind — `▲N`/`▼N` is arithmetic about a list the view does not paint.
+    #[test]
+    fn zen_keeps_the_agents_counts_in_the_conversation_panes_title() {
+        let (mut app, _rx) = test_app("zen-counts");
+        // Twenty rows in a pane that shows eighteen: the agents pane's own
+        // title drops its tail, and the tail is the `waiting` clause.
+        crowd(&mut app, 19);
+        let two = screen(&mut app, 80, 24);
+        assert!(
+            two[0].contains('▼'),
+            "the agents pane hides rows and says so: {}",
+            two[0]
+        );
+        assert!(two[0].contains("19 working"), "{}", two[0]);
+        assert!(
+            !two[0].contains("waiting"),
+            "and its own title had to drop the waiting count: {}",
+            two[0]
+        );
+
+        ctrl(&mut app, 'f');
+        let zen = screen(&mut app, 80, 24);
+        assert!(
+            zen[0].contains(" mush "),
+            "the conversation pane's title is painted: {}",
+            zen[0]
+        );
+        assert!(zen[0].contains("19 working"), "{}", zen[0]);
+        assert!(
+            zen[0].contains("1 waiting"),
+            "the clause the hidden title dropped is readable again: {}",
+            zen[0]
+        );
+        assert!(
+            !zen[0].contains('▲') && !zen[0].contains('▼'),
+            "the hidden rows are not a fact about a pane with no rows: {}",
+            zen[0]
+        );
+        assert!(
+            !zen.iter().any(|row| row.contains(" agents ")),
+            "the agents pane is not painted: {zen:?}"
         );
     }
 

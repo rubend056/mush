@@ -120,6 +120,11 @@ pub const KEYS: &[Binding] = &[
     },
     Binding {
         context: Context::Anywhere,
+        keys: "Ctrl-F",
+        help: "the focused pane takes the whole screen, and back",
+    },
+    Binding {
+        context: Context::Anywhere,
         keys: "Tab / Shift-Tab",
         help: "cycle panes (agents, chat)",
     },
@@ -344,6 +349,10 @@ pub enum Intent {
     /// A view: the reasoning is already stored with the turn, so this changes
     /// what the pane paints and nothing else.
     ToggleReasoning,
+    /// Show or hide the zen view: the focused pane takes the whole screen
+    /// (`Ctrl-F`). A view in the same sense as `Ctrl-T`'s: it changes what the
+    /// frame paints and nothing else.
+    ToggleZen,
     /// Cycle the pane focus: `+1` for `Tab`, `-1` for `Shift-Tab`.
     CycleFocus(i64),
     PickerClose,
@@ -400,6 +409,7 @@ pub fn key(focus: Focus, picker_open: bool, key: KeyEvent) -> Intent {
             KeyCode::Char('n') => return Intent::NewChat,
             KeyCode::Char('p') => return Intent::OpenModelPicker,
             KeyCode::Char('t') => return Intent::ToggleReasoning,
+            KeyCode::Char('f') => return Intent::ToggleZen,
             _ => {}
         }
     }
@@ -538,6 +548,7 @@ mod tests {
                     (ctrl('n'), Intent::NewChat),
                     (ctrl('p'), Intent::OpenModelPicker),
                     (ctrl('t'), Intent::ToggleReasoning),
+                    (ctrl('f'), Intent::ToggleZen),
                     (none(KeyCode::Tab), Intent::CycleFocus(1)),
                     (none(KeyCode::BackTab), Intent::CycleFocus(-1)),
                     // Shift-Tab is also reported as BackTab with SHIFT held.

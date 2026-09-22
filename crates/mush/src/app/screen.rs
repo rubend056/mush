@@ -259,7 +259,8 @@ pub struct ChatPane {
     pub input_area: Rect,
     /// The transcript as `Chat` rendered it, windowed to the room it has, or
     /// `None` when the pane has no inner room at all — a pane that short paints
-    /// its border and nothing else.
+    /// its border and nothing else — or no rows to paint by construction, which
+    /// is how the zen view leaves the message box alone on screen.
     pub transcript: Option<Painted>,
     /// The message box as it is painted, or `None` for the same reason.
     pub input: Option<InputPane>,
@@ -374,9 +375,53 @@ impl App {
             (columns[0], columns[1], rows[1])
         };
 
+        // The zen view ([`App::zen`]): the focused pane takes what the two
+        // panes shared, because the terminal's own drag — mush deliberately
+        // does not capture the mouse (finding K3) — takes a rectangle of cells,
+        // and at 80 columns that rectangle starts in the agents pane. The
+        // two-pane layout above is the source of every row this hands over, so
+        // the pane that keeps its place keeps exactly the rows it had.
+        let (agents_area, chat) = match (self.zen, self.focus) {
+            (false, _) => (agents_area, self.chat_pane(chat_area)),
+            // The chat takes the rows above the bar whole — what the agents
+            // pane and the chat had between them — and the agents pane becomes
+            // a zero rect, so nothing can paint in it.
+            (true, Focus::Chat) => (
+                Rect::new(area.x, area.y, 0, 0),
+                self.chat_pane(Rect::new(
+                    area.x,
+                    area.y,
+                    area.width,
+                    bar_area.y.saturating_sub(area.y),
+                )),
+            ),
+            // The message box keeps the rows the two-pane layout gave it — its
+            // own split, not a re-derivation — and takes the width; the tree
+            // gets everything above it.
+            (true, Focus::Agents) => {
+                let split =
+                    Layout::vertical([Constraint::Min(3), Constraint::Length(self.input_rows())])
+                        .split(chat_area);
+                let box_area = Rect {
+                    x: area.x,
+                    width: area.width,
+                    ..split[1]
+                };
+                (
+                    Rect::new(
+                        area.x,
+                        area.y,
+                        area.width,
+                        box_area.y.saturating_sub(area.y),
+                    ),
+                    self.chat_box(box_area),
+                )
+            }
+        };
+
         Screen::Panes(Box::new(Panes {
             agents: self.agents_pane(agents_area),
-            chat: self.chat_pane(chat_area),
+            chat,
             bar: self.bar_pane(bar_area),
             picker: self.picker_pane(area),
             focus: self.focus,
@@ -387,6 +432,22 @@ impl App {
     /// links, so a child is drawn under its parent rather than after everything
     /// spawned before it (finding U4) — the cursor row's footer, and the title.
     fn agents_pane(&self, area: Rect) -> AgentsPane {
+        // A pane zen hid is a zero rect: there are no columns to fit a row into
+        // and no row to paint, so nothing is derived for it — the same choice
+        // `Screen::Floor` makes when it builds no panes at all, so a hidden
+        // pane cannot paint a shard of itself. The counts a title would carry
+        // are not lost: the conversation pane's title reads them from
+        // `agent_count_cells`.
+        if area.width == 0 || area.height == 0 {
+            return AgentsPane {
+                area,
+                list_area: inner(area),
+                title: String::new(),
+                rows: Vec::new(),
+                cursor: 0,
+                footer: Vec::new(),
+            };
+        }
         let inner = inner(area);
         let nodes = self.tree.rows();
         let cursor = self.tree.cursor();
@@ -530,22 +591,47 @@ impl App {
 
     /// The chat column: the transcript `Chat` renders and the message box.
     fn chat_pane(&self, area: Rect) -> ChatPane {
-        // The box grows with the message: a multi-line draft has to be visible,
-        // not hidden behind a one-line window. It stops growing so the
-        // transcript keeps the screen.
-        let input_lines = (self.chat.input().line_count() as u16).clamp(1, MAX_INPUT_LINES);
-        // And it grows with the attachments, which are painted above the text:
-        // a row the box does not have is a row the message being typed is
-        // pushed out of.
-        let attachment_count = self.chat.attachments().len().min(MAX_ATTACHMENT_ROWS) as u16;
-        let rows = Layout::vertical([
-            Constraint::Min(3),
-            Constraint::Length(input_lines + attachment_count + 2),
-        ])
-        .split(area);
-        let transcript_area = rows[0];
-        let input_area = rows[1];
+        let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(self.input_rows())])
+            .split(area);
+        self.chat_pane_with(rows[0], rows[1])
+    }
 
+    /// The rows the message box wants: the draft's lines, capped so the pane
+    /// keeps the screen, plus the attachment rows and the box's two border
+    /// rows. The box grows with the message — a multi-line draft has to be
+    /// visible, not hidden behind a one-line window — and with the attachments,
+    /// which are painted above the text: a row the box does not have is a row
+    /// the message being typed is pushed out of.
+    ///
+    /// One derivation, because two layouts read it: the split above, and the
+    /// zen view, which has to hand the box exactly the rows this gives it so
+    /// the box does not move when the tree takes the screen.
+    fn input_rows(&self) -> u16 {
+        let input_lines = (self.chat.input().line_count() as u16).clamp(1, MAX_INPUT_LINES);
+        let attachment_count = self.chat.attachments().len().min(MAX_ATTACHMENT_ROWS) as u16;
+        input_lines + attachment_count + 2
+    }
+
+    /// The chat pane when zen hides its transcript: the message box alone, in
+    /// `area`, with a transcript area of no rows — so `ChatPane::transcript` is
+    /// `None` and the painter has no transcript to draw. The rows are the
+    /// caller's: the zen layout hands the box the very rect the two-pane split
+    /// gave it.
+    ///
+    /// The chat's own title goes with the transcript (`+N more lines`,
+    /// `scrolled ↑N rows`): it is arithmetic about rows this view does not
+    /// paint, which is the same rule that keeps the agents pane's `▲N`/`▼N`
+    /// counts off the conversation pane's title when the *agents* pane is the
+    /// hidden one.
+    fn chat_box(&self, area: Rect) -> ChatPane {
+        self.chat_pane_with(Rect { height: 0, ..area }, area)
+    }
+
+    /// What the chat column paints, from the two rects it is made of: the
+    /// transcript at `transcript_area` and the box at `input_area`. [`Self::chat_pane`]
+    /// splits a column into the two; [`Self::chat_box`] hands over the box
+    /// alone.
+    fn chat_pane_with(&self, transcript_area: Rect, input_area: Rect) -> ChatPane {
         let label = self.cfg().label();
         let room = inner(transcript_area);
         // One lookup of the focused node for the pane's activity line: what the
@@ -573,7 +659,18 @@ impl App {
             // Only the rows the window can show are built — the whole
             // scrollback to display forty lines cost 55 ms a frame on a long
             // session, and `tick` repaints every frame while an agent works.
-            self.chat.painted(&pane, width, room.height as usize)
+            let mut painted = self.chat.painted(&pane, width, room.height as usize);
+            // Zen takes the agents pane off the screen, and its title with it:
+            // the counts that say who is working move to the one title still
+            // painted, the conversation pane's (`zen_title`).
+            if self.zen && self.focus == Focus::Chat {
+                painted.title = zen_title(
+                    &painted.title,
+                    &agent_count_cells(self),
+                    room.width as usize,
+                );
+            }
+            painted
         });
 
         let field = inner(input_area);
@@ -754,6 +851,44 @@ fn elide(cells: &[String], separator: &str, prefix: &str, floor: &str, width: us
     floor.to_string()
 }
 
+/// The conversation pane's title while zen takes the agents pane away: the
+/// chat's own title with the agents' count clauses appended, dropped whole
+/// rather than cut.
+///
+/// The surface is the conversation pane's title because it is the one title
+/// still on screen, and its own facts are of the same kind: `+N more lines` and
+/// `scrolled ↑N rows` are clauses about a pane with no row to spend on them, so
+/// a count of who is working reads as one more of those. The bar could not
+/// carry it — its single line has a precedence table of its own, where a
+/// failure, a quit warning and the tree's derived line already win, and a count
+/// that must not vanish cannot be made to compete with a failure — and the
+/// message box's title is the draft's, not the tree's.
+///
+/// The clauses are [`agent_count_cells`]'s, the same strings the agents pane's
+/// own title is built from, so the two titles cannot count the tree
+/// differently. `▲N`/`▼N` keep their distance: they are arithmetic about the
+/// list this view does not paint, and a count of hidden rows in a pane with no
+/// rows is not a fact about anything on screen.
+///
+/// `width` is the columns the pane really has — its inner width, the budget its
+/// own title is elided to — so the appended clauses never reach under the
+/// right border, and one that does not fit is dropped with every clause after
+/// it: the clauses are ranked, and a gap in the middle would read as a count
+/// that is not the count. `title` is the chat's own title, space-terminated by
+/// construction (`chat::Chat::painted`), so the first appended clause reads as
+/// one more of its own.
+fn zen_title(title: &str, counts: &[String], width: usize) -> String {
+    let mut line = title.to_string();
+    for cell in counts {
+        let candidate = format!("{line}· {cell} ");
+        if UnicodeWidthStr::width(candidate.as_str()) > width {
+            break;
+        }
+        line = candidate;
+    }
+    line
+}
+
 /// The branch cell of the facts line: the branch, how many paths are dirty, the
 /// uncommitted delta — and, once the read has aged past [`GIT_STALE`], how old
 /// it is. A cached read must not read as a live one, so the age rides with the
@@ -793,12 +928,11 @@ fn git_cell(git: &git::RepoStatus, age: Option<Duration>) -> String {
 ///
 /// The totals are last because the least is lost last: every branch's own
 /// `+add −del` is on its row and in the selected row's footer, while who is
-/// working exists only here. The machine's job count rides between the two
-/// counts it is read beside: it is the box's load, the one fact that says why a
-/// dozen isolated children feel slow (finding H8). This knows the numbers;
-/// [`elide`] spends the columns on them.
+/// working exists only here — which is why the clauses between them are
+/// [`agent_count_cells`]'s, and the conversation pane's title reads the very
+/// same ones while zen hides this pane. This knows the numbers; [`elide`]
+/// spends the columns on them.
 fn title_cells(app: &App, above: usize, below: usize) -> Vec<String> {
-    let roster = app.tree.roster();
     let mut cells = Vec::new();
     if above > 0 {
         cells.push(format!("▲{above}"));
@@ -806,16 +940,40 @@ fn title_cells(app: &App, above: usize, below: usize) -> Vec<String> {
     if below > 0 {
         cells.push(format!("▼{below}"));
     }
+    cells.extend(agent_count_cells(app));
+    let mut added = 0;
+    let mut removed = 0;
+    for stat in app.tree.agent_stats.values() {
+        added += stat.added;
+        removed += stat.removed;
+    }
+    if added + removed > 0 {
+        cells.push(format!("Σ +{added} −{removed}"));
+    }
+    cells
+}
+
+/// The clauses that say what the agents themselves are doing: `N working`,
+/// `N jobs`, `N waiting`, in that order.
+///
+/// Split out of [`title_cells`] because two titles read them: the agents pane's
+/// own, with the hidden-row counts and the branch totals around them, and the
+/// conversation pane's while zen hides that pane ([`zen_title`]). One
+/// derivation, so the two titles cannot count the tree differently.
+///
+/// A working count is the agents whose own run is in flight; a waiting count is
+/// the ones at rest with children working; and the job count is the machine's
+/// load, the same fact every row wears as `⚙N`, summed over the tree — one
+/// agent's share is a row, this is the whole (finding H8). It is jobs and only
+/// jobs: a command still under its tool call is not one, so it is on neither.
+/// Ranked before `waiting` because a napping agent is already visible on its
+/// own row as `⏸N`, while the machine's load exists nowhere else.
+fn agent_count_cells(app: &App) -> Vec<String> {
+    let roster = app.tree.roster();
+    let mut cells = Vec::new();
     if roster.working > 0 {
         cells.push(format!("{} working", roster.working));
     }
-    // The machine's job count: the same fact every row wears as `⚙N`, summed
-    // over the tree, because every isolated worktree builds its own artifacts
-    // and with a dozen children the box is the bottleneck — a row is one
-    // agent's share, this is the whole (finding H8). It is jobs and only jobs:
-    // a command still under its tool call is not one, so it is on neither.
-    // Ranked before `waiting` because a napping agent is already visible on its
-    // own row as `⏸N`, while the machine's load exists nowhere else.
     let load = app.tree.live_job_count();
     if load > 0 {
         cells.push(if load == 1 {
@@ -826,15 +984,6 @@ fn title_cells(app: &App, above: usize, below: usize) -> Vec<String> {
     }
     if roster.waiting > 0 {
         cells.push(format!("{} waiting", roster.waiting));
-    }
-    let mut added = 0;
-    let mut removed = 0;
-    for stat in app.tree.agent_stats.values() {
-        added += stat.added;
-        removed += stat.removed;
-    }
-    if added + removed > 0 {
-        cells.push(format!("Σ +{added} −{removed}"));
     }
     cells
 }
@@ -1159,6 +1308,36 @@ mod tests {
                 "a report wider than its popup at {terminal}"
             );
         }
+    }
+
+    /// The conversation pane's title while zen hides the agents pane: the
+    /// counts are appended to the chat's own title, each clause whole or not at
+    /// all, and never past the columns the pane really has. A clause cut
+    /// mid-number is a count that is not the count, and a gap in the middle
+    /// would read as one too.
+    #[test]
+    fn a_hidden_panes_counts_are_added_to_the_title_whole_or_not_at_all() {
+        let counts = [
+            "1 working".to_string(),
+            "2 jobs".to_string(),
+            "1 waiting".to_string(),
+        ];
+        let all = " mush · 1 working · 2 jobs · 1 waiting ";
+        // Wide enough for every clause: they arrive in the agents pane's own
+        // order, one more clause of the chat's title.
+        assert_eq!(zen_title(" mush ", &counts, all.chars().count()), all);
+
+        // One column short of the last clause: it is dropped whole, and with it
+        // the clause after it — never `· 1 waitin`.
+        assert_eq!(
+            zen_title(" mush ", &counts, all.chars().count() - 1),
+            " mush · 1 working · 2 jobs "
+        );
+
+        // Room for nothing but the chat's own title: the title stands alone
+        // rather than taking a count under the border.
+        assert_eq!(zen_title(" mush ", &counts, 6), " mush ");
+        assert_eq!(zen_title(" mush ", &[], 6), " mush ");
     }
 
     /// A row's glyph is the whole status vocabulary in one character; it must
