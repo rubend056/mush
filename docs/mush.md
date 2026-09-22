@@ -370,8 +370,8 @@ request reserves room for the tool schemas, the reply, and a margin —
 three numbers live in `crates/mush-core/src/config.rs`, and
 `mush --print-config` prints what they resolve to for the window in front of
 you — the reply cap's size and the name it travels under, the tool schemas every
-request reserves (`schemas`), and the history budget they leave (`history
-budget`). Before each request the agent folds or trims, in that order — the fold is a
+request reserves (`schemas`), and the history budget they leave
+(`history budget`). Before each request the agent folds or trims, in that order — the fold is a
 request itself, asked only while the whole summarize request fits the window —
 and always cuts at a **user** message boundary so assistant/tool pairs stay
 valid.
