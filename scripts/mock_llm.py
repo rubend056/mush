@@ -38,9 +38,10 @@ takes no arguments. Scenarios, selected by the root's first user message:
    and answers "first reply". Request "STEERME" answers "steered".
    (Exercises a nudge that arrives while a reply is being generated.)
 
-5. TURNS (user message contains "TURNS"): every turn calls run_command until
-   the request carries the wrap-up instruction ("runaway guard"), which is
-   answered with a summary. (Exercises the final turn of a run.)
+5. TURNS (user message contains "TURNS"): every turn repeats the *same*
+   `run_command` with nothing changed in between, until the run's loop guard
+   stops it after `LOOP_ROUNDS` (5) identical rounds. (Exercises a run that
+   ends early because it stopped making progress; nothing counts turns.)
 
 6. ORPHAN (user message contains "ORPHAN"): the first turn runs
    `sleep 10; touch /tmp/mush-orphan-marker` as an ordinary *foreground*
@@ -127,15 +128,10 @@ class Handler(BaseHTTPRequestHandler):
             reply = {"role": "assistant", "content": "first reply"}
         elif "STEERME" in joined:
             reply = {"role": "assistant", "content": "steered"}
-        elif "TURNS" in joined and "runaway guard" in joined:
-            # The wrap-up turn: tools are withdrawn and a summary is asked for.
-            # The phrase is the one the real instruction carries
-            # (`WRAP_UP_INSTRUCTION`); "turn limit" was the old prompt's wording
-            # and the scripted run fell through to the loop guard (S8 iv).
-            reply = {"role": "assistant",
-                     "content": "wrapped up: the work done so far is in the workspace"}
         elif "TURNS" in joined:
-            # Keep taking turns until the run hits its limit.
+            # The same call, unchanged, every turn: nothing counts turns any
+            # more (finding H45), so what stops this hand-driven run is the
+            # loop guard — the same tool batch `LOOP_ROUNDS` (5) rounds over.
             reply = self.tool_call("run_command", {"command": "true"})
         else:
             is_subagent = "mush subagent" in system
