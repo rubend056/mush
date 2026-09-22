@@ -2076,7 +2076,7 @@ impl App {
             let previous = self.tree.nudge(target);
             let delivered = self.deliver_to_actor(target, AgentMsg::Nudge(message.clone()));
             if !delivered {
-                let line = agent::gone(target);
+                let line = self.no_actor_line(target);
                 self.tree.nudge_failed(target, previous);
                 self.fail(&line);
                 return Err(line);
@@ -2182,6 +2182,30 @@ impl App {
         let taken = tx.send(refused).is_ok();
         self.tree.agent_tx.insert(id, tx);
         taken
+    }
+
+    /// Why a message to `id` cannot start a run, in the words of the row it is
+    /// aimed at.
+    ///
+    /// A node whose absence of a mailbox is by *design* is not an agent that is
+    /// gone: a leftover worktree found on disk was registered with a row and a
+    /// branch and never given an actor, and it is sitting on the screen while
+    /// `agent::gone` says no such agent exists (finding H10). The refusal is
+    /// the same in both cases — nothing runs — but only one of the two is a
+    /// disappearance, and the sentence has to say which one the human is
+    /// looking at.
+    fn no_actor_line(&self, id: AgentId) -> String {
+        let leftover = self
+            .tree
+            .node(id)
+            .is_some_and(|node| node.leftover && !self.tree.agent_tx.contains_key(&id));
+        if leftover {
+            return format!(
+                "agent {id} was found on disk and never given an actor — work in the root \
+                 or spawn a fresh agent"
+            );
+        }
+        agent::gone(id)
     }
 
     /// Tell `id`'s parent, when it has one, that the child is running again.
@@ -2786,7 +2810,7 @@ impl App {
             // next step…`.
             self.say(format!("{} {target}…", Compacting::Requested.verb()));
         } else {
-            self.fail(agent::gone(target));
+            self.fail(self.no_actor_line(target));
         }
     }
 
@@ -4166,6 +4190,47 @@ mod tests {
             !app.tree.agent_tx.contains_key(&AgentId(2)),
             "and no actor behind the mailbox either"
         );
+    }
+
+    /// A message to a leftover worktree is refused — no actor was ever built
+    /// for it, and that absence is the design — but the sentence must not say
+    /// the agent is gone: the row, its worktree and its branch are on disk and
+    /// on screen. `agent::gone` is for an agent whose node the UI reached for
+    /// and found nothing (finding H10).
+    #[test]
+    fn a_message_to_a_leftover_says_it_was_never_given_an_actor() {
+        use std::fs;
+
+        let root = repo("leftover-actor");
+        git(
+            &root,
+            &["worktree", "add", "-q", "-b", "mush/7", ".mush/wt/7"],
+        );
+        // Unmerged work: the startup pass keeps the worktree and registers the
+        // leftover this test is about.
+        fs::write(root.join(".mush/wt/7/work.txt"), "the leftover's work\n").unwrap();
+        git(&root.join(".mush/wt/7"), &["add", "-A"]);
+        git(
+            &root.join(".mush/wt/7"),
+            &["commit", "-qm", "leftover work"],
+        );
+        let (mut app, _rx) = app_root(&root, None, session_save::fake::Recorder::new());
+        assert!(app.tree.has(AgentId(7)), "the leftover is a row on screen");
+
+        app.tree.focus(AgentId(7));
+        app.chat.insert("carry on");
+        app.send_message();
+
+        let line = text_of(&app);
+        assert!(
+            line.contains("never given an actor"),
+            "the refusal says which absence this is: {line}"
+        );
+        assert!(
+            !line.contains("is gone"),
+            "and it is not a disappearance: {line}"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// Waking a parked child replaces its mailbox, and the *parent's* books hold
