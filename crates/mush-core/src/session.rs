@@ -590,6 +590,19 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A png whose IHDR names `width × height`, with `padding` bytes behind it:
+    /// the size the budget reads, whatever the file happens to weigh.
+    fn png_of(width: u32, height: u32, padding: usize) -> Vec<u8> {
+        let mut bytes = vec![
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
+        ];
+        bytes.extend(width.to_be_bytes());
+        bytes.extend(height.to_be_bytes());
+        bytes.extend([8, 6, 0, 0, 0]);
+        bytes.resize(33 + padding, 0);
+        bytes
+    }
+
     /// A session file is a conversation, not an image store: before anything is
     /// written, every message's payload — the root transcript's and every
     /// subagent's — becomes the placeholder that names its path. Loading yields
@@ -609,6 +622,7 @@ mod tests {
             path: "shots/a.png".into(),
             mime: "image/png".into(),
             bytes: vec![0x41; 4_096],
+            pixels: Some((1_920, 1_080)),
         });
         session.agents.push(AgentSession {
             id: 1,
@@ -617,6 +631,7 @@ mod tests {
                     path: "shots/b.jpg".into(),
                     mime: "image/jpeg".into(),
                     bytes: vec![0x42; 4_096],
+                    pixels: Some((800, 600)),
                 }],
                 ..Message::user("and this one")
             }],
@@ -666,6 +681,21 @@ mod tests {
         assert!(
             child_text.contains("shots/b.jpg"),
             "and its placeholder names its path: {child_text}"
+        );
+
+        // The road back the placeholder names: the model reads the file again,
+        // and the size comes back with it, so the resumed run prices the
+        // picture the way the run that attached it did.
+        fs::create_dir_all(root.join("shots")).unwrap();
+        fs::write(root.join("shots/a.png"), png_of(1_920, 1_080, 120_000)).unwrap();
+        let ws = crate::workspace::Workspace::new(&root).unwrap();
+        let reread = ws.read_image("shots/a.png").unwrap().unwrap();
+        assert_eq!(reread.pixels, Some((1_920, 1_080)));
+        assert!(
+            reread.weight() < 20_000,
+            "the re-read is priced by its pixels, not its {}-byte file: {}",
+            reread.bytes.len(),
+            reread.weight()
         );
 
         loaded.save(&root).unwrap();

@@ -7790,6 +7790,53 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// The model's own road fills the size in too: `read_file` on a picture
+    /// hands back an image whose pixels come from the header, so the budget
+    /// counts a tool result the way it counts an attachment — the same 724 KB
+    /// screenshot is ~2.8k tokens whichever road it arrived by.
+    #[test]
+    fn a_read_image_carries_the_size_its_header_names() {
+        let cfg = ConfigHandle::own(Config::new("http://127.0.0.1:1", "deepseek-flash", None));
+        let (actor, _events, _mailbox) = build_actor(
+            "read-image-size",
+            Arc::new(HttpModel::new(cfg.clone())),
+            cfg,
+        );
+        fs::write(actor.ws.root().join("screen.png"), png_of(1_920, 1_080)).unwrap();
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let seen = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::ReadFile,
+            &json!({ "path": "screen.png" }),
+            &cancel,
+        )
+        .unwrap();
+
+        assert_eq!(seen.images.len(), 1, "the bytes travel with the result");
+        assert_eq!(
+            seen.images[0].pixels,
+            Some((1_920, 1_080)),
+            "and the size the budget prices them by"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A png whose IHDR names `width × height`, for the tests that need the
+    /// size in the header as well as the magic number: signature, IHDR, the
+    /// two big-endian dimensions, and the five bytes of IHDR payload left over.
+    fn png_of(width: u32, height: u32) -> Vec<u8> {
+        let mut bytes = vec![
+            0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 13, b'I', b'H', b'D', b'R',
+        ];
+        bytes.extend(width.to_be_bytes());
+        bytes.extend(height.to_be_bytes());
+        bytes.extend([8, 6, 0, 0, 0]);
+        bytes
+    }
+
     /// Two refusals an image can meet, each naming a move that exists: a model
     /// that cannot see it (nothing the model can change — it says so in its
     /// summary) and an image past the 2 MB cap (downscale it, and read that).

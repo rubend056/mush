@@ -6745,11 +6745,13 @@ mod tests {
     }
 
     /// A saved image, as a test attaches one without going through a paste.
+    /// Its header names no size, so the budget counts its bytes — the fallback.
     fn image(path: &str) -> Image {
         Image {
             path: path.to_string(),
             mime: "image/png".to_string(),
             bytes: png(0),
+            pixels: None,
         }
     }
 

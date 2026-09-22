@@ -80,6 +80,35 @@ pub const REPLY_SHARE_WORDS: &str = "an eighth of the window";
 /// endpoint's own `usage` is the only place a real count comes from.
 pub const BYTES_PER_TOKEN: usize = 3;
 
+/// The pixels-per-token the image half of the budget heuristic uses: one token
+/// per this many pixels of picture, before [`BYTES_PER_TOKEN`] turns that back
+/// into the byte-shaped currency `Message::weight` counts. An image's real
+/// token cost is a function of its pixels — not of its file size, which a
+/// screenshot's compression can move by 10× — so this is the number that
+/// prices one.
+///
+/// It follows the two rules the big vision endpoints document, and takes the
+/// conservative side of both: Anthropic's image guidance prices a picture at
+/// about `width × height / 750`, and OpenAI tiles one into 512 px patches at
+/// roughly 1,500 px per token after the first — so 750 counts a picture as
+/// *more* expensive than either, which is the safe direction for a budget that
+/// sheds over-weight history ([`Config::history_budget`]).
+///
+/// What it does not model: an endpoint that tokenized a `data:` URL's base64
+/// text as text would pay for the spelling as well as the picture. No endpoint
+/// mush talks to documents that, and a caveat is cheaper than a fiction: the
+/// estimate above is what the code charges, everywhere.
+pub const PIXELS_PER_TOKEN: usize = 750;
+
+/// The tokens a picture of `pixels` pixels costs at [`PIXELS_PER_TOKEN`],
+/// rounded *up* so no picture is ever free, and saturating so a header that
+/// claims `u32::MAX × u32::MAX` cannot overflow the arithmetic.
+pub fn tokens_for_pixels(pixels: u64) -> usize {
+    let per = PIXELS_PER_TOKEN as u64;
+    let tokens = pixels.saturating_add(per - 1) / per;
+    usize::try_from(tokens).unwrap_or(usize::MAX)
+}
+
 /// Keep a window inside the range mush can work with, whatever its source.
 fn clamp_context(tokens: usize) -> usize {
     tokens.clamp(MIN_CONTEXT_TOKENS, MAX_CONTEXT_TOKENS)
