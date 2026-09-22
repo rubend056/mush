@@ -462,10 +462,11 @@ elided, and the cursor is always on screen.
 
 | Context | Keys |
 |---|---|
-| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning |
+| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning · `Ctrl-F` the focused pane takes the whole screen, and back · `Ctrl-Y` select the transcript: `Enter` copies, `Esc` leaves |
+| selecting | `↑`/`↓` the cursor one transcript line, `Shift` holding the selection while it moves · `PgUp`/`PgDn` ten lines at a time · `Home`/`End` the oldest / newest · `Enter` copy the selection, or the cursor's own line · `Esc` leave without copying · the pane's own scroll keys are the cursor's while this is open, and a letter is not typing |
 | picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End`, `PgUp`/`PgDn` move the list, `Enter` take the row, `Esc` close |
 | agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them, `←` the row's parent, `→` its first child, `Enter` show its transcript, `c` cancel that agent, `Esc` back to the root |
-| chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `Ctrl-V` attach the image on the clipboard, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete` (at the start of the box, Backspace pops the newest attachment), `Ctrl-U` clear the words and keep the images, `Ctrl-Z` put back what the box last lost, `↑`/`↓`/`PgUp`/`PgDn` scroll, `Esc` clear the box and its attachments · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/compact` `/notes` `/help` `/quit` |
+| chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `Ctrl-V` attach the image on the clipboard, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete` (at the start of the box, Backspace pops the newest attachment), `Ctrl-U` clear the words and keep the images, `Ctrl-Z` put back what the box last lost, `↑`/`↓`/`PgUp`/`PgDn` scroll (the select mode's cursor while it is open), `Esc` clear the box and its attachments · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/compact` `/notes` `/help` `/quit` |
 
 A paste whose every word is an image's path attaches them all — one or several,
 split on whitespace or newlines — and anything else is text and lands in the box
@@ -493,7 +494,13 @@ be retyped is the one that has to say so.
 `Enter` in the agents pane moves the *view*, not the keyboard: the row's
 transcript replaces the chat pane while the keys stay in the tree, and `Tab` is
 what puts them in the box, where typing reaches the agent on screen. A page is
-always ten rows, in every pane and every list.
+always ten rows, in every pane and every list. `Ctrl-F` is the frame's version
+of the same question — the focused pane takes the whole screen — and because
+`Tab` already cycles the focus it is what switches which pane that is. A hidden
+pane keeps its facts on screen: with the agents pane a zero rect, its
+`N working` / `N jobs` / `N waiting` counts move into the conversation pane's
+title; the hidden-row counts (`▲N`/`▼N`, `+N more lines`) stay behind, because
+they are arithmetic about a list this view does not paint.
 
 The transcript is not only the human's words, and it says so. `you › ` marks a
 line the human typed — and only a line the human typed: a subagent's brief opens
@@ -502,7 +509,36 @@ and a folded result (`#1 done: …`) is mush's own report, marked `· ` like the
 other lines mush writes. And the text itself is untrusted: a model reply, a tool
 result and a tool call's arguments are defanged before they are painted, so an
 `ESC ]0; …` in them cannot rename the terminal window and a `CSI 2J` cannot
-repaint the frame they are drawn on.
+repaint the frame they are drawn on. A model's *reply* is read one more way:
+each source line is parsed as a small, line-local, additive markdown view —
+`**strong**`, `*emphasis*`/`_emphasis_`, `` `code` ``, `~~strike~~`, one to
+three `#` headings, list markers kept, fenced code, links as `text (url)` — and
+painted in the reply's styles, with only the scaffolding a view does not read (a
+heading's `#`s, a fence's two lines) left unpainted. It is deliberately not a
+document renderer — no reflow, tables, block quotes, nested lists or HTML — and
+it changes no bytes: tool results and `run_command` output, the human's own
+lines, briefs, notices and the model's reasoning rows are painted raw, so a `#`
+there is a comment and an `*` a glob. What the copy road hands another program
+is the *source* lines of a reply, never the painted screen.
+
+`Ctrl-Y` is that copy road. mush never captures the mouse (finding K3): the
+terminal owns selection, and a drag is a rectangle of screen cells — at 80
+columns it starts in the agents pane, which is why a paragraph dragged out of
+the conversation can arrive with the tree's lines in front of it. So the mode
+is a cursor over the transcript's **source** lines instead of a drag over the
+screen: `↑`/`↓` move it
+one line, `Shift` holds the selection while it moves, `PgUp`/`PgDn` ten,
+`Home`/`End` jump to the oldest or newest, `Enter` copies and leaves, `Esc`
+leaves without copying. While it is open the mode has the keyboard — a letter is
+not typing — and `Tab` leaves it for the pane cycle. What lands on the system
+clipboard is `Message::text()`, exactly: the selected source lines joined with
+the newlines they have, so a soft wrap never becomes one, a tab is a tab, a tool
+result is copied whole even past the eight rows the pane paints of it, and a
+picture a saved transcript shed copies as its placeholder. A copy that cannot
+reach the clipboard says so in the bar instead: no writer on `PATH` names what
+to install, and a writer that never takes the text is killed at the deadline and
+reported, not waited on. The bar says `copied 12 lines from #1's reply — 1,284
+bytes` once the clipboard has taken the text.
 
 A thinking endpoint's own reasoning is painted above the turn it decided, dim
 and marked `⋯ `, one block per assistant turn. It is the endpoint's
@@ -1037,6 +1073,7 @@ mush/
       provider.rs    the provider table: a vendor's endpoint, models and defaults
       session.rs     `.mush/` creation and conversation persistence
       text.rs        display-column arithmetic: wrap, truncate, fit_row, mask, sanitize
+                     and the line-local markdown view: markdown_rows, Run/RunStyle
       tools.rs       tool names, argument helpers, exact-match edit semantics
       transcript.rs  pairing, repair, trimming and the compaction trigger
       userconfig.rs  the machine-global config file (where the API key lives)
@@ -1050,7 +1087,8 @@ mush/
       app/keys.rs    key → `Intent`, as a pure table
       app/commands.rs  the slash commands: one parse, one table
       agent.rs       agent actors, model loop, tool dispatch, shell execution
-      clipboard.rs   the system clipboard's image: wl-paste / xclip / pngpaste
+      clipboard.rs   the system clipboard: wl-paste / xclip / pngpaste read an image,
+                     and wl-copy / xclip / pbcopy write text
       jobs.rs        the job registry: detached commands, the machine lock
       model.rs       the `ModelClient` seam, the HTTP client, the transport retry
       machine.rs     the shell seam: spawn, poll, kill a command
@@ -1325,6 +1363,10 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
   threads; there is no live buffer, so there is no save race to design around.
 - **mush is not an editor** `[v0.2]`. It manages agents and shows git state at a
   glance. The message box is the only editable text.
+- **The terminal owns the mouse** (finding K3). mush never captures it, so
+  selection and the scroll wheel stay the terminal's; a drag is a rectangle of
+  screen cells, which is why `Ctrl-F` gives the focused pane the whole screen
+  and `Ctrl-Y` copies a transcript as its *source* lines instead of as a drag.
 - **One owner of state.** `Msg` → `update` → `draw`. No shared mutable state
   between the painter and the work.
 - **A run is bounded by progress, not by a count.** A run ends when the model
