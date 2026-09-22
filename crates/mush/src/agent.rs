@@ -528,6 +528,18 @@ pub enum AgentMsg {
     /// Adopt these messages and run. The actor keeps the transcript, so later
     /// nudges continue the same conversation.
     Run(Vec<Message>),
+    /// Keep these messages as this agent's conversation, and do **not** run.
+    ///
+    /// The one caller is the restore door (`App::restore_agents`): the root's
+    /// actor is started with an empty transcript, because its history lives in
+    /// the UI and travels with the first [`Run`](Self::Run) — and a child's
+    /// completion that reaches it before the human has said anything would fold
+    /// into a transcript with no system message and no history, i.e. a run whose
+    /// whole request is a bare `#2 done: …` line (§8.39). This is the repair
+    /// every hand-over goes through ([`adopted`]) and not a request: a restart is
+    /// not a run ([`revive`]), and the next `Run` still wins — its arm replaces
+    /// the transcript with the UI's newer copy.
+    Adopt(Vec<Message>),
     /// Append a user message the human typed; if idle, run again. The UI echoed
     /// these words before sending them, so the actor folds them in without
     /// telling it to add them again.
@@ -550,10 +562,11 @@ pub enum AgentMsg {
     /// once and stays idle.
     ///
     /// `messages` is the UI's copy of the conversation, used only by an actor
-    /// that has none yet: a session restored from disk starts every actor with
-    /// an empty transcript (the UI holds the history until the human's next
-    /// message hands it over), and a fold is not a run, so nothing else would
-    /// ever hand it over — the request folded nothing at all, silently.
+    /// that has none yet: a root actor is built with no transcript at all — the
+    /// history lives in the UI, and reaches the actor with the first `Run` (or
+    /// with `Adopt`, at a restore) — and a fold is not a run, so nothing else
+    /// would ever hand it over. Without this the request folded nothing at all,
+    /// silently.
     Compact(Vec<Message>),
     /// Cancel the current run. An idle agent ignores it — Stop cancels work,
     /// it does not end an agent. It carries *who* asked, because the child's
@@ -738,6 +751,27 @@ pub enum AgentEvent {
     /// row is busy already, and the words wait for a message boundary.
     ChildResumed {
         child: u64,
+    },
+    /// A report this agent could not hand to its parent: the mailbox it holds
+    /// has no actor behind it (`tell_parent`).
+    ///
+    /// The parent's books are where a child's run is booked, and the completion
+    /// is the one report whose loss leaves them wrong for the rest of the
+    /// session: a running child that finished — a `wait` that burns its whole
+    /// cap, a shared workspace the guard refuses to a sibling — under a row
+    /// that says `✓` (§8.39). A missing actor is not a missing parent: it is a
+    /// parent whose thread the UI reclaimed or replaced, and only the UI holds
+    /// the transcript a new one is rebuilt from. So the command travels here and
+    /// the UI delivers it to the parent the *tree* names
+    /// (`App::hand_to_parent`) — the same road [`ChildAsleep`] is, for the other
+    /// direction (finding H18).
+    ///
+    /// The root never emits this: it has no parent, so its reports have no
+    /// reader and are dropped where they are made.
+    ///
+    /// [`ChildAsleep`]: Self::ChildAsleep
+    ParentAsleep {
+        command: AgentMsg,
     },
     Error(String),
     /// A job this agent started began running in the background. The registry
@@ -1075,10 +1109,25 @@ struct Actor {
     brief: String,
     /// Its own mailbox — where its children report their completions.
     my_tx: Sender<AgentMsg>,
-    /// Where it reports its own completion to its parent. Dead for the root,
-    /// which has no parent.
-    parent_tx: Sender<AgentMsg>,
+    /// Where it reports its own completion to its parent. `None` for the root,
+    /// which has no parent at all — the difference that matters, because a
+    /// report whose send *fails* is handed to the UI to deliver
+    /// ([`AgentEvent::ParentAsleep`]), and the root must never be handed its
+    /// own completion back (§8.39).
+    ///
+    /// `Some` for every child, live or not: one revived without the mailbox its
+    /// parent is listening on carries a dead one ([`dead_mailbox`]), which is
+    /// exactly the case the UI's road is for.
+    parent_tx: Option<Sender<AgentMsg>>,
     rx: Receiver<AgentMsg>,
+}
+
+impl Actor {
+    /// Say one thing about this run to whoever owns this agent, or hand it to
+    /// the UI when there is nobody at the other end ([`tell_parent`]).
+    fn tell_parent(&self, command: AgentMsg) {
+        tell_parent(&self.ctx, self.id, self.parent_tx.as_ref(), command);
+    }
 }
 
 /// The handles every actor in one tree shares: the id counters it draws from,
@@ -1176,10 +1225,6 @@ fn root_actor(
     });
     let ws = Workspace::new(&ctx.root).expect("workspace root must exist");
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AgentMsg>();
-    // The root has no parent. Its children report into its own mailbox; its
-    // own completion goes to a dead channel so it can never wake itself up.
-    let (dead_tx, dead_rx) = crossbeam_channel::unbounded::<AgentMsg>();
-    drop(dead_rx);
     let actor = Actor {
         ctx,
         id: 0,
@@ -1190,7 +1235,12 @@ fn root_actor(
         fork: None,
         brief: String::new(),
         my_tx: cmd_tx.clone(),
-        parent_tx: dead_tx,
+        // The root has no parent. Its children report into its own mailbox;
+        // its own completion has no reader anywhere, and `None` is that fact
+        // rather than a mailbox nobody listens on — the road a failed send
+        // takes (`tell_parent`) ends in the UI, and the UI must never file a
+        // report about the root back into the root's own mailbox (§8.39).
+        parent_tx: None,
         rx: cmd_rx,
     };
     start(actor, Vec::new(), false);
@@ -1215,15 +1265,21 @@ pub struct ReviveSpec {
     /// The messages it had, *without* the system prompt (which is regenerated:
     /// it names a workspace that may have moved).
     pub messages: Vec<Message>,
-    /// Where the new actor reports a finished run, when the caller has the
-    /// mailbox its parent is listening on.
+    /// The mailbox this agent's parent is listening on, when the caller has it.
     ///
-    /// The restart path passes `None`: the parent it would report to is a book
-    /// with no runs in it, and waking the root with a completion nobody asked
-    /// for is what the dead channel is for. A child woken *inside* a live tree
-    /// by the human's own message (`App::deliver_to_actor`) passes `Some`: the
-    /// parent's books already say that child is running, and the completion is
-    /// the only thing that can ever say it stopped.
+    /// A session restore passes the tree's own sender for the parent
+    /// (`App::restore_agents`): a child that comes back is one whose row is on
+    /// screen and whose parent's books already say it is running, so its
+    /// completion is the only thing that can ever say it stopped — and a
+    /// restored child used to report into a dead channel, which left the books
+    /// holding a running child that had finished (a `wait` that burned its whole
+    /// 600 s cap, a shared workspace the guard refused to a sibling) while the
+    /// row said `✓` (§8.39). The same for a child woken *inside* a live tree by
+    /// the human's own message (`App::deliver_to_actor`).
+    ///
+    /// `None` is not silence: the actor is given a dead mailbox and every send
+    /// that fails is handed to the UI, which finds the parent in the tree and
+    /// delivers it ([`dead_mailbox`], [`AgentEvent::ParentAsleep`]).
     pub parent: Option<Sender<AgentMsg>>,
 }
 
@@ -1240,12 +1296,13 @@ pub fn live_branch(root: &Path, id: u64, branch: Option<String>) -> Option<Strin
 }
 
 /// Bring back an agent whose actor is gone — one restored from a stored session,
-/// or a worktree found on disk — seeded with the transcript it had, and run it.
+/// or a worktree found on disk — seeded with the transcript it had.
 ///
-/// The human owns this agent, not the root: its completion goes to a dead
-/// channel, so reviving a child never wakes the root with news it did not ask
-/// for. It joins the same tree as the root, which is why its handles come in one
-/// value (see [`TreeHandles`]).
+/// It comes back at rest, and it reports where the caller names it: the parent
+/// it is handed owns the rows this agent's completion settles, so reviving a
+/// child inside a live tree is what lets its `✓` reach its parent's books at all
+/// (§8.39). It joins the same tree as the root, which is why its handles come in
+/// one value (see [`TreeHandles`]).
 pub fn revive(
     handles: TreeHandles,
     cfg: ConfigHandle,
@@ -1291,8 +1348,6 @@ pub fn revive(
         live,
     });
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AgentMsg>();
-    let (dead_tx, dead_rx) = crossbeam_channel::unbounded::<AgentMsg>();
-    drop(dead_rx);
     let actor = Actor {
         ctx,
         id,
@@ -1309,11 +1364,12 @@ pub fn revive(
         fork: None,
         brief: brief.clone(),
         my_tx: cmd_tx.clone(),
-        // Its completions go where the caller said they belong: to the dead
-        // channel for an agent coming back from a stored session (nobody is
-        // waiting on a run that never happened here), to its parent's live
-        // mailbox for a parked child woken inside the tree (§8.21).
-        parent_tx: parent.unwrap_or(dead_tx),
+        // Its completions go where the caller said they belong: to its parent's
+        // live mailbox when the tree still holds one (a child restored from a
+        // session, a parked child woken inside the tree — §8.21, §8.39), and
+        // into a dead one when the caller has no mailbox to give, where the
+        // failed send hands the report to the UI rather than dropping it.
+        parent_tx: Some(parent.unwrap_or_else(dead_mailbox)),
         rx: cmd_rx,
     };
     // The system prompt is regenerated, and an agent with no transcript but a
@@ -1341,6 +1397,49 @@ pub fn revive(
     cmd_tx
 }
 
+/// A mailbox nobody is listening on: what a child is given when its caller
+/// cannot name the mailbox its parent is listening on — a parent whose actor is
+/// gone, or one whose row never had an actor at all (a worktree found on disk).
+///
+/// A send into it **fails**, and that failure is the whole fact the UI needs:
+/// this agent *has* a parent (so the report is somebody's news) and its actor
+/// cannot reach it, so the UI — the one hand holding the tree and the transcript
+/// a new actor is rebuilt from — delivers it (`tell_parent`,
+/// [`AgentEvent::ParentAsleep`]). The root gets `None` instead, and that road
+/// must never carry a report about it (§8.39).
+fn dead_mailbox() -> Sender<AgentMsg> {
+    let (tx, rx) = crossbeam_channel::unbounded::<AgentMsg>();
+    drop(rx);
+    tx
+}
+
+/// Tell this agent's parent one fact about its run — that it started, how it
+/// left its worktree, how it ended — or hand the fact to the UI when the mailbox
+/// the parent left behind has no actor behind it.
+///
+/// Every one of these sends used to be a `let _ =`, and the one that mattered
+/// was the last: a child restored from a session reported its completion into a
+/// dead channel, so its parent's books kept a running child that had finished —
+/// a `wait` burning its whole 600 s cap, a shared workspace the guard refused to
+/// a sibling — while the row said `✓` (§8.39). A mailbox with no actor behind it
+/// is not proof the parent is gone: it is a parent whose thread the UI reclaimed
+/// or replaced, and the UI is the only hand that holds the transcript a new actor
+/// is rebuilt from. So the command travels there in an event — the same road a
+/// parent's own undeliverable command takes in the other direction
+/// ([`AgentEvent::ChildAsleep`], finding H18).
+///
+/// `None` is the root, and is a different fact: it has no parent at all, its
+/// reports have no reader, and the one thing that must never happen is the UI
+/// filing them back into its own mailbox (§8.39).
+fn tell_parent(ctx: &AgentCtx, id: u64, parent_tx: Option<&Sender<AgentMsg>>, command: AgentMsg) {
+    let Some(parent_tx) = parent_tx else {
+        return;
+    };
+    if parent_tx.send(command.clone()).is_err() {
+        ctx.emit(id, AgentEvent::ParentAsleep { command });
+    }
+}
+
 /// Run an actor on its own thread. A thread that cannot start is reported as
 /// that agent's result, so a parent waiting on it is never left waiting.
 fn start(actor: Actor, initial: Vec<Message>, start_immediately: bool) {
@@ -1351,12 +1450,17 @@ fn start(actor: Actor, initial: Vec<Message>, start_immediately: bool) {
     if let Err(error) = builder.spawn(move || actor_main(actor, initial, start_immediately)) {
         let summary = format!("agent #{id} could not start ({error})");
         ctx.emit(id, AgentEvent::Error(summary.clone()));
-        let _ = parent_tx.send(AgentMsg::ChildDone {
+        tell_parent(
+            &ctx,
             id,
-            // The run it never got to take: its first, and only.
-            run: 1,
-            outcome: Outcome::Failed(summary),
-        });
+            parent_tx.as_ref(),
+            AgentMsg::ChildDone {
+                id,
+                // The run it never got to take: its first, and only.
+                run: 1,
+                outcome: Outcome::Failed(summary),
+            },
+        );
     }
 }
 
@@ -1389,11 +1493,9 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         // leave a working child marked at rest (a `status` line, the
         // one-shared-child guard, and the next `wait` all read that). The
         // message order closes it: the parent drains the completion first, then
-        // this, and the books end where the child really is. The root's parent
-        // receiver is dead, so its send is dropped.
-        let _ = actor
-            .parent_tx
-            .send(AgentMsg::ChildRunning { id: actor.id });
+        // this, and the books end where the child really is. The root has no
+        // parent, so it says none of this (`tell_parent`).
+        actor.tell_parent(AgentMsg::ChildRunning { id: actor.id });
         actor.ctx.live.fetch_add(1, Ordering::SeqCst);
         let result = run_loop(&actor, &mut state, &mut transcript, &cancel);
         actor.ctx.live.fetch_sub(1, Ordering::SeqCst);
@@ -1449,13 +1551,13 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         // mailbox in order has it by the time it renders the listing (finding
         // H1). It is listed, never delivered: it marks nothing read.
         if let Some(work) = &work {
-            let _ = actor.parent_tx.send(AgentMsg::Work {
+            actor.tell_parent(AgentMsg::Work {
                 id: actor.id,
                 run: state.runs,
                 work: work.clone(),
             });
         }
-        let _ = actor.parent_tx.send(AgentMsg::ChildDone {
+        actor.tell_parent(AgentMsg::ChildDone {
             id: actor.id,
             run: state.runs,
             outcome: outcome.clone(),
@@ -1708,6 +1810,23 @@ fn absorb(
             state.delivered_jobs.extend(announced_jobs);
             Fold::Run
         }
+        // The UI's own copy of the conversation, for an actor that has none.
+        // Only a restored root is ever in that state: its history is the UI's
+        // until the human's next message hands it over (`Run`), and a child's
+        // completion reaching it first would fold into a transcript with no
+        // system message and no history — a request that is a bare `#2 done: …`
+        // and nothing else (§8.39). It is not a run: a restart is not a request,
+        // and the next `Run` replaces this copy with the UI's newer one.
+        //
+        // An actor that already has a conversation keeps it: its own copy is the
+        // newer one, which is the same reason `Run` is only folded in at an idle
+        // boundary (`drain_mailbox`).
+        AgentMsg::Adopt(messages) => {
+            if transcript.is_empty() {
+                *transcript = adopted(messages);
+            }
+            Fold::Idle
+        }
         AgentMsg::Nudge(message) => {
             if worktree_gone(actor) {
                 actor
@@ -1735,11 +1854,12 @@ fn absorb(
         // the flag is honoured by `wait_for_work`'s idle loop, and by the
         // next turn of a run already in flight.
         AgentMsg::Compact(messages) => {
-            // An actor restored from a session starts with no transcript — the
-            // UI holds the conversation until the human's next message hands it
-            // over. A fold is not a run, so this is that hand-over: without it
-            // the command folded nothing and said nothing. It is repaired like
-            // every hand-over ([`adopted`]): the summarize request is the first
+            // An actor that has never run has no transcript: the UI holds the
+            // conversation and hands it over with the first `Run` — or, for a
+            // restored root, with `Adopt` at the restore door. A fold is not a
+            // run, so this is the other hand-over: without it the command folded
+            // nothing and said nothing. It is repaired like every hand-over
+            // ([`adopted`]): the summarize request is the first
             // one the stored conversation ever travels in, so a call left
             // dangling by the process that wrote the file is exactly what the
             // endpoint would refuse here.
@@ -2848,6 +2968,11 @@ fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
             AgentMsg::CommandDone { id, line, news } => {
                 note_job(state, id, line, news);
             }
+            // A conversation for an actor that has none — and this one has a
+            // run in flight, which is a conversation already. Dropped here
+            // rather than parked for a boundary that would drop it too
+            // (`absorb`'s arm holds the rule both doors read).
+            AgentMsg::Adopt(_) => {}
             // A fold that arrived while a tool call was in flight: parked for
             // the next message boundary, like a nudge. Said out loud, because
             // this is the one window in which the request exists and nothing is
@@ -2951,6 +3076,11 @@ fn drain_mailbox(
                     }
                 }
             }
+            // A conversation for an actor that has none: this one has the newer
+            // copy — the run's own, mid-flight — and replacing it would erase
+            // the turn being answered. The rule is `absorb`'s; this door only
+            // sees it one boundary late.
+            AgentMsg::Adopt(_) => {}
         }
     }
 }
@@ -3548,7 +3678,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         fork: fork.clone(),
         brief: brief.clone(),
         my_tx: cmd_tx.clone(),
-        parent_tx: actor.my_tx.clone(),
+        parent_tx: Some(actor.my_tx.clone()),
         rx: cmd_rx,
     };
     start(child, initial, true);
@@ -8139,8 +8269,6 @@ mod tests {
             live: Arc::new(AtomicU64::new(0)),
         });
         let (my_tx, rx) = crossbeam_channel::unbounded::<AgentMsg>();
-        let (dead_tx, dead_rx) = crossbeam_channel::unbounded::<AgentMsg>();
-        drop(dead_rx);
         let actor = Actor {
             ctx,
             id: 7,
@@ -8151,7 +8279,11 @@ mod tests {
             base: None,
             brief: String::new(),
             my_tx: my_tx.clone(),
-            parent_tx: dead_tx,
+            // No parent: the standalone actor has nobody to report to, which is
+            // the one `parent_tx` value that says nothing at all — a test that
+            // wants the UI's road builds the actor with a dead mailbox of its
+            // own (`Some(dead_mailbox())`, §8.39).
+            parent_tx: None,
             rx,
         };
         (actor, recorder, my_tx)
@@ -12853,10 +12985,11 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// An actor restored from a session starts with no transcript — the UI
-    /// holds the conversation until the human's next message. A fold is not a
-    /// run, so the request carries it: without that a `/compact` on a restored
-    /// agent folded nothing, and said nothing about it (finding U11).
+    /// A root actor starts with no transcript — the UI holds the conversation
+    /// until a `Run` hands it over, or an `Adopt` at a restore. A fold is not a
+    /// run, so the request carries it: without that a `/compact` on an actor
+    /// that has never run folded nothing, and said nothing about it
+    /// (finding U11).
     #[test]
     fn a_compact_request_carries_the_transcript_an_actor_has_none_of() {
         let root = scratch_dir("compact-adopted");
@@ -13591,7 +13724,10 @@ mod tests {
         let model = Arc::new(Scripted::new().says("done"));
         let (actor, _events, _mailbox) = scripted_actor("child-running", &model);
         let (parent_tx, parent_rx) = crossbeam_channel::unbounded::<AgentMsg>();
-        let child = Actor { parent_tx, ..actor };
+        let child = Actor {
+            parent_tx: Some(parent_tx),
+            ..actor
+        };
         start(child, vec![Message::user("do the thing")], true);
 
         // The run's start, before the run's report — which is the order that
@@ -13645,6 +13781,77 @@ mod tests {
             "and the run that started is booked as started"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A report whose send finds nobody behind the parent's mailbox is handed to
+    /// the UI rather than dropped: the parent's books are where a child's run is
+    /// booked, and the completion is the one report whose loss leaves them
+    /// holding a running child that has finished — a `wait` burning its whole
+    /// cap, a shared workspace the guard refuses to a sibling, under a row that
+    /// says `✓` (§8.39).
+    ///
+    /// The root is the one agent that says nothing at all: it has no parent, and
+    /// an event about it would be the UI filing the root's own completion back
+    /// into its own mailbox — a wake-up that could never end.
+    #[test]
+    fn a_report_with_no_actor_behind_the_parent_goes_to_the_ui() {
+        // A child whose parent's actor is gone: the mailbox is there and nobody
+        // reads it, which is what a replaced or reclaimed parent leaves.
+        let (actor, events, _mailbox) = build_actor(
+            "parent-asleep",
+            Arc::new(Scripted::new().says("done")),
+            test_cfg(),
+        );
+        let child = Actor {
+            parent_tx: Some(dead_mailbox()),
+            ..actor
+        };
+        start(child, vec![Message::user("do the thing")], true);
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done == 1),
+            "the run must end: {seen:?}"
+        );
+        let told: Vec<AgentMsg> = events
+            .events()
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                AgentEvent::ParentAsleep { command } => Some(command),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            matches!(told.first(), Some(AgentMsg::ChildRunning { id: 7 })),
+            "the start is offered to the UI first, in the order a parent reads it: {told:?}"
+        );
+        assert!(
+            matches!(
+                told.last(),
+                Some(AgentMsg::ChildDone { id: 7, run: 1, outcome: Outcome::Finished(text) }) if text == "done"
+            ),
+            "and so is the completion the parent's books are waiting for: {told:?}"
+        );
+
+        // The same actor with no parent at all: `build_actor`'s own
+        // `parent_tx: None`, which is the root's shape.
+        let (root, events, _mailbox) = build_actor(
+            "root-silent",
+            Arc::new(Scripted::new().says("done")),
+            test_cfg(),
+        );
+        start(root, vec![Message::user("do the thing")], true);
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done == 1),
+            "the run must end: {seen:?}"
+        );
+        assert!(
+            !events
+                .events()
+                .into_iter()
+                .any(|(_, event)| matches!(event, AgentEvent::ParentAsleep { .. })),
+            "the root's own completion must not become a report somebody could deliver"
+        );
     }
 
     /// What the actors told the UI, as a test watches a run.
