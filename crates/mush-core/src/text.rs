@@ -156,7 +156,18 @@ fn wrap_capped(text: &str, width: usize, max_lines: Option<usize>) -> Vec<String
                 )
             };
 
-            if current_width + char_width > width && !current.is_empty() {
+            // A row ends at its last space, and the character that did not fit
+            // goes after the tail the space left behind. That tail can itself
+            // be too full for the character — a row that ended exactly at the
+            // width, then a CJK glyph or a tab (four columns at once) — and the
+            // old single break appended it anyway: `wrap_text(" bcd日", 4)`
+            // painted `bcd日`, five columns, and the terminal cut the glyph the
+            // pane had no column for. So the break is a loop: while the tail
+            // does not fit either, the tail is a row of its own.
+            loop {
+                if current_width + char_width <= width || current.is_empty() {
+                    break;
+                }
                 if let Some(space) = last_space {
                     let rest = current.split_off(space);
                     out.push(std::mem::take(&mut current));
@@ -626,6 +637,34 @@ mod tests {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("anything", 0), "");
         assert!(UnicodeWidthStr::width(truncate(wide, 1).as_str()) <= 1);
+    }
+
+    /// A wrapped row never outgrows the width it was given, whatever lands on
+    /// the tail a space break left behind: a CJK glyph is two columns and a tab
+    /// is four, and the terminal cuts whatever a row paints past its edge. Four
+    /// columns is where a row starts to have room for either — the body of a
+    /// pane is never narrower (the app's `MIN_BODY` is 4).
+    #[test]
+    fn a_wrapped_row_never_outgrows_its_width() {
+        for text in [
+            "ab c\t",
+            " bcd日",
+            "abc日",
+            "日本語 日本語",
+            "a\tb\tc",
+            "\t先 后\t",
+            "one two three 日本 four",
+        ] {
+            for width in 4..=12usize {
+                for row in wrap_text(text, width) {
+                    assert!(
+                        UnicodeWidthStr::width(row.as_str()) <= width,
+                        "{text:?} @ {width} painted {row:?}, {} columns",
+                        UnicodeWidthStr::width(row.as_str())
+                    );
+                }
+            }
+        }
     }
 
     /// Showing the edges of an API key must count characters: slicing four
