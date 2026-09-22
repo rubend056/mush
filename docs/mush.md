@@ -122,8 +122,8 @@ and never share state with the painter.
   the agent is trusted to stay, not stopped from leaving.
 - **Edits are exact.** `edit_file` refuses if an `old_string` is missing or
   appears more than once, so an edit can never hit the wrong occurrence.
-- **Every big-text result is capped, edits are not.** One cap bounds them all —
-  a command's output, a file read, a listing, a search (`CMD_CAP = 16 000`
+- **Every big-text result is capped; inputs are not.** One cap bounds every
+  result — a command's output, a file read, a listing, a search (`CMD_CAP = 16 000`
   bytes, scaled down by `Config::cmd_cap()` to the fifth a trim leaves — the
   room between its stopping point and the ceiling — floored at 512) — and a
   job's report is the same kind of window, a **tail** (§5.6). A capped result
@@ -141,7 +141,12 @@ and never share state with the painter.
   no window: past 2 MB it is refused with a downscale as the road, and an image
   the run's model is not documented to see is refused *before* it is sent, so a
   request that cannot be read never costs a turn. Edit operations always work on
-  the complete file.
+  the complete file, and no *input* is capped: `write_file`'s `content` and
+  `edit_file`'s replacement are bytes the model already sent, in its own tool
+  call and in the request that carries it, so a cap there would save the
+  conversation nothing and cost a turn and the work. A write large enough to
+  push the request past the window ends that turn at the request's own refusal
+  (`cannot send this request: …`), with the bytes already on disk.
 - **Bounded loops.** A run ends when the model stops calling tools; a *loop* —
   the same tool batch five rounds over with nothing changed in between — ends it
   early. Nothing counts turns, so a model that keeps making *different* calls

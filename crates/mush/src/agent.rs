@@ -3698,7 +3698,7 @@ fn exec_tool(
         // that keep working while another agent holds the machine, and the only
         // road that can carry an image (finding H31).
         ToolName::EditFile => edit_tool(&actor.ws, args),
-        ToolName::WriteFile => write_tool(actor, state, args),
+        ToolName::WriteFile => write_tool(actor, args),
         ToolName::ListFiles => list_tool(actor, state, args),
         ToolName::Search => search_tool(actor, state, args),
     };
@@ -4779,17 +4779,27 @@ fn read_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<ToolOutp
 
 /// `write_file`: create or replace a whole file. The answer is one line naming
 /// what changed, because the model already knows what it wrote.
-fn write_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String, String> {
+///
+/// Nothing caps `content`. The check this tool used to make was
+/// [`result_cap`]'s, and a result cap bounds what the model *reads back* — a
+/// command's output, a read's window, a listing, a search. A write's content is
+/// not a result: the bytes travelled in the tool call, so they are already in
+/// the transcript and in the request for this same turn, and refusing them
+/// would save the conversation nothing while costing a turn and the model's
+/// work. What bounds a write is the wire's own invariant: the assembled request
+/// is weighed before it is sent ([`run_loop`]'s [`over_window_line`] refusal),
+/// so a write big enough to push the request past the window ends *that turn*
+/// with that one line, naming what does not fit and the roads that make room.
+/// The bytes are on disk — the write ran — so the work is not lost, and the
+/// turn stays in the transcript until [`trim_history`] can shed it like any
+/// other older turn: the newest turn is the one a trim cannot cut, and a trim
+/// needs the three user lines it always needs, so a write can hold the window
+/// open for a while but not for good. The human's Stop is the outer bound, as
+/// everywhere; and the one-line answer cannot inflate a result, which is what
+/// [`result_cap`] exists to bound.
+fn write_tool(actor: &Actor, args: &Value) -> Result<String, String> {
     let path = tools::arg_string(args, "path")?;
     let content = tools::arg_string(args, "content")?;
-    let cap = result_cap(actor, state);
-    if content.len() > cap {
-        return Err(format!(
-            "content is {} bytes — over the {cap}-byte cap on one write; write the first part, \
-             then extend it with edit_file",
-            content.len()
-        ));
-    }
     // Existence, not readability. A file this tool is about to replace is a
     // file whether or not its bytes are text: answering "(new)" over a binary
     // file — an image, a blob — records a history fact that is simply false.
@@ -8734,8 +8744,6 @@ mod tests {
         let (actor, _mailbox) = test_actor("write-file");
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
-        // Before the closure borrows the state: what one result may carry now.
-        let cap = result_cap(&actor, &state);
         let mut write =
             |args: Value| exec_tool(&actor, &mut state, ToolName::WriteFile, &args, &cancel);
 
@@ -8754,11 +8762,130 @@ mod tests {
 
         let root = write(json!({ "path": ".", "content": "x" })).unwrap_err();
         assert!(root.text().contains("workspace root"), "{}", root.text());
-        let big = write(json!({ "path": "big.txt", "content": "x".repeat(cap + 1) })).unwrap_err();
-        assert!(big.text().contains("cap"), "{}", big.text());
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A one-call write far past the old cap lands whole, with its one-line
+    /// answer. The cap was [`result_cap`]'s, and a result cap bounds what the
+    /// model *reads back* — a write's content is bytes the model already sent,
+    /// in the tool call and in this turn's request, so refusing them saved the
+    /// conversation nothing while costing a turn and the model's work. The
+    /// answer is one line at 64 KB exactly as at one byte: a write cannot
+    /// inflate a result, which is all a result cap could have protected.
+    #[test]
+    fn a_write_past_the_old_cap_lands_whole() {
+        let (actor, _mailbox) = test_actor("write-past-cap");
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let content = "x".repeat(64 * 1024);
+
+        let written = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::WriteFile,
+            &json!({ "path": "big.txt", "content": content }),
+            &cancel,
+        )
+        .unwrap();
+
+        assert_eq!(written, "wrote big.txt — 1 line (new)");
+        assert_eq!(
+            fs::read_to_string(actor.ws.root().join("big.txt")).unwrap(),
+            content,
+            "every byte the model sent is on disk"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A write big enough to break a small window's budget ends the turn at the
+    /// wire's own refusal — and the file is on disk, because the write ran.
+    ///
+    /// The content lives in the assistant's tool call, not in the one-line
+    /// result, so the window's shed road (the newest turn's results) cannot take
+    /// it back and `trim_history` stops at the newest turn: this is the honest
+    /// consequence of no cap, pinned rather than assumed. The recovery is the
+    /// trim's own: the turn is no longer newest on the next message, but a trim
+    /// needs three user lines to cut anything at all, so it takes one more
+    /// message before the oversized turn is dropped like any older one — and
+    /// the bytes themselves were never at risk, because they are on disk.
+    #[test]
+    fn a_write_over_the_window_ends_the_turn_and_leaves_the_file() {
+        let content = "x".repeat(40_000);
+        let budget = test_cfg().config().unwrap().history_budget();
         assert!(
-            !actor.ws.root().join("big.txt").exists(),
-            "nothing was written"
+            content.len() > budget,
+            "the shape this test means to drive: {} > {budget}",
+            content.len()
+        );
+        let scripted = Arc::new(
+            Scripted::new()
+                .calls(vec![tool_call(
+                    "c1",
+                    "write_file",
+                    json!({ "path": "huge.txt", "content": content }),
+                )])
+                .says("done"),
+        );
+        let (actor, _events, _mailbox) = build_actor_about(
+            "write-over-window",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![
+            Message::system("s".repeat(3_247)),
+            Message::user("write it in one call"),
+        ];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+
+        assert!(error.contains("cannot send this request"), "{error}");
+        assert!(
+            error.contains("read less"),
+            "the line names the roads that make room: {error}"
+        );
+        assert_eq!(
+            scripted.asked().len(),
+            1,
+            "the turn that asked for the write went out; the request carrying it back was refused"
+        );
+        assert_eq!(
+            fs::read_to_string(actor.ws.root().join("huge.txt")).unwrap(),
+            content,
+            "the write ran before the request that could not carry it"
+        );
+
+        // One more message does not recover the conversation yet: the turn is
+        // older, but `trim_history` needs three user lines and there is nothing
+        // in the newest turn for the shed road to take, so the same line comes
+        // again. The human's own words still land in the transcript either way.
+        messages.push(Message::user("continue"));
+        let again = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+        assert!(again.contains("cannot send this request"), "{again}");
+        assert_eq!(scripted.asked().len(), 1, "still nothing went out");
+
+        // The third user line is the trim's own cutting point: the oversized
+        // turn is dropped like any older one, the request fits, and the run
+        // carries on — the bytes were never the conversation's to keep.
+        messages.push(Message::user("and continue"));
+        let outcome = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(outcome.as_deref(), Some("done"));
+        assert_eq!(scripted.asked().len(), 2, "the trimmed request went out");
+        assert!(
+            scripted.asked()[1]
+                .messages
+                .iter()
+                .all(|message| message.weight() < content.len()),
+            "the request no longer carries the write's bytes"
+        );
+        assert!(
+            messages
+                .iter()
+                .all(|message| message.weight() < content.len()),
+            "nor does the actor's transcript"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
@@ -8936,16 +9063,13 @@ mod tests {
     }
 
     /// A file this tool is about to replace is a file whether or not its bytes
-    /// are text: `(new)` over a blob is a false history fact, and the over-cap
-    /// refusal must not tell the model to do the thing that just failed.
+    /// are text: `(new)` over a blob is a false history fact.
     #[test]
     fn write_file_does_not_call_a_replaced_blob_new() {
         let (actor, _mailbox) = test_actor("write-blob");
         fs::write(actor.ws.root().join("blob.bin"), b"\0\0\0\0").unwrap();
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
-        // Before the closure borrows the state: what one result may carry now.
-        let cap = result_cap(&actor, &state);
         let mut write =
             |args: Value| exec_tool(&actor, &mut state, ToolName::WriteFile, &args, &cancel);
 
@@ -8953,13 +9077,6 @@ mod tests {
         assert_eq!(
             replaced,
             "wrote blob.bin — 1 line (replaced a file that is not text)"
-        );
-
-        let over = write(json!({ "path": "big.txt", "content": "x".repeat(cap + 1) })).unwrap_err();
-        assert!(
-            over.text().contains("write the first part"),
-            "the road is a split, not a repeat: {}",
-            over.text()
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }

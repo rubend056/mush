@@ -412,6 +412,18 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   repeated batch, not a count) stays as the one early end, and the human's Stop
   is the only outer bound. Pinned by
   `a_run_past_200_turns_ends_when_the_model_stops_calling_tools`.
+- **H46** — ✅ fixed by `c69e4d8`, §8.48: a `write_file` whose `content` was
+  longer than `result_cap(actor, state)` — on a big window the fixed
+  `CMD_CAP = 16 000` bytes — was refused with "content is N bytes — over the
+  cap on one write; write the first part…", the only place in the tree where
+  a *result* cap bounded an *input*. The bytes had already travelled in the
+  tool call, so the refusal saved the conversation nothing and cost a turn and
+  the model's work. The check is gone, `write_tool` no longer takes `state`,
+  and what bounds a write is the tool's one-line answer, the request's own
+  over-window refusal (`over_window_line` — the bytes are already on disk, and
+  a later trim sheds the turn) and the human's Stop. Pinned by
+  `a_write_past_the_old_cap_lands_whole` and
+  `a_write_over_the_window_ends_the_turn_and_leaves_the_file`.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -3743,3 +3755,95 @@ comments 17,276 — this wave is 67 lines fewer: 54 production, 14 comment and 3
 blank lines gone, 4 test lines more (one test replaced by one). `cargo test
 --workspace`: 680 + 4 ignored in the mush bin, 202 in mush-core; clippy and fmt
 clean.
+
+---
+
+## 8.48 A write is not a result: the content cap goes (`c69e4d8`)
+
+> "Can we also remove the 16000 byte cap for writes... its seems odd that we
+> accept the bytes from the request/llm but refuse to write it... :/"
+
+The human's ruling was the removal. `write_tool` refused a `write_file` whose
+`content` was longer than `result_cap(actor, state)` — on a big window the
+fixed `CMD_CAP = 16_000` bytes — with one line: "content is N bytes — over the
+cap on one write; write the first part, then extend it with edit_file". It was
+the only place in the tree where `result_cap` bounded an *input*: every other
+caller — `read_window`, a command's output, a listing, a search — bounds what
+the model reads back, which is the right shape for a result cap. A write's
+content is not a result: the bytes already travelled in the tool call, so they
+are in the transcript and in the request for that same turn, and the check
+saved the conversation nothing while costing a turn and the model's work. The
+check had no written rationale anywhere — the tool's doc said only "the answer
+is one line naming what changed", the schema said only "The complete new
+content", and no prompt line promised a size limit on a write — so the doc
+comment that replaces it is the first written account of what bounds a write.
+
+**The site.** `write_tool` loses the `content.len() > cap` check and the
+`state` parameter it only existed for (`exec_tool`'s arm is
+`write_tool(actor, args)` now, as `edit_tool`'s is), and with them the
+refusal sentence and its "write the first part" road into `edit_file`. The two
+tests that pinned the refusal — `write_file_creates_and_says_what_it_replaced`'s
+`cap + 1` write and `write_file_does_not_call_a_replaced_blob_new`'s "write the
+first part" assertion — lose it, and two new tests pin the new fact; no test
+asserts a refusal that no longer exists. The parallel road was checked and had
+none:
+`edit_file`'s replacement text is read by `tools::edits_arg` and written with
+no cap anywhere, and `tools::arg_string` has no size bound, so this check was
+the tree's only cap on a tool's input.
+
+**What bounds a write now** (written into `write_tool`'s doc comment, because
+the decision is being written for the first time):
+
+- the tool's own **answer** is one line, so a write cannot inflate a result —
+  which is what `result_cap` is for, and it stays for every real result road;
+- the conversation's own invariant at the wire bounds the **request**: the
+  assembled request is weighed before it is sent (`over_window_line` in
+  `run_loop`'s assembly), and a write big enough to push the request past the
+  window ends **that turn** with that line. The write ran first, so the bytes
+  are on disk and the work is not lost; and the turn cannot be cut while it is
+  the newest, so the window can be broken for a while but not for good — the
+  next messages make the turn an older one, which the trim then sheds like any
+  other;
+- the human's Stop, as everywhere.
+
+**The tests that pin it.** `a_write_past_the_old_cap_lands_whole`: one
+`write_file` call carrying 64 KB (over 26 times the 2,458-byte `cmd_cap` the
+test's 8k window gives, and more than four times the 16,000-byte ceiling any
+bigger window keeps) answers "wrote big.txt — 1 line (new)" and leaves every
+byte on disk.
+`a_write_over_the_window_ends_the_turn_and_leaves_the_file`: through
+`run_loop` at the 8k default's 12,288-byte budget, a scripted model calls
+`write_file` with 40,000 bytes. The turn that asked goes out (one request), the
+request carrying the call back is refused with "cannot send this request: the
+transcript weighs … against the 12,288-byte budget", and `huge.txt` holds all
+40,000 bytes — the honest consequence, pinned rather than assumed. The test
+then measures the recovery instead of promising one: one more message still
+refuses (the turn is no longer newest, but the trim has two user lines and the
+shed road has nothing to take), the third user line is the trim's cutting
+point, and the trimmed request goes out and is answered — with the oversized
+call gone from both the request and the actor's transcript.
+
+**Recorded, not changed.** No schema description or prompt line promised a
+size limit on a write, so nothing in `prompt.rs` or `tools.rs` changed — and
+`TRUNCATION_INSTRUCTION`'s "create a file with a heredoc … then extend it with
+`edit_file`" stays: it is about a *reply* cut off at the token cap, not about a
+write's size. `result_cap`'s doc ("Every big-text road uses it — a command's
+output, a file read, a listing, a search") is still the whole set of result
+roads, and `README.md`'s command-cap paragraph is still true of a command's
+output. `over_window_line`'s three roads ("Downscale an attached picture,
+`/compact` the conversation, or read less") do not name the road that actually
+recovers a writer's case — the trim's own three-user-line rule — but that is
+the pre-existing over-window shape (H43's picture refusal has it too), not
+something this removal created; recorded here rather than reworded. The grep
+for an older section or row that called the write cap a good thing found none,
+so nothing is superseded by this section.
+
+**Census** at this landing (`scripts/census.py`), against §8.47's (total
+65,352 · prod 15,280 · tests 28,837 · comments 17,276; the base this branch
+forked from, `09cea90`, holds the same tree as that landing's `b6b6d56`):
+total 65,469 · **prod 15,272** · tests 28,915 · comments 17,316 — 117 lines
+more: 8 production lines gone (the check and the `state` parameter), 40
+comment lines more (the `write_tool` doc comment the removal owes, and the new
+tests' own), 78 test lines more (two new tests), 7 blanks. `cargo test --workspace`: 682 + 4 ignored
+in the mush bin, 202 in mush-core; clippy and fmt clean; both endpoint-free pty
+scenarios (`--resize`, `--cancel`) pass.
