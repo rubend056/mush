@@ -15,6 +15,11 @@ use crate::message::Message;
 
 /// Ceiling on a compaction summary. A summary is prose, not a transcript, but
 /// reasoning tokens count against it too.
+///
+/// It is a ceiling and not the ask: the run loop sizes the fold's cap to the
+/// window the request is about to be sent to (what is left under the prompt,
+/// floored), so a window with little room gets a smaller summary — and one that
+/// cannot hold even the floor is not folded at all.
 pub const COMPACT_REPLY_TOKENS: u32 = 10_240;
 
 /// The instruction appended when the transcript nears the context window.
@@ -60,12 +65,16 @@ pub fn compaction_trigger(budget_bytes: usize) -> usize {
 /// A cut is a rewrite of the prompt's front — exactly the prefix a provider's
 /// cache had warmed — so it is the last resort and it is made once, deeply:
 /// [`trim_history`] cuts only a transcript already over the window's ceiling,
-/// and then all the way down here. That leaves a tenth of the budget between
-/// the stopping point and the fold's own trigger ([`compaction_trigger`], nine
-/// tenths), which is room the conversation grows back through: the growth that
-/// crosses the trigger is folded — one re-send that keeps the prompt's prefix
-/// and re-bases the conversation on a summary — rather than cut again at the
-/// brim.
+/// and then all the way down here. The room the conversation grows back through
+/// is the fifth between this stopping point and the ceiling — the room
+/// `Config::cmd_cap` gives one tool result, so a full-size result on top of a
+/// just-cut transcript lands *on* the ceiling. The fold's trigger
+/// ([`compaction_trigger`], nine tenths) sits inside that room, so the growth
+/// that crosses it is folded — one re-send that keeps the prompt's prefix and
+/// re-bases the conversation on a summary — rather than cut again at the brim.
+/// The trigger is not the size of a turn's growth: that growth is the whole
+/// fifth, two tenths, which is why the cap and this stopping point are one
+/// relation rather than two independent numbers.
 ///
 /// This is a stopping point and not a trigger, and the difference is measured:
 /// a trimmer that started cutting as soon as a transcript passed four fifths
@@ -91,15 +100,18 @@ pub fn trim_target(budget_bytes: usize) -> usize {
 
 /// Approaching the context window: fold the conversation into a summary
 /// instead of dropping old turns, so long-running tasks keep their state. The
-/// summarize request re-sends the history, so only fire while it still fits;
-/// beyond that, trimming stays the last resort.
+/// summarize request re-sends the history, so this fires only while the history
+/// is inside its own budget; past that, the run's trim is what drops turns —
+/// and whether the *whole* request (schemas, prompt, summary cap) fits the
+/// window is the caller's fit test, which refuses a fold rather than attempting
+/// one the endpoint would reject.
 ///
 /// `budget_bytes` is in bytes, the unit [`Message::weight`] weighs a transcript
 /// in. The lower bound is strict — a transcript *at* the trigger is not yet
 /// worth folding — and the upper one is inclusive: a transcript at exactly the
-/// whole budget is still one the summarize request can carry, and anything past
-/// it belongs to [`trim_history`], which drops turns instead of asking a model
-/// to read history the endpoint would reject.
+/// whole budget still folds, and anything past it belongs to [`trim_history`],
+/// which drops turns instead of asking a model to read history the endpoint
+/// would reject.
 pub fn needs_compaction(messages: &[Message], budget_bytes: usize) -> bool {
     let history: usize = messages.iter().map(Message::weight).sum();
     history > compaction_trigger(budget_bytes) && history <= budget_bytes
@@ -315,9 +327,11 @@ may have been dropped rather than never said.";
 /// - **over the ceiling, cut**: only a transcript past `budget` is touched at
 ///   all, and it is cut all the way down to [`trim_target`] — four fifths —
 ///   rather than just back under the ceiling, so the request has room to grow;
-/// - **back up, fold**: the tenth between four fifths and the fold's trigger
-///   ([`compaction_trigger`], nine tenths) is what the next growth crosses,
-///   and the fold is what meets it.
+/// - **back up, fold**: a turn grows the transcript by at most its fifth — the
+///   ceiling minus this stopping point, which is what `Config::cmd_cap` bounds
+///   one result by — so a transcript cut down here can reach the ceiling in one
+///   turn but never past it, and the growth that crosses the fold's trigger
+///   ([`compaction_trigger`], nine tenths) is folded rather than cut again.
 ///
 /// The watermark is a *stopping point, not a trigger*: a transcript inside the
 /// window is left exactly as it is, even one over four fifths. That shape is
@@ -485,6 +499,8 @@ mod tests {
     /// Past the whole budget the fold must not fire: the summarize request
     /// re-sends the history, and one the endpoint will reject is not a
     /// summary, it is a failed request. Trimming is what handles that range.
+    /// The upper bound is *inclusive*, as [`needs_compaction`]'s doc says: a
+    /// transcript at exactly the budget is inside it.
     #[test]
     fn a_transcript_past_the_whole_budget_does_not_fold() {
         let budget = 1_000;
@@ -492,6 +508,10 @@ mod tests {
             &transcript_of_weight(compaction_trigger(budget) + 1),
             budget
         ));
+        assert!(
+            needs_compaction(&transcript_of_weight(budget), budget),
+            "the upper bound is inclusive: a transcript at the budget still folds"
+        );
         assert!(!needs_compaction(&transcript_of_weight(budget + 1), budget));
     }
 

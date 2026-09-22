@@ -10,6 +10,7 @@
 //! copy of any file, so there is nothing to round-trip and nothing to keep in
 //! sync. An isolated agent works in its own git worktree.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -20,14 +21,14 @@ use crossbeam_channel::{Receiver, Sender};
 use serde_json::{json, Value};
 
 use mush_core::config::parse_context_hint;
-use mush_core::config::vision_capable;
+use mush_core::config::{vision_capable, BYTES_PER_TOKEN, SCHEMA_TOKENS};
 use mush_core::git;
 use mush_core::message::{ChatRequest, ChatResponse};
 use mush_core::text::{first_line, sanitize, truncate, truncate_flag};
 use mush_core::tools::ToolName;
 use mush_core::transcript::{
-    needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, COMPACT_INSTRUCTION,
-    COMPACT_REPLY_TOKENS,
+    needs_compaction, repair_tool_pairs, sanitize_tool_calls, trim_history, trim_target,
+    COMPACT_INSTRUCTION, COMPACT_REPLY_TOKENS,
 };
 use mush_core::workspace::{truncate_for_model, SEARCH_FILE_CAP};
 use mush_core::{prompt, tools, Config, Image, Message, Workspace, CMD_TIMEOUT_SECS};
@@ -973,6 +974,26 @@ struct ActorState {
     /// kills a run for making — a hold can outlast a wait many times over, so
     /// "wait again" is an instruction the guard has to survive (`count_round`).
     waited: bool,
+    /// Whether a fold of this transcript has already been refused for the
+    /// window and the human told. The automatic trigger fires on every turn at
+    /// the same unchanging transcript, and the same line every turn is not
+    /// news; an asked `/compact` always gets its answer, because a human typed a
+    /// command. Cleared when a fold fits again (a bigger window, a shorter
+    /// transcript), so the next refusal can speak.
+    fold_refused: bool,
+    /// What is left of one turn's *results* room: the bytes the whole batch of
+    /// tool results may still add to this turn's transcript. It is set when a
+    /// batch starts, spent by each result as it is stored, and `None` outside a
+    /// batch — then [`result_cap`]'s config half is the whole bound.
+    ///
+    /// A per-result cap is not enough: a `run_command` batch is unbounded in
+    /// count, so four results each answering to [`Config::cmd_cap`] would add
+    /// four fifths of the budget to a transcript with a fifth of room. The
+    /// first result takes its share of that fifth first, and each later one
+    /// gets what is left, so one turn's results cannot push a just-cut
+    /// transcript back over the ceiling — the request that goes out over the
+    /// window instead of being folded.
+    turn_room: Option<usize>,
 }
 
 /// One child's run ending, as its parent keeps it: which run it was, and how it
@@ -2110,6 +2131,158 @@ fn reply_broke(base_url: &str, error: &str) -> String {
     format!("the reply from {base_url} broke before it could be read: {error}")
 }
 
+/// What a request's messages weigh, in the byte-shaped currency
+/// [`Config::history_budget`] is in: the comparison the window invariant is
+/// made of. Saturating, for the reason [`trim_history`]'s own sum is — an image
+/// header may claim a size as large as a `usize`, and a transcript of them has
+/// to read as over the window rather than wrap to a small number that fits.
+fn request_weight(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(Message::weight)
+        .fold(0, usize::saturating_add)
+}
+
+/// The same weight in tokens — the unit a window is stated in — at the
+/// bytes-per-token heuristic, rounded *up* so a prompt never reads as fitting
+/// on a rounding.
+fn request_tokens(messages: &[Message]) -> usize {
+    request_weight(messages).div_ceil(BYTES_PER_TOKEN)
+}
+
+/// The messages a request may carry for the model it is addressed to: the
+/// transcript it was handed, minus the image parts of a model the provider
+/// table says cannot see ([`vision_capable`]).
+///
+/// The gate is asked here, where the request's parts are assembled, and not
+/// only where an image is attached or read: a mid-run model switch points a
+/// conversation that already holds pictures at a model the table says is blind,
+/// and a request that replays them would carry `image_url` parts an endpoint may
+/// reject — a whole turn and the human's money. The bytes stay in the actor's
+/// transcript (a picture goes with the turn it arrived in, and only the
+/// request's own copy is a copy); each message's own placeholder text stands
+/// where its images were (`Message::drop_images`), so the model still learns a
+/// picture was there and which file it came from, and one line says the model
+/// is why and `/model` is the road.
+fn for_the_model<'a>(actor: &Actor, cfg: &Config, messages: &'a [Message]) -> Cow<'a, [Message]> {
+    let images: usize = messages.iter().map(|message| message.images.len()).sum();
+    if images == 0 || vision_capable(&cfg.model) {
+        return Cow::Borrowed(messages);
+    }
+    let what = if images == 1 {
+        "one image part".to_string()
+    } else {
+        format!("{images} image parts")
+    };
+    actor.ctx.emit(
+        actor.id,
+        AgentEvent::Notice(format!(
+            "dropped {what} from the request: `{}` is not a model mush knows to accept images, so \
+             their bytes cannot travel — the transcript keeps the file names, and `/model` picks a \
+             model whose row documents vision",
+            cfg.model
+        )),
+    );
+    let mut stripped = messages.to_vec();
+    for message in &mut stripped {
+        message.drop_images();
+    }
+    Cow::Owned(stripped)
+}
+
+/// The reply cap a summarize request may ask for: the summary's own ceiling
+/// ([`COMPACT_REPLY_TOKENS`]), never more than the window has left once the
+/// prompt is paid for — the tool schemas that head it, then the history and the
+/// instruction — and floored at the same 1,024 tokens [`Config::reply_cap`] is
+/// floored at, so a fold that fits at all asks for a summary rather than for
+/// nothing. The floor is what makes "does not fit" reachable: a window with
+/// less than that left under the prompt is one [`fold_request_fits`] refuses.
+fn compaction_reply_cap(cfg: &Config, prompt_tokens: usize) -> u32 {
+    let left = cfg
+        .context_tokens
+        .saturating_sub(SCHEMA_TOKENS)
+        .saturating_sub(prompt_tokens);
+    (COMPACT_REPLY_TOKENS as usize).min(left).max(1_024) as u32
+}
+
+/// Whether a summarize request fits the window it would be sent to: the three
+/// parts the endpoint counts are the schemas, the prompt's messages, and the
+/// reply the cap asks for. False means the fold is not attempted — a request
+/// over the window is one a strict endpoint refuses, with the money already
+/// spent — and it is a fact about the window, not about the request's own
+/// arithmetic: past the floor, nothing smaller is worth asking for.
+fn fold_request_fits(cfg: &Config, prompt_tokens: usize, cap: u32) -> bool {
+    SCHEMA_TOKENS + prompt_tokens + cap as usize <= cfg.context_tokens
+}
+
+/// The one line a fold that cannot fit carries: what the request would need,
+/// what the window has, and the roads that change it. One spelling for the
+/// automatic arm and the asked one, because it is one fact.
+fn fold_does_not_fit_line(cfg: &Config, prompt_tokens: usize, cap: u32) -> String {
+    format!(
+        "cannot fold: the summarize request would need about {} tokens against a {}-token window \
+         ({prompt_tokens} of history and instruction, {SCHEMA_TOKENS} for the tool schemas, \
+         {cap} for the summary), so it was not sent — `/context N` states a bigger window, and \
+         Ctrl-N starts a new conversation",
+        SCHEMA_TOKENS + prompt_tokens + cap as usize,
+        cfg.context_tokens
+    )
+}
+
+/// What a tool result says when the window took its bytes. The call is still
+/// answered — a dangling call is a shape a strict server rejects — and the road
+/// back is the tools' own: the same output is one narrower call away.
+const SHED_RESULT_NOTE: &str = "\
+[mush: this result was dropped to fit the window — the call it answers is not lost; ask again in \
+a smaller piece (a narrower command, a smaller read) if you need the output]";
+
+/// Take back the newest turn's own tool results until the request fits the
+/// budget, and answer how many were shed and how many bytes they gave back.
+///
+/// This is the one thing besides a whole turn that a window may take back: a
+/// tool result is mush's own bytes, where the human's words are not, and a
+/// result that carries an image is left whole — a picture goes with its turn,
+/// never ahead of it. "The newest turn" is everything after the last user
+/// message, which is also the part [`trim_history`] can never cut, so this is
+/// the room the last resort has left. Largest first: the fewest results pay for
+/// the room, and each one says in its own text what happened to it.
+fn shed_newest_results(messages: &mut [Message], budget: usize) -> (usize, usize) {
+    let start = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .map_or(0, |index| index + 1);
+    let mut shed = (0usize, 0usize);
+    while request_weight(messages) > budget {
+        let heaviest = (start..messages.len())
+            .filter(|&index| {
+                messages[index].role == "tool"
+                    && messages[index].images.is_empty()
+                    && messages[index].text() != SHED_RESULT_NOTE
+            })
+            .max_by_key(|&index| messages[index].weight());
+        let Some(index) = heaviest else { break };
+        let before = messages[index].weight();
+        messages[index].content = Some(SHED_RESULT_NOTE.to_string());
+        shed.0 += 1;
+        shed.1 += before.saturating_sub(messages[index].weight());
+    }
+    shed
+}
+
+/// The one line a turn refused before the wire carries: what does not fit, and
+/// the roads that change it. Each road names something *in the transcript* — a
+/// picture to downscale, a fold that re-bases the conversation on a summary, a
+/// read that asked for less — because the shape is a fact about the request and
+/// only the human or the model can change it.
+fn over_window_line(cfg: &Config, carried: usize, budget: usize) -> String {
+    format!(
+        "cannot send this request: the transcript weighs {carried} bytes against the {budget}-byte \
+         budget for a {}-token window, and nothing left to drop. Downscale an attached picture, \
+         `/compact` the conversation, or read less — any of the three makes room",
+        cfg.context_tokens
+    )
+}
+
 /// One turn's ask, with the bounded retry a transport hiccup gets: the pause
 /// waits on the run's clock, the cancel flag is read between attempts, and
 /// every retry is a line in this agent's transcript rather than a spinner that
@@ -2253,6 +2426,27 @@ fn run_loop(
         // growth is folded in rather than cut.
         trim_history(messages, budget);
 
+        // Nothing goes over the wire over the window's budget, and
+        // `trim_history` is not the last hand that can make room: it cannot cut
+        // a transcript with fewer than three user lines, nor the newest turn
+        // itself, and the newest turn's own tool results are the one thing a
+        // window may take back — mush's bytes, never the human's words and
+        // never a picture. They go before the request is assembled, largest
+        // first, until the transcript fits; what was shed says so in the
+        // result it replaced, and the human is told in one line.
+        if request_weight(messages) > budget {
+            let (count, bytes) = shed_newest_results(messages, budget);
+            if count > 0 {
+                actor.ctx.emit(
+                    actor.id,
+                    AgentEvent::Notice(format!(
+                        "dropped {count} tool result(s) ({bytes} bytes) from the newest turn to fit \
+                         the window — the run continues",
+                    )),
+                );
+            }
+        }
+
         // The wrap-up turn asks for a summary, appended only to the request so
         // the stored transcript does not carry a turn-limit notice. A stop that
         // arrived in the meantime is honoured below, before the request goes
@@ -2268,6 +2462,21 @@ fn run_loop(
         } else {
             messages
         };
+        // The invariant, on the assembled request: the system prompt and the
+        // opening task are not droppable, so a shape that still does not fit —
+        // a picture too big for the window is the common one — is refused here,
+        // where no money has been spent, instead of by the endpoint's 400. The
+        // turn ends with one line naming what does not fit and the roads that
+        // change it; the actor is alive, and the next message tries again with
+        // whatever the human changed. What the model may actually see is
+        // decided first ([`for_the_model`]): a blind model's request is the
+        // transcript without its image parts, and it is that request the
+        // window has to hold.
+        let visible = for_the_model(actor, &cfg, request_messages);
+        let carried = request_weight(&visible);
+        if carried > budget {
+            return Err(over_window_line(&cfg, carried, budget));
+        }
 
         // The schemas stay even on a wrap-up turn: the prompt starts with
         // them, so withdrawing them re-prefills a history that is at its
@@ -2276,7 +2485,7 @@ fn run_loop(
         // `auto` keeps models that ignore tools working: they simply answer.
         let request = request(
             &cfg,
-            request_messages,
+            &visible,
             &schemas,
             if wrap_up { "none" } else { "auto" },
             cfg.reply_cap(),
@@ -2568,6 +2777,15 @@ fn run_loop(
         // the next round's guard.
         let mut all_refused = true;
         waited_round = false;
+        // One turn's results share the room the ceiling leaves above the trim's
+        // stopping point: a batch is unbounded in count, and four results each
+        // answering to `Config::cmd_cap` would add four fifths of the budget to
+        // a transcript with a fifth of room — the request that goes out over
+        // the window, or the cut-again shape the per-result cap was just fixed
+        // for. The first result takes its share first; each later one gets what
+        // is left (`result_cap`), and every result stored spends its own weight
+        // from the room below.
+        state.turn_room = Some(budget.saturating_sub(trim_target(budget)));
         for (index, call) in tool_calls.iter().enumerate() {
             // Keep watching for a Stop/Shutdown between calls, and answer the
             // rest of the batch before leaving: a cancellation must not leave
@@ -2613,9 +2831,13 @@ fn run_loop(
             // condemning a model waiting on a locked machine (H13).
             all_refused &= refused;
             let tool_message = Message::tool_with_images(call.id.clone(), output, images);
+            state.turn_room = state
+                .turn_room
+                .map(|room| room.saturating_sub(tool_message.weight()));
             messages.push(tool_message.clone());
             actor.ctx.emit(actor.id, AgentEvent::Message(tool_message));
         }
+        state.turn_room = None;
         refused_round = all_refused;
         // Fold mailbox commands in at the message boundary, and honour a
         // cancellation now that every call has a result.
@@ -2777,10 +2999,45 @@ fn compact_history(
     // Sampling and length parameters are a separate matter: they are not prompt
     // text, so the summary's own cap costs no cache miss.
     let schemas = tool_schemas(actor);
-    // The fold's cap is its own (`COMPACT_REPLY_TOKENS`) and it leaves
-    // `tool_choice` at `auto`; everything else — the field the cap travels
-    // under included — is [`request`]'s, shared with the run's own ask.
-    let request = request(cfg, &folded, &schemas, "auto", COMPACT_REPLY_TOKENS);
+    // The fold's cap is its own (`COMPACT_REPLY_TOKENS`, as far as the window
+    // allows) and it leaves `tool_choice` at `auto`; everything else — the field
+    // the cap travels under included — is [`request`]'s, shared with the run's
+    // own ask. The cap is what the window has left once the *whole* prompt is
+    // paid for — the schemas that head it and the history and instruction
+    // behind them — and the fit test is the whole request: a summarize request
+    // over the window is one a strict endpoint refuses with a 400, and the
+    // automatic arm has no line of its own, so paying for that refusal every
+    // turn is the silent hole this closes.
+    //
+    // What the model may see comes first: a blind model is never sent an image
+    // part, and the fold's prompt is what that leaves — a picture the transcript
+    // holds (an old turn, a restored session) stands as its placeholder line.
+    let visible = for_the_model(actor, cfg, &folded);
+    let prompt_tokens = request_tokens(&visible);
+    // What the model may see of it: a blind model is never sent an image part,
+    // and the fold's own prompt is what that leaves — a picture the transcript
+    // holds (an old turn, a session) stands as its placeholder line.
+    let cap = compaction_reply_cap(cfg, prompt_tokens);
+    if !fold_request_fits(cfg, prompt_tokens, cap) {
+        // Nothing is attempted: folded over the window is the one shape a
+        // summary cannot help with, and the transcript is left exactly as it
+        // was for the trim and the next road. The automatic arm says it once
+        // per state — the same unchanging shape retried every turn is not news
+        // — while a human who typed `/compact` is owed the answer every time.
+        if asked || !state.fold_refused {
+            actor.ctx.emit(
+                actor.id,
+                AgentEvent::Notice(fold_does_not_fit_line(cfg, prompt_tokens, cap)),
+            );
+        }
+        state.fold_refused = true;
+        actor
+            .ctx
+            .emit(actor.id, AgentEvent::CompactingEnded { in_run });
+        return Ok(false);
+    }
+    state.fold_refused = false;
+    let request = request(cfg, &visible, &schemas, "auto", cap);
     let reply = match ask(actor, &request, cancel) {
         Ok(reply) => reply,
         // A cancelled run is already ending; do not report a network failure.
@@ -3455,7 +3712,7 @@ fn exec_tool(
         ToolName::RunCommand => {
             return run_command(actor, state, args, cancel).map(ToolOutput::from)
         }
-        ToolName::ReadFile => return read_tool(actor, args).map_err(ToolError::Failed),
+        ToolName::ReadFile => return read_tool(actor, state, args).map_err(ToolError::Failed),
         ToolName::SpawnAgent => spawn_tool(actor, state, args),
         ToolName::Status => status_tool(actor, state),
         ToolName::Control => control_tool(actor, state, args),
@@ -3467,9 +3724,9 @@ fn exec_tool(
         // that keep working while another agent holds the machine, and the only
         // road that can carry an image (finding H31).
         ToolName::EditFile => edit_tool(&actor.ws, args),
-        ToolName::WriteFile => write_tool(actor, args),
-        ToolName::ListFiles => list_tool(actor, args),
-        ToolName::Search => search_tool(actor, args),
+        ToolName::WriteFile => write_tool(actor, state, args),
+        ToolName::ListFiles => list_tool(actor, state, args),
+        ToolName::Search => search_tool(actor, state, args),
     };
     answer.map_err(ToolError::Failed).map(ToolOutput::from)
 }
@@ -4503,14 +4760,17 @@ fn commit_worktree(
 /// after the six-tool cut assumed the shell would always be there to read. It is
 /// also the one road an image can travel by: a shell hands back bytes as text,
 /// and a picture is not text.
-fn read_tool(actor: &Actor, args: &Value) -> Result<ToolOutput, String> {
+fn read_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<ToolOutput, String> {
     let path = tools::arg_string(args, "path")?;
     if let Some(image) = actor.ws.read_image(&path)? {
         // Vision is a per-model fact ([`Config::model`]'s row in the provider
-        // table), and an image sent to a model that cannot see it is a rejected
-        // request — a whole turn, and the human's money. The refusal names what
-        // to do instead, because "this model cannot see" is not something the
-        // model can change.
+        // table), and the read is refused *before* the bytes are stored: the
+        // request gate ([`for_the_model`]) would drop the image part rather
+        // than let a blind model be sent it, but this is the honest place — the
+        // model learns at once that the picture it asked for cannot travel, and
+        // no megabytes of it are carried for nobody to look at. The refusal
+        // names what to do instead, because "this model cannot see" is not
+        // something the model can change.
         let model = actor.ctx.cfg.config()?.model;
         if !vision_capable(&model) {
             let format = image.mime.strip_prefix("image/").unwrap_or(&image.mime);
@@ -4540,16 +4800,16 @@ fn read_tool(actor: &Actor, args: &Value) -> Result<ToolOutput, String> {
     let limit = tools::arg_usize(args, "limit", usize::MAX)?;
     actor
         .ws
-        .read_window(&path, offset, limit, result_cap(actor))
+        .read_window(&path, offset, limit, result_cap(actor, state))
         .map(ToolOutput::from)
 }
 
 /// `write_file`: create or replace a whole file. The answer is one line naming
 /// what changed, because the model already knows what it wrote.
-fn write_tool(actor: &Actor, args: &Value) -> Result<String, String> {
+fn write_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String, String> {
     let path = tools::arg_string(args, "path")?;
     let content = tools::arg_string(args, "content")?;
-    let cap = result_cap(actor);
+    let cap = result_cap(actor, state);
     if content.len() > cap {
         return Err(format!(
             "content is {} bytes — over the {cap}-byte cap on one write; write the first part, \
@@ -4583,7 +4843,7 @@ fn write_tool(actor: &Actor, args: &Value) -> Result<String, String> {
 }
 
 /// `list_files`: the workspace's files under a path, one per line.
-fn list_tool(actor: &Actor, args: &Value) -> Result<String, String> {
+fn list_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String, String> {
     let rel = tools::arg_path(args, "path")?;
     let (files, truncated) = actor.ws.list_files(&rel, LIST_LIMIT)?;
     if files.is_empty() {
@@ -4595,11 +4855,11 @@ fn list_tool(actor: &Actor, args: &Value) -> Result<String, String> {
             "\n[mush: the first {LIST_LIMIT} files — list a narrower path to see the rest]"
         ));
     }
-    Ok(truncate_for_model(out, result_cap(actor)))
+    Ok(truncate_for_model(out, result_cap(actor, state)))
 }
 
 /// `search`: a literal string in the workspace's text files.
-fn search_tool(actor: &Actor, args: &Value) -> Result<String, String> {
+fn search_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String, String> {
     let pattern = tools::arg_string(args, "pattern")?;
     let rel = tools::arg_path(args, "path")?;
     let ignore_case = tools::arg_bool(args, "ignore_case", false)?;
@@ -4631,7 +4891,7 @@ fn search_tool(actor: &Actor, args: &Value) -> Result<String, String> {
     if !notes.is_empty() {
         out.push_str(&format!("\n[mush: {}]", notes.join("; ")));
     }
-    Ok(truncate_for_model(out, result_cap(actor)))
+    Ok(truncate_for_model(out, result_cap(actor, state)))
 }
 
 /// The files a search did not open, as a sentence. One function for both
@@ -4942,21 +5202,26 @@ fn detached_line(id: JobId) -> String {
 /// `crate::jobs` beside the other rule a job and a tool call share.
 use crate::jobs::CMD_OUTPUT_LIMIT;
 
-/// The bytes one tool result may carry.
+/// The bytes one tool result may carry *now*.
 ///
 /// Every big-text road uses it — a command's output, a file read, a listing, a
 /// search — so a result is bounded by the context budget rather than by a fixed
-/// number: a quarter of what the history can hold, capped at `CMD_CAP` (see
-/// `Config::cmd_cap`). A result that hits it says so and says what to do
-/// (`truncate_for_model`), and the file tools' windows are cut to it as they
-/// are built, so the sentence names the way on rather than a lost tail.
-fn result_cap(actor: &Actor) -> usize {
-    actor
+/// number: `Config::cmd_cap` is the room a cut leaves between its stopping point
+/// and the ceiling (a fifth of what the history can hold, capped at `CMD_CAP`),
+/// and a result of a batch is additionally bounded by what is left of this
+/// turn's room (`ActorState::turn_room`) — the same fifth, shared out among
+/// every result the turn has not stored yet. A result that hits the cap says so
+/// and says what to do (`truncate_for_model`), and the file tools' windows are
+/// cut to it as they are built, so the sentence names the way on rather than a
+/// lost tail.
+fn result_cap(actor: &Actor, state: &ActorState) -> usize {
+    let config = actor
         .ctx
         .cfg
         .config()
         .map(|cfg| cfg.cmd_cap())
-        .unwrap_or(mush_core::CMD_CAP)
+        .unwrap_or(mush_core::CMD_CAP);
+    config.min(state.turn_room.unwrap_or(usize::MAX))
 }
 
 /// Why a command stopped running.
@@ -5019,7 +5284,7 @@ fn run_shell(
             // its refusal kills the process group, and the launch owns the only
             // handle to the output — a report built after that would have
             // nothing to show (audit row 2).
-            let (stdout, stderr) = running.output(result_cap(actor));
+            let (stdout, stderr) = running.output(result_cap(actor, state));
             match detach_now(
                 actor,
                 registry,
@@ -5046,7 +5311,7 @@ fn run_shell(
     // finding S4 is about, or the registry's half of a `Stop` — must not be
     // reported as the command's own exit: `-1` is a signal nobody asked about.
     let ended = ending(ended, running.stopped());
-    let cap = result_cap(actor);
+    let cap = result_cap(actor, state);
     let (stdout, stderr) = running.output(cap);
     let mut report = command_report(&stdout, &stderr);
     report.push_str(&end_note(
@@ -7480,7 +7745,7 @@ mod tests {
 
         assert!(report.contains("output passed"), "{report}");
         assert_eq!(machine.kills(), 1, "the runaway writer was killed");
-        let cap = result_cap(&actor);
+        let cap = result_cap(&actor, &state);
         assert!(report.len() < cap * 2, "report grew: {}", report.len());
         assert!(
             clock.elapsed() < Duration::from_secs(30),
@@ -7516,13 +7781,545 @@ mod tests {
             report.contains("output truncated at"),
             "cap was not marked: {report}"
         );
-        let cap = result_cap(&actor);
+        let cap = result_cap(&actor, &state);
         assert!(
             report.len() < cap * 2,
             "report grew past the cap: {}",
             report.len()
         );
         let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// One turn's results share the room under the ceiling.
+    ///
+    /// A `run_command` batch is unbounded in count, and a per-result cap is no
+    /// bound on the batch: four results each answering to `Config::cmd_cap` add
+    /// four fifths of the budget to a transcript with a fifth of room, so the
+    /// request that carries them goes out over the window — or, on a transcript
+    /// a trim can cut, is cut again. Measured through `run_loop` on the shape
+    /// the audit used (a first turn: one user line, no older turn to drop, the
+    /// real 3,247-byte system prompt) and the 8k default: four results at the
+    /// cap left the next request carrying 13,768 bytes against a 12,288-byte
+    /// budget, with no cut, no note and no fold: a transcript with one user line
+    /// has no older turn to drop, and a transcript over the budget cannot fold.
+    /// Now the first result takes what it can and each later
+    /// one gets what is left of the fifth, so the request that carries the
+    /// whole batch fits.
+    #[test]
+    fn one_turns_results_share_the_room_under_the_ceiling() {
+        let big = "x".repeat(100_000);
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::exits(0).says(&big))
+                .runs(Script::exits(0).says(&big))
+                .runs(Script::exits(0).says(&big))
+                .runs(Script::exits(0).says(&big)),
+        );
+        let scripted = Arc::new(
+            Scripted::new()
+                .calls(
+                    ["one", "two", "three", "four"]
+                        .iter()
+                        .enumerate()
+                        .map(|(index, command)| {
+                            tool_call(
+                                &format!("c{}", index + 1),
+                                "run_command",
+                                json!({ "command": command }),
+                            )
+                        })
+                        .collect(),
+                )
+                .says("done"),
+        );
+        let cfg = test_cfg();
+        let budget = cfg.config().unwrap().history_budget();
+        let (actor, _events, _mailbox) = build_actor_about(
+            "turn-results",
+            scripted.clone(),
+            cfg,
+            machine,
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        // The shape the audit measured: a first turn, so a transcript with one
+        // user line and no older turn a trim could drop, under a prompt the
+        // size of the real one rather than the tests' stand-in.
+        let mut messages = vec![
+            Message::system("s".repeat(3_247)),
+            Message::user("run the four checks"),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("done"), "the run finished");
+
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 2, "the batch, then the answer");
+        let second = &asked[1];
+        let results: Vec<&Message> = second
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool")
+            .collect();
+        assert_eq!(
+            results.len(),
+            4,
+            "every call in the batch is still answered"
+        );
+        let room = budget - trim_target(budget);
+        assert_eq!(room, 2_458, "the fifth the ceiling leaves");
+        let carried: usize = second.messages.iter().map(Message::weight).sum();
+        assert!(
+            carried <= budget,
+            "the request carrying the batch weighs {carried} against a {budget}-byte budget"
+        );
+        // The sharing, in the results the model reads: the first took the room
+        // and each later one was answered with what was left of it — mush's own
+        // cut note, never the output the cap would have let through.
+        assert!(
+            results[0].text().contains("output truncated at") && results[0].weight() >= room,
+            "the first result took its share of the room: {}",
+            results[0].weight()
+        );
+        for later in &results[1..] {
+            assert!(
+                later.text().contains("truncated at 0 bytes"),
+                "a later result is cut to what was left: {:?}",
+                later.text()
+            );
+            assert!(
+                later.weight() < 200,
+                "and it is only mush's note: {}",
+                later.weight()
+            );
+        }
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The window's last resort before a refusal: the newest turn's own tool
+    /// results are mush's bytes, and they go largest-first until the request
+    /// fits, each replaced by one line saying so. A call is never left
+    /// unanswered and never loses its answer in silence, and the model is told
+    /// the road back — the same output is one narrower call away. This is the
+    /// shape a restored transcript has: results a per-turn cap would not let
+    /// through today, in a turn `trim_history` can never cut (it stops at a user
+    /// line, and the newest one is where those results live).
+    #[test]
+    fn the_window_takes_back_the_newest_turns_results_and_says_so() {
+        let scripted = Arc::new(Scripted::new().says("carried on"));
+        let (actor, events, _mailbox) = build_actor_about(
+            "shed-results",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let budget = test_cfg().config().unwrap().history_budget();
+        let mut messages = vec![
+            Message::system("s".repeat(3_247)),
+            Message::user("go"),
+            Message {
+                role: "assistant".into(),
+                tool_calls: Some(
+                    (1..=4)
+                        .map(|n| {
+                            tool_call(
+                                &format!("c{n}"),
+                                "run_command",
+                                json!({ "command": format!("check {n}") }),
+                            )
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+        ];
+        for n in 1..=4 {
+            messages.push(Message::tool(format!("c{n}"), "x".repeat(6_000)));
+        }
+        let before: usize = messages.iter().map(Message::weight).sum();
+        assert!(before > budget, "the shape is over the window: {before}");
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some("carried on"),
+            "the turn was kept alive instead of refused"
+        );
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 1, "one request, the one that fits");
+        let carried: usize = asked[0].messages.iter().map(Message::weight).sum();
+        assert!(carried <= budget, "{carried} > {budget}");
+
+        // What was shed says so where the model reads it, and the shed stops as
+        // soon as the request fits: a result that still had room is whole.
+        let shed: Vec<&Message> = asked[0]
+            .messages
+            .iter()
+            .filter(|message| message.text() == SHED_RESULT_NOTE)
+            .collect();
+        let kept: Vec<&Message> = asked[0]
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool" && message.text() != SHED_RESULT_NOTE)
+            .collect();
+        assert!(!shed.is_empty(), "the window took something back");
+        assert!(!kept.is_empty(), "and took no more than the room needed");
+        assert!(
+            kept.iter().all(|message| message.text().len() == 6_000),
+            "a kept result is whole"
+        );
+        // The human is told in one line too, because a transcript that quietly
+        // lost a result it still shows is the lie this line prevents.
+        let told = events.events_for(AgentId(7)).into_iter().any(|event| {
+            matches!(event, AgentEvent::Notice(line) if line.contains(&format!("dropped {} tool result(s)", shed.len())))
+        });
+        assert!(told, "the drop is said out loud");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A picture the window cannot hold is refused before the wire. The system
+    /// prompt and the opening task are not droppable, a picture is not mush's to
+    /// shed, and this turn has no older turn to cut: the request would go out
+    /// over the window and the endpoint would answer a 400 with the money
+    /// already spent. Measured at the 8k default: a 2,560×1,440 png weighs
+    /// the request weighs 18,041 bytes — 3,686,400 px at 750 px/token, ×3
+    /// bytes, on top of the 3,247-byte system prompt — against a 12,288-byte
+    /// budget. The turn ends with one line naming the road out — a downscale —
+    /// and the picture is never sent.
+    #[test]
+    fn a_picture_the_window_cannot_hold_is_refused_before_the_wire() {
+        let scripted = Arc::new(Scripted::new().says("looked"));
+        // A model the table documents as seeing: the picture has to meet the
+        // window invariant, not the vision gate (`for_the_model` drops an image
+        // part for a model `vision_capable` says cannot see).
+        let cfg = ConfigHandle::own(Config::new("http://127.0.0.1:1", "deepseek-flash", None));
+        let budget = cfg.config().unwrap().history_budget();
+        let (actor, _events, _mailbox) = build_actor_about(
+            "over-window-picture",
+            scripted.clone(),
+            cfg,
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![
+            Message::system("s".repeat(3_247)),
+            Message::user_with_images(
+                "what is wrong here?",
+                vec![image_at("shot.png", 2_560, 1_440)],
+            ),
+        ];
+        let over: usize = messages.iter().map(Message::weight).sum();
+        assert!(
+            over > budget,
+            "the picture alone is over the window: {over} > {budget}"
+        );
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+        assert!(
+            scripted.asked().is_empty(),
+            "nothing may go over the wire: {:?}",
+            scripted.asked()
+        );
+        assert!(error.contains("cannot send this request"), "{error}");
+        assert!(
+            error.contains(&format!("{over}")),
+            "the line says what does not fit: {error}"
+        );
+        assert!(error.contains("Downscale"), "and names the road: {error}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A transcript that cannot fit at all is refused with one line and no
+    /// call: the human's own words are not mush's to drop, and a shape with no
+    /// tool result in its newest turn has nothing to take back. The words are
+    /// left exactly as they were, so a `/compact` or a smaller paste meets the
+    /// same transcript.
+    #[test]
+    fn a_transcript_that_cannot_fit_is_refused_with_one_line() {
+        let scripted = Arc::new(Scripted::new().says("answered anyway"));
+        let (actor, _events, _mailbox) = build_actor_about(
+            "cannot-fit",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let budget = test_cfg().config().unwrap().history_budget();
+        let mut messages = vec![
+            Message::system("s".repeat(3_247)),
+            Message::user("x".repeat(budget)),
+        ];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+        assert!(scripted.asked().is_empty(), "no request went out");
+        assert!(error.contains("cannot send this request"), "{error}");
+        assert_eq!(
+            messages[1].text().len(),
+            budget,
+            "the human's words are not mush's to drop"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The audit's blind spot, pinned: no test compared a request to the
+    /// window's budget at all. These are the shapes a trim cannot cut — a
+    /// transcript with fewer than three user lines, a picture, the newest turn
+    /// itself — driven through the real loop: every request that reached the
+    /// model weighs no more than the budget, and every shape that could not fit
+    /// sent none. Without the invariant check the over-window picture's request
+    /// goes out (the audit measured 9,451 tokens against an 8,192-token
+    /// window), which is the assertion this loop trips on.
+    #[test]
+    fn no_request_the_trim_cannot_cut_goes_over_the_window() {
+        let budget = test_cfg().config().unwrap().history_budget();
+        let run = |label: &str,
+                   scripted: &Arc<Scripted>,
+                   mut messages: Vec<Message>|
+         -> (Result<Option<String>, String>, usize) {
+            // A shape with a picture goes to a model the table documents as
+            // seeing: what it measures is the window, and the vision gate is
+            // its own test (`a_blind_model_is_never_sent_an_image_part`).
+            let cfg = if messages.iter().any(|message| !message.images.is_empty()) {
+                ConfigHandle::own(Config::new("http://127.0.0.1:1", "deepseek-flash", None))
+            } else {
+                test_cfg()
+            };
+            let (actor, _events, _mailbox) = build_actor_about(
+                label,
+                scripted.clone(),
+                cfg,
+                Arc::new(ScriptedMachine::new()),
+                Arc::new(clock::System),
+            );
+            let mut state = ActorState::default();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let outcome = run_loop(&actor, &mut state, &mut messages, &cancel);
+            let asked = scripted.asked();
+            for request in &asked {
+                let carried: usize = request.messages.iter().map(Message::weight).sum();
+                assert!(
+                    carried <= budget,
+                    "{label}: a request went over the window: {carried} > {budget}"
+                );
+            }
+            let _ = fs::remove_dir_all(actor.ws.root());
+            (outcome, asked.len())
+        };
+
+        // A newest turn whose results were never bounded by a per-turn cap, in
+        // a transcript with one user line: the shed road keeps it alive.
+        let adopted = Arc::new(Scripted::new().says("carried on"));
+        let (outcome, sent) = run(
+            "invariant-adopted",
+            &adopted,
+            vec![
+                Message::system("s".repeat(3_247)),
+                Message::user("go"),
+                Message {
+                    role: "assistant".into(),
+                    tool_calls: Some(vec![tool_call(
+                        "c1",
+                        "run_command",
+                        json!({ "command": "check" }),
+                    )]),
+                    ..Default::default()
+                },
+                Message::tool("c1", "x".repeat(20_000)),
+            ],
+        );
+        assert!(outcome.is_ok(), "the shed road keeps the turn: {outcome:?}");
+        assert_eq!(sent, 1);
+
+        // A picture that fits the same window goes out — and fits.
+        let fitting = Arc::new(Scripted::new().says("looked"));
+        let (outcome, sent) = run(
+            "invariant-fitting-picture",
+            &fitting,
+            vec![
+                Message::system("s".repeat(3_247)),
+                Message::user_with_images("here", vec![image_at("shot.png", 1_920, 1_080)]),
+            ],
+        );
+        assert!(
+            outcome.is_ok(),
+            "a 1920×1080 screenshot fits an 8k window: {outcome:?}"
+        );
+        assert_eq!(sent, 1);
+
+        // A picture that cannot: nothing goes out.
+        let over = Arc::new(Scripted::new().says("looked"));
+        let (outcome, sent) = run(
+            "invariant-over-picture",
+            &over,
+            vec![
+                Message::system("s".repeat(3_247)),
+                Message::user_with_images("here", vec![image_at("shot.png", 2_560, 1_440)]),
+            ],
+        );
+        assert!(outcome.is_err(), "an over-window picture is refused");
+        assert_eq!(sent, 0);
+
+        // The human's own words, over the whole budget: nothing goes out.
+        let words = Arc::new(Scripted::new().says("answered anyway"));
+        let (outcome, sent) = run(
+            "invariant-words",
+            &words,
+            vec![
+                Message::system("s".repeat(3_247)),
+                Message::user("x".repeat(budget)),
+            ],
+        );
+        assert!(outcome.is_err(), "a paste over the budget is refused");
+        assert_eq!(sent, 0);
+    }
+
+    /// No request ever carries an image part to a model `vision_capable` says
+    /// cannot see. The attach and deliver gates ask at the box, but a request
+    /// that *replays* a transcript does not: a mid-run model switch (Ctrl-P)
+    /// leaves pictures a seeing model's turns brought in, and the request built
+    /// for the new model would carry `image_url` parts it may reject. The actor's
+    /// transcript keeps the picture whole — only the request's copy loses the
+    /// bytes — and the placeholder line stands where it was, so the model still
+    /// learns a picture arrived and which file it came from. One line names what
+    /// was dropped and `/model` as the road.
+    #[test]
+    fn a_blind_model_is_never_sent_an_image_part() {
+        // `test_cfg`'s model is one no provider row names, and the table says a
+        // capability mush cannot point at a document for is not assumed.
+        let scripted = Arc::new(Scripted::new().says("I cannot see it"));
+        let (actor, events, _mailbox) = build_actor_about(
+            "blind-request",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user_with_images("what is this?", vec![image_at("shot.png", 64, 64)]),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("I cannot see it"));
+
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 1);
+        assert!(
+            asked[0]
+                .messages
+                .iter()
+                .all(|message| message.images.is_empty()),
+            "no image part may reach a model the table says cannot see: {:?}",
+            asked[0]
+                .messages
+                .iter()
+                .map(|message| message.images.len())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            asked[0]
+                .messages
+                .iter()
+                .any(|message| message.text().contains("[image: shot.png (png)")),
+            "the placeholder stands for the picture, so the model still knows it was there: {:?}",
+            asked[0]
+                .messages
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>()
+        );
+        // The transcript the actor holds keeps the picture whole: the drop is
+        // the request's copy, and a picture goes with the turn it arrived in.
+        assert_eq!(messages[1].images.len(), 1, "the picture is still there");
+        let told: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(line) if line.contains("dropped") => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told.len(), 1, "one line for the drop: {told:?}");
+        assert!(
+            told[0].contains("`test`") && told[0].contains("/model"),
+            "the line names the model and the road: {}",
+            told[0]
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The fold's own request goes through the same gate: its prompt is built
+    /// from a transcript that may hold a picture (an old turn, a restored
+    /// session) long after the model that could see it is gone, and a summary
+    /// ask that carries image parts to a blind model is the rejected request
+    /// this gate exists for.
+    #[test]
+    fn the_folds_request_is_stripped_too_for_a_blind_model() {
+        let root = scratch_dir("blind-fold");
+        let summary = "the task was to look at a screenshot";
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary)
+                .says("carried on"),
+        );
+        let cfg = Config::new("http://127.0.0.1:1", "scripted", None);
+        let budget = cfg.history_budget();
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
+        // A picture in the opening turn, and a history filled to the fold's
+        // trigger behind it.
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user_with_images("look at this", vec![image_at("shot.png", 64, 64)]),
+        ];
+        let mut total: usize = messages.iter().map(Message::weight).sum();
+        let mut index = 0;
+        while total <= compaction_trigger(budget) {
+            let assistant = Message::assistant(format!("reply {index} {}", "x".repeat(280)));
+            let user = Message::user(format!("again {index}"));
+            total += assistant.weight() + user.weight();
+            messages.push(assistant);
+            messages.push(user);
+            index += 1;
+        }
+        root_tx.send(AgentMsg::Run(messages)).unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the run must finish: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+
+        let asked = scripted.asked();
+        let fold = asked
+            .iter()
+            .find(|asked| asked.saw(COMPACT_INSTRUCTION))
+            .expect("the fold was asked");
+        assert!(
+            fold.messages
+                .iter()
+                .all(|message| message.images.is_empty()),
+            "the fold's prompt carries no image part to a blind model"
+        );
+        assert!(
+            fold.messages
+                .iter()
+                .any(|message| message.text().contains("[image: shot.png (png)")),
+            "and the placeholder stands where the picture was: {:?}",
+            fold.messages.iter().map(Message::text).collect::<Vec<_>>()
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A standalone actor over a scratch workspace, for exercising the mailbox
@@ -7901,6 +8698,8 @@ mod tests {
         let (actor, _mailbox) = test_actor("write-file");
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
+        // Before the closure borrows the state: what one result may carry now.
+        let cap = result_cap(&actor, &state);
         let mut write =
             |args: Value| exec_tool(&actor, &mut state, ToolName::WriteFile, &args, &cancel);
 
@@ -7919,9 +8718,7 @@ mod tests {
 
         let root = write(json!({ "path": ".", "content": "x" })).unwrap_err();
         assert!(root.text().contains("workspace root"), "{}", root.text());
-        let big =
-            write(json!({ "path": "big.txt", "content": "x".repeat(result_cap(&actor) + 1) }))
-                .unwrap_err();
+        let big = write(json!({ "path": "big.txt", "content": "x".repeat(cap + 1) })).unwrap_err();
         assert!(big.text().contains("cap"), "{}", big.text());
         assert!(
             !actor.ws.root().join("big.txt").exists(),
@@ -8111,6 +8908,8 @@ mod tests {
         fs::write(actor.ws.root().join("blob.bin"), b"\0\0\0\0").unwrap();
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
+        // Before the closure borrows the state: what one result may carry now.
+        let cap = result_cap(&actor, &state);
         let mut write =
             |args: Value| exec_tool(&actor, &mut state, ToolName::WriteFile, &args, &cancel);
 
@@ -8120,9 +8919,7 @@ mod tests {
             "wrote blob.bin — 1 line (replaced a file that is not text)"
         );
 
-        let over =
-            write(json!({ "path": "big.txt", "content": "x".repeat(result_cap(&actor) + 1) }))
-                .unwrap_err();
+        let over = write(json!({ "path": "big.txt", "content": "x".repeat(cap + 1) })).unwrap_err();
         assert!(
             over.text().contains("write the first part"),
             "the road is a split, not a repeat: {}",
@@ -8195,6 +8992,20 @@ mod tests {
         let (actor, _events, mailbox) =
             build_actor(label, Arc::new(HttpModel::new(cfg.clone())), cfg);
         (actor, mailbox)
+    }
+
+    /// One picture with the pixels a test cares about. The bytes are a
+    /// placeholder on purpose: [`Image::weight`] prices a picture by its pixels
+    /// when its header named a size, and that is the pricing the window
+    /// invariant is asked about — a screenshot's file size can move by 10×
+    /// without moving its cost.
+    fn image_at(path: &str, width: u32, height: u32) -> Image {
+        Image {
+            path: path.to_string(),
+            mime: "image/png".to_string(),
+            bytes: vec![0; 32],
+            pixels: Some((width, height)),
+        }
     }
 
     /// The same actor, keeping the sink it emits into: how a delivery test sees
@@ -12549,8 +13360,12 @@ mod tests {
 
         let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
         // Tight window: the reserve scales with it, so the budget is 3 * (ctx
-        // - ctx/2) = 6000 bytes.
-        cfg.context_tokens = 4_000;
+        // - ctx/2) bytes. Small enough that the trim's trigger arrives after a
+        // few turns, big enough that the fold's own request fits it: below
+        // ~5.5k tokens the prompt plus the summary floor does not fit any window
+        // this size, and the fold is refused rather than attempted
+        // (`a_fold_the_window_cannot_hold_is_not_attempted` pins that road).
+        cfg.context_tokens = 6_000;
         let budget = cfg.history_budget();
         let events = Recorder::new();
         let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
@@ -12620,6 +13435,215 @@ mod tests {
             Some("isolated work")
         );
         let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The fold's reply cap is a function of the window, not a constant: the
+    /// summary may ask for its own ceiling ([`COMPACT_REPLY_TOKENS`]) only while
+    /// the window has that much left under the prompt it is about to send — the
+    /// schemas that head it, the history, and the instruction — and otherwise
+    /// for exactly what is left. Raising `COMPACT_REPLY_TOKENS` to 200,000 fails
+    /// this test at the 32k window, which is the blind spot the audit named.
+    /// Both requests are measured against the window they were built from,
+    /// because the cap and the prompt are one relation.
+    #[test]
+    fn the_folds_cap_is_what_the_window_leaves() {
+        let run = |label: &str, context: usize| -> (usize, Vec<Asked>) {
+            let root = scratch_dir(label);
+            let summary = "the task was done";
+            let scripted = Arc::new(
+                Scripted::new()
+                    .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                    .says(summary)
+                    .says("carried on"),
+            );
+            let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
+            cfg.context_tokens = context;
+            let budget = cfg.history_budget();
+            let events = Recorder::new();
+            let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
+            // A transcript at the fold's own trigger, built from the formula so
+            // the test does not encode it.
+            let mut messages = vec![
+                Message::system("you are mush"),
+                Message::user("task".to_string()),
+            ];
+            let mut total: usize = messages.iter().map(Message::weight).sum();
+            let mut index = 0;
+            while total <= compaction_trigger(budget) {
+                let assistant = Message::assistant(format!("reply {index} {}", "x".repeat(280)));
+                let user = Message::user(format!("again {index}"));
+                total += assistant.weight() + user.weight();
+                messages.push(assistant);
+                messages.push(user);
+                index += 1;
+            }
+            root_tx.send(AgentMsg::Run(messages)).unwrap();
+            let mut seen = Watched::default();
+            assert!(
+                seen.wait(&events, WAIT, |seen| seen.done >= 1),
+                "{label}: the run must finish: {seen:?}"
+            );
+            assert_eq!(seen.errors, Vec::<String>::new(), "{label}");
+            let _ = fs::remove_dir_all(&root);
+            (context, scripted.asked())
+        };
+
+        // The window binds: the cap is exactly what is left under the prompt.
+        let (context, asked) = run("fold-cap-window", 16_000);
+        let fold = asked
+            .iter()
+            .find(|asked| asked.saw(COMPACT_INSTRUCTION))
+            .expect("the fold was asked");
+        let prompt = request_tokens(&fold.messages);
+        assert!(
+            fold.max_tokens < COMPACT_REPLY_TOKENS,
+            "a 16k window has less left than the summary's ceiling: {}",
+            fold.max_tokens
+        );
+        assert_eq!(
+            fold.max_tokens as usize,
+            context - SCHEMA_TOKENS - prompt,
+            "the cap is what the window leaves"
+        );
+        assert!(SCHEMA_TOKENS + prompt + fold.max_tokens as usize <= context);
+
+        // The ceiling binds: a window with room keeps the summary's own cap.
+        let (context, asked) = run("fold-cap-ceiling", 32_000);
+        let fold = asked
+            .iter()
+            .find(|asked| asked.saw(COMPACT_INSTRUCTION))
+            .expect("the fold was asked");
+        let prompt = request_tokens(&fold.messages);
+        assert_eq!(
+            fold.max_tokens, COMPACT_REPLY_TOKENS,
+            "a window with room keeps the summary's own ceiling"
+        );
+        assert!(SCHEMA_TOKENS + prompt + fold.max_tokens as usize <= context);
+    }
+
+    /// A fold the window cannot hold is not attempted: at the trigger the
+    /// summarize request's own prompt *plus* the floored summary cap is more
+    /// than the window, so the only thing a wire call would buy is an
+    /// endpoint's 400 — with the money already spent, and nothing said. Measured
+    /// at the 4,000-token window and the fold's own trigger: 1,985 tokens of
+    /// history and instruction, 2,000 for the tool schemas, 1,024 for the
+    /// summary — 5,009 against 4,000. The line is said once per state, not once
+    /// per turn: the automatic trigger fires on the same unchanging transcript
+    /// every run, and the second run proves it — its own request went out, and
+    /// the fold was not mentioned again.
+    #[test]
+    fn a_fold_the_window_cannot_hold_is_not_attempted() {
+        let root = scratch_dir("fold-cannot-fit");
+        let scripted = Arc::new(Scripted::new().says("first answer").says("second answer"));
+        let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
+        cfg.context_tokens = 4_000;
+        let budget = cfg.history_budget();
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("say something".to_string()),
+        ];
+        let mut total: usize = messages.iter().map(Message::weight).sum();
+        let mut index = 0;
+        while total <= compaction_trigger(budget) {
+            let assistant = Message::assistant(format!("reply {index} {}", "x".repeat(280)));
+            let user = Message::user(format!("again {index}"));
+            total += assistant.weight() + user.weight();
+            messages.push(assistant);
+            messages.push(user);
+            index += 1;
+        }
+        assert!(
+            total > compaction_trigger(budget) && total <= budget,
+            "the transcript sits in the fold's window (total {total}, budget {budget})"
+        );
+
+        root_tx.send(AgentMsg::Run(messages.clone())).unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the first run must finish: {seen:?}"
+        );
+        root_tx.send(AgentMsg::Run(messages)).unwrap();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 2),
+            "the second run must finish: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 2, "the two runs' own requests, and no fold");
+        assert!(
+            !asked.iter().any(|asked| asked.saw(COMPACT_INSTRUCTION)),
+            "no summarize request went over the wire"
+        );
+        let refusals: Vec<&String> = seen
+            .notices
+            .iter()
+            .filter(|line| line.contains("cannot fold"))
+            .collect();
+        assert_eq!(
+            refusals.len(),
+            1,
+            "one line per state, not per turn: {refusals:?}"
+        );
+        assert!(
+            refusals[0].contains("4000-token window"),
+            "the line says the window it does not fit: {}",
+            refusals[0]
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// An asked `/compact` obeys exactly the same fit test as the automatic
+    /// arm: a transcript that cannot be summarized by a request that fits the
+    /// window is not summarized at all, and the human gets one line instead of a
+    /// wasted call. Measured before the fix: an idle `/compact` over a
+    /// 37,210-byte transcript sent 37,568 bytes ≈ 14,494 tokens with a
+    /// 10,240-token cap, one wasted request and a red line — the transcript was
+    /// over the window three times over.
+    #[test]
+    fn an_asked_compact_the_window_cannot_hold_is_not_attempted() {
+        let scripted = Arc::new(Scripted::new().says("summarized"));
+        let (actor, events, _mailbox) = build_actor_about(
+            "asked-fold-cannot-fit",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        // The human typed `/compact`: the flag the idle fold reads.
+        let mut state = ActorState {
+            compact_requested: true,
+            ..ActorState::default()
+        };
+        let mut transcript = vec![
+            Message::system("s".repeat(3_247)),
+            Message::user("task"),
+            Message::user("x".repeat(37_210)),
+        ];
+
+        compact_now(&actor, &mut state, &mut transcript);
+
+        assert!(
+            scripted.asked().is_empty(),
+            "a fold that cannot fit costs no call"
+        );
+        let refusals: Vec<AgentEvent> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter(
+                |event| matches!(event, AgentEvent::Notice(line) if line.contains("cannot fold")),
+            )
+            .collect();
+        assert_eq!(refusals.len(), 1, "one line: {refusals:?}");
+        assert_eq!(
+            transcript[2].text().len(),
+            37_210,
+            "the transcript is untouched: a refused fold is not a trim"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// `/compact` on an idle agent: the conversation is folded into a summary
@@ -13367,6 +14391,7 @@ mod tests {
         );
         let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
         cfg.max_completion_tokens = true;
+        let context = cfg.context_tokens;
         let events = Recorder::new();
         let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
         root_tx
@@ -13390,10 +14415,17 @@ mod tests {
         let asked = scripted.asked();
         let fold = asked.last().expect("the fold asked the model");
         assert!(fold.saw(COMPACT_INSTRUCTION), "the last ask is the fold");
-        assert_eq!(
-            fold.max_completion_tokens,
-            Some(COMPACT_REPLY_TOKENS),
-            "the fold's cap, under the field this endpoint requires"
+        let prompt = request_tokens(&fold.messages);
+        let cap = fold
+            .max_completion_tokens
+            .expect("the fold's cap travels, under the field this endpoint requires");
+        assert!(
+            SCHEMA_TOKENS + prompt + cap as usize <= context,
+            "the cap leaves the window its own prompt: {SCHEMA_TOKENS} + {prompt} + {cap} > {context}"
+        );
+        assert!(
+            cap < COMPACT_REPLY_TOKENS,
+            "an 8k window has less left than the summary's ceiling: {cap}"
         );
         assert_eq!(
             fold.max_tokens, 0,
