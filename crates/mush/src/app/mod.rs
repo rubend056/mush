@@ -1961,6 +1961,12 @@ impl App {
         if text.is_empty() && self.chat.attachments().is_empty() {
             return;
         }
+        // The draft is on its way out, so the road back goes with it: the
+        // `Ctrl-Z` slot is spent here and not by `take_input`, because the
+        // check above comes first — Enter on an empty box sends nothing, and
+        // spending the slot on a keystroke that sent nothing would be a loss of
+        // its own.
+        self.chat.forget_lost();
         let parsed = commands::parse_command(&text);
         // `/notes` is the reader of the chatter lines, not the act that
         // supersedes them: a human asking for the rest of the foot is reading
@@ -7013,6 +7019,88 @@ mod tests {
         app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         assert_eq!(app.chat.input().text(), "");
         assert!(app.chat.attachments().is_empty());
+    }
+
+    /// A send spends the `Ctrl-Z` slot: the draft left the box, so no keystroke
+    /// brings it back — even when the slot was holding an earlier loss.
+    #[test]
+    fn a_send_spends_the_slot() {
+        let (mut app, _rx) = test_app("send-spends");
+        let_the_model_see(&mut app);
+        app.focus = Focus::Chat;
+        app.chat.insert("lost words");
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        app.chat.insert("sent words");
+
+        app.send_message();
+
+        ctrl(&mut app, 'z');
+        assert_eq!(app.chat.input().text(), "", "the sent draft stays sent");
+    }
+
+    /// Enter on an empty box sends nothing, so it spends nothing: the slot is
+    /// still there for the key that refills the box.
+    #[test]
+    fn enter_on_an_empty_box_does_not_spend_the_slot() {
+        let (mut app, _rx) = test_app("empty-enter");
+        app.focus = Focus::Chat;
+        app.chat.insert("lost words");
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+
+        ctrl(&mut app, 'z');
+        assert_eq!(app.chat.input().text(), "lost words");
+    }
+
+    /// The box's painted promises survive every key that moves the draft: the
+    /// rows are what is attached, and the title counts the whole message.
+    #[test]
+    fn the_boxes_rows_and_title_follow_the_edit_keys() {
+        let (mut app, _rx) = test_app("paint-keys");
+        app.focus = Focus::Chat;
+        app.chat.attach(image("a.png"));
+        app.chat.attach(image("b.png"));
+        app.chat.insert("draft");
+
+        let painted = shot(&mut app, 120, 32).text();
+        assert!(painted.contains("▣ a.png"), "{painted}");
+        assert!(painted.contains("▣ b.png"), "{painted}");
+        assert!(painted.contains("message · 2 images"), "{painted}");
+
+        // A pop takes the newest row, and the title with it.
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE)));
+        backspace(&mut app);
+        let painted = shot(&mut app, 120, 32).text();
+        assert!(!painted.contains("▣ b.png"), "the row went too: {painted}");
+        assert!(painted.contains("▣ a.png"), "{painted}");
+        assert!(painted.contains("message · 1 image"), "{painted}");
+
+        // Ctrl-U clears the words and leaves the rows and the count alone.
+        ctrl(&mut app, 'u');
+        let painted = shot(&mut app, 120, 32).text();
+        assert!(!painted.contains("draft"), "the words are gone: {painted}");
+        assert!(painted.contains("▣ a.png"), "{painted}");
+        assert!(painted.contains("message · 1 image"), "{painted}");
+
+        // Ctrl-Z puts the words back; the rows never moved.
+        ctrl(&mut app, 'z');
+        let painted = shot(&mut app, 120, 32).text();
+        assert!(painted.contains("draft"), "the words are back: {painted}");
+        assert!(painted.contains("▣ a.png"), "{painted}");
+        assert!(painted.contains("message · 1 image"), "{painted}");
+
+        // Esc empties the box, rows and title included. The count is what the
+        // title promises, so that is what is read — the bar's own line about
+        // the clear names an image too, and it is a different surface.
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+        let painted = shot(&mut app, 120, 32).text();
+        assert!(!painted.contains("▣"), "the rows went: {painted}");
+        assert!(
+            !painted.contains("message · "),
+            "and the title stops counting: {painted}"
+        );
+        assert!(painted.contains("┌ message ─"), "{painted}");
     }
 
     /// An image-only message is a legal send — the box is empty and Enter still

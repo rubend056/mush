@@ -225,6 +225,11 @@ pub const KEYS: &[Binding] = &[
     },
     Binding {
         context: Context::Chat,
+        keys: "Ctrl-Z",
+        help: "put back the words and images the box last lost",
+    },
+    Binding {
+        context: Context::Chat,
         keys: "↑ / ↓, PgUp / PgDn",
         help: "scroll the transcript",
     },
@@ -305,12 +310,17 @@ pub enum ChatKey {
     Insert(char),
     /// The transcript's scrollback, in rows: positive is older.
     Scroll(i64),
-    /// Empty the message box, keeping a draft nowhere.
+    /// Esc: empty the message box and its attachments. The draft waits in the
+    /// `Ctrl-Z` slot, so what this key puts down is one keypress away.
     Clear,
     /// `Ctrl-U`: empty the box's words and keep its images — readline's
     /// `unix-line-discard`, in a box that soft-wraps, so it takes the whole
     /// draft and not "the cursor's line".
     ClearWords,
+    /// `Ctrl-Z`: put back the words and images the box last lost, where a loss
+    /// is Esc's clear, a `Backspace` pop, or a `Ctrl-U`. One slot, not an undo
+    /// history.
+    Undo,
 }
 
 /// What a key does. Every effect the keyboard has on the program goes through
@@ -463,17 +473,18 @@ fn chat(key: KeyEvent) -> Intent {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     let alt = key.modifiers.contains(KeyModifiers::ALT);
     match key.code {
-        // The chat pane's own modified key: the box takes the clipboard's
-        // image. It is here rather than with the app-wide `Ctrl-` keys because
-        // it is about the message being written, and it sits below the picker
-        // check in [`key`]: a picker owns the keyboard, and an attachment with
-        // no box on screen has nowhere to land.
+        // `Ctrl-V`: the box takes the clipboard's image. It is here rather
+        // than with the app-wide `Ctrl-` keys because it is about the message
+        // being written, and it sits below the picker check in [`key`]: a
+        // picker owns the keyboard, and an attachment with no box on screen
+        // has nowhere to land.
         KeyCode::Char('v') if ctrl => Intent::AttachClipboardImage,
-        // The chat pane's other `Ctrl-` key so far, here for the same reason: it
-        // is about the words being written, and it sits below the picker check
-        // in [`key`], so a picker — which owns the keyboard and has no box on
-        // screen — is not a way to reach the draft behind it.
+        // The chat pane's other two `Ctrl-` keys, here for the same reason:
+        // they are about the words being written, and they sit below the
+        // picker check in [`key`], so a picker — which owns the keyboard and
+        // has no box on screen — is not a way to reach the draft behind it.
         KeyCode::Char('u') if ctrl => Intent::Chat(ChatKey::ClearWords),
+        KeyCode::Char('z') if ctrl => Intent::Chat(ChatKey::Undo),
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) || alt => {
             Intent::Chat(ChatKey::Newline)
         }
@@ -593,6 +604,7 @@ mod tests {
             (none(KeyCode::Esc), Intent::Chat(ChatKey::Clear)),
             (ctrl('v'), Intent::AttachClipboardImage),
             (ctrl('u'), Intent::Chat(ChatKey::ClearWords)),
+            (ctrl('z'), Intent::Chat(ChatKey::Undo)),
         ];
         for (key, want) in cases {
             assert_eq!(at(Focus::Chat, false, key), want, "{key:?}");
@@ -611,6 +623,23 @@ mod tests {
         assert_eq!(at(Focus::Agents, false, ctrl('v')), Intent::Ignore);
         assert_eq!(at(Focus::Agents, true, ctrl('v')), Intent::Ignore);
         assert_eq!(at(Focus::Chat, true, ctrl('v')), Intent::Ignore);
+    }
+
+    /// `Ctrl-U` and `Ctrl-Z` are the box's, in the same shape as `Ctrl-V`: they
+    /// edit a draft, so the tree has nothing for them to do and a picker over
+    /// the box is not a way to reach it.
+    #[test]
+    fn the_boxs_clear_and_undo_keys_belong_to_the_chat_pane_and_not_to_a_picker() {
+        let cases = [
+            (ctrl('u'), Intent::Chat(ChatKey::ClearWords)),
+            (ctrl('z'), Intent::Chat(ChatKey::Undo)),
+        ];
+        for (key, want) in cases {
+            assert_eq!(at(Focus::Chat, false, key), want, "{key:?}");
+            assert_eq!(at(Focus::Agents, false, key), Intent::Ignore, "{key:?}");
+            assert_eq!(at(Focus::Agents, true, key), Intent::Ignore, "{key:?}");
+            assert_eq!(at(Focus::Chat, true, key), Intent::Ignore, "{key:?}");
+        }
     }
 
     /// `<Enter>` is the one key three panes share: send in the chat, focus a
@@ -698,7 +727,7 @@ mod tests {
                     none(KeyCode::Null),
                     none(KeyCode::CapsLock),
                     ctrl('a'),
-                    ctrl('z'),
+                    ctrl('y'),
                     // Alt-char is not typing: it is a shortcut mush does not
                     // have, in either pane.
                     KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
