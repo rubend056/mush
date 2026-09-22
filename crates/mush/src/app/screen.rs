@@ -247,7 +247,7 @@ pub struct AgentRow {
     /// The branch, its delta and any jobs: `mush/3 +12−4 ⚙1`.
     pub place: String,
     /// What it is doing, with its age: `thinking 3s`, `edit_file a.rs 12s`,
-    /// `waiting on agents 3s`, `compacting 2s`.
+    /// `waiting on results 3s` (the `wait` tool's own noun), `compacting 2s`.
     pub activity: String,
 }
 
