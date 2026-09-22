@@ -2516,6 +2516,42 @@ exactly this reason. The arm and the read are on different threads, so the
 order is the scheduler's; a fix needs the run number on both events, which is
 what would make the two comparable.
 
+**Why the tree was right and the actor was wrong.** The human asked the sharp
+version of the question — "the UI was correct in showing who was supposed to
+receive it; why is the UI's resolution and the actual resolution different?" —
+and the answer is the shape of the two references, not a slip in either.
+
+*The tree resolves by name, every time.* A node carries its parent's `AgentId`,
+and every use re-resolves it against a live map: `hand_to_parent` reads
+`node.parent` and looks the mailbox up in `AgentTree::agent_tx`, which the UI
+swaps in whenever an actor is revived (`ChildMailbox`). An id survives its
+actor — it is what a row is *for* — so the tree can name a recipient that has no
+thread at all, which is exactly what `✉` and `✉2` did while the orchestrator was
+asleep. *The actor holds a capability, once.* `Actor.parent_tx` is a
+`Sender<AgentMsg>` cloned when the actor was built: one receiver, for that
+actor's whole life, with no setter and no message that carries a new one. A name
+can be re-resolved; a capability cannot be re-pointed — that is the entire
+difference, and it is why the actor's side went silent while the tree's side
+stayed right.
+
+*And the fact had two owners.* `result_unread` is the tree's claim, set by the
+child's own end (`finish`/`fail`/`stopped`, from the tree's structure alone) and
+cleared only by the parent actor's `ResultRead` event — or by the child starting
+another run, which supersedes the result; the books
+(`ActorState::completed`/`running`) are the actor's claim, written only by a
+delivery on the wire. So "2 news waiting" was true about the tree and false
+about the books at the same moment — one fact, two owners, one of them fed.
+That is the §8 class again, this time between a capability and a lookup; the fix
+makes the wire report its own failure (`ParentAsleep`) so the UI's id-based road
+is what carries it, rather than giving the actor a second, shared copy of the
+tree's map.
+
+The UI's road is not infallible either, and the same distinction says why:
+`agent_tx` is a *mailbox* registry, not an *actor* registry, so a parked child's
+mailbox is a name with nobody behind it — which is what the two `let _ =` sends
+recorded above (the H22 shape) cost. Name-based resolution settles *who*, never
+*whether anyone is listening*.
+
 **Census** at this landing on the rebased tree (`scripts/census.py`), against
 §8.41's (total 57,994 · prod 14,459 · tests 24,963 · comments 14,980): total
 58,917 · **prod 14,500** · tests 25,461 · comments 15,330 — 923 lines: 41
