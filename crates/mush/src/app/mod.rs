@@ -9331,7 +9331,11 @@ mod tests {
             "{empty}"
         );
 
-        app.chat.insert("a question long enough to weigh something");
+        // Long enough that its weight has to show at the label's own
+        // granularity: the meter prints a tenth of a thousand tokens, so a
+        // short question can weigh less than the smallest step it shows.
+        app.chat
+            .insert(&"a question long enough to weigh something ".repeat(20));
         app.send_message();
         let meter = app.context_meter();
         assert_ne!(meter, empty, "the human's words are counted: {meter}");

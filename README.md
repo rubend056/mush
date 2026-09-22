@@ -99,6 +99,13 @@ own schema, and as the design record in the *agent contract* of
 toolset, so a leaf keeps nine, and a live-agent budget (`MAX_AGENTS` 16) caps
 total fan-out.
 
+The root is an **orchestrator**: its job is the overview and the person in front
+of it — deciding what happens next, briefing the children, and reading what
+they hand back. The work itself (the edits, the tests, the chasing) belongs to
+subagents, in a few large briefs rather than many small ones, and the system
+prompt says so: a change the root makes with its own hands lands in your
+checkout with no brief, no branch and no second reader.
+
 The orchestrator may end its turn while children still run: mush shows
 `waiting on 1 subagent(s) — the root resumes as they finish`, and the root is
 **woken with each child's `#N done: summary`** as they finish — early End is not

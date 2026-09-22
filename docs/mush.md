@@ -157,20 +157,28 @@ and never share state with the painter.
 
 `mush-core/src/prompt.rs` generates the entire prompt, and is the only place it
 exists: this section describes its shape rather than quoting it, because a quote
-here is a second copy, and a second copy goes stale on its own. One line names
-the workspace, then the rules, the delegation policy, and what the machine is
-like (§5.6) — `RULES`, `DELEGATION` and `MACHINE`. The blocks are shared with the
-subagent prompt, so a rule has one home rather than two copies that drift, and
-the prompt is kept small on purpose: every word of it is paid for on every
-request of every turn.
+here is a second copy, and a second copy goes stale on its own. The root opens
+with the workspace it works in and the job it holds — `ROOT_ROLE`: keep the
+overview, decide what happens next, and talk to the human, because the work
+belongs to subagents and an edit the root makes itself lands in this checkout
+with no brief, no branch and no second reader — and then the rules, the
+delegation policy, and what the machine is like (§5.6): `RULES`, `DELEGATION`
+and `MACHINE`. The blocks are shared with the subagent prompt, so a rule has one
+home rather than two copies that drift, and the prompt is kept small on purpose:
+every word of it is paid for on every request of every turn. `ROOT_ROLE` is the
+one block a child does not read — a child is handed a brief rather than a role,
+and it does not talk to the human.
 
 The DELEGATION block is only in a prompt whose tools include delegation: a leaf
-at `MAX_DEPTH` has no `spawn_agent`, so it is not told how to use it. A
-subagent's prompt is otherwise the same shape — who it is (depth), the workspace
-it works in (the shared one, or its own worktree with a `base`) — and the brief
-travels as the first user message, not in the system prompt, mirroring the
-root's system+user shape. The UI shows that same brief as the child's first
-message, so the human's picture of a child starts where the child's does.
+at `MAX_DEPTH` has no `spawn_agent`, so it is not told how to use it. It puts
+the work itself on the children — the edits, the tests, the chases — and leaves
+the overview to the agent that delegates: lookups a single call answers, the
+briefs, and the decisions about what happens next. A subagent's prompt is
+otherwise the same shape — who it is (depth), the workspace it works in (the
+shared one, or its own worktree with a `base`) — and the brief travels as the
+first user message, not in the system prompt, mirroring the root's system+user
+shape. The UI shows that same brief as the child's first message, so the human's
+picture of a child starts where the child's does.
 
 ### Tools
 
@@ -258,11 +266,14 @@ the same facts that decide whether a `read_file` image travels; the human's gate
 is the one that keeps the path as text instead of dropping the gesture, and the
 clipboard's is the one that has no path to keep.
 
-A third fact is said but does not refuse: an image bigger than the whole
-`Config::history_budget()` attaches, with the line that says `trim_history`
-sheds image payloads *before* it drops a turn, so those bytes would never reach
-the model. The human decides what to send; what the model will actually see is
-not a thing to leave unsaid.
+A third fact is said but does not refuse: an image that does not fit the room the
+conversation has left — `Config::history_budget()` minus the system prompt, the
+transcript, and the images already waiting in the box — attaches, with the line
+that says `trim_history` sheds image payloads *before* it drops a turn, so the
+picture would never reach the model, and that names the two roads that make it
+arrive: `/compact` folds the history into a summary and makes room, and a
+downscale makes the picture cost less. The human decides what to send; what the
+model will actually see is not a thing to leave unsaid.
 
 Three facts decide whether an image travels:
 
@@ -278,6 +289,22 @@ Three facts decide whether an image travels:
 - **An image is capped at 2 MB and cannot be windowed.** `offset`/`limit` are
   lines and an image has none, so the refusal names the one road that makes a
   big picture readable: downscale it with `run_command` and read that.
+
+How an image is **weighed** is this section's third measure, and the one that
+used to be wrong. Text is counted in bytes (`BYTES_PER_TOKEN`); a picture is
+counted in **pixels** — `Config::PIXELS_PER_TOKEN` turns width × height into
+tokens, which the budget turns back into its byte-shaped currency — and falls
+back to raw file bytes only when its header named no size (an unreadable or
+foreign file, which then *over*counts, the safe direction). The dimensions come
+from the image's own header, read beside the bytes it sniffs
+(`Workspace::image_dimensions`: png's `IHDR`, a jpeg `SOFn` reached by walking
+the marker segments, gif's screen descriptor, webp's three chunk shapes).
+File size is no proxy for cost: png compression moves the same 1920×1080 shot
+between ~70 KB and ~724 KB, and the byte counting read the large one as ~247k
+tokens where it costs ~2.8k — so an over-budget transcript shed a picture the
+model could have looked at, and the meter a human watches jumped by a quarter of
+a million for one screenshot (finding H36). The 2 MB cap above stays a
+*transport* measure — what is worth putting on the wire — and not a token one.
 
 An image's bytes leave the transcript the same way they would leave the context:
 `Message::drop_images` replaces them, in place, with one line naming the path and
@@ -306,6 +333,11 @@ Trimming drops information, so it is the fallback, not the first move: once the
 transcript passes nine tenths of the budget the agent asks the model to
 summarize everything important and continues from `system + summary`. That is
 what lets a long task survive a small context window.
+
+The budget weighs its two kinds of thing by their own measure: text in bytes
+(`BYTES_PER_TOKEN`), pictures in pixels (`PIXELS_PER_TOKEN` — see §3). A
+screenshot therefore costs what it shows rather than how well it compressed,
+and the trimmer sheds pictures before turns in that same currency.
 
 `/compact` is the same fold, asked for by hand instead of triggered by the
 window — one routine, so the two cannot disagree about the summary message or
@@ -1199,6 +1231,12 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
 - **No OT/CRDT.** Plain files, atomic writes, exact-match edits.
 - **The prompt is data, not logic.** It lives in one small function beside the
   tool schemas, so the contract can be read in one screen.
+- **The root orchestrates; the work belongs to subagents.** A change the root
+  makes itself lands in the human's checkout with no brief, no branch and no
+  second reader, and it costs the picture the root was holding. So `ROOT_ROLE`
+  says the job is the overview and the human, and the delegation policy puts
+  the edits, the tests and the chases on children — in a few large briefs
+  rather than many small ones. It is the one block a subagent does not read.
 - **The direct crates in §7 are the budget.** Anything else must earn its place.
 - **`.mush/` ignores itself.** Zero setup, zero footprint in the host repo.
 - **An isolated agent's work is committed when its run ends.** A branch that stays

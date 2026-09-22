@@ -58,12 +58,23 @@ Decide up front, or wait for the running one first. (The check can only fail aft
 exists, so decide before writing it.)\n\
 - A subagent runs until it stops calling tools, so a brief is bounded by the work, not a turn count: \
 split by what is independent, not by how long you think it takes.\n\
-- Delegate independent, large, or context-heavy subtasks; do single edits and lookups yourself. Prefer \
-a few big delegations over many small ones.\n\
+- Delegate the work itself — the edits, the tests, the chases — and keep the overview: lookups a \
+single call answers, the briefs, and the decisions about what happens next. Prefer a few big \
+delegations over many small ones.\n\
 - Ending your turn while children still run is fine: they keep working and a finish wakes you with its \
 \"#N done: summary\". wait is optional — use it when you want the results now (its schema says what it \
 hands over) — but never `sleep` to wait: a finish arrives on its own, and a repeated `sleep` is \
 stopped as a loop.";
+
+/// The root's own job, in the root's prompt only: the one agent whose work is
+/// the picture and the person rather than a file. It says what the work is and
+/// why an edit of its own is the wrong shape for it; how to delegate stays in
+/// [`DELEGATION`], which every delegating agent reads.
+const ROOT_ROLE: &str = "\
+Your job is to orchestrate: hold the overview, decide what happens next, and talk to the human — you \
+are the only agent in this tree who does. The work belongs to subagents, and almost every change should \
+happen in a child's run: an edit you make yourself lands in this checkout with no brief, no branch and \
+no second reader, and it costs you the picture you were holding.";
 
 /// The opening a blank brief leaves: the child's first user message and the
 /// transcript's first line, so the model and the human read the same words.
@@ -74,6 +85,8 @@ pub const BEGIN_TASK: &str = "Begin the task now.";
 pub fn system_prompt(root: &str) -> String {
     format!(
         "You are mush, a coding agent working in the workspace at {root}.\n\
+         \n\
+         {ROOT_ROLE}\n\
          \n\
          {RULES}\n\
          \n\
@@ -461,6 +474,31 @@ mod tests {
     fn only_a_delegating_subagent_reads_the_delegation_policy() {
         assert!(subagent_prompt("/tmp/ws", 1, false, true).contains("Delegation:"));
         assert!(!subagent_prompt("/tmp/ws", 3, false, false).contains("Delegation:"));
+    }
+
+    /// The root is the one agent whose work is the picture and the person, and
+    /// its prompt says so: the role, the reason an edit of its own is the wrong
+    /// shape for it, and the delegation mechanics underneath. A child is handed
+    /// a brief rather than a role, so it reads the mechanics and none of the
+    /// "talk to the human" sentence — the two prompts share everything they
+    /// can and nothing they cannot.
+    #[test]
+    fn the_root_is_told_its_job_is_the_overview_and_the_human() {
+        let root = system_prompt("/tmp/ws");
+        assert!(root.contains(ROOT_ROLE), "{root}");
+        assert!(root.contains("talk to the human"), "{root}");
+        assert!(
+            root.contains("no brief, no branch and no second reader"),
+            "{root}"
+        );
+        assert!(root.contains("Delegation:"), "{root}");
+
+        let child = subagent_prompt("/tmp/ws", 1, false, true);
+        assert!(!child.contains(ROOT_ROLE), "{child}");
+        assert!(!child.contains("talk to the human"), "{child}");
+        // What a delegating child does read is the policy: the work is the
+        // children's there too.
+        assert!(child.contains("Delegate the work itself"), "{child}");
     }
 
     #[test]
