@@ -12,7 +12,7 @@
 //! body gray — stays fixed: a failure reads the same in every workspace.
 
 use ratatui::layout::{Constraint, Layout, Position, Rect};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph};
 use ratatui::Frame;
@@ -20,7 +20,9 @@ use unicode_width::UnicodeWidthStr;
 
 use mush_core::text::fit_row;
 
-use crate::app::{AgentRow, AgentsPane, BarPane, ChatPane, Focus, PickerPane, Rank, Screen};
+use crate::app::{
+    AgentRow, AgentsPane, BarPane, ChatPane, Focus, PickerPane, Rank, Screen, SelectRows,
+};
 use crate::theme::Theme;
 
 /// The idle bar hint, when there is nothing to report. The commands it names
@@ -178,6 +180,55 @@ pub(crate) fn agent_line(row: &AgentRow, width: usize) -> String {
     fit_row(&head, &row.title, &row.place, &tail, width)
 }
 
+/// The pane's rows with the select mode's two marks on them: the cursor, the
+/// selection, or both.
+///
+/// The mode hands over *which* rows ([`SelectRows`]) and the painter says what
+/// they wear, the way every other colour decision lives here. Neither mark is
+/// the agents pane's selected row (`Black` on the accent): that row is a
+/// *place* in the tree and its bar is the chrome's hue, while a selection is a
+/// *range of the transcript* — the hue as a band behind the text's own colours,
+/// so a dimmed tool result and a green reply stay themselves inside it — and
+/// the cursor is the terminal's own mark for the cell the keyboard is on
+/// (`REVERSED`, the attribute a terminal paints its cursor with). A row that is
+/// both wears both: the reversed cell inside the band reads as the cursor
+/// within the selection, which is exactly what it is.
+fn select_painted(
+    lines: &[Line<'static>],
+    select: &SelectRows,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    lines
+        .iter()
+        .enumerate()
+        .map(|(at, line)| {
+            let selected = select.selected.contains(&at);
+            let cursor = select.cursor.contains(&at);
+            if !selected && !cursor {
+                return line.clone();
+            }
+            let mut mark = Style::default();
+            if selected {
+                mark = mark.bg(theme.accent());
+            }
+            if cursor {
+                mark = mark.add_modifier(Modifier::REVERSED);
+            }
+            // Patched onto every span rather than set as the line's own style:
+            // a span's colour (the dim of a result, the reply's green) is what
+            // the row *is*, and the mark is laid over it — the same order the
+            // rest of the frame paints in, where content is chosen first and
+            // the chrome patches what it must.
+            let spans = line
+                .spans
+                .iter()
+                .map(|span| Span::styled(span.content.clone(), span.style.patch(mark)))
+                .collect::<Vec<Span<'static>>>();
+            Line::from(spans).style(line.style.patch(mark))
+        })
+        .collect()
+}
+
 fn draw_chat(frame: &mut Frame, pane: &ChatPane, focus: Focus, theme: &Theme) {
     let focused = focus == Focus::Chat;
     let block = Block::default()
@@ -187,7 +238,11 @@ fn draw_chat(frame: &mut Frame, pane: &ChatPane, focus: Focus, theme: &Theme) {
         Some(painted) => {
             let inner = block.inner(pane.transcript_area);
             frame.render_widget(block.title(painted.title.clone()), pane.transcript_area);
-            frame.render_widget(Paragraph::new(Text::from(painted.lines.clone())), inner);
+            let lines = match &painted.select {
+                Some(select) => select_painted(&painted.lines, select, theme),
+                None => painted.lines.clone(),
+            };
+            frame.render_widget(Paragraph::new(Text::from(lines)), inner);
         }
         None => frame.render_widget(block, pane.transcript_area),
     }
@@ -330,6 +385,7 @@ mod tests {
     use ratatui::buffer::Buffer;
     use ratatui::Terminal;
 
+    use crate::app::Painted;
     use crate::theme::EnvText;
 
     /// A picker at `area` with one item, so a frame has a border, a selected
@@ -387,6 +443,99 @@ mod tests {
                 "the hint needs the row the popup does not have: {area:?}: {painted}"
             );
         }
+    }
+
+    /// A chat pane with three transcript rows and no box, so the select mode's
+    /// two marks can be read off the frame's own cells. The lines carry the
+    /// colours a real transcript's do — a dim result in the middle, plain text
+    /// above and below — because what the band must not do is repaint the ink
+    /// of the row it is drawn under.
+    fn select_pane(area: Rect, select: Option<SelectRows>) -> ChatPane {
+        ChatPane {
+            transcript_area: area,
+            // Below the transcript, with no rows: the box is not what this test
+            // reads, and a zero-height one paints nothing.
+            input_area: Rect::new(area.x, area.y + area.height, area.width, 0),
+            transcript: Some(Painted {
+                lines: vec![
+                    Line::from("plain"),
+                    Line::from(Span::styled("dim result", dim())),
+                    Line::from("cursor"),
+                ],
+                title: " mush ".to_string(),
+                select,
+            }),
+            input: None,
+        }
+    }
+
+    /// The select mode reaches the frame as two marks that are neither each
+    /// other nor the agents pane's selected row: the pick is the hue as a
+    /// *background* with the text's own ink left alone (a dim result stays dim
+    /// inside it, and nothing wears the tree's `Black`), and the cursor is the
+    /// terminal's own `REVERSED` cell — which is what a row that is both wears,
+    /// reading as the cursor inside the selection.
+    #[test]
+    fn the_select_mode_paints_its_cursor_and_its_selection_on_their_own_cells() {
+        let theme = Theme::default();
+        let area = Rect::new(0, 0, 20, 5);
+        let select = SelectRows {
+            // The cursor's source line is two painted rows in the pane this
+            // fixture stands for; here it is the last row and the middle one,
+            // so the frame shows a bare cursor (the last), a row that is both
+            // (the middle) and rows nobody marked (the first).
+            cursor: vec![1, 2],
+            selected: vec![1],
+        };
+        let painted = |pane: &ChatPane| {
+            let mut terminal = Terminal::new(TestBackend::new(area.width, area.height)).unwrap();
+            terminal
+                .draw(|frame| draw_chat(frame, pane, Focus::Chat, &theme))
+                .unwrap();
+            terminal.backend().buffer().clone()
+        };
+        let buffer = painted(&select_pane(area, Some(select)));
+        let ordinary = painted(&select_pane(area, None));
+
+        // The pane's border takes (0, 0), so the transcript's rows start at
+        // (1, 1).
+        assert_eq!(
+            style_at(&buffer, 1, 1),
+            style_at(&ordinary, 1, 1),
+            "a row nobody marked is the row the pane painted before the mode"
+        );
+
+        let both = style_at(&buffer, 1, 2);
+        assert_eq!(
+            both.bg,
+            Some(theme.accent()),
+            "the pick is a band of hue, here under the cursor too"
+        );
+        assert_eq!(
+            both.fg,
+            Some(Color::DarkGray),
+            "the row's own dim ink is not repainted"
+        );
+        assert!(
+            both.add_modifier.contains(Modifier::REVERSED),
+            "the cursor's own cell: {both:?}"
+        );
+        assert_ne!(
+            both,
+            Style::default().fg(Color::Black).bg(theme.accent()),
+            "which is not the agents pane's selected row"
+        );
+
+        let cursor = style_at(&buffer, 1, 3);
+        assert!(
+            cursor.add_modifier.contains(Modifier::REVERSED),
+            "a bare cursor is reversed too: {cursor:?}"
+        );
+        assert_ne!(
+            cursor.bg,
+            Some(theme.accent()),
+            "and wears no band of the pick: a bare cursor reverses the cell"
+        );
     }
 
     /// The default theme paints exactly what the tree painted before hues

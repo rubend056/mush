@@ -346,7 +346,6 @@ fn saved(ws: &Workspace, drained: Drained) -> Result<Option<Image>, String> {
 // without this attribute the binary target reports five dead items — this
 // function and the four below it, the whole road hanging off it. The attribute
 // leaves with the binding that uses it.
-#[allow(dead_code)]
 pub fn write_text(text: &str) -> Result<(), String> {
     run_writers(writers(), text, Instant::now() + DEADLINE)
 }
