@@ -3317,7 +3317,7 @@ happen before the bounds are read.
 
 ---
 
-## 8.45 What goes on the wire, audited: the fifth a cut leaves, and the fold's own request (`e34e49a`..`991be92`, `mush/19`)
+## 8.45 What goes on the wire, audited: the fifth a cut leaves, and the fold's own request (`e34e49a`..`991be92`, `mush/14`)
 
 A second blind audit — the trimmer and the budget, T1 to T4 — found every bound
 asked in the wrong place: the command cap was a fraction the trim does not
