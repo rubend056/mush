@@ -1627,9 +1627,9 @@ impl App {
                 // nothing, so a run could be dead for as long as it took them to
                 // look at that child (finding B27's live shape). The sentence
                 // names the agent, so the bar is unambiguous whichever pane is
-                // open. A guard-stop is this same event (the runaway guard's
-                // `stopped after N turns…` is the run's error), so one arm
-                // covers both endings.
+                // open. A loop-stop is this same event (the loop guard's
+                // `stopped as a loop…` is the run's error), so one arm covers
+                // both endings.
                 let line = format!("agent {id} failed — {error}");
                 // The durable half too: the row's `✗` is derived and dies with
                 // the next run, while the notice is tagged, stamped and written
@@ -9919,20 +9919,24 @@ mod tests {
     /// A failure is the third way a run can end, and it reaches the bar the way
     /// a stop does. `Stopped` said what happened and `Failed` did not, so the
     /// newest thing on screen could be a crash (`✗ #0` on the row, `! cannot
-    /// reach …` in the foot) under a line advertising Ctrl-P. A guard-stop is
-    /// this same event — the runaway guard's complaint is the run's error — so
-    /// one arm covers both endings.
+    /// reach …` in the foot) under a line advertising Ctrl-P. A loop-stop is
+    /// this same event — the loop guard's complaint is the run's error — so one
+    /// arm covers both endings.
     #[test]
     fn a_failure_reaches_the_bar_like_a_stop_does() {
         let (mut app, _rx) = test_app("failure-bar");
         let conversation = app.tree.conversation();
-        let guard = "stopped after 40 turns without finishing (runaway guard)";
+        let loop_stop = "the run was stopped as a loop: the same tool call repeated 5 times \
+                         with nothing changed in between";
         app.update(Msg::Agent {
             conversation,
             id: AgentId::ROOT,
-            event: AgentEvent::Error(guard.to_string()),
+            event: AgentEvent::Error(loop_stop.to_string()),
         });
-        assert_eq!(app.tree.agents[0].phase, Phase::Failed(guard.to_string()));
+        assert_eq!(
+            app.tree.agents[0].phase,
+            Phase::Failed(loop_stop.to_string())
+        );
         let rows = screen(&mut app, 40, 10);
         let bar = rows.last().expect("the bar is painted");
         assert!(
