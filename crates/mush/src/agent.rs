@@ -2123,6 +2123,72 @@ fn reply_broke(base_url: &str, error: &str) -> String {
     format!("the reply from {base_url} broke before it could be read: {error}")
 }
 
+/// What a request's messages weigh, in the byte-shaped currency
+/// [`Config::history_budget`] is in: the comparison the window invariant is
+/// made of. Saturating, for the reason [`trim_history`]'s own sum is — an image
+/// header may claim a size as large as a `usize`, and a transcript of them has
+/// to read as over the window rather than wrap to a small number that fits.
+fn request_weight(messages: &[Message]) -> usize {
+    messages
+        .iter()
+        .map(Message::weight)
+        .fold(0, usize::saturating_add)
+}
+
+/// What a tool result says when the window took its bytes. The call is still
+/// answered — a dangling call is a shape a strict server rejects — and the road
+/// back is the tools' own: the same output is one narrower call away.
+const SHED_RESULT_NOTE: &str = "\
+[mush: this result was dropped to fit the window — the call it answers is not lost; ask again in \
+a smaller piece (a narrower command, a smaller read) if you need the output]";
+
+/// Take back the newest turn's own tool results until the request fits the
+/// budget, and answer how many were shed and how many bytes they gave back.
+///
+/// This is the one thing besides a whole turn that a window may take back: a
+/// tool result is mush's own bytes, where the human's words are not, and a
+/// result that carries an image is left whole — a picture goes with its turn,
+/// never ahead of it. "The newest turn" is everything after the last user
+/// message, which is also the part [`trim_history`] can never cut, so this is
+/// the room the last resort has left. Largest first: the fewest results pay for
+/// the room, and each one says in its own text what happened to it.
+fn shed_newest_results(messages: &mut [Message], budget: usize) -> (usize, usize) {
+    let start = messages
+        .iter()
+        .rposition(|message| message.role == "user")
+        .map_or(0, |index| index + 1);
+    let mut shed = (0usize, 0usize);
+    while request_weight(messages) > budget {
+        let heaviest = (start..messages.len())
+            .filter(|&index| {
+                messages[index].role == "tool"
+                    && messages[index].images.is_empty()
+                    && messages[index].text() != SHED_RESULT_NOTE
+            })
+            .max_by_key(|&index| messages[index].weight());
+        let Some(index) = heaviest else { break };
+        let before = messages[index].weight();
+        messages[index].content = Some(SHED_RESULT_NOTE.to_string());
+        shed.0 += 1;
+        shed.1 += before.saturating_sub(messages[index].weight());
+    }
+    shed
+}
+
+/// The one line a turn refused before the wire carries: what does not fit, and
+/// the roads that change it. Each road names something *in the transcript* — a
+/// picture to downscale, a fold that re-bases the conversation on a summary, a
+/// read that asked for less — because the shape is a fact about the request and
+/// only the human or the model can change it.
+fn over_window_line(cfg: &Config, carried: usize, budget: usize) -> String {
+    format!(
+        "cannot send this request: the transcript weighs {carried} bytes against the {budget}-byte \
+         budget for a {}-token window, and nothing left to drop. Downscale an attached picture, \
+         `/compact` the conversation, or read less — any of the three makes room",
+        cfg.context_tokens
+    )
+}
+
 /// One turn's ask, with the bounded retry a transport hiccup gets: the pause
 /// waits on the run's clock, the cancel flag is read between attempts, and
 /// every retry is a line in this agent's transcript rather than a spinner that
@@ -2266,6 +2332,27 @@ fn run_loop(
         // growth is folded in rather than cut.
         trim_history(messages, budget);
 
+        // Nothing goes over the wire over the window's budget, and
+        // `trim_history` is not the last hand that can make room: it cannot cut
+        // a transcript with fewer than three user lines, nor the newest turn
+        // itself, and the newest turn's own tool results are the one thing a
+        // window may take back — mush's bytes, never the human's words and
+        // never a picture. They go before the request is assembled, largest
+        // first, until the transcript fits; what was shed says so in the
+        // result it replaced, and the human is told in one line.
+        if request_weight(messages) > budget {
+            let (count, bytes) = shed_newest_results(messages, budget);
+            if count > 0 {
+                actor.ctx.emit(
+                    actor.id,
+                    AgentEvent::Notice(format!(
+                        "dropped {count} tool result(s) ({bytes} bytes) from the newest turn to fit \
+                         the window — the run continues",
+                    )),
+                );
+            }
+        }
+
         // The wrap-up turn asks for a summary, appended only to the request so
         // the stored transcript does not carry a turn-limit notice. A stop that
         // arrived in the meantime is honoured below, before the request goes
@@ -2281,6 +2368,17 @@ fn run_loop(
         } else {
             messages
         };
+        // The invariant, on the assembled request: the system prompt and the
+        // opening task are not droppable, so a shape that still does not fit —
+        // a picture too big for the window is the common one — is refused here,
+        // where no money has been spent, instead of by the endpoint's 400. The
+        // turn ends with one line naming what does not fit and the roads that
+        // change it; the actor is alive, and the next message tries again with
+        // whatever the human changed.
+        let carried = request_weight(request_messages);
+        if carried > budget {
+            return Err(over_window_line(&cfg, carried, budget));
+        }
 
         // The schemas stay even on a wrap-up turn: the prompt starts with
         // them, so withdrawing them re-prefills a history that is at its
@@ -7663,6 +7761,278 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// The window's last resort before a refusal: the newest turn's own tool
+    /// results are mush's bytes, and they go largest-first until the request
+    /// fits, each replaced by one line saying so. A call is never left
+    /// unanswered and never loses its answer in silence, and the model is told
+    /// the road back — the same output is one narrower call away. This is the
+    /// shape a restored transcript has: results a per-turn cap would not let
+    /// through today, in a turn `trim_history` can never cut (it stops at a user
+    /// line, and the newest one is where those results live).
+    #[test]
+    fn the_window_takes_back_the_newest_turns_results_and_says_so() {
+        let scripted = Arc::new(Scripted::new().says("carried on"));
+        let (actor, events, _mailbox) = build_actor_about(
+            "shed-results",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let budget = test_cfg().config().unwrap().history_budget();
+        let mut messages = vec![
+            Message::system("s".repeat(3_247)),
+            Message::user("go"),
+            Message {
+                role: "assistant".into(),
+                tool_calls: Some(
+                    (1..=4)
+                        .map(|n| {
+                            tool_call(
+                                &format!("c{n}"),
+                                "run_command",
+                                json!({ "command": format!("check {n}") }),
+                            )
+                        })
+                        .collect(),
+                ),
+                ..Default::default()
+            },
+        ];
+        for n in 1..=4 {
+            messages.push(Message::tool(format!("c{n}"), "x".repeat(6_000)));
+        }
+        let before: usize = messages.iter().map(Message::weight).sum();
+        assert!(before > budget, "the shape is over the window: {before}");
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some("carried on"),
+            "the turn was kept alive instead of refused"
+        );
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 1, "one request, the one that fits");
+        let carried: usize = asked[0].messages.iter().map(Message::weight).sum();
+        assert!(carried <= budget, "{carried} > {budget}");
+
+        // What was shed says so where the model reads it, and the shed stops as
+        // soon as the request fits: a result that still had room is whole.
+        let shed: Vec<&Message> = asked[0]
+            .messages
+            .iter()
+            .filter(|message| message.text() == SHED_RESULT_NOTE)
+            .collect();
+        let kept: Vec<&Message> = asked[0]
+            .messages
+            .iter()
+            .filter(|message| message.role == "tool" && message.text() != SHED_RESULT_NOTE)
+            .collect();
+        assert!(!shed.is_empty(), "the window took something back");
+        assert!(!kept.is_empty(), "and took no more than the room needed");
+        assert!(
+            kept.iter().all(|message| message.text().len() == 6_000),
+            "a kept result is whole"
+        );
+        // The human is told in one line too, because a transcript that quietly
+        // lost a result it still shows is the lie this line prevents.
+        let told = events.events_for(AgentId(7)).into_iter().any(|event| {
+            matches!(event, AgentEvent::Notice(line) if line.contains(&format!("dropped {} tool result(s)", shed.len())))
+        });
+        assert!(told, "the drop is said out loud");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A picture the window cannot hold is refused before the wire. The system
+    /// prompt and the opening task are not droppable, a picture is not mush's to
+    /// shed, and this turn has no older turn to cut: the request would go out
+    /// over the window and the endpoint would answer a 400 with the money
+    /// already spent. Measured at the 8k default: a 2,560×1,440 png weighs
+    /// the request weighs 18,041 bytes — 3,686,400 px at 750 px/token, ×3
+    /// bytes, on top of the 3,247-byte system prompt — against a 12,288-byte
+    /// budget. The turn ends with one line naming the road out — a downscale —
+    /// and the picture is never sent.
+    #[test]
+    fn a_picture_the_window_cannot_hold_is_refused_before_the_wire() {
+        let scripted = Arc::new(Scripted::new().says("looked"));
+        let (actor, _events, _mailbox) = build_actor_about(
+            "over-window-picture",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let budget = test_cfg().config().unwrap().history_budget();
+        let mut messages = vec![
+            Message::system("s".repeat(3_247)),
+            Message::user_with_images(
+                "what is wrong here?",
+                vec![image_at("shot.png", 2_560, 1_440)],
+            ),
+        ];
+        let over: usize = messages.iter().map(Message::weight).sum();
+        assert!(
+            over > budget,
+            "the picture alone is over the window: {over} > {budget}"
+        );
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+        assert!(
+            scripted.asked().is_empty(),
+            "nothing may go over the wire: {:?}",
+            scripted.asked()
+        );
+        assert!(error.contains("cannot send this request"), "{error}");
+        assert!(
+            error.contains(&format!("{over}")),
+            "the line says what does not fit: {error}"
+        );
+        assert!(error.contains("Downscale"), "and names the road: {error}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A transcript that cannot fit at all is refused with one line and no
+    /// call: the human's own words are not mush's to drop, and a shape with no
+    /// tool result in its newest turn has nothing to take back. The words are
+    /// left exactly as they were, so a `/compact` or a smaller paste meets the
+    /// same transcript.
+    #[test]
+    fn a_transcript_that_cannot_fit_is_refused_with_one_line() {
+        let scripted = Arc::new(Scripted::new().says("answered anyway"));
+        let (actor, _events, _mailbox) = build_actor_about(
+            "cannot-fit",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let budget = test_cfg().config().unwrap().history_budget();
+        let mut messages = vec![
+            Message::system("s".repeat(3_247)),
+            Message::user("x".repeat(budget)),
+        ];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+        assert!(scripted.asked().is_empty(), "no request went out");
+        assert!(error.contains("cannot send this request"), "{error}");
+        assert_eq!(
+            messages[1].text().len(),
+            budget,
+            "the human's words are not mush's to drop"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The audit's blind spot, pinned: no test compared a request to the
+    /// window's budget at all. These are the shapes a trim cannot cut — a
+    /// transcript with fewer than three user lines, a picture, the newest turn
+    /// itself — driven through the real loop: every request that reached the
+    /// model weighs no more than the budget, and every shape that could not fit
+    /// sent none. Without the invariant check the over-window picture's request
+    /// goes out (the audit measured 9,451 tokens against an 8,192-token
+    /// window), which is the assertion this loop trips on.
+    #[test]
+    fn no_request_the_trim_cannot_cut_goes_over_the_window() {
+        let budget = test_cfg().config().unwrap().history_budget();
+        let run = |label: &str,
+                   scripted: &Arc<Scripted>,
+                   mut messages: Vec<Message>|
+         -> (Result<Option<String>, String>, usize) {
+            let (actor, _events, _mailbox) = build_actor_about(
+                label,
+                scripted.clone(),
+                test_cfg(),
+                Arc::new(ScriptedMachine::new()),
+                Arc::new(clock::System),
+            );
+            let mut state = ActorState::default();
+            let cancel = Arc::new(AtomicBool::new(false));
+            let outcome = run_loop(&actor, &mut state, &mut messages, &cancel);
+            let asked = scripted.asked();
+            for request in &asked {
+                let carried: usize = request.messages.iter().map(Message::weight).sum();
+                assert!(
+                    carried <= budget,
+                    "{label}: a request went over the window: {carried} > {budget}"
+                );
+            }
+            let _ = fs::remove_dir_all(actor.ws.root());
+            (outcome, asked.len())
+        };
+
+        // A newest turn whose results were never bounded by a per-turn cap, in
+        // a transcript with one user line: the shed road keeps it alive.
+        let adopted = Arc::new(Scripted::new().says("carried on"));
+        let (outcome, sent) = run(
+            "invariant-adopted",
+            &adopted,
+            vec![
+                Message::system("s".repeat(3_247)),
+                Message::user("go"),
+                Message {
+                    role: "assistant".into(),
+                    tool_calls: Some(vec![tool_call(
+                        "c1",
+                        "run_command",
+                        json!({ "command": "check" }),
+                    )]),
+                    ..Default::default()
+                },
+                Message::tool("c1", "x".repeat(20_000)),
+            ],
+        );
+        assert!(outcome.is_ok(), "the shed road keeps the turn: {outcome:?}");
+        assert_eq!(sent, 1);
+
+        // A picture that fits the same window goes out — and fits.
+        let fitting = Arc::new(Scripted::new().says("looked"));
+        let (outcome, sent) = run(
+            "invariant-fitting-picture",
+            &fitting,
+            vec![
+                Message::system("s".repeat(3_247)),
+                Message::user_with_images("here", vec![image_at("shot.png", 1_920, 1_080)]),
+            ],
+        );
+        assert!(
+            outcome.is_ok(),
+            "a 1920×1080 screenshot fits an 8k window: {outcome:?}"
+        );
+        assert_eq!(sent, 1);
+
+        // A picture that cannot: nothing goes out.
+        let over = Arc::new(Scripted::new().says("looked"));
+        let (outcome, sent) = run(
+            "invariant-over-picture",
+            &over,
+            vec![
+                Message::system("s".repeat(3_247)),
+                Message::user_with_images("here", vec![image_at("shot.png", 2_560, 1_440)]),
+            ],
+        );
+        assert!(outcome.is_err(), "an over-window picture is refused");
+        assert_eq!(sent, 0);
+
+        // The human's own words, over the whole budget: nothing goes out.
+        let words = Arc::new(Scripted::new().says("answered anyway"));
+        let (outcome, sent) = run(
+            "invariant-words",
+            &words,
+            vec![
+                Message::system("s".repeat(3_247)),
+                Message::user("x".repeat(budget)),
+            ],
+        );
+        assert!(outcome.is_err(), "a paste over the budget is refused");
+        assert_eq!(sent, 0);
+    }
+
     /// A standalone actor over a scratch workspace, for exercising the mailbox
     /// plumbing with no model, no UI, and no threads.
     ///
@@ -8333,6 +8703,20 @@ mod tests {
         let (actor, _events, mailbox) =
             build_actor(label, Arc::new(HttpModel::new(cfg.clone())), cfg);
         (actor, mailbox)
+    }
+
+    /// One picture with the pixels a test cares about. The bytes are a
+    /// placeholder on purpose: [`Image::weight`] prices a picture by its pixels
+    /// when its header named a size, and that is the pricing the window
+    /// invariant is asked about — a screenshot's file size can move by 10×
+    /// without moving its cost.
+    fn image_at(path: &str, width: u32, height: u32) -> Image {
+        Image {
+            path: path.to_string(),
+            mime: "image/png".to_string(),
+            bytes: vec![0; 32],
+            pixels: Some((width, height)),
+        }
     }
 
     /// The same actor, keeping the sink it emits into: how a delivery test sees
