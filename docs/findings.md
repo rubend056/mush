@@ -249,6 +249,21 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   `CommandDone` later wakes the actor) or a human Stop (which kills the job),
   and whether the shape measurably curbs the reach for `sleep` — only a live
   model can say that.
+- **H35** — ✅ fixed by `b50a4ef`, with the end-to-end shape in `258ffb5`
+  (§8.39): a child restored from a stored session was revived with a dead
+  parent channel (`App::restore_agents` passed `parent: None`), and nothing
+  could repair it — the road that wires a parent (`App::deliver_to_actor`) is
+  reached only after a send into the child's mailbox fails, and a restored
+  child's actor is alive. Its completion reached nobody: the row turned `✓`
+  while the parent's books kept the child running, the bar kept saying "waiting
+  on 1 subagent(s) — the root resumes as they finish", and a `wait` burned its
+  whole 600 s cap before answering "still running". The restore door now passes
+  the tree's live mailbox for the parent (`ReviveSpec.parent`),
+  `AgentMsg::Adopt` gives the root's actor the conversation a completion folds
+  into, and a failed `parent_tx` send travels to the UI
+  (`AgentEvent::ParentAsleep`) instead of vanishing. The tree's `✉` marks can
+  re-light over a result the parent has read (recorded in §8.39, not fixed
+  there); the end-to-end test asserts the books instead.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -2349,17 +2364,181 @@ written numbers here were 7 short — they were measured before the last two tes
 extensions of the same wave landed; corrected against the commit itself, which
 is what a census is for.)
 
+## 8.39 A result that reached nobody (H35, `b50a4ef`, `258ffb5`)
+
+**The defect.** A child agent restored from a stored session was revived with a
+dead parent channel, and nothing in the process could repair it.
+`App::restore_agents` passed `parent: None` into `agent::revive`, which then
+built `let (dead_tx, dead_rx) = unbounded::<AgentMsg>(); drop(dead_rx);` and
+handed the child `parent_tx: parent.unwrap_or(dead_tx)`. Every send into that
+channel was a `let _ =`: the run's start (`ChildRunning`), its `Work`, its
+completion (`ChildDone`), and the thread-start-failure report in `start`. It
+had no reader, and no report through it could be heard.
+
+**Why nothing repaired it.** The one road that would wire a parent,
+`App::deliver_to_actor`, is reached only after `tx.send(command)` has already
+*failed* (`Ok(()) => return true` returns early on success). A restored child's
+actor is alive (`agent::revive` ends in `start(actor, transcript, false)`), so
+the human's nudge succeeded, the early return happened, and `parent_tx` stayed
+dead for the life of the process — unreachable by construction, not merely
+absent. And the books were still marked: `App::deliver` sends
+`tell_parent_running` (`ChildRunning`) to the parent from the UI, and the
+completion that would clear it went to the dead channel, so the books were
+marked and never settled.
+
+**What the human saw.** The root naps, the child's row turns `✓` or `✗`, and
+the bar still says "waiting on 1 subagent(s) — the root resumes as they finish";
+the root never runs again, its books keep the child running
+(`state.running[child]`), a `wait` blocks the full 600 s and then answers
+"still running", and only the human typing wakes it. Three surfaces promise the
+wake — `App::tree_line`'s sentence, the `✉` result-unread mark, and
+`docs/mush.md`'s "a result is never lost just because nobody called `wait` in
+time" — and `ReviveSpec.parent`'s own doc claimed the re-wiring happened for a
+child woken by the human's message. It is long-standing: `8f75cb2` introduced
+restore deliberately ("Its completion goes to a dead channel: the human owns a
+revived agent, not the root").
+
+**The restore door passes the parent's live mailbox.** `ReviveSpec.parent` is
+now `parent.and_then(|parent| self.tree.agent_tx.get(&parent).cloned())`: the
+tree's live mailbox for the parent, read at the revive. The order question —
+does a nested child's parent already have an actor? — is answered and pinned:
+the file is in spawn order (`App::session_snapshot` walks `tree.agents`, and a
+parent's node is pushed before any child it spawns) and `AgentTree::register`
+inserts each revived actor's sender immediately, so a *nested* child's parent is
+already in `tree.agent_tx` when the child is revived — the whole tree is wired,
+not only the root's children. A parent that has no actor of its own (a worktree
+found on disk) has no sender to give: the child gets a dead mailbox, and
+`dead_mailbox()` is now the one home of that ("a send into it fails, and the
+failure is the fact the UI reads").
+
+**The hazard the wiring opens.** A root actor is built with no transcript at
+all (`agent::spawn` starts it with an empty `Vec`; the conversation lives in the
+UI and travels with the first `AgentMsg::Run`, whose arm does
+`*transcript = adopted(messages)`). A completion reaching the root's live actor
+therefore folded `Fold::Run` over nothing, and the run's whole request was a
+bare `#2 done: …` user message — no system message, no history. The commit
+closes this in two halves.
+
+**`AgentMsg::Adopt`** hands the UI's conversation over at the restore door, at
+the *end* of `App::restore_agents` so it is the conversation the human is
+looking at (cut-off lines included), repaired through `adopted` like every
+hand-over. It does not run — the guard is "an actor that already has a
+conversation keeps it", which is why `drain_mailbox`'s arm drops it mid-run —
+and the next `Run` still wins.
+
+**`AgentEvent::ParentAsleep`** covers a parent-directed send that really fails.
+`tell_parent` no longer drops it: the command goes to the UI, and
+`App::hand_to_parent` delivers it to the parent the *tree* names through the
+same door a human's message uses (`App::deliver_to_actor`, reviving a parked
+parent and starting nothing for one that is really gone). This is the class road
+— every silently dropped `parent_tx` send, not only the restore case — and the
+mirror of `AgentEvent::ChildAsleep` (finding H18) in the other direction. The
+root is the one agent that reports nothing: `parent_tx: None` (not a dead
+mailbox, so "has a parent" is a fact in the actor), and `hand_to_parent` refuses
+it once more by the tree (no parent row) — the root must never absorb its own
+completion, a wake-up that could never end.
+
+**Tests, and what fails when each is reverted.** Six were added, each verified
+by removal, and the first is the end-to-end the suite lacked:
+`a_restored_childs_completion_wakes_the_root` stores a session with one child,
+restores it, nudges the child through
+`App::deliver`, lets its run finish — a loopback `say_endpoint` answers the
+revived actor, which uses the cell's own `HttpModel`, hence the new
+`app_with_scripted_root_at` harness — and reads the root's request. Reverting
+the restore wiring fails it with no request at all; removing only the hand-over
+fails it with the hazard printed whole, `["#2 done: ported the parser"]` as the
+entire request. Nothing in it drains the UI's channel, so it pins the *direct*
+road.
+
+**Five more, each verified by removal.**
+`a_wait_on_a_restored_child_answers_the_result_not_the_deadline` reads the
+parent's books: the root's first run calls `wait`, and the answer
+(`#2 ✓ ported the parser (already read — no new run since)`) arrives in the next
+request — a ghost running child would block the full 600 s and that request
+would never come. `a_restored_grandchilds_completion_walks_the_tree` pins the
+revive order: root → #2 → #3, the grandchild's result wakes its parent and the
+parent's wakes the root, and `#3 done:` never appears in the root's request — a
+report that skipped its own parent.
+`a_report_with_no_actor_behind_the_parent_goes_to_the_ui` (agent.rs) is the
+actor's half: a child with a dead mailbox emits `ParentAsleep` carrying
+`ChildRunning` then `ChildDone` in order, and the actor with `parent_tx: None`
+emits none. `a_childs_report_reaches_the_parent_the_tree_names` (app/mod.rs) is
+the UI's half: a parked parent with a child row is revived and runs on the
+completion it could not have been handed — reverting the UI's delivery (the arm
+dropping the command) fails it. The sixth,
+`the_roots_own_completion_is_not_filed_back_into_it`, pins the wake-up that
+could never end: a `ParentAsleep` about the root delivers nothing.
+
+**The shape the human reported, end to end** (`258ffb5`). The six above each
+hold one half; `a_restored_root_is_woken_by_the_children_it_continued` drives
+the session the report came from through the *app's* own loop: a stored session
+whose two children have no worktree or branch left, the human's nudge at the
+root, the root's own `control message` continuing both (*continued*, not
+spawned), their runs answered by the loopback endpoint, and the parent's books
+read back. Three things are asserted, and they are the three that were wrong:
+the root's *next* request carries both `#N done: …` lines in a well-formed
+conversation (the system prompt and the human's own words are in it, so it is
+not the bare completion line), `status` answers each child's outcome instead of
+`◐ running`, and the `wait` is answered out of the books — both results, marked
+`(already read — no new run since)` — instead of parking for its whole cap.
+The order is the test's and not the scheduler's: the root's second turn is a
+`Scripted::held` reply, so both children finish and their completions sit in the
+parent's mailbox before that turn's answer lands and the boundary at its end
+folds them. A child tells its parent *before* it tells the UI, so the pumps
+wait on the tree's `✓` for a fact the parent already holds. Ten consecutive
+runs pass, and the first draft of this test is worth recording: it waited for
+the root to *nap* while the children finished, which the fix makes impossible —
+the root is awake, answering the news — and it failed at its 20 s deadline
+until the premise was dropped. Its removal evidence is the pair, not the wiring
+alone: reverting `ReviveSpec.parent` to `None` still passes, because the dead
+mailbox then hands the completion to the UI (`ParentAsleep`) and
+`hand_to_parent` delivers it to the root anyway — that is what the class road is
+for. With the wiring reverted *and* the `ParentAsleep` arm dropped, the woken
+request never comes and the test fails at its deadline.
+
+**Recorded rather than changed.** `App::deliver_to_actor`'s own `ChildMailbox`
+send and `App::tell_parent_running` are still `let _ =` — a failed one of those
+is the H22 shape, and the next `control` takes the wake path again — and the
+`readers` rule in `AgentTree::may_park` is what keeps the
+reachable-because-stale case rare today, so the UI's half is a class road
+rather than a road a test in this wave drives end to end through production.
+
+**The `✉` re-arm, recorded rather than fixed.**
+`AgentTree::{finish,fail,stopped}` set `result_unread = parent.is_some()`
+unconditionally, and that arm can land *after* the parent's read: `finish_run`
+sends the parent its `ChildDone` before it emits the run's `Done` to the UI, so
+the parent can be scheduled in between, fold the result and have its
+`ResultRead` applied to the tree first — the row then wears `✉` over a result
+its parent *has* read, and nothing clears it (the books hold that run as read,
+so no second `ResultRead` comes). The end-to-end test asserts the books
+(`status`'s listing, the `wait`'s answer) and never the tree's marks, for
+exactly this reason. The arm and the read are on different threads, so the
+order is the scheduler's; a fix needs the run number on both events, which is
+what would make the two comparable.
+
+**Census** at this landing on the rebased tree (`scripts/census.py`), against
+§8.41's (total 57,994 · prod 14,459 · tests 24,963 · comments 14,980): total
+58,917 · **prod 14,500** · tests 25,461 · comments 15,330 — 923 lines: 41
+production, 498 test, 350 comment, 34 blank. The production lines are the
+restore door's parent lookup, `Adopt` and its three arms, `parent_tx`'s
+`Option`, `dead_mailbox`, `tell_parent`'s two homes, `ParentAsleep`, and
+`hand_to_parent`; the test lines are the seven tests and their harnesses
+(`say_endpoint`, `pump`, two stored-session fixtures); the comment lines are the
+docs on those shapes plus the comments that asserted the old behaviour, flipped
+rather than left standing. `cargo test` 621 + 153, `fmt` and `clippy -D warnings`
+clean at `258ffb5`.
+
 ## 8.40 Four holes of one class: a report, a sweep, a sentence, a tick (`3a3f474`, `5e93f5b`, `d482ab9`, `cbed322`)
 
 A read-only audit at `faa658d` confirmed one bug — a restored child's dead
-parent channel, whose fix lands beside this wave — and listed four more of the
-same class: a fact one hand knows and another drops, mis-times or mis-words.
-They are independent, and each is its own commit below, with its test and what
-fails when the fix is reverted. This is §8.40 and not §8.39 because the parental
-half of the same audit — a restored parent woken with the children the tree
-shows it — is §8.39, written in parallel; the file order settles when the two
-branches land together. The audit's two residual ordering notes are recorded at
-the end, not changed.
+parent channel, fixed in §8.39 (`b50a4ef`, `258ffb5`) just above — and listed
+four more of the same class: a fact one hand knows and another drops, mis-times
+or mis-words. They are independent, and each is its own commit below, with its
+test and what fails when the fix is reverted. This is §8.40 and not §8.39
+because the parental half of the same audit — a restored child's completion
+reaching its parent, and the root that wakes to it — was written in parallel as
+§8.39, which is the section above; the two branches met here. The audit's two
+residual ordering notes are recorded at the end, not changed.
 
 **1 — a cut-off report dropped into a parked parent** (`3a3f474`).
 `App::report_cut_off` (`app/mod.rs:3481`) sent `ChildDone { run: CUT_OFF_RUN,
