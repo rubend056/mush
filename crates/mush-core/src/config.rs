@@ -10,6 +10,7 @@
 
 use crate::provider;
 use crate::session::Session;
+use crate::transcript::trim_target;
 use crate::userconfig::UserConfig;
 use crate::CMD_CAP;
 
@@ -511,17 +512,28 @@ impl Config {
 
     /// The one cap on the text a tool result may carry — a command's output, a
     /// file read, a listing, a search. It scales with the window like a read
-    /// did: a quarter of [`Self::history_budget`], floored at 512 bytes so a
-    /// tiny window still gets an answer, and capped by [`CMD_CAP`] so a huge one
-    /// does not hand the model a transcript's worth in a single turn. A result
-    /// that hits the cap says so (see `truncate_for_model`; a file read is cut
-    /// with its own "read on" sentence), so a model never mistakes a cut result
-    /// for a complete one.
+    /// did: the room a cut leaves between its stopping point and the ceiling
+    /// ([`Self::history_budget`] minus
+    /// [`trim_target`](crate::transcript::trim_target)), floored at 512 bytes so
+    /// a tiny window still gets an answer, and capped by [`CMD_CAP`] so a huge
+    /// one does not hand the model a transcript's worth in a single turn. A
+    /// result that hits the cap says so (see `truncate_for_model`; a file read
+    /// is cut with its own "read on" sentence), so a model never mistakes a cut
+    /// result for a complete one.
+    ///
+    /// The fifth is that relation and not a number of its own: a cut stops at
+    /// four fifths, so a result of exactly the fifth lands the next request on
+    /// the ceiling, where the fold meets it, instead of over it, where the only
+    /// road left is another cut. A quarter — what this used to be — overshoots
+    /// by a twentieth and turned every tool result into a new cut: the prompt's
+    /// front is rewritten a turn at a time, which is the shape §8.43 of
+    /// `docs/findings.md` measured and rejected.
     pub fn cmd_cap(&self) -> usize {
+        let budget = self.history_budget();
         CMD_CAP
-            .min(self.history_budget() / 4)
+            .min(budget.saturating_sub(trim_target(budget)))
             .max(512)
-            .min(self.history_budget())
+            .min(budget)
     }
 
     /// How many bytes of conversation history fit alongside the tool schemas
@@ -1732,10 +1744,15 @@ mod tests {
         cfg.context_tokens = cfg.fallback_context();
         assert_eq!(cfg.cmd_cap(), CMD_CAP, "a huge window keeps the ceiling");
 
-        // An 8k local window: a single command result may take a quarter of the
-        // budget, well under the ceiling.
+        // An 8k local window: one command result may take the fifth a cut
+        // leaves between its stopping point (four fifths) and the ceiling — not
+        // a quarter, which would land the next request over the ceiling and
+        // have it cut again.
         let small = Config::new("http://x:1", "m", None);
-        assert_eq!(small.cmd_cap(), small.history_budget() / 4);
+        assert_eq!(
+            small.cmd_cap(),
+            small.history_budget() - trim_target(small.history_budget())
+        );
         assert!(
             small.cmd_cap() < CMD_CAP,
             "an 8k transcript cannot hold the ceiling: {}",
@@ -1760,6 +1777,52 @@ mod tests {
         let mut cfg = Config::new("http://x:1", "m", None);
         assert!(cfg.adopt_context(32_768), "discovery fills in a guess");
         assert_eq!(cfg.context_tokens, 32_768);
+    }
+
+    /// A full-size tool result on top of a transcript the trim has just cut
+    /// lands *on* the ceiling, not past it: the trim stops at [`trim_target`]
+    /// (four fifths), so the fifth above it is exactly what one result may
+    /// carry. A cap of a quarter of the budget overshot by a twentieth, and
+    /// every result then pushed the next request over the ceiling — cut again
+    /// instead of folded, the prompt's front rewritten a turn at a time
+    /// (§8.43 of `docs/findings.md`). Measured at 8k before the fix: a
+    /// transcript cut to 9,325 bytes plus a 3,177-byte result weighed 12,506
+    /// against a 12,288-byte budget.
+    ///
+    /// The 512-byte floor is the one exception, and only under windows nothing
+    /// fits in anyway: at a 1,024-token window the fifth is 307 bytes while the
+    /// floor is 512, and the system prompt alone (3,247 bytes) outweighs the
+    /// whole 1,536-byte budget.
+    #[test]
+    fn a_full_result_after_a_cut_lands_on_the_ceiling() {
+        for context in [2_000, 8_192, 24_000, 40_000, 120_000] {
+            let cfg = Config {
+                context_tokens: context,
+                ..Config::new("http://x:1", "m", None)
+            };
+            let budget = cfg.history_budget();
+            assert!(
+                cfg.cmd_cap() >= 512,
+                "context {context}: the floor still stands"
+            );
+            assert!(
+                trim_target(budget) + cfg.cmd_cap() <= budget,
+                "context {context}: a cut to {} plus a {}-byte result is over the \
+                 {budget}-byte ceiling",
+                trim_target(budget),
+                cfg.cmd_cap()
+            );
+        }
+        // The measured 8k numbers, spelled so a change to either formula has to
+        // face them.
+        let eight_k = Config::new("http://x:1", "m", None);
+        assert_eq!(eight_k.history_budget(), 12_288);
+        assert_eq!(trim_target(12_288), 9_830);
+        assert_eq!(
+            eight_k.cmd_cap(),
+            2_458,
+            "the fifth above the stopping point"
+        );
     }
 
     #[test]

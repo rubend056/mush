@@ -60,12 +60,16 @@ pub fn compaction_trigger(budget_bytes: usize) -> usize {
 /// A cut is a rewrite of the prompt's front — exactly the prefix a provider's
 /// cache had warmed — so it is the last resort and it is made once, deeply:
 /// [`trim_history`] cuts only a transcript already over the window's ceiling,
-/// and then all the way down here. That leaves a tenth of the budget between
-/// the stopping point and the fold's own trigger ([`compaction_trigger`], nine
-/// tenths), which is room the conversation grows back through: the growth that
-/// crosses the trigger is folded — one re-send that keeps the prompt's prefix
-/// and re-bases the conversation on a summary — rather than cut again at the
-/// brim.
+/// and then all the way down here. The room the conversation grows back through
+/// is the fifth between this stopping point and the ceiling — the room
+/// `Config::cmd_cap` gives one tool result, so a full-size result on top of a
+/// just-cut transcript lands *on* the ceiling. The fold's trigger
+/// ([`compaction_trigger`], nine tenths) sits inside that room, so the growth
+/// that crosses it is folded — one re-send that keeps the prompt's prefix and
+/// re-bases the conversation on a summary — rather than cut again at the brim.
+/// The trigger is not the size of a turn's growth: that growth is the whole
+/// fifth, two tenths, which is why the cap and this stopping point are one
+/// relation rather than two independent numbers.
 ///
 /// This is a stopping point and not a trigger, and the difference is measured:
 /// a trimmer that started cutting as soon as a transcript passed four fifths
@@ -315,9 +319,11 @@ may have been dropped rather than never said.";
 /// - **over the ceiling, cut**: only a transcript past `budget` is touched at
 ///   all, and it is cut all the way down to [`trim_target`] — four fifths —
 ///   rather than just back under the ceiling, so the request has room to grow;
-/// - **back up, fold**: the tenth between four fifths and the fold's trigger
-///   ([`compaction_trigger`], nine tenths) is what the next growth crosses,
-///   and the fold is what meets it.
+/// - **back up, fold**: a turn grows the transcript by at most its fifth — the
+///   ceiling minus this stopping point, which is what `Config::cmd_cap` bounds
+///   one result by — so a transcript cut down here can reach the ceiling in one
+///   turn but never past it, and the growth that crosses the fold's trigger
+///   ([`compaction_trigger`], nine tenths) is folded rather than cut again.
 ///
 /// The watermark is a *stopping point, not a trigger*: a transcript inside the
 /// window is left exactly as it is, even one over four fifths. That shape is

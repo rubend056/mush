@@ -4946,7 +4946,8 @@ use crate::jobs::CMD_OUTPUT_LIMIT;
 ///
 /// Every big-text road uses it — a command's output, a file read, a listing, a
 /// search — so a result is bounded by the context budget rather than by a fixed
-/// number: a quarter of what the history can hold, capped at `CMD_CAP` (see
+/// number: the room a cut leaves between its stopping point and the ceiling (a
+/// fifth of what the history can hold), capped at `CMD_CAP` (see
 /// `Config::cmd_cap`). A result that hits it says so and says what to do
 /// (`truncate_for_model`), and the file tools' windows are cut to it as they
 /// are built, so the sentence names the way on rather than a lost tail.
