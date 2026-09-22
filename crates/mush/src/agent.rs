@@ -41,21 +41,14 @@ use crate::jobs::{self, Refused};
 use crate::machine::{End, Job, Machine, Shell, ShellCommand};
 use crate::model::{retrying, HttpModel, ModelClient, ModelError};
 
-/// Backstop against a model that never stops — *not* a budget for the work.
-///
-/// This used to be 24 and acted as a task budget, which turned honest long work
-/// (read a 2,500-line file, edit it, run the gate, edit again) into a truncated
-/// run: the agent was stopped mid-task for being thorough. A run is really
-/// bounded by the endpoint's context window (compaction and `trim_history`) and
-/// by `LOOP_ROUNDS` below, so this is only the last line of defence against a
-/// model that answers forever. Set past any real task on purpose.
-const RUNAWAY_TURNS: usize = 200;
 /// Identical consecutive tool batches before the run is called a loop.
 ///
 /// The honest reason to stop a run *early* is that it stopped making progress,
 /// not that it took a certain number of turns. Repeating the same call with the
 /// same arguments and nothing changed in between is that signal; a long task
-/// that keeps changing something never trips it, however long it runs.
+/// that keeps changing something never trips it, however long it runs — and
+/// nothing else counts a run's turns: a run ends when the model stops calling
+/// tools, so this guard is the one early end it gives itself (finding H45).
 const LOOP_ROUNDS: usize = 5;
 /// The real token counts the endpoint reported for this run's calls, summed
 /// over the turns it reported them on. `None` until a reply carries `usage`: a
@@ -2080,12 +2073,11 @@ fn worktree_gone_line(id: u64) -> String {
 ///
 /// One function, because every request an agent makes has to carry the *same*
 /// schemas. The rendered prompt starts with the tool definitions, so a request
-/// that drops them — the summarize call, or a wrap-up turn — shares no prefix
-/// with the run it belongs to: the endpoint's prompt cache misses at the first
-/// token and the whole history is prefilled again, which is the one cost
-/// compaction exists to avoid, paid exactly when the history is largest. A
-/// request that must not call tools says so with `tool_choice: "none"`, a
-/// request parameter rather than prompt text.
+/// that drops them — the summarize call is the only other one mush makes —
+/// shares no prefix with the run it belongs to: the endpoint's prompt cache
+/// misses at the first token and the whole history is prefilled again, which
+/// is the one cost compaction exists to avoid, paid exactly when the history
+/// is largest.
 fn tool_schemas(actor: &Actor) -> Vec<Value> {
     if actor.depth >= MAX_DEPTH {
         prompt::leaf_tool_schemas()
@@ -2108,17 +2100,15 @@ fn thinking_fields(cfg: &Config) -> (Option<Value>, Option<String>) {
 
 /// The request shape both the run loop and the fold send: same model, same
 /// sampling, same thinking knobs, and the reply cap carried under the name the
-/// endpoint takes. `tool_choice` and `cap` are the only things a caller varies
-/// from the run's turn — a wrap-up turn withdraws tools, a fold asks for a
-/// smaller reply — so they travel in the arguments, and the swap between
-/// `max_tokens` and `max_completion_tokens` lives here and nowhere else. A
-/// second, hand-built request is how the fold came to send `max_tokens` to an
-/// endpoint that rejects it and silently never compacted.
+/// endpoint takes. `cap` is the only thing a caller varies from the run's turn
+/// — a fold asks for a smaller reply — so it travels in the arguments, and the
+/// swap between `max_tokens` and `max_completion_tokens` lives here and nowhere
+/// else. A second, hand-built request is how the fold came to send `max_tokens`
+/// to an endpoint that rejects it and silently never compacted.
 fn request<'a>(
     cfg: &'a Config,
     messages: &'a [Message],
     tools: &'a [Value],
-    tool_choice: &'a str,
     cap: u32,
 ) -> ChatRequest<'a> {
     let (thinking, reasoning_effort) = thinking_fields(cfg);
@@ -2126,7 +2116,7 @@ fn request<'a>(
         model: &cfg.model,
         messages,
         tools,
-        tool_choice,
+        tool_choice: "auto",
         stream: false,
         temperature: cfg.temperature(),
         max_tokens: cap,
@@ -2370,6 +2360,10 @@ fn count_round(last_batch: &mut String, repeats: &mut usize, batch: &str, did_no
 }
 
 /// One run: model turns → tool calls → results, until the model answers.
+///
+/// Nothing counts turns: the run goes on until the model calls no more tools.
+/// Its one early end is [`LOOP_ROUNDS`] identical rounds (finding H45); the
+/// other is the human's Stop.
 fn run_loop(
     actor: &Actor,
     state: &mut ActorState,
@@ -2419,21 +2413,7 @@ fn run_loop(
     // estimate, and this is the one number that is not.
     let mut usage: Option<RunUsage> = None;
 
-    for turn in 0..RUNAWAY_TURNS {
-        // The last turn is a wrap-up: no tools, and a request for a summary.
-        // A long task then ends with a report of what was done and what is
-        // left, instead of a bare `stopped after N turns` (finding N1).
-        let wrap_up = turn + 1 == RUNAWAY_TURNS;
-        if wrap_up {
-            // The wrap-up turn still ends the run with a summary (finding N1),
-            // but the human should learn why tools suddenly went away.
-            actor.ctx.emit(
-                actor.id,
-                AgentEvent::Notice(format!(
-                    "runaway guard reached ({RUNAWAY_TURNS} turns) — asking the model to wrap up"
-                )),
-            );
-        }
+    loop {
         drain_mailbox(actor, cancel, messages, state);
         if cancel.load(Ordering::SeqCst) {
             return Err(CANCELLED.to_string());
@@ -2493,21 +2473,9 @@ fn run_loop(
             }
         }
 
-        // The wrap-up turn asks for a summary, appended only to the request so
-        // the stored transcript does not carry a turn-limit notice. A stop that
-        // arrived in the meantime is honoured below, before the request goes
-        // out.
-        let asked;
-        let request_messages: &[Message] = if wrap_up {
-            asked = {
-                let mut with_instruction = messages.clone();
-                with_instruction.push(Message::user(WRAP_UP_INSTRUCTION));
-                with_instruction
-            };
-            &asked
-        } else {
-            messages
-        };
+        // A stop that arrived since the last boundary is honoured by the call
+        // below, which polls the cancel flag and answers `Cancelled`.
+        //
         // The invariant, on the assembled request: the system prompt and the
         // opening task are not droppable, so a shape that still does not fit —
         // a picture too big for the window is the common one — is refused here,
@@ -2518,24 +2486,17 @@ fn run_loop(
         // decided first ([`for_the_model`]): a blind model's request is the
         // transcript without its image parts, and it is that request the
         // window has to hold.
-        let visible = for_the_model(actor, &cfg, request_messages);
+        let visible = for_the_model(actor, &cfg, messages);
         let carried = request_weight(&visible);
         if carried > budget {
             return Err(over_window_line(&cfg, carried, budget));
         }
 
-        // The schemas stay even on a wrap-up turn: the prompt starts with
-        // them, so withdrawing them re-prefills a history that is at its
-        // longest (see `tool_schemas`). `tool_choice` is what stops the
-        // calls, and a call the model makes anyway is answered, not run — and
-        // `auto` keeps models that ignore tools working: they simply answer.
-        let request = request(
-            &cfg,
-            &visible,
-            &schemas,
-            if wrap_up { "none" } else { "auto" },
-            cfg.reply_cap(),
-        );
+        // The schemas travel on every request: the prompt starts with them, so
+        // withdrawing them re-prefills a history that is at its longest (see
+        // `tool_schemas`). `auto` keeps models that ignore tools working: they
+        // simply answer, and a model that answers is a run that has finished.
+        let request = request(&cfg, &visible, &schemas, cfg.reply_cap());
 
         // One turn's ask: the retry policy and the retry line are [`ask`]'s,
         // the error arms below are the run's own.
@@ -2756,28 +2717,6 @@ fn run_loop(
             }
         }
 
-        if wrap_up {
-            // Whatever the model wrote is the run's result. If it tried to keep
-            // calling tools, answer the calls so the transcript stays valid,
-            // but run none of them: the run is out of turns.
-            for call in &tool_calls {
-                let message = Message::tool(
-                    call.id.clone(),
-                    format!("error: the run hit its {RUNAWAY_TURNS}-turn runaway guard; tools are no longer available"),
-                );
-                messages.push(message.clone());
-                actor.ctx.emit(actor.id, AgentEvent::Message(message));
-            }
-            return if content.is_empty() {
-                Err(format!(
-                    "stopped after {RUNAWAY_TURNS} turns without finishing (runaway guard)"
-                ))
-            } else {
-                report_usage(actor, usage);
-                Ok(Some(content))
-            };
-        }
-
         if tool_calls.is_empty() {
             if content.is_empty() {
                 actor.ctx.emit(
@@ -2898,18 +2837,7 @@ fn run_loop(
         // transcript a shape a strict server accepts.
         fold_completions(actor, state, messages);
     }
-
-    Err(format!(
-        "stopped after {RUNAWAY_TURNS} turns without finishing (runaway guard)"
-    ))
 }
-
-/// The instruction appended to the request on the run's final turn.
-const WRAP_UP_INSTRUCTION: &str = "\
-You have reached this run's runaway guard, which is meant to be far past any \
-real task. Stop using tools now — none of them will be run. Reply with a \
-concise summary of what has been done, what still remains, and anything the \
-next run needs to know.";
 
 /// What the model is told after a reply was cut off at the token cap. A cut
 /// reply is usually a *big* answer — a whole file in one call, or a long
@@ -3046,7 +2974,7 @@ fn compact_history(
     // text, so the summary's own cap costs no cache miss.
     let schemas = tool_schemas(actor);
     // The fold's cap is its own (`COMPACT_REPLY_TOKENS`, as far as the window
-    // allows) and it leaves `tool_choice` at `auto`; everything else — the field
+    // allows); everything else — the field
     // the cap travels under included — is [`request`]'s, shared with the run's
     // own ask. The cap is what the window has left once the *whole* prompt is
     // paid for — the schemas that head it and the history and instruction
@@ -3083,7 +3011,7 @@ fn compact_history(
         return Ok(false);
     }
     state.fold_refused = false;
-    let request = request(cfg, &visible, &schemas, "auto", cap);
+    let request = request(cfg, &visible, &schemas, cap);
     let reply = match ask(actor, &request, cancel) {
         Ok(reply) => reply,
         // A cancelled run is already ending; do not report a network failure.
@@ -4000,9 +3928,8 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     }
     // A run is bounded by progress, not by a turn count: it ends when the model
     // stops calling tools, and is cut short only if it starts looping
-    // (`LOOP_ROUNDS` identical rounds). The only hard ceiling is a runaway
-    // guard far past any real task, so this is not a budget to size a brief
-    // against any more.
+    // (`LOOP_ROUNDS` identical rounds) — so there is no budget to size a brief
+    // against, and the line below offers none.
     Ok(format!(
         "spawned agent {id}{on}{at} · runs until it stops calling tools · wait returns its summary"
     ))
@@ -14651,36 +14578,40 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// Hitting the turn limit must end with a summary, not a bare `stopped
-    /// after 200 turns without finishing`: the safety valve stays, the failure
-    /// goes (finding N1). Every turn before the guard does real work — one
-    /// `run_command`, with the arguments differing each turn so the run is not
+    /// Nothing counts turns: a run that goes well past the old 200-turn
+    /// ceiling ends because the model stopped calling tools, and its own last
+    /// reply is the result. The ceiling was removed because it truncated real
+    /// work — a read-only docs scan was cut off mid-run — and any fixed count
+    /// has the same failure mode (finding H45). Every turn does real work: one
+    /// `write_file`, with the arguments differing each turn, so the run is not
     /// stopped early as a loop instead.
     #[test]
-    fn the_turn_limit_ends_with_a_summary() {
-        const WRAPPED_UP: &str = "wrapped up: the work done so far is in the workspace";
-        let root = scratch_dir("turns");
+    fn a_run_past_200_turns_ends_when_the_model_stops_calling_tools() {
+        /// Past the 200 the old guard cut at, with room to spare.
+        const ROUNDS: usize = 220;
+        const DONE: &str = "done: the work done so far is in the workspace";
+        let root = scratch_dir("no-turn-cap");
 
         let mut scripted = Scripted::new();
-        for turn in 0..RUNAWAY_TURNS - 1 {
+        for turn in 0..ROUNDS {
             scripted = scripted.calls(vec![tool_call(
                 "call",
-                "run_command",
-                json!({ "command": format!("printf 'turn {turn}' > notes.txt") }),
+                "write_file",
+                json!({ "path": "notes.txt", "content": format!("turn {turn}") }),
             )]);
         }
-        let scripted = Arc::new(scripted.says(WRAPPED_UP));
+        let scripted = Arc::new(scripted.says(DONE));
 
         let mut cfg = Config::new("http://127.0.0.1:1", "scripted", None);
-        // A window wide enough that this transcript never compacts: the only
-        // thing that may end this run is the runaway guard.
+        // A window wide enough that this transcript never compacts: nothing
+        // but the model's own stop may end this run.
         cfg.context_tokens = 128_000;
         let events = Recorder::new();
         let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
         root_tx
             .send(AgentMsg::Run(vec![
                 Message::system(prompt::system_prompt(root.to_str().unwrap())),
-                Message::user("TURNS: keep working until you are done".to_string()),
+                Message::user("keep writing a note each turn until you are done".to_string()),
             ]))
             .unwrap();
 
@@ -14693,51 +14624,49 @@ mod tests {
         assert_eq!(
             seen.errors,
             Vec::<String>::new(),
-            "the turn limit must not be reported as an error"
+            "no ceiling stops this run: {seen:?}"
         );
         assert_eq!(seen.done, 1, "the run must finish normally: {seen:?}");
         assert_eq!(
             seen.replies,
-            vec![WRAPPED_UP.to_string()],
-            "the wrap-up turn's summary must be the result"
+            vec![DONE.to_string()],
+            "the model's own last reply is the run's result"
         );
         assert!(
-            seen.notices
-                .iter()
-                .any(|notice| notice.contains("runaway guard")),
-            "the human must be told why the tools went away: {:?}",
+            !seen.notices.iter().any(|notice| notice.contains("runaway")
+                || notice.contains("wrap")
+                || notice.contains("turns")),
+            "nothing announces a turn ceiling that does not exist: {:?}",
             seen.notices
         );
 
-        // Every turn ran: one request per turn, and the last one asked for the
-        // summary with the tools withdrawn rather than failing the run.
+        // Every turn ran: one request per turn, and the one after the 220th
+        // tool round is the reply that ends it — past the 200 the guard cut at.
         let asked = scripted.asked();
         assert_eq!(
             asked.len(),
-            RUNAWAY_TURNS,
-            "the run must use every turn before the guard"
+            ROUNDS + 1,
+            "the run must use every turn it has work for"
         );
-        // The tools stay even here, and so does `tool_choice`: the schemas are
-        // the head of the prompt, so withdrawing them re-prefills the longest
-        // history the run has had. The instruction is what tells the model to
-        // stop calling them, and a call it makes anyway is answered, not run.
+        // And nothing changes shape as the run goes on: the tools and `auto`
+        // travel on every request, and no request carries a guard instruction
+        // telling the model to stop calling them.
         assert_eq!(
-            asked[RUNAWAY_TURNS - 1].tool_schemas,
-            asked[0].tool_schemas,
-            "the wrap-up turn must share the run's prefix, tools included"
+            asked[ROUNDS].tool_schemas, asked[0].tool_schemas,
+            "the last turn must share the run's prefix, tools included"
+        );
+        assert_eq!(
+            asked[ROUNDS].tool_choice, "auto",
+            "and nothing withdraws the tools"
         );
         assert!(
-            !asked[RUNAWAY_TURNS - 1].tool_schemas.is_empty(),
-            "and they must be the real schemas, not two empty lists"
-        );
-        assert!(
-            asked[RUNAWAY_TURNS - 1].saw("runaway guard"),
-            "the wrap-up request must say why the tools went away"
+            !asked[ROUNDS].saw("runaway guard"),
+            "no request tells the model about a ceiling that does not exist"
         );
         assert_eq!(
             fs::read_to_string(root.join("notes.txt")).ok().as_deref(),
-            Some(format!("turn {}", RUNAWAY_TURNS - 2).as_str()),
-            "the last turn before the guard must have done its work"
+            Some(format!("turn {}", ROUNDS - 1).as_str()),
+            "the last turn before the model's stop must have done its work"
         );
         let _ = fs::remove_dir_all(&root);
     }

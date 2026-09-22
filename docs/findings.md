@@ -403,6 +403,15 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   is `ctx {used}/{budget}{ full| over} (fold {trigger}) {~}{window}`, and
   `--print-config` prints the schemas and the history budget beside the reply
   cap.
+- **H45** — ✅ fixed by `7141353` + `da6a59b` (+ `8398525`, `b1f1572`), §8.47: a
+  fixed ceiling on a run's turns was a bound on honest work, and it fired on
+  real work — a subagent's read-only docs scan was cut off with `stopped after
+  200 turns without finishing (runaway guard)`, while the constant's own doc
+  called 200 "past any real task". `RUNAWAY_TURNS = 200` and the wrap-up turn
+  that existed only to soften it are removed, not raised; `LOOP_ROUNDS` (a
+  repeated batch, not a count) stays as the one early end, and the human's Stop
+  is the only outer bound. Pinned by
+  `a_run_past_200_turns_ends_when_the_model_stops_calling_tools`.
 
 `docs/refactor.md` §11 is now the ledger of a queue closed except `R6` (judged
 and left on purpose); each of its rows carries its price and the commit that
@@ -3620,3 +3629,117 @@ prod 15,279 · tests 28,526 · comments 17,066): total 65,378 · **prod 15,334**
 tests 28,804 · comments 17,281 — 571 lines: 55 production, 278 test, 215
 comment, 23 blank. `cargo test --workspace`: 680 + 4 ignored in the mush bin,
 201 in mush-core; clippy and fmt clean.
+
+---
+
+## 8.47 Nothing counts turns: the runaway guard goes entirely (`7141353`..`da6a59b`)
+
+> "i just want to remove the hard cap on tool calls I believe its 200 maybe 800
+> or 1000 is more reasonable / or just remove the hard cap mechanic completely"
+
+The human's ruling was the second half — remove the mechanic, don't raise the
+number — and it was measured before it was made. `RUNAWAY_TURNS = 200` had
+fired on real work: a subagent's read-only docs scan in this very workspace was
+cut off with `stopped after 200 turns without finishing (runaway guard)`. The
+constant's own doc called 200 "past any real task"; the run it truncated was a
+real one, and any fixed number has the same failure mode, so 800 or 1000 would
+only move the truncation. Four commits landed it: the removal and its pin
+(`7141353`, `da6a59b`), the hand-driven script (`8398525`) and the living docs
+(`b1f1572`); H45 is their row.
+
+**What was removed.** `RUNAWAY_TURNS` and its doc; the run loop's
+`for turn in 0..RUNAWAY_TURNS` is a `loop` (`turn` was read by nothing else);
+the `wrap_up` flag and its `Notice` ("runaway guard reached (200 turns) —
+asking the model to wrap up"); the request shape that appended
+`WRAP_UP_INSTRUCTION` to a copy of the transcript and sent `tool_choice:
+"none"`; the arm that answered the model's tool calls with `the run hit its
+200-turn runaway guard; tools are no longer available` and returned either the
+summary or the bare `stopped after 200 turns without finishing (runaway
+guard)`; the trailing `Err(…)` after the loop; and `WRAP_UP_INSTRUCTION`.
+`request()`'s `tool_choice` argument went with them: both remaining callers —
+the run and the fold — passed `"auto"`, and the wrap-up was the only thing that
+ever passed `"none"`, so the knob had one setting left. Two prose sites outside
+`agent.rs` carried the same mechanic and are re-pointed at the stop that
+remains: `app/mod.rs`'s `Error` arm said "a guard-stop is this same event (the
+runaway guard's `stopped after N turns…`)", and
+`a_failure_reaches_the_bar_like_a_stop_does` used the guard's string as its
+example failure — both now use the loop stop, the run-error that still exists.
+`scripts/mock_llm.py`'s `TURNS` scenario waited for the wrap-up instruction's
+phrase to answer with a summary; it now repeats the *same* `run_command`, so
+the run it drives is ended by the loop guard — checked on a real pty: six
+identical `run_command true` rounds, then `! error: this call was not run — the
+run was stopped as a loop` and the guard's notice in the pane.
+
+**What bounds a run now.** The model's own stop: a reply with no tool calls is
+the run finished and its text is the result — the prompt's own promise ("a
+subagent runs until it stops calling tools, so a brief is bounded by the work,
+not a turn count") now has nothing behind it. `LOOP_ROUNDS` still ends a run
+early when it stops making progress: the same batch five rounds over with
+nothing changed in between, with `state.loop_stop` and the H14 resume road
+untouched, and with the two rounds that did nothing — a refusal before anything
+ran (H13), and a `wait` that slept — still exempt. The human's Stop (`Ctrl-C`,
+`Ctrl-X`) is the only outer bound. The context budget does not end a run: the
+fold rewrites history into a summary, `trim_history` drops the oldest turns and
+the newest turn's own results are shed to fit, and the run carries on — which
+is why the ceiling had been the only outer bound, and why the human is now that
+bound. The one refusal the budget can still produce is a request that does not fit
+after all of that (`over_window_line`), and it names the shape the human
+changes; the other ends are the run's own error arms — a reply cut off at the
+token cap `TRUNCATION_ROUNDS` times in a row, a refused or unreadable answer, a
+dead endpoint — none of them a count of turns.
+
+**The test that pins it.**
+`a_run_past_200_turns_ends_when_the_model_stops_calling_tools`: 220 turns of
+real `write_file` work, the content differing each turn so the loop guard never
+trips, then a scripted reply. The run ends as `Done` with that reply as its
+result, 221 requests, no notice containing "runaway", "wrap" or "turns", the
+last request's schemas and `tool_choice: "auto"` identical to the first's, no
+request carrying a guard instruction, and `notes.txt` holding the last turn's
+write. The probe, with `for _turn in 0..200` and a trailing guard error patched
+back in, fails on the fact it exists for —
+`errors: ["stopped after 200 turns without finishing (runaway guard)"]` — in
+0.16 s. Its first shape used `run_command`, one shell a turn, and under a
+loaded machine (load average 15 on 14 cores) 220 spawns outran its 5 s wait:
+the proof is the request count, not what the turn asks for, so `da6a59b` moved
+the turn's work to `write_file`. The suite's totals are unchanged (one test
+removed, one added): 680 + 4 ignored in the mush bin, 202 in mush-core.
+
+**The honest cost.** A model that keeps making *different* pointless calls has
+nothing inside the run to stop it: it runs until the human stops it, where a
+count stopped it before. That is the trade the human chose, and the loss it
+buys away is the worse one — a real task truncated at 200 turns is a silent,
+certain loss the human reads as a failure, while a model that will not stop is
+visible (the row's activity, the pane, the meter's growth) and has a key. The
+loop guard still ends the shape that is pointless in itself.
+
+**What this supersedes.** N1's row in `docs/refactor.md` §11 was fixed by
+`RUNAWAY_TURNS` + `LOOP_ROUNDS`; the ceiling half is gone and the row says so.
+The wrap-up's finding is **obsolete, not violated**: N1's point was that a long
+task must not end as a bare `stopped after N turns`, and there is no longer any
+bare `stopped after N turns` to soften — the only `stopped after` left is a
+job's own line (`jobs.rs`'s `#c2 stopped after 4s`). S8(iv) — the `TURNS`
+scenario waiting for "runaway guard", which `f70374f` had re-pointed at the
+wrap-up instruction — is superseded by the scenario's second re-pointing, at
+the loop guard. §8.11's "deliberately left" clause ("`RUNAWAY_TURNS`'s wrap-up
+turn explains itself when it fires") has no turn to explain; §8.27's "Left
+standing, on purpose" pair — the prompt's "runs until it stops calling tools"
+beside a code ceiling — is settled by removing the ceiling, not by rewording
+the prompt; and `docs/refactor.md`'s Stage 2.2 list ("a wrap-up summary rather
+than a bare failure") and its "turn-limit scenario" now name the long-run pin.
+
+**Recorded, not changed.** `crates/mush/src/app/chat.rs`'s notice fixture
+`"the lexer subagent hit its turn limit"` is a hand-written line for the
+notice-scoping test (`a_notice_belongs_to_one_agent_only`), not the guard's
+error string and no longer a message the code produces; the test asserts
+scoping, so the fixture stays. And `TRUNCATION_ROUNDS` still ends a run early
+on consecutive cut-off replies — a count of replies the endpoint truncated, not
+of turns.
+
+**Census** at this landing (`scripts/census.py`), against §8.46's (total 65,378
+· prod 15,334 · tests 28,804 · comments 17,281 at `1608de9`) and measured at
+the base this branch forked from (`5f24f95`: total 65,419 · prod 15,334 · tests
+28,833 · comments 17,290): total 65,352 · **prod 15,280** · tests 28,837 ·
+comments 17,276 — this wave is 67 lines fewer: 54 production, 14 comment and 3
+blank lines gone, 4 test lines more (one test replaced by one). `cargo test
+--workspace`: 680 + 4 ignored in the mush bin, 202 in mush-core; clippy and fmt
+clean.

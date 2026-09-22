@@ -144,10 +144,10 @@ and never share state with the painter.
   the complete file.
 - **Bounded loops.** A run ends when the model stops calling tools; a *loop* —
   the same tool batch five rounds over with nothing changed in between — ends it
-  early, and a 200-turn runaway guard withdraws the tools and asks for a
-  summary. A shell command runs in its own process group with a 120 s timeout
-  and a hard 8 MB output limit, and delegation is bounded in depth and fan-out
-  (§5.5). A runaway agent stops.
+  early. Nothing counts turns, so a model that keeps making *different* calls
+  runs until the human stops it. A shell command runs in its own process group
+  with a 120 s timeout and a hard 8 MB output limit, and delegation is bounded
+  in depth and fan-out (§5.5).
 
 ---
 
@@ -1239,11 +1239,12 @@ transitions.
   overflow that must compact (and the corners where a fold is refused or parked),
   a nudge that arrives mid-reply and must be answered, a root that ends its turn
   while a child still runs and is woken by its result, a stop acknowledged as a
-  stop, and a run that hits its runaway guard and must end with a summary. The
-  model is scripted; the work — git worktrees, files, the commit, the merge — is
-  real, so they need no socket and no `python3`, though they do need `git`, and one
-  scenario waits on a real shell sleep. `scripts/mock_llm.py` is kept for
-  hand-driven runs; no test and no script refers to it.
+  stop, and a run that goes past two hundred turns and ends only because the
+  model stopped calling tools. The model is scripted; the work — git worktrees,
+  files, the commit, the merge — is real, so they need no socket and no
+  `python3`, though they do need `git`, and one scenario waits on a real shell
+  sleep. `scripts/mock_llm.py` is kept for hand-driven runs; no test and no
+  script refers to it.
 - **Live.** Three `#[ignore]`d tests keep the default suite green offline: two
 talk to the configured endpoint (the model list and the shipped reply cap), and
 one makes a TLS handshake against `https://api.deepseek.com`.
@@ -1321,8 +1322,9 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
   glance. The message box is the only editable text.
 - **One owner of state.** `Msg` → `update` → `draw`. No shared mutable state
   between the painter and the work.
-- **A wrap-up turn, not a bare error, at the turn limit** `[v0.2]`. A long task
-  ends with a summary of what was done and what is left; the bound stays.
+- **A run is bounded by progress, not by a count.** A run ends when the model
+  stops calling tools, and a repeated tool batch ends it early as a loop. No
+  turn ceiling exists to truncate a long task mid-work.
 - **No async runtime.** Threads and channels; `run_command` off the UI thread.
 - **No OT/CRDT.** Plain files, atomic writes, exact-match edits.
 - **The prompt is data, not logic.** It lives in one small function beside the
