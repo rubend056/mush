@@ -66,16 +66,44 @@ const MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 /// even be spawned, the clipboard is unreadable on this machine, and the
 /// refusal names what to install rather than pretending the clipboard was
 /// empty — the two facts need different actions from the human.
+///
+/// The same is true of a reader killed at the deadline: it is its own refusal
+/// ([`Answer::TimedOut`]) because the picture may well be on the clipboard and
+/// the reader stuck, so "the clipboard holds no image" would send the human
+/// looking in the wrong place. The sentence names the reader and the wait, and
+/// points at the road that always works — the picture's own file.
+///
+/// The bodies live in [`run_readers`] because a test has to be able to hand in
+/// a reader that never answers; installing one on the machine's PATH would be
+/// the test's own lie about the machine.
 pub fn read_image(ws: &Workspace) -> Result<Option<Image>, String> {
-    let deadline = Instant::now() + DEADLINE;
+    run_readers(ws, readers(), Instant::now() + DEADLINE)
+}
+
+/// [`read_image`] with the readers and the deadline handed in: the loop, the
+/// three answers that are not a picture, and the sentences each one earns.
+fn run_readers(
+    ws: &Workspace,
+    readers: Vec<(&'static str, Vec<String>)>,
+    deadline: Instant,
+) -> Result<Option<Image>, String> {
     let mut ran = false;
-    for (program, args) in readers() {
+    let mut stalled = None;
+    for (program, args) in readers {
         if Instant::now() >= deadline {
             break;
         }
         match run(program, &args, deadline) {
             Answer::Missing => {}
             Answer::Nothing => ran = true,
+            Answer::TimedOut => {
+                ran = true;
+                stalled = Some(program);
+                // The deadline is shared — one wait for the whole sequence, so
+                // nine readers cannot each spend two seconds of a frozen paste
+                // — so the readers after a stall have no time left to run.
+                break;
+            }
             Answer::Bytes(drained) => return saved(ws, drained),
         }
     }
@@ -85,6 +113,13 @@ pub fn read_image(ws: &Workspace) -> Result<Option<Image>, String> {
              macOS's `pngpaste`"
                 .to_string(),
         );
+    }
+    if let Some(program) = stalled {
+        return Err(format!(
+            "`{program}` did not answer within {}s — it may be waiting on a clipboard owner that \
+             never speaks. Try again, or save the picture to a file and paste its path",
+            DEADLINE.as_secs()
+        ));
     }
     Ok(None)
 }
@@ -139,9 +174,17 @@ struct Drained {
 enum Answer {
     /// The program is not on this machine.
     Missing,
-    /// It ran and handed back no image bytes — no such type on the clipboard,
-    /// an error it reported, or a kill at the deadline.
+    /// It ran and handed back no image bytes: no such type on the clipboard, or
+    /// an exit that failed. A reader that failed is "no image" rather than its
+    /// own sentence because a failed reader can serve no picture either way, and
+    /// the human's move — copy the picture again, or paste its path — is the one
+    /// an empty clipboard asks for.
     Nothing,
+    /// It was still running when the shared deadline arrived and was killed.
+    /// That is not the same fact as [`Answer::Nothing`]: the clipboard may hold
+    /// the picture and the reader may be stuck, so the caller says a reader did
+    /// not answer, never that the clipboard is empty.
+    TimedOut,
     /// It exited successfully with these bytes.
     Bytes(Drained),
 }
@@ -186,7 +229,9 @@ fn run(program: &str, args: &[String], deadline: Instant) -> Answer {
             Ok(Some(status)) => {
                 let left = deadline.saturating_duration_since(Instant::now());
                 let Ok(drained) = rx.recv_timeout(left) else {
-                    return Answer::Nothing;
+                    // The child exited but its bytes did not arrive in the time
+                    // left: the deadline is the fact, not an empty clipboard.
+                    return Answer::TimedOut;
                 };
                 return if status.success() && !drained.bytes.is_empty() {
                     Answer::Bytes(drained)
@@ -204,10 +249,12 @@ fn run(program: &str, args: &[String], deadline: Instant) -> Answer {
         if Instant::now() >= deadline {
             // Kill and reap. The reader is not awaited past this: killing the
             // child closes the pipe it is reading, and a thread that ends on its
-            // own a moment later is one this caller never has to wait for.
+            // own a moment later is one this caller never has to wait for. What
+            // the deadline bought is its own answer ([`Answer::TimedOut`]), not
+            // an empty clipboard.
             let _ = child.kill();
             let _ = child.wait();
-            return Answer::Nothing;
+            return Answer::TimedOut;
         }
         std::thread::sleep(POLL);
     }
@@ -370,6 +417,71 @@ mod tests {
             refused.contains(&format!("of {} bytes", whole.len())),
             "the exact-size sentence stays for known sizes: {refused}"
         );
+    }
+
+    /// A reader killed at the deadline is its own fact with its own sentence:
+    /// the old road folded the kill into the same `Nothing` as an empty
+    /// clipboard, so the human was told there was no picture when the truth was
+    /// that nobody answered. The sentence names the reader and the wait — 2s,
+    /// the shared deadline — and points at the file road, because the clipboard
+    /// may hold the picture yet.
+    #[test]
+    fn a_reader_killed_at_the_deadline_is_a_timeout_and_says_so() {
+        let ws = temp_workspace("timeout");
+        let readers = vec![("sh", vec!["-c".to_string(), "sleep 30".to_string()])];
+        let refused =
+            run_readers(&ws, readers, Instant::now() + Duration::from_millis(50)).unwrap_err();
+        assert!(
+            refused.contains("`sh` did not answer within 2s"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("paste its path"),
+            "the file road: {refused}"
+        );
+        assert!(
+            !refused.contains("no image") && !refused.contains("no clipboard reader"),
+            "and it is not the empty clipboard's claim: {refused}"
+        );
+    }
+
+    /// A reader that exits — zero or non-zero — is "no image", deliberately:
+    /// it can serve no picture, so the human's move is the one an empty
+    /// clipboard asks for, and only the deadline needs a sentence of its own.
+    #[test]
+    fn a_reader_that_exits_without_a_picture_is_no_image() {
+        let ws = temp_workspace("failed");
+        for exit in ["exit 0", "exit 3"] {
+            let answer = run(
+                "sh",
+                &["-c".into(), exit.into()],
+                Instant::now() + Duration::from_secs(5),
+            );
+            assert!(
+                matches!(answer, Answer::Nothing),
+                "`{exit}` is no image, not a timeout"
+            );
+        }
+        let readers = vec![("sh", vec!["-c".to_string(), "exit 3".to_string()])];
+        assert!(
+            run_readers(&ws, readers, Instant::now() + Duration::from_secs(5))
+                .unwrap()
+                .is_none(),
+            "a failed reader answers as an empty clipboard does"
+        );
+    }
+
+    /// Not one reader on PATH is a third fact: the machine cannot read its
+    /// clipboard at all, and the sentence names what to install rather than
+    /// pretending either that the clipboard was empty or that a reader stalled.
+    #[test]
+    fn no_reader_at_all_names_what_to_install() {
+        let ws = temp_workspace("no-reader");
+        let readers = vec![("mush-no-such-reader", Vec::new())];
+        let refused =
+            run_readers(&ws, readers, Instant::now() + Duration::from_secs(5)).unwrap_err();
+        assert!(refused.contains("no clipboard reader on PATH"), "{refused}");
+        assert!(refused.contains("wl-clipboard"), "{refused}");
     }
 
     /// The reader list is the three platforms' tools in the order the module
