@@ -987,6 +987,10 @@ impl Workspace {
 
     /// Atomically create or replace a file, creating parent directories.
     ///
+    /// The name is resolved to what it really is before anything is made
+    /// ([`entry_for_write`]): a write through a symlink lands in the file the
+    /// link points at and the link stays a link.
+    ///
     /// A file with no owner-write bit is refused with the mode it has, so a
     /// `0444` file the human marked read-only is a sentence the model can read
     /// instead of an override it cannot see. That refusal lives here, at the
@@ -994,7 +998,7 @@ impl Workspace {
     /// human's own `config.json` writer also use: they may replace a file
     /// whatever its mode, but a model may not.
     pub fn write_file(&self, rel: &str, content: &str) -> Result<(), String> {
-        let path = self.resolve(rel)?;
+        let path = entry_for_write(&self.resolve(rel)?, rel)?;
         if path == self.root {
             return Err("refusing to write to the workspace root".to_string());
         }
@@ -1369,6 +1373,9 @@ impl Fresh {
 /// Write via a same-directory temp file plus `rename`, so readers never observe
 /// a half-written file and a crash cannot corrupt the original.
 ///
+/// The name is resolved to what it really is first ([`entry_for_write`]): a
+/// symlink is written through and stays a link.
+///
 /// The mode is a fact of the file, not of this function. `tempfile` makes its
 /// scratch file `0600` and the rename would carry that onto the target, so an
 /// existing target's mode is copied onto the temp file before the rename
@@ -1376,9 +1383,17 @@ impl Fresh {
 /// recorded the mode change); a name that did not exist is made the way
 /// `fresh` says. A mode the file already had is copied exactly, not created
 /// through the umask: the umask decides *new* modes, and this one is not new.
+///
+/// A hard-linked twin is the one fact this cannot keep: `rename` replaces the
+/// *name*, so the other name keeps the old bytes and the two stop being one
+/// inode. The fork is the price of the rename's atomicity, and this road will
+/// not trade that away for it — a copy-then-truncate would leave a reader able
+/// to see a half-written file, which is the promise above — so the fork is
+/// documented here and pinned by `a_hard_link_forks_under_the_rename`.
 pub fn atomic_write(path: &Path, bytes: &[u8], fresh: Fresh) -> io::Result<()> {
-    let dir = path.parent().unwrap_or_else(|| Path::new("."));
-    let existing = fs::metadata(path)
+    let entry = entry_for_write(path, &path.display().to_string()).map_err(invalid)?;
+    let dir = entry.parent().unwrap_or_else(|| Path::new("."));
+    let existing = fs::metadata(&entry)
         .ok()
         .map(|meta| meta.permissions().mode() & 0o7777);
     let mut tmp = tempfile::Builder::new()
@@ -1391,8 +1406,57 @@ pub fn atomic_write(path: &Path, bytes: &[u8], fresh: Fresh) -> io::Result<()> {
         tmp.as_file()
             .set_permissions(fs::Permissions::from_mode(mode))?;
     }
-    tmp.persist(path).map_err(|error| error.error)?;
+    tmp.persist(&entry).map_err(|error| error.error)?;
     Ok(())
+}
+
+/// What a write to `path` must land on, or why it cannot: the file the name
+/// really is.
+///
+/// A write is a `rename`, and a `rename` replaces the *name*, so the name is
+/// asked what it is first. A symlink is followed one link deep, because that is
+/// where the write belongs: the model edited the file the name points at, and a
+/// rename over the link would delete the link and leave that file untouched. A
+/// symlink to nothing is refused, because following it would make a file at a
+/// path no caller checked; the reader is told to make the target first.
+///
+/// `name` is the caller's spelling of the path — the workspace-relative `rel`
+/// at the tool's door, the path itself for a caller with no root — because the
+/// refusal is read by a model or a human, not by `readlink`.
+fn entry_for_write(path: &Path, name: &str) -> Result<PathBuf, String> {
+    let Ok(kind) = fs::symlink_metadata(path) else {
+        return Ok(path.to_path_buf());
+    };
+    if kind.is_file() {
+        return Ok(path.to_path_buf());
+    }
+    if kind.file_type().is_symlink() {
+        let target = fs::read_link(path)
+            .map(|target| target.display().to_string())
+            .unwrap_or_else(|error| format!("(unreadable: {error})"));
+        return match fs::canonicalize(path) {
+            Ok(real) => match fs::symlink_metadata(&real) {
+                Ok(real_kind) if real_kind.is_file() => Ok(real),
+                _ => Err(format!(
+                    "{name} is a symlink to {target} — which is not a regular file; refusing to \
+                     write through it"
+                )),
+            },
+            Err(_) => Err(format!(
+                "{name} is a symlink to {target}, which does not exist — refusing to replace \
+                 the link; create the target first"
+            )),
+        };
+    }
+    Ok(path.to_path_buf())
+}
+
+/// [`entry_for_write`]'s refusal as an IO error: the kind that says "the name
+/// is wrong", not "the disk is". The callers inside a workspace wrap it in the
+/// sentence their model reads, and the callers outside one (`session::save`,
+/// the home `config.json`) report it through their own error channel.
+fn invalid(message: String) -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
 #[cfg(test)]
@@ -2485,6 +2549,37 @@ mod tests {
         atomic_write(&path, b"{\"a\":1}", Fresh::Private).unwrap();
         assert_eq!(mode_of(&path), 0o640);
         assert_eq!(fs::read(&path).unwrap(), b"{\"a\":1}");
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The one fact a rename cannot keep, pinned as the fact it is: a hard link
+    /// is another *name* for the inode, and `rename` replaces the name — so the
+    /// two names fork, the other keeps the old bytes, and they stop being one
+    /// inode. This is accepted, not fixed: the alternative, copying into the
+    /// existing inode, would give up the atomic rename that promises a reader
+    /// never sees a half-written file, and [`atomic_write`]'s doc says so. A
+    /// *symlink* is the case a rename can and does follow
+    /// (`an_edit_follows_a_symlink_to_its_target`, in the TUI crate's tests).
+    #[test]
+    fn a_hard_link_forks_under_the_rename() {
+        use std::os::unix::fs::MetadataExt;
+
+        let ws = temp_workspace("hard-link");
+        let left = ws.root().join("left.txt");
+        let right = ws.root().join("right.txt");
+        fs::write(&left, "one\n").unwrap();
+        fs::hard_link(&left, &right).unwrap();
+
+        ws.write_file("left.txt", "two\n").unwrap();
+        assert_eq!(fs::read_to_string(&left).unwrap(), "two\n");
+        assert_eq!(
+            fs::read_to_string(&right).unwrap(),
+            "one\n",
+            "the twin keeps the old bytes"
+        );
+        let a = fs::metadata(&left).unwrap();
+        let b = fs::metadata(&right).unwrap();
+        assert_ne!(a.ino(), b.ino(), "and the two names fork");
         let _ = fs::remove_dir_all(ws.root());
     }
 
