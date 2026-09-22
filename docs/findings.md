@@ -2504,8 +2504,9 @@ and now incomplete; the human owns that file, so it is recorded rather than
 edited.
 
 **Census** at this landing (`scripts/census.py`), against §8.40's (total 57,814 ·
-prod 14,427 · tests 24,894 · comments 14,905): total 57,972 · **prod 14,459** ·
-tests 24,941 · comments 14,980 — 158 lines: 32 production, 47 test, 75 comment,
+prod 14,427 · tests 24,894 · comments 14,905): total 57,994 · **prod 14,459** ·
+tests 24,963 · comments 14,980 — 180 lines: 32 production, 69 test, 75 comment,
 4 blank. The wave is comment-heavy on purpose: the ruling, the four hands and
 the two races are what a later reader has to be told, and the code that carries
-them is a dozen lines.
+them is a dozen lines. Twenty-two of the test lines are `cargo fmt`'s reflow of
+calls that grew a payload, not assertions.
