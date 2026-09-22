@@ -3787,7 +3787,7 @@ mod tests {
     use crate::session_save;
     use crate::session_save::SessionSave;
 
-    use crate::model::fake::{tool_call, Asked, Scripted};
+    use crate::model::fake::{tool_call, Asked, Gate, Scripted};
 
     /// Run a typed line the way a send does: through the pure parser, then the
     /// arms. A test that names a command string this way exercises both, so the
@@ -5675,6 +5675,244 @@ mod tests {
             }
         });
         port
+    }
+
+    /// Drive the app's own loop by hand: apply every event the actors emitted
+    /// until `until` holds, or the deadline passes.
+    ///
+    /// Most tests in this module read what an *actor* was asked, which is a
+    /// value the scripted model records with the UI nowhere in the way. A test
+    /// that needs a fact the *tree* owns — that a child's run is over, say,
+    /// which a parent knows before the UI does — has to apply the events that
+    /// move it, exactly as the window would (§8.39).
+    fn pump(
+        app: &mut App,
+        rx: &Receiver<Msg>,
+        scripted: &Arc<Scripted>,
+        until: impl Fn(&App, &[Asked]) -> bool,
+    ) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        loop {
+            while let Ok(msg) = rx.try_recv() {
+                app.update(msg);
+            }
+            if until(app, &scripted.asked()) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// The reported session, minus the one fact this test has no use for: two
+    /// children the human had stopped on purpose before the restart — so they
+    /// come back `⊘ stopped`, and with no branch and no worktree left
+    /// (`live_branch` sends them to the main checkout) — whose stop lines the
+    /// human had already read. Unread stored results would seed the parent's
+    /// books with a line it owes a read, and the fold of *that* line, not the
+    /// wake, would be the restored root's first boundary (finding H25).
+    fn stored_continued_children() -> Session {
+        let child = |id: u64, brief: &str| session::AgentSession {
+            id,
+            parent: Some(0),
+            depth: 1,
+            brief: brief.into(),
+            title: None,
+            branch: None,
+            status: session::StoredStatus::Stopped,
+            landed: None,
+            leftover: false,
+            summary: Some("stopped mid-task".into()),
+            result_unread: false,
+            messages: vec![Message::user(brief)],
+        };
+        Session {
+            model: "test-model".into(),
+            provider: "custom".into(),
+            base_url: "http://127.0.0.1:1".into(),
+            context: None,
+            messages: vec![Message::user("the root task")],
+            agents: vec![child(2, "port the parser"), child(3, "port the lexer")],
+            notices: Vec::new(),
+        }
+    }
+
+    /// The shape the defect was reported in, end to end: the root had stopped
+    /// every child on purpose before a restart, the human told the restored root
+    /// to keep going, and the root woke its children with a follow-up
+    /// (`control message` — *continued*, not spawned). The children finished and
+    /// nothing woke the root: each child's row wore `✉`, the root's wore `✉2`,
+    /// and its own books answered `status` with `#30 ◐ running` while its
+    /// transcript never received the line at all (§8.39).
+    ///
+    /// A nudge at the *root* is what gives its restored actor a transcript, so
+    /// this is not the empty-transcript case (that one is
+    /// `a_restored_childs_completion_wakes_the_root`): the root here is alive
+    /// and mid-run when the news lands, which is the other road a completion
+    /// takes — the fold at a message boundary (`drain_mailbox`), not the wake of
+    /// an idle actor. What the completion road is then asked to carry is exactly
+    /// what the session showed it could not.
+    ///
+    /// The test's own order comes from [`Gate`], never from sleeping: the root's
+    /// second turn is a *held* scripted reply, so both children finish — and
+    /// their completions are in the root's mailbox — before that turn's answer
+    /// lands, and the boundary at its end is where they fold. Nothing waits for
+    /// the root to nap: a root that is answering its children is what the fix
+    /// produces, and the reported session's failure was that it stayed at rest.
+    #[test]
+    fn a_restored_root_is_woken_by_the_children_it_continued() {
+        let root = repo("restored-continued");
+        let held = Arc::new(Gate::new());
+        let port = say_endpoint("does the thing");
+        let scripted = Arc::new(
+            Scripted::new()
+                // The human's message starts the restored root's run, and its
+                // first turn is the follow-up the session's root sent: two
+                // `control message` calls, which continue stopped children
+                // rather than spawn new ones.
+                .calls(vec![
+                    tool_call(
+                        "c0",
+                        "control",
+                        serde_json::json!({ "id": "#2", "action": "message", "text": "carry on with the parser" }),
+                    ),
+                    tool_call(
+                        "c1",
+                        "control",
+                        serde_json::json!({ "id": "#3", "action": "message", "text": "carry on with the lexer" }),
+                    ),
+                ])
+                // …and its second turn is held, so that it ends without having
+                // heard them: the news lands in the mailbox of a run that is
+                // still going, which is the road this test is about.
+                .held(held.clone())
+                .says("they are on it")
+                // The run the news buys, in the order a parent reads its books:
+                // a `wait` for the results, a `status` for what the books say
+                // now, and the end.
+                .calls(vec![tool_call("c2", "wait", serde_json::json!({}))])
+                .calls(vec![tool_call("c3", "status", serde_json::json!({}))])
+                .says("done"),
+        );
+        let (mut app, rx) = app_with_scripted_root_at(
+            &root,
+            Some(stored_continued_children()),
+            scripted.clone(),
+            &format!("http://127.0.0.1:{port}"),
+        );
+
+        // The human tells the restored root to keep going. Its first turn
+        // resumes both children; it is then parked in the held turn while they
+        // work.
+        app.deliver("keep going".into(), Vec::new())
+            .expect("the restored root takes the human's words");
+        assert!(
+            held.wait_until_asked(Duration::from_secs(5)),
+            "the root reaches the turn the hold is on"
+        );
+
+        // Both children run to their end. The tree is how this test knows: a
+        // child tells its parent *before* it tells the UI, so a row reading `✓`
+        // is proof that the completion is already in the parent's mailbox —
+        // which is what the released turn's boundary then has to fold.
+        let finished = |app: &App, _: &[Asked]| {
+            [AgentId(2), AgentId(3)].iter().all(|id| {
+                app.tree
+                    .node(*id)
+                    .is_some_and(|node| node.phase == Phase::Done)
+            })
+        };
+        assert!(
+            pump(&mut app, &rx, &scripted, finished),
+            "both continued children run to their end"
+        );
+
+        held.release();
+        assert!(
+            pump(&mut app, &rx, &scripted, |_, asked| asked.len() >= 5),
+            "the root runs on to its own end"
+        );
+
+        let asked = scripted.asked();
+        let shape = |ask: &Asked| {
+            ask.messages
+                .iter()
+                .map(|message| message.text().to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            asked.len(),
+            5,
+            "the root asks exactly the five turns scripted for it: {:?}",
+            asked.last().map(shape)
+        );
+
+        // (a) The wake the reported session never got: the root's *next*
+        // request is a conversation — the system prompt and the human's own
+        // words are in it, so it is not the bare completion line a run woken
+        // onto an empty transcript would make — and both children's results are
+        // folded into it, on the run that news buys.
+        let woken = &asked[2];
+        assert_eq!(
+            woken.messages.first().map(|message| message.role.as_str()),
+            Some("system"),
+            "the news wakes a conversation, not a bare line: {:?}",
+            shape(woken)
+        );
+        assert!(
+            woken.saw("keep going")
+                && woken.saw("#2 done: does the thing")
+                && woken.saw("#3 done: does the thing"),
+            "…the human's own words and both children's results are in it: {:?}",
+            shape(woken)
+        );
+
+        // (b) The books, read the way a parent reads them: `status` answers each
+        // child's *outcome*, not the `◐ running` a lost completion left on the
+        // reported session.
+        let books = asked.last().expect("the status request");
+        assert!(
+            books.saw("#2 ✓ does the thing") && books.saw("#3 ✓ does the thing"),
+            "`status` answers both outcomes: {:?}",
+            shape(books)
+        );
+        assert!(
+            !books.saw("◐ running"),
+            "…and no child is still booked running: {:?}",
+            shape(books)
+        );
+
+        // (c) The books settled: the `wait` was *answered* out of them — with
+        // both results the run had already read — instead of parking for its
+        // whole 600 s cap, which is what the reported session's `wait` did. And
+        // the listing `status` answered carries no `✉` for either child.
+        //
+        // The *books* and not the tree's `✉` marks, deliberately: `AgentTree`'s
+        // `finish` (and `fail`/`stopped`) re-arm `result_unread = parent.is_some()`
+        // unconditionally, and that arm and the parent's read travel on different
+        // threads. `finish_run` hands the parent its `ChildDone` *before* it
+        // emits the run's `Done` to the UI, so the parent can be scheduled in
+        // between, fold the result, and have its `ResultRead` applied to the tree
+        // *before* the child's `Done` re-lights the mark — a mark nothing then
+        // clears, because the books hold that run as read and no second
+        // `ResultRead` ever comes. A row wearing `✉` over a result its parent has
+        // read is what the human would see (§8.39).
+        let waited = &asked[3];
+        assert!(
+            waited.saw("#2 ✓ does the thing (already read — no new run since)")
+                && waited.saw("#3 ✓ does the thing (already read — no new run since)"),
+            "the wait hands both results over instead of parking: {:?}",
+            shape(waited)
+        );
+        assert!(
+            !books.saw("✉"),
+            "…and the books say the parent has read both results: {:?}",
+            shape(books)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A stored session with one child, for the two tests below: the child that
