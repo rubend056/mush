@@ -10623,8 +10623,14 @@ mod tests {
             "the root's number is the conversation it sends"
         );
 
-        // A child: what its own actor published, plus what it has said.
+        // A child: what its own actor published, plus the transcript it holds —
+        // its parent's brief as the opening line, and everything since.
         let (child_root, _mailbox) = isolate_child(&mut app, 1);
+        assert_eq!(
+            app.chat.transcript(AgentId(1))[0].text(),
+            "task 1",
+            "the brief opens the child's transcript, as it opens the actor's history"
+        );
         app.chat
             .push_message(AgentId(1), Message::user("do the thing"));
         let prompt = Message::system(prompt::subagent_prompt(
