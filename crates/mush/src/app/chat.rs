@@ -40,6 +40,7 @@
 //! tall has no row to spend on saying what it is hiding, or that the human has
 //! scrolled away from the bottom.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -49,7 +50,7 @@ use unicode_width::UnicodeWidthStr;
 
 use mush_core::message::{Image, Message};
 use mush_core::session;
-use mush_core::text::{truncate, wrap_text, wrap_text_capped};
+use mush_core::text::{markdown_rows, sanitize, truncate, wrap_text, wrap_text_capped};
 use mush_core::transcript;
 
 use crate::agent::summarize_args;
@@ -274,6 +275,22 @@ impl Notice {
 pub struct Painted {
     pub lines: Vec<Line<'static>>,
     pub title: String,
+    /// Where the select mode is painted, when it is on this pane's
+    /// conversation. `None` is the ordinary reading.
+    pub select: Option<SelectRows>,
+}
+
+/// The rows of a painted pane the select mode marks: indices into
+/// [`Painted::lines`].
+///
+/// Positions, not styles: the colour a cursor wears is a painting decision and
+/// lives in `ui.rs` with every other colour, so a frame says only which rows
+/// wear it — and a test can read which rows the mode is on without a terminal.
+pub struct SelectRows {
+    /// Every painted row of the cursor's own source line.
+    pub cursor: Vec<usize>,
+    /// Every painted row of the source lines the selection covers.
+    pub selected: Vec<usize>,
 }
 
 /// The lines mush wrote about one agent, as `/notes` reads them: the rows of
@@ -368,6 +385,85 @@ struct Lost {
     images: Vec<Image>,
 }
 
+/// The select mode: a cursor over the transcript's *own source lines*, and the
+/// window a pane shows it through.
+///
+/// `Ctrl-Y` starts it and `Enter` copies, so this is the one road from a pane to
+/// the clipboard. What it copies is the transcript, not the rows: a painted row
+/// is a wrap of a source line at one terminal's width, and a drag over the
+/// screen is the terminal's rectangle — neither is text another program can be
+/// handed. `Message::text()` is, and every source line is one line of it, so
+/// the cursor moves over those lines and the copy is them joined with the
+/// newlines the transcript has — a soft wrap never becomes one.
+///
+/// The mode is *modal*: while it is on the keys belong to it (`keys::key`
+/// routes them before the panes, the way a picker does), so a letter is not
+/// typing and `Esc` is not the box's clear.
+#[derive(Debug)]
+struct Selecting {
+    /// The agent whose pane this cursor is over: the mode belongs to one
+    /// conversation, and a pane showing another one paints no cursor.
+    agent: AgentId,
+    /// The cursor: an index into that agent's transcript, and an index into
+    /// `Message::text().split('\n')` — one *source* line, which is one or more
+    /// painted rows.
+    cursor: (usize, usize),
+    /// The other end of a selection while `Shift-↑`/`Shift-↓` extends one.
+    /// `None` is a bare cursor, and `Enter` then copies its own line.
+    anchor: Option<(usize, usize)>,
+    /// The pane's window: which message row `top.0`'s chunk starts at, and how
+    /// many rows of it the window drops (`top.1`).
+    ///
+    /// A `Cell` because only the frame knows the pane's measure. The cursor is
+    /// the state the keys own; where the pane can show it depends on a width and
+    /// a height the keys never see, so the frame places the window as it paints
+    /// and leaves the cursor alone. The placement is idempotent, and one a fold
+    /// or a resize left behind is put right by the next frame or key.
+    top: Cell<(usize, usize)>,
+}
+
+/// What the select mode's keys do.
+///
+/// `keys::key` decides *which* key is which (the one keymap, [`ChatKey`]'s
+/// reason), and [`Chat::select_apply`] is the one place they run.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectKey {
+    /// `Ctrl-Y`: open the mode, with the cursor on the newest line. The key
+    /// that opens the mode belongs with the keys that work it, and it is the
+    /// one [`Chat::start_select`] answers; the others go through
+    /// [`Chat::select_apply`].
+    Start,
+    /// `↑`/`↓` and `PgUp`/`PgDn`: move the cursor `step` source lines, positive
+    /// toward the newest.
+    Move(i64),
+    /// `Shift-↑`/`Shift-↓`: move the cursor and keep the selection reaching back
+    /// to where it started.
+    Extend(i64),
+    /// `Home`: the oldest source line in the pane.
+    First,
+    /// `End`: the newest.
+    Last,
+    /// `Enter`: put the selection (or the cursor's own line) on the clipboard
+    /// and leave the mode.
+    Copy,
+    /// `Esc`: leave without copying.
+    Cancel,
+}
+
+/// What `Enter` hands the app: the text to put on the clipboard, and the line
+/// mush says once it is there.
+///
+/// The line is built with the copy because the count of lines, the byte count
+/// and *what* was copied are facts about the selection; the clipboard decides
+/// only whether the copy worked ([`crate::clipboard::write_text`]).
+pub struct Copied {
+    /// The transcript's own text, exactly as it is: the selected source lines
+    /// joined with the `\n`s they have between them.
+    pub text: String,
+    /// `copied 12 lines from #1's reply — 1,284 bytes`.
+    pub line: String,
+}
+
 /// The line the bar reads after Esc cleared the box: what went, and the one key
 /// that puts it back. `None` when the box had nothing to lose — Esc on an empty
 /// box clears nothing, so there is nothing to name and no road to offer — which
@@ -380,6 +476,182 @@ fn cleared_line(had_words: bool, images: usize) -> Option<String> {
         (false, n) => image_count(n),
     };
     Some(format!("cleared {what} · Ctrl-Z puts it back"))
+}
+
+/// The rows one message paints, and the source line each row is the reading of.
+///
+/// The map is what lets a *source line* be found among painted rows at all: a
+/// wrapped row is not a line of the text, and a tool result's cap paints fewer
+/// rows than its text has lines. `rows` runs parallel to `lines` and is `None`
+/// for a row that is not the message's own words — the reasoning, a tool call, a
+/// picture label, the blank that closes a message.
+#[derive(Default)]
+struct Chunk {
+    lines: Vec<Line<'static>>,
+    rows: Vec<Option<(usize, usize)>>,
+}
+
+impl Chunk {
+    /// The first `rows` rows, for the one caller that wants the part of a
+    /// message above a row it already found.
+    fn cut(mut self, rows: usize) -> Self {
+        self.lines.truncate(rows);
+        self.rows.truncate(rows);
+        self
+    }
+
+    /// Append the rows from `skip` on, at most `room` of them.
+    fn take_into(self, body: &mut Body, skip: usize, room: usize) {
+        for (line, row) in self.lines.into_iter().zip(self.rows).skip(skip).take(room) {
+            body.lines.push(line);
+            body.rows.push(row);
+        }
+    }
+}
+
+/// A pane's rows, and where each row's own text came from.
+#[derive(Default)]
+struct Body {
+    lines: Vec<Line<'static>>,
+    /// Parallel to `lines`: `(message index, source line)`, the provenance a
+    /// [`Chunk`] carries once the message is known.
+    rows: Vec<Option<(usize, usize)>>,
+}
+
+impl Body {
+    /// Drop the blank rows that close the transcript, if it closes here: at one
+    /// row of pane that blank would be the only visible line (finding B4).
+    fn trim_trailing_blanks(&mut self) {
+        let mut kept = self.lines.len();
+        while self.lines[..kept].last().map(|line| line.width()) == Some(0) {
+            kept -= 1;
+        }
+        self.lines.truncate(kept);
+        self.rows.truncate(kept);
+    }
+}
+
+/// The source lines of one message the pane paints text rows for, or `None` for
+/// a message whose text has no row of its own.
+///
+/// The predicate is the `render_message` arms' own: a user line is always
+/// painted (the mark is, even for a message that is only a picture), a reply
+/// with no words paints nothing, and a tool result is painted from its first
+/// row — its cap decides *which* rows, never whether the line exists, so the
+/// cursor can still walk the lines a long result hides behind its `…` and copy
+/// them whole.
+fn lines_of(message: &Message) -> Option<Vec<&str>> {
+    match message.role.as_str() {
+        "user" | "tool" => Some(message.text().split('\n').collect()),
+        "assistant" if !message.text().trim().is_empty() => {
+            Some(message.text().split('\n').collect())
+        }
+        _ => None,
+    }
+}
+
+/// The first row of a message that is the reading of source line `line`, or —
+/// for a line the pane's cap hid — the last row that is the reading of a line at
+/// or before it: the result's `…`, which stands for the rows that did not fit.
+fn first_row(rows: &[Option<(usize, usize)>], message: usize, line: usize) -> Option<usize> {
+    rows.iter()
+        .position(|row| *row == Some((message, line)))
+        .or_else(|| last_row(rows, message, line))
+}
+
+/// The last row that is the reading of `line`: a wrapped line is several rows,
+/// and a window that ends on the cursor's line wants its end, not its start.
+fn last_row(rows: &[Option<(usize, usize)>], message: usize, line: usize) -> Option<usize> {
+    rows.iter()
+        .rposition(|row| *row == Some((message, line)))
+        .or_else(|| {
+            rows.iter().rposition(
+                |row| matches!(row, Some((at, row_line)) if *at == message && *row_line <= line),
+            )
+        })
+}
+
+/// One past the last row of a chunk that is the reading of the message's own
+/// text. A window the pane's height cut *before* this row is hiding text; one
+/// cut at or after it has all the words on screen, whatever else it left below
+/// (the picture labels, the blank that closes a message).
+fn last_text(chunk: &Chunk) -> usize {
+    chunk
+        .rows
+        .iter()
+        .rposition(|row| row.is_some())
+        .map_or(0, |at| at + 1)
+}
+
+/// Which row of a window the cursor is painted on: the cursor's own line's
+/// first row, or — for a line the cap hid — the row [`first_row`]'s fallback
+/// names. `None` is "this window does not show the cursor", which is what makes
+/// the frame place the window again.
+///
+/// `cut` is the message whose rows the window's height cut short of its text: a
+/// cut message cannot answer for a hidden line, because the cursor's line may be
+/// under the cut rather than behind the cap.
+fn cursor_row(
+    rows: &[Option<(usize, usize)>],
+    cursor: (usize, usize),
+    cut: Option<usize>,
+) -> Option<usize> {
+    if let Some(at) = rows.iter().position(|row| *row == Some(cursor)) {
+        return Some(at);
+    }
+    if cut == Some(cursor.0) {
+        return None;
+    }
+    rows.iter().rposition(
+        |row| matches!(row, Some((message, line)) if *message == cursor.0 && *line <= cursor.1),
+    )
+}
+
+/// Whether the cursor sits above everything a window shows. A window with no
+/// text row in it at all has nothing to be above, and reads as below — the
+/// bottom anchoring is the one that ends up showing the cursor.
+fn cursor_above(body: &Body, cursor: (usize, usize)) -> bool {
+    match body.rows.iter().flatten().next() {
+        Some(&first) => cursor < first,
+        None => false,
+    }
+}
+
+/// The rows a window paints the mode on: the cursor's own line, and every
+/// source line the selection covers.
+fn select_rows(
+    rows: &[Option<(usize, usize)>],
+    select: &Selecting,
+    cut: Option<usize>,
+) -> Option<SelectRows> {
+    let at = cursor_row(rows, select.cursor, cut)?;
+    // Every row of the cursor's own line, not just the one the lookup landed
+    // on: a wrapped line is one line, and every row of it is the cursor.
+    let tag = rows[at];
+    let cursor: Vec<usize> = rows
+        .iter()
+        .enumerate()
+        .filter(|(_, row)| **row == tag)
+        .map(|(at, _)| at)
+        .collect();
+    let selected = match select.anchor {
+        Some(anchor) if anchor != select.cursor => {
+            let (from, to) = if anchor < select.cursor {
+                (anchor, select.cursor)
+            } else {
+                (select.cursor, anchor)
+            };
+            rows.iter()
+                .enumerate()
+                .filter(|(_, row)| row.is_some_and(|tag| from <= tag && tag <= to))
+                .map(|(at, _)| at)
+                .collect()
+        }
+        // A bare cursor is not a selection: the one line it covers would wear
+        // both styles and say nothing the cursor does not.
+        _ => Vec::new(),
+    };
+    Some(SelectRows { cursor, selected })
 }
 
 /// One conversation: what has been said, what mush added to it, and what the
@@ -432,6 +704,11 @@ pub struct Chat {
     /// (finding U3). A pane nobody has scrolled is absent, which is exactly
     /// `Reading::Following` — following costs no state at all.
     reading: HashMap<AgentId, Reading>,
+    /// The select mode: the cursor `Ctrl-Y` put over a pane's transcript, or
+    /// `None` when the keys are the box's again. One mode at a time, over one
+    /// conversation — a pane showing another agent paints no cursor and its
+    /// keys are the box's.
+    select: Option<Selecting>,
     /// The user lines that are *not* the human's, keyed by the index they sit at
     /// in their conversation. Absent is the norm — most of a transcript is the
     /// human's own words — so the default costs nothing and there is no second
@@ -482,6 +759,7 @@ impl Chat {
             attachments: Vec::new(),
             lost: None,
             reading: HashMap::new(),
+            select: None,
             spoken: HashMap::new(),
             revisions: HashMap::new(),
             pending: None,
@@ -708,6 +986,9 @@ impl Chat {
         self.systems.clear();
         self.notices.clear();
         self.reading.clear();
+        // The mode is a cursor over a transcript that no longer exists; the
+        // mode that survives Ctrl-N would be a cursor over nothing.
+        self.select = None;
         self.spoken.clear();
         self.pending = None;
         // The road back goes with the conversation the loss was in: a Ctrl-N
@@ -1030,6 +1311,244 @@ impl Chat {
         }
     }
 
+    /// Whether the select mode is on, in whichever pane it was started in.
+    ///
+    /// The keymap's question: while it is on the mode takes the keyboard from
+    /// both panes, the way a picker does (finding B2's one home for that
+    /// decision).
+    pub fn selecting(&self) -> bool {
+        self.select.is_some()
+    }
+
+    /// Leave the select mode without copying anything. The other road out is
+    /// `Esc` (which every caller can reach through [`Chat::select_apply`]), and
+    /// this one is for a key that is not the mode's: `Tab` moves the focus, and
+    /// a mode that kept the keyboard after the human moved on would be the one
+    /// modal mush could not get out of with `Tab`.
+    pub fn cancel_select(&mut self) {
+        self.select = None;
+    }
+
+    /// `Ctrl-Y`: start selecting in the pane `on` shows, with the cursor on the
+    /// newest source line — where the pane already is, because it follows the
+    /// bottom.
+    ///
+    /// `Some(line)` is what the bar says when there is nothing to stand on: a
+    /// pane with no words yet has no source line, and a mode whose cursor has
+    /// nowhere to be is a mode the human cannot copy their way out of.
+    pub fn start_select(&mut self, on: AgentId) -> Option<String> {
+        match self.last_line(on) {
+            Some(cursor) => {
+                self.select = Some(Selecting {
+                    agent: on,
+                    cursor,
+                    anchor: None,
+                    // Placed by the first frame, which is what knows the
+                    // pane's measure; anywhere above the cursor is the same
+                    // answer here.
+                    top: Cell::new((0, 0)),
+                });
+                None
+            }
+            None => Some("nothing to select in this pane".to_string()),
+        }
+    }
+
+    /// The newest source line the pane paints, if it paints one.
+    fn last_line(&self, on: AgentId) -> Option<(usize, usize)> {
+        let transcript = self.transcript(on);
+        (0..transcript.len())
+            .rev()
+            .find_map(|index| lines_of(&transcript[index]).map(|lines| (index, lines.len() - 1)))
+    }
+
+    /// The oldest source line the pane paints, if it paints one.
+    fn first_line(&self, on: AgentId) -> Option<(usize, usize)> {
+        let transcript = self.transcript(on);
+        (0..transcript.len()).find_map(|index| lines_of(&transcript[index]).map(|_| (index, 0)))
+    }
+
+    /// What the select mode's keys do — the one place they run.
+    ///
+    /// `Some(copied)` is `Enter`: the copy the caller hands the clipboard, and
+    /// the mode left behind with it.
+    pub fn select_apply(&mut self, on: AgentId, key: SelectKey) -> Option<Copied> {
+        let Some(cursor) = self.clamped_cursor(on) else {
+            // A fold took the lines the cursor was over: the mode has nothing
+            // left to stand on, and leaving is the only honest answer.
+            self.select = None;
+            return None;
+        };
+        self.set_cursor(cursor);
+        match key {
+            // The key that opens the mode is [`Chat::start_select`]'s: the
+            // caller never routes it here, and one that arrives anyway has
+            // nothing to do — the cursor is already where the mode was started.
+            SelectKey::Start => None,
+            SelectKey::Cancel => {
+                self.select = None;
+                None
+            }
+            SelectKey::Copy => {
+                let copied = self.copy(on, cursor);
+                self.select = None;
+                Some(copied)
+            }
+            SelectKey::Move(step) => {
+                let next = self.step_line(on, cursor, step);
+                self.set_cursor(next);
+                None
+            }
+            SelectKey::Extend(step) => {
+                let next = self.step_line(on, cursor, step);
+                if let Some(select) = self.select.as_mut() {
+                    // The anchor is where the selection started: the first
+                    // extended step plants it on the line the cursor was on,
+                    // and every one after keeps it. A plain move never drops
+                    // it, so the selection follows the cursor's end.
+                    if select.anchor.is_none() {
+                        select.anchor = Some(cursor);
+                    }
+                    select.cursor = next;
+                }
+                None
+            }
+            SelectKey::First => {
+                if let Some(first) = self.first_line(on) {
+                    self.set_cursor(first);
+                }
+                None
+            }
+            SelectKey::Last => {
+                if let Some(last) = self.last_line(on) {
+                    self.set_cursor(last);
+                }
+                None
+            }
+        }
+    }
+
+    fn set_cursor(&mut self, cursor: (usize, usize)) {
+        if let Some(select) = self.select.as_mut() {
+            select.cursor = cursor;
+        }
+    }
+
+    /// The cursor as the transcript is *now*: a fold can leave the state
+    /// pointing at a message or a line that is gone, and a key must not index
+    /// past the end. The nearest line that still exists is the honest clamp —
+    /// and `None` when there is no source line left at all, which drops the
+    /// mode rather than leaving a cursor over nothing.
+    fn clamped_cursor(&self, on: AgentId) -> Option<(usize, usize)> {
+        let select = self.select.as_ref().filter(|select| select.agent == on)?;
+        let transcript = self.transcript(on);
+        let mut index = select.cursor.0.min(transcript.len().checked_sub(1)?);
+        loop {
+            if let Some(lines) = lines_of(&transcript[index]) {
+                return Some((index, select.cursor.1.min(lines.len() - 1)));
+            }
+            index = index.checked_sub(1)?;
+        }
+    }
+
+    /// The source line one step older or newer than `cursor`, or `None` at an
+    /// end of the transcript.
+    fn adjacent(
+        &self,
+        on: AgentId,
+        cursor: (usize, usize),
+        forward: bool,
+    ) -> Option<(usize, usize)> {
+        let transcript = self.transcript(on);
+        let lines = lines_of(transcript.get(cursor.0)?)?;
+        if forward {
+            if cursor.1 + 1 < lines.len() {
+                return Some((cursor.0, cursor.1 + 1));
+            }
+            ((cursor.0 + 1)..transcript.len())
+                .find_map(|index| lines_of(&transcript[index]).map(|_| (index, 0)))
+        } else {
+            if cursor.1 > 0 && cursor.1 < lines.len() {
+                return Some((cursor.0, cursor.1 - 1));
+            }
+            (0..cursor.0).rev().find_map(|index| {
+                lines_of(&transcript[index]).map(|lines| (index, lines.len() - 1))
+            })
+        }
+    }
+
+    /// The cursor moved `step` source lines, positive toward the newest,
+    /// stopping at either end: the oldest and the newest lines are ends of the
+    /// transcript, not walls to crash into.
+    fn step_line(&self, on: AgentId, cursor: (usize, usize), step: i64) -> (usize, usize) {
+        let mut cursor = cursor;
+        let forward = step > 0;
+        for _ in 0..step.unsigned_abs() {
+            match self.adjacent(on, cursor, forward) {
+                Some(next) => cursor = next,
+                None => break,
+            }
+        }
+        cursor
+    }
+
+    /// `Enter`: the transcript's own text for the selection, or for the cursor's
+    /// own line when there is no selection, plus the line mush says once the
+    /// clipboard has taken it.
+    ///
+    /// The text is the *source lines* joined with `\n` — the separator the
+    /// transcript has between them — so a whole message is `Message::text()`
+    /// byte for byte, a soft wrap at this pane's width is not a newline, and a
+    /// tab is a tab. A tool result is copied whole even where the pane's cap
+    /// hides its tail.
+    fn copy(&self, on: AgentId, cursor: (usize, usize)) -> Copied {
+        let select = self.select.as_ref().expect("the mode is on");
+        let (from, to) = match select.anchor {
+            Some(anchor) if anchor <= cursor => (anchor, cursor),
+            Some(anchor) => (cursor, anchor),
+            None => (cursor, cursor),
+        };
+        let transcript = self.transcript(on);
+        let mut parts: Vec<&str> = Vec::new();
+        let mut covered: Vec<usize> = Vec::new();
+        for index in from.0..=to.0 {
+            let Some(lines) = transcript.get(index).and_then(lines_of) else {
+                continue;
+            };
+            let first = if index == from.0 {
+                from.1.min(lines.len() - 1)
+            } else {
+                0
+            };
+            let last = if index == to.0 {
+                to.1.min(lines.len() - 1)
+            } else {
+                lines.len() - 1
+            };
+            if first > last {
+                continue;
+            }
+            parts.extend_from_slice(&lines[first..=last]);
+            covered.push(index);
+        }
+        let text = parts.join("\n");
+        let what = match covered.as_slice() {
+            [one] => match transcript[*one].role.as_str() {
+                "user" => "your message".to_string(),
+                "tool" => format!("{on}'s tool result"),
+                _ => format!("{on}'s reply"),
+            },
+            many => format!("{} messages", many.len()),
+        };
+        let count = parts.len();
+        let noun = if count == 1 { "line" } else { "lines" };
+        let line = format!(
+            "copied {count} {noun} from {what} — {} bytes",
+            grouped(text.len())
+        );
+        Copied { text, line }
+    }
+
     /// Where the pane showing `agent` is reading from. A conversation nobody
     /// has scrolled is at the bottom.
     fn reading(&self, agent: AgentId) -> Reading {
@@ -1102,14 +1621,43 @@ impl Chat {
         let protected = usize::from(!transcript.is_empty());
         let room = FOOT_ROWS.min(height.saturating_sub(protected));
         let foot = self.foot(pane, width, room);
-        let mut lines = self.body(pane, width, height.saturating_sub(foot.lines.len()));
-        lines.extend(foot.lines);
+        // The window: the select mode's own while its cursor is on this pane,
+        // the human's reading otherwise.
+        let select = self
+            .select
+            .as_ref()
+            .filter(|select| select.agent == pane.agent);
+        let (mut body, cut) = match select {
+            Some(select) => self.select_body(
+                select,
+                pane.agent,
+                width,
+                height.saturating_sub(foot.lines.len()),
+            ),
+            None => (
+                self.body(pane, width, height.saturating_sub(foot.lines.len())),
+                None,
+            ),
+        };
+        // Read before the foot is appended: the mode's rows are transcript
+        // rows, and the foot never carries the cursor.
+        let select_rows = select.and_then(|select| select_rows(&body.rows, select, cut));
+        body.lines.extend(foot.lines);
+        let lines = body.lines;
 
         let mut title = if pane.agent == AgentId::ROOT {
             " mush ".to_string()
         } else {
             format!(" agent {} ", pane.agent)
         };
+        // The mode's own line, first because it is the newest thing about the
+        // pane: `Ctrl-Y` put the cursor here and the keys that finish the job
+        // are not the ones the hint under the pane advertises. The pair named
+        // is the one that leaves the mode — nothing else on this screen says
+        // which of the two copies.
+        if select.is_some() {
+            title.push_str("· Enter copies · Esc leaves ");
+        }
         // A pane with no row to spare for the foot's own count line is the case
         // the title exists for: wherever the human looks, the pane says how
         // many lines it is hiding — and names the way to read them, because the
@@ -1123,18 +1671,170 @@ impl Chat {
         // looks exactly like one following it, and the human who scrolled away
         // is the only one who knows they did (finding T10). The rows are the
         // held window's own offset, and the key named is the chat pane's way
-        // back down to the newest line.
-        if let Some((offset, _)) = self.reading(pane.agent).held(transcript.len()) {
-            title.push_str(&format!("· scrolled ↑{offset} rows · PgDn "));
+        // back down to the newest line. While the mode is on, this is not the
+        // reading the pane shows — the mode has its own window — so the clause
+        // would be a lie about the rows on screen.
+        if select.is_none() {
+            if let Some((offset, _)) = self.reading(pane.agent).held(transcript.len()) {
+                title.push_str(&format!("· scrolled ↑{offset} rows · PgDn "));
+            }
         }
-        Painted { lines, title }
+        Painted {
+            lines,
+            title,
+            select: select_rows,
+        }
+    }
+
+    /// The window the select mode's cursor is shown through, placed so the
+    /// cursor is on screen.
+    ///
+    /// The pane's own reading ([`Reading`]) is not touched: the mode is a
+    /// reading of its own, and leaving it puts the pane back where the human
+    /// was, not where the cursor ended.
+    fn select_body(
+        &self,
+        select: &Selecting,
+        on: AgentId,
+        width: usize,
+        height: usize,
+    ) -> (Body, Option<usize>) {
+        let transcript = self.transcript(on);
+        if transcript.is_empty() || height == 0 {
+            return (Body::default(), None);
+        }
+        let cursor = select.cursor;
+        let start = select.top.get();
+        let start = (start.0.min(transcript.len() - 1), start.1);
+        let (body, cut) = self.window_from(on, width, height, start);
+        if cursor_row(&body.rows, cursor, cut).is_some() {
+            return (body, cut);
+        }
+        // The window the state carries no longer shows the cursor: the terminal
+        // was resized, the transcript moved under it (a fold), or the cursor's
+        // own line is behind a tool result's cap. Put it where the pane can hold
+        // it — the cursor's line at the top when it is above the window, at the
+        // bottom when it is below — and leave the placement where the next
+        // frame finds it.
+        let start = if cursor_above(&body, cursor) {
+            self.top_at_cursor(on, width, cursor)
+        } else {
+            self.top_at_bottom(on, width, height, cursor)
+        };
+        select.top.set(start);
+        self.window_from(on, width, height, start)
+    }
+
+    /// The transcript's rows in a window: from `start` — a message, and how many
+    /// rows of that message's own chunk to skip — forward, until `height` rows
+    /// are filled or the transcript ends.
+    ///
+    /// The message the height cut is reported, so a caller can tell a window
+    /// that stopped at the pane's bottom from one that stopped at the
+    /// transcript's end.
+    fn window_from(
+        &self,
+        on: AgentId,
+        width: usize,
+        height: usize,
+        start: (usize, usize),
+    ) -> (Body, Option<usize>) {
+        let transcript = self.transcript(on);
+        let mut body = Body::default();
+        let mut cut = None;
+        let mut index = start.0;
+        let mut skip = start.1;
+        while body.lines.len() < height && index < transcript.len() {
+            let chunk = self.chunk(on, index, width);
+            let room = height - body.lines.len();
+            if chunk.lines.len().saturating_sub(skip) > room && skip + room < last_text(&chunk) {
+                cut = Some(index);
+            }
+            chunk.take_into(&mut body, skip, room);
+            skip = 0;
+            index += 1;
+        }
+        // A window that reached the transcript's own end trims the blank that
+        // closes it, exactly as the following view does (finding B4); a window
+        // the pane's height cut has no closing blank to trim.
+        if cut.is_none() {
+            body.trim_trailing_blanks();
+        }
+        (body, cut)
+    }
+
+    /// One message's rows, with the message and source line each came from.
+    fn chunk(&self, on: AgentId, index: usize, width: usize) -> Chunk {
+        let message = &self.transcript(on)[index];
+        let voice = self.voice_at(on, index, message);
+        let mut lines = Vec::new();
+        let rows = render_message(&mut lines, message, voice, width, self.reasoning);
+        debug_assert_eq!(lines.len(), rows.len(), "one map entry per painted row");
+        Chunk {
+            lines,
+            rows: rows
+                .into_iter()
+                .map(|line| line.map(|line| (index, line)))
+                .collect(),
+        }
+    }
+
+    /// The window's top with the cursor's own line as its first row: where the
+    /// line begins in its message. A line the pane's cap hid begins at the
+    /// result's `…`, which is the row that stands for it.
+    fn top_at_cursor(&self, on: AgentId, width: usize, cursor: (usize, usize)) -> (usize, usize) {
+        let chunk = self.chunk(on, cursor.0, width);
+        (
+            cursor.0,
+            first_row(&chunk.rows, cursor.0, cursor.1).unwrap_or(0),
+        )
+    }
+
+    /// The window's top with the cursor's own line as the pane's last row: the
+    /// rows above it, walked back until the pane is full.
+    ///
+    /// When the transcript's own beginning is closer than the pane's top there
+    /// is nothing above the start to fill a pane with, and the window is the
+    /// transcript's first rows instead — a half-empty pane under the cursor
+    /// would read as a gap in the conversation that is not there.
+    fn top_at_bottom(
+        &self,
+        on: AgentId,
+        width: usize,
+        height: usize,
+        cursor: (usize, usize),
+    ) -> (usize, usize) {
+        let want = height.saturating_sub(1);
+        let head = self.chunk(on, cursor.0, width);
+        // The cursor's line's last row is the window's last row, so the rows
+        // above the window are everything before it.
+        let mut above = last_row(&head.rows, cursor.0, cursor.1).unwrap_or(0);
+        let mut blocks: Vec<(usize, Chunk)> = vec![(cursor.0, head.cut(above))];
+        let mut index = cursor.0;
+        while above < want && index > 0 {
+            index -= 1;
+            let chunk = self.chunk(on, index, width);
+            above += chunk.lines.len();
+            blocks.push((index, chunk));
+        }
+        if above < want {
+            return (0, 0);
+        }
+        let mut skip = above - want;
+        for (index, chunk) in blocks.iter().rev() {
+            if skip < chunk.lines.len() {
+                return (*index, skip);
+            }
+            skip -= chunk.lines.len();
+        }
+        (0, 0)
     }
 
     /// The transcript itself, without the foot: the rows the conversation fills
     /// in `height`, newest at the bottom — or, while the human is holding a
     /// window, the rows they are holding, with everything that arrived since
     /// still below them (finding U3).
-    fn body(&self, pane: &Pane<'_>, width: usize, height: usize) -> Vec<Line<'static>> {
+    fn body(&self, pane: &Pane<'_>, width: usize, height: usize) -> Body {
         let transcript = self.transcript(pane.agent);
         // Which conversation this window is made of, and how far above its
         // bottom it starts. Holding is a fact about the human's reading, so it
@@ -1167,37 +1867,39 @@ impl Chat {
             // Wrapped to the pane and windowed to its height, like every other
             // row: returned raw, the hint was cut mid-word on a narrow pane
             // ("the agent reads and") and the lines under it never appeared.
-            return hint
+            let lines: Vec<Line<'static>> = hint
                 .iter()
                 .flat_map(|line| wrap_text(line, width))
                 .take(height)
                 .map(|line| Line::from(Span::styled(line, dim())))
                 .collect();
+            return Body {
+                rows: vec![None; lines.len()],
+                lines,
+            };
         }
 
         // Built back to front and then reversed: each chunk is one message's
         // rows in their own order, and the pane is anchored at the bottom, so
         // the newest line is the one that must be there.
         let want = height + scroll;
-        let mut chunks: Vec<Vec<Line<'static>>> = Vec::new();
+        let mut chunks: Vec<Chunk> = Vec::new();
         let mut count = 0usize;
 
-        for (index, message) in messages.iter().enumerate().rev() {
+        for index in (0..messages.len()).rev() {
             if count >= want {
                 break;
             }
-            let voice = self.voice_at(pane.agent, index, message);
-            let mut chunk = Vec::new();
-            render_message(&mut chunk, message, voice, width, self.reasoning);
-            count += chunk.len();
+            let chunk = self.chunk(pane.agent, index, width);
+            count += chunk.lines.len();
             chunks.push(chunk);
         }
 
-        let mut lines = Vec::with_capacity(count);
+        let mut body = Body::default();
         for chunk in chunks.into_iter().rev() {
-            lines.extend(chunk);
+            chunk.take_into(&mut body, 0, usize::MAX);
         }
-        trim_trailing_blanks(&mut lines);
+        body.trim_trailing_blanks();
 
         // Anchor the window at the bottom: the newest `height` rows, with
         // `scroll` rows of older ones above them. Building backwards means the
@@ -1206,8 +1908,12 @@ impl Chat {
         // the only arithmetic that is right in both cases. Taking `0` when it
         // overshot painted the *oldest* rows of the window, which made a
         // message taller than the pane freeze the view and hide its own end.
-        let start = lines.len().saturating_sub(height + scroll);
-        lines.into_iter().skip(start).take(height).collect()
+        let start = body.lines.len().saturating_sub(height + scroll);
+        body.lines.drain(..start);
+        body.rows.drain(..start);
+        body.lines.truncate(height);
+        body.rows.truncate(height);
+        body
     }
 
     /// The rows of the foot, capped at `room` and counted, in the order the pane
@@ -1743,13 +2449,18 @@ fn more_label(hidden: usize) -> String {
     format!("+{hidden} more lines")
 }
 
-/// Every message ends with a blank separator line. At one row of transcript that
-/// blank would be the only visible line — the reply would be invisible — so the
-/// separator is trimmed before windowing (finding B4).
-fn trim_trailing_blanks(lines: &mut Vec<Line<'static>>) {
-    while lines.last().map(|line| line.width()) == Some(0) {
-        lines.pop();
+/// `1,284`: a count with its thousands marked, the way a number a human reads
+/// rather than counts is written.
+fn grouped(n: usize) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (at, digit) in digits.chars().enumerate() {
+        if at > 0 && (digits.len() - at) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(digit);
     }
+    out
 }
 
 /// The head of the one user message a fold leaves behind
@@ -1812,16 +2523,27 @@ fn report(text: &str) -> bool {
             .any(|tail| rest[digits..].starts_with(tail))
 }
 
-/// One message's rows: who said it, wrapped at the pane's width. `reasoning`
-/// is the pane's `Ctrl-T` choice, threaded in rather than read off a `Chat`
-/// this free function has no handle on.
+/// One message's rows: who said it, wrapped at the pane's width — and, beside
+/// them, the source line of the message's own text each row is the reading of.
+///
+/// The map is *returned* rather than kept by the painter because a source line
+/// is one or more painted rows, and only the pass that paints a row knows
+/// whether the row is a soft wrap of the line above it, a markdown view of it,
+/// or the `…` that stands for the tail a tool result's cap hid. A second pass
+/// that counted them could disagree with the rows on screen, and the cursor
+/// would then sit on the wrong one. The caller adds the message's index.
+///
+/// `reasoning` is the pane's `Ctrl-T` choice, threaded in rather than read off a
+/// `Chat` this free function has no handle on.
 fn render_message(
     out: &mut Vec<Line<'static>>,
     message: &Message,
     voice: Option<Voice>,
     width: usize,
     reasoning: bool,
-) {
+) -> Vec<Option<usize>> {
+    let start = out.len();
+    let mut rows: Vec<Option<usize>> = Vec::new();
     match message.role.as_str() {
         "user" => {
             // Mush's own line in the conversation is marked like the other
@@ -1832,9 +2554,19 @@ fn render_message(
             // attachment: the `▣` rows below are *what* was said, whoever said
             // it, and the mark is *who* said it. Without it, a picture the
             // human sent would read exactly like a dim line of mush's own.
-            marked(out, mark, style, message.text(), width);
+            mark_rows(
+                out,
+                &mut rows,
+                mark,
+                style,
+                message.text(),
+                width,
+                View::Plain,
+            );
             image_rows(out, message);
+            rows.resize(out.len() - start, None);
             out.push(Line::from(""));
+            rows.push(None);
         }
         "assistant" => {
             // The reasoning comes first because that is the order it decided
@@ -1845,15 +2577,18 @@ fn render_message(
             // the text the human pressed `Ctrl-T` to read.
             if reasoning {
                 reasoning_rows(out, message, width);
+                rows.resize(out.len() - start, None);
             }
             let text = message.text();
             if !text.trim().is_empty() {
-                marked(
+                mark_rows(
                     out,
+                    &mut rows,
                     "mush › ",
                     Style::default().fg(Color::Green),
                     text,
                     width,
+                    View::Markdown,
                 );
             }
             for call in message.tool_calls() {
@@ -1861,9 +2596,12 @@ fn render_message(
                     tool_label(call, width),
                     Style::default().fg(Color::Yellow),
                 )));
+                rows.push(None);
             }
             image_rows(out, message);
+            rows.resize(out.len() - start, None);
             out.push(Line::from(""));
+            rows.push(None);
         }
         "tool" => {
             // Only the first eight lines are ever shown, so only those are
@@ -1887,8 +2625,27 @@ fn render_message(
             // `mark` columns wider than a successful one.
             const INDENT: usize = 2;
             let lead = INDENT + mark.width();
-            let wrapped = wrap_text_capped(message.text(), width.saturating_sub(lead), SHOWN + 1);
+            let wrap = width.saturating_sub(lead);
+            let wrapped = wrap_text_capped(message.text(), wrap, SHOWN + 1);
             let clipped = wrapped.len() > SHOWN;
+            // Which source line each painted row is the reading of. The wrap is
+            // per source line, so walking the lines and counting their rows is
+            // where the boundaries are — and where the cap's ninth row falls,
+            // which is the line the `…` stands for. The walk stops at the cap:
+            // it is the same arithmetic `wrap_text_capped` just did, over the
+            // rows it was allowed to do it for, never a second wrap of the
+            // whole result.
+            let mut tags: Vec<usize> = Vec::with_capacity(SHOWN + 1);
+            let mut left = SHOWN + 1;
+            for (line, raw) in message.text().split('\n').enumerate() {
+                if left == 0 {
+                    break;
+                }
+                let count = wrap_text_capped(raw, wrap, left).len();
+                tags.extend(std::iter::repeat(line).take(count));
+                left -= count;
+            }
+            debug_assert_eq!(tags.len(), wrapped.len(), "one source per wrapped row");
             for (index, line) in wrapped.iter().take(SHOWN).enumerate() {
                 let head = if index == 0 {
                     format!("{}{mark}", " ".repeat(INDENT))
@@ -1896,18 +2653,102 @@ fn render_message(
                     " ".repeat(lead)
                 };
                 out.push(Line::from(Span::styled(format!("{head}{line}"), style)));
+                rows.push(tags.get(index).copied());
             }
             if clipped {
+                // The `…` stands for the first wrapped row the cap did not
+                // paint, so the cursor can stand on the line it hides — and,
+                // through the fallback in [`first_row`], on the lines after it.
                 out.push(Line::from(Span::styled(
                     format!("{}…", " ".repeat(lead)),
                     style,
                 )));
+                rows.push(tags.get(SHOWN).copied());
             }
             image_rows(out, message);
+            rows.resize(out.len() - start, None);
             out.push(Line::from(""));
+            rows.push(None);
         }
         _ => {}
     }
+    debug_assert_eq!(
+        out.len() - start,
+        rows.len(),
+        "one map entry per painted row"
+    );
+    rows
+}
+
+/// Which view makes a text's rows: the reply's markdown, or the wrapper every
+/// other line goes through.
+///
+/// [`marked`] decides the view from the mark it is handed — the reply's
+/// `mush › ` is the one that reaches the parser — and this names that same
+/// choice for the caller that has to follow the rows back to their source
+/// lines: the two views split rows over a line differently (the view does not
+/// paint a heading's `#`s or a fence's own lines), so a map counted off the
+/// source alone would point at the wrong row.
+#[derive(Clone, Copy)]
+enum View {
+    Plain,
+    Markdown,
+}
+
+/// The rows of one marked line, and the source line each is the reading of:
+/// [`marked`] paints them and this tags them.
+///
+/// `marked` wraps each source line on its own (`wrap_text` splits on `\n`
+/// first, and the markdown parser is line-local for the same reason), so its
+/// rows come out one source line at a time; the head it put on the first row is
+/// the width the line was wrapped inside, read back off the row rather than
+/// recomputed, so the map cannot disagree with the mark the pane could afford.
+///
+/// The markdown walk restates the view's one cross-line rule — a fence line
+/// paints no row, and the lines inside a fence are one plain block — because the
+/// parser's own `fence_line` is not public and asking it for a prefix of the
+/// reply per source line would parse the message once per line. The
+/// `debug_assert` below is what keeps the two row counts from drifting.
+fn mark_rows(
+    out: &mut Vec<Line<'static>>,
+    rows: &mut Vec<Option<usize>>,
+    mark: &str,
+    style: Style,
+    text: &str,
+    width: usize,
+    view: View,
+) {
+    let start = out.len();
+    let base = rows.len();
+    debug_assert_eq!(out.len(), rows.len(), "the map is one entry per row");
+    marked(out, mark, style, text, width);
+    let lead = out
+        .get(start)
+        .and_then(|row| row.spans.first())
+        .map_or(0, |head| UnicodeWidthStr::width(head.content.as_ref()));
+    let wrap = width.saturating_sub(lead);
+    let mut fence = false;
+    for (line, raw) in text.split('\n').enumerate() {
+        let count = match view {
+            View::Plain => wrap_text(raw, wrap).len(),
+            View::Markdown => {
+                let source = sanitize(raw);
+                if source.trim_start().starts_with("```") {
+                    fence = !fence;
+                    0
+                } else if fence {
+                    wrap_text(&source, wrap).len()
+                } else {
+                    markdown_rows(&source, wrap).len()
+                }
+            }
+        };
+        rows.extend(std::iter::repeat(Some(line)).take(count));
+    }
+    // The buffers are parallel, not merely both filled: `marked` pushed the
+    // rows and this pushed one entry for each of them, and it is that pairing —
+    // the map's index into `out` — that the whole selection reads.
+    debug_assert_eq!(out.len() - start, rows.len() - base, "one entry per row");
 }
 
 #[cfg(test)]
@@ -1944,7 +2785,9 @@ mod tests {
     /// tested through the real table rather than a private entry point, so a
     /// key that stopped reaching the box fails here.
     fn press(chat: &mut Chat, key: KeyEvent) -> bool {
-        match keys::key(Focus::Chat, false, key) {
+        // Not selecting: this helper is how the box's own keys are tested, and
+        // the mode's keys are pinned in the tests that open the mode.
+        match keys::key(Focus::Chat, false, false, key) {
             Intent::Chat(intent) => {
                 // The pane the key is about is the one the chat is showing.
                 chat.apply(AgentId::ROOT, intent);
@@ -1998,6 +2841,19 @@ mod tests {
     /// every size test here reads.
     fn pane_rows(chat: &Chat, pane: &Pane<'_>, width: usize, height: usize) -> Vec<Line<'static>> {
         chat.painted(pane, width, height).lines
+    }
+
+    /// One message's rows, as `render_message` paints them: the map beside them
+    /// is the select mode's own, and these tests read the words.
+    fn message_rows(
+        message: &Message,
+        voice: Option<Voice>,
+        width: usize,
+        reasoning: bool,
+    ) -> Vec<Line<'static>> {
+        let mut lines = Vec::new();
+        render_message(&mut lines, message, voice, width, reasoning);
+        lines
     }
 
     /// A 40×10 terminal leaves the transcript pane one row tall, and every
@@ -2163,6 +3019,302 @@ mod tests {
         );
     }
 
+    /// What `Enter` copies is the message's own text, byte for byte: a pane's
+    /// soft wrap of a paragraph is a fact about the screen, and a paragraph's
+    /// own newlines are facts about the text. The pane must wrap more rows than
+    /// the text has lines for this to say anything, so the painted rows are
+    /// read beside the copy.
+    #[test]
+    fn a_reply_is_copied_as_the_message_wrote_it() {
+        let reply = "the first paragraph, long enough that a narrow pane wraps it more than once\n\nand a second paragraph\n\nand a third";
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::assistant(reply));
+        assert!(chat.start_select(AgentId::ROOT).is_none(), "the mode is on");
+        chat.select_apply(AgentId::ROOT, SelectKey::First);
+        chat.select_apply(AgentId::ROOT, SelectKey::Extend(keys::PAGE));
+        let copied = chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        assert_eq!(copied.text, reply, "the message's own bytes");
+        assert_eq!(
+            copied.line,
+            format!(
+                "copied {} lines from #0's reply — {} bytes",
+                reply.split('\n').count(),
+                reply.len()
+            )
+        );
+        assert!(!chat.selecting(), "Enter leaves the mode");
+
+        let pane = pane(AgentId::ROOT);
+        let painted = chat.painted(&pane, 20, 12);
+        assert!(
+            painted.lines.len() > reply.split('\n').count(),
+            "the pane wrapped the paragraphs: {}",
+            shown(&painted.lines).join(" / ")
+        );
+    }
+
+    /// A tool result is copied whole, byte for byte, including the lines the
+    /// pane's cap hides: the cap bounds the frame, not the transcript — and a
+    /// soft wrap would have eaten the tab or the indent.
+    #[test]
+    fn a_tool_result_is_copied_byte_exact() {
+        let result = (0..20)
+            .map(|n| format!("line {n}: a\tb"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::tool("call_1", &result));
+        chat.start_select(AgentId::ROOT);
+        // The cursor starts on the newest line, so a shift-page back past the
+        // oldest one is a selection of the whole result — the 11 lines a page
+        // covers are not the transcript, and the copy is not the pane.
+        chat.select_apply(AgentId::ROOT, SelectKey::Extend(-2 * keys::PAGE));
+        let copied = chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        assert_eq!(copied.text, result, "the whole result, cap and all");
+        assert_eq!(
+            copied.line,
+            format!(
+                "copied 20 lines from #0's tool result — {} bytes",
+                result.len()
+            )
+        );
+    }
+
+    /// The human's own message is the text they typed, newlines and all.
+    #[test]
+    fn the_humans_own_message_is_copied_as_it_was_typed() {
+        let mut chat = Chat::bare();
+        say(&mut chat, AgentId::ROOT, "one\ntwo");
+        chat.start_select(AgentId::ROOT);
+        chat.select_apply(AgentId::ROOT, SelectKey::First);
+        chat.select_apply(AgentId::ROOT, SelectKey::Extend(keys::PAGE));
+        let copied = chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        assert_eq!(copied.text, "one\ntwo");
+        assert_eq!(copied.line, "copied 2 lines from your message — 7 bytes");
+    }
+
+    /// A message whose bytes are gone carries its placeholder, and that is what
+    /// the copy is: a selection over the transcript is the transcript's text,
+    /// not the picture that once was there.
+    #[test]
+    fn a_message_that_dropped_its_images_carries_its_placeholder() {
+        let mut message = Message::user_with_images("look at this", vec![image("shot.png")]);
+        message.drop_images();
+        let text = message.text().to_string();
+        assert!(text.contains("[image: shot.png (png)"), "{text}");
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, message);
+        chat.start_select(AgentId::ROOT);
+        chat.select_apply(AgentId::ROOT, SelectKey::First);
+        chat.select_apply(AgentId::ROOT, SelectKey::Extend(keys::PAGE));
+        let copied = chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        assert_eq!(copied.text, text);
+    }
+
+    /// A selection that crosses a message boundary joins the messages at the
+    /// lines the selection starts and ends on, and says how many messages it
+    /// came from.
+    #[test]
+    fn a_selection_spanning_two_messages_joins_them_at_their_own_lines() {
+        let mut chat = Chat::bare();
+        say(&mut chat, AgentId::ROOT, "one\ntwo");
+        chat.push_message(AgentId::ROOT, Message::assistant("three\nfour"));
+        chat.start_select(AgentId::ROOT);
+        chat.select_apply(AgentId::ROOT, SelectKey::First);
+        chat.select_apply(AgentId::ROOT, SelectKey::Extend(keys::PAGE));
+        let copied = chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        assert_eq!(copied.text, "one\ntwo\nthree\nfour");
+        assert_eq!(copied.line, "copied 4 lines from 2 messages — 18 bytes");
+    }
+
+    /// A count a human reads rather than counts: the bar says `1,284`, not
+    /// `1284`.
+    #[test]
+    fn the_copied_line_marks_the_thousands_of_a_big_number() {
+        let text = "x".repeat(1234);
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::user(&text));
+        chat.start_select(AgentId::ROOT);
+        let copied = chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        assert_eq!(
+            copied.line,
+            format!(
+                "copied 1 line from your message — {text_len} bytes",
+                text_len = "1,234"
+            )
+        );
+    }
+
+    /// The oldest and newest lines are ends of the transcript, not walls: a key
+    /// held down past either one stays where it is, and the copy still works.
+    #[test]
+    fn moving_the_cursor_past_either_end_does_not_panic() {
+        let mut chat = Chat::bare();
+        say(&mut chat, AgentId::ROOT, "the only line");
+        chat.start_select(AgentId::ROOT);
+        for step in [1, 100, -100, -1, 0] {
+            chat.select_apply(AgentId::ROOT, SelectKey::Move(step));
+            chat.select_apply(AgentId::ROOT, SelectKey::Extend(step));
+        }
+        let copied = chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        assert_eq!(copied.text, "the only line");
+
+        // And a pane with nothing said yet is not a mode with nowhere to be.
+        let mut empty = Chat::bare();
+        assert!(empty.start_select(AgentId::ROOT).is_some(), "it says so");
+        assert!(!empty.selecting(), "and does not enter");
+    }
+
+    /// `Esc` leaves the mode without copying and without touching the box: the
+    /// keys are the mode's, so the pane's own clear is not one of them.
+    #[test]
+    fn esc_leaves_the_mode_without_copying_and_the_box_alone() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::assistant("something"));
+        chat.insert("a draft");
+        chat.start_select(AgentId::ROOT);
+        assert!(
+            chat.select_apply(AgentId::ROOT, SelectKey::Cancel)
+                .is_none(),
+            "Esc copies nothing"
+        );
+        assert!(!chat.selecting());
+        assert_eq!(chat.input().text(), "a draft");
+    }
+
+    /// The cursor and the selection are painted on the transcript's own lines,
+    /// whatever the window is showing: a line the pane wraps is one line of the
+    /// cursor.
+    #[test]
+    fn the_cursor_and_the_selection_are_painted_on_their_own_lines() {
+        let mut chat = Chat::bare();
+        say(&mut chat, AgentId::ROOT, "one\ntwo");
+        chat.push_message(AgentId::ROOT, Message::assistant("three\nfour"));
+        chat.start_select(AgentId::ROOT);
+        let pane = pane(AgentId::ROOT);
+        let painted = chat.painted(&pane, 20, 6);
+        let select = painted.select.as_ref().expect("the mode paints");
+        assert!(
+            select.selected.is_empty(),
+            "a bare cursor is not a selection yet"
+        );
+        let rows = shown(&painted.lines);
+        assert!(
+            select.cursor.iter().any(|at| rows[*at].contains("four")),
+            "the cursor stands on the newest line: {:?} {rows:?}",
+            select.cursor
+        );
+        chat.select_apply(AgentId::ROOT, SelectKey::First);
+        let painted = chat.painted(&pane, 20, 6);
+        let select = painted.select.as_ref().expect("the mode paints");
+        let rows = shown(&painted.lines);
+        assert!(
+            select.cursor.iter().any(|at| rows[*at].contains("one")),
+            "the cursor followed the jump to the oldest line: {:?} {rows:?}",
+            select.cursor
+        );
+
+        chat.select_apply(AgentId::ROOT, SelectKey::Extend(keys::PAGE));
+        let painted = chat.painted(&pane, 20, 6);
+        let select = painted.select.as_ref().expect("the mode paints");
+        let covered: Vec<String> = select
+            .selected
+            .iter()
+            .map(|at| shown(&painted.lines[*at..=*at])[0].clone())
+            .collect();
+        for word in ["one", "two", "three", "four"] {
+            assert!(
+                covered.iter().any(|row| row.contains(word)),
+                "{word} is selected: {covered:?}"
+            );
+        }
+        let rows = shown(&painted.lines);
+        assert!(
+            select.cursor.iter().any(|at| rows[*at].contains("four")),
+            "the extended cursor is the selection's new end: {:?} {rows:?}",
+            select.cursor
+        );
+    }
+
+    /// A pane smaller than the transcript shows the line the cursor is on, not
+    /// the bottom: the mode's window follows the cursor, which is the whole
+    /// point of a cursor.
+    #[test]
+    fn the_panes_window_follows_the_cursor_and_not_the_bottom() {
+        let mut chat = Chat::bare();
+        for n in 0..8 {
+            chat.push_message(AgentId::ROOT, Message::assistant(format!("reply {n}")));
+        }
+        chat.start_select(AgentId::ROOT);
+        let pane = pane(AgentId::ROOT);
+        let painted = chat.painted(&pane, 40, 5);
+        let cursor = painted.select.as_ref().expect("painted").cursor[0];
+        assert!(
+            shown(&painted.lines[cursor..=cursor])[0].contains("reply 7"),
+            "the newest line to start with"
+        );
+        chat.select_apply(AgentId::ROOT, SelectKey::First);
+        let painted = chat.painted(&pane, 40, 5);
+        let cursor = painted.select.as_ref().expect("painted").cursor[0];
+        assert!(
+            shown(&painted.lines[cursor..=cursor])[0].contains("reply 0"),
+            "and the oldest after Home"
+        );
+    }
+
+    /// A line behind a tool result's cap still has a row to stand on — the `…`
+    /// that hides it — and the copy takes the line whole: the cap is the pane's,
+    /// not the transcript's.
+    #[test]
+    fn a_line_behind_a_tool_results_cap_stands_on_the_ellipsis() {
+        let result = (0..12)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::tool("call_1", &result));
+        chat.start_select(AgentId::ROOT);
+        chat.select_apply(AgentId::ROOT, SelectKey::First);
+        chat.select_apply(AgentId::ROOT, SelectKey::Move(11));
+        let pane = pane(AgentId::ROOT);
+        let painted = chat.painted(&pane, 40, 8);
+        let cursor = painted.select.as_ref().expect("painted").cursor.clone();
+        assert_eq!(cursor.len(), 1, "the hidden line has one row to stand on");
+        assert!(
+            shown(&painted.lines[cursor[0]..=cursor[0]])[0].contains('…'),
+            "and it is the ellipsis"
+        );
+        let copied = chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        assert_eq!(copied.text, "line 11");
+    }
+
+    /// Ctrl-N leaves the mode behind: a cursor over a transcript that is gone is
+    /// not a cursor.
+    #[test]
+    fn a_new_chat_leaves_the_select_mode_behind() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::assistant("hi"));
+        chat.start_select(AgentId::ROOT);
+        chat.clear();
+        assert!(!chat.selecting());
+    }
+
     /// A transcript belongs to one agent: what a child was told is in the
     /// child's pane, and the root's conversation is not shown to it.
     #[test]
@@ -2221,8 +3373,7 @@ mod tests {
         let text = words.join(" ");
         for width in [30usize, 40, 60, 80, 120] {
             for message in [Message::user(&text), Message::assistant(&text)] {
-                let mut rows = Vec::new();
-                render_message(&mut rows, &message, Some(Voice::Human), width, true);
+                let rows = message_rows(&message, Some(Voice::Human), width, true);
                 let painted = shown(&rows);
                 for row in &painted {
                     assert!(
@@ -2357,14 +3508,7 @@ mod tests {
     /// and nothing else, and a message the human cannot read.
     #[test]
     fn a_pane_narrower_than_the_voice_still_shows_the_words() {
-        let mut rows = Vec::new();
-        render_message(
-            &mut rows,
-            &Message::user("aaaa bbbb"),
-            Some(Voice::Human),
-            5,
-            true,
-        );
+        let rows = message_rows(&Message::user("aaaa bbbb"), Some(Voice::Human), 5, true);
         assert_eq!(
             shown(&rows),
             vec!["aaaa".to_string(), "bbbb".to_string(), String::new()]

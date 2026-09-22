@@ -13,11 +13,12 @@
 //! binding could only be observed through a live `App`, which is how a key
 //! edited the wrong thing while its own test kept passing (finding B2).
 //!
-//! The sketch in `docs/refactor.md` §3.5 puts a `mode` beside the pane. There
-//! is none to pass: the only modal state the keyboard has is the picker, which
-//! the caller holds as a bool, and the editor pane that had insert and normal
-//! modes was dropped from the tree in Stage 0 — a `mode` argument here would be
-//! a value no state can produce.
+//! The sketch in `docs/refactor.md` §3.5 puts a `mode` beside the pane. There is
+//! no enum to pass: the keyboard's two modal states are the picker and the
+//! select mode ([`super::chat::SelectKey`]), each of which the caller holds as a
+//! bool it already has — and the editor pane that had insert and normal modes
+//! was dropped from the tree in Stage 0, so a `mode` argument here would be a
+//! value no state could produce.
 //!
 //! The whole table lives in [`KEYS`] — one row per binding — and both help
 //! surfaces render it through [`help_table`]: `mush --help`'s KEYS block and
@@ -36,12 +37,13 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
 use mush_core::text::wrap_text;
 
+use super::chat::SelectKey;
 use super::Focus;
 
 /// How many rows a page key moves, in the chat's scrollback, in a picker's
-/// list and in the agent tree. One number, so "a page" is the same distance
-/// wherever a human pages.
-const PAGE: i64 = 10;
+/// list, in the agent tree and in the select mode. One number, so "a page" is
+/// the same distance wherever a human pages.
+pub(crate) const PAGE: i64 = 10;
 
 /// The context a binding belongs to, so the help can group the rows the way a
 /// human reads them: what works anywhere, then the modal list, then each pane.
@@ -51,6 +53,8 @@ pub enum Context {
     Anywhere,
     /// Only while a picker holds the keyboard.
     Picker,
+    /// Only while the select mode holds it (`Ctrl-Y`).
+    Select,
     Agents,
     Chat,
 }
@@ -61,6 +65,7 @@ impl Context {
         match self {
             Context::Anywhere => "anywhere",
             Context::Picker => "in a picker",
+            Context::Select => "selecting (Ctrl-Y)",
             Context::Agents => "agents pane",
             Context::Chat => "chat pane",
         }
@@ -120,6 +125,19 @@ pub const KEYS: &[Binding] = &[
     },
     Binding {
         context: Context::Anywhere,
+        keys: "Ctrl-F",
+        help: "the focused pane takes the whole screen, and back",
+    },
+    Binding {
+        context: Context::Anywhere,
+        keys: "Ctrl-Y",
+        // The whole mode in one row: the keys it takes are the pane's own
+        // scroll keys, so the row says what they do *there* and the `select`
+        // rows below list them one by one.
+        help: "select the transcript: Enter copies, Esc leaves",
+    },
+    Binding {
+        context: Context::Anywhere,
         keys: "Tab / Shift-Tab",
         help: "cycle panes (agents, chat)",
     },
@@ -147,6 +165,36 @@ pub const KEYS: &[Binding] = &[
         context: Context::Picker,
         keys: "PgUp / PgDn",
         help: "page the list",
+    },
+    Binding {
+        context: Context::Select,
+        keys: "↑ / ↓",
+        help: "the cursor one line older / newer",
+    },
+    Binding {
+        context: Context::Select,
+        keys: "Shift-↑ / Shift-↓",
+        help: "the same move, keeping the selection",
+    },
+    Binding {
+        context: Context::Select,
+        keys: "PgUp / PgDn",
+        help: "ten lines at a time (with Shift, keeping the selection)",
+    },
+    Binding {
+        context: Context::Select,
+        keys: "Home / End",
+        help: "the oldest / newest line",
+    },
+    Binding {
+        context: Context::Select,
+        keys: "Enter",
+        help: "copy the selection, or the cursor's own line",
+    },
+    Binding {
+        context: Context::Select,
+        keys: "Esc",
+        help: "leave without copying",
     },
     Binding {
         context: Context::Agents,
@@ -344,6 +392,15 @@ pub enum Intent {
     /// A view: the reasoning is already stored with the turn, so this changes
     /// what the pane paints and nothing else.
     ToggleReasoning,
+    /// Show or hide the zen view: the focused pane takes the whole screen
+    /// (`Ctrl-F`). A view in the same sense as `Ctrl-T`'s: it changes what the
+    /// frame paints and nothing else.
+    ToggleZen,
+    /// The select mode's keys (`Ctrl-Y` opens it — see [`SelectKey`]): a cursor
+    /// over the focused transcript's own source lines, and the copy out of it.
+    /// The mode's state is the chat's, so this carries the key the pane would
+    /// have been handed and the caller routes it there.
+    Select(SelectKey),
     /// Cycle the pane focus: `+1` for `Tab`, `-1` for `Shift-Tab`.
     CycleFocus(i64),
     PickerClose,
@@ -383,8 +440,13 @@ pub enum Intent {
 /// The order of the checks is the precedence, and it is the old `on_key`'s: the
 /// app-wide `Ctrl` keys and the pane cycle first (so they work with a picker up
 /// and while either pane is focused), then the picker, which takes the keyboard
-/// from both panes while it is open.
-pub fn key(focus: Focus, picker_open: bool, key: KeyEvent) -> Intent {
+/// from both panes while it is open, then the select mode, which does the same,
+/// then the focused pane.
+///
+/// The three modal facts are bools the caller already holds, and one of them is
+/// [`super::Chat::selecting`]'s: a mode whose keyboard this is, is a mode the
+/// keymap asks about rather than a second table somewhere below.
+pub fn key(focus: Focus, picker_open: bool, selecting: bool, key: KeyEvent) -> Intent {
     // A terminal reports the release half of a press too (kitty and friends).
     // Only the press is a key.
     if key.kind == KeyEventKind::Release {
@@ -400,6 +462,13 @@ pub fn key(focus: Focus, picker_open: bool, key: KeyEvent) -> Intent {
             KeyCode::Char('n') => return Intent::NewChat,
             KeyCode::Char('p') => return Intent::OpenModelPicker,
             KeyCode::Char('t') => return Intent::ToggleReasoning,
+            KeyCode::Char('f') => return Intent::ToggleZen,
+            // The mode's opener is app-wide because the mode it opens is about
+            // the *conversation*, which is the chat pane's whichever pane has
+            // the keyboard: `Ctrl-T` and `Ctrl-F` sit here for the same reason.
+            // What it starts is the chat's own state, and the pane it is shown
+            // in is the one the tree has focused.
+            KeyCode::Char('y') => return Intent::Select(SelectKey::Start),
             _ => {}
         }
     }
@@ -413,9 +482,50 @@ pub fn key(focus: Focus, picker_open: bool, key: KeyEvent) -> Intent {
     if picker_open {
         return picker(key);
     }
+    if selecting {
+        return select(key);
+    }
     match focus {
         Focus::Agents => tree(key),
         Focus::Chat => chat(key),
+    }
+}
+
+/// The select mode's keys: the cursor, the selection, and the two ways out.
+///
+/// The mode is modal the way a picker is, so this is the *whole* keyboard while
+/// it is on: a letter is not typing and reaches neither the box behind it nor
+/// the tree — which is what makes it safe to open with a draft in the box. The
+/// app-wide block above still works (`Ctrl-Q`, `Ctrl-C`, and `Ctrl-Y`, whose
+/// `Start` is a no-op while the mode is already on), exactly as it does over a
+/// picker.
+///
+/// Shift is the one modifier that means something here, and it means one thing
+/// on every movement key: hold it and the line the cursor was on stays selected
+/// while the cursor moves away ([`SelectKey::Extend`]); let go and the cursor
+/// moves alone, with the selection following its end when it has one
+/// ([`SelectKey::Move`]). `Home`/`End` need no second spelling for that: they
+/// move the cursor like any other key, so a selection already started reaches to
+/// whichever end the human jumped to.
+fn select(key: KeyEvent) -> Intent {
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    let moved = |step: i64| {
+        Intent::Select(if shift {
+            SelectKey::Extend(step)
+        } else {
+            SelectKey::Move(step)
+        })
+    };
+    match key.code {
+        KeyCode::Up => moved(-1),
+        KeyCode::Down => moved(1),
+        KeyCode::PageUp => moved(-PAGE),
+        KeyCode::PageDown => moved(PAGE),
+        KeyCode::Home => Intent::Select(SelectKey::First),
+        KeyCode::End => Intent::Select(SelectKey::Last),
+        KeyCode::Enter => Intent::Select(SelectKey::Copy),
+        KeyCode::Esc => Intent::Select(SelectKey::Cancel),
+        _ => Intent::Ignore,
     }
 }
 
@@ -521,7 +631,14 @@ mod tests {
     }
 
     fn at(focus: Focus, picker_open: bool, pressed: KeyEvent) -> Intent {
-        key(focus, picker_open, pressed)
+        key(focus, picker_open, false, pressed)
+    }
+
+    /// A key pressed while the select mode holds the keyboard: the cursor is
+    /// over the chat's transcript whichever pane has the focus, so the mode's
+    /// keys are asked of both.
+    fn selecting(focus: Focus, pressed: KeyEvent) -> Intent {
+        key(focus, false, true, pressed)
     }
 
     /// Every pane-wide binding, from each of the three contexts it can be
@@ -538,6 +655,8 @@ mod tests {
                     (ctrl('n'), Intent::NewChat),
                     (ctrl('p'), Intent::OpenModelPicker),
                     (ctrl('t'), Intent::ToggleReasoning),
+                    (ctrl('f'), Intent::ToggleZen),
+                    (ctrl('y'), Intent::Select(SelectKey::Start)),
                     (none(KeyCode::Tab), Intent::CycleFocus(1)),
                     (none(KeyCode::BackTab), Intent::CycleFocus(-1)),
                     // Shift-Tab is also reported as BackTab with SHIFT held.
@@ -642,6 +761,92 @@ mod tests {
         }
     }
 
+    /// `Ctrl-Y` is decided above the mode it opens, so the key means one thing
+    /// whether the mode is off (open it) or on (the app's own no-op): a second
+    /// press must not move the cursor the human is standing on, and a key that
+    /// meant two things would have to be read twice (`key`'s invariant).
+    #[test]
+    fn ctrl_y_is_the_same_key_while_the_mode_is_on() {
+        for focus in [Focus::Agents, Focus::Chat] {
+            assert_eq!(
+                selecting(focus, ctrl('y')),
+                Intent::Select(SelectKey::Start),
+                "{focus:?}"
+            );
+        }
+    }
+
+    /// The select mode owns the keyboard once `Ctrl-Y` has opened it: the
+    /// cursor's keys from either pane, `Shift` meaning "keep the selection" on
+    /// every movement key, and no key at all into the box behind it — a letter
+    /// is not typing, and `Esc` is not the box's clear. The mode is asked of
+    /// both focuses because it is the *chat's* mode: which pane has the focus
+    /// cannot change what a key means while the cursor is up.
+    #[test]
+    fn the_select_mode_takes_the_keyboard_from_both_panes_and_not_the_box() {
+        let shift = |code: KeyCode| KeyEvent::new(code, KeyModifiers::SHIFT);
+        let cases = [
+            (none(KeyCode::Up), Intent::Select(SelectKey::Move(-1))),
+            (none(KeyCode::Down), Intent::Select(SelectKey::Move(1))),
+            (shift(KeyCode::Up), Intent::Select(SelectKey::Extend(-1))),
+            (shift(KeyCode::Down), Intent::Select(SelectKey::Extend(1))),
+            (
+                none(KeyCode::PageUp),
+                Intent::Select(SelectKey::Move(-PAGE)),
+            ),
+            (
+                none(KeyCode::PageDown),
+                Intent::Select(SelectKey::Move(PAGE)),
+            ),
+            (
+                shift(KeyCode::PageUp),
+                Intent::Select(SelectKey::Extend(-PAGE)),
+            ),
+            (
+                shift(KeyCode::PageDown),
+                Intent::Select(SelectKey::Extend(PAGE)),
+            ),
+            (none(KeyCode::Home), Intent::Select(SelectKey::First)),
+            (none(KeyCode::End), Intent::Select(SelectKey::Last)),
+            (none(KeyCode::Enter), Intent::Select(SelectKey::Copy)),
+            (none(KeyCode::Esc), Intent::Select(SelectKey::Cancel)),
+        ];
+        for focus in [Focus::Agents, Focus::Chat] {
+            for (key, want) in cases {
+                assert_eq!(selecting(focus, key), want, "{key:?} in {focus:?}");
+            }
+            // A letter, a punctuation char, the box's own editing keys and the
+            // chat's own `Ctrl-` keys: while the mode is on, none of them is a
+            // way into the draft behind it. This is what makes `Ctrl-Y` safe to
+            // press with words in the box.
+            for key in [
+                none(KeyCode::Char('j')),
+                none(KeyCode::Char('/')),
+                none(KeyCode::Char(' ')),
+                none(KeyCode::Backspace),
+                none(KeyCode::Delete),
+                none(KeyCode::Left),
+                none(KeyCode::Right),
+                ctrl('v'),
+                ctrl('u'),
+                ctrl('z'),
+            ] {
+                assert_eq!(
+                    selecting(focus, key),
+                    Intent::Ignore,
+                    "{key:?} in {focus:?} reached the box"
+                );
+            }
+        }
+        // `Home` is the key that would have moved the box's cursor: in the mode
+        // it is the transcript's oldest line, and that is asserted above against
+        // `SelectKey::First` rather than against the box's own key.
+        assert_ne!(
+            selecting(Focus::Chat, none(KeyCode::Home)),
+            Intent::Chat(ChatKey::Home)
+        );
+    }
+
     /// `<Enter>` is the one key three panes share: send in the chat, focus a
     /// row in the tree, take a row in a picker.
     #[test]
@@ -727,7 +932,6 @@ mod tests {
                     none(KeyCode::Null),
                     none(KeyCode::CapsLock),
                     ctrl('a'),
-                    ctrl('y'),
                     // Alt-char is not typing: it is a shortcut mush does not
                     // have, in either pane.
                     KeyEvent::new(KeyCode::Char('x'), KeyModifiers::ALT),
@@ -841,6 +1045,7 @@ mod tests {
         for context in [
             Context::Anywhere,
             Context::Picker,
+            Context::Select,
             Context::Agents,
             Context::Chat,
         ] {

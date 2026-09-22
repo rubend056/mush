@@ -19,7 +19,14 @@ mod screen;
 mod settings;
 mod tree;
 
-pub use chat::{Chat, Pane, Rank};
+pub use chat::{Chat, Pane, Rank, SelectRows};
+// The select mode's rows are painted by their positions, and the ui's frame test
+// builds a `Painted` by hand to check they land on the cells: the re-export is
+// for it, because a frame never names the type itself — `ChatPane::transcript`
+// already holds one — and a plain `pub use` of it is an unused import in every
+// non-test build.
+#[cfg(test)]
+pub use chat::Painted;
 pub use screen::{AgentRow, AgentsPane, BarPane, ChatPane, PickerPane, Screen};
 pub use settings::{ConfigCell, ConfigHandle, WindowSource};
 pub use tree::{AgentNode, AgentTree, Compacting, ConversationId, Existing, Landed, Phase, Spawn};
@@ -49,6 +56,7 @@ use crate::clipboard;
 use crate::http;
 use crate::session_save::SessionSave;
 
+use chat::{Copied, SelectKey};
 use commands::{Command, CommandError};
 use keys::Intent;
 
@@ -102,6 +110,17 @@ pub enum Msg {
     Clipboard {
         conversation: ConversationId,
         result: Result<Option<Image>, String>,
+    },
+    /// What a clipboard write found, off the UI thread (`Enter` in the select
+    /// mode). The write is subprocesses with a deadline too, so it is on a
+    /// thread for the same reason the read is, and `conversation` stamps it the
+    /// same way: a copy that outlives a Ctrl-N reports nothing into the new
+    /// chat. `line` is the line the copy built — `copied 12 lines from #1's
+    /// reply — 1,284 bytes` — said only if the clipboard took the text.
+    Copied {
+        conversation: ConversationId,
+        line: String,
+        result: Result<(), String>,
     },
 }
 
@@ -534,12 +553,30 @@ pub struct Status {
     pub set_at: Instant,
 }
 
+/// The write road as a value: the function [`App::write_clipboard`] hands the
+/// select mode's text to. A type of its own because the one field it describes
+/// is the whole seam, and the trait bounds are its contract, not an accident of
+/// where it is written.
+type ClipboardWrite = Arc<dyn Fn(&str) -> Result<(), String> + Send + Sync>;
+
 pub struct App {
     pub ws: Workspace,
     /// The endpoint, the model, the key and the context window: the copy the
     /// screen reads and the cell every actor reads, in one owner.
     pub cell: ConfigCell,
     pub focus: Focus,
+    /// Whether the zen view is on: the focused pane takes the whole screen
+    /// (`Ctrl-F`).
+    ///
+    /// A view, so it changes what a frame paints and nothing else: no notice is
+    /// said, no session is written, no message goes out. The mouse is never
+    /// captured on purpose (finding K3), so the terminal owns selection and a
+    /// drag takes a rectangle of screen cells — at 80 columns that rectangle
+    /// starts in the agents pane, which is how a paragraph copied from the
+    /// conversation arrives with the tree's lines in front of it. `Ctrl-N`
+    /// leaves it as the human set it: the view is the human's, not the
+    /// conversation's.
+    pub zen: bool,
     /// The conversation: the transcripts the screen shows, the notices, the
     /// message box and the context meter, in one value.
     pub chat: Chat,
@@ -547,6 +584,20 @@ pub struct App {
     pub picker: Option<Picker>,
     /// The main worktree's branch, dirty count, and uncommitted line delta.
     pub git: Option<git::RepoStatus>,
+    /// The write road as a value the app holds: what the select mode's `Enter`
+    /// hands the text to, and the one place that road can be stood in for.
+    ///
+    /// The default is [`clipboard::write_text`] — the real `wl-copy`/`xclip`/
+    /// `pbcopy` sequence. The seam exists because `Enter` is a *key*, and a key
+    /// mush can press must be a key a test can press: without it, a test that
+    /// copied would either clobber the human's real clipboard (the key is the
+    /// one the whole mode exists for, and a test run has no business writing
+    /// to the clipboard the human is using) or depend on which of the three
+    /// programs the machine happens to have on `PATH`. The read road needs no
+    /// such seam: its answer is a message a test hands in directly
+    /// (`Msg::Clipboard`), and pressing `Ctrl-V` where the machine has no
+    /// reader costs a status line and nothing else.
+    write_clipboard: ClipboardWrite,
     /// The agents, their phases, the focus and the per-agent mailboxes,
     /// cancel flags and git stats.
     pub tree: AgentTree,
@@ -625,6 +676,7 @@ impl App {
             ws,
             cell,
             focus: Focus::Chat,
+            zen: false,
             chat: Chat::new(system, messages),
             // Empty until a fetch says otherwise: the model list is discovered
             // on its own thread so nothing about an endpoint delays the first
@@ -633,6 +685,7 @@ impl App {
             models: Vec::new(),
             picker: None,
             git: None,
+            write_clipboard: Arc::new(clipboard::write_text),
             tree: AgentTree::rooted(root),
             session_save,
             session_dirty_at: None,
@@ -1338,6 +1391,22 @@ impl App {
                 }
             }
             Msg::Key(key) => self.on_key(key),
+            // The write road's answer, and the mode's line said only when the
+            // clipboard actually took the text: the count of lines and bytes is
+            // the copy's fact, and a line that read `copied 12 lines` over a
+            // write that failed would be the one lie the bar must not tell.
+            Msg::Copied {
+                conversation,
+                line,
+                result,
+            } => {
+                if conversation == self.tree.conversation() {
+                    match result {
+                        Ok(()) => self.say(line),
+                        Err(why) => self.fail(why),
+                    }
+                }
+            }
             Msg::Agent {
                 conversation,
                 id,
@@ -3062,6 +3131,26 @@ impl App {
         self.dirty_screen = true;
     }
 
+    /// `Ctrl-F`: the focused pane takes the whole screen, and back.
+    ///
+    /// Why the view exists: mush deliberately never captures the mouse (finding
+    /// K3), so selection belongs to the terminal and a drag takes a rectangle
+    /// of screen cells — at 80 columns and up, the left column is the agents
+    /// pane, and a drag across the conversation comes back with the tree's rows
+    /// in front of the paragraph. The cheapest honest answer is a view where
+    /// one pane covers the screen, so a rectangle can hold one pane's text and
+    /// nothing else.
+    ///
+    /// A view like [`Self::toggle_reasoning`], so it is not said and not
+    /// stored: `dirty_screen` is the whole record, and `Ctrl-N` keeps the
+    /// choice — the view is the human's and not the conversation's.
+    /// [`Self::screen`] lays the panes out from this and `self.focus`,
+    /// so `Tab` is what switches which pane is full-screen.
+    fn toggle_zen(&mut self) {
+        self.zen = !self.zen;
+        self.dirty_screen = true;
+    }
+
     /// Forget the finished children the history window is done with, and park
     /// the actor threads of the ones it keeps — the two halves of §8.21's
     /// "everything needs a cap, even a high one", run from `tick` because both
@@ -3296,7 +3385,12 @@ impl App {
     /// binding is testable without an `App` — which the old shape, where an arm
     /// both matched a key and did its work, made impossible (finding B2).
     fn on_key(&mut self, key: KeyEvent) {
-        let intent = keys::key(self.focus, self.picker.is_some(), key);
+        let intent = keys::key(
+            self.focus,
+            self.picker.is_some(),
+            self.chat.selecting(),
+            key,
+        );
         // Below the floor the screen is a single notice: a key whose effect the
         // human cannot see — `Ctrl-N` wipes the conversation and starts a new
         // one — must not act. `Ctrl-Q` is the exception: a terminal too small
@@ -3329,7 +3423,16 @@ impl App {
             Intent::InterruptAll => self.interrupt_all(),
             Intent::OpenModelPicker => self.open_model_picker(),
             Intent::ToggleReasoning => self.toggle_reasoning(),
-            Intent::CycleFocus(direction) => self.cycle_focus(direction),
+            Intent::ToggleZen => self.toggle_zen(),
+            // `Tab` leaves the select mode behind: the mode is what the keyboard
+            // was doing, and the key the human pressed is the one that says they
+            // are done with the pane they were reading (the mode's own `Esc` is
+            // the other way out, and it is the mode's).
+            Intent::CycleFocus(direction) => {
+                self.chat.cancel_select();
+                self.cycle_focus(direction);
+            }
+            Intent::Select(key) => self.select_key(key),
             Intent::PickerClose => self.picker = None,
             Intent::PickerPick => self.pick_cursor(),
             Intent::PickerMove(step) => self.move_picker(step),
@@ -3355,6 +3458,63 @@ impl App {
                 }
             }
         }
+    }
+
+    /// The select mode's keys, where the mode meets the app: `Ctrl-Y` opens it
+    /// on the pane the tree has focused, `Enter` hands the copied text to the
+    /// clipboard, and every other key is the chat's own.
+    ///
+    /// The mode belongs to the conversation the chat pane shows, so the agent
+    /// here is [`Tree::focused`] — the same agent every other chat key is about.
+    /// A pane with nothing to stand on says so in the bar rather than opening a
+    /// cursor over nothing.
+    fn select_key(&mut self, key: SelectKey) {
+        let on = self.tree.focused;
+        match key {
+            // Already on: the mode is the keyboard's, and "start" has nothing
+            // left to start. A second `Ctrl-Y` that restarted the cursor would
+            // silently throw away a selection the human was building.
+            SelectKey::Start => {
+                if !self.chat.selecting() {
+                    if let Some(line) = self.chat.start_select(on) {
+                        self.say(line);
+                    }
+                }
+            }
+            SelectKey::Copy => {
+                if let Some(copied) = self.chat.select_apply(on, SelectKey::Copy) {
+                    self.copy_text(copied);
+                }
+            }
+            key => {
+                self.chat.select_apply(on, key);
+            }
+        }
+    }
+
+    /// `Enter` in the select mode: put the copied text on the system clipboard.
+    ///
+    /// The write is subprocesses with a deadline ([`clipboard::write_text`]),
+    /// so it happens on a thread of its own and the answer comes back as a
+    /// message — the read road's rule (`Ctrl-V`), for the write road: a
+    /// clipboard owner that never answers costs the human a status line, never a
+    /// frame. The line mush says on success is the one built with the copy
+    /// (`Chat::copy`), because only there is the count of lines and bytes; the
+    /// write decides whether it is said at all.
+    fn copy_text(&mut self, copied: Copied) {
+        let tx = self.ui_tx.clone();
+        let conversation = self.tree.conversation();
+        // The road the app holds is what the thread runs, so a test's writer is
+        // the one `Enter` reaches — no program is spawned by it.
+        let write = Arc::clone(&self.write_clipboard);
+        std::thread::spawn(move || {
+            let result = write(&copied.text);
+            let _ = tx.send(Msg::Copied {
+                conversation,
+                line: copied.line,
+                result,
+            });
+        });
     }
 
     /// `Ctrl-V`: read the clipboard for an image and attach it to the box.
@@ -4249,6 +4409,7 @@ mod tests {
     use crate::attach;
     use crate::ids::JobId;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Mutex;
 
     use crossbeam_channel::Receiver;
     use ratatui::backend::TestBackend;
@@ -4299,6 +4460,13 @@ mod tests {
             KeyCode::Char(key),
             KeyModifiers::CONTROL,
         )));
+    }
+
+    /// A press of the pane cycle, through the key table and the arms: the key
+    /// that decides which pane is focused — and so, under zen, which pane is
+    /// full-screen.
+    fn tab(app: &mut App) {
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)));
     }
 
     /// A real `App` on a scratch directory, with a real (idle) root actor. The
@@ -5532,6 +5700,11 @@ mod tests {
                 panes.chat.transcript_area,
                 panes.chat.input_area,
             ] {
+                // A pane zen hid is a zero rect: it has no rows to keep
+                // intact, and no bottom border to find.
+                if rect.height == 0 {
+                    continue;
+                }
                 // The sides, from just under the top border to just above the
                 // bottom one: the top row carries the pane's title, which may
                 // reach either corner.
@@ -5677,6 +5850,32 @@ mod tests {
             })
             .collect();
         Shot { screen, cells }
+    }
+
+    /// The pane rects one frame derives, and whether the chat pane has a
+    /// transcript at all. The zen view's claims are claims about these — "the
+    /// focused pane took the width", "the box kept its rows" — so these tests
+    /// read the `Screen` the frame was derived from, not the text it painted.
+    #[derive(Debug, PartialEq)]
+    struct PaneRects {
+        agents: Rect,
+        transcript: Rect,
+        input: Rect,
+        bar: Rect,
+        transcript_painted: bool,
+    }
+
+    fn pane_rects(app: &mut App, width: u16, height: u16) -> PaneRects {
+        match painted(app, width, height).0 {
+            Screen::Panes(panes) => PaneRects {
+                agents: panes.agents.area,
+                transcript: panes.chat.transcript_area,
+                input: panes.chat.input_area,
+                bar: panes.bar.area,
+                transcript_painted: panes.chat.transcript.is_some(),
+            },
+            Screen::Floor { .. } => panic!("{width}×{height} is below the floor"),
+        }
     }
 
     /// One painted frame, cell by cell and borders included: a leak lands *on*
@@ -8274,6 +8473,136 @@ mod tests {
         );
     }
 
+    /// `Ctrl-Y` opens the select mode on the conversation the pane shows: a
+    /// pane with no words says so instead of opening a cursor over nothing, a
+    /// second `Ctrl-Y` does not move the cursor the human is standing on, a
+    /// letter while the mode is on is not typing, and `Tab` — the app-wide pane
+    /// cycle, which the mode does not own — leaves it behind and moves on.
+    #[test]
+    fn ctrl_y_opens_the_select_mode_and_a_letter_is_not_typing() {
+        let (mut app, _rx) = test_app("select-open");
+
+        ctrl(&mut app, 'y');
+        assert!(!app.chat.selecting(), "a pane with no words has no line");
+        assert!(
+            text_of(&app).contains("nothing to select"),
+            "the key says why: {}",
+            text_of(&app)
+        );
+
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("first\nsecond"));
+        ctrl(&mut app, 'y');
+        assert!(app.chat.selecting(), "the mode is on");
+
+        // The mode takes the keyboard: the `x` is the mode's to drop, and an
+        // empty box proves the drop — a `Chat(Insert('x'))` would have left it
+        // there. `↑` is not the transcript's scroll either: it is the cursor.
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)));
+        app.update(Msg::Key(KeyEvent::new(
+            KeyCode::Char('x'),
+            KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.chat.input().text(),
+            "",
+            "the letter never reached the box"
+        );
+        ctrl(&mut app, 'y');
+        assert!(app.chat.selecting(), "a second Ctrl-Y is a no-op");
+
+        tab(&mut app);
+        assert!(!app.chat.selecting(), "Tab leaves the mode");
+        assert_eq!(app.focus, Focus::Agents, "and cycles the pane it names");
+    }
+
+    /// `Enter` in the select mode is the copy: the app hands the text to the
+    /// writer it holds (never to a program the machine may not have, and never
+    /// to the human's real clipboard), queues the line the copy built for the
+    /// bar, and leaves the mode behind.
+    #[test]
+    fn enter_in_the_select_mode_hands_the_text_to_the_writer_and_says_what_copied() {
+        let (mut app, rx) = test_app("select-copy");
+        let written: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&written);
+        app.write_clipboard = Arc::new(move |text: &str| {
+            sink.lock().unwrap().push(text.to_string());
+            Ok(())
+        });
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("first\nsecond"));
+
+        ctrl(&mut app, 'y');
+        // Shift-↑ extends: the cursor is on `first` and `second` is selected
+        // with it, so the copy is both source lines.
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::SHIFT)));
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)));
+        assert!(!app.chat.selecting(), "Enter leaves the mode");
+
+        // The write is a thread, and its answer is the message: the line the
+        // bar will say, and *what* the writer was handed.
+        let answer = loop {
+            match rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("the write answered")
+            {
+                msg @ Msg::Copied { .. } => break msg,
+                // The idle root's own events are not this test's subject.
+                _ => continue,
+            }
+        };
+        let Msg::Copied {
+            conversation,
+            line,
+            result,
+        } = answer
+        else {
+            unreachable!("the loop stopped at a copy's answer");
+        };
+        assert_eq!(conversation, app.tree.conversation());
+        assert_eq!(line, "copied 2 lines from #0's reply — 12 bytes");
+        assert!(result.is_ok(), "the writer the test handed in took it");
+        assert_eq!(
+            written.lock().unwrap().as_slice(),
+            ["first\nsecond"],
+            "the source lines, joined with the transcript's own newline"
+        );
+
+        // The answer with the live conversation is the bar's line.
+        app.update(Msg::Copied {
+            conversation,
+            line,
+            result: Ok(()),
+        });
+        assert_eq!(text_of(&app), "copied 2 lines from #0's reply — 12 bytes");
+    }
+
+    /// The copy's answer carries the conversation that asked for it, so one
+    /// that outlived a `Ctrl-N` says nothing into the new chat — and a write
+    /// that failed is a failure, which does not fade.
+    #[test]
+    fn a_copy_answer_from_a_chat_that_is_gone_is_dropped() {
+        let (mut app, _rx) = test_app("select-stale");
+        let conversation = app.tree.conversation();
+        ctrl(&mut app, 'n');
+        let before = text_of(&app).to_string();
+        app.update(Msg::Copied {
+            conversation,
+            line: "copied 2 lines from #0's reply — 12 bytes".to_string(),
+            result: Ok(()),
+        });
+        assert_eq!(text_of(&app), before, "a stale copy is not news here");
+
+        app.update(Msg::Copied {
+            conversation: app.tree.conversation(),
+            line: "copied 2 lines from #0's reply — 12 bytes".to_string(),
+            result: Err("no clipboard writer on PATH".to_string()),
+        });
+        let (line, kind) = app.status_line().expect("the writer's failure");
+        assert_eq!(kind, StatusKind::Error);
+        assert!(line.contains("no clipboard writer"), "{line}");
+    }
+
     /// Backspace takes the thing immediately before the cursor, and at the very
     /// start of the box that is the newest attachment — the pictures are painted
     /// above the words. Esc clears both halves of the box.
@@ -10462,6 +10791,220 @@ mod tests {
         );
     }
 
+    /// Zen's whole promise, at the ubiquitous 80×24 and on a wide terminal:
+    /// the focused pane takes the columns the two panes shared — the rectangle
+    /// a terminal drag can take without a line of the other pane in it (finding
+    /// K3) — while the bar and the message box keep the rows they had, so the
+    /// view moves the panes' frame and not the conversation in it.
+    #[test]
+    fn zen_gives_the_focused_pane_the_two_panes_width_at_every_size() {
+        let (mut app, _rx) = test_app("zen-layout");
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("hello"));
+        for (width, height) in [(80u16, 24u16), (200, 40)] {
+            let at = format!("{width}×{height}");
+            let two = pane_rects(&mut app, width, height);
+            assert!(two.agents.width > 0, "{at}: the two-pane frame to measure");
+            assert!(
+                two.transcript.width < width,
+                "{at}: the chat shares the frame with the tree"
+            );
+
+            // Chat focused: the transcript and its box are the whole frame
+            // above the bar, and the agents pane is a zero rect — not a hidden
+            // pane, so nothing can paint in it.
+            ctrl(&mut app, 'f');
+            let zen = pane_rects(&mut app, width, height);
+            assert_eq!(
+                zen.agents,
+                Rect::new(0, 0, 0, 0),
+                "{at}: the agents pane is not painted"
+            );
+            assert_eq!(zen.transcript.x, 0, "{at}: the chat starts at the left");
+            assert_eq!(
+                zen.transcript.width, width,
+                "{at}: the chat has the two-pane width"
+            );
+            assert_eq!(zen.transcript.y, two.transcript.y, "{at}: and its rows");
+            assert_eq!(
+                zen.transcript.height + zen.input.height,
+                two.transcript.height + two.input.height,
+                "{at}: the internal split keeps its rows"
+            );
+            assert_eq!(
+                zen.transcript.bottom(),
+                zen.input.y,
+                "{at}: the transcript sits on its box"
+            );
+            assert_eq!(zen.input.y, two.input.y, "{at}: the box keeps its rows");
+            assert_eq!(
+                zen.input.height, two.input.height,
+                "{at}: the box keeps its rows"
+            );
+            assert_eq!(zen.bar, two.bar, "{at}: and so does the bar");
+            assert!(zen.transcript_painted, "{at}: the transcript still paints");
+            shot(&mut app, width, height).assert_shape("zen chat", width, height);
+            ctrl(&mut app, 'f');
+
+            // Agents focused: the tree is the whole width above the box, and
+            // the chat is reduced to its message box below it.
+            tab(&mut app);
+            assert_eq!(app.focus, Focus::Agents, "{at}: Tab moves the keyboard");
+            ctrl(&mut app, 'f');
+            let tree = pane_rects(&mut app, width, height);
+            assert_eq!(tree.agents.x, 0, "{at}: the tree starts at the left");
+            assert_eq!(
+                tree.agents.width, width,
+                "{at}: the tree has the two-pane width"
+            );
+            assert_eq!(
+                tree.agents.height + tree.input.height,
+                two.agents.height,
+                "{at}: the tree and the box take the rows the tree had"
+            );
+            assert_eq!(
+                tree.agents.bottom(),
+                tree.input.y,
+                "{at}: the tree sits on the box"
+            );
+            assert_eq!(
+                tree.transcript.height, 0,
+                "{at}: the chat's transcript has no rows"
+            );
+            assert!(
+                !tree.transcript_painted,
+                "{at}: so `ChatPane::transcript` is `None`"
+            );
+            assert_eq!(tree.input.y, two.input.y, "{at}: the box keeps its rows");
+            assert_eq!(
+                tree.input.height, two.input.height,
+                "{at}: the box keeps its rows"
+            );
+            assert_eq!(tree.input.x, 0, "{at}: and takes the width");
+            assert_eq!(tree.input.width, width, "{at}: and takes the width");
+            assert_eq!(tree.bar, two.bar, "{at}: and the bar keeps its rows");
+            shot(&mut app, width, height).assert_shape("zen tree", width, height);
+            ctrl(&mut app, 'f');
+            tab(&mut app);
+            assert_eq!(app.focus, Focus::Chat, "{at}: back where the size began");
+        }
+    }
+
+    /// With zen on, the layout reads the focus — the fact `Tab` already cycles
+    /// — so the pane cycle is the whole of "which pane is full-screen".
+    #[test]
+    fn zen_tabs_between_the_full_screen_panes() {
+        let (mut app, _rx) = test_app("zen-tab");
+        ctrl(&mut app, 'f');
+        let chat = pane_rects(&mut app, 80, 24);
+        assert_eq!(chat.transcript.width, 80, "the chat has the frame");
+        assert_eq!(chat.agents.width, 0, "and the tree has nothing");
+
+        tab(&mut app);
+        let tree = pane_rects(&mut app, 80, 24);
+        assert_eq!(tree.agents.width, 80, "Tab hands the frame to the tree");
+        assert_eq!(tree.transcript.width, 80, "the box still spans the frame");
+        assert_eq!(tree.transcript.height, 0, "with no transcript above it");
+
+        tab(&mut app);
+        assert_eq!(
+            pane_rects(&mut app, 80, 24),
+            chat,
+            "and Tab again hands it back"
+        );
+    }
+
+    /// Zen is a view, and the same key puts the frame back: the two panes, the
+    /// same rects, the same box rows.
+    #[test]
+    fn toggling_zen_back_restores_the_two_panes() {
+        let (mut app, _rx) = test_app("zen-back");
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("hello"));
+        let before = pane_rects(&mut app, 120, 32);
+        ctrl(&mut app, 'f');
+        assert_ne!(
+            pane_rects(&mut app, 120, 32),
+            before,
+            "the view changed the frame"
+        );
+        ctrl(&mut app, 'f');
+        assert_eq!(
+            pane_rects(&mut app, 120, 32),
+            before,
+            "and the same key is the road back"
+        );
+    }
+
+    /// `Ctrl-F` is a view key, so it rides the app-wide `Ctrl-` block: it works
+    /// from the chat and from the tree, it is off until asked for, and `Ctrl-N`
+    /// leaves it as the human set it — the view is the human's, not the
+    /// conversation's.
+    #[test]
+    fn ctrl_f_toggles_zen_from_both_panes() {
+        let (mut app, _rx) = test_app("zen-key");
+        assert!(!app.zen, "the zen view is off until asked for");
+        assert_eq!(app.focus, Focus::Chat, "the test starts in the chat");
+        ctrl(&mut app, 'f');
+        assert!(app.zen, "the chat pane's keyboard reaches the key");
+        ctrl(&mut app, 'f');
+        assert!(!app.zen, "and the same key takes it back");
+
+        tab(&mut app);
+        assert_eq!(app.focus, Focus::Agents);
+        ctrl(&mut app, 'f');
+        assert!(app.zen, "the agents pane's keyboard reaches it too");
+        ctrl(&mut app, 'n');
+        assert!(app.zen, "a new chat leaves the view as the human set it");
+    }
+
+    /// The counts of who is working are the one fact that lives only in the
+    /// agents pane's title, so zen moves them to the title of the pane that is
+    /// still on screen: the conversation pane's. The hidden-row counts stay
+    /// behind — `▲N`/`▼N` is arithmetic about a list the view does not paint.
+    #[test]
+    fn zen_keeps_the_agents_counts_in_the_conversation_panes_title() {
+        let (mut app, _rx) = test_app("zen-counts");
+        // Twenty rows in a pane that shows eighteen: the agents pane's own
+        // title drops its tail, and the tail is the `waiting` clause.
+        crowd(&mut app, 19);
+        let two = screen(&mut app, 80, 24);
+        assert!(
+            two[0].contains('▼'),
+            "the agents pane hides rows and says so: {}",
+            two[0]
+        );
+        assert!(two[0].contains("19 working"), "{}", two[0]);
+        assert!(
+            !two[0].contains("waiting"),
+            "and its own title had to drop the waiting count: {}",
+            two[0]
+        );
+
+        ctrl(&mut app, 'f');
+        let zen = screen(&mut app, 80, 24);
+        assert!(
+            zen[0].contains(" mush "),
+            "the conversation pane's title is painted: {}",
+            zen[0]
+        );
+        assert!(zen[0].contains("19 working"), "{}", zen[0]);
+        assert!(
+            zen[0].contains("1 waiting"),
+            "the clause the hidden title dropped is readable again: {}",
+            zen[0]
+        );
+        assert!(
+            !zen[0].contains('▲') && !zen[0].contains('▼'),
+            "the hidden rows are not a fact about a pane with no rows: {}",
+            zen[0]
+        );
+        assert!(
+            !zen.iter().any(|row| row.contains(" agents ")),
+            "the agents pane is not painted: {zen:?}"
+        );
+    }
+
     /// An actor Ctrl-N abandoned can still be finishing a request (up to the
     /// HTTP timeout); its events must not land in the new conversation. Ids
     /// collide by design — the new root is #0 too.
@@ -11705,7 +12248,7 @@ mod tests {
         let up = KeyEvent::new(KeyCode::PageUp, KeyModifiers::NONE);
         // The page is whatever the key table says it is, so this test cannot
         // disagree with `keys.rs` about the distance.
-        let page = match keys::key(Focus::Agents, false, down) {
+        let page = match keys::key(Focus::Agents, false, false, down) {
             Intent::TreeMove(step) => step,
             other => panic!("PgDn in the agents pane is not a page: {other:?}"),
         };
