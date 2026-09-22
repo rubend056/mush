@@ -430,6 +430,24 @@ impl Workspace {
     /// [`IMAGE_FILE_CAP`] it is an image that cannot ride, and the `Err` is the
     /// read tool's own refusal sentence — one file refused at either door is
     /// refused with the same words.
+    ///
+    /// The path the returned image carries is the one fact a shed payload
+    /// leaves behind (a trim or [`Session::save`](crate::session::Session::save)
+    /// keeps the path and drops the bytes), and the placeholder it leaves
+    /// promises the model that the file can be read again. The model's own
+    /// tools reach nothing outside the root — the human's privilege to name any
+    /// path does not extend to the model — so an image named from *outside* it
+    /// is copied into `.mush/paste/` through [`Self::write_pasted_image`], the
+    /// same writer, directory, name and cap the clipboard road uses, and the
+    /// *copy* is the image's path: an image the model may have to look at again
+    /// is kept where the model's own tools can reach it. That is what makes a
+    /// screenshot pasted from anywhere survive a restart the way a clipboard
+    /// screenshot always has. The human's original is read, never moved or
+    /// rewritten, and its path is not recorded: it is the human's file to keep,
+    /// and the copy is what mush can promise to keep. Nothing is copied for a
+    /// paste that already names a file inside the root — that name resolves, so
+    /// it is kept exactly as the human gave it (workspace-relative for an
+    /// absolute spelling).
     pub fn pasted_image(&self, paste: &str) -> Result<Option<Image>, String> {
         let Some(name) = pasted_name(paste) else {
             return Ok(None);
@@ -444,12 +462,23 @@ impl Workspace {
                 Err(_) => return Ok(None),
             }
         };
-        // The name the placeholder keeps: workspace-relative for a file inside
-        // the root (however the human spelled it), and the absolute path as
-        // given for one outside — a name that still means the file after the
-        // bytes are shed.
+        // The name the human gave, and the name the placeholder would keep. It
+        // answers the copy question too: a name [`Self::resolve`] accepts is
+        // one the model's own tools reach, and needs no copy.
         let label = self.rel(&path);
-        self.image_at(&path, &label)
+        let Some(image) = self.image_at(&path, &label)? else {
+            return Ok(None);
+        };
+        if self.resolve(&label).is_ok() {
+            return Ok(Some(image));
+        }
+        // Outside the root: the bytes are copied where the model can reach
+        // them, and that copy — never the human's path — is what the image
+        // carries from here on.
+        let Image { bytes, mime, .. } = image;
+        self.write_pasted_image(bytes, &mime)
+            .map(Some)
+            .map_err(|e| format!("cannot copy {label} into .mush/paste: {e}"))
     }
 
     /// Write bytes that came from outside the workspace (the clipboard) into
@@ -461,7 +490,10 @@ impl Workspace {
     /// own `.gitignore` ([`session::ensure_mush_dir`]), so a pasted screenshot
     /// cannot dirty the tree, and the file is named for the moment it was
     /// pasted rather than for the clipboard, which would let a second paste
-    /// overwrite the first.
+    /// overwrite the first. The write itself is [`Self::write_pasted_image`],
+    /// shared with the copy [`Self::pasted_image`] makes of a file outside the
+    /// root, so the two roads cannot drift in where the bytes land or what the
+    /// image is called.
     ///
     /// `Err` is "these bytes are an image, and they cannot ride": bytes that
     /// sniff as no image at all, or one past [`IMAGE_FILE_CAP`], whose refusal
@@ -486,6 +518,30 @@ impl Workspace {
                  then `convert shot.png -resize 50% small.png`), then copy the smaller one"
             ));
         }
+        self.write_pasted_image(bytes, mime)
+    }
+
+    /// Write `bytes` — sniffed by the caller as `mime` — into `.mush/paste/`
+    /// and hand back the image that names the copy.
+    ///
+    /// The one write of that directory, shared by the two roads bytes from
+    /// outside the workspace arrive by: the clipboard
+    /// ([`Self::save_pasted_image`]), which has no file behind the bytes, and
+    /// a paste naming a file outside the root ([`Self::pasted_image`]), which
+    /// the model's own tools cannot reach. Two writes would be two spellings of
+    /// one rule — the directory, the `pasted-<unix millis>.<png|jpg|gif|webp>`
+    /// name and the [`Image`] that points at it — so there is one. `.mush/`
+    /// ignores itself via its own `.gitignore` ([`session::ensure_mush_dir`]),
+    /// so neither paste can dirty the tree, and the name carries the moment it
+    /// was pasted rather than the clipboard or the source file, so a second
+    /// paste cannot overwrite the first.
+    ///
+    /// Both callers have already refused a payload that is no image and one
+    /// past [`IMAGE_FILE_CAP`], each with the sentence its own road can act on
+    /// (the clipboard names `wl-paste`, a file names the `convert` downscale);
+    /// what must not differ is where under-cap bytes land. `Err` here is "the
+    /// copy cannot be written": the IO problem the directory or the file named.
+    fn write_pasted_image(&self, bytes: Vec<u8>, mime: &str) -> Result<Image, String> {
         session::ensure_mush_dir(self.root())
             .map_err(|e| format!("cannot create {}: {e}", session::MUSH_DIR))?;
         let dir = self.root().join(session::MUSH_DIR).join("paste");
@@ -1009,6 +1065,21 @@ mod tests {
         Workspace::new(&dir).unwrap()
     }
 
+    /// A picture file *outside* every test workspace — the paste road's own
+    /// case: a name the human may give and the model's tools may not resolve.
+    /// The test's name and the process id keep two tests from sharing (and so
+    /// overwriting) one outside file, and a stale one from an earlier run is
+    /// replaced.
+    fn outside_image(name: &str, bytes: &[u8]) -> PathBuf {
+        let path = std::env::temp_dir().join(format!(
+            "mush-test-outside-{name}-{}.png",
+            std::process::id()
+        ));
+        let _ = fs::remove_file(&path);
+        fs::write(&path, bytes).unwrap();
+        path
+    }
+
     /// A path that is not under the root is shown as it is: a workspace opened
     /// as another directory must not have a real path rewritten into a relative
     /// one that means something else. This is the one elision rule — the session
@@ -1515,13 +1586,24 @@ mod tests {
         let image = ws.pasted_image(&inside).unwrap().unwrap();
         assert_eq!(image.path, "shots/a.png");
 
-        // An absolute path outside the root keeps the path as the human gave
-        // it: there is no workspace name for it.
-        let outside = std::env::temp_dir().join(format!("mush-paste-{}", std::process::id()));
-        fs::write(&outside, png(0)).unwrap();
-        let paste = outside.display().to_string();
-        let image = ws.pasted_image(&paste).unwrap().unwrap();
-        assert_eq!(image.path, paste);
+        // An absolute path outside the root is copied into `.mush/paste/`: the
+        // human may name what the model's tools may not, and the copy's name is
+        // the one a placeholder can promise to a restart.
+        let outside = outside_image("paste-shapes", &png(0));
+        let image = ws
+            .pasted_image(&outside.display().to_string())
+            .unwrap()
+            .unwrap();
+        assert!(
+            image.path.starts_with(".mush/paste/pasted-"),
+            "the copy's name, not the human's path: {}",
+            image.path
+        );
+        assert_eq!(
+            fs::read(ws.root().join(&image.path)).unwrap(),
+            png(0),
+            "the copy holds the original's bytes"
+        );
 
         // A `file://` URL from a browser: the scheme and the `localhost` host
         // go, and `%20` becomes the space it encodes.
@@ -1558,6 +1640,110 @@ mod tests {
         fs::write(ws.root().join("a(1).png"), png(0)).unwrap();
         let image = ws.pasted_image("  a\\(1\\).png\n").unwrap().unwrap();
         assert_eq!(image.path, "a(1).png");
+    }
+
+    /// The human's ruling: a paste names a file anywhere, and the picture must
+    /// be here after a restart. An image outside the root is read under the
+    /// human's own path and then copied into `.mush/paste/` — the copy is the
+    /// image's path, the one name the model's own tools can resolve — with the
+    /// bytes, the mime and the pixel size unchanged, and the original left
+    /// exactly where it was.
+    #[test]
+    fn a_paste_from_outside_the_root_is_copied_into_the_workspace() {
+        let ws = temp_workspace("paste-outside");
+        let original = png_of(1_920, 1_080, 500);
+        let outside = outside_image("paste-outside", &original);
+
+        let image = ws
+            .pasted_image(&outside.display().to_string())
+            .unwrap()
+            .expect("the outside file is an image");
+        assert!(
+            image.path.starts_with(".mush/paste/pasted-"),
+            "the copy, not the human's path: {}",
+            image.path
+        );
+        assert!(image.path.ends_with(".png"), "{}", image.path);
+        assert_eq!(image.mime, "image/png");
+        assert_eq!(image.pixels, Some((1_920, 1_080)));
+        assert_eq!(image.bytes, original, "the bytes that ride are the file's");
+        assert_eq!(
+            fs::read(ws.root().join(&image.path)).unwrap(),
+            original,
+            "and the copy on disk is byte for byte the original"
+        );
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            original,
+            "the human's file is read, not moved or rewritten"
+        );
+        assert_eq!(
+            fs::read_to_string(ws.root().join(".mush/.gitignore")).unwrap(),
+            "*\n",
+            "the copy is invisible to git, like every paste"
+        );
+    }
+
+    /// The copy is not one shape's special case: every spelling of an outside
+    /// name this door reads lands a picture under `.mush/paste/` — a bare
+    /// absolute path, a quoted one, the `\ ` a terminal escapes a dragged
+    /// file's space with, and a `file://` URL from a browser.
+    #[test]
+    fn every_shape_of_an_outside_paste_copies_the_same_way() {
+        let ws = temp_workspace("paste-outside-shapes");
+        let plain = outside_image("paste-outside-plain", &png(4));
+        let spaced = outside_image("paste-outside space", &png(8));
+        assert!(
+            spaced.to_string_lossy().contains(' '),
+            "the file under test has a space in its name"
+        );
+
+        let plain = plain.display().to_string();
+        let spaced = spaced.display().to_string();
+        for paste in [
+            plain.clone(),
+            format!("\"{plain}\""),
+            format!("file://{plain}"),
+            spaced.replace(' ', "\\ "),
+            format!("file://{}", spaced.replace(' ', "%20")),
+        ] {
+            let image = ws
+                .pasted_image(&paste)
+                .unwrap()
+                .unwrap_or_else(|| panic!("{paste:?} names an outside image"));
+            assert!(
+                image.path.starts_with(".mush/paste/pasted-"),
+                "{paste:?} is copied to a reachable name, got {}",
+                image.path
+            );
+            assert_eq!(
+                fs::read(ws.root().join(&image.path)).unwrap(),
+                image.bytes,
+                "{paste:?} wrote its bytes to the copy"
+            );
+        }
+    }
+
+    /// A paste naming an image inside the root is not copied: the name the
+    /// human gave is already one the model's tools resolve, so the paste writes
+    /// nothing at all — no `.mush/paste/` entry to drift from the original.
+    #[test]
+    fn a_paste_from_inside_the_root_names_the_file_and_writes_nothing() {
+        let ws = temp_workspace("paste-inside");
+        fs::create_dir_all(ws.root().join("shots")).unwrap();
+        fs::write(ws.root().join("shots/a.png"), png(0)).unwrap();
+
+        for paste in [
+            "shots/a.png".to_string(),
+            ws.root().join("shots/a.png").display().to_string(),
+        ] {
+            let image = ws.pasted_image(&paste).unwrap().unwrap();
+            assert_eq!(image.path, "shots/a.png", "{paste}");
+        }
+        assert!(
+            !ws.root().join(".mush").exists(),
+            "no copy and no `.mush/paste/`: the paste wrote nothing"
+        );
     }
 
     /// A paste that is text, in every shape that is not an image's: prose, a
@@ -1645,6 +1831,112 @@ mod tests {
             "the clipboard road: {refused}"
         );
         assert!(refused.contains("convert"), "and the downscale: {refused}");
+    }
+
+    /// An outside image past the cap is refused the same way an inside one is —
+    /// with the read tool's sentence naming the human's file — and the refusal
+    /// comes before any copy: `.mush/paste/` never appears for a picture that
+    /// cannot ride.
+    #[test]
+    fn an_outside_image_past_the_cap_is_refused_before_any_copy() {
+        let ws = temp_workspace("paste-outside-big");
+        let outside = outside_image("paste-outside-big", &png(IMAGE_FILE_CAP as usize));
+
+        let refused = ws.pasted_image(&outside.display().to_string()).unwrap_err();
+        assert!(refused.contains("past the 2 MB cap"), "{refused}");
+        assert!(
+            refused.contains(&outside.display().to_string()),
+            "the refusal names the human's file: {refused}"
+        );
+        assert!(!ws.root().join(".mush").exists(), "nothing was copied");
+    }
+
+    /// A copy that cannot be written is a refusal, not a broken attachment: the
+    /// `Err` names the human's file and the problem, so the app can put the
+    /// path in the box as text and say why — nothing half-written is left, and
+    /// the original is untouched.
+    #[test]
+    fn a_copy_that_cannot_be_written_is_refused_and_attaches_nothing() {
+        let ws = temp_workspace("paste-refused");
+        // `.mush` is a file, so nothing can be created under it.
+        fs::write(ws.root().join(".mush"), "not a directory").unwrap();
+        let outside = outside_image("paste-refused", &png(4));
+
+        let refused = ws.pasted_image(&outside.display().to_string()).unwrap_err();
+        assert!(refused.contains("cannot copy"), "{refused}");
+        assert!(
+            refused.contains(&outside.display().to_string()),
+            "the sentence names the file: {refused}"
+        );
+        assert!(
+            refused.contains("cannot create .mush"),
+            "and the problem: {refused}"
+        );
+        assert!(
+            !ws.root().join(".mush/paste").exists(),
+            "no broken image and no half-written copy"
+        );
+        assert_eq!(
+            fs::read(&outside).unwrap(),
+            png(4),
+            "the human's file is untouched"
+        );
+    }
+
+    /// The human's ruling, end to end at the level this crate owns: a picture
+    /// pasted from *outside* the root — their screenshots live where they live —
+    /// must survive a restart. Attach, save (the payload is shed to the
+    /// placeholder), load, then read the placeholder's *own* path back through
+    /// the workspace's image reader: the model gets the picture again. The
+    /// human's path, which the old rule kept, is the one name that cannot do
+    /// this.
+    ///
+    /// What this does not reach: the app painting the placeholder or
+    /// re-attaching on resume; those roads are the app's, and this is the
+    /// workspace/session seam they rest on.
+    #[test]
+    fn a_picture_pasted_from_outside_is_read_again_after_a_restart() {
+        use crate::message::Message;
+
+        let ws = temp_workspace("paste-restart");
+        let original = png_of(640, 480, 32);
+        let outside = outside_image("paste-restart", &original);
+        let image = ws
+            .pasted_image(&outside.display().to_string())
+            .unwrap()
+            .expect("an outside image is attached");
+
+        let session = session::Session {
+            model: "a-model".to_string(),
+            messages: vec![Message::user_with_images("look at this", vec![image])],
+            ..Default::default()
+        };
+        session.save(ws.root()).unwrap();
+
+        // The restart: no bytes in the file, one placeholder naming the copy.
+        let loaded = session::Session::load(ws.root()).unwrap();
+        assert!(loaded.messages[0].images.is_empty(), "no bytes come back");
+        let line = loaded.messages[0].text().to_string();
+        let path = line
+            .split("[image: ")
+            .nth(1)
+            .and_then(|rest| rest.split(" (").next())
+            .unwrap_or_else(|| panic!("the placeholder names a path: {line}"))
+            .to_string();
+        assert!(path.starts_with(".mush/paste/pasted-"), "{line}");
+        assert!(
+            ws.resolve(&path).is_ok(),
+            "the model's own tools resolve the placeholder's path: {path}"
+        );
+        assert!(
+            ws.resolve(&outside.display().to_string()).is_err(),
+            "the human's own path is one the model may not resolve"
+        );
+
+        let reread = ws.read_image(&path).unwrap().unwrap();
+        assert_eq!(reread.mime, "image/png");
+        assert_eq!(reread.pixels, Some((640, 480)));
+        assert_eq!(reread.bytes, original, "the model gets the very picture");
     }
 
     /// The whole file or a refusal: `edit_file` is the one caller left, and an
