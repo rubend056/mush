@@ -58,7 +58,7 @@ use crate::app::short_age;
 use crate::app::tree::Compacting;
 use crate::ids::AgentId;
 use crate::input::Input;
-use crate::ui::dim;
+use crate::ui::{dim, image_count};
 
 /// The pane's own line while a run is in flight: `working.`, `working..`,
 /// `working...`, one dot a second, looping.
@@ -364,6 +364,20 @@ struct Lost {
     /// The images the loss took: the newest one for a `Backspace` pop, every
     /// one for Esc, none for a `Ctrl-U`.
     images: Vec<Image>,
+}
+
+/// The line the bar reads after Esc cleared the box: what went, and the one key
+/// that puts it back. `None` when the box had nothing to lose — Esc on an empty
+/// box clears nothing, so there is nothing to name and no road to offer — which
+/// is also the caller's guard against taking down a draft that is not there.
+fn cleared_line(had_words: bool, images: usize) -> Option<String> {
+    let what = match (had_words, images) {
+        (false, 0) => return None,
+        (true, 0) => "the box".to_string(),
+        (true, n) => format!("the box and {}", image_count(n)),
+        (false, n) => image_count(n),
+    };
+    Some(format!("cleared {what} · Ctrl-Z puts it back"))
 }
 
 /// One conversation: what has been said, what mush added to it, and what the
@@ -1320,13 +1334,20 @@ impl Chat {
     /// private key table that drifts from the app's. `<Enter>` never arrives
     /// here: sending is the agents' business, and the keymap asks the pane
     /// that question first.
-    pub fn apply(&mut self, on: AgentId, key: ChatKey) {
+    ///
+    /// The `Some` a few arms return is a line for the bar — the one thing a key
+    /// here says to the human rather than to the box ([`cleared_line`]); every
+    /// other arm is box state and returns `None`.
+    pub fn apply(&mut self, on: AgentId, key: ChatKey) -> Option<String> {
         match key {
             // A new line instead of sending. Only terminals that report the
             // modifier can deliver Shift+Enter (kitty, WezTerm, foot, Ghostty,
             // recent Alacritty); elsewhere it arrives as a plain Enter, which
             // is why Alt+Enter does the same thing and is the reliable one.
-            ChatKey::Newline => self.input.insert("\n"),
+            ChatKey::Newline => {
+                self.input.insert("\n");
+                None
+            }
             // Backspace takes the thing immediately before the cursor. The
             // pictures are painted above the words, so at the very start of the
             // box that thing is the newest attachment, and a plain backspace
@@ -1343,27 +1364,50 @@ impl Chat {
                 } else {
                     self.input.backspace();
                 }
+                None
             }
-            ChatKey::Delete => self.input.delete_forward(),
-            ChatKey::Left => self.input.move_left(),
-            ChatKey::Right => self.input.move_right(),
-            ChatKey::Home => self.input.move_home(),
-            ChatKey::End => self.input.move_end(),
-            ChatKey::Insert(c) => self.input.insert(&c.to_string()),
-            ChatKey::Scroll(rows) => self.scroll_by(on, rows),
+            ChatKey::Delete => {
+                self.input.delete_forward();
+                None
+            }
+            ChatKey::Left => {
+                self.input.move_left();
+                None
+            }
+            ChatKey::Right => {
+                self.input.move_right();
+                None
+            }
+            ChatKey::Home => {
+                self.input.move_home();
+                None
+            }
+            ChatKey::End => {
+                self.input.move_end();
+                None
+            }
+            ChatKey::Insert(c) => {
+                self.input.insert(&c.to_string());
+                None
+            }
+            ChatKey::Scroll(rows) => {
+                self.scroll_by(on, rows);
+                None
+            }
             // Esc empties the box, and everything waiting to be sent with it:
             // what the human asked to clear is the message they were writing,
             // and half of that message left behind would be a picture they
             // thought they had let go of. The draft goes into the `Ctrl-Z` slot
             // on its way out, so this one-key loss has a road back, and Esc
-            // with nothing to lose is not a loss: it sets nothing.
+            // with nothing to lose is not a loss: it sets nothing and says
+            // nothing.
             ChatKey::Clear => {
-                if !self.input.is_empty() || !self.attachments.is_empty() {
-                    self.lost = Some(Lost {
-                        words: self.input.take(),
-                        images: std::mem::take(&mut self.attachments),
-                    });
-                }
+                let said = cleared_line(!self.input.is_empty(), self.attachments.len())?;
+                self.lost = Some(Lost {
+                    words: self.input.take(),
+                    images: std::mem::take(&mut self.attachments),
+                });
+                Some(said)
             }
             // Ctrl-U: readline's `unix-line-discard`, which is the habit a
             // terminal input is allowed to have. It clears the whole draft, not
@@ -1377,6 +1421,7 @@ impl Chat {
                         ..Lost::default()
                     });
                 }
+                None
             }
             // Ctrl-Z puts back what the box last lost — the words, the images,
             // or both, whichever the loss took ([`Lost`]). The slot is spent by
@@ -1387,6 +1432,7 @@ impl Chat {
                     self.input.insert(&lost.words);
                     self.attachments.extend(lost.images);
                 }
+                None
             }
         }
     }
@@ -3276,5 +3322,38 @@ mod tests {
         chat.clear();
         press(&mut chat, ctrl('z'));
         assert_eq!(chat.input().text(), "");
+    }
+
+    /// The words Esc leaves on the bar name what went and the one key that puts
+    /// it back — and an empty box is not a loss, so it says nothing at all.
+    #[test]
+    fn esc_says_what_it_took_and_the_way_back() {
+        let cleared = |chat: &mut Chat| chat.apply(AgentId::ROOT, ChatKey::Clear);
+
+        let mut chat = Chat::bare();
+        chat.attach(image("a.png"));
+        chat.attach(image("b.png"));
+        chat.insert("draft");
+        assert_eq!(
+            cleared(&mut chat).as_deref(),
+            Some("cleared the box and 2 images · Ctrl-Z puts it back")
+        );
+
+        let mut chat = Chat::bare();
+        chat.insert("draft");
+        assert_eq!(
+            cleared(&mut chat).as_deref(),
+            Some("cleared the box · Ctrl-Z puts it back")
+        );
+
+        let mut chat = Chat::bare();
+        chat.attach(image("a.png"));
+        assert_eq!(
+            cleared(&mut chat).as_deref(),
+            Some("cleared 1 image · Ctrl-Z puts it back")
+        );
+
+        let mut chat = Chat::bare();
+        assert_eq!(cleared(&mut chat), None, "an empty box is not a loss");
     }
 }

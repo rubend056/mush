@@ -3270,7 +3270,14 @@ impl App {
             }
             Intent::Send => self.send_message(),
             Intent::AttachClipboardImage => self.attach_clipboard_image(),
-            Intent::Chat(key) => self.chat.apply(self.tree.focused, key),
+            // The chat does what the key says to the box, and a key that leaves
+            // a line does it here: the box's losses are the chat's fact, the bar
+            // is the app's surface, and this is the one place the two meet.
+            Intent::Chat(key) => {
+                if let Some(line) = self.chat.apply(self.tree.focused, key) {
+                    self.say(line);
+                }
+            }
         }
     }
 
@@ -7019,6 +7026,30 @@ mod tests {
         app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
         assert_eq!(app.chat.input().text(), "");
         assert!(app.chat.attachments().is_empty());
+    }
+
+    /// Esc names what went and the one key that puts it back: the bar is where a
+    /// human learns the road exists, at the moment they need it.
+    #[test]
+    fn esc_says_what_it_cleared_and_the_way_back() {
+        let (mut app, _rx) = test_app("esc-line");
+        app.focus = Focus::Chat;
+        app.chat.attach(image("a.png"));
+        app.chat.attach(image("b.png"));
+        app.chat.insert("draft");
+
+        app.update(Msg::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)));
+
+        let (line, kind) = app.status_line().expect("the line Esc leaves");
+        assert_eq!(kind, StatusKind::Info, "a line, not a failure");
+        assert_eq!(line, "cleared the box and 2 images · Ctrl-Z puts it back");
+        assert!(app.chat.input().is_empty());
+        assert!(app.chat.attachments().is_empty());
+
+        // The key the line names is the key that does it.
+        ctrl(&mut app, 'z');
+        assert_eq!(app.chat.input().text(), "draft");
+        assert_eq!(app.chat.attachments().len(), 2, "and both pictures");
     }
 
     /// A send spends the `Ctrl-Z` slot: the draft left the box, so no keystroke
