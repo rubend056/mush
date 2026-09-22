@@ -1,34 +1,44 @@
-//! The image on the system clipboard, read the way a human would read it.
+//! The system clipboard: the image on it, read the way a human would read it,
+//! and the text put on it the way a human would put it there.
 //!
 //! There is no portable clipboard API, and a crate that offers one is a
 //! dependency mush does not want to pay for a screenshot: the programs every
-//! desktop already ships read the clipboard — wayland's `wl-paste`, X11's
-//! `xclip`, macOS's `pngpaste` — and shelling out to them is what a human does
-//! by hand. Which one exists is discovered by trying them, because a program
-//! that is not installed fails to spawn instantly and costs nothing to ask.
+//! desktop already ships carry the clipboard both ways — wayland's `wl-paste`
+//! and `wl-copy`, X11's `xclip`, macOS's `pngpaste` and `pbcopy` — and shelling
+//! out to them is what a human does by hand. Which one exists is discovered by
+//! trying them, because a program that is not installed fails to spawn
+//! instantly and costs nothing to ask.
 //!
 //! This module lives in the binary crate, not in `mush-core`: it is a
 //! subprocess and the clipboard is a machine facility, and `mush-core` is
 //! deliberately free of both. What travels back is a workspace [`Image`] —
 //! already saved under `.mush/paste/` (`Workspace::save_pasted_image`) — so
-//! the caller on the UI thread only has to attach it.
+//! the caller on the UI thread only has to attach it. What travels *in*, on the
+//! write road, is a `&str` and nothing else: the text the human copied in order
+//! to paste it somewhere else, put on the clipboard exactly as it was handed in.
 //!
 //! Nothing here may block the human's keyboard: the app calls it on a thread of
 //! its own, and every command is bounded anyway, because "a clipboard tool that
 //! waits for an owner that will never answer" is a hang the app's thread must
 //! not inherit. `Command::output()` would be exactly that mistake: it waits for
 //! exit before it reads the pipe, which deadlocks on an image past the pipe
-//! buffer and hangs forever on a program that never exits.
+//! buffer and hangs forever on a program that never exits. The write road
+//! mirrors it, because the same hang has a second shape: the text goes to the
+//! child's stdin on a thread of its own, since a program that stops reading
+//! fills the pipe and a caller that wrote the text itself would block in
+//! `write` on exactly the program that never came back for the read.
 
-use std::io::Read;
+use std::io::{Read, Write};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mush_core::message::Image;
 use mush_core::workspace::{image_mime, IMAGE_FILE_CAP};
 use mush_core::Workspace;
 
-/// How long the whole read may take, every reader together.
+/// How long one clipboard road may take, every program on it together: the
+/// readers of an image, or the writers of a text.
 ///
 /// One deadline for the sequence rather than one per command: the human is
 /// waiting at the keyboard, and nine readers that each take their own two
@@ -38,8 +48,8 @@ use mush_core::Workspace;
 /// and short enough that its absence is noticed as a hiccup rather than a hang.
 const DEADLINE: Duration = Duration::from_secs(2);
 
-/// How often a reader is checked for having exited: fine enough that a fast
-/// answer costs about one poll, coarse enough that nine readers are not a
+/// How often the running program is checked for having exited: fine enough that
+/// a fast answer costs about one poll, coarse enough that nine readers are not a
 /// busy loop.
 const POLL: Duration = Duration::from_millis(5);
 
@@ -306,6 +316,216 @@ fn saved(ws: &Workspace, drained: Drained) -> Result<Option<Image>, String> {
         .map(Some)
 }
 
+/// Put `text` on the system clipboard, exactly as it was handed in. `Err(line)`
+/// is "it cannot be copied, and this is the sentence to say".
+///
+/// The first writer that takes the text wins; a writer that is not installed,
+/// or that leaves without the text having landed, is passed over for the next
+/// one ([`Delivered`]). When not one writer could even be spawned, the clipboard
+/// cannot be written on this machine, and the refusal names what to install
+/// rather than a failure the human cannot act on — the same two facts the read
+/// road keeps apart.
+///
+/// Nothing is added and nothing is taken away: a multi-line text keeps its
+/// newlines and tabs, and a text that ends in `\n` keeps that newline, because
+/// what the human copied is what they mean to paste elsewhere. `wl-copy`'s `-n`
+/// is `--trim-newline` on this road and would drop that newline, so [`writers`]
+/// passes it no flags; the reader's `--no-newline` is `wl-paste`'s flag against
+/// the newline *it* appends, and has no counterpart on the way in.
+///
+/// A writer still running when the deadline arrives is killed and earns its own
+/// sentence ([`Delivered::TimedOut`]): the text may be on its way to the
+/// clipboard, and "the text did not reach the clipboard" would be a different
+/// fact from "nobody answered in time".
+///
+/// The bodies live in [`run_writers`] because a test has to be able to hand in a
+/// writer that never reads its stdin; putting one on the machine's PATH would be
+/// the test's own lie about the machine.
+// The write road's primitive, waiting for the key that will call it: a `pub` fn
+// in a binary crate that no `main` can reach is dead code. Measured, it is:
+// without this attribute the binary target reports five dead items — this
+// function and the four below it, the whole road hanging off it. The attribute
+// leaves with the binding that uses it.
+#[allow(dead_code)]
+pub fn write_text(text: &str) -> Result<(), String> {
+    run_writers(writers(), text, Instant::now() + DEADLINE)
+}
+
+/// [`write_text`] with the writers and the deadline handed in: the loop, the
+/// fall-through, and the sentences the failures earn.
+fn run_writers(
+    writers: Vec<(&'static str, Vec<String>)>,
+    text: &str,
+    deadline: Instant,
+) -> Result<(), String> {
+    // Shared with the thread that writes it, so a text handed to three writers
+    // is copied once, and never once per poll.
+    let text: Arc<str> = Arc::from(text);
+    let mut ran = false;
+    let mut stalled = None;
+    for (program, args) in writers {
+        if Instant::now() >= deadline {
+            break;
+        }
+        match deliver(program, &args, &text, deadline) {
+            Delivered::Missing => {}
+            Delivered::Taken => return Ok(()),
+            Delivered::Refused => ran = true,
+            Delivered::TimedOut => {
+                ran = true;
+                stalled = Some(program);
+                // The deadline is shared — one wait for the whole sequence, so
+                // three writers cannot each spend two seconds of a frozen
+                // keyboard — so the writers after a stall have no time left.
+                break;
+            }
+        }
+    }
+    if !ran {
+        return Err(
+            "no clipboard writer on PATH — install `wl-clipboard` (wl-copy), `xclip`, or macOS's \
+             `pbcopy`"
+                .to_string(),
+        );
+    }
+    if let Some(program) = stalled {
+        return Err(format!(
+            "`{program}` did not take the text within {}s — it may be waiting on a clipboard \
+             owner that never speaks",
+            DEADLINE.as_secs()
+        ));
+    }
+    Err(
+        "the text did not reach the clipboard — every writer on PATH exited without taking it"
+            .to_string(),
+    )
+}
+
+/// Every way this writes a clipboard, in the order it tries them: wayland's
+/// `wl-copy`, then X11's `xclip` with the clipboard selection in, then macOS's
+/// `pbcopy`. All three take the text on stdin, so the two that have nothing else
+/// to say take no arguments at all.
+///
+/// The order is not a guess at the session: a program of the wrong display
+/// server fails just as fast as a missing one (no `$WAYLAND_DISPLAY`, no X
+/// display), so trying all of them is how this stays one code path on three
+/// platforms. `wl-copy` is passed no flag where `wl-paste` is passed
+/// `--no-newline`: `-n` on the write side is `--trim-newline`, which drops a
+/// trailing newline the human put there ([`write_text`]). Nor is a type asked
+/// for the way the readers ask for mimes: the text is written as text and the
+/// program decides how that reads on the clipboard, where the reader must ask
+/// because the clipboard holds whatever was last put on it.
+fn writers() -> Vec<(&'static str, Vec<String>)> {
+    vec![
+        ("wl-copy", Vec::new()),
+        (
+            "xclip",
+            vec!["-selection".into(), "clipboard".into(), "-i".into()],
+        ),
+        ("pbcopy", Vec::new()),
+    ]
+}
+
+/// What one run of one writer made of the text.
+enum Delivered {
+    /// The program is not on this machine.
+    Missing,
+    /// It ran and the text did not land: it exited non-zero, or its stdin write
+    /// failed — a pipe whose reader has gone takes nothing, whatever the program
+    /// returned. The next writer is tried, because a writer that took no text
+    /// can serve none. The evidence stops at the stdin, and the prose has to
+    /// stop there too: a text that fits the pipe is handed over whether or not
+    /// the program ever reads it, and no exit status can be asked about bytes
+    /// already buffered.
+    Refused,
+    /// It was still running when the shared deadline arrived and was killed.
+    /// That is not the same fact as [`Delivered::Refused`]: the text may be on
+    /// its way to the clipboard and the writer merely stuck on an owner that
+    /// never speaks, so the caller says the writer did not take the text in
+    /// time, never that the write failed. It is the same distinction the readers
+    /// draw between an empty clipboard and nobody answering.
+    TimedOut,
+    /// It took the text and exited successfully.
+    Taken,
+}
+
+/// Run one writer against `deadline`, with the text written to its stdin on a
+/// thread of its own.
+///
+/// The thread is the point, and it is the mirror of the reader's drain: a
+/// program that stops reading fills the pipe, and a caller that wrote the text
+/// itself would block in `write` on the program that never came back for the
+/// read, holding the human's keyboard for a hang the deadline exists to cut.
+/// The write's own result comes back over a channel rather than through the
+/// thread's join — a join has no deadline, and a thread left behind by a killed
+/// writer ends when its pipe finally closes — and it is what says whether the
+/// text landed, because the exit status cannot: a program can exit `0` with the
+/// pipe closed under it — a text past the buffer it never read — and that `0` is
+/// not a copy. It is evidence about the stdin and nothing more: bytes buffered
+/// in a pipe are the program's to read or to leave, and that gap is the price of
+/// not blocking on a writer that may never read them.
+fn deliver(program: &str, args: &[String], text: &Arc<str>, deadline: Instant) -> Delivered {
+    let mut child = match Command::new(program)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(_) => return Delivered::Missing,
+    };
+    let Some(mut stdin) = child.stdin.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Delivered::Refused;
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    let text = Arc::clone(text);
+    std::thread::spawn(move || {
+        // The drop of `stdin` when this closure ends is the end of the text: a
+        // writer that waits for EOF — every one of the three does — is waiting
+        // for exactly that. The send is what the caller reads as "the write
+        // succeeded"; a write that failed sends its error instead.
+        let _ = tx.send(stdin.write_all(text.as_bytes()));
+    });
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let left = deadline.saturating_duration_since(Instant::now());
+                let Ok(sent) = rx.recv_timeout(left) else {
+                    // The child exited but the write's answer did not arrive in
+                    // the time left: the deadline is the fact, not a write that
+                    // failed.
+                    return Delivered::TimedOut;
+                };
+                return if status.success() && sent.is_ok() {
+                    Delivered::Taken
+                } else {
+                    Delivered::Refused
+                };
+            }
+            Ok(None) => {}
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Delivered::Refused;
+            }
+        }
+        if Instant::now() >= deadline {
+            // Kill and reap. The writer is not awaited past this: killing the
+            // child closes the pipe the write thread is filling, so a thread
+            // that ends on its own a moment later is one this caller never has
+            // to wait for. What the deadline bought is its own answer
+            // ([`Delivered::TimedOut`]), not a failed write.
+            let _ = child.kill();
+            let _ = child.wait();
+            return Delivered::TimedOut;
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -515,6 +735,215 @@ mod tests {
                 ("pngpaste", None),
             ],
             "the readers, in order"
+        );
+    }
+
+    /// A path in the machine's temp directory that one test owns: it names the
+    /// test and the process, so a leftover from an earlier run cannot be read as
+    /// this run's answer. The file is removed first for the same reason — a test
+    /// that asserts "this was never written" has to know it was not there.
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        let path =
+            std::env::temp_dir().join(format!("mush-clipboard-{name}-{}", std::process::id()));
+        let _ = fs::remove_file(&path);
+        path
+    }
+
+    /// A writer that takes its stdin the way a real one does and puts it in a
+    /// file instead of on the clipboard: the write road's fake, the shape the
+    /// readers' tests hand in as `("sh", vec!["-c", "…"])`. The machine's own
+    /// clipboard is never what a test writes to.
+    fn capturing(path: &std::path::Path) -> Vec<String> {
+        vec!["-c".to_string(), format!("cat > '{}'", path.display())]
+    }
+
+    /// The text goes in exactly: newlines and tabs stay where they were, a
+    /// trailing newline is the human's and is neither dropped nor doubled, and a
+    /// text that ends without one does not gain it. `wl-copy`'s `-n` is
+    /// `--trim-newline` on this road, so a writer list that passed it would drop
+    /// the trailing newline of every case here that has one; the reader's
+    /// `--no-newline` is the read road's and has no counterpart here.
+    #[test]
+    fn the_text_arrives_byte_for_byte() {
+        let path = temp_path("exact");
+        for text in [
+            "first line\nsecond line\n",
+            "tabbed:\tone\ttwo\n\nand a blank line\n",
+            "no trailing newline",
+            "\n",
+        ] {
+            run_writers(
+                vec![("sh", capturing(&path))],
+                text,
+                Instant::now() + Duration::from_secs(5),
+            )
+            .unwrap_or_else(|refused| panic!("a `cat` takes any text, {text:?}: {refused}"));
+            assert_eq!(
+                fs::read(&path).unwrap(),
+                text.as_bytes(),
+                "byte for byte, nothing added and nothing trimmed: {text:?}"
+            );
+        }
+    }
+
+    /// The first writer that takes the text wins the road: one that is not
+    /// installed and one that exits non-zero are both passed over without a
+    /// sentence of their own, and once a writer has the text the writers after
+    /// it never run — the text is already on its way, so running another program
+    /// could only put a second, staler copy on the clipboard.
+    #[test]
+    fn the_first_writer_that_takes_the_text_wins() {
+        let path = temp_path("first-writer");
+        let later = temp_path("later-writer");
+        let writers = vec![
+            ("mush-no-such-writer", Vec::new()),
+            ("sh", vec!["-c".to_string(), "exit 3".to_string()]),
+            ("sh", capturing(&path)),
+            ("sh", capturing(&later)),
+        ];
+        run_writers(
+            writers,
+            "the winner",
+            Instant::now() + Duration::from_secs(5),
+        )
+        .expect("the third writer takes what the first two could not");
+        assert_eq!(fs::read(&path).unwrap(), b"the winner");
+        assert!(
+            !later.exists(),
+            "a writer after the one that took the text never runs"
+        );
+    }
+
+    /// A writer that exits successfully without having read the text has put it
+    /// nowhere, and its exit status alone cannot say so: `exit 0` closes stdin
+    /// and leaves. The write thread's own answer is what knows — a text past the
+    /// pipe buffer can never have landed in a program that took none of it — so
+    /// the road falls through instead of reporting a copy that never happened.
+    #[test]
+    fn a_writer_that_exits_without_taking_the_text_is_not_a_success() {
+        let path = temp_path("unread");
+        let text = "x".repeat(1024 * 1024);
+        let writers = vec![
+            ("sh", vec!["-c".to_string(), "exit 0".to_string()]),
+            ("sh", capturing(&path)),
+        ];
+        run_writers(writers, &text, Instant::now() + Duration::from_secs(5))
+            .expect("the second writer takes what the first dropped");
+        assert_eq!(fs::read(&path).unwrap(), text.as_bytes());
+    }
+
+    /// A road where every writer ran and none took the text is its own refusal:
+    /// the text is not on the clipboard, and that is the whole of what can be
+    /// said — there is no reader to point at and no file road, as the image half
+    /// has. It is not the missing-program sentence either, because a program that
+    /// is installed and failed asks the human for something else.
+    #[test]
+    fn a_text_no_writer_took_did_not_reach_the_clipboard() {
+        let writers = vec![("sh", vec!["-c".to_string(), "exit 3".to_string()])];
+        let refused = run_writers(
+            writers,
+            "undelivered",
+            Instant::now() + Duration::from_secs(5),
+        )
+        .unwrap_err();
+        assert!(refused.contains("did not reach the clipboard"), "{refused}");
+        assert!(
+            !refused.contains("no clipboard writer on PATH"),
+            "the writer is on PATH — it just failed: {refused}"
+        );
+    }
+
+    /// Not one writer on PATH is a third fact: the machine cannot write its
+    /// clipboard at all, and the sentence names what to install — the programs
+    /// themselves, so the human has something to do about it.
+    #[test]
+    fn no_writer_at_all_names_what_to_install() {
+        let writers = vec![("mush-no-such-writer", Vec::new())];
+        let refused =
+            run_writers(writers, "nowhere", Instant::now() + Duration::from_secs(5)).unwrap_err();
+        assert!(refused.contains("no clipboard writer on PATH"), "{refused}");
+        assert!(refused.contains("wl-clipboard"), "{refused}");
+        assert!(refused.contains("wl-copy"), "{refused}");
+        assert!(refused.contains("xclip"), "{refused}");
+        assert!(refused.contains("pbcopy"), "{refused}");
+    }
+
+    /// A writer that never reads is killed at the deadline and earns its own
+    /// sentence: it may be waiting on a clipboard owner that will never speak,
+    /// so "the text did not reach the clipboard" would send the human looking in
+    /// the wrong place. The text here is past the pipe buffer, which is what the
+    /// deadline is for: the caller's own thread never writes it, so a program
+    /// that stops reading cannot hold the human's keyboard on a full pipe. On
+    /// Linux the killed writer is checked to be really gone — a `kill` that left
+    /// a zombie would answer here and never reap anything again.
+    #[test]
+    fn a_writer_that_never_takes_the_text_is_killed_at_the_deadline() {
+        let pid_file = temp_path("hung-pid");
+        let writers = vec![(
+            "sh",
+            vec![
+                "-c".to_string(),
+                format!("echo $$ > '{}'; sleep 30", pid_file.display()),
+            ],
+        )];
+        let text = "x".repeat(1024 * 1024);
+        let started = Instant::now();
+        let refused =
+            run_writers(writers, &text, Instant::now() + Duration::from_millis(50)).unwrap_err();
+        let waited = started.elapsed();
+        assert!(
+            refused.contains("`sh` did not take the text within 2s"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("clipboard owner"),
+            "the sentence names the wait as the likely reason: {refused}"
+        );
+        assert!(
+            !refused.contains("no clipboard writer on PATH")
+                && !refused.contains("did not reach the clipboard"),
+            "a stall is neither a missing writer nor a failed write: {refused}"
+        );
+        assert!(
+            waited < Duration::from_secs(2),
+            "30s of sleep may not be waited on: the call took {waited:?}"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let pid: i32 = fs::read_to_string(&pid_file)
+                .expect("the writer names its own process before it sleeps")
+                .trim()
+                .parse()
+                .expect("sh's `$$` is a pid");
+            assert!(
+                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                "the killed writer is reaped, not left as a zombie: /proc/{pid} is still there"
+            );
+        }
+    }
+
+    /// The writer list is the three platforms' tools in the order the module
+    /// documents, with `xclip` told which selection to put the text in: a binding
+    /// dropped here is a platform that silently stops accepting text. `wl-copy`
+    /// takes no flags where `wl-paste` takes `--no-newline`, because `-n` on this
+    /// side would trim a trailing newline that is the human's.
+    #[test]
+    fn the_writers_are_the_three_programs_in_the_documented_order() {
+        assert_eq!(
+            writers(),
+            vec![
+                ("wl-copy", Vec::new()),
+                (
+                    "xclip",
+                    vec![
+                        "-selection".to_string(),
+                        "clipboard".to_string(),
+                        "-i".to_string(),
+                    ],
+                ),
+                ("pbcopy", Vec::new()),
+            ],
+            "the writers, in order"
         );
     }
 }
