@@ -2515,10 +2515,10 @@ impl App {
     /// The same answer `agent::revive` gives the actor — `live_branch` keeps a
     /// branch only while its worktree exists, and the workspace is built on the
     /// worktree when there is one — so the UI and the actor cannot disagree
-    /// about what a workspace-relative path means to this agent. It is also the
-    /// answer both of [`Self::attach_worktree`]'s callers need: the roster's
-    /// `worktree` string and the attach gate's copy of a picture for an agent
-    /// that works elsewhere.
+    /// about what a workspace-relative path means to this agent. Two surfaces
+    /// ask it: the roster's `worktree` string, through [`Self::attach_worktree`],
+    /// and the attach gate's copy of a picture for an agent that works
+    /// elsewhere ([`Self::carry_images`]).
     fn agent_root(&self, id: AgentId) -> std::path::PathBuf {
         let path = git::worktree_path(self.ws.root(), id.0);
         match self.tree.node(id) {
@@ -3587,11 +3587,11 @@ impl App {
     ///   opening task cannot be dropped and no trim shrinks a picture, so a
     ///   request carrying it would go out over the window and the endpoint
     ///   would refuse it: attaching would only spend a turn discovering that.
-    ///   The line says how many of the box's pictures are at stake and names
-    ///   the road: a downscale. `/compact` is named only when the pictures
-    ///   already in the box are part of the sum, and it is named for what it
-    ///   is — a fold of the *conversation*, whose room is not the weight over
-    ///   this bound.
+    ///   The line names the road: a downscale. `/compact` is named only when
+    ///   the pictures already in the box are part of the sum, and it is named
+    ///   for what it is — a fold of the *conversation*, whose room is not the
+    ///   weight over this bound. (The batch door's line says how many of how
+    ///   many are at stake.)
     /// - **A box past its own byte bound.** [`BOX_IMAGE_BYTES`] is the box's
     ///   memory — what is held while the pictures wait — and it is not the
     ///   window's bound: a picture is priced by its pixels, so a 2 MB file of a
