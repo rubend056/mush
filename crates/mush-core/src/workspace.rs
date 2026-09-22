@@ -349,7 +349,12 @@ impl Workspace {
             .replace('\\', "/")
     }
 
-    /// Read a text file whole. Binary files are refused.
+    /// Read a text file whole. Binary files are refused, and so is anything
+    /// that is not a regular file: `fs::read` on a FIFO blocks until a writer
+    /// appears — an actor parked forever on a name as innocent as `x.png` — and
+    /// a device may never end at all. The metadata answers what the path *is*
+    /// before anything is opened, the same shape of check [`Self::image_at`]
+    /// makes, so the two roads cannot disagree about which paths can be read.
     ///
     /// It used to take a `cap`, keep the head of a long file and mark the cut
     /// with a sentence of its own — then the six-tool cut took the file tools
@@ -359,6 +364,10 @@ impl Workspace {
     /// machine lock, so the cut lives there and this stays the whole-file read.
     pub fn read_file(&self, rel: &str) -> Result<String, String> {
         let path = self.resolve(rel)?;
+        let meta = fs::metadata(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
+        if !meta.is_file() {
+            return Err(format!("{rel} is not a regular file — cannot read it"));
+        }
         let bytes = fs::read(&path).map_err(|e| format!("cannot read {rel}: {e}"))?;
         if bytes.contains(&0) {
             return Err(format!("{rel} looks like a binary file"));
@@ -426,7 +435,8 @@ impl Workspace {
     ///   meaning a bare relative name has here.
     ///
     /// The file must exist and its first bytes must sniff as an image. Not
-    /// existing, not being a file at all, and not being an image are all
+    /// existing, not being a regular file (a FIFO is never opened — its open
+    /// would block until a writer appeared), and not being an image are all
     /// `Ok(None)`: the paste is inserted as the text it is. Past
     /// [`IMAGE_FILE_CAP`] it is an image that cannot ride, and the `Err` is the
     /// read tool's own refusal sentence — one file refused at either door is
@@ -571,7 +581,15 @@ impl Workspace {
     /// names the clipboard's own road (`wl-paste -t image/png > shot.png`,
     /// then a `convert` downscale) because that is the only one a clipboard
     /// image has.
-    pub fn save_pasted_image(&self, bytes: Vec<u8>) -> Result<Image, String> {
+    ///
+    /// `cut_at_the_cap` is the caller's own fact: true when its read stopped
+    /// at its cap before the bytes ended, so `bytes` is a prefix of the picture
+    /// and its length is the buffer's rather than the picture's. Such bytes are
+    /// refused whatever any cap arithmetic says (a prefix cannot ride), and the
+    /// refusal names the cap and no size, because an exact number that is
+    /// really the buffer's is a lie about the human's picture. A caller holding
+    /// the whole picture passes `false` and gets the exact-size sentence.
+    pub fn save_pasted_image(&self, bytes: Vec<u8>, cut_at_the_cap: bool) -> Result<Image, String> {
         let Some(mime) = image_mime(&bytes) else {
             return Err(
                 "the clipboard bytes are not a png, jpeg, gif or webp image — copy the picture \
@@ -579,15 +597,9 @@ impl Workspace {
                     .to_string(),
             );
         };
-        let size = bytes.len() as u64;
-        if size > IMAGE_FILE_CAP {
-            let cap = IMAGE_FILE_CAP / (1024 * 1024);
-            let format = mime.strip_prefix("image/").unwrap_or(mime);
-            return Err(format!(
-                "the clipboard image is a {format} of {size} bytes — past the {cap} MB cap on an \
-                 image. Save it to a file and downscale it (`wl-paste -t image/png > shot.png`, \
-                 then `convert shot.png -resize 50% small.png`), then copy the smaller one"
-            ));
+        if cut_at_the_cap || bytes.len() as u64 > IMAGE_FILE_CAP {
+            let size = (!cut_at_the_cap).then_some(bytes.len() as u64);
+            return Err(clipboard_image_too_big(mime, size));
         }
         self.write_pasted_image(bytes, mime)
     }
@@ -642,29 +654,65 @@ impl Workspace {
     /// One reader for the two doors a picture comes in by — the model's
     /// `read_file` and the human's paste — because a cap, a sniff and a
     /// refusal sentence that differed between them would be the same decision
-    /// made twice, and the copies would drift. The head is read before the
-    /// whole file so a 200 MB blob that is not an image is not loaded to find
-    /// that out; the file is only whole here once its own bytes said "image".
+    /// made twice, and the copies would drift.
+    ///
+    /// The order of the decisions is load-bearing, and each is made from a fact
+    /// already in hand rather than from the read:
+    ///
+    /// - the file's *shape* comes from `fs::metadata` before anything is
+    ///   opened. `File::open` on a FIFO blocks until a writer appears, and this
+    ///   runs on the UI thread (the human's paste) and in an actor (the model's
+    ///   read): a name as innocent as `x.png` must not be able to freeze
+    ///   either. Only a regular file can be an image, and anything else is
+    ///   `Ok(None)` before an open is attempted;
+    /// - the *cap* comes from the metadata's length, before any whole read: a
+    ///   256 MB blob that starts with a png signature is refused from its size,
+    ///   not after being loaded to find the size out;
+    /// - the sixteen-byte head is still sniffed before the whole file, because
+    ///   an over-cap file that is *not* an image is text — the head decides
+    ///   that, and the cap must not turn it into a refusal;
+    /// - and the whole read is bounded by [`IMAGE_FILE_CAP`] + 1 bytes whatever
+    ///   the stat said, because a file can grow between the stat and the read.
+    ///   A read that hits the bound is refused without a size named
+    ///   ([`image_too_big`]): the length in hand is the buffer's, not the
+    ///   picture's.
     fn image_at(&self, path: &Path, name: &str) -> Result<Option<Image>, String> {
-        let mut head = [0u8; 16];
-        let Ok(mut file) = fs::File::open(path) else {
-            // Not there, or not openable: not an image, so the caller's other
+        // A directory opens but does not read (or does not open at all,
+        // depending on the platform), and a FIFO's open blocks until a writer
+        // appears. Neither is an image, and the stat says so without opening
+        // anything.
+        let Ok(meta) = fs::metadata(path) else {
+            // Not there, or not statable: not an image, so the caller's other
             // reading of the path is the answer.
             return Ok(None);
         };
-        // A directory opens but does not read (or does not open at all,
-        // depending on the platform): either way it is `Ok(None)`, not an
-        // image.
+        if !meta.is_file() {
+            return Ok(None);
+        }
+        let mut head = [0u8; 16];
+        let Ok(mut file) = fs::File::open(path) else {
+            return Ok(None);
+        };
         let Ok(read) = file.read(&mut head) else {
             return Ok(None);
         };
         let Some(mime) = image_mime(&head[..read]) else {
             return Ok(None);
         };
-        let bytes = fs::read(path).map_err(|e| format!("cannot read {name}: {e}"))?;
-        let size = bytes.len() as u64;
-        if size > IMAGE_FILE_CAP {
-            return Err(image_too_big(name, mime, size));
+        if meta.len() > IMAGE_FILE_CAP {
+            return Err(image_too_big(name, mime, Some(meta.len())));
+        }
+        // The head is already read, so the rest is bounded to what is left of
+        // the cap: `read_to_end` on a `take` never asks the disk for more than
+        // that. A file that grew past the stat is caught by the length rather
+        // than loaded.
+        let mut bytes = head[..read].to_vec();
+        let room = IMAGE_FILE_CAP + 1 - read as u64;
+        file.take(room)
+            .read_to_end(&mut bytes)
+            .map_err(|e| format!("cannot read {name}: {e}"))?;
+        if bytes.len() as u64 > IMAGE_FILE_CAP {
+            return Err(image_too_big(name, mime, None));
         }
         let pixels = image_dimensions(mime, &bytes);
         Ok(Some(Image {
@@ -943,13 +991,53 @@ impl Workspace {
 /// came in by. One spelling, because it is one fact — the picture is too big
 /// to travel — and one road, because `offset`/`limit` are lines and an image
 /// has none: nothing but a downscale makes it readable.
-fn image_too_big(name: &str, mime: &str, size: u64) -> String {
+///
+/// `size` is the picture's length when the caller knows it — the file's own
+/// stat, or the whole of a buffer — and `None` when a read stopped at the cap
+/// before the file's end, where the length in hand is the buffer's and naming
+/// it would put a number on the human's picture that is not its own.
+fn image_too_big(name: &str, mime: &str, size: Option<u64>) -> String {
     let cap = IMAGE_FILE_CAP / (1024 * 1024);
     let format = mime.strip_prefix("image/").unwrap_or(mime);
-    format!(
-        "{name} is a {format} image of {size} bytes — past the {cap} MB cap on an image. \
-         Downscale it with run_command (`convert {name} -resize 50% small.png`) and read that"
-    )
+    let road = format!(
+        "Downscale it with run_command (`convert {name} -resize 50% small.png`) and read that"
+    );
+    match size {
+        Some(size) => format!(
+            "{name} is a {format} image of {size} bytes — past the {cap} MB cap on an image. {road}"
+        ),
+        None => format!(
+            "{name} is a {format} image past the {cap} MB cap on an image — the read stopped at \
+             the cap before the file's end, so its size is not known. {road}"
+        ),
+    }
+}
+
+/// The one refusal clipboard bytes past [`IMAGE_FILE_CAP`] get, whatever road
+/// read them: the sentence names the clipboard's own road (`wl-paste -t
+/// image/png > shot.png`, then a `convert` downscale) because that is the only
+/// one a clipboard image has.
+///
+/// `size` is the picture's length when the caller knows it — the whole picture
+/// was held — and `None` when the caller's own read stopped at its cap before
+/// the picture ended, where the length in hand is the buffer's and naming it
+/// would put a false number on the human's picture. The two sentences share
+/// every word but that one clause, because they are one refusal.
+fn clipboard_image_too_big(mime: &str, size: Option<u64>) -> String {
+    let cap = IMAGE_FILE_CAP / (1024 * 1024);
+    let format = mime.strip_prefix("image/").unwrap_or(mime);
+    let road = "Save it to a file and downscale it (`wl-paste -t image/png > shot.png`, \
+                then `convert shot.png -resize 50% small.png`), then copy the smaller one";
+    match size {
+        Some(size) => format!(
+            "the clipboard image is a {format} of {size} bytes — past the {cap} MB cap on an \
+             image. {road}"
+        ),
+        None => format!(
+            "the clipboard image is a {format} past the {cap} MB cap on an image — it was cut \
+             off at the cap before its end, so its true size is not known. {road}"
+        ),
+    }
 }
 
 /// The name one *word* of a paste may be, or `None` when that word is no name.
@@ -1629,6 +1717,44 @@ mod tests {
         assert_eq!(image_dimensions("", &png_of(8, 8, 0)), None);
     }
 
+    /// A slice shorter than a signature is no image, whatever it starts with.
+    /// The sniff is four `starts_with` calls and one `len() >= 12`, and the
+    /// guard had no test of its own: `b"RIFF"`, `b"GIF8"` and a three-byte
+    /// slice must answer `None` rather than panic on the `[8..12]` the webp
+    /// branch reaches for. Not a bug today; a test that fails tomorrow is the
+    /// point.
+    #[test]
+    fn a_slice_shorter_than_a_signature_is_no_image() {
+        let short: [&[u8]; 13] = [
+            &[],
+            b"R",
+            b"RI",
+            b"RIF",
+            b"RIFF",
+            b"RIFF\x00\x00\x00\x00",
+            b"WEB",
+            b"WEBP",
+            b"GIF",
+            b"GIF8",
+            b"GIF87",
+            &[0xff, 0xd8],
+            &[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a],
+        ];
+        for bytes in short {
+            assert_eq!(image_mime(bytes), None, "{bytes:?} is not an image");
+            for mime in ["image/png", "image/jpeg", "image/gif", "image/webp"] {
+                assert_eq!(image_dimensions(mime, bytes), None, "{mime} on {bytes:?}");
+            }
+        }
+
+        // The full signatures still answer, so the floor is a floor and not a
+        // ceiling: the guard may not swallow a real picture.
+        assert_eq!(image_mime(&png(0)), Some("image/png"));
+        assert_eq!(image_mime(b"GIF89a"), Some("image/gif"));
+        assert_eq!(image_mime(&[0xff, 0xd8, 0xff, 0xe0]), Some("image/jpeg"));
+        assert_eq!(image_mime(b"RIFF\x00\x00\x00\x00WEBP"), Some("image/webp"));
+    }
+
     /// The parser does not shrink a claim it can read: a png that says
     /// `0xffff_ffff × 0xffff_ffff` is that size, and every other format reads
     /// up to its own ceiling — the weight arithmetic is what keeps the biggest
@@ -1679,7 +1805,7 @@ mod tests {
 
         let refused = ws.pasted_image("heavy.png").unwrap_err();
         assert!(refused.contains("past the 2 MB cap"), "{refused}");
-        let refused = ws.save_pasted_image(heavy).unwrap_err();
+        let refused = ws.save_pasted_image(heavy, false).unwrap_err();
         assert!(refused.contains("past the 2 MB cap"), "{refused}");
 
         // Under the cap, the same 8×8 picture rides — and its weight is its
@@ -1706,7 +1832,7 @@ mod tests {
         let image = ws.pasted_image("screen.png").unwrap().unwrap();
         assert_eq!(image.pixels, Some((1_920, 1_080)));
 
-        let pasted = ws.save_pasted_image(png_of(800, 600, 4)).unwrap();
+        let pasted = ws.save_pasted_image(png_of(800, 600, 4), false).unwrap();
         assert_eq!(pasted.pixels, Some((800, 600)));
     }
 
@@ -2122,6 +2248,146 @@ mod tests {
         assert!(refused.contains("convert"), "the downscale road: {refused}");
     }
 
+    /// A FIFO named like an image is not an image, and is never opened:
+    /// `File::open` on a FIFO with no writer blocks until one appears, so the
+    /// old order — open, sniff, decide — froze the pane on the human's paste
+    /// and parked an actor on the model's read, on a name as innocent as
+    /// `x.png`. Both roads answer from the metadata now, and the watchdog is
+    /// the test: the old code never answers, and a hang must fail here rather
+    /// than hang the suite.
+    #[test]
+    fn a_fifo_named_like_an_image_is_never_opened() {
+        let ws = temp_workspace("fifo");
+        let fifo = ws.root().join("x.png");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(
+            made.is_ok_and(|status| status.success()),
+            "this test needs `mkfifo` to build the shape it pins"
+        );
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        let (paste_ws, read_ws) = (ws.clone(), ws.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((
+                paste_ws.pasted_image("x.png"),
+                read_ws.read_window("x.png", 1, 10, 1024),
+            ));
+        });
+        let (image, text) = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("a FIFO must answer, not hold an open until a writer appears");
+        assert!(
+            image.unwrap().is_none(),
+            "a FIFO is not an image, so the paste is the text it is"
+        );
+        assert!(text.is_err(), "and there are no bytes to read: {text:?}");
+    }
+
+    /// A file far past the cap is refused from what the stat said, not by being
+    /// read. The 8 GiB here is sparse — a few blocks on disk, cheap on ext4 and
+    /// tmpfs — so the old code's read-the-whole-file first would have allocated
+    /// gigabytes to say what the metadata already said: a probe on a 128 MiB
+    /// sparse png drove the test process's peak RSS from 3,172 kB to 134,136 kB
+    /// before the refusal.
+    #[test]
+    fn a_sparse_file_far_past_the_cap_is_refused_without_a_whole_read() {
+        let ws = temp_workspace("sparse-big");
+        let path = ws.root().join("huge.png");
+        let mut file = fs::File::create(&path).unwrap();
+        file.set_len(8 * 1024 * 1024 * 1024).unwrap();
+        file.write_all(&png(0)).unwrap();
+        drop(file);
+
+        let refused = ws.read_image("huge.png").unwrap_err();
+        assert!(
+            refused.contains("8589934592 bytes"),
+            "the sentence names the size the stat saw: {refused}"
+        );
+        assert!(refused.contains("past the 2 MB cap"), "{refused}");
+    }
+
+    /// A file bigger than the image cap is opened and refused with its own
+    /// size: the number is the file's length — the stat's — and not a buffer's,
+    /// and the head sniff ran first, so an over-cap file that is not an image
+    /// stays text ([`Self::image_at`]'s head decides that). The audit found no
+    /// test that opened one.
+    #[test]
+    fn a_file_bigger_than_the_cap_is_refused_with_the_size_the_stat_saw() {
+        let ws = temp_workspace("over-cap-open");
+        let bytes = png(IMAGE_FILE_CAP as usize + 4096);
+        fs::write(ws.root().join("big.png"), &bytes).unwrap();
+
+        let refused = ws.read_image("big.png").unwrap_err();
+        assert!(
+            refused.contains(&format!("of {} bytes", bytes.len())),
+            "the file's own length is named: {refused}"
+        );
+        assert!(refused.contains("past the 2 MB cap"), "{refused}");
+    }
+
+    /// The other half of the same rule: when the length in hand is a buffer's
+    /// and not the picture's, the refusal names the cap and no number. The
+    /// branch that reaches this is the growth race [`Self::image_at`]'s bounded
+    /// read guards — a file that grew between the stat and the read — which a
+    /// test cannot stage, because the stat and the read are one function; so
+    /// the sentence is pinned directly, and the known-size branch beside it
+    /// keeps its exact number.
+    #[test]
+    fn a_size_nobody_knows_is_not_named_in_the_refusal() {
+        let unknown = image_too_big("shots/a.png", "image/png", None);
+        assert!(unknown.contains("past the 2 MB cap"), "{unknown}");
+        assert!(unknown.contains("its size is not known"), "{unknown}");
+        assert!(
+            !unknown.contains(" bytes"),
+            "no length is claimed: {unknown}"
+        );
+        assert!(unknown.contains("convert"), "the road stays: {unknown}");
+
+        let known = image_too_big("shots/a.png", "image/png", Some(3_000_000));
+        assert!(known.contains("of 3000000 bytes"), "{known}");
+    }
+
+    /// The whole-read cap is a different ruler from the image cap, and it had
+    /// no test either: a file past it is refused by `read_window` from the stat
+    /// before anything is opened or read, and the sentence names the road that
+    /// does work (`run_command`). The 32 MiB here are sparse — a few blocks on
+    /// disk — so the pin costs nothing to hold.
+    #[test]
+    fn a_file_bigger_than_the_read_cap_is_refused_before_any_read() {
+        let ws = temp_workspace("over-read-cap");
+        let path = ws.root().join("huge.log");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(READ_FILE_CAP + 4096).unwrap();
+        drop(file);
+
+        let refused = ws.read_window("huge.log", 1, 10, 4_000).unwrap_err();
+        assert!(
+            refused.contains(&format!("{} bytes", READ_FILE_CAP + 4096)),
+            "the file's own length is named: {refused}"
+        );
+        assert!(refused.contains("past the 32 MB cap"), "{refused}");
+        assert!(
+            refused.contains("run_command"),
+            "the road that works: {refused}"
+        );
+    }
+
+    /// The cap is the transport's, not the sniffer's: a file past it that is
+    /// not an image is still text. The head decides that before any whole read
+    /// — the cap must not turn "this is not a picture" into a refusal, or a
+    /// long log with a `PNG`-looking start would stop being readable.
+    #[test]
+    fn an_over_cap_file_that_is_not_an_image_is_still_text() {
+        let ws = temp_workspace("over-cap-text");
+        let body = "not a picture\n".repeat(200_000);
+        assert!(body.len() as u64 > IMAGE_FILE_CAP, "past the cap");
+        fs::write(ws.root().join("notes.txt"), &body).unwrap();
+
+        assert!(ws.read_image("notes.txt").unwrap().is_none());
+        assert!(ws.pasted_image("notes.txt").unwrap().is_none());
+        assert_eq!(ws.read_file("notes.txt").unwrap(), body);
+    }
+
     /// A paste that is text, in every shape that is not an image's: prose, a
     /// paragraph, a path that is not there, a directory, a file that is not a
     /// picture, and a name that escapes the workspace. All of them are
@@ -2172,7 +2438,7 @@ mod tests {
     #[test]
     fn a_clipboard_image_is_saved_under_mush_paste() {
         let ws = temp_workspace("clipboard");
-        let image = ws.save_pasted_image(png(4)).unwrap();
+        let image = ws.save_pasted_image(png(4), false).unwrap();
         assert_eq!(image.mime, "image/png");
         assert!(image.path.starts_with(".mush/paste/pasted-"), "{image:?}");
         assert!(image.path.ends_with(".png"), "{image:?}");
@@ -2190,16 +2456,16 @@ mod tests {
         // The jpeg extension is the spelling a browser reads, and the other
         // three are the mime's own name.
         let jpeg = ws
-            .save_pasted_image(vec![0xff, 0xd8, 0xff, 0xe0, 0x00])
+            .save_pasted_image(vec![0xff, 0xd8, 0xff, 0xe0, 0x00], false)
             .unwrap();
         assert!(jpeg.path.ends_with(".jpg"), "{jpeg:?}");
 
         // Words are not an image, and an image past the cap names the
         // clipboard's own road: save it, downscale it, copy the smaller one.
-        let refused = ws.save_pasted_image(b"hello".to_vec()).unwrap_err();
+        let refused = ws.save_pasted_image(b"hello".to_vec(), false).unwrap_err();
         assert!(refused.contains("not a png"), "{refused}");
         let refused = ws
-            .save_pasted_image(png(IMAGE_FILE_CAP as usize))
+            .save_pasted_image(png(IMAGE_FILE_CAP as usize), false)
             .unwrap_err();
         assert!(refused.contains("past the 2 MB cap"), "{refused}");
         assert!(

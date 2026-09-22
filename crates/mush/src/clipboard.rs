@@ -46,7 +46,9 @@ const POLL: Duration = Duration::from_millis(5);
 /// The most of a reader's stdout that is ever held in memory: one byte past the
 /// image cap, so a picture that is too big is *detected* as too big while its
 /// bytes are still bounded. The rest of a runaway's output is drained and
-/// dropped, never buffered.
+/// dropped, never buffered — and a buffer that reached the cap is reported as
+/// such ([`Drained::filled`]), so the refusal it earns says the picture is
+/// past the cap instead of reading the buffer's length aloud as the picture's.
 const READ_CAP: usize = IMAGE_FILE_CAP as usize + 1;
 
 /// The mimes a reader is asked for, in the order it is asked for them. Png
@@ -64,17 +66,45 @@ const MIMES: [&str; 4] = ["image/png", "image/jpeg", "image/gif", "image/webp"];
 /// even be spawned, the clipboard is unreadable on this machine, and the
 /// refusal names what to install rather than pretending the clipboard was
 /// empty — the two facts need different actions from the human.
+///
+/// The same is true of a reader killed at the deadline: it is its own refusal
+/// ([`Answer::TimedOut`]) because the picture may well be on the clipboard and
+/// the reader stuck, so "the clipboard holds no image" would send the human
+/// looking in the wrong place. The sentence names the reader and the wait, and
+/// points at the road that always works — the picture's own file.
+///
+/// The bodies live in [`run_readers`] because a test has to be able to hand in
+/// a reader that never answers; installing one on the machine's PATH would be
+/// the test's own lie about the machine.
 pub fn read_image(ws: &Workspace) -> Result<Option<Image>, String> {
-    let deadline = Instant::now() + DEADLINE;
+    run_readers(ws, readers(), Instant::now() + DEADLINE)
+}
+
+/// [`read_image`] with the readers and the deadline handed in: the loop, the
+/// three answers that are not a picture, and the sentences each one earns.
+fn run_readers(
+    ws: &Workspace,
+    readers: Vec<(&'static str, Vec<String>)>,
+    deadline: Instant,
+) -> Result<Option<Image>, String> {
     let mut ran = false;
-    for (program, args) in readers() {
+    let mut stalled = None;
+    for (program, args) in readers {
         if Instant::now() >= deadline {
             break;
         }
         match run(program, &args, deadline) {
             Answer::Missing => {}
             Answer::Nothing => ran = true,
-            Answer::Bytes(bytes) => return saved(ws, bytes),
+            Answer::TimedOut => {
+                ran = true;
+                stalled = Some(program);
+                // The deadline is shared — one wait for the whole sequence, so
+                // nine readers cannot each spend two seconds of a frozen paste
+                // — so the readers after a stall have no time left to run.
+                break;
+            }
+            Answer::Bytes(drained) => return saved(ws, drained),
         }
     }
     if !ran {
@@ -83,6 +113,13 @@ pub fn read_image(ws: &Workspace) -> Result<Option<Image>, String> {
              macOS's `pngpaste`"
                 .to_string(),
         );
+    }
+    if let Some(program) = stalled {
+        return Err(format!(
+            "`{program}` did not answer within {}s — it may be waiting on a clipboard owner that \
+             never speaks. Try again, or save the picture to a file and paste its path",
+            DEADLINE.as_secs()
+        ));
     }
     Ok(None)
 }
@@ -121,15 +158,35 @@ fn readers() -> Vec<(&'static str, Vec<String>)> {
     readers
 }
 
+/// What a reader's stdout yielded: the bytes worth keeping, and whether the cap
+/// was reached.
+///
+/// A filled buffer means the reader had more to say and the rest was read and
+/// dropped — so these bytes are the first [`READ_CAP`] of the picture and their
+/// length is the buffer's, not the picture's. [`saved`] carries that fact into
+/// the refusal, which must not name a size it does not know.
+struct Drained {
+    bytes: Vec<u8>,
+    filled: bool,
+}
+
 /// What one run of one reader produced.
 enum Answer {
     /// The program is not on this machine.
     Missing,
-    /// It ran and handed back no image bytes — no such type on the clipboard,
-    /// an error it reported, or a kill at the deadline.
+    /// It ran and handed back no image bytes: no such type on the clipboard, or
+    /// an exit that failed. A reader that failed is "no image" rather than its
+    /// own sentence because a failed reader can serve no picture either way, and
+    /// the human's move — copy the picture again, or paste its path — is the one
+    /// an empty clipboard asks for.
     Nothing,
+    /// It was still running when the shared deadline arrived and was killed.
+    /// That is not the same fact as [`Answer::Nothing`]: the clipboard may hold
+    /// the picture and the reader may be stuck, so the caller says a reader did
+    /// not answer, never that the clipboard is empty.
+    TimedOut,
     /// It exited successfully with these bytes.
-    Bytes(Vec<u8>),
+    Bytes(Drained),
 }
 
 /// Run one reader against `deadline`, with its stdout drained on a thread while
@@ -171,11 +228,13 @@ fn run(program: &str, args: &[String], deadline: Instant) -> Answer {
         match child.try_wait() {
             Ok(Some(status)) => {
                 let left = deadline.saturating_duration_since(Instant::now());
-                let Ok(bytes) = rx.recv_timeout(left) else {
-                    return Answer::Nothing;
+                let Ok(drained) = rx.recv_timeout(left) else {
+                    // The child exited but its bytes did not arrive in the time
+                    // left: the deadline is the fact, not an empty clipboard.
+                    return Answer::TimedOut;
                 };
-                return if status.success() && !bytes.is_empty() {
-                    Answer::Bytes(bytes)
+                return if status.success() && !drained.bytes.is_empty() {
+                    Answer::Bytes(drained)
                 } else {
                     Answer::Nothing
                 };
@@ -190,28 +249,39 @@ fn run(program: &str, args: &[String], deadline: Instant) -> Answer {
         if Instant::now() >= deadline {
             // Kill and reap. The reader is not awaited past this: killing the
             // child closes the pipe it is reading, and a thread that ends on its
-            // own a moment later is one this caller never has to wait for.
+            // own a moment later is one this caller never has to wait for. What
+            // the deadline bought is its own answer ([`Answer::TimedOut`]), not
+            // an empty clipboard.
             let _ = child.kill();
             let _ = child.wait();
-            return Answer::Nothing;
+            return Answer::TimedOut;
         }
         std::thread::sleep(POLL);
     }
 }
 
-/// Read a reader's stdout to the end, keeping at most [`READ_CAP`] bytes. The
-/// rest is read and dropped rather than left in the pipe: a child whose output
-/// nobody reads blocks on a full pipe and never exits, which would spend the
-/// whole deadline of a reader that is working fine.
-fn drain(mut stdout: impl Read) -> Vec<u8> {
-    let mut kept = Vec::new();
+/// Read a reader's stdout to the end, keeping at most [`READ_CAP`] bytes and
+/// reporting whether that cap filled. The rest is read and dropped rather than
+/// left in the pipe: a child whose output nobody reads blocks on a full pipe
+/// and never exits, which would spend the whole deadline of a reader that is
+/// working fine. [`Drained::filled`] is the difference between a whole picture
+/// and the first `READ_CAP` bytes of one, and the refusal owes the human that
+/// difference: the old code dropped the rest silently and then named the
+/// buffer's length as the picture's.
+fn drain(mut stdout: impl Read) -> Drained {
+    let mut bytes = Vec::new();
     let mut buf = [0u8; 16 * 1024];
     loop {
         match stdout.read(&mut buf) {
-            Ok(0) | Err(_) => return kept,
+            Ok(0) | Err(_) => {
+                return Drained {
+                    filled: bytes.len() == READ_CAP,
+                    bytes,
+                }
+            }
             Ok(read) => {
-                let room = READ_CAP.saturating_sub(kept.len());
-                kept.extend_from_slice(&buf[..read.min(room)]);
+                let room = READ_CAP.saturating_sub(bytes.len());
+                bytes.extend_from_slice(&buf[..read.min(room)]);
             }
         }
     }
@@ -224,12 +294,16 @@ fn drain(mut stdout: impl Read) -> Vec<u8> {
 /// answers differ: bytes that are not an image mean the clipboard held
 /// something else — a reader that exited successfully with words — and that is
 /// "no image", not "an image that cannot ride". A picture past the cap *is* the
-/// second, and its refusal sentence comes from the save.
-fn saved(ws: &Workspace, bytes: Vec<u8>) -> Result<Option<Image>, String> {
-    if image_mime(&bytes).is_none() {
+/// second, and its refusal sentence comes from the save, which is told whether
+/// the buffer was cut at [`READ_CAP`] ([`Drained::filled`]): a picture of any
+/// size past the cap then earns "past the 2 MB cap" and no size, where the old
+/// road called every one of them exactly 2,097,153 bytes.
+fn saved(ws: &Workspace, drained: Drained) -> Result<Option<Image>, String> {
+    if image_mime(&drained.bytes).is_none() {
         return Ok(None);
     }
-    ws.save_pasted_image(bytes).map(Some)
+    ws.save_pasted_image(drained.bytes, drained.filled)
+        .map(Some)
 }
 
 #[cfg(test)]
@@ -248,13 +322,24 @@ mod tests {
 
     /// A reader that pours out more than the cap has the rest drained and
     /// dropped: the memory a stuck clipboard tool can cost is a constant, and a
-    /// child whose output nobody read would block on a full pipe instead.
+    /// child whose output nobody read would block on a full pipe instead. The
+    /// cap reaching its end is the fact the refusal needs — a buffer that
+    /// filled is not the picture, and one that ended short of the cap is.
     #[test]
     fn a_runaway_reader_is_capped_and_drained() {
         let flood = vec![7u8; READ_CAP * 3];
         let kept = drain(flood.as_slice());
-        assert_eq!(kept.len(), READ_CAP, "three times the cap, one cap kept");
-        assert!(kept.iter().all(|byte| *byte == 7));
+        assert_eq!(
+            kept.bytes.len(),
+            READ_CAP,
+            "three times the cap, one cap kept"
+        );
+        assert!(kept.filled, "and the cap is reported as filled");
+        assert!(kept.bytes.iter().all(|byte| *byte == 7));
+
+        let whole = drain(&flood[..READ_CAP - 1]);
+        assert_eq!(whole.bytes.len(), READ_CAP - 1);
+        assert!(!whole.filled, "a short reader is a whole picture");
     }
 
     /// The bytes of a png, as far as `image_mime` is concerned: the magic
@@ -271,7 +356,10 @@ mod tests {
     #[test]
     fn clipboard_bytes_that_are_an_image_are_saved() {
         let ws = temp_workspace("saved");
-        let image = saved(&ws, png(4)).unwrap().expect("a png is an image");
+        let bytes = png(4);
+        let image = saved(&ws, drain(bytes.as_slice()))
+            .unwrap()
+            .expect("a png is an image");
         assert_eq!(image.mime, "image/png");
         assert!(image.path.starts_with(".mush/paste/pasted-"), "{image:?}");
         assert_eq!(fs::read(ws.root().join(&image.path)).unwrap(), image.bytes);
@@ -283,7 +371,7 @@ mod tests {
     #[test]
     fn clipboard_bytes_that_are_not_an_image_are_no_image() {
         let ws = temp_workspace("junk");
-        assert!(saved(&ws, b"hello, world".to_vec()).unwrap().is_none());
+        assert!(saved(&ws, drain(&b"hello, world"[..])).unwrap().is_none());
     }
 
     /// A picture past the cap cannot ride, and the sentence names the road a
@@ -291,10 +379,109 @@ mod tests {
     #[test]
     fn a_clipboard_image_past_the_cap_names_a_road() {
         let ws = temp_workspace("big");
-        let refused = saved(&ws, png(IMAGE_FILE_CAP as usize)).unwrap_err();
+        let picture = png(IMAGE_FILE_CAP as usize);
+        let refused = saved(&ws, drain(picture.as_slice())).unwrap_err();
         assert!(refused.contains("past the 2 MB cap"), "{refused}");
         assert!(refused.contains("wl-paste"), "{refused}");
         assert!(refused.contains("convert"), "{refused}");
+    }
+
+    /// A picture cut at the reader's cap is refused without a size being named:
+    /// the reader stopped at [`READ_CAP`], so the length in hand is the
+    /// buffer's, not the picture's — the old road called every picture over the
+    /// cap exactly 2,097,153 bytes, whatever it really was. A whole picture
+    /// handed straight to the save still gets its exact length, because that is
+    /// the half of the rule that is known.
+    #[test]
+    fn a_picture_cut_at_the_reader_cap_is_refused_without_a_number() {
+        let ws = temp_workspace("cut");
+        let picture = png(READ_CAP * 2);
+        let drained = drain(picture.as_slice());
+        assert!(drained.filled, "the buffer stopped at the cap");
+        let refused = saved(&ws, drained).unwrap_err();
+        assert!(refused.contains("past the 2 MB cap"), "{refused}");
+        assert!(refused.contains("wl-paste"), "{refused}");
+        assert!(refused.contains("convert"), "{refused}");
+        assert!(
+            !refused.contains("2097153"),
+            "the buffer's length may not be read as the picture's: {refused}"
+        );
+        assert!(
+            refused.contains("true size is not known"),
+            "and the sentence says the size is unknown: {refused}"
+        );
+
+        let whole = png(IMAGE_FILE_CAP as usize + 4096);
+        let refused = ws.save_pasted_image(whole.clone(), false).unwrap_err();
+        assert!(
+            refused.contains(&format!("of {} bytes", whole.len())),
+            "the exact-size sentence stays for known sizes: {refused}"
+        );
+    }
+
+    /// A reader killed at the deadline is its own fact with its own sentence:
+    /// the old road folded the kill into the same `Nothing` as an empty
+    /// clipboard, so the human was told there was no picture when the truth was
+    /// that nobody answered. The sentence names the reader and the wait — 2s,
+    /// the shared deadline — and points at the file road, because the clipboard
+    /// may hold the picture yet.
+    #[test]
+    fn a_reader_killed_at_the_deadline_is_a_timeout_and_says_so() {
+        let ws = temp_workspace("timeout");
+        let readers = vec![("sh", vec!["-c".to_string(), "sleep 30".to_string()])];
+        let refused =
+            run_readers(&ws, readers, Instant::now() + Duration::from_millis(50)).unwrap_err();
+        assert!(
+            refused.contains("`sh` did not answer within 2s"),
+            "{refused}"
+        );
+        assert!(
+            refused.contains("paste its path"),
+            "the file road: {refused}"
+        );
+        assert!(
+            !refused.contains("no image") && !refused.contains("no clipboard reader"),
+            "and it is not the empty clipboard's claim: {refused}"
+        );
+    }
+
+    /// A reader that exits — zero or non-zero — is "no image", deliberately:
+    /// it can serve no picture, so the human's move is the one an empty
+    /// clipboard asks for, and only the deadline needs a sentence of its own.
+    #[test]
+    fn a_reader_that_exits_without_a_picture_is_no_image() {
+        let ws = temp_workspace("failed");
+        for exit in ["exit 0", "exit 3"] {
+            let answer = run(
+                "sh",
+                &["-c".into(), exit.into()],
+                Instant::now() + Duration::from_secs(5),
+            );
+            assert!(
+                matches!(answer, Answer::Nothing),
+                "`{exit}` is no image, not a timeout"
+            );
+        }
+        let readers = vec![("sh", vec!["-c".to_string(), "exit 3".to_string()])];
+        assert!(
+            run_readers(&ws, readers, Instant::now() + Duration::from_secs(5))
+                .unwrap()
+                .is_none(),
+            "a failed reader answers as an empty clipboard does"
+        );
+    }
+
+    /// Not one reader on PATH is a third fact: the machine cannot read its
+    /// clipboard at all, and the sentence names what to install rather than
+    /// pretending either that the clipboard was empty or that a reader stalled.
+    #[test]
+    fn no_reader_at_all_names_what_to_install() {
+        let ws = temp_workspace("no-reader");
+        let readers = vec![("mush-no-such-reader", Vec::new())];
+        let refused =
+            run_readers(&ws, readers, Instant::now() + Duration::from_secs(5)).unwrap_err();
+        assert!(refused.contains("no clipboard reader on PATH"), "{refused}");
+        assert!(refused.contains("wl-clipboard"), "{refused}");
     }
 
     /// The reader list is the three platforms' tools in the order the module
