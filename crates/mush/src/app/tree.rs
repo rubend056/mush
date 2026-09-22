@@ -197,6 +197,11 @@ impl Phase {
     /// of the roster's `working` (finding H9, refactor R22).
     pub fn doing(&self) -> &str {
         match self {
+            // A run parked in a `wait` is waiting, not working — and not
+            // `wait` either: the word the roster, the row's footer, the
+            // transcript's foot and the quit warning all read is the one
+            // `Phase::label` already answers (finding U14).
+            Phase::Activity(_) if self.waiting().is_some() => "waiting",
             Phase::Activity(what) => what.split_whitespace().next().unwrap_or("working"),
             phase => phase.label(),
         }
@@ -1959,13 +1964,13 @@ mod tests {
         assert_eq!(edit.doing(), "edit_file", "the bar carries the tool's own");
         // A label with no words in it is still a word: nothing may read `#0 `.
         assert_eq!(Phase::Activity(String::new()).doing(), "working");
-        // A run parked in a `wait` is the case where the *two* answers differ
-        // for the same tool label, and both are honest: the roster's machine
-        // name says the fact the row's `⧗` draws, and the bar has room for the
-        // tool's own name (finding U14).
+        // A run parked in a `wait` answers `waiting` on every surface with one
+        // word for it: the roster's machine name, the quit line's word and the
+        // transcript's foot all read the fact the row's `⧗` draws, rather than
+        // the tool's odd name (`wait`) — findings U7/U14, refactor R22.
         let parked = Phase::Activity("wait ".to_string());
         assert_eq!(parked.label(), "waiting");
-        assert_eq!(parked.doing(), "wait");
+        assert_eq!(parked.doing(), "waiting");
     }
 
     /// A fold from rest is visible — the hole `activity` could not fill, because
