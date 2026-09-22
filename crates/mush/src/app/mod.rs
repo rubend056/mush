@@ -3479,9 +3479,10 @@ impl App {
             let first = first_at_stake.unwrap_or_default();
             self.fail(format!(
                 "{at_stake} of {count} images will not fit the room left for history ({}) — \
-                 trim_history sheds an image's bytes before it drops a turn, so the model would \
-                 never look at them. `/compact` makes room, or downscale them (`convert \
-                 {first} -resize 50% small.png`) and paste them again",
+                 attaching them costs the oldest turns of the conversation, which are dropped \
+                 at the next request to make room. `/compact` folds them into a summary \
+                 instead, or downscale them (`convert {first} -resize 50% small.png`) and paste \
+                 them again",
                 size_label(room)
             ));
             return true;
@@ -7327,6 +7328,14 @@ mod tests {
         assert_eq!(kind, StatusKind::Error);
         assert!(line.contains("room left for history"), "{line}");
         assert!(line.contains("2 of 4 images"), "the count at stake: {line}");
+        assert!(
+            line.contains("oldest turns"),
+            "what attaching them costs: {line}"
+        );
+        assert!(
+            !line.contains("shed"),
+            "a trim drops the turn a picture arrived in, not its bytes: {line}"
+        );
         assert!(line.contains("/compact"), "one road to make room: {line}");
         assert!(line.contains("convert"), "and the downscale: {line}");
         assert_eq!(line.matches("room left").count(), 1, "said once: {line}");
