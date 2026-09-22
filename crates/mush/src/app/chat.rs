@@ -55,23 +55,23 @@ use crate::agent::summarize_args;
 use crate::app::image_label;
 use crate::app::keys::ChatKey;
 use crate::app::short_age;
-use crate::app::tree::Compacting;
 use crate::ids::AgentId;
 use crate::input::Input;
 use crate::ui::{dim, image_count};
 
-/// The pane's own line while a run is in flight: `working.`, `working..`,
-/// `working...`, one dot a second, looping.
+/// The dots behind a pane's activity line: `thinking.`, `thinking..`,
+/// `thinking...`, one a second, looping.
 ///
 /// The dots are the whole animation. They replaced a ten-frame braille spinner
 /// (`⠋⠙⠹…`) that `App::tick` advanced once per event-loop pass: a 30 ms poll
 /// turned that glyph over thirty times a second, which is a flicker rather than
-/// a pulse — and a decoration that repaints a frame is not free. The word was
-/// already `working`, so the animation is its own punctuation, and the beat
-/// comes from the caller ([`Pane::spin`]) rather than from each tool call, so a
-/// run that changes tools does not restart mid-dot.
-fn working_dots(beats: u64) -> String {
-    format!("working{}", ".".repeat(1 + (beats % 3) as usize))
+/// a pulse — and a decoration that repaints a frame is not free. The word in
+/// front of them is the phase's own ([`Pane::words`]), so the foot and the row
+/// spell one phase once; the beat comes from the caller ([`Pane::spin`])
+/// rather than from each tool call, so a run that changes tools does not
+/// restart mid-dot.
+fn dotted(words: &str, beats: u64) -> String {
+    format!("{words}{}", ".".repeat(1 + (beats % 3) as usize))
 }
 
 /// The most rows the foot may take from the transcript: two rows of notes and
@@ -300,19 +300,20 @@ struct Foot {
 }
 
 /// What a pane knows that the conversation does not: which agent it is showing,
-/// whether that agent's run is in flight, whether it is folding its
-/// conversation, which beat its dots are on, and the endpoint/model line the
-/// empty state names.
-#[derive(Clone, Copy)]
+/// what that agent's run is doing, which beat its dots are on, and the
+/// endpoint/model line the empty state names.
+#[derive(Clone)]
 pub struct Pane<'a> {
     pub agent: AgentId,
-    pub busy: bool,
-    /// The fold this agent is doing, if any: the pane's own activity line says
-    /// *that*, not `working`, because a fold is not the run's model call and
-    /// the human waiting for it should see which of the two is moving (finding
-    /// U11).
-    pub compacting: Option<Compacting>,
-    /// The beat [`working_dots`] counts from: one a second while anything is in
+    /// What the run is doing, in the row's own words
+    /// ([`Phase::words`](crate::app::tree::Phase::words)), or `None` when there
+    /// is nothing in flight. Carried rather than derived here, so the foot
+    /// cannot spell a phase differently from the row beside it — and a run
+    /// parked in a `wait` says what it waits on (`waiting on results.`) instead
+    /// of the silence that made the pane tell a human less than the row
+    /// (finding U7, superseded).
+    pub words: Option<String>,
+    /// The beat [`dotted`] counts from: one a second while anything is in
     /// flight (`DOT_PERIOD`), not one a frame.
     pub spin: u64,
     pub label: &'a str,
@@ -1183,17 +1184,21 @@ impl Chat {
             blocks.push(footnote_lines(notice, width));
             is_note.push(true);
         }
-        if pane.busy {
+        if let Some(words) = &pane.words {
             worth.push(1);
-            // A fold says so: the row and the bar already do, and a pane that
-            // said `working.` while the conversation is being summarized would
-            // be the third surface disagreeing about one fact (finding U11).
-            let what = match pane.compacting {
-                Some(kind) => kind.words().to_string(),
-                None => working_dots(pane.spin),
-            };
+            // The foot says what the run is doing, in the words the row beside
+            // it already shows ([`Pane::words`], the phase's own derivation) —
+            // `thinking.` for a model call, the tool's own label for a call in
+            // flight, `waiting on results.` for a run parked in a `wait`, the
+            // fold's sentence for a fold — with the beat's dots behind them.
+            //
+            // Finding U7 ruled that `working` may not claim a model call that
+            // is not happening, and its fix was to paint *nothing* over a
+            // parked `wait`. That mechanism is superseded: silence made the
+            // pane tell a human less than the row beside it, and `waiting on
+            // results.` cannot be mistaken for a model call either.
             blocks.push(vec![Line::from(Span::styled(
-                what,
+                dotted(words, pane.spin),
                 Style::default().fg(Color::Cyan),
             ))]);
             // Derived from a phase, so not a note: hiding it promises nothing
@@ -1757,7 +1762,7 @@ mod tests {
     use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 
     use crate::app::keys::{self, Intent};
-    use crate::app::Focus;
+    use crate::app::{Compacting, Focus, Phase};
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -1798,8 +1803,7 @@ mod tests {
     fn pane(agent: AgentId) -> Pane<'static> {
         Pane {
             agent,
-            busy: false,
-            compacting: None,
+            words: None,
             spin: 0,
             label: "test-model · ctx ~500k",
         }
@@ -2684,7 +2688,7 @@ mod tests {
         chat.note_for(AgentId(1), "reading the lexer");
         chat.note_error_for(AgentId(1), "no route to host");
         let busy = Pane {
-            busy: true,
+            words: Phase::Activity("run_command cargo test".to_string()).words(),
             ..pane(AgentId(1))
         };
 
@@ -2695,8 +2699,10 @@ mod tests {
             "the failure is never the line the cap gives up: {rows:?}"
         );
         assert!(
-            rows.iter().any(|row| row.contains("working")),
-            "and the run in flight is still shown, ranked below the failure"
+            rows.iter()
+                .any(|row| row.contains("run_command cargo test.")),
+            "and the run in flight is still shown, in its own words, ranked below the failure: \
+             {rows:?}"
         );
         assert!(
             !rows.iter().any(|row| row.contains("reading the lexer")),
@@ -2715,31 +2721,92 @@ mod tests {
         );
     }
 
-    /// The foot's animation is the word's own dots: `working.`, `working..`,
-    /// `working...`, and round again — one a second (`DOT_PERIOD`), not one a
-    /// frame, and no glyph in front of it.
+    /// The foot paints the phase's own words plus the beat's dots — the whole
+    /// line, at every phase that has something to say and every dot it can
+    /// wear: `thinking.`, `thinking..`, `thinking...`, a tool call's own label,
+    /// `waiting on results.` for a run parked in a `wait`, the fold's sentence,
+    /// `cancelling.`. The word is `Phase::words`, the same one the row paints,
+    /// so the two surfaces cannot spell one phase two ways.
     #[test]
-    fn the_working_line_counts_its_dots() {
-        assert_eq!(working_dots(0), "working.");
-        assert_eq!(working_dots(1), "working..");
-        assert_eq!(working_dots(2), "working...");
-        assert_eq!(working_dots(3), "working.");
-
-        // The same spellings on the row a human reads, painted from the beat
-        // the pane was handed. The whole line is the assertion: no glyph in
-        // front of the word, only the dots behind it.
+    fn the_foot_paints_the_phases_words_and_the_beats_dots() {
         let chat = Chat::bare();
-        for (beat, row) in [(0, "working."), (1, "working.."), (2, "working...")] {
-            let busy = Pane {
-                busy: true,
-                spin: beat,
-                ..pane(AgentId(1))
+        for (phase, words) in [
+            (Phase::Thinking, "thinking"),
+            (
+                Phase::Activity("run_command cargo test".to_string()),
+                "run_command cargo test",
+            ),
+            (Phase::Activity("wait ".to_string()), "waiting on results"),
+            (
+                Phase::Compacting(Compacting::Parked),
+                "folding at the next step",
+            ),
+            (Phase::Compacting(Compacting::Requested), "compacting"),
+            (
+                Phase::Compacting(Compacting::NearlyFull),
+                "context nearly full — compacting",
+            ),
+            (Phase::Cancelling, "cancelling"),
+        ] {
+            assert_eq!(
+                phase.words().as_deref(),
+                Some(words),
+                "{phase:?} is its own words"
+            );
+            for (beat, dots) in [(0u64, "."), (1, ".."), (2, "...")] {
+                let pane = Pane {
+                    words: phase.words(),
+                    spin: beat,
+                    ..pane(AgentId::ROOT)
+                };
+                let line = format!("{words}{dots}");
+                let rows = shown(&chat.painted(&pane, 40, 4).lines);
+                assert!(
+                    rows.iter().any(|row| row == &line),
+                    "{phase:?} at beat {beat} must paint exactly {line:?}: {rows:?}"
+                );
+            }
+        }
+    }
+
+    /// The animation did not move into one phase's line when the line became
+    /// the phase's own: the beat is the pane's, the third dot loops back to the
+    /// first, and a run that changes tools keeps its dot.
+    #[test]
+    fn the_dots_count_on_every_word() {
+        assert_eq!(dotted("thinking", 0), "thinking.");
+        assert_eq!(dotted("thinking", 1), "thinking..");
+        assert_eq!(dotted("thinking", 2), "thinking...");
+        assert_eq!(dotted("thinking", 3), "thinking.");
+        assert_eq!(
+            dotted("run_command cargo test", 1),
+            "run_command cargo test.."
+        );
+    }
+
+    /// A phase at rest paints no foot line: `None` is not an empty dot line,
+    /// and the pane says nothing about a run that is not in flight. The rows
+    /// are the transcript's alone.
+    #[test]
+    fn the_foot_paints_nothing_at_rest() {
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::assistant("the reply"));
+        for phase in [
+            Phase::Idle,
+            Phase::Done,
+            Phase::Failed("no route to host".to_string()),
+            Phase::Stopped,
+            Phase::CutOff,
+        ] {
+            assert_eq!(phase.words(), None, "{phase:?} is at rest");
+            let pane = Pane {
+                words: phase.words(),
+                ..pane(AgentId::ROOT)
             };
-            let painted = chat.painted(&busy, 40, 4);
-            assert!(
-                shown(&painted.lines).iter().any(|line| line == row),
-                "at beat {beat}: {:?}",
-                shown(&painted.lines)
+            assert_eq!(
+                shown(&chat.painted(&pane, 40, 4).lines),
+                vec!["mush › the reply"],
+                "{phase:?} must not paint a foot line"
             );
         }
     }
@@ -2853,12 +2920,12 @@ mod tests {
         let mut chat = Chat::bare();
         chat.push_message(AgentId::ROOT, Message::assistant("the newest reply"));
         let busy = Pane {
-            busy: true,
+            words: Phase::Activity("edit_file src/lib.rs".to_string()).words(),
             ..pane(AgentId::ROOT)
         };
 
         // One row of pane, and no notes: the transcript keeps the row, the
-        // hidden working line is not a line something wrote, and the title
+        // hidden activity line is not a line something wrote, and the title
         // claims nothing.
         let painted = chat.painted(&busy, 40, 1);
         assert_eq!(shown(&painted.lines), vec!["mush › the newest reply"]);
@@ -2869,7 +2936,7 @@ mod tests {
         );
 
         // With one note the count is that note and only that note, whether the
-        // working line is shown beside it or not.
+        // activity line is shown beside it or not.
         chat.note_for(AgentId::ROOT, "reading the lexer");
         let painted = chat.painted(&busy, 40, 1);
         assert_eq!(painted.title, " mush · +1 more lines · /notes ");

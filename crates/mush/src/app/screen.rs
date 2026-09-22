@@ -247,7 +247,7 @@ pub struct AgentRow {
     /// The branch, its delta and any jobs: `mush/3 +12−4 ⚙1`.
     pub place: String,
     /// What it is doing, with its age: `thinking 3s`, `edit_file a.rs 12s`,
-    /// `waiting on agents 3s`, `compacting 2s`.
+    /// `waiting on results 3s` (the `wait` tool's own noun), `compacting 2s`.
     pub activity: String,
 }
 
@@ -548,9 +548,9 @@ impl App {
 
         let label = self.cfg().label();
         let room = inner(transcript_area);
-        // One lookup of the focused node for the two facts the pane's activity
-        // line is built from: `busy` and `compacting` are projections of the
-        // same node, and asking the tree twice is one thing more to keep in
+        // One lookup of the focused node for the pane's activity line: what the
+        // run is doing is a projection of the same node the row beside the pane
+        // is built from, and asking the tree twice is one thing more to keep in
         // step (finding R9).
         let node = self.tree.node(self.tree.focused);
         let transcript = (room.height > 0 && room.width > 0).then(|| {
@@ -559,19 +559,14 @@ impl App {
             let width = (room.width as usize).min(MAX_TRANSCRIPT as usize);
             let pane = Pane {
                 agent: self.tree.focused,
-                // A run in flight is what the pane's own activity line is
-                // derived from, and the beat it counts its dots from is the one
-                // `App::tick` advanced.
-                //
-                // A run parked in a wait is *not* one: the foot's `working` may
-                // only claim a model call, and `wait` is not one — the
-                // agent is waiting for somebody else's result, and the row says
-                // so (`waiting on agents 3s`). Painting the working line over that
-                // was exactly the lie finding U7 named.
-                busy: node
-                    .map(|node| node.phase.is_busy() && node.phase.waiting().is_none())
-                    .unwrap_or(false),
-                compacting: node.and_then(|node| node.phase.compacting()),
+                // The run's own words, the same derivation the row paints
+                // (`phase_detail`): the foot can no longer spell a phase
+                // differently from the row, and a run parked in a `wait` gets a
+                // line naming what it waits on instead of the old silence
+                // (finding U7, superseded).
+                words: node.and_then(|node| node.phase.words()),
+                // The beat the foot counts its dots from is the one `App::tick`
+                // advanced.
                 spin: self.spin,
                 label: &label,
             };
@@ -1047,10 +1042,17 @@ fn phase_glyph(phase: &Phase) -> &'static str {
 /// What the row says the agent is doing, ageing with the phase so a slow model
 /// is visible as `thinking 42s` rather than a static word.
 ///
-/// A run parked in a wait says so instead of naming the tool: `wait 3s`
-/// reads like a model call in flight, and the human asked for an hourglass for
-/// the case where nothing is being computed — a napping orchestrator was the
-/// one agent on the screen claiming work it was not doing (finding U7).
+/// The words are [`Phase::words`], the same derivation the transcript's foot
+/// paints: the row is that plus the age, so the two surfaces cannot drift into
+/// two spellings of one phase (the drift this function and the foot's own
+/// `working` used to be free to have).
+///
+/// A run parked in a wait says what it is waiting on instead of naming the
+/// tool: `wait 3s` reads like a model call in flight, and the human asked for
+/// an hourglass for the case where nothing is being computed — a napping
+/// orchestrator was the one agent on the screen claiming work it was not doing
+/// (finding U7). The noun comes from the same [`Phase::waiting`] the `⧗` glyph
+/// and the foot read, so no surface can name a different thing.
 ///
 /// A fold says what it is too, and its own words: a fold the human asked for,
 /// one the window triggered, and one parked behind the run in flight are three
@@ -1059,16 +1061,6 @@ fn phase_glyph(phase: &Phase) -> &'static str {
 fn phase_detail(node: &AgentNode) -> String {
     let age = short_age(node.since.elapsed());
     match &node.phase {
-        Phase::Thinking => format!("thinking {age}"),
-        Phase::Activity(what) => match node.phase.waiting() {
-            Some(waiting) => format!("waiting on {} {age}", waiting.noun()),
-            // The actor's label is the tool name and its summarized arguments;
-            // with no arguments it ends in a space, which the row would paint
-            // as a double one (`wait  3s`).
-            None => format!("{} {age}", what.trim_end()),
-        },
-        Phase::Compacting(kind) => format!("{} {age}", kind.words().trim_end_matches('…')),
-        Phase::Cancelling => "cancelling…".to_string(),
         // A stopped run has no result to show: its last summary belongs to a
         // run that was interrupted, so showing it would claim work that was
         // never delivered. `node.summary` is deliberately not consulted.
@@ -1080,6 +1072,17 @@ fn phase_detail(node: &AgentNode) -> String {
         Phase::CutOff => "cut off · nothing committed".to_string(),
         Phase::Failed(error) => error.clone(),
         Phase::Idle | Phase::Done => node.summary.clone().unwrap_or_default(),
+        // Everything in flight reads the one derivation the foot paints too:
+        // the row is those words and its age. The pattern lists the busy
+        // phases explicitly, so a phase added to neither list fails to compile
+        // instead of quietly painting nothing.
+        phase @ (Phase::Thinking
+        | Phase::Activity(_)
+        | Phase::Compacting(_)
+        | Phase::Cancelling) => {
+            let words = phase.words().expect("a phase in flight says what it is");
+            format!("{words} {age}")
+        }
     }
 }
 
@@ -1238,7 +1241,18 @@ mod tests {
             phase_detail(&node(Phase::Activity("edit_file src/a.rs".into()), 75)),
             "edit_file src/a.rs 1m15s"
         );
-        assert_eq!(phase_detail(&node(Phase::Cancelling, 1)), "cancelling…");
+        assert_eq!(phase_detail(&node(Phase::Cancelling, 1)), "cancelling 1s");
+        // A run parked in a `wait` names what it waits on, from the one
+        // derivation the foot reads too (finding U7).
+        assert_eq!(
+            phase_detail(&node(Phase::Activity("wait ".into()), 5)),
+            "waiting on results 5s"
+        );
+        // A label with no words still has one to paint.
+        assert_eq!(
+            phase_detail(&node(Phase::Activity(String::new()), 2)),
+            "working 2s"
+        );
         assert_eq!(
             phase_detail(&node(Phase::Failed("no route".into()), 9)),
             "no route"
@@ -1263,6 +1277,34 @@ mod tests {
             !phase_detail(&stopped).contains("half the parser"),
             "a stop must not show the previous run's summary"
         );
+    }
+
+    /// The row and the foot cannot disagree: the row's activity *is* the one
+    /// derivation the foot paints ([`Phase::words`]) plus the age. The drift
+    /// this exists to prevent is a phase spelled one way on the row and another
+    /// under the transcript — `working.` over a `run_command cargo test`, or
+    /// silence over a row that names a parked `wait`.
+    #[test]
+    fn the_row_and_the_foot_read_one_derivation() {
+        for phase in [
+            Phase::Thinking,
+            Phase::Activity("run_command cargo test".to_string()),
+            Phase::Activity("wait ".to_string()),
+            Phase::Activity(String::new()),
+            Phase::Compacting(Compacting::Parked),
+            Phase::Compacting(Compacting::Requested),
+            Phase::Compacting(Compacting::NearlyFull),
+            Phase::Cancelling,
+        ] {
+            let words = phase
+                .words()
+                .unwrap_or_else(|| panic!("{phase:?} says what it is doing"));
+            assert_eq!(
+                phase_detail(&node(phase.clone(), 9)),
+                format!("{words} 9s"),
+                "{phase:?}: the row is the foot's words and the age"
+            );
+        }
     }
 
     /// A landed worktree still has a branch recorded, so the row must key off

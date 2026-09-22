@@ -119,6 +119,54 @@ impl Phase {
         }
     }
 
+    /// What this run is doing, in the row's own words — or `None` when it is
+    /// at rest and there is nothing to say.
+    ///
+    /// The one derivation the tree row and the transcript's foot both read, so
+    /// the pane cannot spell a phase differently from the row beside it: the
+    /// row adds the age (`screen::phase_detail`) and the foot adds its dot beat
+    /// (`chat`), and neither owns a word of its own. The vocabulary is the
+    /// row's: `thinking` for a model call, the actor's own tool label,
+    /// `waiting on results` for a run parked in a `wait` (the same
+    /// [`Phase::waiting`] the `⧗` glyph reads, so the noun cannot differ between
+    /// the two), and the fold's own sentence ([`Compacting::words`]) for a fold.
+    ///
+    /// A trailing ellipsis is trimmed here: it is punctuation the foot's dots
+    /// would double (`compacting….`), and the dots are the whole animation. For
+    /// the same reason a label the actor itself cut short (`summarize_args`
+    /// truncates a long command) loses its mark, and the row is left with the
+    /// words rather than two ellipses.
+    ///
+    /// `Stopped`, `CutOff`, `Failed`, `Done` and `Idle` answer `None`: what they
+    /// carry is a result, a summary or a failure, and that belongs to the row's
+    /// detail, not to a line claiming work in flight.
+    pub fn words(&self) -> Option<String> {
+        let words = match self {
+            Phase::Thinking => "thinking",
+            Phase::Activity(what) => match self.waiting() {
+                Some(waiting) => return Some(format!("waiting on {}", waiting.noun())),
+                // The actor's label is the tool name and its summarized
+                // arguments; with no arguments it ends in a space, which the
+                // row would paint as a double one (`wait  3s`).
+                None => what.as_str(),
+            },
+            Phase::Compacting(kind) => kind.words(),
+            Phase::Cancelling => "cancelling",
+            Phase::Idle | Phase::Done | Phase::Failed(_) | Phase::Stopped | Phase::CutOff => {
+                return None
+            }
+        };
+        // A trailing ellipsis is punctuation the foot's dots would double
+        // (`compacting….`), and the whitespace around it is not a word either.
+        // A label with no words at all still has one: `doing`'s fallback.
+        let words = words.trim_end_matches(['…', ' ']);
+        Some(if words.is_empty() {
+            self.doing().to_string()
+        } else {
+            words.to_string()
+        })
+    }
+
     /// A stable, one-word name for this phase, for a reader that is not the
     /// painter: the attach protocol's roster (M3). The glyph and the row's own
     /// words stay the painter's (`app/screen.rs`); this is the same distinction
@@ -149,6 +197,11 @@ impl Phase {
     /// of the roster's `working` (finding H9, refactor R22).
     pub fn doing(&self) -> &str {
         match self {
+            // A run parked in a `wait` is waiting, not working — and not
+            // `wait` either: the word the roster, the row's footer, the
+            // transcript's foot and the quit warning all read is the one
+            // `Phase::label` already answers (finding U14).
+            Phase::Activity(_) if self.waiting().is_some() => "waiting",
             Phase::Activity(what) => what.split_whitespace().next().unwrap_or("working"),
             phase => phase.label(),
         }
@@ -1760,6 +1813,68 @@ mod tests {
         );
     }
 
+    /// What a run is doing, in the row's own words: the one derivation the row
+    /// and the transcript's foot both read (`screen::phase_detail` adds the age,
+    /// `chat` adds the dot beat). At rest there is nothing to say, and no words
+    /// carry a trailing `…` for the foot's dots to double.
+    #[test]
+    fn a_phase_says_what_it_is_doing_in_words() {
+        assert_eq!(Phase::Thinking.words().as_deref(), Some("thinking"));
+        assert_eq!(
+            Phase::Activity("run_command cargo test".to_string())
+                .words()
+                .as_deref(),
+            Some("run_command cargo test")
+        );
+        // A run parked in a `wait` names what it waits on, from the same
+        // [`Phase::waiting`] the glyph reads.
+        assert_eq!(
+            Phase::Activity("wait ".to_string()).words().as_deref(),
+            Some("waiting on results")
+        );
+        // The actor's label can end in the space a missing argument leaves or
+        // in the `…` `summarize_args` cut a long command with: neither is a
+        // word, and the foot's dots would make the second two ellipses.
+        assert_eq!(
+            Phase::Activity("run_command cargo …".to_string())
+                .words()
+                .as_deref(),
+            Some("run_command cargo")
+        );
+        // A label with no words keeps the one generic word `doing` falls back
+        // to, so the foot never paints a bare dot.
+        assert_eq!(
+            Phase::Activity(String::new()).words().as_deref(),
+            Some("working")
+        );
+        // A fold's sentence loses its own ellipsis for the same reason.
+        assert_eq!(
+            Phase::Compacting(Compacting::Parked).words().as_deref(),
+            Some("folding at the next step")
+        );
+        assert_eq!(
+            Phase::Compacting(Compacting::Requested).words().as_deref(),
+            Some("compacting")
+        );
+        assert_eq!(
+            Phase::Compacting(Compacting::NearlyFull).words().as_deref(),
+            Some("context nearly full — compacting")
+        );
+        assert_eq!(Phase::Cancelling.words().as_deref(), Some("cancelling"));
+
+        // At rest there is nothing to say: what these carry is a result, a
+        // summary or a failure, and the row's own detail owns those.
+        for phase in [
+            Phase::Idle,
+            Phase::Done,
+            Phase::Failed("no route".to_string()),
+            Phase::Stopped,
+            Phase::CutOff,
+        ] {
+            assert_eq!(phase.words(), None, "{phase:?} is at rest");
+        }
+    }
+
     /// A fold is a phase of its own, and the words that describe it are one
     /// derivation — the row, the footer, the bar and the transcript's foot read
     /// `compacting()`, so none of them can call the same fold something else
@@ -1849,13 +1964,13 @@ mod tests {
         assert_eq!(edit.doing(), "edit_file", "the bar carries the tool's own");
         // A label with no words in it is still a word: nothing may read `#0 `.
         assert_eq!(Phase::Activity(String::new()).doing(), "working");
-        // A run parked in a `wait` is the case where the *two* answers differ
-        // for the same tool label, and both are honest: the roster's machine
-        // name says the fact the row's `⧗` draws, and the bar has room for the
-        // tool's own name (finding U14).
+        // A run parked in a `wait` answers `waiting` on every surface with one
+        // word for it: the roster's machine name, the quit line's word and the
+        // transcript's foot all read the fact the row's `⧗` draws, rather than
+        // the tool's odd name (`wait`) — findings U7/U14, refactor R22.
         let parked = Phase::Activity("wait ".to_string());
         assert_eq!(parked.label(), "waiting");
-        assert_eq!(parked.doing(), "wait");
+        assert_eq!(parked.doing(), "waiting");
     }
 
     /// A fold from rest is visible — the hole `activity` could not fill, because
