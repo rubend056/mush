@@ -10,6 +10,7 @@
 //! copy of any file, so there is nothing to round-trip and nothing to keep in
 //! sync. An isolated agent works in its own git worktree.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2149,6 +2150,46 @@ fn request_tokens(messages: &[Message]) -> usize {
     request_weight(messages).div_ceil(BYTES_PER_TOKEN)
 }
 
+/// The messages a request may carry for the model it is addressed to: the
+/// transcript it was handed, minus the image parts of a model the provider
+/// table says cannot see ([`vision_capable`]).
+///
+/// The gate is asked here, where the request's parts are assembled, and not
+/// only where an image is attached or read: a mid-run model switch points a
+/// conversation that already holds pictures at a model the table says is blind,
+/// and a request that replays them would carry `image_url` parts an endpoint may
+/// reject — a whole turn and the human's money. The bytes stay in the actor's
+/// transcript (a picture goes with the turn it arrived in, and only the
+/// request's own copy is a copy); each message's own placeholder text stands
+/// where its images were (`Message::drop_images`), so the model still learns a
+/// picture was there and which file it came from, and one line says the model
+/// is why and `/model` is the road.
+fn for_the_model<'a>(actor: &Actor, cfg: &Config, messages: &'a [Message]) -> Cow<'a, [Message]> {
+    let images: usize = messages.iter().map(|message| message.images.len()).sum();
+    if images == 0 || vision_capable(&cfg.model) {
+        return Cow::Borrowed(messages);
+    }
+    let what = if images == 1 {
+        "one image part".to_string()
+    } else {
+        format!("{images} image parts")
+    };
+    actor.ctx.emit(
+        actor.id,
+        AgentEvent::Notice(format!(
+            "dropped {what} from the request: `{}` is not a model mush knows to accept images, so \
+             their bytes cannot travel — the transcript keeps the file names, and `/model` picks a \
+             model whose row documents vision",
+            cfg.model
+        )),
+    );
+    let mut stripped = messages.to_vec();
+    for message in &mut stripped {
+        message.drop_images();
+    }
+    Cow::Owned(stripped)
+}
+
 /// The reply cap a summarize request may ask for: the summary's own ceiling
 /// ([`COMPACT_REPLY_TOKENS`]), never more than the window has left once the
 /// prompt is paid for — the tool schemas that head it, then the history and the
@@ -2427,8 +2468,12 @@ fn run_loop(
         // where no money has been spent, instead of by the endpoint's 400. The
         // turn ends with one line naming what does not fit and the roads that
         // change it; the actor is alive, and the next message tries again with
-        // whatever the human changed.
-        let carried = request_weight(request_messages);
+        // whatever the human changed. What the model may actually see is
+        // decided first ([`for_the_model`]): a blind model's request is the
+        // transcript without its image parts, and it is that request the
+        // window has to hold.
+        let visible = for_the_model(actor, &cfg, request_messages);
+        let carried = request_weight(&visible);
         if carried > budget {
             return Err(over_window_line(&cfg, carried, budget));
         }
@@ -2440,7 +2485,7 @@ fn run_loop(
         // `auto` keeps models that ignore tools working: they simply answer.
         let request = request(
             &cfg,
-            request_messages,
+            &visible,
             &schemas,
             if wrap_up { "none" } else { "auto" },
             cfg.reply_cap(),
@@ -2963,7 +3008,15 @@ fn compact_history(
     // over the window is one a strict endpoint refuses with a 400, and the
     // automatic arm has no line of its own, so paying for that refusal every
     // turn is the silent hole this closes.
-    let prompt_tokens = request_tokens(&folded);
+    //
+    // What the model may see comes first: a blind model is never sent an image
+    // part, and the fold's prompt is what that leaves — a picture the transcript
+    // holds (an old turn, a restored session) stands as its placeholder line.
+    let visible = for_the_model(actor, cfg, &folded);
+    let prompt_tokens = request_tokens(&visible);
+    // What the model may see of it: a blind model is never sent an image part,
+    // and the fold's own prompt is what that leaves — a picture the transcript
+    // holds (an old turn, a session) stands as its placeholder line.
     let cap = compaction_reply_cap(cfg, prompt_tokens);
     if !fold_request_fits(cfg, prompt_tokens, cap) {
         // Nothing is attempted: folded over the window is the one shape a
@@ -2984,7 +3037,7 @@ fn compact_history(
         return Ok(false);
     }
     state.fold_refused = false;
-    let request = request(cfg, &folded, &schemas, "auto", cap);
+    let request = request(cfg, &visible, &schemas, "auto", cap);
     let reply = match ask(actor, &request, cancel) {
         Ok(reply) => reply,
         // A cancelled run is already ending; do not report a network failure.
@@ -4711,10 +4764,13 @@ fn read_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<ToolOutp
     let path = tools::arg_string(args, "path")?;
     if let Some(image) = actor.ws.read_image(&path)? {
         // Vision is a per-model fact ([`Config::model`]'s row in the provider
-        // table), and an image sent to a model that cannot see it is a rejected
-        // request — a whole turn, and the human's money. The refusal names what
-        // to do instead, because "this model cannot see" is not something the
-        // model can change.
+        // table), and the read is refused *before* the bytes are stored: the
+        // request gate ([`for_the_model`]) would drop the image part rather
+        // than let a blind model be sent it, but this is the honest place — the
+        // model learns at once that the picture it asked for cannot travel, and
+        // no megabytes of it are carried for nobody to look at. The refusal
+        // names what to do instead, because "this model cannot see" is not
+        // something the model can change.
         let model = actor.ctx.cfg.config()?.model;
         if !vision_capable(&model) {
             let format = image.mime.strip_prefix("image/").unwrap_or(&image.mime);
@@ -7937,16 +7993,20 @@ mod tests {
     #[test]
     fn a_picture_the_window_cannot_hold_is_refused_before_the_wire() {
         let scripted = Arc::new(Scripted::new().says("looked"));
+        // A model the table documents as seeing: the picture has to meet the
+        // window invariant, not the vision gate (`for_the_model` drops an image
+        // part for a model `vision_capable` says cannot see).
+        let cfg = ConfigHandle::own(Config::new("http://127.0.0.1:1", "deepseek-flash", None));
+        let budget = cfg.config().unwrap().history_budget();
         let (actor, _events, _mailbox) = build_actor_about(
             "over-window-picture",
             scripted.clone(),
-            test_cfg(),
+            cfg,
             Arc::new(ScriptedMachine::new()),
             Arc::new(clock::System),
         );
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
-        let budget = test_cfg().config().unwrap().history_budget();
         let mut messages = vec![
             Message::system("s".repeat(3_247)),
             Message::user_with_images(
@@ -8024,10 +8084,18 @@ mod tests {
                    scripted: &Arc<Scripted>,
                    mut messages: Vec<Message>|
          -> (Result<Option<String>, String>, usize) {
+            // A shape with a picture goes to a model the table documents as
+            // seeing: what it measures is the window, and the vision gate is
+            // its own test (`a_blind_model_is_never_sent_an_image_part`).
+            let cfg = if messages.iter().any(|message| !message.images.is_empty()) {
+                ConfigHandle::own(Config::new("http://127.0.0.1:1", "deepseek-flash", None))
+            } else {
+                test_cfg()
+            };
             let (actor, _events, _mailbox) = build_actor_about(
                 label,
                 scripted.clone(),
-                test_cfg(),
+                cfg,
                 Arc::new(ScriptedMachine::new()),
                 Arc::new(clock::System),
             );
@@ -8111,6 +8179,147 @@ mod tests {
         );
         assert!(outcome.is_err(), "a paste over the budget is refused");
         assert_eq!(sent, 0);
+    }
+
+    /// No request ever carries an image part to a model `vision_capable` says
+    /// cannot see. The attach and deliver gates ask at the box, but a request
+    /// that *replays* a transcript does not: a mid-run model switch (Ctrl-P)
+    /// leaves pictures a seeing model's turns brought in, and the request built
+    /// for the new model would carry `image_url` parts it may reject. The actor's
+    /// transcript keeps the picture whole — only the request's copy loses the
+    /// bytes — and the placeholder line stands where it was, so the model still
+    /// learns a picture arrived and which file it came from. One line names what
+    /// was dropped and `/model` as the road.
+    #[test]
+    fn a_blind_model_is_never_sent_an_image_part() {
+        // `test_cfg`'s model is one no provider row names, and the table says a
+        // capability mush cannot point at a document for is not assumed.
+        let scripted = Arc::new(Scripted::new().says("I cannot see it"));
+        let (actor, events, _mailbox) = build_actor_about(
+            "blind-request",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user_with_images("what is this?", vec![image_at("shot.png", 64, 64)]),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("I cannot see it"));
+
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 1);
+        assert!(
+            asked[0]
+                .messages
+                .iter()
+                .all(|message| message.images.is_empty()),
+            "no image part may reach a model the table says cannot see: {:?}",
+            asked[0]
+                .messages
+                .iter()
+                .map(|message| message.images.len())
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            asked[0]
+                .messages
+                .iter()
+                .any(|message| message.text().contains("[image: shot.png (png)")),
+            "the placeholder stands for the picture, so the model still knows it was there: {:?}",
+            asked[0]
+                .messages
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>()
+        );
+        // The transcript the actor holds keeps the picture whole: the drop is
+        // the request's copy, and a picture goes with the turn it arrived in.
+        assert_eq!(messages[1].images.len(), 1, "the picture is still there");
+        let told: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(line) if line.contains("dropped") => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(told.len(), 1, "one line for the drop: {told:?}");
+        assert!(
+            told[0].contains("`test`") && told[0].contains("/model"),
+            "the line names the model and the road: {}",
+            told[0]
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The fold's own request goes through the same gate: its prompt is built
+    /// from a transcript that may hold a picture (an old turn, a restored
+    /// session) long after the model that could see it is gone, and a summary
+    /// ask that carries image parts to a blind model is the rejected request
+    /// this gate exists for.
+    #[test]
+    fn the_folds_request_is_stripped_too_for_a_blind_model() {
+        let root = scratch_dir("blind-fold");
+        let summary = "the task was to look at a screenshot";
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary)
+                .says("carried on"),
+        );
+        let cfg = Config::new("http://127.0.0.1:1", "scripted", None);
+        let budget = cfg.history_budget();
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(cfg, events.clone(), root.clone(), scripted.clone()).tx;
+        // A picture in the opening turn, and a history filled to the fold's
+        // trigger behind it.
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user_with_images("look at this", vec![image_at("shot.png", 64, 64)]),
+        ];
+        let mut total: usize = messages.iter().map(Message::weight).sum();
+        let mut index = 0;
+        while total <= compaction_trigger(budget) {
+            let assistant = Message::assistant(format!("reply {index} {}", "x".repeat(280)));
+            let user = Message::user(format!("again {index}"));
+            total += assistant.weight() + user.weight();
+            messages.push(assistant);
+            messages.push(user);
+            index += 1;
+        }
+        root_tx.send(AgentMsg::Run(messages)).unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the run must finish: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+
+        let asked = scripted.asked();
+        let fold = asked
+            .iter()
+            .find(|asked| asked.saw(COMPACT_INSTRUCTION))
+            .expect("the fold was asked");
+        assert!(
+            fold.messages
+                .iter()
+                .all(|message| message.images.is_empty()),
+            "the fold's prompt carries no image part to a blind model"
+        );
+        assert!(
+            fold.messages
+                .iter()
+                .any(|message| message.text().contains("[image: shot.png (png)")),
+            "and the placeholder stands where the picture was: {:?}",
+            fold.messages.iter().map(Message::text).collect::<Vec<_>>()
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// A standalone actor over a scratch workspace, for exercising the mailbox
