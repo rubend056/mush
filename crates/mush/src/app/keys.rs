@@ -220,6 +220,11 @@ pub const KEYS: &[Binding] = &[
     },
     Binding {
         context: Context::Chat,
+        keys: "Ctrl-U",
+        help: "clear the words in the box, keeping the images",
+    },
+    Binding {
+        context: Context::Chat,
         keys: "↑ / ↓, PgUp / PgDn",
         help: "scroll the transcript",
     },
@@ -302,6 +307,10 @@ pub enum ChatKey {
     Scroll(i64),
     /// Empty the message box, keeping a draft nowhere.
     Clear,
+    /// `Ctrl-U`: empty the box's words and keep its images — readline's
+    /// `unix-line-discard`, in a box that soft-wraps, so it takes the whole
+    /// draft and not "the cursor's line".
+    ClearWords,
 }
 
 /// What a key does. Every effect the keyboard has on the program goes through
@@ -460,6 +469,11 @@ fn chat(key: KeyEvent) -> Intent {
         // check in [`key`]: a picker owns the keyboard, and an attachment with
         // no box on screen has nowhere to land.
         KeyCode::Char('v') if ctrl => Intent::AttachClipboardImage,
+        // The chat pane's other `Ctrl-` key so far, here for the same reason: it
+        // is about the words being written, and it sits below the picker check
+        // in [`key`], so a picker — which owns the keyboard and has no box on
+        // screen — is not a way to reach the draft behind it.
+        KeyCode::Char('u') if ctrl => Intent::Chat(ChatKey::ClearWords),
         KeyCode::Enter if key.modifiers.contains(KeyModifiers::SHIFT) || alt => {
             Intent::Chat(ChatKey::Newline)
         }
@@ -578,6 +592,7 @@ mod tests {
             (none(KeyCode::PageDown), Intent::Chat(ChatKey::Scroll(-10))),
             (none(KeyCode::Esc), Intent::Chat(ChatKey::Clear)),
             (ctrl('v'), Intent::AttachClipboardImage),
+            (ctrl('u'), Intent::Chat(ChatKey::ClearWords)),
         ];
         for (key, want) in cases {
             assert_eq!(at(Focus::Chat, false, key), want, "{key:?}");

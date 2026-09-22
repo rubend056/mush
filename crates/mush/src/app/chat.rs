@@ -1310,6 +1310,12 @@ impl Chat {
             ChatKey::End => self.input.move_end(),
             ChatKey::Insert(c) => self.input.insert(&c.to_string()),
             ChatKey::Scroll(rows) => self.scroll_by(on, rows),
+            // Ctrl-U: readline's `unix-line-discard`, which is the habit a
+            // terminal input is allowed to have. It clears the whole draft, not
+            // "the cursor's line" — the box soft-wraps, so the line a human
+            // sees is not a line the text has. The images stay: they are not
+            // what the key is about.
+            ChatKey::ClearWords => self.input.clear(),
             // Esc empties the box, and everything waiting to be sent with it:
             // what the human asked to clear is the message they were writing,
             // and half of that message left behind would be a picture they
@@ -1630,6 +1636,11 @@ mod tests {
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    /// A `Ctrl-` key as a terminal delivers it.
+    fn ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
     }
 
     /// An attached image, as `Ctrl-V` or a pasted path produces one. Its bytes
@@ -3094,5 +3105,25 @@ mod tests {
         press(&mut chat, key(KeyCode::End));
         press(&mut chat, key(KeyCode::Backspace));
         assert_eq!(chat.input().text(), "word");
+    }
+
+    /// Ctrl-U clears the words and keeps the images: the images are not what the
+    /// key is about, and Esc is still the one key that takes both.
+    #[test]
+    fn ctrl_u_clears_the_words_and_keeps_the_images() {
+        let mut chat = Chat::bare();
+        chat.attach(image("shot.png"));
+        chat.insert("a draft");
+
+        assert!(press(&mut chat, ctrl('u')));
+        assert_eq!(chat.input().text(), "");
+        assert_eq!(chat.attachments().len(), 1, "the image stays");
+        assert_eq!(chat.attachments()[0].path, "shot.png");
+
+        // The images' rows are still the box's to paint, and Esc takes them.
+        chat.insert("again");
+        press(&mut chat, key(KeyCode::Esc));
+        assert_eq!(chat.input().text(), "");
+        assert!(chat.attachments().is_empty(), "Esc clears both");
     }
 }
