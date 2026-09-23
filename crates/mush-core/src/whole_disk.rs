@@ -67,6 +67,17 @@
 //! allowed, and the other whole-disk walkers (`du`, `ls -R`, `grep -r`, `rg`,
 //! `tree`, `fd`) share the rule because their roots can be read the same way.
 //!
+//! Two more spellings reach that root, and the reading sees both. A glob in the
+//! name *directly* under `/` — `find /*`, `du -sh /*`, `rg foo /*` — is refused:
+//! the shell expands it to `/`'s own entries before the walker starts, so it
+//! walks the whole disk by expansion, and a name under `/` is provably one of
+//! `/`'s entries where a variable's value is not. The reading cannot tell which
+//! names survive the expansion (`/*` is every top-level entry, `/t*` is
+//! whatever starts with `t`), so it refuses the shape rather than guess; a glob
+//! deeper than that (`find /tmp/*`) is a walk of some other root and stays
+//! allowed. And `find`'s own `--` ends its options, as GNU find reads it, so
+//! `find -- /` is `find /` rather than a path loop with nothing to read.
+//!
 //! Two cases are deliberately *not* guessed at, and they are why an unknown cwd
 //! or an unknown operand allows a bare walker:
 //!
@@ -92,6 +103,7 @@
 //! `<<` does not begin its own word — `cat<<EOF` is one word, so its body is
 //! read as commands, and a `find /` written in it is refused.
 
+use std::ffi::OsStr;
 use std::path::{Component, Path, PathBuf};
 
 /// The refusal's one sentence: what was refused, why, the road that works, and
@@ -141,8 +153,23 @@ impl Cwd {
     }
 
     /// Whether a walker starting at this operand would start at `/`.
+    ///
+    /// `/` itself is one spelling; a glob in the name *directly* under it is
+    /// the other (finding IN10). The shell expands such an operand to `/`'s own
+    /// entries before the walker ever starts, so `find /*` and `du -sh /*` walk
+    /// the disk by expansion where they do not name it: a name under `/` is
+    /// *provably* one of `/`'s entries, where a variable's value is not. The
+    /// glob is read on the normalized path, so `/./*` and `/tmp/../*` are the
+    /// same fact as `/*`; only the component directly under `/` counts, so
+    /// `find /tmp/*` is a walk of `/tmp` and stays allowed.
     fn walk_is_root(&self, operand: &str) -> bool {
-        resolve(operand, self).is_some_and(|root| root == Path::new("/"))
+        let Some(root) = resolve(operand, self) else {
+            return false;
+        };
+        if root == Path::new("/") {
+            return true;
+        }
+        root.parent() == Some(Path::new("/")) && root.file_name().is_some_and(has_glob)
     }
 
     /// Whether the walker's default root — the cwd itself — is `/`.
@@ -167,6 +194,16 @@ fn resolve(operand: &str, cwd: &Cwd) -> Option<PathBuf> {
             Cwd::Unknown => None,
         }
     }
+}
+
+/// Whether a name holds a character the shell expands as a glob: `*`, `?` or an
+/// opening `[`. A `]` on its own is an ordinary byte.
+///
+/// The whole-disk reading refuses a glob in the name directly under `/` because
+/// the shell expands it to `/`'s own entries where the reading cannot see the
+/// expansion; this is the one place that decides what counts as one.
+fn has_glob(name: &OsStr) -> bool {
+    name.to_string_lossy().contains(['*', '?', '['])
 }
 
 /// The shell's own path arithmetic, lexically: `/tmp/x/../..` is `/`, `/./` is
@@ -904,10 +941,16 @@ fn walker_refuses(walker: &Walker, args: &[String], cwd: &Cwd) -> bool {
 }
 
 /// Whether `find`'s operands send it to `/`. `find`'s syntax is its own:
-/// leading options (`-H`, `-L`, `-P`, `-D debugopts`, `-O level`), then path
-/// operands until the expression begins — the first word that starts with `-`,
-/// or `!`, `(`, `)`. With no path operand `find` searches the cwd, which its
-/// own `--help` says.
+/// leading options (`-H`, `-L`, `-P`, `-D debugopts`, `-O level`, and the `--`
+/// that ends them — GNU find reads `--` as the end of its own options, probed
+/// on this box: `find -- /tmp -maxdepth 0` printed `/tmp`), then path operands
+/// until the expression begins — the first word that starts with `-`, or `!`,
+/// `(`, `)`. With no path operand `find` searches the cwd, which its own
+/// `--help` says.
+///
+/// The `--` used to be read as the expression's first word: the path loop broke
+/// on it, found no operand, and the cwd fallback answered instead of the `/`
+/// that followed, so `find -- /` — the same walk as `find /` — ran (finding R8).
 fn find_refuses(args: &[String], cwd: &Cwd) -> bool {
     let mut at = 0;
     while at < args.len() {
@@ -917,6 +960,12 @@ fn find_refuses(args: &[String], cwd: &Cwd) -> bool {
             // also be attached (`-O2`).
             "-D" | "-O" => at += 2,
             word if word.len() > 2 && word.starts_with("-O") => at += 1,
+            // The end of find's own options. The path loop below then reads
+            // the operand that follows, which is the whole fact.
+            "--" => {
+                at += 1;
+                break;
+            }
             _ => break,
         }
     }
@@ -1337,6 +1386,44 @@ mod tests {
         // own word — so the body is read as commands: an over-refusal, not a
         // miss, and the module docs say so.
         assert!(refused("cat<<EOF\nfind /\nEOF"));
+    }
+
+    /// The whole-disk guard reads the two spellings of `/` it used to miss
+    /// (findings R8 and IN10). `find -- /` is `find /` — the `--` ends find's
+    /// own options, as GNU find reads it (probed on this box: `find -- /tmp
+    /// -maxdepth 0` printed `/tmp`) — but the path loop read the `--` as the
+    /// expression's first word, found no path operand, and let the fallback
+    /// look at the effective cwd, which is the workspace root. `/*` is a glob
+    /// in the name directly under `/`, which the shell expands to every
+    /// top-level entry before the walker starts: it *is* a walk of the whole
+    /// disk, and `normalize` kept it as a path named `*`. The same two
+    /// spellings reach every other walker (`ls -R /*`, `du -sh /*`, `rg foo
+    /// /*`), so the rule is read where their roots are.
+    #[test]
+    fn a_root_spelled_by_a_marker_or_a_glob_is_still_refused() {
+        for command in [
+            "find -- /",
+            "find -- / -name '*.log'",
+            "find -H -- /",
+            "find /*",
+            "find /./*",
+            "find /tmp/../*",
+            "cd / && find -- .",
+            "ls -R /*",
+            "du -sh /*",
+            "grep -r foo /*",
+            "rg foo /*",
+            "tree /*",
+            "fd foo /*",
+        ] {
+            assert!(refused(command), "must be refused: {command}");
+        }
+        // The glob rule is the name *directly* under `/`: a glob deeper than
+        // that is a walk of some other root, and stays allowed like every
+        // operand that does not name `/`.
+        for command in ["find /tmp/*", "ls -R /tmp/*", "du -sh /tmp/*", "find ./*"] {
+            assert!(allowed(command), "must stay allowed: {command}");
+        }
     }
 
     /// The sentence the model reads names what was refused, the road that
