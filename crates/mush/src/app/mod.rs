@@ -690,6 +690,13 @@ pub struct App {
     /// older tree is not one: it is dropped when it lands (finding D26), and
     /// `Ctrl-N` clears this with the tree that started it.
     git_in_flight: bool,
+    /// The facts the spawn cap asks about this tree's worktrees — each node's
+    /// base and fork — published for the actor threads that ask
+    /// (`git::unlandable`, from `agent::spawn_tool`). The guard lives as long
+    /// as the app, so a later tree on this root cannot be judged by this one's
+    /// nodes; [`Self::refresh_git`] walks them into it on every read (finding
+    /// F7).
+    worktree_facts: git::PublishedFacts,
     /// A transient line for the bar: what just happened, or what went wrong.
     /// Work in progress does not live here — it is derived from the phases.
     pub status: Option<Status>,
@@ -835,6 +842,12 @@ impl App {
         session_save: Arc<dyn SessionSave>,
     ) -> Self {
         let system = Message::system(prompt::system_prompt(&ws.root_str()));
+        // The facts the spawn cap asks about this tree's worktrees, before any
+        // actor thread can ask: published here and refreshed by every git read
+        // ([`Self::refresh_git`]). The guard lives as long as the app, so a
+        // later tree on this root cannot be judged by this one's nodes
+        // (finding F7).
+        let worktree_facts = git::publish_worktree_facts(ws.root());
         let (messages, stored_agents, stored_notices) = match stored {
             Some(session) => (session.messages, session.agents, session.notices),
             None => (Vec::new(), Vec::new(), Vec::new()),
@@ -862,6 +875,7 @@ impl App {
             ui_tx,
             git_at: None,
             git_in_flight: false,
+            worktree_facts,
             status: None,
             should_quit: false,
             dirty_screen: true,
@@ -1236,6 +1250,9 @@ impl App {
         // read must not even propose it (finding H10).
         let mut branches: Vec<(AgentId, String, String)> = Vec::new();
         let mut sweep: Vec<(AgentId, String, Option<String>)> = Vec::new();
+        // The same walk yields the spawn cap's own facts: one entry per node
+        // with a worktree, published whole (`Self::worktree_facts`).
+        let mut facts: Vec<(u64, String, Option<String>)> = Vec::new();
         // A worktree may only be swept while nothing of its agent's own is out: a
         // child that is still working, or a result the agent has not read yet,
         // wakes its actor into a fresh run *in that directory* — and a run in a
@@ -1259,8 +1276,15 @@ impl App {
             if !self.in_flight(node) && !waking.contains(&node.id) {
                 sweep.push((node.id, base.clone(), node.fork.clone()));
             }
+            facts.push((node.id.0, base.clone(), node.fork.clone()));
             branches.push((node.id, base, branch));
         }
+        // The same walk is what the spawn cap is handed: each node's base and
+        // fork, the two facts that make `git::unlandable` ask the sweep's own
+        // question instead of one against `HEAD` (finding F7). Published before
+        // the worker starts — they are UI facts, and the worker is only the git
+        // half — and the guard drops them with the app.
+        self.worktree_facts.set(facts);
         let tx = self.ui_tx.clone();
         std::thread::spawn(move || {
             let mut stats = HashMap::new();
@@ -18025,14 +18049,14 @@ mod tests {
                 0u64,
                 "parent work".to_string(),
                 "mush/1".to_string(),
-                parent_fork,
+                parent_fork.clone(),
             ),
             (
                 2,
                 1,
                 "child work".to_string(),
                 "mush/2".to_string(),
-                child_fork,
+                child_fork.clone(),
             ),
         ] {
             app.update(Msg::Agent {
@@ -18058,6 +18082,23 @@ mod tests {
         wait_git(&mut app, &rx);
 
         app.refresh_git();
+        // The spawn cap's own question, asked while both checkouts are still
+        // on disk: the walk above published each node's base and fork, so
+        // `unlandable` measures the child against its parent's branch — the
+        // one thing finding F7 proved a cap against `HEAD` got wrong — and
+        // the merged child is not what refuses a spawn.
+        assert_eq!(
+            app.worktree_facts.published(),
+            Some(vec![
+                (1, "HEAD".to_string(), Some(parent_fork)),
+                (2, "mush/1".to_string(), Some(child_fork)),
+            ])
+        );
+        assert_eq!(
+            git::unlandable(&root),
+            vec![1],
+            "the nested child merged into its parent is not counted"
+        );
         wait_git(&mut app, &rx);
 
         let child = app.tree.node(AgentId(2)).expect("the child is in the tree");
