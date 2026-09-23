@@ -874,7 +874,8 @@ pub struct Chat {
     /// here, next to the transcript it opens.
     system: Message,
     /// Each *subagent's* own system prompt, keyed by id: the prompt its actor
-    /// was built with, published once per actor ([`AgentEvent::SystemPrompt`]).
+    /// was built with, published once per actor
+    /// ([`AgentEvent::SystemPrompt`](crate::agent::AgentEvent::SystemPrompt)).
     ///
     /// The root's is `system` above. A child's cannot be rebuilt here: it names
     /// the workspace the child's own tools resolve paths in, its depth, and
@@ -1102,7 +1103,8 @@ impl Chat {
     /// `id`'s actor says what its own history opens with: the prompt it was
     /// built with, and the one every request it sends starts from.
     ///
-    /// One writer, one reader: the actor emits it ([`AgentEvent::SystemPrompt`]
+    /// One writer, one reader: the actor emits it
+    /// ([`AgentEvent::SystemPrompt`](crate::agent::AgentEvent::SystemPrompt)
     /// when its thread is built) and [`Self::used_weight_for`] weighs it. It is
     /// not stored in the session — a prompt names a workspace that may have
     /// moved, so `session_snapshot` leaves a child's system message out of what
