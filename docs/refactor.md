@@ -513,8 +513,8 @@ was asked for, and what it now says:
   idle-box frame-budget test.
 - §12: the decisions the wave made — one owner per fact; a trait is justified
   only by a fake a test actually uses; a delivered result has one owner; notices
-  have kinds and lifetimes; a transport hiccup is retried and an answer is not; a
-  window a human states beats a default.
+  have kinds and lifetimes; a request that never went out is retried and an
+  answer is not; a window a human states beats a default.
 
 Housekeeping: `.mush/wt/2` was still registered, and `mush/2` pointed at `d4f80ae`
 = master with a clean worktree, so `/discard 2` lost nothing. **Done**: wave 0
