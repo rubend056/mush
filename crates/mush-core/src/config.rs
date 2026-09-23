@@ -494,9 +494,18 @@ fn normalize_url(url: &str) -> String {
 ///
 /// Surrounding space is trimmed *before* the check, as it is for every other
 /// stated value: a URL pasted with a trailing newline is the URL it looks like,
-/// and an interior one is not a URL at all.
+/// and an interior one is not a URL at all. A value that is *only* space trims
+/// to the empty string, which is not an endpoint: `MUSH_URL="   "` used to be
+/// taken as the empty URL — a value that looked set, and every request line
+/// built from it began at the path — so the empty result is refused by this
+/// same door, naming the road the value came in by, while the lenient read
+/// ([`Config::from_env`]) drops it and falls back to the provider's default
+/// exactly as it does for an absent variable (finding D19's family).
 pub fn checked_url(url: &str, road: &str) -> Result<String, String> {
     let url = url.trim();
+    if url.is_empty() {
+        return Err(format!("{road} is empty after trimming — check the value"));
+    }
     match url.chars().find(|character| character.is_control()) {
         Some(control) => Err(format!(
             "{road} contains a control character ({}) — check the value",
@@ -1420,6 +1429,91 @@ mod tests {
         // block gives `/url` is the URL it looks like.
         config.set_base_url("  http://next.test:8078/  \n");
         assert_eq!(config.base_url, "http://next.test:8078");
+    }
+
+    /// A URL that is only space is not an endpoint: the door trims before it
+    /// decides, and `MUSH_URL="   "` left the empty string — a value that
+    /// looked set, with every request line built from it beginning at the
+    /// path. It is the same door's fact as a control character (finding D19's
+    /// family): the checked read refuses it by name, the lenient read drops it
+    /// and falls back to the provider's default exactly as it does for an
+    /// absent variable, and no writer moves the endpoint to the empty URL.
+    #[test]
+    fn a_url_of_only_spaces_is_not_an_endpoint() {
+        assert_eq!(
+            parse_url_env("   "),
+            Err("MUSH_URL is empty after trimming — check the value".to_string())
+        );
+        // Every road that states one goes through the door, and the road is
+        // named: the flag and a file's line, as for a control character.
+        assert_eq!(
+            checked_url("   ", "--url"),
+            Err("--url is empty after trimming — check the value".to_string())
+        );
+
+        // The lenient environment layer — the read with no human to answer —
+        // falls back to the provider's default, the road an absent `MUSH_URL`
+        // takes. Before this fact it stored the empty endpoint instead.
+        assert_eq!(
+            Config::from_env_layer(&Overrides {
+                url: Some("   ".into()),
+                ..Overrides::default()
+            })
+            .base_url,
+            Provider::Custom.default_base_url()
+        );
+
+        // The flag: refused by name, and nothing is applied to the base config.
+        let cli = Overrides {
+            url: Some("   ".into()),
+            ..Overrides::default()
+        };
+        assert_eq!(
+            resolve_with(
+                Config::new("http://base:0", "m", None),
+                &cli,
+                &Overrides::default(),
+                &UserConfig::default(),
+                None,
+            )
+            .unwrap_err(),
+            "--url is empty after trimming — check the value"
+        );
+
+        // The home config names the file to fix, the way its control-character
+        // refusal does.
+        let error = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home("custom", "   ", "m"),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with("home config's base_url is empty after trimming"),
+            "{error}"
+        );
+
+        // A session is a file a workspace carries rather than hand-edited
+        // input, so the bad value is a notice and the endpoint in force stays
+        // where it was.
+        let resolved = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &UserConfig::default(),
+            Some(&stored("custom", "   ", "m")),
+        )
+        .unwrap();
+        assert_eq!(resolved.config.base_url, "http://base:0");
+        assert_eq!(resolved.notices.len(), 1, "{:?}", resolved.notices);
+
+        // And the writer `/url` reaches: refused, so the endpoint a request
+        // line is built from is unchanged.
+        let mut config = Config::new("http://base:0", "m", None);
+        config.set_base_url("   ");
+        assert_eq!(config.base_url, "http://base:0");
     }
 
     /// The other field a request head is built from (finding C7): a key with a
