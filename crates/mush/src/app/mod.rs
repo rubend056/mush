@@ -2375,10 +2375,11 @@ impl App {
     /// (`◐ #0 edit_file src/lib.rs 12s`) and the transcript had said again
     /// (`⚙ edit_file src/lib.rs`): one fact, three homes, and the bar's only
     /// line spent on a sentence the human had already read twice (finding U5).
-    /// What survives is the fact no row states even though its `⏸N` implies
-    /// it: an orchestrator that has ended its turn with children still working
-    /// is napping and *will* resume by itself (§5.5), which is a promise about
-    /// what happens next rather than a report of what is happening now.
+    /// What survives is the one reading the rows cannot promise: an
+    /// orchestrator that has ended its turn with children still working is
+    /// napping and *will* resume by itself (§5.5) — its own row says it is at
+    /// rest over the children's running rows, and this says what happens next
+    /// rather than reporting what is happening now.
     ///
     /// Everything else the bar's line one carries is an event with no other
     /// home — a failure, a stop, a job's report, a command's answer — and the
@@ -2394,8 +2395,8 @@ impl App {
     /// typing.
     ///
     /// The count is the root's *own* busy children — [`AgentTree::busy_counts`] —
-    /// the same derivation the row's `⏸N` mark and the title's `M waiting`
-    /// read, and not every busy node in the tree. The sentence is a promise
+    /// the same derivation the title's `M waiting` reads, and not every busy
+    /// node in the tree. The sentence is a promise
     /// about when the root resumes, and it resumes when its children finish: a
     /// grandchild working under a child that is itself parked promised a resume
     /// the grandchild's finish does not cause, and it contradicted the title of
@@ -2421,9 +2422,9 @@ impl App {
         if !self.tree.napping(AgentId::ROOT) {
             return None;
         }
-        // The count is the root's own busy children, read from the same map the
-        // rows' `⏸N` marks and the title's buckets are built from: one
-        // derivation, so a count and a mark cannot disagree (finding U1).
+        // The count is the root's own busy children, read from the same
+        // derivation the title's buckets are built from: one count, so the
+        // bar's number and the title's cannot disagree (finding U2).
         let waiting = self
             .tree
             .busy_counts()
@@ -2970,12 +2971,19 @@ impl App {
     ///
     /// Each entry is a row from [`App::rows`] — the one derivation of what a row
     /// says — plus what a row cannot carry: where the node hangs, its phase's
-    /// machine name, its raw branch and worktree, the summary, and the
-    /// revision a client edits against. Deriving the row again here is how a
-    /// roster starts claiming things the pane does not say (finding R21).
+    /// machine name, its raw branch and worktree, the summary, the parent's
+    /// working-children count, and the revision a client edits against.
+    /// Deriving the row again here is how a roster starts claiming things the
+    /// pane does not say (finding R21).
     fn attach_agents(&self) -> attach::Reply {
         let nodes = self.tree.rows();
         let rows = self.rows(&nodes);
+        // The wire's `children_working` is the count the title's `M waiting`
+        // and the bar's sentence read, from the one derivation they read: built
+        // once for the whole roster rather than once per node (finding U2,
+        // R29), so a client's roster and the pane it mirrors cannot count the
+        // children differently.
+        let busy = self.tree.busy_counts();
         let agents: Vec<serde_json::Value> = nodes
             .iter()
             .zip(rows)
@@ -2992,7 +3000,7 @@ impl App {
                     "branch": node.branch.clone(),
                     "worktree": self.attach_worktree(node.id),
                     "focused": row.focused,
-                    "children_working": row.waiting,
+                    "children_working": busy.get(&node.id).copied().unwrap_or(0),
                     "result_unread": row.result_unread,
                     "unread_children": row.unread_children,
                     "leftover": node.leftover,
@@ -15225,9 +15233,9 @@ mod tests {
     /// counts (finding U2).
     ///
     /// It used to say `N running` over every busy phase, so an agent napping on
-    /// its children — a row wearing `⏸` — was counted as work the title could
-    /// not show. The counts now come from the phases as two disjoint buckets,
-    /// and each clause says which one it is.
+    /// its children — at rest while their rows say they run — was counted as
+    /// work the title could not show. The counts now come from the phases as
+    /// two disjoint buckets, and each clause says which one it is.
     #[test]
     fn the_title_counts_working_and_waiting_agents_separately() {
         let (mut app, _rx) = test_app("title-counts");
@@ -15504,13 +15512,15 @@ mod tests {
         );
     }
 
-    /// A working agent with working children is drawn working, and the children
-    /// are a second mark rather than a replacement glyph (finding U1).
+    /// A working agent with working children is drawn working: the glyph is a
+    /// function of the agent's own phase alone, and the children's own rows say
+    /// they are running (finding U1).
     ///
     /// The row used to derive its glyph from "has live children", so an agent
     /// mid-turn with children running wore `⏸` — "paused" about the one agent
-    /// the human was watching work. The glyph is now a function of the agent's
-    /// own phase and `⏸N` carries the children, so neither fact hides the other.
+    /// the human was watching work — and the count that replaced it was read on
+    /// the parent's row as a pause too, which is why it is gone (the human's
+    /// ask): the children's `◐` rows are where their run is read.
     #[test]
     fn a_working_agent_with_working_children_is_not_drawn_paused() {
         let (mut app, _rx) = test_app("waiting-glyph");
@@ -15541,28 +15551,32 @@ mod tests {
         }
 
         let rows = screen(&mut app, 120, 32);
-        let root_row = rows
-            .iter()
-            .find(|row| row.contains("#0"))
-            .expect("the root has a row")
-            .clone();
+        let row_of = |id: &str| {
+            rows.iter()
+                .find(|row| row.contains(id))
+                .unwrap_or_else(|| panic!("{id} has a row: {rows:#?}"))
+                .clone()
+        };
+        let root_row = row_of("#0");
         assert!(
             root_row.contains("◐ #0"),
-            "a working agent is `◐`, never `⏸`: {root_row}"
-        );
-        assert!(
-            root_row.contains("⏸2"),
-            "and its two working children are still on the row: {root_row}"
+            "a working agent is `◐`: {root_row}"
         );
 
-        // A child with no children of its own wears the plain running glyph.
-        let child_row = rows
-            .iter()
-            .find(|row| row.contains("#1"))
-            .expect("the child has a row")
-            .clone();
-        assert!(child_row.contains("◐ #1"), "{child_row}");
-        assert!(!child_row.contains("⏸"), "{child_row}");
+        // The two children say they are running on their own rows, and the
+        // title counts them; no row claims a pause about anybody.
+        for (id, child_row) in [("#1", row_of("#1")), ("#2", row_of("#2"))] {
+            assert!(child_row.contains(&format!("◐ {id}")), "{child_row}");
+        }
+        assert!(
+            rows.iter().all(|row| !row.contains('⏸')),
+            "no row wears the removed count: {rows:#?}"
+        );
+        assert!(
+            rows[0].contains("3 working"),
+            "the title counts the agents whose own run is in flight — all three: {}",
+            rows[0]
+        );
     }
 
     /// A pane's position is the human's: another agent's line cannot move it,
@@ -15988,9 +16002,9 @@ mod tests {
         keep.push(rx);
 
         // A root parked on a child's result — and a grandchild of its own in
-        // flight under that child, because the count the bar prints, the `⏸N`
-        // on the row and the title's `M waiting` all have to be about the
-        // root's *own* children (finding U2).
+        // flight under that child, because the count the bar prints and the
+        // title's `M waiting` both have to be about the root's *own* children,
+        // not every busy node in the tree (finding U2).
         let (mut parked, rx) = test_app("sweep-parked");
         spawn_agent(
             &mut parked,
@@ -16004,7 +16018,7 @@ mod tests {
         states.push(Sweep {
             name: "parked on children",
             app: parked,
-            words: vec!["⏸1", "2 working", "waiting on 1 subagent"],
+            words: vec!["· #0", "2 working", "waiting on 1 subagent"],
             roomy: vec!["◐ #1", "◐ #2", "lexer", " agents · 2 working · 1 waiting"],
             absent: Vec::new(),
         });
@@ -16955,8 +16969,8 @@ mod tests {
     ///
     /// The bar's sentence is a promise about when the root resumes — "the root
     /// resumes as they finish" — and the root resumes when *its* children
-    /// finish, which is the derivation the row's `⏸N` and the title's `M
-    /// waiting` read. The bar counted every busy node in the tree instead, so
+    /// finish, which is the derivation the title's `M waiting` and the bar's
+    /// count read. The bar counted every busy node in the tree instead, so
     /// with a grandchild at work it promised a resume that the grandchild's
     /// finish does not cause, in the same frame where the pane title named one
     /// (finding U2's second owner).
@@ -18212,7 +18226,8 @@ mod tests {
     }
 
     /// The roster is read from the tree: parents, phases, the focused flag, and
-    /// the working-children count the row paints as `⏸N` (M3 / H1).
+    /// the working-children count the bar's sentence and the title's `M waiting`
+    /// read (M3 / H1).
     #[test]
     fn attach_agents_reflects_the_tree() {
         let (mut app, _rx) = test_app("attach-agents");

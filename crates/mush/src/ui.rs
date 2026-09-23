@@ -5,9 +5,14 @@
 //! "does not panic" (refactor B17).
 //!
 //! Every colour lives here, and every colour is one of two kinds. The *chrome*
-//! — the focused border, the selected row, the picker's frame, the message
-//! prompt, the bar's badge and an activity line — wears the workspace's
-//! [`Theme`] accent, so two windows are told apart at a glance.
+//! wears the workspace's [`Theme`] accent — so two windows are told apart at a
+//! glance — and the hue only ever *points*: at whose window this is, or at
+//! where the keyboard is, never at what happened. This is the whole list: the
+//! focused border, the bar's badge, the message prompt, the picker's frame,
+//! the selected row of whichever list is acting for the keyboard (the agent
+//! tree's — a band while that pane has the keyboard, the hue as the row's own
+//! ink while the chat does — and the picker's), the transcript select mode's
+//! cursor band and its selection, and an activity line.
 //! The *content* — dimmed text, the alert red, the floor notice's yellow, the
 //! body gray — stays fixed: a failure reads the same in every workspace.
 
@@ -119,7 +124,7 @@ fn draw_agents(frame: &mut Frame, pane: &AgentsPane, focus: Focus, theme: &Theme
     // changed and no column spent, which is why an outline, an underline or the
     // old `› ` highlight symbol were all worse: any of them spends or moves a
     // cell, and the row's first cells are the tree's `▶` and the agent's own
-    // `⊘`/`⏸`/`✓` glyph, which are state and not this mark's to paint over.
+    // `⊘`/`✓` glyph, which are state and not this mark's to paint over.
     let highlight = if focus == Focus::Agents {
         Style::default().fg(Color::Black).bg(theme.accent())
     } else {
@@ -161,10 +166,10 @@ fn draw_agents(frame: &mut Frame, pane: &AgentsPane, focus: Focus, theme: &Theme
 /// full. The fields themselves are derived by the tree; this only spends the
 /// columns on them.
 ///
-/// The head is where a mark that must never be given up rides: `✉`/`✉N`,
-/// `⏸N`, and the `⚮` a row wears when its parent is gone. The title yields its
-/// columns first, so a mark left in the tail could vanish on a narrow pane
-/// where the fact is most needed.
+/// The head is where a mark that must never be given up rides: `✉`/`✉N` and
+/// the `⚮` a row wears when its parent is gone. The title yields its columns
+/// first, so a mark left in the tail could vanish on a narrow pane where the
+/// fact is most needed.
 ///
 /// `pub(crate)`, not private, because "every row fits its pane" is an assertion
 /// a frame has to carry: the sweep fits each row at the width it is painted at
@@ -202,11 +207,6 @@ pub(crate) fn agent_line(row: &AgentRow, width: usize) -> String {
     }
     if row.unread_children > 0 {
         head.push_str(&format!(" ✉{}", row.unread_children));
-    }
-    if row.waiting > 0 {
-        // R4's `⏸`, owned by the children it is about: the parent's own state
-        // stays in the glyph, and this says how much it has out.
-        head.push_str(&format!(" ⏸{}", row.waiting));
     }
     let tail: Vec<String> = if row.activity.is_empty() {
         Vec::new()
@@ -762,7 +762,7 @@ mod tests {
 
     /// An agents pane at `area` with the tree's four leading shapes — an idle
     /// `·`, the `⊘` a stopped agent wears, a finished `✓`, and a running `◐`
-    /// three levels in with its `⏸` count — and the cursor on the `✓` row, so
+    /// three levels in — and the cursor on the `✓` row, so
     /// the mark has rows on both sides of it and the leading glyphs it must not
     /// paint over. The geometry is `App::agents_pane`'s at a plain size: a
     /// bordered pane with no footer, so the list gets the whole inner rect.
@@ -778,7 +778,6 @@ mod tests {
                 parent_gone: false,
                 glyph,
                 focused: false,
-                waiting: at,
                 result_unread: false,
                 unread_children: 0,
                 title: format!("row {at}"),
@@ -816,7 +815,7 @@ mod tests {
     /// (instead of fill)"). The quiet mark spends no column and moves no cell,
     /// which an outline, an underline or a `highlight_symbol` could not promise:
     /// the selected row's leading cells are the tree's `▶` and the agent's own
-    /// `⊘`/`⏸`/`✓` glyph, and those are state, not this mark's to paint over.
+    /// `⊘`/`✓` glyph, and those are state, not this mark's to paint over.
     #[test]
     fn the_agents_cursor_is_a_band_only_while_the_pane_has_the_keyboard() {
         /// The cell wears the band: `Black` text on the accent's background.
@@ -915,7 +914,7 @@ mod tests {
 
             // And nothing moved: the two frames carry the same glyphs in the
             // same cells — the pane's geometry, every row's fields, and the
-            // cursor row's own `✓` and `⏸` among them.
+            // cursor row's own `✓` among them.
             for y in area.y..area.bottom() {
                 for x in area.x..area.right() {
                     assert_eq!(
