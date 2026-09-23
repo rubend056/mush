@@ -2482,7 +2482,8 @@ mod tests {
             &mush_core::UserConfig::default(),
             None,
         )
-        .expect("the environment resolves to a config");
+        .expect("the environment resolves to a config")
+        .config;
         if cfg.model.is_empty() {
             // Nothing named one: take what the endpoint lists first, so the
             // request names a model the endpoint knows.

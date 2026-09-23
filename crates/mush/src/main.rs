@@ -628,6 +628,10 @@ fn unreadable_session_notice(
 /// argument, tolerating one that does not canonicalize yet, because the dump
 /// describes a workspace that is allowed not to exist.
 ///
+/// The home config is the caller's ([`run`] reads the file once for both roads),
+/// because its *complaint* when it could not be read is a fact the dump prints
+/// and the startup road says before the first frame (finding C3).
+///
 /// The session is read as [`session::Stored`], not through `Session::load`
 /// — which answers `None` for a file that is *there and unusable* exactly as it
 /// does for no file at all. The two are different facts about the layer, and a
@@ -637,15 +641,16 @@ fn resolved_config(
     dir: &Path,
     overrides: &Overrides,
     env: &theme::EnvText,
-) -> Result<(Config, session::Stored, theme::Theme), Box<dyn Error>> {
+    home: &UserConfig,
+) -> Result<(config::Resolved, session::Stored, theme::Theme), Box<dyn Error>> {
     let stored = Session::read(dir);
     let session = match &stored {
         session::Stored::Loaded(session) => Some(session),
         session::Stored::Absent | session::Stored::Unusable(_) => None,
     };
-    let config = config::resolve(overrides, &UserConfig::load(), session)?;
+    let resolved = config::resolve(overrides, home, session)?;
     let theme = theme::Theme::resolve(env, dir)?;
-    Ok((config, stored, theme))
+    Ok((resolved, stored, theme))
 }
 
 /// `--print-config`: the resolved config and nothing else — no workspace, no
@@ -656,8 +661,14 @@ fn resolved_config(
 /// One column, wide enough for the longest name (`history budget`): a name that
 /// overflows its padding runs into its own value, and `history budget1291500
 /// bytes` is not a line a human can read.
-fn print_config(config: &Config, stored: &session::Stored, theme: &theme::Theme) {
-    for (field, value) in describe(config, auto_approve(), stored, theme) {
+fn print_config(
+    config: &Config,
+    stored: &session::Stored,
+    theme: &theme::Theme,
+    notices: &[String],
+    home: Option<&str>,
+) {
+    for (field, value) in describe(config, auto_approve(), stored, notices, home, theme) {
         println!("{field:<15}{value}");
     }
 }
@@ -669,6 +680,8 @@ fn describe(
     config: &Config,
     approved: bool,
     stored: &session::Stored,
+    notices: &[String],
+    home: Option<&str>,
     theme: &theme::Theme,
 ) -> Vec<(String, String)> {
     // The session is the workspace's own layer of the chain, and the dump says
@@ -757,7 +770,7 @@ fn describe(
     } else {
         "no"
     };
-    vec![
+    let mut rows = vec![
         ("endpoint".to_string(), config.base_url.clone()),
         ("provider".to_string(), config.provider.name().to_string()),
         // Before the values it can supply: endpoint, provider, model and
@@ -783,7 +796,36 @@ fn describe(
         // comparing two windows needs the fact `--print-config` shows to be
         // the one the window would have, environment included.
         ("theme".to_string(), theme.describe()),
-    ]
+    ];
+    // The home config is the layer below the session, and the one whose file
+    // mush could not read but did not refuse to start over: the row appears only
+    // when there is a complaint, because a file that read (or none at all) is
+    // not news. It sits directly under the session — before the values either
+    // layer can supply — and its words come from a file on their way to a
+    // terminal, so they take the same door the session row's reason does
+    // (finding C3).
+    if let Some(complaint) = home {
+        let at = rows
+            .iter()
+            .position(|(field, _)| field == "session")
+            .map_or(rows.len(), |at| at + 1);
+        rows.insert(
+            at,
+            (
+                "home config".to_string(),
+                format!("unreadable — {}", mush_core::text::sanitize(complaint)),
+            ),
+        );
+    }
+    // The lines resolution owed the human: a stored layer that was refused
+    // rather than obeyed (finding C2). A row of its own, the way the session
+    // layer's `unreadable` is, because these are facts about the chain that no
+    // other row can carry — and both are built from what a file contained, so
+    // both go through the door every terminal-bound string goes through.
+    for notice in notices {
+        rows.push(("notice".to_string(), mush_core::text::sanitize(notice)));
+    }
+    rows
 }
 
 /// Open the workspace directory, naming it when it cannot be opened.
@@ -855,14 +897,29 @@ fn run() -> Result<(), Box<dyn Error>> {
     // path, so nothing further down touches the process environment.
     let env = theme::EnvText::read();
 
+    // The home config is read once, here: both roads need it, and reading the
+    // file twice would be a second chance for the two to disagree about what it
+    // says (and about whether it could be read at all). It is a layer below the
+    // session, so a file mush cannot read is not fatal — the defaults stand in —
+    // but it is not silent either: the complaint travels to `--print-config` as
+    // a row and to the window as a failure before the first frame (finding
+    // C3).
+    let home = UserConfig::load();
+
     if args.print_config {
         // The resolved config, then out: no terminal is entered, no `.mush/` is
         // created, no lock is taken and no request is made — [`resolved_config`]
         // is where the layers are read, and where a session file that cannot be
         // read stays a fact about the layer rather than being flattened into
         // absence (finding B2).
-        let (config, stored, theme) = resolved_config(&dir, &overrides, &env)?;
-        print_config(&config, &stored, &theme);
+        let (resolved, stored, theme) = resolved_config(&dir, &overrides, &env, &home.config)?;
+        print_config(
+            &resolved.config,
+            &stored,
+            &theme,
+            &resolved.notices,
+            home.complaint.as_deref(),
+        );
         return Ok(());
     }
 
@@ -920,7 +977,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         }
     };
-    let config = config::resolve(&overrides, &UserConfig::load(), stored.as_ref())?;
+    let resolved = config::resolve(&overrides, &home.config, stored.as_ref())?;
+    // The lines a stored layer owes the human travel to the frame with the
+    // config; the config itself is cloned into the cell below.
+    let notices = resolved.notices;
+    let config = resolved.config;
 
     // Model discovery happens *after* the first frame, on its own thread. A
     // model from the startup precedence skips it entirely; when one has to be
@@ -982,9 +1043,18 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     // Before the first frame, so the line is one of the first things painted:
     // a workspace whose conversation could not be read is not a workspace with
-    // nothing in it.
+    // nothing in it, a home config mush could not read is not a machine with no
+    // settings, and a notice resolution owed (a session provider this build does
+    // not know, finding C2) is not noise either. The failures come last because
+    // they are the ones that must not be overwritten on the bar.
+    for notice in notices {
+        app.say(notice);
+    }
+    if let Some(complaint) = home.complaint {
+        app.stored_unreadable(complaint);
+    }
     if let Some(notice) = unreadable {
-        app.session_unreadable(notice);
+        app.stored_unreadable(notice);
     }
 
     install_panic_hook();
@@ -1410,6 +1480,8 @@ mod tests {
             &cfg,
             true,
             &session::Stored::Absent,
+            &[],
+            None,
             &theme::Theme::default(),
         );
         let field = |name: &str| {
@@ -1458,6 +1530,8 @@ mod tests {
             &plain,
             false,
             &session::Stored::Absent,
+            &[],
+            None,
             &theme::Theme::default(),
         );
         let field = |name: &str| {
@@ -1493,6 +1567,8 @@ mod tests {
             &preset,
             false,
             &session::Stored::Absent,
+            &[],
+            None,
             &theme::Theme::default(),
         );
         let field = |name: &str| {
@@ -1514,7 +1590,7 @@ mod tests {
     fn describe_reports_the_theme_a_window_would_wear() {
         let cfg = Config::new("http://host:1", "m", None);
         let value = |theme: &theme::Theme| {
-            describe(&cfg, false, &session::Stored::Absent, theme)
+            describe(&cfg, false, &session::Stored::Absent, &[], None, theme)
                 .into_iter()
                 .find(|(field, _)| field == "theme")
                 .map(|(_, value)| value)
@@ -1559,6 +1635,8 @@ mod tests {
             &cfg,
             false,
             &session::Stored::Absent,
+            &[],
+            None,
             &theme::Theme::default(),
         );
         let model = lines
@@ -1590,6 +1668,8 @@ mod tests {
             &config,
             false,
             &session::Stored::Absent,
+            &[],
+            None,
             &theme::Theme::default(),
         );
         let field = |name: &str| {
@@ -1618,7 +1698,7 @@ mod tests {
     fn describe_reports_the_session_layer_it_read() {
         let cfg = Config::new("http://host:1", "m", None);
         let row = |stored: &session::Stored| {
-            describe(&cfg, false, stored, &theme::Theme::default())
+            describe(&cfg, false, stored, &[], None, &theme::Theme::default())
                 .into_iter()
                 .find(|(field, _)| field == "session")
                 .map(|(_, value)| value)
@@ -1647,6 +1727,122 @@ mod tests {
         assert!(!row.contains('\x1b') && !row.contains('\r'), "{row:?}");
     }
 
+    /// A line resolution owed about a stored layer — a session provider this
+    /// build does not know (finding C2) — gets a row of its own, so the dump
+    /// cannot show the config a typo fell through to without showing why. Like
+    /// the session row's reason, the words came out of a file on their way to
+    /// a terminal, so they go through the same door.
+    #[test]
+    fn describe_reports_the_notices_a_stored_layer_owed() {
+        let cfg = Config::new("http://host:1", "m", None);
+        let notice =
+            "session: unknown provider `boom\r\x1b[2Jmock` (try deepseek or custom)".to_string();
+        let lines = describe(
+            &cfg,
+            false,
+            &session::Stored::Absent,
+            std::slice::from_ref(&notice),
+            None,
+            &theme::Theme::default(),
+        );
+        let row = lines
+            .iter()
+            .find(|(field, _)| field == "notice")
+            .map(|(_, value)| value.clone())
+            .expect("no `notice` row");
+        assert!(row.contains("unknown provider"), "{row}");
+        assert!(!row.contains('\x1b') && !row.contains('\r'), "{row:?}");
+    }
+
+    /// A home config that is *there* and cannot be used is a row of its own in
+    /// the dump — `unreadable — <reason>`, under the session, the layer it
+    /// ranks below — because the values it might have carried are not read and
+    /// a human chasing a vanished key has to see that (finding C3). A file that
+    /// read, or none at all, adds no row: silence is the normal state.
+    #[test]
+    fn describe_reports_an_unreadable_home_config() {
+        let cfg = Config::new("http://host:1", "m", None);
+        let complaint = "could not read /tmp/x/config.json — expected value at line 1 column 2; \
+                         using defaults";
+        let rows = describe(
+            &cfg,
+            false,
+            &session::Stored::Absent,
+            &[],
+            Some(complaint),
+            &theme::Theme::default(),
+        );
+        let names: Vec<&str> = rows.iter().map(|(field, _)| field.as_str()).collect();
+        let at = names
+            .iter()
+            .position(|name| *name == "home config")
+            .expect("no `home config` row");
+        assert_eq!(names[at - 1], "session", "under the layer it ranks below");
+        let row = &rows[at].1;
+        assert!(row.starts_with("unreadable — "), "{row}");
+        assert!(
+            row.contains("/tmp/x/config.json") && row.contains("using defaults"),
+            "{row}"
+        );
+
+        let rows = describe(
+            &cfg,
+            false,
+            &session::Stored::Absent,
+            &[],
+            None,
+            &theme::Theme::default(),
+        );
+        assert!(
+            !rows.iter().any(|(field, _)| field == "home config"),
+            "a file that read is not news"
+        );
+    }
+
+    /// End to end through the load road: the file the human edited badly comes
+    /// back as the complaint the dump prints and the window says, and nothing
+    /// is half-read out of it (finding C3).
+    #[test]
+    fn an_unreadable_home_config_travels_to_the_dump() {
+        let dir = std::env::temp_dir().join(format!("mush-main-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, "{ \"api_key\": \"sk-secret\", ").unwrap();
+
+        let loaded = UserConfig::load_from(&path);
+        let env = theme::EnvText {
+            theme: None,
+            colorterm: None,
+            term: None,
+        };
+        let (resolved, stored, theme) =
+            resolved_config(&dir, &Overrides::default(), &env, &loaded.config).unwrap();
+        let rows = describe(
+            &resolved.config,
+            false,
+            &stored,
+            &resolved.notices,
+            loaded.complaint.as_deref(),
+            &theme,
+        );
+        let row = rows
+            .iter()
+            .find(|(field, _)| field == "home config")
+            .map(|(_, value)| value.clone())
+            .expect("no `home config` row");
+        assert!(row.contains(&path.display().to_string()), "{row}");
+        assert!(
+            resolved.config.api_key.is_none(),
+            "the key in a file mush could not read is not half-read"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{ \"api_key\": \"sk-secret\", "
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// `--print-config` is a diagnostic: it reads the layers and writes
     /// nothing. A workspace nothing has opened yet is described as the fresh
     /// one it would be, with no `.mush/` appearing, and a session file it
@@ -1664,7 +1860,8 @@ mod tests {
         let missing =
             std::env::temp_dir().join(format!("mush-main-dump-missing-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&missing);
-        let (_, stored, _) = resolved_config(&missing, &Overrides::default(), &env).unwrap();
+        let home = UserConfig::default();
+        let (_, stored, _) = resolved_config(&missing, &Overrides::default(), &env, &home).unwrap();
         assert!(matches!(stored, session::Stored::Absent), "{stored:?}");
         assert!(
             !missing.exists(),
@@ -1675,13 +1872,23 @@ mod tests {
         let file = session::session_path(ws.root());
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "{ not json").unwrap();
-        let (config, stored, theme) =
-            resolved_config(ws.root(), &Overrides::default(), &env).unwrap();
-        let row = describe(&config, false, &stored, &theme)
-            .into_iter()
-            .find(|(field, _)| field == "session")
-            .map(|(_, value)| value)
-            .expect("no `session` row");
+        // The dump reads the home file too; a `MUSH_CONFIG` another test set
+        // is none of this test's business, so it names a config of its own.
+        let home = UserConfig::load_from(Path::new("/nonexistent/mush/config.json"));
+        let (resolved, stored, theme) =
+            resolved_config(ws.root(), &Overrides::default(), &env, &home.config).unwrap();
+        let row = describe(
+            &resolved.config,
+            false,
+            &stored,
+            &resolved.notices,
+            home.complaint.as_deref(),
+            &theme,
+        )
+        .into_iter()
+        .find(|(field, _)| field == "session")
+        .map(|(_, value)| value)
+        .expect("no `session` row");
         assert!(row.starts_with("unreadable — "), "{row}");
         assert!(
             row.contains("line 1"),
@@ -1699,7 +1906,9 @@ mod tests {
     /// usable config: that is the "window opens, no model" case.
     #[test]
     fn resolution_survives_an_empty_world() {
-        let config = config::resolve(&Overrides::default(), &UserConfig::default(), None).unwrap();
+        let config = config::resolve(&Overrides::default(), &UserConfig::default(), None)
+            .unwrap()
+            .config;
         assert!(!config.base_url.is_empty());
         assert!(config.chat_url().ends_with("/v1/chat/completions"));
     }
