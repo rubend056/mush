@@ -3479,6 +3479,21 @@ impl App {
         self.dirty_screen = true;
     }
 
+    /// `Ctrl-O`: show or hide the output — a tool's result, mush's own report
+    /// about a child or a job, and the brief a child's pane opens with.
+    ///
+    /// A view like [`Self::toggle_reasoning`], so it is not said and not
+    /// stored: the rows are still in the transcript, the same key brings them
+    /// back exactly as they were, and a restart paints them again —
+    /// `dirty_screen` is the whole record. The failure exemption is not here:
+    /// it lives on `chat::Fold`, so at no rows a failed result's
+    /// `! error: …` row and a `#1 failed: …` report still paint
+    /// ([`Chat::set_output`]).
+    fn toggle_output(&mut self) {
+        self.chat.set_output(!self.chat.shows_output());
+        self.dirty_screen = true;
+    }
+
     /// `Ctrl-F`: the focused pane takes the whole screen, and back.
     ///
     /// Why the view exists: mush deliberately never captures the mouse (finding
@@ -3798,6 +3813,7 @@ impl App {
             Intent::InterruptAll => self.interrupt_all(),
             Intent::OpenModelPicker => self.open_model_picker(),
             Intent::ToggleReasoning => self.toggle_reasoning(),
+            Intent::ToggleOutput => self.toggle_output(),
             Intent::ToggleZen => self.toggle_zen(),
             // `Tab` leaves the select mode behind: the mode is what the keyboard
             // was doing, and the key the human pressed is the one that says they
@@ -12054,6 +12070,105 @@ mod tests {
             !app.chat.shows_reasoning(),
             "the human's view outlives the chat it was set in"
         );
+    }
+
+    /// `Ctrl-O` is a view in `Ctrl-T`'s family: it hides the output rows in the
+    /// pane, writes no line about itself — not to the transcript, not to the
+    /// bar, not to the session file — and a fresh `App` on the same store
+    /// paints the output again, which is what "not stored" means.
+    #[test]
+    fn ctrl_o_is_a_view_and_is_not_stored() {
+        let root = dir("ctrl-o-view");
+        let (mut app, _writer) = app_writing(&root);
+        app.chat.push_message(
+            AgentId::ROOT,
+            Message::tool("call_1", "a diff, one line\nthe rest of the log"),
+        );
+        assert!(
+            app.session_dirty_at.is_none(),
+            "nothing has asked for a save yet"
+        );
+        assert!(
+            chat_rows(&mut app)
+                .iter()
+                .any(|row| row.contains("the rest of the log")),
+            "the output is painted by default: {:?}",
+            chat_rows(&mut app)
+        );
+
+        ctrl(&mut app, 'o');
+
+        assert!(!app.chat.shows_output());
+        assert!(text_of(&app).is_empty(), "a view is not said");
+        assert!(
+            app.session_dirty_at.is_none(),
+            "a view is not a change to store"
+        );
+        assert_eq!(
+            app.chat.transcript(AgentId::ROOT).len(),
+            1,
+            "and not a line in the transcript: {:?}",
+            app.chat.transcript(AgentId::ROOT)
+        );
+        assert!(
+            app.chat.notices_for(AgentId::ROOT).next().is_none(),
+            "and not a line in the foot either"
+        );
+        assert!(
+            !chat_rows(&mut app)
+                .iter()
+                .any(|row| row.contains("the rest of the log")),
+            "one toggle hides it in the pane: {:?}",
+            chat_rows(&mut app)
+        );
+
+        // The same key brings the rows back...
+        ctrl(&mut app, 'o');
+        assert!(app.chat.shows_output());
+        assert!(
+            chat_rows(&mut app)
+                .iter()
+                .any(|row| row.contains("the rest of the log")),
+            "and the same key brings the output back: {:?}",
+            chat_rows(&mut app)
+        );
+
+        // ...and a restart paints it too: the store never heard of the view.
+        ctrl(&mut app, 'o');
+        app.flush_session();
+        let stored = Session::load(&root).expect("the flush wrote the conversation");
+        assert_eq!(
+            stored.messages.len(),
+            1,
+            "the store holds the tool result and nothing about the view"
+        );
+        assert!(
+            stored.notices.is_empty(),
+            "and nothing about the view in the foot's stored lines either"
+        );
+        let mut fresh = reopened(&root);
+        assert!(
+            fresh.chat.shows_output(),
+            "a restart opens with the output shown"
+        );
+        assert!(
+            chat_rows(&mut fresh)
+                .iter()
+                .any(|row| row.contains("the rest of the log")),
+            "and paints it: {:?}",
+            chat_rows(&mut fresh)
+        );
+
+        // Ctrl-N starts a new chat, not a new preference — the family rule
+        // `Ctrl-T`'s choice already has.
+        ctrl(&mut fresh, 'o');
+        assert!(!fresh.chat.shows_output());
+        ctrl(&mut fresh, 'n');
+        assert!(
+            !fresh.chat.shows_output(),
+            "the human's view outlives the chat it was set in"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// Zen's whole promise, at the ubiquitous 80×24 and on a wide terminal:

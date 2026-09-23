@@ -127,6 +127,11 @@ pub const KEYS: &[Binding] = &[
     },
     Binding {
         context: Context::Anywhere,
+        keys: "Ctrl-O",
+        help: "show or hide tool output, reports and briefs (a failure always shows)",
+    },
+    Binding {
+        context: Context::Anywhere,
         keys: "Ctrl-F",
         help: "the focused pane takes the whole screen, and back",
     },
@@ -394,6 +399,14 @@ pub enum Intent {
     /// A view: the reasoning is already stored with the turn, so this changes
     /// what the pane paints and nothing else.
     ToggleReasoning,
+    /// Show or hide the *output* (`Ctrl-O`): a tool's result, mush's own report
+    /// about a child or a job, and the brief a child's pane opens with. A view
+    /// in [`Intent::ToggleReasoning`]'s sense: it is not said into the
+    /// transcript and not stored, the rows are still there and come back on the
+    /// next press, and a restart paints them again. The failure exemption is
+    /// the fold's, not this key's: a failed result's own row and a
+    /// `#1 failed: …` report stay in both states.
+    ToggleOutput,
     /// Show or hide the zen view: the focused pane takes the whole screen
     /// (`Ctrl-F`). A view in the same sense as `Ctrl-T`'s: it changes what the
     /// frame paints and nothing else.
@@ -464,6 +477,11 @@ pub fn key(focus: Focus, picker_open: bool, selecting: bool, key: KeyEvent) -> I
             KeyCode::Char('n') => return Intent::NewChat,
             KeyCode::Char('p') => return Intent::OpenModelPicker,
             KeyCode::Char('t') => return Intent::ToggleReasoning,
+            // The output view (`Ctrl-O`), beside the reasoning's and zen's: a
+            // view is about the reading and not the conversation, so the key
+            // sits above the picker and the select mode, and works with either
+            // pane focused.
+            KeyCode::Char('o') => return Intent::ToggleOutput,
             KeyCode::Char('f') => return Intent::ToggleZen,
             // The mode's opener is app-wide because the mode it opens is about
             // the *conversation*, which is the chat pane's whichever pane has
@@ -657,6 +675,7 @@ mod tests {
                     (ctrl('n'), Intent::NewChat),
                     (ctrl('p'), Intent::OpenModelPicker),
                     (ctrl('t'), Intent::ToggleReasoning),
+                    (ctrl('o'), Intent::ToggleOutput),
                     (ctrl('f'), Intent::ToggleZen),
                     (ctrl('y'), Intent::Select(SelectKey::Start)),
                     (none(KeyCode::Tab), Intent::CycleFocus(1)),
