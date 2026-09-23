@@ -28,9 +28,18 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 ///   meant to be overwritten) that no row can honour, and it is rare enough that
 ///   marking it is honest where dropping it would silently join two words. The
 ///   `\r` of a `\r\n` is a line ending, so it goes with nothing shown.
-/// - every other **C0/C1 control** and `DEL` is dropped, along with the bidi
-///   embedding and isolate characters: they exist to command a display rather
-///   than to be read, and the one U+200D a ZWJ emoji needs is not among them.
+/// - every other **C0/C1 control** and `DEL` is dropped, along with the
+///   characters that command the order a line is painted in: the bidi
+///   embeddings and isolates (U+202A–202E, U+2066–2069) and the bidi *marks*
+///   (U+200E LRM, U+200F RLM, U+061C ALM). A mark is the same command spelled
+///   invisibly — inside `src/main.rs` it can make the painted name read as a
+///   different path — and the whole family goes (finding B15).
+/// - the zero-width characters that command no order **stay**, and are named
+///   so the rule above cannot be read as wider than it is: ZWJ (U+200D) and
+///   ZWNJ (U+200C) are orthography — an emoji sequence, a Persian word — and
+///   ZWSP (U+200B), BOM (U+FEFF) and SHY (U+00AD) are invisible but reorder
+///   nothing and take no column. Dropping them would be this function editing
+///   the text it was asked to make safe.
 /// - a **tab** is kept. It is layout, not a command, and [`wrap_text`] renders
 ///   it as four columns — the pane's tab stop, never the terminal's.
 ///
@@ -57,8 +66,20 @@ pub fn sanitize(text: &str) -> String {
 }
 
 /// A character that commands a display instead of appearing on it.
+///
+/// The bidi *marks* are here beside the embeddings and isolates: LRM, RLM and
+/// ALM do not paint, but they pick the order a neutral run is laid out in, so a
+/// line that holds one can be painted as a different line than it is — the
+/// same command the embeddings spell, in one invisible character (finding
+/// B15). The zero-width characters that command no order are not here, and
+/// [`sanitize`]'s doc names them so this rule cannot be read as wider than it
+/// is.
 fn invisible(ch: char) -> bool {
-    ch.is_control() || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
 }
 
 /// Whether `text` holds a `\n` that is not the second byte of a `\r\n`.
@@ -1155,6 +1176,55 @@ mod tests {
         assert_eq!(sanitize("safe\u{202e}drowssap"), "safedrowssap");
         // And the ordinary text a transcript is made of is untouched.
         assert_eq!(sanitize("w00 w01 · #1 done: ✓"), "w00 w01 · #1 done: ✓");
+    }
+
+    /// The doc says what goes and what stays, and this pins both halves. Every
+    /// character that can command the *order* a line is painted in leaves no
+    /// trace — the bidi marks beside the embeddings and isolates — while the
+    /// zero-width characters that command no order stay, because removing them
+    /// would be the sanitizer editing the text it was asked to make safe: a ZWJ
+    /// emoji and a ZWNJ word are the proof (finding B15).
+    #[test]
+    fn sanitize_strips_what_its_doc_says() {
+        for ch in [
+            '\u{061c}', // ALM
+            '\u{200e}', // LRM
+            '\u{200f}', // RLM
+            '\u{202a}', // LRE
+            '\u{202e}', // RLO
+            '\u{2066}', // LRI
+            '\u{2069}', // PDI
+        ] {
+            assert_eq!(
+                sanitize(&format!("safe{ch}drowssap")),
+                "safedrowssap",
+                "{ch:?} commands the display"
+            );
+            // The one-line cut is a painter too, and must not put it back.
+            assert_eq!(
+                truncate(&format!("src{ch}/main.rs"), 40),
+                "src/main.rs",
+                "the cut sanitizes as it truncates"
+            );
+        }
+
+        // Kept, and named in the doc: orthography, and zero-width characters
+        // with no order to command.
+        for ch in [
+            '\u{200b}', // ZWSP
+            '\u{200c}', // ZWNJ
+            '\u{200d}', // ZWJ
+            '\u{feff}', // BOM
+            '\u{00ad}', // SHY
+        ] {
+            assert_eq!(
+                sanitize(&format!("a{ch}b")),
+                format!("a{ch}b"),
+                "{ch:?} is not a command and stays"
+            );
+        }
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        assert_eq!(sanitize(family), family, "a ZWJ emoji survives whole");
     }
 
     /// A wrapped row is what the terminal will paint: no escape survives the
