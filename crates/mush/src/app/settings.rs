@@ -94,9 +94,25 @@ impl ConfigCell {
     /// Change the configuration: the UI's copy and the actors' copy in one
     /// write, so a `/model`, `/url` or `/key` cannot reach one of them and not
     /// the other (finding B7).
-    pub fn edit(&mut self, f: impl FnOnce(&mut Config)) {
+    ///
+    /// One rule rides here because the endpoint, the key and the host are one
+    /// fact: a key belongs to a host, so an edit that moves the endpoint to
+    /// another host forgets the key unless the same write states a new one
+    /// (findings C6, D6). Every runtime road that changes the endpoint goes
+    /// through this function, so no road can leave a key aimed at the old host —
+    /// and no request can be built with a key whose endpoint changed under it —
+    /// and the answer says whether one was dropped, which is the one thing a
+    /// caller owes the human in the acknowledgement.
+    pub fn edit(&mut self, f: impl FnOnce(&mut Config)) -> bool {
+        let was = self.ui.base_url.clone();
+        let key_was = self.ui.api_key.clone();
         f(&mut self.ui);
+        // A key stated in the same write is stated for the new endpoint: the
+        // closure set it deliberately, so it is not the key that was carried
+        // across the change.
+        let forgotten = self.ui.api_key == key_was && self.ui.forget_key_if_host_changed(&was);
         self.shared.adopt(&self.ui);
+        forgotten
     }
 
     /// Adopt a window the endpoint named, on the same terms as the actor that
@@ -246,6 +262,37 @@ mod tests {
             !cell.learn_context(64_000, WindowSource::Advertised),
             "learning the number twice changes nothing"
         );
+    }
+
+    /// The one rule that rides in the cell, because the endpoint, the key and
+    /// the host are one fact: an edit that moves the endpoint to another host
+    /// forgets the key — in both copies — unless the same write states a new
+    /// one (findings C6, D6). With every endpoint writer behind this function,
+    /// no request can be built with a key whose endpoint changed under it.
+    #[test]
+    fn a_host_change_forgets_the_key_in_both_copies() {
+        let mut cell = ConfigCell::own(Config::new("http://old:1", "m", Some("sk-old".into())));
+        let handle = cell.handle();
+        assert!(
+            cell.edit(|cfg| cfg.set_base_url("http://new:2")),
+            "the host changed and a key was dropped"
+        );
+        assert_eq!(cell.ui().api_key, None, "the UI's copy");
+        assert_eq!(handle.config().unwrap().api_key, None, "the actors' copy");
+
+        // A path on the same host is the same destination: the key stays.
+        let mut cell = ConfigCell::own(Config::new("http://old:1", "m", Some("sk-old".into())));
+        assert!(!cell.edit(|cfg| cfg.set_base_url("http://old:1/proxy")));
+        assert_eq!(cell.ui().api_key.as_deref(), Some("sk-old"));
+
+        // A key stated in the same write is for the new endpoint: it is the
+        // writer's decision, not a leftover of the old one.
+        let mut cell = ConfigCell::own(Config::new("http://old:1", "m", Some("sk-old".into())));
+        assert!(!cell.edit(|cfg| {
+            cfg.set_base_url("http://new:2");
+            cfg.api_key = Some("sk-new".into());
+        }));
+        assert_eq!(cell.ui().api_key.as_deref(), Some("sk-new"));
     }
 
     /// The window the human stated is theirs: no endpoint, however plausible,

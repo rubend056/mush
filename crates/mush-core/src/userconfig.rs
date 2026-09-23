@@ -226,6 +226,12 @@ impl UserConfig {
     /// `temperature`, or a setting only a newer mush understands, must survive
     /// that. Fields that are stated overwrite.
     ///
+    /// `api_key` is the one field that is *always* stated: `None` there means
+    /// this endpoint has no key, not "leave the file's alone". The key lives
+    /// beside the endpoint it was minted for, and the save that drops it is the
+    /// save that just moved the endpoint (findings C6, D6) — merging the old
+    /// host's key forward would hand it to the new one on the next start.
+    ///
     /// A file that is there and is not an object mush can merge into — not
     /// JSON, JSON that is not an object, or unreadable — is moved beside itself
     /// as `<name>.bak` (then `.bak.2`, …) before anything is written: this save
@@ -257,7 +263,9 @@ impl UserConfig {
                 let unstated = fields.get(key).map_or(true, |current| {
                     current.is_null() || current.as_str() == Some("")
                 });
-                if unstated && key != COMMENT_KEY {
+                // `api_key` is the exception, and the reason is above: the key
+                // is stated, and `None` is a statement.
+                if unstated && key != COMMENT_KEY && key != "api_key" {
                     fields.insert(key.clone(), value.clone());
                 }
             }
@@ -543,6 +551,44 @@ mod tests {
         let written = fs::read_to_string(&path).unwrap();
         assert!(written.contains("future_knob"), "{written}");
         assert!(header_of(&path).contains("CLI flags > MUSH_* environment"));
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The key lives beside the endpoint it was minted for: a save that states
+    /// `None` erases the key the file held rather than merging it forward,
+    /// because the save that does this is the one that just moved the endpoint
+    /// and dropped the key (findings C6, D6). Every other unstated field keeps
+    /// its old value.
+    #[test]
+    fn a_save_states_the_key_even_when_it_has_none() {
+        let path = temp_path("no-key");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let with_key = UserConfig {
+            api_key: Some("sk-old-0123456789".into()),
+            provider: "custom".into(),
+            base_url: "http://old:1".into(),
+            context: Some(32_000),
+            ..UserConfig::default()
+        };
+        with_key.save_to(&path).unwrap();
+        assert_eq!(
+            UserConfig::load_from(&path).config.api_key.as_deref(),
+            Some("sk-old-0123456789")
+        );
+
+        // The save after a host change: the endpoint moves, and the key is not
+        // there to move with it — but a field this save does not own (the
+        // window) is untouched.
+        let moved = UserConfig {
+            provider: "deepseek".into(),
+            base_url: "https://api.deepseek.com".into(),
+            ..UserConfig::default()
+        };
+        moved.save_to(&path).unwrap();
+        let reloaded = UserConfig::load_from(&path).config;
+        assert_eq!(reloaded.api_key, None, "the old host's key is not re-homed");
+        assert_eq!(reloaded.base_url, "https://api.deepseek.com");
+        assert_eq!(reloaded.context, Some(32_000), "the merge still merges");
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 }

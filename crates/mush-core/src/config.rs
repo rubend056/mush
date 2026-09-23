@@ -394,6 +394,23 @@ fn normalize_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
+/// The host of an endpoint URL: the authority, port included; the scheme, the
+/// path and the query are not part of it.
+///
+/// This is the part an API key is minted for (findings C6, D6).
+/// `http://Box:8078/v1` and `https://box:8078` name one host — a key sent to
+/// either is sent to the same server — while `http://box:9000` names another,
+/// because two ports on one box can be two different servers. Case is not part
+/// of the answer either, because DNS is not case-sensitive; callers compare
+/// with [`str::eq_ignore_ascii_case`].
+fn host_of(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme)
+}
+
 /// Tokens every request reserves for the tool schemas. Ten schemas measure
 /// ~5.9 KB (~2 K tokens at the 3 bytes/token heuristic), so the reserve
 /// rounds up; `prompt` tests that they keep fitting.
@@ -686,6 +703,24 @@ impl Config {
         self.base_url = normalize_url(url);
     }
 
+    /// Forget the API key when the endpoint now set is on another host, and say
+    /// whether one was dropped.
+    ///
+    /// A key belongs to a host (findings C6, D6): the request head carries it to
+    /// whatever [`Self::base_url`] names, so an endpoint that moved under the
+    /// key is a secret handed to a host the human never aimed it at. `was` is
+    /// the endpoint before the change. A change that only moves the path, or the
+    /// scheme on one host, keeps the key — it is the same destination — and so
+    /// does a change with no key in hand, which is why the answer is "was one
+    /// dropped" rather than "did the host move".
+    pub fn forget_key_if_host_changed(&mut self, was: &str) -> bool {
+        if self.api_key.is_none() || host_of(was).eq_ignore_ascii_case(host_of(&self.base_url)) {
+            return false;
+        }
+        self.api_key = None;
+        true
+    }
+
     /// Whether the endpoint a request will carry is the provider's own — the
     /// question anything that wants to name the vendor rather than the URL has
     /// to ask first.
@@ -907,7 +942,22 @@ pub fn resolve_with(
     //    machine-global defaults.
     if let Some(session) = session {
         if !url_given && !session.base_url.is_empty() {
+            // A stored endpoint may not take a key minted for another host
+            // (finding D6): clone a repository, run mush in it, and the session
+            // file would decide the host the machine-global key travels to. The
+            // rule is the runtime one ([`Config::forget_key_if_host_changed`])
+            // and the notice names the road back, as the `/url` and `/provider`
+            // acks do.
+            let was = config.base_url.clone();
             config.set_base_url(&session.base_url);
+            if config.forget_key_if_host_changed(&was) {
+                notices.push(format!(
+                    "session: endpoint {} is another host — no api key for this endpoint; \
+                     the key was not sent — /key <secret> sets one (saved to {})",
+                    config.base_url,
+                    crate::userconfig::config_path().display()
+                ));
+            }
         }
         if !provider_given && !session.provider.is_empty() {
             // A session is not hand-edited input the way the home config is —
@@ -1077,7 +1127,11 @@ mod tests {
         assert_eq!(config.base_url, "http://session:3");
         assert_eq!(config.provider, Provider::DeepSeek);
         assert_eq!(config.model, "session-model");
-        assert_eq!(config.api_key.as_deref(), Some("sk-home"));
+        // The home key is *not* carried to the session's host: the session's
+        // endpoint is another one, and a stored endpoint does not take a key
+        // minted elsewhere (finding D6;
+        // `a_stored_session_cannot_take_the_home_key_to_its_own_host`).
+        assert_eq!(config.api_key, None);
     }
 
     #[test]
@@ -1183,6 +1237,87 @@ mod tests {
         assert!(notice.contains("deepsek"), "{notice}");
         assert!(notice.contains("deepseek or custom"), "{notice}");
         assert!(notice.contains("http://box:9"), "{notice}");
+    }
+
+    /// A session may not take the home key to a host of its own choosing
+    /// (finding D6): the file inside the workspace would decide where the
+    /// machine-global key travels, so cloning a repository and opening it would
+    /// put the key on the wire seconds later. The key is dropped — not sent —
+    /// and the notice names the endpoint, the fact and the road back. A session
+    /// whose endpoint is the home one keeps the key: same host, same
+    /// destination.
+    #[test]
+    fn a_stored_session_cannot_take_the_home_key_to_its_own_host() {
+        let home = home("custom", "http://home:4", "m");
+        let elsewhere = stored("custom", "http://elsewhere:9", "m");
+        let resolved = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            Some(&elsewhere),
+        )
+        .unwrap();
+        assert_eq!(
+            resolved.config.base_url, "http://elsewhere:9",
+            "the session's endpoint still wins"
+        );
+        assert_eq!(
+            resolved.config.api_key, None,
+            "but the home key does not travel to it"
+        );
+        assert_eq!(resolved.notices.len(), 1, "{:?}", resolved.notices);
+        let notice = &resolved.notices[0];
+        assert!(notice.contains("http://elsewhere:9"), "{notice}");
+        assert!(notice.contains("/key"), "the road back is named: {notice}");
+
+        // The home's own endpoint keeps the key.
+        let same = stored("custom", "http://home:4", "m");
+        let resolved = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            Some(&same),
+        )
+        .unwrap();
+        assert_eq!(resolved.config.api_key.as_deref(), Some("sk-home"));
+        assert!(resolved.notices.is_empty(), "{:?}", resolved.notices);
+
+        // A different *port* is another server, so the key drops; a different
+        // scheme on the same host is the same destination, so it does not.
+        let port = stored("custom", "http://home:5", "m");
+        let resolved = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            Some(&port),
+        )
+        .unwrap();
+        assert_eq!(resolved.config.api_key, None, "another port, another host");
+        let secure = stored("custom", "https://home:4", "m");
+        let resolved = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home,
+            Some(&secure),
+        )
+        .unwrap();
+        assert_eq!(resolved.config.api_key.as_deref(), Some("sk-home"));
+    }
+
+    /// The host is the part of an endpoint a key is minted for: the authority,
+    /// port included; the scheme and the path are not part of the answer
+    /// (findings C6, D6).
+    #[test]
+    fn the_host_of_an_endpoint_is_its_authority() {
+        assert_eq!(host_of("http://box:8078/v1"), "box:8078");
+        assert_eq!(host_of("https://box:8078"), "box:8078");
+        assert_eq!(host_of("http://box"), "box");
+        assert_eq!(host_of("http://box:9/v1?x=1"), "box:9");
+        assert_eq!(host_of("box:9/v1"), "box:9");
     }
 
     /// The home config fills what every layer above it leaves unstated: the
