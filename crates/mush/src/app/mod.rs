@@ -3859,6 +3859,14 @@ impl App {
     /// here is [`Tree::focused`] — the same agent every other chat key is about.
     /// A pane with nothing to stand on says so in the bar rather than opening a
     /// cursor over nothing.
+    ///
+    /// `Ctrl-Y` is app-wide, so one state has to be refused *before* the chat
+    /// is asked: the zen view with the tree full-screen, where the chat pane is
+    /// the message box alone and paints no transcript at all. The mode is
+    /// modal, and one opened over a pane the frame cannot paint would swallow
+    /// every letter with no cursor and nothing on screen saying why; the
+    /// refusal names the key that shows the pane, and is the same shape as the
+    /// empty-pane answer [`Chat::start_select`] gives (finding D24).
     fn select_key(&mut self, key: SelectKey) {
         let on = self.tree.focused;
         match key {
@@ -3867,7 +3875,9 @@ impl App {
             // silently throw away a selection the human was building.
             SelectKey::Start => {
                 if !self.chat.selecting() {
-                    if let Some(line) = self.chat.start_select(on) {
+                    if self.zen && self.focus == Focus::Agents {
+                        self.say("the chat pane is hidden — Tab shows it, then Ctrl-Y");
+                    } else if let Some(line) = self.chat.start_select(on) {
                         self.say(line);
                     }
                 }
@@ -9580,6 +9590,54 @@ mod tests {
         tab(&mut app);
         assert!(!app.chat.selecting(), "Tab leaves the mode");
         assert_eq!(app.focus, Focus::Agents, "and cycles the pane it names");
+    }
+
+    /// `Ctrl-Y` is app-wide, but the pane it selects from is the chat pane's:
+    /// in the zen view with the tree full-screen the chat is the message box
+    /// alone, and the mode it would open is one no frame can paint — no cursor,
+    /// and every letter swallowed with nothing on screen saying why. The key
+    /// refuses with a line naming the way to the pane, and the pane it does
+    /// paint the mode in still opens it (finding D24).
+    #[test]
+    fn ctrl_y_with_the_chat_hidden_says_so() {
+        let (mut app, _rx) = test_app("select-hidden");
+        crowd(&mut app, 3);
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("a reply to select from"));
+
+        // `Tab` to the tree, `Ctrl-F`: the chat pane is a zero rect.
+        tab(&mut app);
+        ctrl(&mut app, 'f');
+        assert!(
+            app.zen && app.focus == Focus::Agents,
+            "the tree takes the screen"
+        );
+        assert!(
+            !screen(&mut app, 80, 24)
+                .iter()
+                .any(|row| row.contains("a reply to select from")),
+            "and the chat's rows are not painted"
+        );
+
+        ctrl(&mut app, 'y');
+
+        assert!(!app.chat.selecting(), "no mode is taken");
+        assert!(
+            text_of(&app).contains("hidden"),
+            "and the bar says why: {}",
+            text_of(&app)
+        );
+        // The keyboard is still the tree's: a letter is a tree binding, not a
+        // swallowed mode key.
+        app.tree.cursor_top();
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_ne!(app.tree.cursor(), 0, "`j` still moves the tree's cursor");
+
+        // The pane that does paint the transcript takes the mode as before.
+        tab(&mut app);
+        assert_eq!(app.focus, Focus::Chat);
+        ctrl(&mut app, 'y');
+        assert!(app.chat.selecting(), "the chat pane opens the mode");
     }
 
     /// A fold replaces the transcript under the select mode, and the mode must
