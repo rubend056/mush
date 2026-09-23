@@ -958,12 +958,13 @@ impl Chat {
     /// budget, whose boundary is one byte); this is the same sum in the unit a
     /// window is stated in, for a reader that wants that number on its own.
     #[cfg(test)]
-    pub fn used_tokens_for(&self, id: AgentId) -> usize {
-        self.used_weight_for(id) / mush_core::config::BYTES_PER_TOKEN
+    pub fn used_tokens_for(&self, id: AgentId, budget: usize) -> usize {
+        self.used_weight_for(id, budget) / mush_core::config::BYTES_PER_TOKEN
     }
 
     /// The same sum in the budget's own currency: one agent's **own** system
-    /// prompt plus its transcript, weighed the one way
+    /// prompt plus its transcript, trimmed to `budget` the way the actor's own
+    /// list is ([`Self::bounded_transcript`]) and weighed the one way
     /// [`mush_core::transcript::trim_history`] weighs them. Split from the
     /// token spelling of the same sum so a caller that needs the number in
     /// bytes — the attach gate, asking how much room a picture has left, and
@@ -971,36 +972,51 @@ impl Chat {
     /// reads the one sum instead of adding the parts up again (two spellings
     /// of one arithmetic is how the budget and the meter drift apart).
     ///
-    /// The prompt is the agent's own: the root's is the conversation's
-    /// ([`Self::system`], which the root actor is handed with every run), and a
-    /// child's is the one its actor published ([`Self::learn_system`]) — a
-    /// child's prompt names the child's own workspace, so only the actor that
-    /// built it can say what it weighs. An agent whose prompt has not been
-    /// published, or that has no transcript at all, weighs nothing.
+    /// The number is a question about the *next request*: the pane's record is
+    /// not trimmed and the next request is not built from it untrimmed, so
+    /// weighing the record made the meter say `over` forever on a window whose
+    /// fold cannot fit while every request that went out still fitted (finding
+    /// A8). The bound is the one the actor itself trims to, so the attach
+    /// gate's room is the room the run will find, and the meter's fraction is
+    /// the fraction of the request that follows.
     ///
-    /// The pane's copy can be heavier than the actor's list, and that is
-    /// deliberate: a trim drops turns the pane keeps — the pane is the human's
-    /// record of the conversation, and the dropped-turns note is in both — and
-    /// a shed replaces a result in the actor's list while the pane still shows
-    /// what the tool produced. The difference is one-directional: the actor's
-    /// list is never the heavier of the two, so the room the attach gate
-    /// computes is never larger than the room the next request has.
-    pub fn used_weight_for(&self, id: AgentId) -> usize {
-        let transcript = if id == AgentId::ROOT {
-            &self.root
-        } else {
-            match self.agents.get(&id) {
-                Some(messages) => messages,
-                None => return 0,
-            }
-        };
-        let prompt = self.system_for(id).map_or(0, Message::weight);
-        prompt.saturating_add(
-            transcript
-                .iter()
-                .map(Message::weight)
-                .fold(0, usize::saturating_add),
-        )
+    /// An agent whose prompt has not been published, or that has no transcript
+    /// at all, weighs nothing. The prompt counted is the agent's own: the
+    /// root's is the conversation's ([`Self::system`], which the root actor is
+    /// handed with every run), and a child's is the one its actor published
+    /// ([`Self::learn_system`]) — a child's prompt names the child's own
+    /// workspace, so only the actor that built it can say what it weighs.
+    pub fn used_weight_for(&self, id: AgentId, budget: usize) -> usize {
+        self.bounded_transcript(id, budget)
+            .iter()
+            .map(Message::weight)
+            .fold(0, usize::saturating_add)
+    }
+
+    /// `id`'s conversation as a request would carry it at the next message
+    /// boundary: the system prompt the history opens with, the transcript, and
+    /// a trim to `budget` in the shape an actor's own list has (system first,
+    /// the opening task after it), with the dropped-turns note put back where
+    /// the dropped turns were ([`mush_core::transcript::place_dropped_note`]'s
+    /// rule, applied by the trim itself).
+    ///
+    /// This is the **bounded view**, and it is what [`Self::used_weight_for`]
+    /// weighs and what `App::session_snapshot` stores. The pane's own record is
+    /// deliberately *not* trimmed and is allowed to be heavier: a cut drops
+    /// turns the human still wants to read, and scrolling the conversation they
+    /// had is what the pane is for. The two are allowed to differ because they
+    /// answer different questions — the pane keeps what was said, this keeps
+    /// what the next request pays for — and the pane is the one that can be
+    /// reconstructed from nothing, since it is on screen.
+    pub fn bounded_transcript(&self, id: AgentId, budget: usize) -> Vec<Message> {
+        let mut messages: Vec<Message> = self.system_for(id).into_iter().cloned().collect();
+        messages.extend(self.transcript(id).iter().cloned());
+        // The note — the one the trim adds, or the one the copy already carried
+        // and the trim moves back into place — is part of the view: a transcript
+        // that lost turns says so once, and the stored row and the meter count
+        // that line like any other.
+        let _ = transcript::trim_history(&mut messages, budget);
+        messages
     }
 
     /// How many lines [`Self::clear`] would drop: the root transcript and every
@@ -1059,11 +1075,12 @@ impl Chat {
     ///
     /// **No archive** (§8.21): the transcript is dropped, not written anywhere,
     /// because an archive is one more lifetime to reason about and the file is
-    /// already bounded without it: a conversation is folded at nine tenths of
-    /// its history budget, a *finished* child's is never folded again (it sits
-    /// frozen at whatever it reached), and the file's bound is `CHILD_HISTORY ×
-    /// that fold trigger + the root`. So dropping the row drops one child's
-    /// frozen transcript from the next save.
+    /// already bounded without it: what a save stores for an agent is the
+    /// **bounded view** of its conversation ([`Self::bounded_transcript`]), at
+    /// most one trim away from the history budget the run measures against —
+    /// the pane's record can be heavier without the store following it (finding
+    /// A8), so the file holds `CHILD_HISTORY` such rows plus the root. Dropping
+    /// the row drops one child's bounded transcript from the next save.
     ///
     /// Every map in here is keyed by the agent's id, so every one of them goes
     /// with it: the transcript itself, the voices keyed by line index, the
@@ -4695,8 +4712,11 @@ mod tests {
     /// nothing to forget (finding B8).
     #[test]
     fn the_context_meter_is_derived_from_the_conversation() {
+        // A window no transcript here fills: these tests are about the
+        // arithmetic, not about where the trim lands.
+        let budget = 1 << 20;
         let mut chat = Chat::bare();
-        let idle = chat.used_tokens_for(AgentId::ROOT);
+        let idle = chat.used_tokens_for(AgentId::ROOT, budget);
         assert_eq!(
             idle,
             chat.system().weight() / mush_core::config::BYTES_PER_TOKEN,
@@ -4706,7 +4726,7 @@ mod tests {
         let asked = Message::user("a question long enough to weigh something");
         chat.push_message(AgentId::ROOT, asked.clone());
         assert!(
-            chat.used_tokens_for(AgentId::ROOT) > idle,
+            chat.used_tokens_for(AgentId::ROOT, budget) > idle,
             "the meter must count the human's own message"
         );
 
@@ -4715,7 +4735,7 @@ mod tests {
         let summary = Message::user("a summary");
         chat.replace_transcript(AgentId::ROOT, vec![summary.clone()]);
         assert_eq!(
-            chat.used_tokens_for(AgentId::ROOT),
+            chat.used_tokens_for(AgentId::ROOT, budget),
             (chat.system().weight() + summary.weight()) / mush_core::config::BYTES_PER_TOKEN,
             "the meter reads what is there now"
         );
@@ -4724,7 +4744,7 @@ mod tests {
         // not weigh on it.
         chat.push_message(AgentId(1), Message::assistant("x".repeat(1000)));
         assert_eq!(
-            chat.used_tokens_for(AgentId::ROOT),
+            chat.used_tokens_for(AgentId::ROOT, budget),
             (chat.system().weight() + summary.weight()) / mush_core::config::BYTES_PER_TOKEN
         );
     }

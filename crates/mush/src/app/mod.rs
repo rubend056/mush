@@ -1256,7 +1256,8 @@ impl App {
     /// transcript, so nothing can go stale between a push and a draw.
     #[cfg(test)]
     pub fn context_used_tokens(&self) -> usize {
-        self.chat.used_tokens_for(self.tree.focused)
+        self.chat
+            .used_tokens_for(self.tree.focused, self.cfg().history_budget())
     }
 
     /// How long ago the git snapshot was read, for the bar to say when it is
@@ -1575,13 +1576,30 @@ impl App {
                 id,
                 event,
             } => {
-                if conversation == self.tree.conversation() {
+                // The tree is the authority on which ids exist: a `Spawned` is
+                // a fact about the *parent* it is tagged with, every other
+                // event a fact about the agent that emitted it. An event that
+                // arrives after its subject is gone is news about nothing, and
+                // it must change nothing — no transcript, no notice, no
+                // weight, no row. The window is real and one frame wide: the
+                // event loop drains actors without blocking and the reap tick
+                // runs after the drain (`main`), so anything emitted after the
+                // last drain is applied after the reap. Without the guard a
+                // ghost is unreachable by every reaping path forever —
+                // `Chat::push_message` writes unconditionally while
+                // `Chat::forget` only walks the ids `tree.past_history()`
+                // returns — and an `Error`-kind notice is stored, so a false
+                // `✗` about work that never happened comes back on every
+                // launch (finding A4). The neighbouring doors already ask this
+                // (`App::attach_read`/`attach_edit` guard membership).
+                if conversation == self.tree.conversation() && self.tree.has(id) {
                     self.on_agent(id, event);
                 } else if let AgentEvent::Spawned { cmd, .. } = &event {
-                    // A tree Ctrl-N abandoned can still spawn children. They are
-                    // not ours, but they must not run either — and because this
-                    // event is dropped, telling the child here is the only
-                    // chance it gets to end.
+                    // A tree Ctrl-N abandoned can still spawn children, and so
+                    // can a parent the reap just forgot. They are not ours, but
+                    // they must not run either — and because this event is
+                    // dropped, telling the child here is the only chance it
+                    // gets to end.
                     let _ = cmd.send(AgentMsg::Shutdown);
                 }
             }
@@ -2060,7 +2078,9 @@ impl App {
     pub fn context_meter(&self) -> String {
         let budget = self.cfg().history_budget();
         let fold = mush_core::transcript::compaction_trigger(budget);
-        let used = self.chat.used_weight_for(self.tree.focused);
+        let used = self
+            .chat
+            .used_weight_for(self.tree.focused, self.cfg().history_budget());
         let mark = if self.cfg().context_explicit { "" } else { "~" };
         let used_label = tokens_label(used / BYTES_PER_TOKEN);
         let budget_label = tokens_label(budget / BYTES_PER_TOKEN);
@@ -3595,7 +3615,15 @@ impl App {
 
     /// The conversation as it is stored: the root transcript, every subagent's,
     /// and the endpoint selection it was held against.
+    ///
+    /// Every row is the **bounded view** of its agent's conversation
+    /// ([`Chat::bounded_transcript`]): the same trim the actor's own list gets,
+    /// so the file is bounded by the history budget rather than by the pane's
+    /// record, which keeps every turn a cut dropped. The system prompts are
+    /// left out either way — a prompt names a workspace that may have moved, and
+    /// the actor builds a fresh one on the way back in.
     fn session_snapshot(&self) -> Session {
+        let budget = self.cfg().history_budget();
         // Every subagent, not just the root: without this a relaunch forgot
         // each child's context, and "continue that agent" meant writing the
         // brief again from scratch.
@@ -3647,13 +3675,13 @@ impl App {
                 summary: node.summary.clone(),
                 result_unread: node.result_unread,
                 // The system prompt is regenerated on the way back in, since it
-                // names a workspace that may have moved.
+                // names a workspace that may have moved; everything else is the
+                // bounded view, not the pane's record (see above).
                 messages: self
                     .chat
-                    .transcript(node.id)
-                    .iter()
+                    .bounded_transcript(node.id, budget)
+                    .into_iter()
                     .filter(|message| message.role != "system")
-                    .cloned()
                     .collect(),
             })
             .collect();
@@ -3667,7 +3695,12 @@ impl App {
                 .cfg()
                 .context_explicit
                 .then_some(self.cfg().context_tokens),
-            messages: self.chat.transcript(AgentId::ROOT).to_vec(),
+            messages: self
+                .chat
+                .bounded_transcript(AgentId::ROOT, budget)
+                .into_iter()
+                .filter(|message| message.role != "system")
+                .collect(),
             agents,
             // A failure is the one line worth coming back to; a command's answer
             // is not (see `Chat::stored_notices`).
@@ -3977,7 +4010,7 @@ impl App {
             }
         };
         let budget = self.cfg().history_budget();
-        let room = budget.saturating_sub(self.chat.used_weight_for(target));
+        let room = budget.saturating_sub(self.chat.used_weight_for(target, budget));
         let pending: usize = self
             .chat
             .attachments()
@@ -4187,7 +4220,7 @@ impl App {
         // the conversation the human is looking at and will be sent to that
         // agent, and a child's own transcript is what its next request pays for
         // (`Chat::used_weight_for`).
-        let room = budget.saturating_sub(self.chat.used_weight_for(target));
+        let room = budget.saturating_sub(self.chat.used_weight_for(target, budget));
         if cost.saturating_add(pending) > budget {
             // Past the whole history budget, with the pictures already in the
             // box counted: the system prompt and the opening task are not
@@ -5000,11 +5033,15 @@ mod tests {
         let ws = Workspace::new(root).unwrap();
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        // One cell for the window and the tree: the actor is handed the very
+        // handle the `App` edits, so a test that states a window has stated it
+        // for the requests too (and not only for the meter).
+        let cell = ConfigCell::own(cfg);
         let handle =
-            agent::spawn_scripted_ui(cfg.clone(), tx.clone(), root.to_path_buf(), scripted);
+            agent::spawn_scripted_ui(cell.handle(), tx.clone(), root.to_path_buf(), scripted);
         let app = App::new(
             ws,
-            ConfigCell::own(cfg),
+            cell,
             None,
             handle,
             tx,
@@ -5137,6 +5174,204 @@ mod tests {
             (2..=51).collect::<Vec<u64>>(),
             "reaping from the oldest end leaves the surviving numbers contiguous"
         );
+    }
+
+    /// A4, the probe: an event whose subject the tree has reaped must change
+    /// nothing — no transcript, no notice, no weight, no row — and a `Spawned`
+    /// for a gone parent must answer its own channel with `Shutdown` rather
+    /// than leaking a child nobody owns.
+    ///
+    /// The door in [`App::update`] hands every event to `on_agent` without
+    /// asking whether the tree still holds the id; `Chat::push_message` writes
+    /// unconditionally and `Chat::forget` is only called by the reap for ids
+    /// `tree.past_history()` returns, so a ghost id is unreachable by every
+    /// reaping path forever — and an `Error`-kind notice is stored, so a false
+    /// `✗` comes back on the next launch.
+    #[test]
+    fn a_late_event_for_a_reaped_agent_changes_nothing() {
+        let (mut app, _rx) = test_app("late-event");
+        let _mailboxes: Vec<Receiver<AgentMsg>> =
+            (1..=51).map(|id| finished_child(&mut app, id)).collect();
+        app.tick();
+        let gone = AgentId(1);
+        assert!(!app.tree.has(gone), "the window reaped the oldest child");
+        let rows = app.tree.rows().len();
+        let stored_before = serde_json::to_string(&app.session_snapshot()).unwrap();
+
+        // Everything an actor can still say after its node is gone, in one
+        // frame's window between the last drain and the tick.
+        let (late_tx, late_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let events = vec![
+            AgentEvent::Message(Message::assistant("a reply the reap was too late for")),
+            AgentEvent::Notice("a notice for nobody".into()),
+            AgentEvent::Error("a failure that never happened".into()),
+            AgentEvent::SystemPrompt(Message::system("a prompt for a gone agent")),
+            AgentEvent::Done,
+            AgentEvent::Spawned {
+                child: 52,
+                parent: gone.0,
+                brief: "a child of a ghost".into(),
+                depth: 1,
+                branch: None,
+                fork: None,
+                title: None,
+                cmd: late_tx,
+            },
+        ];
+        for event in events {
+            app.update(Msg::Agent {
+                conversation: app.tree.conversation(),
+                id: gone,
+                event,
+            });
+        }
+
+        assert!(
+            app.chat.transcript(gone).is_empty(),
+            "a gone agent's transcript stays empty: {:?}",
+            app.chat.transcript(gone)
+        );
+        assert_eq!(
+            app.chat.notices_for(gone).count(),
+            0,
+            "no notice for a ghost"
+        );
+        assert_eq!(
+            app.chat.used_weight_for(gone, app.cfg().history_budget()),
+            0,
+            "no weight for a ghost"
+        );
+        assert_eq!(app.tree.rows().len(), rows, "no row came back");
+        assert!(!app.tree.has(AgentId(52)), "a ghost's child is not a row");
+        assert!(
+            matches!(late_rx.try_recv(), Ok(AgentMsg::Shutdown)),
+            "and the child it named is told to end instead of running"
+        );
+        assert_eq!(
+            serde_json::to_string(&app.session_snapshot()).unwrap(),
+            stored_before,
+            "nothing of a ghost reaches the store"
+        );
+    }
+
+    /// A5's end-to-end half: twenty children, each spawned and waited on by a
+    /// scripted root, all the way to `Done` and idle. Every report is delivered,
+    /// so the stored session holds no `result_unread: true`; the twelve outside
+    /// the warm window have their threads reclaimed by `park_history` and the
+    /// newest eight keep theirs (§8.21).
+    ///
+    /// This is the road the race used to break: the parent folded a child's
+    /// report in the gap between `ChildDone` and the child's ending event, so
+    /// the ending re-armed `✉` over a result the model had read — a lying mark,
+    /// a pinned thread and a node `CHILD_HISTORY` could no longer forget. With
+    /// the ending emitted first, the store must hold zero unread results.
+    #[test]
+    fn twenty_children_end_read_and_park() {
+        let mut script = Scripted::new();
+        for id in 1..=20u64 {
+            script = script
+                .when(|asked: &Asked| asked.depth().is_none())
+                .calls(vec![
+                    tool_call(
+                        &format!("s{id}"),
+                        "spawn_agent",
+                        serde_json::json!({ "brief": format!("child number {id}") }),
+                    ),
+                    tool_call(&format!("w{id}"), "wait", serde_json::json!({})),
+                ])
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .says(&format!("child number {id} is done"));
+        }
+        let scripted = Arc::new(
+            script
+                .when(|asked: &Asked| asked.depth().is_none())
+                .says("all twenty are in"),
+        );
+        let root = repo("twenty-children");
+        let (mut app, rx) = app_with_live_scripted_root(&root, scripted.clone());
+        // A window no twenty short turns can fill: the fold would otherwise eat
+        // a scripted reply meant for the next spawn, and this test is about the
+        // completion road, not about folding.
+        app.cell.edit(|cfg| cfg.set_context(1_000_000));
+        app.chat.insert("delegate twenty children");
+        app.send_message();
+
+        let children: Vec<AgentId> = (1..=20).map(AgentId).collect();
+        assert!(
+            pump(&mut app, &rx, &scripted, |app, _| {
+                children.iter().all(|id| {
+                    app.tree
+                        .node(*id)
+                        .is_some_and(|node| node.phase == Phase::Done)
+                }) && app
+                    .tree
+                    .node(AgentId::ROOT)
+                    .is_some_and(|node| node.phase == Phase::Done)
+            }),
+            "twenty children and their root must run to Done"
+        );
+
+        let stored = app.session_snapshot();
+        assert_eq!(stored.agents.len(), 20, "every child is in the store");
+        let unread: Vec<u64> = stored
+            .agents
+            .iter()
+            .filter(|agent| agent.result_unread)
+            .map(|agent| agent.id)
+            .collect();
+        assert!(
+            unread.is_empty(),
+            "a delivered result must not be re-armed into `✉`: {unread:?}"
+        );
+
+        // Park: the twelve oldest are outside `WARM_CHILDREN` and their threads
+        // go; the newest eight stay warm. `park_history`'s own probe is the
+        // `Shutdown` it sends — a parked actor's mailbox still exists and has no
+        // receiver behind it, so the send fails.
+        app.tick();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut parked = Vec::new();
+        while Instant::now() < deadline {
+            app.tick();
+            parked = children
+                .iter()
+                .take(12)
+                .copied()
+                .filter(|id| {
+                    app.tree
+                        .agent_tx
+                        .get(id)
+                        .map(|tx| tx.send(AgentMsg::Shutdown).is_err())
+                        .unwrap_or(true)
+                })
+                .collect();
+            if parked.len() == 12 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            parked.len(),
+            12,
+            "the twelve outside the warm window are parked: {parked:?}"
+        );
+        let warm: Vec<AgentId> = children
+            .iter()
+            .skip(12)
+            .copied()
+            .filter(|id| {
+                app.tree
+                    .agent_tx
+                    .get(id)
+                    .is_some_and(|tx| tx.send(AgentMsg::Shutdown).is_ok())
+            })
+            .collect();
+        assert_eq!(
+            warm,
+            children[12..].to_vec(),
+            "and only the newest eight keep a thread: {warm:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The row goes and so does the name: a child the history window reaps is
@@ -5777,7 +6012,7 @@ mod tests {
             AgentId::ROOT,
             Message::user("x".repeat(budget - system - "user".len())),
         );
-        assert_eq!(app.chat.used_weight_for(AgentId::ROOT), budget);
+        assert_eq!(app.chat.used_weight_for(AgentId::ROOT, budget), budget);
         let full = app.context_meter();
         assert!(full.contains(" full"), "{full}");
         assert!(!full.contains(" over"), "{full}");
@@ -5788,10 +6023,74 @@ mod tests {
         // read this state as ordinary and the mark could not be reached in
         // normal operation (the audit's finding).
         app.chat.push_message(AgentId::ROOT, Message::user("!"));
-        assert!(app.chat.used_weight_for(AgentId::ROOT) > budget);
+        assert!(app.chat.used_weight_for(AgentId::ROOT, budget) > budget);
         assert!(budget < app.cfg().context_tokens * BYTES_PER_TOKEN);
         let over = app.context_meter();
         assert!(over.contains(" over"), "{over}");
+    }
+
+    /// A8, the probe: on a window whose fold cannot fit — a fold is refused
+    /// below ≈5.5 k tokens, and `/context` accepts down to 1,024 — the pane's
+    /// copy accumulates every turn the actor's list cut, and the store and the
+    /// meter used to grow with it without bound.
+    ///
+    /// The fix reads a bounded view: `used_weight_for` and `session_snapshot`
+    /// trim a copy of the conversation the way an actor trims its own list, so
+    /// the `ctx` meter reads what the next request will carry and the file
+    /// stays within one turn of the budget. The pane keeps the full record —
+    /// scrolling the human's conversation is what the pane is for.
+    #[test]
+    fn the_store_and_the_meter_hold_a_bounded_view() {
+        let (mut app, _rx) = test_app("bounded-view");
+        // 5,376 tokens is an 8,064-byte budget, just inside the band where the
+        // fold is refused (it fits from ≈5,504): every turn the actor cuts is a
+        // turn the pane used to keep forever.
+        app.cell.edit(|cfg| cfg.set_context(5_376));
+        let budget = app.cfg().history_budget();
+        let conversation = app.tree.conversation();
+        for run in 1..=24 {
+            for message in [
+                Message::assistant(format!("reply {run} {}", "x".repeat(900))),
+                Message::user(format!("turn {run} {}", "y".repeat(900))),
+            ] {
+                app.update(Msg::Agent {
+                    conversation,
+                    id: AgentId::ROOT,
+                    event: AgentEvent::Message(message),
+                });
+            }
+        }
+
+        let pane: usize = app
+            .chat
+            .transcript(AgentId::ROOT)
+            .iter()
+            .map(Message::weight)
+            .sum();
+        let used = app.chat.used_weight_for(AgentId::ROOT, budget);
+        let stored = serde_json::to_string(&app.session_snapshot()).unwrap();
+        let meter = app.context_meter();
+        // The numbers the assertions below pin, printed for a reader running
+        // this with `--nocapture`: the pane's whole record, the bounded view
+        // the meter and the file read, and the file's own bytes.
+        eprintln!(
+            "measured: pane {pane} B, used {used} B of {budget} B, stored {} B, meter {meter}",
+            stored.len()
+        );
+        assert!(pane > 40_000, "the pane keeps the full record: {pane}");
+        assert!(
+            used <= budget,
+            "the meter's number stays within the budget: {used} > {budget}"
+        );
+        assert!(
+            stored.len() < 8_000,
+            "the stored row stays within one turn of the budget: {} B",
+            stored.len()
+        );
+        assert!(
+            !meter.contains(" full") && !meter.contains(" over"),
+            "the meter does not say full or over while the list fits: {meter}"
+        );
     }
 
     /// The meter prints the three numbers the run's decisions are made of:
@@ -5805,7 +6104,7 @@ mod tests {
         app.cell.edit(|cfg| cfg.set_context(32_768));
         let budget = app.cfg().history_budget();
         let fold = mush_core::transcript::compaction_trigger(budget);
-        let used = app.chat.used_weight_for(AgentId::ROOT);
+        let used = app.chat.used_weight_for(AgentId::ROOT, budget);
         let meter = app.context_meter();
 
         assert!(
@@ -8451,7 +8750,7 @@ mod tests {
         let budget = app.cfg().history_budget();
         app.chat
             .push_message(AgentId::ROOT, Message::user("x".repeat(budget / 3)));
-        let room = budget - app.chat.used_weight_for(AgentId::ROOT);
+        let room = budget - app.chat.used_weight_for(AgentId::ROOT, budget);
         // Each picture weighs a quarter of the budget: bytes + path (11) +
         // mime (9).
         let each = budget / 4;
@@ -8594,7 +8893,10 @@ mod tests {
         let (mut app, _rx) = test_app("attach-pending");
         let_the_model_see(&mut app);
         app.cell.edit(|cfg| cfg.set_context(120_000));
-        let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId::ROOT);
+        let room = app.cfg().history_budget()
+            - app
+                .chat
+                .used_weight_for(AgentId::ROOT, app.cfg().history_budget());
         // A hair over half the room each, with the path and mime on top: one
         // fits alone, the second makes the pair too heavy.
         let each = room / 2 + 64;
@@ -8628,7 +8930,10 @@ mod tests {
         let_the_model_see(&mut app);
         app.cell.edit(|cfg| cfg.set_context(500_000));
         let (child_root, _mailbox) = isolate_child(&mut app, 1);
-        let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId(1));
+        let room = app.cfg().history_budget()
+            - app
+                .chat
+                .used_weight_for(AgentId(1), app.cfg().history_budget());
         let path = "shots/big.png";
         let bytes = png(room + 1 - 8 - path.len() - "image/png".len());
         // The file lies in both workspaces with these bytes, so the picture is
@@ -8660,7 +8965,10 @@ mod tests {
         let_the_model_see(&mut app);
         app.cell.edit(|cfg| cfg.set_context(500_000));
         let (child_root, _mailbox) = isolate_child(&mut app, 1);
-        let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId(1));
+        let room = app.cfg().history_budget()
+            - app
+                .chat
+                .used_weight_for(AgentId(1), app.cfg().history_budget());
         let bytes = png(room / 2 - 8 - path.len() - "image/png".len());
         for root in [app.ws.root().to_path_buf(), child_root] {
             std::fs::create_dir_all(root.join("shots")).unwrap();
@@ -8727,7 +9035,10 @@ mod tests {
             let (mut app, _rx) = test_app(&format!("attach-boundary-{label}"));
             let_the_model_see(&mut app);
             app.cell.edit(|cfg| cfg.set_context(500_000));
-            let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId::ROOT);
+            let room = app.cfg().history_budget()
+                - app
+                    .chat
+                    .used_weight_for(AgentId::ROOT, app.cfg().history_budget());
             // A headerless png weighs its bytes (8 + padding) plus its path
             // (8) and mime (9); size it to land on the boundary or a byte past
             // — and write the file, so the gate has the path it weighs.
@@ -8769,7 +9080,10 @@ mod tests {
         let (mut app, _rx) = test_app("attach-measures");
         let_the_model_see(&mut app);
         app.cell.edit(|cfg| cfg.set_context(500_000));
-        let room = app.cfg().history_budget() - app.chat.used_weight_for(AgentId::ROOT);
+        let room = app.cfg().history_budget()
+            - app
+                .chat
+                .used_weight_for(AgentId::ROOT, app.cfg().history_budget());
 
         let cap = mush_core::workspace::IMAGE_FILE_CAP as usize;
         let bytes_heavy = Image {
@@ -11973,23 +12287,26 @@ mod tests {
     /// next request will send.
     #[test]
     fn the_meter_measures_the_open_conversation() {
+        // A window no test transcript fills: these tests are about the
+        // arithmetic, not about where the trim lands.
+        let budget = 1 << 20;
         let mut chat = Chat::bare();
         chat.push_message(AgentId::ROOT, Message::user("x".repeat(300)));
-        let root = chat.used_tokens_for(AgentId::ROOT);
+        let root = chat.used_tokens_for(AgentId::ROOT, budget);
         assert!(root > 0);
         assert_eq!(
-            chat.used_tokens_for(AgentId(7)),
+            chat.used_tokens_for(AgentId(7), budget),
             0,
             "nothing has been said to that agent"
         );
 
         chat.push_message(AgentId(7), Message::user("y".repeat(900)));
         assert!(
-            chat.used_tokens_for(AgentId(7)) > root,
+            chat.used_tokens_for(AgentId(7), budget) > root,
             "a longer child conversation weighs more than the root's"
         );
         assert_eq!(
-            chat.used_tokens_for(AgentId::ROOT),
+            chat.used_tokens_for(AgentId::ROOT, budget),
             root,
             "the root's own number is unchanged by a child's"
         );
@@ -12044,12 +12361,14 @@ mod tests {
     #[test]
     fn an_agents_weight_is_its_own_prompt_plus_its_transcript() {
         let (mut app, _rx) = test_app("own-prompt");
+        // A window no transcript here fills: the trim is not this test's fact.
+        let budget = 1 << 20;
         // The root: exactly the conversation the actor is handed.
         app.chat
             .push_message(AgentId::ROOT, Message::user("x".repeat(300)));
         let conversation: usize = app.chat.conversation().iter().map(Message::weight).sum();
         assert_eq!(
-            app.chat.used_weight_for(AgentId::ROOT),
+            app.chat.used_weight_for(AgentId::ROOT, budget),
             conversation,
             "the root's number is the conversation it sends"
         );
@@ -12084,7 +12403,7 @@ mod tests {
             .map(Message::weight)
             .sum();
         assert_eq!(
-            app.chat.used_weight_for(AgentId(1)),
+            app.chat.used_weight_for(AgentId(1), budget),
             prompt.weight() + transcript,
             "the child's number is its own prompt plus its transcript"
         );
@@ -13770,9 +14089,12 @@ mod tests {
     fn a_napping_root_reports_its_children() {
         let (mut app, _rx) = test_app("napping-root");
         let conversation = app.tree.conversation();
+        // The event is tagged with the agent that emitted it — the parent —
+        // exactly as `spawn_tool` emits it; the tree's authority on ids is what
+        // let the door refuse a `Spawned` for a parent that is gone (A4).
         app.update(Msg::Agent {
             conversation,
-            id: AgentId(1),
+            id: AgentId::ROOT,
             event: AgentEvent::Spawned {
                 child: 1,
                 parent: 0,

@@ -614,13 +614,15 @@ const STALE_CANCEL: Duration = Duration::from_secs(10);
 ///
 /// **No archive.** The reaped transcript is *gone*, not written anywhere: an
 /// archive would be one more lifetime to reason about, and what bounds a stored
-/// transcript is the request-side fold rather than any byte cut — a conversation
-/// is folded at nine tenths of its history budget
-/// (`mush_core::transcript::compaction_trigger`), and a *child's* is folded only
-/// while it runs, so a finished child sits frozen at whatever it reached. The
-/// file's bound is `CHILD_HISTORY × that fold trigger + the root`, and dropping
-/// a row drops one child's frozen transcript from the next save (the human's
-/// decision, §8.21).
+/// transcript is the request-side bound rather than a lifetime — every row a
+/// save writes is the **bounded view** of its agent's conversation
+/// ([`Chat::bounded_transcript`](crate::app::Chat::bounded_transcript)), the
+/// trim to the history budget an actor's own list gets. A fold is one road to
+/// fitting that budget, not the bound itself: the fold is refused on a window
+/// below ≈5.5 k tokens and a finished child is never folded again, and the
+/// store no longer depends on it (finding A8). The file's bound is
+/// `CHILD_HISTORY × that budget + the root`, and dropping a row drops one
+/// child's transcript from the next save (the human's decision, §8.21).
 pub const CHILD_HISTORY: usize = 50;
 
 /// How many of the newest children keep their actor thread.
@@ -2578,6 +2580,50 @@ mod tests {
         // Fifty exactly is not over the window: nothing to forget.
         tree.reap(&[AgentId(1)]);
         assert!(tree.past_history().is_empty());
+    }
+
+    /// A5, the state machine half, pinned: the order of the run's ending and
+    /// the parent's read is the whole invariant.
+    ///
+    /// A read that lands *before* the ending is written over by
+    /// [`AgentTree::finish`], which arms `result_unread` for a child with a
+    /// parent — and nothing can clear it afterwards, because the parent's
+    /// `delivered` set already names that run and no later `ResultRead` is
+    /// emitted for it. The row then keeps its thread (`may_park`) and stays out
+    /// of the 50-node window (`kept`) with a lying `✉` over a result the model
+    /// has read (§8.39). The actor's order — the ending's emit before
+    /// `tell_parent(ChildDone)` — is what makes the other shape the only one
+    /// that happens; this pins what the two shapes mean.
+    #[test]
+    fn a_read_that_lands_before_the_end_is_re_armed_and_pinned() {
+        let mut tree = AgentTree::bare();
+        let _mailboxes: Vec<_> = (1..=10).map(|id| spawn(&mut tree, id, 0, 1)).collect();
+
+        // The order the actor produces: the ending, then the parent's read.
+        tree.finish(AgentId(1), Some("did 1".into()));
+        tree.result_read(AgentId(1));
+        // The order the race used to produce: the read, then the ending — the
+        // re-arm nothing can clear.
+        tree.result_read(AgentId(2));
+        tree.finish(AgentId(2), Some("did 2".into()));
+
+        assert!(
+            !tree.node(AgentId(1)).unwrap().result_unread,
+            "an ending before the read leaves the row read"
+        );
+        assert!(
+            tree.node(AgentId(2)).unwrap().result_unread,
+            "a read before the ending is re-armed into a lie"
+        );
+        let parkable = tree.parkable();
+        assert!(
+            parkable.contains(&AgentId(1)),
+            "so the read child's thread may be reclaimed: {parkable:?}"
+        );
+        assert!(
+            !parkable.contains(&AgentId(2)),
+            "and the re-armed one's may not: {parkable:?}"
+        );
     }
 
     /// A result its parent has not read is the `✉` protocol, and the child
