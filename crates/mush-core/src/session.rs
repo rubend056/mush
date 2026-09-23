@@ -75,8 +75,15 @@ pub fn session_path(root: &Path) -> PathBuf {
 /// rather than only when absent (finding C5): a hand edit, another tool, or a
 /// repository that ships its own `.mush/.gitignore` used to survive here, and
 /// the whole conversation was then one `git add -A` from the index. The file is
-/// one line and idempotent, so enforcing it costs one small write per start —
+/// one line and idempotent, so enforcing it costs one small write per call —
 /// and a sticky wrong one is a leak, which is the more expensive of the two.
+///
+/// Every road that creates the directory comes through here, not
+/// `create_dir_all`: a `.mush/` recreated mid-run — the human's `rm -rf .mush`,
+/// a `git clean -xfd` — is mush's directory again, and a write that recreated
+/// it without the ignore line would leave the conversation one `git add -A`
+/// from the index (finding R18). `Session::save` and [`keep_previous`] are the
+/// two writes that can find it missing.
 pub fn ensure_mush_dir(root: &Path) -> std::io::Result<()> {
     let dir = mushroom_dir(root);
     fs::create_dir_all(&dir)?;
@@ -116,9 +123,10 @@ pub fn keep_previous(root: &Path, mut session: Session) -> Result<PathBuf, Strin
     let to = previous_session_path(root);
     session.shed_images();
     let write = (|| -> std::io::Result<()> {
-        if let Some(parent) = to.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        // Through `ensure_mush_dir`, not `create_dir_all`: the directory this
+        // recreates has to come back with its ignore line, or the copy just
+        // kept is untracked work the next `git add -A` stages (finding R18).
+        ensure_mush_dir(root)?;
         let json = serde_json::to_vec_pretty(&session).map_err(std::io::Error::other)?;
         crate::workspace::atomic_write(&to, &json, crate::workspace::Fresh::Private)
     })();
@@ -413,9 +421,11 @@ impl Session {
     pub fn save(mut self, root: &Path) -> std::io::Result<()> {
         self.shed_images();
         let path = session_path(root);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        // The directory comes back through `ensure_mush_dir`, the same door
+        // the start takes: a store written after a `git clean -xfd` (or
+        // `rm -rf .mush`) must recreate *mush's* directory, ignore line and
+        // all, not a plain one the next `git add -A` stages (finding R18).
+        ensure_mush_dir(root)?;
         // A serialization failure is an error like any other: the writer's
         // error channel two files away is where the human hears about it, and a
         // session replaced by `{}` would be a save reporting success.
@@ -507,6 +517,36 @@ mod tests {
             fs::read_to_string(&kept).unwrap(),
             broken,
             "and the only copy of the old conversation is byte for byte what it was"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A `.mush/` recreated mid-run — `rm -rf .mush`, a `git clean -xfd` — is
+    /// mush's directory again, so the store's writes have to bring the ignore
+    /// line back with it: the same `ensure_mush_dir` the start takes is the one
+    /// the write roads take, so a conversation written after the directory was
+    /// recreated is not one `git add -A` from the index (finding R18).
+    #[test]
+    fn a_store_write_recreates_the_mush_dir_with_its_ignore_line() {
+        let root = Scratch::new("session-recreated");
+
+        // The save road: no `.mush/` exists at all, and the write is what
+        // creates it.
+        saying("hello").save(&root).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(MUSH_DIR).join(".gitignore")).unwrap(),
+            SELF_IGNORE,
+            "a save recreated .mush/ without its ignore line"
+        );
+
+        // The keep road: the directory is taken away mid-run, with the
+        // conversation still live in the window.
+        fs::remove_dir_all(root.join(MUSH_DIR)).unwrap();
+        keep_previous(&root, saying("the cleared conversation")).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(MUSH_DIR).join(".gitignore")).unwrap(),
+            SELF_IGNORE,
+            "the kept copy recreated .mush/ without its ignore line"
         );
         let _ = fs::remove_dir_all(&root);
     }
