@@ -1,6 +1,8 @@
 //! The attach socket: an external agent drives a running mush (M3).
 //!
-//! A UNIX socket lives at `<root>/.mush/mush.sock` for as long as mush runs.
+//! A UNIX socket lives at `<root>/.mush/mush.sock` for as long as mush runs,
+//! owner-only (`0600`) whatever the process's umask, because the surface
+//! speaks for the human (finding R14).
 //! The listener has a thread of its own, and each connection another, so a
 //! client that goes quiet cannot block the ones behind it (finding A2); none of
 //! those threads ever touches `App`'s state. A request line is parsed, handed
@@ -20,6 +22,7 @@
 //! with `conflict` rather than guessing.
 
 use std::io::{self, BufRead, BufReader, Write};
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -233,6 +236,20 @@ fn serve_with(
     }
     let listener = UnixListener::bind(&path)
         .map_err(|error| format!("could not bind {}: {error}", path.display()))?;
+    // `bind` creates the socket with the process's umask, so a shared-group
+    // checkout (umask 002) or a lax umask (000) leaves it readable and
+    // answerable by every group member — the surface speaks for the human, so
+    // the name is narrowed to its owner right after it exists (finding R14).
+    // A chmod that fails fails the serve: a socket others may reach is not one
+    // to leave running, and the name goes with the error rather than staying
+    // behind for the next mush to find as a crash's leftover.
+    if let Err(error) = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)) {
+        let _ = std::fs::remove_file(&path);
+        return Err(format!(
+            "could not make {} owner-only: {error}",
+            path.display()
+        ));
+    }
     let guard = Guard { path };
     // The guard is built before the thread so the file is never left behind if
     // the spawn fails: returning here drops it, and its `Drop` removes the
@@ -1344,6 +1361,23 @@ mod tests {
             Line::Text(line) => assert_eq!(line, "still a request"),
             other => panic!("the refused line ended at its newline: {other:?}"),
         }
+    }
+
+    /// The socket is the human's alone: `bind` creates it with the process's
+    /// umask, so a shared-group checkout or a lax umask would leave every
+    /// other account able to read the conversation and steer the session; it
+    /// is narrowed to owner-only right after the bind (finding R14).
+    #[test]
+    fn the_socket_is_owner_only() {
+        let root = Scratch::new("attach-mode");
+        std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let guard = serve(&root, tx).unwrap();
+        let path = socket_path(&root);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the socket is owner-only, not {mode:04o}");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A thread that will not start must not leave the socket file behind. The
