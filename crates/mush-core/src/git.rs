@@ -392,11 +392,12 @@ fn head_answer(probe: Result<String, String>) -> Option<bool> {
 /// Returns the path and the branch, both from the formatters above, so no caller
 /// ever spells `.mush/wt/<id>` or `mush/<id>` itself.
 ///
-/// The three ways this can refuse each carry a reason a human has to read: no
-/// repository, no commit to start from, and git's own message when the add
-/// itself fails (an id whose branch or directory is still taken). The spawn
-/// tool treats every one of them as a refused delegation: a base is a promise
-/// about history, and a child running on the wrong one is worse than no child.
+/// Every way this can refuse carries a reason a human has to read: not a
+/// repository, no commit to start from, a path git cannot be handed, and git's
+/// own message when the add itself fails (an id whose branch or directory is
+/// still taken). The spawn tool treats each of them as a refused delegation: a
+/// base is a promise about history, and a child running on the wrong one is
+/// worse than no child.
 pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf, String), String> {
     if !dir.join(".git").exists() {
         return Err("not a git repository".to_string());
@@ -412,6 +413,17 @@ pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf,
     }
     let path = worktree_path(dir, id);
     let branch = branch_name(id);
+    // A path git cannot be given is refused *before* anything is created: the
+    // empty string this used to fall through to (`to_str().unwrap_or("")`) made
+    // `git worktree add -b mush/<id> "" HEAD` create the branch and then die on
+    // git's own assertion — a partial add whose id the caller has to keep
+    // either way (finding F10).
+    let Some(path_arg) = path.to_str() else {
+        return Err(format!(
+            "cannot create a worktree at `{}`: the path is not valid UTF-8, and git cannot be given it",
+            path.display()
+        ));
+    };
     // The name is `worktree add`, not `run`'s `worktree`: a silent failure has
     // to name the subcommand that failed, and this is the call that knows it.
     run_named(
@@ -422,7 +434,7 @@ pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf,
             "add",
             "-b",
             &branch,
-            path.to_str().unwrap_or(""),
+            path_arg,
             base.unwrap_or("HEAD"),
         ],
     )
