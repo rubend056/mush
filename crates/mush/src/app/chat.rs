@@ -934,7 +934,7 @@ pub struct Chat {
     /// human's own words — so the default costs nothing and there is no second
     /// copy of the transcript to keep in step with this one. `replace_transcript`
     /// drops an agent's map with it: a restored transcript arrives without its
-    /// provenance, and the pane then reads what it can from the lines themselves
+    /// voices, and the pane then reads the flags the lines carry
     /// ([`unrecorded`]).
     spoken: HashMap<AgentId, HashMap<usize, Voice>>,
     /// Each painted tool call's one-word reading, keyed like [`Self::spoken`]:
@@ -3064,11 +3064,6 @@ fn grouped(n: usize) -> String {
     out
 }
 
-/// The head of the one user message a fold leaves behind
-/// (`prompt::compaction_message`): the model's own summary, carried as the next
-/// conversation's first message. It is mush's line, not the human's words.
-const FOLDED: &str = "Context compacted";
-
 /// The two lines one loop guard writes, in its own vocabulary: the notice it
 /// emits as it stops the run, and the failure the run then ends with
 /// (`agent.rs`'s guard, which the run has no other way to report). They are one
@@ -3077,26 +3072,30 @@ const LOOP_NOTICE: &str = "the run repeated the same tool call";
 const LOOP_STOP: &str = "the run was stopped as a loop";
 
 /// Who said a user line when nothing recorded it: a transcript restored from the
-/// session file, or the one a fold just replaced. Everything mush writes into a
-/// conversation is marked or shaped — a child's `#1 done: …` / `#1 stopped: …` /
-/// `#1 failed: …`, a job's `#c2 done: …`, a fold's carried summary, the line
-/// that says the oldest turns were dropped (marked by `Message::note`'s flag and
-/// read by [`transcript::is_dropped_note`]), and the lines mush writes *to* a
+/// session file, or the one a fold just replaced. Every line mush writes into a
+/// conversation carries a flag — a child's `#1 done: …` / `#1 stopped: …` /
+/// `#1 failed: …` and a job's `#c2 done: …` (marked where the fold delivers
+/// them, `agent::push_mush_line`), a fold's carried summary (marked where it is
+/// written, in the actor and in the UI's mirror), the lines mush writes *to* a
 /// run — the loop guard's warning, the instructions a cut-off or unreadable
-/// reply is answered with, the report a failed commit leaves (marked by
-/// [`Message::mush`], the one constructor that sets the flag) — and a child's
-/// transcript opens with the brief its parent spawned it with. What is left is
-/// the human's, because that is what most of a transcript is.
+/// reply is answered with, the report a failed commit leaves (the same mark) —
+/// and the line that says the oldest turns were dropped ([`Message::note`]'s
+/// flag, read by [`transcript::is_dropped_note`]). A child's transcript opens
+/// with the brief its parent spawned it with, and every other line is the
+/// human's, because that is what most of a transcript is.
 ///
-/// The marked lines are read by the flag alone, never by their words: every one
-/// of them reaches the pane as the `user` message the model must keep reading
-/// (its place in the request is the point of finding F17), and every one of them
-/// is a sentence a human could type word for word. Reading a sentence's own head
-/// would make those words the provenance, which is the rule finding F3 removed;
-/// the flag is what the session file stores ([`Message::mush`]), so the same
-/// read serves the live transcript and the one restored from the session file.
-/// One mark serves every writer — the loop guard, both instructions, the failed
-/// commit — instead of a prefix per sentence to keep in step with the pane.
+/// The lines are read by their flag alone, never by their words: every one of
+/// them reaches the pane as the `user` message the model must keep reading (its
+/// place in the request is the point of finding F17), and every one of them is
+/// a sentence a human could type word for word. Reading a sentence's own head
+/// would make those words the provenance, which is the rule finding F3 removed —
+/// the two shape reads this function used to open with (a report's `#1 done:`
+/// and the fold's `Context compacted`) painted a restored human's own sentence
+/// as mush's. The flag is what the session file stores ([`Message::mush`]), so
+/// the same read serves the live transcript and the one restored from the
+/// session file. One mark serves every writer — the loop guard, both
+/// instructions, the failed commit, a report, a fold — instead of a prefix per
+/// sentence to keep in step with the pane.
 ///
 /// The one line this cannot place is a parent's steering after a restart: the
 /// words look exactly like the human's own nudge, and nothing in the file says
@@ -3109,12 +3108,7 @@ const LOOP_STOP: &str = "the run was stopped as a loop";
 /// the one rule finding F3 removed: a line that is word for word the note but
 /// carries no flag stays the human's.
 fn unrecorded(agent: AgentId, index: usize, message: &Message) -> Voice {
-    let text = message.text();
-    if report(text)
-        || text.starts_with(FOLDED)
-        || message.mush
-        || transcript::is_dropped_note(message)
-    {
+    if message.mush || transcript::is_dropped_note(message) {
         return Voice::Mush;
     }
     if agent != AgentId::ROOT && index == 0 {
@@ -3148,13 +3142,6 @@ fn report_tail(text: &str) -> Option<&str> {
         .iter()
         .any(|head| tail.starts_with(head))
         .then_some(tail)
-}
-
-/// Whether a line is one of mush's reports — `#1 done: …`, `#c2 stopped: …`,
-/// `#3 cut off: …` — written by the run loop, the job registry and the UI's own
-/// last-resort report with exactly this vocabulary.
-fn report(text: &str) -> bool {
-    report_tail(text).is_some()
 }
 
 /// Whether a report line is the one that says a run *failed* (`#3 failed: …`)
@@ -5321,7 +5308,7 @@ mod tests {
     fn a_line_the_human_did_not_say_is_not_in_the_human_voice() {
         let mut chat = Chat::bare();
         chat.push_message(AgentId(1), Message::user("create a file called iso.txt"));
-        chat.push_message(AgentId(1), Message::user("#1 done: created iso.txt"));
+        chat.push_message(AgentId(1), Message::mush("#1 done: created iso.txt"));
         chat.push_message(AgentId(1), Message::user("keep the steps small"));
         say(&mut chat, AgentId(1), "and add a test");
 
@@ -5510,14 +5497,15 @@ mod tests {
     }
 
     /// The same in the root's pane: mush folds a child's result in as a *user*
-    /// message (that is the shape a model reads it in), so the root's transcript
-    /// paints `· #1 done: …` — mush's report — and not the human asking
-    /// themselves a question.
+    /// message (that is the shape a model reads it in) and marks it
+    /// [`Message::mush`], because `#1 done: …` is a sentence a human could type
+    /// word for word — so the root's transcript paints `· #1 done: …`, mush's
+    /// report, and not the human asking themselves a question.
     #[test]
     fn a_folded_completion_is_mushs_line_in_the_roots_pane() {
         let mut chat = Chat::bare();
         say(&mut chat, AgentId::ROOT, "delegate the parser");
-        chat.push_message(AgentId::ROOT, Message::user("#1 done: wrote the parser"));
+        chat.push_message(AgentId::ROOT, Message::mush("#1 done: wrote the parser"));
 
         let rows = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 6));
         assert!(
@@ -5528,6 +5516,87 @@ mod tests {
             rows.iter().any(|row| row == "you › delegate the parser"),
             "{rows:?}"
         );
+    }
+
+    /// The last two shape reads retire: a child's or a job's report and the
+    /// fold's carried summary are mush's line because the writer set the mark
+    /// ([`Message::mush`]), never because of the words. Both are sentences a
+    /// human can type — `#1 done: …`, `Context compacted …` — and a human's
+    /// word-for-word lookalike restored from the session file, which carries
+    /// the flag and not the reader, must keep the human's voice.
+    ///
+    /// Measured before: a real report, a real fold, and the human's lookalikes
+    /// all painted `· ` on a child's pane and on a restored copy — reading the
+    /// shape made the human's own sentence mush's. After: the marked lines
+    /// still `· `, the lookalikes `you › ` (and a lookalike arriving unmarked
+    /// mid-run is another agent's, the pane's existing fallback).
+    #[test]
+    fn a_report_and_a_fold_read_their_mark_and_never_their_words() {
+        let fold = mush_core::prompt::compaction_message("did the thing");
+        let report = "#1 done: created iso.txt";
+
+        // A child's pane, the shape the fold delivers: the report and the
+        // carried summary the writers mark are mush's.
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId(1), Message::user("the brief"));
+        chat.push_message(AgentId(1), Message::mush(report));
+        chat.push_message(AgentId(1), Message::mush(fold.clone()));
+        // The same sentences arriving unmarked: no writer said mush wrote
+        // them, so the old shape read must not place them either.
+        chat.push_message(AgentId(1), Message::user(report));
+        chat.push_message(AgentId(1), Message::user(fold.clone()));
+        let live = shown(&pane_rows(&chat, &pane(AgentId(1)), 80, 30));
+        let painted = live.join("\n");
+        assert!(painted.contains("· #1 done: created iso.txt"), "{painted}");
+        assert!(painted.contains("· Context compacted"), "{painted}");
+        assert!(
+            painted.contains("parent › #1 done: created iso.txt"),
+            "an unmarked report is nobody's mark to claim: {painted}"
+        );
+        assert!(
+            painted.contains("parent › Context compacted"),
+            "and neither is a fold-shaped line: {painted}"
+        );
+        assert_eq!(
+            live.iter().filter(|row| row.starts_with("· ")).count(),
+            2,
+            "only the two marked sentences are mush's: {live:?}"
+        );
+
+        // A restored copy: the flag is what the session file keeps, so the
+        // marked real lines paint as mush's and a human's lookalikes — word
+        // for word the same sentences, with no flag — keep the human's voice,
+        // on the root's pane and on a child's.
+        for agent in [AgentId::ROOT, AgentId(1)] {
+            let mut chat = Chat::bare();
+            chat.replace_transcript(
+                agent,
+                vec![
+                    Message::user("port the parser"),
+                    Message::mush(report),
+                    Message::mush(fold.clone()),
+                    Message::user(report),
+                    Message::user(fold.clone()),
+                ],
+            );
+            let rows = shown(&pane_rows(&chat, &pane(agent), 80, 30));
+            let painted = rows.join("\n");
+            assert!(painted.contains("· #1 done: created iso.txt"), "{painted}");
+            assert!(painted.contains("· Context compacted"), "{painted}");
+            assert!(
+                painted.contains("you › #1 done: created iso.txt"),
+                "the human's report-shaped line is theirs: {painted}"
+            );
+            assert!(
+                painted.contains("you › Context compacted"),
+                "and the human's fold-shaped line too: {painted}"
+            );
+            assert_eq!(
+                rows.iter().filter(|row| row.starts_with("· ")).count(),
+                2,
+                "only the two marked sentences are mush's: {rows:?}"
+            );
+        }
     }
 
     /// Mush's words *to* a run are marked at the shape the actor hands over —
@@ -5686,10 +5755,11 @@ mod tests {
     }
 
     /// A transcript restored from the session file arrives without its voices,
-    /// so the pane reads what the lines themselves say: a fold's carried summary
-    /// is mush's line, a child's first line is the brief it was spawned with,
-    /// and everything else is the human — which is what most of a transcript is,
-    /// and the panel recusing itself from the human's own question would be the
+    /// so the pane reads the flags the lines themselves carry: a fold's carried
+    /// summary and a job's report are mush's lines — marked where they were
+    /// written — a child's first line is the brief it was spawned with, and
+    /// everything else is the human, which is what most of a transcript is and
+    /// the panel recusing itself from the human's own question would be the
     /// louder lie.
     #[test]
     fn a_restored_transcript_reads_its_own_lines() {
@@ -5698,8 +5768,8 @@ mod tests {
             AgentId::ROOT,
             vec![
                 Message::user("port the parser"),
-                Message::user("Context compacted — continue the task from this summary:\ndid it"),
-                Message::user("#c2 done: exit 0 · 3m12s · cargo test"),
+                Message::mush("Context compacted — continue the task from this summary:\ndid it"),
+                Message::mush("#c2 done: exit 0 · 3m12s · cargo test"),
                 Message::assistant("still here"),
             ],
         );
@@ -6158,7 +6228,7 @@ mod tests {
     fn forgetting_an_agent_drops_only_its_own_entries() {
         let mut chat = Chat::bare();
         say(&mut chat, AgentId(1), "port the parser");
-        chat.push_message(AgentId(1), Message::user("#1 done: did it"));
+        chat.push_message(AgentId(1), Message::mush("#1 done: did it"));
         chat.note_error_for(AgentId(1), "boom");
         chat.scroll_by(AgentId(1), 2);
         say(&mut chat, AgentId(2), "port the lexer");
@@ -6739,7 +6809,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let mut chat = Chat::bare();
-        chat.push_message(AgentId::ROOT, Message::user(&report));
+        chat.push_message(AgentId::ROOT, Message::mush(report.clone()));
 
         // Eight wrapped rows, the `…` that stands for the rest; the pane trims
         // the blank that closes the message when the transcript ends there.
@@ -6886,7 +6956,7 @@ mod tests {
         chat.fold = zero;
         chat.push_message(
             AgentId::ROOT,
-            Message::user("#1 failed: no route to the endpoint\nthe run's own log"),
+            Message::mush("#1 failed: no route to the endpoint\nthe run's own log"),
         );
         assert_eq!(
             shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 8)),
@@ -6960,7 +7030,7 @@ mod tests {
         );
         chat.push_message(
             AgentId::ROOT,
-            Message::user("#1 done: the parser is written"),
+            Message::mush("#1 done: the parser is written"),
         );
         let pane = pane(AgentId::ROOT);
 
@@ -7026,7 +7096,7 @@ mod tests {
         );
         chat.push_message(
             AgentId::ROOT,
-            Message::user("#1 failed: no route to the endpoint\nthe run's own log"),
+            Message::mush("#1 failed: no route to the endpoint\nthe run's own log"),
         );
         let pane = pane(AgentId::ROOT);
 

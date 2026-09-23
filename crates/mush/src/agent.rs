@@ -2602,7 +2602,7 @@ fn absorb(
             if !fresh {
                 return Fold::Idle;
             }
-            push_line(actor, transcript, line);
+            push_mush_line(actor, transcript, line);
             // The line is in this parent's transcript now, so the child's row
             // stops claiming nobody has read it — the one moment that fact
             // changes hands, told to the UI from the actor that owns it
@@ -2677,7 +2677,7 @@ fn absorb(
             match state.record_job(id, line, news) {
                 None => Fold::Idle,
                 Some(line) => {
-                    push_line(actor, transcript, line);
+                    push_mush_line(actor, transcript, line);
                     if news {
                         Fold::Run
                     } else {
@@ -3880,7 +3880,7 @@ fn compact_history(
     }
 
     let system = messages[0].clone();
-    *messages = vec![system, Message::user(prompt::compaction_message(&summary))];
+    *messages = vec![system, Message::mush(prompt::compaction_message(&summary))];
     actor.ctx.emit(
         actor.id,
         AgentEvent::Compact {
@@ -4108,15 +4108,16 @@ fn drain_mailbox(
                 shared,
             } => note_child_book(state, id, cmd, outcome, read, shared),
             AgentMsg::ForgetChild { id } => forget_child(state, id),
-            // A job's report is folded into the transcript as a user message:
-            // the model reads `#c2 done: exit 0 · …` in the next request, and
+            // A job's report is folded into the transcript as a marked `user`
+            // message (`push_mush_line`): the model reads `#c2 done: exit 0 · …`
+            // in the next request, and
             // the line is marked delivered so it is never injected twice. A
             // report the model has *already* read is not folded again however
             // often it is recorded (`docs/findings.md` B24), which is what makes
             // a replayed record cost nothing.
             AgentMsg::CommandDone { id, line, news } => {
                 if let Some(line) = state.record_job(id, line, news) {
-                    push_line(actor, messages, line);
+                    push_mush_line(actor, messages, line);
                 }
             }
             // The UI sends a whole transcript when it believes we are idle.
@@ -4389,26 +4390,29 @@ fn prune_job_books(state: &mut ActorState) {
 /// A line that reaches `messages` alone is a line the human cannot see
 /// (`docs/findings.md` B20) and, because the UI's copy is what an idle `Run`
 /// hands back, a delivery that adoption then re-arms and the model reads
-/// twice. Every fold of a completion or a steering line goes through here, so
-/// the two copies cannot drift apart in either direction.
+/// twice. Every fold of another agent's line — a steering, a report — goes
+/// through here, so the two copies cannot drift apart in either direction.
 ///
-/// The line is somebody else's — a completion, a steering, a nudge — so it
-/// carries no provenance flag: those lines the pane already tells apart by
-/// their shape (a report's `#1 done:`, a fold's opening) or by the fact that
-/// it just watched them arrive. Mush's own lines to the model take
-/// [`push_mush_line`], the same road with the mark that makes them mush's.
+/// The line is somebody else's — a parent's steering — so it carries no
+/// provenance flag; the pane tells it from the human's by the fact that it
+/// just watched it arrive, and from mush's by the mark this road does not set.
+/// Mush's own lines to the model take [`push_mush_line`], the same road with
+/// the mark that makes them mush's — a child's or a job's report included:
+/// `#1 done: …` is a sentence a human could type word for word, so the words
+/// cannot be what says whose it is (finding F3).
 fn push_line(actor: &Actor, messages: &mut Vec<Message>, text: String) {
     push_message(actor, messages, Message::user(text));
 }
 
 /// [`push_line`] for a line *mush* wrote into the conversation: the loop
 /// guard's warning, a reply that was cut off or could not be read, the report
-/// a failed commit leaves. The sentence is the model's to read, so it is not a
-/// shape the pane can read provenance from: the line goes as `user` — the
-/// shape a request carries an instruction in — and [`Message::mush`] is what
-/// tells the pane it did not come from the human or another agent (finding
-/// F3, and the head [`Work`]'s name once carried: one mark for every writer
-/// instead of a prefix per sentence).
+/// a failed commit leaves, and a child's or a job's report a fold delivers.
+/// The sentence is the model's to read, so it is not a shape the pane can read
+/// provenance from: the line goes as `user` — the shape a request carries an
+/// instruction in — and [`Message::mush`] is what tells the pane it did not
+/// come from the human or another agent (finding F3, and the head [`Work`]'s
+/// name once carried: one mark for every writer instead of a prefix per
+/// sentence).
 fn push_mush_line(actor: &Actor, messages: &mut Vec<Message>, text: String) {
     push_message(actor, messages, Message::mush(text));
 }
@@ -4448,7 +4452,7 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
     let mut news = false;
     for (job, line, job_news) in jobs {
         if let Some(line) = state.record_job(job, line, job_news) {
-            push_line(actor, messages, line);
+            push_mush_line(actor, messages, line);
         }
         news |= job_news;
     }
@@ -4465,7 +4469,7 @@ fn fold_completions(actor: &Actor, state: &mut ActorState, messages: &mut Vec<Me
     for (child, run, outcome) in children {
         let (line, fresh) = state.record_child(child, run, outcome);
         if fresh {
-            push_line(actor, messages, line);
+            push_mush_line(actor, messages, line);
             actor.ctx.emit(actor.id, AgentEvent::ResultRead { child });
         }
         news = true;
@@ -14817,6 +14821,10 @@ mod tests {
         );
         assert_eq!(messages.last().unwrap().text(), "#1 done: did the thing");
         assert!(
+            messages.last().unwrap().mush,
+            "the report carries the mark its writer sets, not its shape"
+        );
+        assert!(
             state.delivered.contains_key(&1),
             "and it counts as delivered"
         );
@@ -14851,6 +14859,13 @@ mod tests {
         assert!(
             folded.contains(&"#c3 stopped after 1s · npm run dev"),
             "and so is the kill, without a turn being paid for it: {folded:?}"
+        );
+        assert!(
+            messages
+                .iter()
+                .filter(|message| message.text().starts_with("#c"))
+                .all(|message| message.mush),
+            "a job's report carries the same mark: {messages:?}"
         );
         assert!(
             state.delivered_jobs.contains(&JobId(2)) && state.delivered_jobs.contains(&JobId(3))
@@ -16539,6 +16554,10 @@ mod tests {
         assert_eq!(
             asked[1].messages[1].text(),
             prompt::compaction_message(summary)
+        );
+        assert!(
+            asked[1].messages[1].mush,
+            "the fold's carried summary is marked as mush's line, not left to its words"
         );
         // …and the work survives the fold: the child was asked afterwards.
         assert_eq!(
