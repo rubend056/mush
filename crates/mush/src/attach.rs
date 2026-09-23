@@ -1,10 +1,16 @@
 //! The attach socket: an external agent drives a running mush (M3).
 //!
 //! A UNIX socket lives at `<root>/.mush/mush.sock` for as long as mush runs.
-//! One thread owns the accept loop and every connection; it never touches
-//! `App`'s state. It parses a request line, hands it to the UI thread as
-//! [`Msg::Attach`] with a one-shot reply channel, blocks on the answer, and
-//! writes it back. `App` stays the only effector.
+//! The listener has a thread of its own, and each connection another, so a
+//! client that goes quiet cannot block the ones behind it (finding A2); none of
+//! those threads ever touches `App`'s state. A request line is parsed, handed
+//! to the UI thread as [`Msg::Attach`] with a one-shot reply channel, and the
+//! answer is written back. `App` stays the only effector.
+//!
+//! Every road in — the line, the connections, the time a client may say
+//! nothing — is bounded (see [`MAX_REQUEST_BYTES`], [`MAX_CONNECTIONS`] and
+//! [`IDLE_TIMEOUT`]), because a surface a same-user process can reach is a
+//! surface that must not be able to spend mush's heap, threads or patience.
 //!
 //! The protocol is newline-delimited JSON: one request and one response per
 //! line. Every request carries an `id` (any JSON value, echoed verbatim), and
@@ -15,6 +21,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
@@ -35,6 +43,47 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(20);
 /// the write. A mush that is alive but not answering must not hang a script
 /// (the client half of finding A2).
 const ASK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How much of a request line the socket will hold before it refuses it.
+///
+/// 64 KiB is generous for a JSON line, and it is the same decision every other
+/// input road in the tree already makes (the clipboard's `READ_CAP`, the HTTP
+/// body's `MAX_BODY_BYTES`): a buffer whose size the client does not choose.
+/// A line past the cap is answered `bad_request`, naming the cap, and the rest
+/// of the line is read and thrown away — constant memory however long the
+/// client keeps talking, and the connection's next line is a fresh request.
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+
+/// How many connections the surface serves at once.
+///
+/// Each one owns a thread that waits on its client, so without a cap a script
+/// that leaks sockets — or a same-user process that means to — spends the
+/// process's thread limit. Past the cap a connection is answered `unavailable`
+/// and closed: the client can retry, and the surface does not grow.
+const MAX_CONNECTIONS: usize = 64;
+
+/// How long a connection may say nothing before it is reaped.
+///
+/// The protocol is one request and one answer per line, so a client that has
+/// connected and then said nothing is either gone or not a client. This is the
+/// server's half of the bound [`ask`] already puts on itself ([`ASK_TIMEOUT`]),
+/// and the two numbers are the same on purpose.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// What a serve is allowed: the live-connection cap and the idle window. One
+/// value rather than two arguments, so the tests can hold a clock and a count
+/// while the production numbers stay in one place ([`LIMITS`]).
+#[derive(Clone, Copy)]
+struct Limits {
+    connections: usize,
+    idle: Duration,
+}
+
+/// The bounds a running mush serves under.
+const LIMITS: Limits = Limits {
+    connections: MAX_CONNECTIONS,
+    idle: IDLE_TIMEOUT,
+};
 
 /// Where a running mush listens, and the CLI looks.
 pub fn socket_path(root: &Path) -> PathBuf {
@@ -62,24 +111,33 @@ impl Drop for Guard {
 /// another mush, and the bind refuses the name rather than stealing its
 /// socket.
 pub fn serve(root: &Path, ui_tx: Sender<Msg>) -> Result<Guard, String> {
-    serve_with(root, ui_tx, |listener, ui_tx| {
-        thread::Builder::new()
-            .name("mush-attach".to_string())
-            .spawn(move || accept_loop(listener, ui_tx))
-            .map(|_| ())
-            .map_err(|error| format!("could not start the attach thread: {error}"))
-    })
+    serve_with(root, ui_tx, LIMITS, spawn_accept_loop)
 }
 
-/// [`serve`] with the one step no test can make fail injected: starting the
-/// thread that runs the accept loop. A spawn the OS refuses is exactly what
-/// finding A7 is about — the socket file must go with the failed serve — and a
-/// thread the OS will not give cannot be asked for on purpose, so the failing
-/// start is the test's own.
+/// The accept loop's thread, named the way the rest of the tree's threads are,
+/// so a spawn failure is a returned error and not a raised panic.
+fn spawn_accept_loop(
+    listener: UnixListener,
+    ui_tx: Sender<Msg>,
+    limits: Limits,
+) -> Result<(), String> {
+    thread::Builder::new()
+        .name("mush-attach".to_string())
+        .spawn(move || accept_loop(listener, ui_tx, limits))
+        .map(|_| ())
+        .map_err(|error| format!("could not start the attach thread: {error}"))
+}
+
+/// [`serve`] with the limits a test holds and the one step no test can make
+/// fail injected: starting the thread that runs the accept loop. A spawn the OS
+/// refuses is exactly what finding A7 is about — the socket file must go with
+/// the failed serve — and a thread the OS will not give cannot be asked for on
+/// purpose, so the failing start is the test's own.
 fn serve_with(
     root: &Path,
     ui_tx: Sender<Msg>,
-    start: impl FnOnce(UnixListener, Sender<Msg>) -> Result<(), String>,
+    limits: Limits,
+    start: impl FnOnce(UnixListener, Sender<Msg>, Limits) -> Result<(), String>,
 ) -> Result<Guard, String> {
     let path = socket_path(root);
     if path.exists() && UnixStream::connect(&path).is_err() {
@@ -91,53 +149,202 @@ fn serve_with(
     // The guard is built before the thread so the file is never left behind if
     // the spawn fails: returning here drops it, and its `Drop` removes the
     // socket (finding A7).
-    start(listener, ui_tx)?;
+    start(listener, ui_tx, limits)?;
     Ok(guard)
 }
 
-/// One thread per connection, so an idle client holds nothing but its own
-/// thread. This used to be serial: a client that connected and said nothing
-/// blocked every other client, and `mush agents` simply did not return while
-/// it was held (finding A2). The UI thread is still never blocked here — it
-/// never touches the socket.
-fn accept_loop(listener: UnixListener, ui_tx: Sender<Msg>) {
+/// Accept connections, one thread per client, until the listener dies.
+///
+/// The thread count is bounded by [`Limits::connections`]: a connection past
+/// the cap is answered `unavailable` and closed without a thread of its own,
+/// and a served connection holds one of the cap's slots until it goes away.
+/// The slot is taken here, on the accepting thread, so the count cannot race —
+/// the only other change is a connection thread giving its slot back.
+fn accept_loop(listener: UnixListener, ui_tx: Sender<Msg>, limits: Limits) {
+    let live = Arc::new(AtomicUsize::new(0));
     loop {
         match listener.accept() {
             Ok((stream, _)) => {
+                if live.load(Ordering::SeqCst) >= limits.connections {
+                    refuse_busy(stream, limits.connections);
+                    continue;
+                }
+                live.fetch_add(1, Ordering::SeqCst);
                 let ui_tx = ui_tx.clone();
+                let slot = live.clone();
                 // A thread that cannot start ends this connection only; the
                 // listener keeps accepting, because a busy box must not take
-                // the attach surface down with it.
-                let _ = thread::Builder::new()
+                // the attach surface down with it. The slot it took goes back
+                // at once: the guard that would have given it back on the way
+                // out of `serve_connection` never ran.
+                let started = thread::Builder::new()
                     .name("mush-attach-conn".to_string())
-                    .spawn(move || serve_connection(stream, &ui_tx));
+                    .spawn(move || {
+                        let _slot = Live(slot);
+                        serve_connection(stream, &ui_tx, limits.idle);
+                    });
+                if started.is_err() {
+                    live.fetch_sub(1, Ordering::SeqCst);
+                }
             }
             Err(_) => thread::sleep(ACCEPT_BACKOFF),
         }
     }
 }
 
+/// Gives a connection's slot back when its thread ends, however it ends: the
+/// guard lives on the connection thread's stack, so a return and a panic both
+/// free it — otherwise the surface would refuse clients nothing was holding.
+struct Live(Arc<AtomicUsize>);
+
+impl Drop for Live {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Answer a client the surface has no room for, and close.
+///
+/// The request line is not read: reading it would take the thread the cap just
+/// refused, and a client past the cap is owed a retryable answer, not a parse of
+/// its request. [`ask`] reads an `unavailable` whose `id` is `null`, which is
+/// the only id a request that was never read can carry.
+fn refuse_busy(mut stream: UnixStream, max: usize) {
+    let response = Response::error(
+        Value::Null,
+        ReplyError::unavailable(format!(
+            "the attach surface already holds {max} connections — retry when one is free"
+        )),
+    );
+    let mut line = response.encode();
+    line.push('\n');
+    let _ = stream.write_all(line.as_bytes());
+    let _ = stream.flush();
+}
+
+/// One line from a client, read under [`MAX_REQUEST_BYTES`].
+#[derive(Debug)]
+enum Line {
+    /// A line, newline stripped (or the last bytes before EOF), within the cap.
+    Text(String),
+    /// A line longer than the cap. It was read to its newline and thrown away,
+    /// so the connection stands at the start of its next line.
+    Oversize,
+    /// The bytes were not UTF-8, so they are not JSON either.
+    NotText,
+    /// The client closed, or said nothing for the idle window.
+    Gone,
+}
+
+/// Read one line, holding at most `cap` bytes of it.
+///
+/// [`BufRead::read_line`] grows with the client, so a line with no newline in
+/// it is a heap the client chooses the size of (finding B11). This reads
+/// through the reader's own buffer: it keeps at most `cap` bytes and, once a
+/// byte past the cap has arrived, stops keeping and drains to the newline
+/// instead — constant memory whichever way the line ends. A read that times out
+/// is [`Line::Gone`], the same as EOF: the client may come back, but this
+/// connection is not going to wait for it.
+fn read_line_capped(reader: &mut impl BufRead, cap: usize) -> std::io::Result<Line> {
+    let mut line: Vec<u8> = Vec::new();
+    let mut oversize = false;
+    loop {
+        let chunk = match reader.fill_buf() {
+            Ok(chunk) => chunk,
+            // The idle window fired (SO_RCVTIMEO answers EAGAIN): the client is
+            // not saying anything, and this thread has other clients to make
+            // room for.
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.kind() == std::io::ErrorKind::TimedOut =>
+            {
+                return Ok(Line::Gone)
+            }
+            Err(error) => return Err(error),
+        };
+        if chunk.is_empty() {
+            // EOF. A line with bytes in it is still a line; nothing at all is
+            // the client's end.
+            if line.is_empty() && !oversize {
+                return Ok(Line::Gone);
+            }
+            return Ok(finish(line, oversize));
+        }
+        let newline = chunk.iter().position(|&byte| byte == b'\n');
+        let piece = match newline {
+            Some(at) => &chunk[..at],
+            None => chunk,
+        };
+        let keep = if oversize {
+            false
+        } else if line.len() + piece.len() > cap {
+            // Keep nothing more: what was refused will not be parsed, and the
+            // bytes after the newline are a fresh request.
+            oversize = true;
+            line.clear();
+            false
+        } else {
+            true
+        };
+        let piece_len = piece.len();
+        if keep {
+            line.extend_from_slice(piece);
+        }
+        let took_newline = newline.is_some();
+        reader.consume(piece_len + usize::from(took_newline));
+        if took_newline {
+            return Ok(finish(line, oversize));
+        }
+    }
+}
+
+/// What the bytes of a finished line are: a line, a line too long, or not text
+/// at all.
+fn finish(bytes: Vec<u8>, oversize: bool) -> Line {
+    if oversize {
+        return Line::Oversize;
+    }
+    match String::from_utf8(bytes) {
+        Ok(text) => Line::Text(text),
+        Err(_) => Line::NotText,
+    }
+}
+
 /// Read request lines from one client and answer each, until it goes away. A
-/// bad line is answered with an error and does not end the connection.
-fn serve_connection(stream: UnixStream, ui_tx: &Sender<Msg>) {
+/// bad line is answered with an error and does not end the connection; a line
+/// past [`MAX_REQUEST_BYTES`] is one of those bad lines, and the connection
+/// lives on to answer whatever line comes after it.
+///
+/// The reads are bounded by the client's own words: a line within the cap, and
+/// something said inside the idle window. Both are the socket's, so the waiting
+/// is the kernel's and this thread is not woken to check a clock.
+fn serve_connection(stream: UnixStream, ui_tx: &Sender<Msg>, idle: Duration) {
     let from = peer_label(&stream);
+    if stream.set_read_timeout(Some(idle)).is_err() {
+        return;
+    }
     let Ok(read_side) = stream.try_clone() else {
         return;
     };
     let mut reader = BufReader::new(read_side);
     let mut writer = stream;
-    let mut line = String::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => return,
-            Ok(_) => {}
+        let response = match read_line_capped(&mut reader, MAX_REQUEST_BYTES) {
+            Ok(Line::Text(line)) if line.trim().is_empty() => continue,
+            Ok(Line::Text(line)) => dispatch(line.trim_end(), &from, ui_tx),
+            Ok(Line::Oversize) => Response::error(
+                Value::Null,
+                ReplyError::bad_request(format!(
+                    "the request line is longer than {MAX_REQUEST_BYTES} bytes"
+                )),
+            ),
+            Ok(Line::NotText) => Response::error(
+                Value::Null,
+                ReplyError::bad_request("the request line is not UTF-8 text"),
+            ),
+            Ok(Line::Gone) => return,
             Err(_) => return,
-        }
-        if line.trim().is_empty() {
-            continue;
-        }
-        let response = dispatch(line.trim_end(), &from, ui_tx);
+        };
         let mut out = response.encode();
         out.push('\n');
         if writer.write_all(out.as_bytes()).is_err() || writer.flush().is_err() {
@@ -863,6 +1070,176 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The three bounds on the surface: a request line past the cap is refused
+    /// with the cap named and the connection kept; connections past the cap are
+    /// refused with `unavailable`; and a client that says nothing is reaped by
+    /// the idle window. The window is the socket's own read timeout, injected
+    /// short, so the test waits on the client's read rather than on a sleep of
+    /// its own.
+    #[test]
+    fn a_request_line_is_capped_and_a_client_is_reaped() {
+        // (1) The line cap, under the production limits.
+        let root = std::env::temp_dir().join(format!("mush-attach-cap-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let guard = serve_with(&root, tx, LIMITS, spawn_accept_loop).unwrap();
+        let socket = socket_path(&root);
+        let mut client = UnixStream::connect(&socket).unwrap();
+        let mut reader = BufReader::new(client.try_clone().unwrap());
+        client
+            .write_all(&vec![b'x'; MAX_REQUEST_BYTES + 1])
+            .and_then(|()| client.write_all(b"\n"))
+            .unwrap();
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        match decode(line.trim_end()).unwrap().reply {
+            Reply::Err(error) => {
+                assert_eq!(
+                    error.kind, "bad_request",
+                    "a line past the cap is a bad request"
+                );
+                let message = error.message.expect("the refusal names the cap");
+                assert!(
+                    message.contains(&MAX_REQUEST_BYTES.to_string()),
+                    "the cap is named: {message}"
+                );
+            }
+            Reply::Ok(_) => panic!("a line past the cap must be refused"),
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "a refused line never reaches the UI thread"
+        );
+
+        // The same connection answers a good line afterwards: the cap refuses
+        // the line, not the client.
+        client.write_all(b"{\"id\":1,\"op\":\"agents\"}\n").unwrap();
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Msg::Attach { request, reply, .. } => {
+                assert_eq!(request.id, json!(1));
+                reply
+                    .send(Response::ok(request.id, json!({"agents": []})))
+                    .unwrap();
+            }
+            _ => panic!("expected Msg::Attach"),
+        }
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        assert!(
+            matches!(decode(line.trim_end()).unwrap().reply, Reply::Ok(_)),
+            "the connection survived the refused line"
+        );
+        drop(reader);
+        drop(client);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
+
+        // (2) The connection cap: with room for two, the third client is
+        // answered `unavailable` without a thread of its own. The two idle
+        // clients hold their slots because this server's idle window is the
+        // production one.
+        let crowd = std::env::temp_dir().join(format!("mush-attach-crowd-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&crowd);
+        std::fs::create_dir_all(crowd.join(mush_core::session::MUSH_DIR)).unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let guard = serve_with(
+            &crowd,
+            tx,
+            Limits {
+                connections: 2,
+                idle: IDLE_TIMEOUT,
+            },
+            spawn_accept_loop,
+        )
+        .unwrap();
+        let crowd_socket = socket_path(&crowd);
+        let _first = UnixStream::connect(&crowd_socket).unwrap();
+        let _second = UnixStream::connect(&crowd_socket).unwrap();
+        let third = UnixStream::connect(&crowd_socket).unwrap();
+        let mut reader = BufReader::new(third.try_clone().unwrap());
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        match decode(line.trim_end()).unwrap().reply {
+            Reply::Err(error) => {
+                assert_eq!(error.kind, "unavailable", "a full surface says retry");
+                assert!(
+                    error.message.unwrap_or_default().contains('2'),
+                    "and it names the cap"
+                );
+            }
+            Reply::Ok(_) => panic!("a connection past the cap must be refused"),
+        }
+        drop(reader);
+        drop(third);
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&crowd);
+
+        // (3) The idle window: a client that connects and says nothing is
+        // reaped. The wait is the socket's own timeout — short here — and the
+        // client reads the close instead of sleeping on it.
+        let idle = std::env::temp_dir().join(format!("mush-attach-idle-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&idle);
+        std::fs::create_dir_all(idle.join(mush_core::session::MUSH_DIR)).unwrap();
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let guard = serve_with(
+            &idle,
+            tx,
+            Limits {
+                connections: MAX_CONNECTIONS,
+                idle: Duration::from_millis(250),
+            },
+            spawn_accept_loop,
+        )
+        .unwrap();
+        let silent = UnixStream::connect(socket_path(&idle)).unwrap();
+        silent
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let started = std::time::Instant::now();
+        line.clear();
+        let read = BufReader::new(silent).read_line(&mut line).unwrap();
+        let waited = started.elapsed();
+        assert_eq!(read, 0, "the silent client was answered with a close");
+        assert!(
+            waited >= Duration::from_millis(25) && waited < Duration::from_secs(5),
+            "the close came from the idle window, not at once: {waited:?}"
+        );
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&idle);
+    }
+
+    /// The cap is on the line, not near it: exactly `cap` bytes are a line and
+    /// `cap + 1` are not, and it is the refused line's newline that leaves the
+    /// next line whole.
+    #[test]
+    fn a_line_at_the_cap_is_kept_and_a_line_past_it_is_refused() {
+        let at_cap = format!(
+            "{}\n{{\"id\":1,\"op\":\"agents\"}}\n",
+            "x".repeat(MAX_REQUEST_BYTES)
+        );
+        let mut reader = BufReader::new(std::io::Cursor::new(at_cap.into_bytes()));
+        match read_line_capped(&mut reader, MAX_REQUEST_BYTES).unwrap() {
+            Line::Text(line) => assert_eq!(line.len(), MAX_REQUEST_BYTES),
+            other => panic!("a line exactly at the cap is a line: {other:?}"),
+        }
+        match read_line_capped(&mut reader, MAX_REQUEST_BYTES).unwrap() {
+            Line::Text(line) => assert_eq!(line, r#"{"id":1,"op":"agents"}"#),
+            other => panic!("the line after the cap is read whole: {other:?}"),
+        }
+
+        let past = format!("{}\nstill a request\n", "x".repeat(MAX_REQUEST_BYTES + 1));
+        let mut reader = BufReader::new(std::io::Cursor::new(past.into_bytes()));
+        assert!(matches!(
+            read_line_capped(&mut reader, MAX_REQUEST_BYTES).unwrap(),
+            Line::Oversize
+        ));
+        match read_line_capped(&mut reader, MAX_REQUEST_BYTES).unwrap() {
+            Line::Text(line) => assert_eq!(line, "still a request"),
+            other => panic!("the refused line ended at its newline: {other:?}"),
+        }
+    }
+
     /// A thread that will not start must not leave the socket file behind. The
     /// guard is built before the start, so the failed serve returns through its
     /// `Drop` and the file goes with it (finding A7).
@@ -873,7 +1250,9 @@ mod tests {
         std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
 
-        let error = match serve_with(&root, tx, |_, _| Err("no threads today".to_string())) {
+        let error = match serve_with(&root, tx, LIMITS, |_, _, _| {
+            Err("no threads today".to_string())
+        }) {
             Ok(_) => panic!("a start that fails fails the serve"),
             Err(error) => error,
         };
