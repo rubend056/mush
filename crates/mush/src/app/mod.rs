@@ -15213,8 +15213,8 @@ mod tests {
         );
         let orphaned = row(&mut app);
         assert!(
-            orphaned.starts_with(" ✓ #2 2  done"),
-            "a row whose parent is gone is painted at the top level: {orphaned:?}"
+            orphaned.starts_with(" ✓ #2 ⚮ 2  done"),
+            "a row whose parent is gone is painted at the top level and says so: {orphaned:?}"
         );
     }
 

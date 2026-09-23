@@ -145,6 +145,11 @@ fn draw_agents(frame: &mut Frame, pane: &AgentsPane, focus: Focus, theme: &Theme
 /// full. The fields themselves are derived by the tree; this only spends the
 /// columns on them.
 ///
+/// The head is where a mark that must never be given up rides: `✉`/`✉N`,
+/// `⏸N`, and the `⚮` a row wears when its parent is gone. The title yields its
+/// columns first, so a mark left in the tail could vanish on a narrow pane
+/// where the fact is most needed.
+///
 /// `pub(crate)`, not private, because "every row fits its pane" is an assertion
 /// a frame has to carry: the sweep fits each row at the width it is painted at
 /// and reads the result, which is the one way a row that silently loses its
@@ -157,6 +162,21 @@ pub(crate) fn agent_line(row: &AgentRow, width: usize) -> String {
         id = row.id,
         glyph = row.glyph
     );
+    if row.parent_gone {
+        // `⚮` — the parent this row hangs under is gone from the tree, and the
+        // row says so rather than passing for a child of the root. `rows()`
+        // orders a parentless node at the top level and (after D9) indents it
+        // there, which is exactly what a root child wears, so the structure
+        // itself cannot tell the two apart; the human's own report is the
+        // case: a reaped #49 left its probe `✓ #58 Adversarial write-road …`
+        // sitting among the root's current children as one of them. U+26AE is
+        // the one symbol Unicode has for a severed pair — the pair here being
+        // the parent link — and one column is what a mark on this row costs
+        // (`every_row_mark_is_one_column`). It rides the head, right after the
+        // id it qualifies: the head is the one field `fit_row` never gives up
+        // (R1).
+        head.push_str(" ⚮");
+    }
     if row.result_unread {
         // `✉` — this result has not been read by its parent — and `✉N` for the
         // reads this agent owes its own children (finding H4). Both marks ride
