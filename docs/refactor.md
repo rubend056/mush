@@ -605,6 +605,16 @@ The census the reviews read, and the tree this ledger anchors to, measured at
 from 9 185 lines at `143325a15` to 41 093 at `f70374f` (prod ×2.5, tests ×6.7,
 comments ×7.5).
 
+The four blind passes below (the seventh through tenth reviews) read production
+code only, each in its own currency: 2 644 code lines in the pane and the text it
+wraps, ~4 600 production lines in the store's fifteen files, 4 865 non-test code
+lines in the actor's nine, 4 800 code lines in the app and its panes. The tree
+those rows were checked against at entry, and this ledger's new anchor, measured
+at `38d0438`: 79 208 lines — prod 18 232, tests 34 663, comments 21 708, blank 4 605
+(`scripts/census.py`). The `b8d8baa` sentence above is left as it stands: it is
+the census the reviews before these read, not a number to be overwritten, and the
+rows below say where a later wave re-priced one of them (`1e07c2e`).
+
 | # | What is duplicated | Net | Risk | Protecting test | Status |
 |---|---|---|---|---|---|
 | D1 | The `App` test fixture is hand-rolled twelve times (`app/mod.rs`: `app_at`, `app_and_rx`, `app_writing`, `app_recording`, `reopened`, `test_app` + six inline). One `app_root(root, stored, save) -> (App, Receiver<Msg>)`. | ≈ −70 | — | — | ✅ `58a309c` (−103) |
