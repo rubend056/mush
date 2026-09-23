@@ -36,8 +36,8 @@
 //! terminal: width and height are arguments, the blank separator that closes a
 //! message is trimmed before the window is cut, every block that is not the
 //! human's own words or the model's reply is folded to its kind's number of rows
-//! ([`Fold`], with the `…` row that says what is hidden), and the foot is capped
-//! and counted. `ui.rs` keeps the frame around it — the border, the prompt and the
+//! ([`Fold`], with the `…` row that says what is hidden — or to none at all,
+//! while `Ctrl-O` hides the output), and the foot is capped and counted. `ui.rs` keeps the frame around it — the border, the prompt and the
 //! cursor — and paints what this returns, title included, because a pane one row
 //! tall has no row to spend on saying what it is hiding, or that the human has
 //! scrolled away from the bottom.
@@ -589,9 +589,10 @@ impl Body {
 /// The predicate is the `render_message` arms' own: a user line is always
 /// painted (the mark is, even for a message that is only a picture), a reply
 /// with no words paints nothing, and a folded block — a tool result, a report,
-/// a brief — is painted from its first row: the fold decides *which* rows,
-/// never whether the line exists, so the lines a long block hides behind its
-/// `…` are still source lines the copy can take whole. They are one stop,
+/// a brief — is painted from its first row: the fold decides *which* rows it
+/// paints, so the lines a long block hides behind its `…` are still source
+/// lines the copy can take whole. A kind the fold gives no rows at all is the
+/// one block whose lines are not stops ([`Stops::of`]). They are one stop,
 /// though, not one each: [`Stops`] is where the fold's boundary turns them into
 /// [`Stop::Tail`].
 fn lines_of(message: &Message) -> Option<Vec<&str>> {
@@ -614,11 +615,13 @@ fn lines_of(message: &Message) -> Option<Vec<&str>> {
 struct Stops {
     /// The message's source lines.
     lines: usize,
-    /// How many of them have a painted row, counted from the first. The rest,
-    /// when `tail` is set, are the one [`Stop::Tail`] — and this is also the
-    /// first line that tail covers, because wrapped rows run in source order:
-    /// every line up to the last painted row's line has a row, and every line
-    /// after it has none.
+    /// How many of them have a painted row, counted from the first: every line
+    /// up to the last painted row's line has a row. The rest are the one
+    /// [`Stop::Tail`] when `tail` is set — and this is also the first line that
+    /// tail covers, because wrapped rows run in source order. Without a tail
+    /// the rest have no stop at all: that is a block the fold gave no rows (the
+    /// failure row a hidden one keeps is line one), and the cursor never lands
+    /// on a line the pane did not paint.
     visible: usize,
     /// Whether the fold hid rows after the last painted one.
     tail: bool,
@@ -637,7 +640,9 @@ impl Stops {
     ///
     /// `measure` is `None` for a mode no pane has painted yet: no line is then
     /// known hidden, and every source line is a stop — the reading that cannot
-    /// lose a line the pane would have shown.
+    /// lose a line the pane would have shown. A kind the fold gives no rows at
+    /// all is the exception, and it does not wait for a width: the nothing is
+    /// the fold's, not the wrap's, so such a block has no stop at any measure.
     fn of(
         message: &Message,
         voice: Option<Voice>,
@@ -650,10 +655,26 @@ impl Stops {
             visible: lines,
             tail: false,
         };
-        let Some(width) = measure else {
+        let Some((kind, head)) = folded_block(message, voice) else {
             return Some(stops);
         };
-        let Some((kind, head)) = folded_block(message, voice) else {
+        // The hidden half of `Ctrl-O`: a kind the fold gives no rows paints no
+        // row of its own, and the cursor walks the rows the pane painted — so
+        // the message is not a stop ([`lines_of`]'s `None`, for the same
+        // reason: a block with no row has nothing to stand on). The one
+        // exception is the failure row the fold never gives up
+        // ([`Fold::shown`]): it is the block's first source line, and there is
+        // no tail behind it — a `…` is part of showing a block, and the hidden
+        // state has no head for it to stand behind ([`folded_rows`]). The
+        // lines are still in the transcript and come back with the toggle.
+        if fold.hides(kind) {
+            return fails(kind, message.text()).then_some(Stops {
+                lines,
+                visible: 1,
+                tail: false,
+            });
+        }
+        let Some(width) = measure else {
             return Some(stops);
         };
         let (_, rows) = folded_rows(head, message.text(), width, kind, fold);
@@ -911,6 +932,19 @@ pub struct Chat {
     /// rather than in `App`, because every pane paints through this one
     /// transcript and the choice is about the reading, not about the frame.
     reasoning: bool,
+    /// Whether a pane paints the *output* kinds — a tool's result, mush's own
+    /// report about a child or a job, the brief a child's pane opens with.
+    ///
+    /// A *view*, in the family of [`Self::reasoning`] and `App`'s zen
+    /// (`Ctrl-F`), and shown by default: `Ctrl-O` changes only what the panes
+    /// paint, so it is not said into the conversation and not stored — the rows
+    /// are still in the transcript and come back on the next press, and a
+    /// restart paints them again. It lives here, beside the transcript it
+    /// hides, for the same reason the reasoning view does: every pane paints
+    /// through this one `Chat`, so one flip is every pane's. The fold's own
+    /// rule — a failure is never what the fold gives up ([`Fold`]) — is what
+    /// keeps a hidden failure visible; this flag knows nothing about it.
+    output: bool,
     /// How much of each kind of block this conversation's panes paint: the one
     /// [`Fold`] behind every pane, so two panes cannot fold the same kind to
     /// two numbers — and so a view that sets one has one place to set it.
@@ -934,6 +968,7 @@ impl Chat {
             revisions: HashMap::new(),
             pending: None,
             reasoning: true,
+            output: true,
             fold: Fold::DEFAULT,
         }
     }
@@ -948,6 +983,40 @@ impl Chat {
     /// leaves it alone: the human's choice outlives the chat it was made in.
     pub fn set_reasoning(&mut self, on: bool) {
         self.reasoning = on;
+    }
+
+    /// Whether a pane paints the tool output, mush's reports and the briefs.
+    pub fn shows_output(&self) -> bool {
+        self.output
+    }
+
+    /// `Ctrl-O`: show or hide the output kinds — a tool's result, mush's own
+    /// report about a child or a job, the brief a child's pane opens with. The
+    /// two states are the folded numbers and none, so the same key brings the
+    /// rows back exactly as they were.
+    ///
+    /// A view, like [`Self::set_reasoning`]: not a change to the conversation
+    /// and not a thing to say, and `clear` deliberately leaves it alone — the
+    /// human's choice outlives the chat it was made in. A failure is still
+    /// painted in both states, because that rule lives on [`Fold`] and not
+    /// here: a hidden failure would be a lie about what happened.
+    pub fn set_output(&mut self, on: bool) {
+        self.output = on;
+    }
+
+    /// The fold this conversation's panes paint through: the conversation's own
+    /// numbers, with the output kinds at none while the human has hidden them
+    /// ([`Self::set_output`]).
+    ///
+    /// The one read for both roads that measure a block — the painter
+    /// ([`Self::chunk`]) and the select mode's stop walk ([`Self::stops_at`]) —
+    /// so a cursor cannot step over a row the pane did not paint.
+    fn painted_fold(&self) -> Fold {
+        if self.output {
+            self.fold
+        } else {
+            self.fold.without_output()
+        }
     }
 
     /// The revision of the UI's copy of `agent`'s transcript. A conversation
@@ -1673,7 +1742,7 @@ impl Chat {
     fn stops_at(&self, on: AgentId, index: usize, measure: Option<usize>) -> Option<Stops> {
         let message = self.transcript(on).get(index)?;
         let voice = self.voice_at(on, index, message);
-        Stops::of(message, voice, measure, self.fold)
+        Stops::of(message, voice, measure, self.painted_fold())
     }
 
     /// The cursor as the transcript *and the pane's last paint* are now: a
@@ -2069,7 +2138,14 @@ impl Chat {
         let message = &self.transcript(on)[index];
         let voice = self.voice_at(on, index, message);
         let mut lines = Vec::new();
-        let rows = render_message(&mut lines, message, voice, width, self.reasoning, self.fold);
+        let rows = render_message(
+            &mut lines,
+            message,
+            voice,
+            width,
+            self.reasoning,
+            self.painted_fold(),
+        );
         debug_assert_eq!(lines.len(), rows.len(), "one map entry per painted row");
         Chunk {
             lines,
@@ -2892,11 +2968,12 @@ impl Kind {
 /// decision lives: how many rows, per [`Kind`] of block, a pane paints before
 /// the `…` row that stands for the rest.
 ///
-/// It is a *value* and not a `const` per arm. A view can hold one and set it
-/// ([`Fold::with`]) — the `Ctrl-O` child is the first setting, a `0`-rows
-/// number for one kind — and a setting will later read the numbers from
-/// configuration, which is why they are here and not spelled at a paint site.
-/// `Chat` holds the one a conversation paints through.
+/// It is a *value* and not a `const` per arm. The `Ctrl-O` view holds one and
+/// sets it ([`Fold::without_output`]) — the output kinds go to no rows at all,
+/// and the same numbers come back on the next press — and a setting will later
+/// read the numbers from configuration, which is why they are here and not
+/// spelled at a paint site. `Chat` holds the one a conversation paints through
+/// ([`Chat::painted_fold`]).
 ///
 /// The numbers are **per kind** because the kinds are read differently. A tool
 /// result, a report and a brief are dumps: the human reads their head and
@@ -2907,14 +2984,17 @@ impl Kind {
 /// [`wrap_text_capped`]). A reasoning block is the text the human pressed
 /// `Ctrl-T` to read, so its number is `usize::MAX`: shown whole today, with the
 /// slot in place because the setting the human already asked for is "one for
-/// child/tool calls and another for thinking rows shown".
+/// child/tool calls and another for thinking rows shown". `Ctrl-O` leaves this
+/// slot exactly where it is: a thought is not output, and `Ctrl-T` owns it.
 ///
 /// A block that reports a **failure** is kept even where the fold would hide
 /// it: the failure is never what the fold gives up. The rule lives here, not in
-/// an arm and not in the handler of a key that changes a number, so a `0`-rows
-/// setting still paints a failed result's own `! error: …` row and a `#1
-/// failed: …` report's first row — the same rule the foot's cap already holds
-/// ("the failure is never the line the cap gives up").
+/// an arm and not in the handler of a key that changes a number, so the
+/// `Ctrl-O` view's no-rows state still paints a failed result's own
+/// `! error: …` row and a `#1 failed: …` report's first row — the same rule the
+/// foot's cap already holds ("the failure is never the line the cap gives up").
+/// And it paints *only* that row: a `…` ([`elision`]) is part of showing a
+/// block, so the hidden state has no head for one to stand behind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fold {
     /// One number per kind, indexed by [`Kind::slot`].
@@ -2932,7 +3012,7 @@ impl Fold {
     /// kind's number, and the one exception at a `0`-rows setting: a block that
     /// reports a failure keeps its failure row (see the type's doc).
     pub fn shown(&self, kind: Kind, text: &str) -> usize {
-        let rows = self.rows[kind.slot()];
+        let rows = self.number(kind);
         if rows == 0 && fails(kind, text) {
             1
         } else {
@@ -2940,12 +3020,36 @@ impl Fold {
         }
     }
 
-    /// The same fold with one kind's number changed — how a view sets it: a
-    /// setting that will read a number from configuration, and the key that
-    /// lowers one at runtime (the `Ctrl-O` child), both hand the result down
-    /// through here. The setter is test-only until that child lands, which is
-    /// why the attribute is here: the value is settable, and this is the door.
-    #[cfg(test)]
+    /// The same fold with the output kinds at no rows at all — what a pane
+    /// paints through while the human has asked for the main model's words
+    /// alone (`Ctrl-O`): a tool's result, mush's own report about a child or a
+    /// job, and the brief a child's pane opens with. The reasoning is
+    /// deliberately untouched: it is not output, and `Ctrl-T` owns that block.
+    pub fn without_output(self) -> Self {
+        self.with(Kind::Result, 0)
+            .with(Kind::Mush, 0)
+            .with(Kind::Brief, 0)
+    }
+
+    /// This fold's own number for `kind`, before [`Fold::shown`] adds the one
+    /// exception a `0` carries.
+    fn number(self, kind: Kind) -> usize {
+        self.rows[kind.slot()]
+    }
+
+    /// Whether this fold gives `kind` no rows at all — the hidden half of the
+    /// `Ctrl-O` view ([`Fold::without_output`]). A block of such a kind paints
+    /// no `…` row either ([`folded_rows`]); its one exception is the failure
+    /// row [`Fold::shown`] never gives up.
+    fn hides(self, kind: Kind) -> bool {
+        self.number(kind) == 0
+    }
+
+    /// The same fold with one kind's number changed — how a view sets one: the
+    /// `Ctrl-O` key zeroes the output kinds through it at runtime
+    /// ([`Fold::without_output`]), and a setting will later read a number from
+    /// configuration. The door is not test-only any more: the key is its first
+    /// runtime caller, which is why the gate came off.
     pub fn with(mut self, kind: Kind, rows: usize) -> Self {
         self.rows[kind.slot()] = rows;
         self
@@ -3067,6 +3171,10 @@ impl<'a> Head<'a> {
 /// reading of: at most [`Fold::shown`] wrapped rows, and, where the text ran
 /// on, the one `…` row [`elision`] spells — whose stop is [`Stop::Tail`].
 ///
+/// A kind the fold gives no rows at all paints none — not even the `…` — and
+/// the one exception is the failure row [`Fold::shown`] keeps: a block that
+/// reports a failure paints its first row and nothing else ([`Fold`]).
+///
 /// One walk, shared by the painter ([`folded_marked`]) and the select mode's
 /// stop boundary ([`Stops::of`]): the rows the cursor steps over are the rows
 /// the pane painted, never a second wrap with arithmetic of its own that could
@@ -3120,10 +3228,15 @@ fn folded_rows<'a>(
         .take(shown)
         .zip(tags.iter().map(|line| Stop::Line(*line)))
         .collect();
-    if clipped {
-        // The `…` stands for the first wrapped row the fold did not paint, and
-        // it is one stop for every line from there on: one `↓` steps the whole
-        // hidden tail, and a selection that reaches the `…` copies it whole.
+    if clipped && !fold.hides(kind) {
+        // The `…` is part of *showing* a block: it stands for the first wrapped
+        // row the fold did not paint, and it is one stop for every line from
+        // there on: one `↓` steps the whole hidden tail, and a selection that
+        // reaches the `…` copies it whole. A kind the fold gives no rows at all
+        // has no head for it to stand behind — the hidden half of `Ctrl-O` — so
+        // nothing is elided there: a `…` on top of the failure row
+        // [`Fold::shown`] keeps would count lines the human asked the pane not
+        // to show.
         let hidden = total - tags[shown];
         rows.push((elision(hidden), Stop::Tail));
     }
@@ -3409,6 +3522,13 @@ mod tests {
             }
             _ => false,
         }
+    }
+
+    /// The chat's half of `Ctrl-O`, as `App::toggle_output` runs it: flip the
+    /// view the panes paint through. The key itself is pinned in `keys.rs`'s
+    /// own table and in the app's test that presses it.
+    fn toggle_output(chat: &mut Chat) {
+        chat.set_output(!chat.shows_output());
     }
 
     fn pane(agent: AgentId) -> Pane<'static> {
@@ -5904,8 +6024,14 @@ mod tests {
     /// A block that reports a failure is kept even where the fold would hide
     /// it: the foot's cap already refuses to drop the failure row ("the failure
     /// is never the line the cap gives up"), and the fold holds the same rule —
-    /// it lives on [`Fold`], not in an arm, so a `0`-rows setting still paints
-    /// the `! error: …` result and the `#1 failed: …` report's own row.
+    /// it lives on [`Fold`], not in an arm, so the `Ctrl-O` view's no-rows
+    /// state still paints the `! error: …` result's own row and the
+    /// `#1 failed: …` report's first row.
+    ///
+    /// And a `0`-rows kind paints nothing else, not even the `…`: the elision
+    /// row is part of *showing* a block — it stands for the tail behind a head
+    /// the fold painted — so a `…` there would count the very lines the human
+    /// asked the pane not to show.
     #[test]
     fn a_failure_is_never_what_the_fold_gives_up() {
         let zero = Fold::DEFAULT.with(Kind::Result, 0).with(Kind::Mush, 0);
@@ -5922,14 +6048,10 @@ mod tests {
         ));
         assert_eq!(
             rows,
-            vec![
-                "  ! error: the call was refused".to_string(),
-                "    … +2 more lines".to_string(),
-                String::new(),
-            ]
+            vec!["  ! error: the call was refused".to_string(), String::new(),]
         );
 
-        // The same text as a *success* vanishes into its `…` at 0: the
+        // The same text as a *success* paints nothing at all at 0: the
         // exemption is the block's, not the setting's.
         let ok = "wrote three lines\nthe log line one\nthe log line two";
         let rows = shown(&message_rows_under(
@@ -5939,7 +6061,7 @@ mod tests {
             true,
             zero,
         ));
-        assert_eq!(rows, vec!["  … +3 more lines".to_string(), String::new()]);
+        assert_eq!(rows, vec![String::new()]);
 
         // And a child's failed report, painted through the pane the human
         // reads: the fold rides on `Chat`, so this is the whole road.
@@ -5951,10 +6073,7 @@ mod tests {
         );
         assert_eq!(
             shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 8)),
-            vec![
-                "· #1 failed: no route to the endpoint".to_string(),
-                "  … +1 more lines".to_string(),
-            ]
+            vec!["· #1 failed: no route to the endpoint".to_string()]
         );
     }
 
@@ -5989,5 +6108,219 @@ mod tests {
             "the reply's 25 lines and the blank, in full"
         );
         assert_eq!(shown(&reply)[0], "mush › line 0");
+    }
+
+    /// The human's ask: a way out if all they want to see is the main model's
+    /// output. `Ctrl-O` hides the output rows — a tool's result and mush's own
+    /// report about a child — and leaves every other row exactly where it was.
+    /// The assistant's turn keeps its `⚙ name args` labels, so the human can
+    /// still see that a call happened, and there is no `…` left behind
+    /// counting what the pane no longer shows. The same key brings the same
+    /// rows back.
+    #[test]
+    fn ctrl_o_hides_and_shows_command_output() {
+        let mut chat = Chat::bare();
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                tool_calls: Some(vec![mush_core::ToolCall {
+                    id: "call_1".into(),
+                    kind: "function".into(),
+                    function: mush_core::FunctionCall {
+                        name: "run_command".into(),
+                        arguments: r#"{"command":"cargo test"}"#.into(),
+                    },
+                }]),
+                ..Message::assistant("running the tests")
+            },
+        );
+        chat.push_message(
+            AgentId::ROOT,
+            Message::tool(
+                "call_1",
+                "test result: ok. 3 passed\nthe log line one\nthe log line two",
+            ),
+        );
+        chat.push_message(
+            AgentId::ROOT,
+            Message::user("#1 done: the parser is written"),
+        );
+        let pane = pane(AgentId::ROOT);
+
+        let before = shown(&pane_rows(&chat, &pane, 60, 20));
+        let before_title = chat.painted(&pane, 60, 20).title;
+        assert!(
+            before.iter().any(|row| row.contains("test result: ok")),
+            "the result is shown by default: {before:?}"
+        );
+        assert!(
+            before.iter().any(|row| row.contains("#1 done:")),
+            "and so is the child's report: {before:?}"
+        );
+
+        toggle_output(&mut chat);
+        let hidden = shown(&pane_rows(&chat, &pane, 60, 20));
+        assert_eq!(
+            hidden,
+            vec![
+                "mush › running the tests".to_string(),
+                "  ⚙ run_command cargo test".to_string(),
+            ],
+            "the call's own label and the reply, and nothing of the output"
+        );
+        for row in &hidden {
+            assert!(
+                before.contains(row),
+                "every row that stayed was left as it was: {row:?}"
+            );
+        }
+        assert!(
+            !hidden.iter().any(|row| row.contains('…')),
+            "nothing counts the rows the human asked not to see: {hidden:?}"
+        );
+        assert_eq!(
+            chat.painted(&pane, 60, 20).title,
+            before_title,
+            "and the pane's title claims nothing about a fold: no count, no hint"
+        );
+
+        toggle_output(&mut chat);
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane, 60, 20)),
+            before,
+            "the second press restores exactly the rows that were there"
+        );
+    }
+
+    /// The failure exemption holds at the view's zero: a failed result's
+    /// `! error: …` row and a `#1 failed: …` report's first row are painted in
+    /// both states, because a hidden failure would be a lie about what
+    /// happened. They are painted *alone*: the log behind them is output, and
+    /// the hidden state has no `…` for it either.
+    #[test]
+    fn ctrl_o_never_hides_a_failure() {
+        let mut chat = Chat::bare();
+        chat.push_message(
+            AgentId::ROOT,
+            Message::tool(
+                "call_1",
+                "error: the call was refused\nthe log line one\nthe log line two",
+            ),
+        );
+        chat.push_message(
+            AgentId::ROOT,
+            Message::user("#1 failed: no route to the endpoint\nthe run's own log"),
+        );
+        let pane = pane(AgentId::ROOT);
+
+        let shown_rows = shown(&pane_rows(&chat, &pane, 60, 20));
+        assert!(
+            shown_rows
+                .iter()
+                .any(|row| row.contains("! error: the call was refused")),
+            "{shown_rows:?}"
+        );
+        assert!(
+            shown_rows
+                .iter()
+                .any(|row| row.contains("· #1 failed: no route to the endpoint")),
+            "{shown_rows:?}"
+        );
+        assert!(
+            shown_rows
+                .iter()
+                .any(|row| row.contains("the run's own log")),
+            "shown whole at the fold's eight: {shown_rows:?}"
+        );
+
+        toggle_output(&mut chat);
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane, 60, 20)),
+            vec![
+                "  ! error: the call was refused".to_string(),
+                String::new(),
+                "· #1 failed: no route to the endpoint".to_string(),
+            ],
+            "the failures stay and nothing else does"
+        );
+    }
+
+    /// The two states are the folded number and none, and the *shown* one is
+    /// exactly the fold's own table: eight wrapped rows and the `…` for a long
+    /// result, before and after the toggle — the key does not touch a number,
+    /// it only decides which state the pane paints.
+    #[test]
+    fn ctrl_o_keeps_the_folds_numbers_in_the_shown_state() {
+        let many = (0..25)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::tool("call_1", &many));
+        let pane = pane(AgentId::ROOT);
+
+        let before = shown(&pane_rows(&chat, &pane, 60, 20));
+        assert_eq!(before.len(), 9, "eight rows and the `…`: {before:?}");
+        assert_eq!(before[0], "  line 0");
+        assert_eq!(before[8], "  … +17 more lines");
+
+        toggle_output(&mut chat);
+        assert!(
+            shown(&pane_rows(&chat, &pane, 60, 20)).is_empty(),
+            "at none, a long result paints no row at all"
+        );
+
+        toggle_output(&mut chat);
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane, 60, 20)),
+            before,
+            "the shown half still folds at eight, with the same `…`"
+        );
+    }
+
+    /// The selector steps where the pane painted, and a block `Ctrl-O` hides
+    /// painted no row of its own — so it has no stop: the cursor walks the rows
+    /// around it, and the text is still in the transcript and comes back with
+    /// the toggle. The failure row the fold keeps is one stop with no tail,
+    /// because the `…` that would stand for the log behind it is not painted
+    /// either.
+    #[test]
+    fn ctrl_o_leaves_no_stop_over_a_hidden_block() {
+        let on = AgentId::ROOT;
+        let mut chat = Chat::bare();
+        say(&mut chat, on, "look at this");
+        chat.push_message(
+            on,
+            Message::tool("call_1", "a diff, one line\nthe rest of the log"),
+        );
+        toggle_output(&mut chat);
+        assert!(chat.start_select(on).is_none(), "the human's line stands");
+        assert_eq!(
+            chat.clamped_cursor(on),
+            Some((0, Stop::Line(0))),
+            "the cursor lands on a row the pane painted, not the hidden block"
+        );
+        assert!(
+            chat.stops_at(on, 1, None).is_none(),
+            "a block with no row has no stop"
+        );
+        chat.cancel_select();
+
+        // A failed result is the one row that stays: a stop, and no tail.
+        let mut chat = Chat::bare();
+        chat.push_message(
+            on,
+            Message::tool("call_1", "error: the call was refused\nthe log line one"),
+        );
+        toggle_output(&mut chat);
+        let stops = chat
+            .stops_at(on, 0, None)
+            .expect("the failure row is a stop");
+        assert_eq!(
+            stops.visible, 1,
+            "the failure row is the block's first line"
+        );
+        assert!(!stops.tail, "no `…` paints, so there is no tail stop");
+        assert_eq!(stops.span(Stop::Line(0)), (0, 0), "it covers its own line");
     }
 }
