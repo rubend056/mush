@@ -930,8 +930,10 @@ the UI observes via id-tagged events. Depth and live count are hard budgets; the
 delegation tool is simply omitted from a leaf's schema. Every agent does its own
 file I/O on its own thread. A child given a
 `base` gets its own git worktree (`.mush/wt/<id>`, branch `mush/<id>`) forked
-from that ref; without one it shares the checkout, and only one shared child may
-run at a time. A `base` git cannot resolve is a *failed delegation* —
+from that ref, resolved in the spawning agent's own workspace — so `HEAD` in a
+base is that agent's `HEAD`, not the application root's; without one it shares
+the spawning agent's workspace, and only one shared child may run at a time. A
+`base` git cannot resolve is a *failed delegation* —
 `cannot start from <ref>` — refused before anything is created, never a child
 that quietly runs somewhere else.
 
