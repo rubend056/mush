@@ -636,15 +636,15 @@ fn resolved_config(
     dir: &Path,
     overrides: &Overrides,
     env: &theme::EnvText,
-) -> Result<(Config, session::Stored, theme::Theme), Box<dyn Error>> {
+) -> Result<(config::Resolved, session::Stored, theme::Theme), Box<dyn Error>> {
     let stored = Session::read(dir);
     let session = match &stored {
         session::Stored::Loaded(session) => Some(session),
         session::Stored::Absent | session::Stored::Unusable(_) => None,
     };
-    let config = config::resolve(overrides, &UserConfig::load(), session)?;
+    let resolved = config::resolve(overrides, &UserConfig::load(), session)?;
     let theme = theme::Theme::resolve(env, dir)?;
-    Ok((config, stored, theme))
+    Ok((resolved, stored, theme))
 }
 
 /// `--print-config`: the resolved config and nothing else — no workspace, no
@@ -655,8 +655,13 @@ fn resolved_config(
 /// One column, wide enough for the longest name (`history budget`): a name that
 /// overflows its padding runs into its own value, and `history budget1291500
 /// bytes` is not a line a human can read.
-fn print_config(config: &Config, stored: &session::Stored, theme: &theme::Theme) {
-    for (field, value) in describe(config, auto_approve(), stored, theme) {
+fn print_config(
+    config: &Config,
+    stored: &session::Stored,
+    theme: &theme::Theme,
+    notices: &[String],
+) {
+    for (field, value) in describe(config, auto_approve(), stored, notices, theme) {
         println!("{field:<15}{value}");
     }
 }
@@ -668,6 +673,7 @@ fn describe(
     config: &Config,
     approved: bool,
     stored: &session::Stored,
+    notices: &[String],
     theme: &theme::Theme,
 ) -> Vec<(String, String)> {
     // The session is the workspace's own layer of the chain, and the dump says
@@ -756,7 +762,7 @@ fn describe(
     } else {
         "no"
     };
-    vec![
+    let mut rows = vec![
         ("endpoint".to_string(), config.base_url.clone()),
         ("provider".to_string(), config.provider.name().to_string()),
         // Before the values it can supply: endpoint, provider, model and
@@ -782,7 +788,16 @@ fn describe(
         // comparing two windows needs the fact `--print-config` shows to be
         // the one the window would have, environment included.
         ("theme".to_string(), theme.describe()),
-    ]
+    ];
+    // The lines resolution owed the human: a stored layer that was refused
+    // rather than obeyed (finding C2). A row of its own, the way the session
+    // layer's `unreadable` is, because these are facts about the chain that no
+    // other row can carry — and both are built from what a file contained, so
+    // both go through the door every terminal-bound string goes through.
+    for notice in notices {
+        rows.push(("notice".to_string(), mush_core::text::sanitize(notice)));
+    }
+    rows
 }
 
 /// Open the workspace directory, naming it when it cannot be opened.
@@ -860,8 +875,8 @@ fn run() -> Result<(), Box<dyn Error>> {
         // is where the layers are read, and where a session file that cannot be
         // read stays a fact about the layer rather than being flattened into
         // absence (finding B2).
-        let (config, stored, theme) = resolved_config(&dir, &overrides, &env)?;
-        print_config(&config, &stored, &theme);
+        let (resolved, stored, theme) = resolved_config(&dir, &overrides, &env)?;
+        print_config(&resolved.config, &stored, &theme, &resolved.notices);
         return Ok(());
     }
 
@@ -899,7 +914,11 @@ fn run() -> Result<(), Box<dyn Error>> {
             )
         }
     };
-    let config = config::resolve(&overrides, &UserConfig::load(), stored.as_ref())?;
+    let resolved = config::resolve(&overrides, &UserConfig::load(), stored.as_ref())?;
+    // The lines a stored layer owes the human travel to the frame with the
+    // config; the config itself is cloned into the cell below.
+    let notices = resolved.notices;
+    let config = resolved.config;
 
     // Model discovery happens *after* the first frame, on its own thread. A
     // model from the startup precedence skips it entirely; when one has to be
@@ -956,7 +975,12 @@ fn run() -> Result<(), Box<dyn Error>> {
 
     // Before the first frame, so the line is one of the first things painted:
     // a workspace whose conversation could not be read is not a workspace with
-    // nothing in it.
+    // nothing in it, and a notice resolution owed (a session provider this
+    // build does not know, finding C2) is not noise either. The failure comes
+    // last because it is the one that must not be overwritten on the bar.
+    for notice in notices {
+        app.say(notice);
+    }
     if let Some(notice) = unreadable {
         app.session_unreadable(notice);
     }
@@ -1362,6 +1386,7 @@ mod tests {
             &cfg,
             true,
             &session::Stored::Absent,
+            &[],
             &theme::Theme::default(),
         );
         let field = |name: &str| {
@@ -1410,6 +1435,7 @@ mod tests {
             &plain,
             false,
             &session::Stored::Absent,
+            &[],
             &theme::Theme::default(),
         );
         let field = |name: &str| {
@@ -1445,6 +1471,7 @@ mod tests {
             &preset,
             false,
             &session::Stored::Absent,
+            &[],
             &theme::Theme::default(),
         );
         let field = |name: &str| {
@@ -1466,7 +1493,7 @@ mod tests {
     fn describe_reports_the_theme_a_window_would_wear() {
         let cfg = Config::new("http://host:1", "m", None);
         let value = |theme: &theme::Theme| {
-            describe(&cfg, false, &session::Stored::Absent, theme)
+            describe(&cfg, false, &session::Stored::Absent, &[], theme)
                 .into_iter()
                 .find(|(field, _)| field == "theme")
                 .map(|(_, value)| value)
@@ -1511,6 +1538,7 @@ mod tests {
             &cfg,
             false,
             &session::Stored::Absent,
+            &[],
             &theme::Theme::default(),
         );
         let model = lines
@@ -1542,6 +1570,7 @@ mod tests {
             &config,
             false,
             &session::Stored::Absent,
+            &[],
             &theme::Theme::default(),
         );
         let field = |name: &str| {
@@ -1570,7 +1599,7 @@ mod tests {
     fn describe_reports_the_session_layer_it_read() {
         let cfg = Config::new("http://host:1", "m", None);
         let row = |stored: &session::Stored| {
-            describe(&cfg, false, stored, &theme::Theme::default())
+            describe(&cfg, false, stored, &[], &theme::Theme::default())
                 .into_iter()
                 .find(|(field, _)| field == "session")
                 .map(|(_, value)| value)
@@ -1596,6 +1625,32 @@ mod tests {
             row.starts_with("unreadable — expected value at line 1 column 2"),
             "{row:?}"
         );
+        assert!(!row.contains('\x1b') && !row.contains('\r'), "{row:?}");
+    }
+
+    /// A line resolution owed about a stored layer — a session provider this
+    /// build does not know (finding C2) — gets a row of its own, so the dump
+    /// cannot show the config a typo fell through to without showing why. Like
+    /// the session row's reason, the words came out of a file on their way to
+    /// a terminal, so they go through the same door.
+    #[test]
+    fn describe_reports_the_notices_a_stored_layer_owed() {
+        let cfg = Config::new("http://host:1", "m", None);
+        let notice =
+            "session: unknown provider `boom\r\x1b[2Jmock` (try deepseek or custom)".to_string();
+        let lines = describe(
+            &cfg,
+            false,
+            &session::Stored::Absent,
+            std::slice::from_ref(&notice),
+            &theme::Theme::default(),
+        );
+        let row = lines
+            .iter()
+            .find(|(field, _)| field == "notice")
+            .map(|(_, value)| value.clone())
+            .expect("no `notice` row");
+        assert!(row.contains("unknown provider"), "{row}");
         assert!(!row.contains('\x1b') && !row.contains('\r'), "{row:?}");
     }
 
@@ -1627,9 +1682,9 @@ mod tests {
         let file = session::session_path(ws.root());
         std::fs::create_dir_all(file.parent().unwrap()).unwrap();
         std::fs::write(&file, "{ not json").unwrap();
-        let (config, stored, theme) =
+        let (resolved, stored, theme) =
             resolved_config(ws.root(), &Overrides::default(), &env).unwrap();
-        let row = describe(&config, false, &stored, &theme)
+        let row = describe(&resolved.config, false, &stored, &resolved.notices, &theme)
             .into_iter()
             .find(|(field, _)| field == "session")
             .map(|(_, value)| value)
@@ -1651,7 +1706,9 @@ mod tests {
     /// usable config: that is the "window opens, no model" case.
     #[test]
     fn resolution_survives_an_empty_world() {
-        let config = config::resolve(&Overrides::default(), &UserConfig::default(), None).unwrap();
+        let config = config::resolve(&Overrides::default(), &UserConfig::default(), None)
+            .unwrap()
+            .config;
         assert!(!config.base_url.is_empty());
         assert!(config.chat_url().ends_with("/v1/chat/completions"));
     }

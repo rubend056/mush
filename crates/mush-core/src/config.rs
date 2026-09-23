@@ -734,6 +734,27 @@ impl Config {
     }
 }
 
+/// The outcome of a resolution: the config a request will carry, and the lines
+/// the human is owed before one goes out.
+///
+/// The notices exist because a stored layer can be wrong in a way that must
+/// neither stop the start nor pass in silence. The command line, the
+/// environment and the home config are the human's own words, so a value mush
+/// cannot use there is an error in the layer's own name; a *session* is a file
+/// a workspace carries, so a provider typo in it is named and the endpoint it
+/// stored is kept (finding C2), and a session endpoint that re-pointed the host
+/// under a key minted for another one is told before any request can carry it
+/// (finding D6).
+#[derive(Debug)]
+pub struct Resolved {
+    /// What every request will be built from.
+    pub config: Config,
+    /// The lines the human has to hear, oldest first. A caller that opens a
+    /// window says them before the first frame; a caller that only prints
+    /// (`--print-config`) may read them and stay silent.
+    pub notices: Vec<String>,
+}
+
 /// Startup resolution over four layers, highest priority first:
 /// **CLI flags > `MUSH_*` environment > saved session > home config >
 /// built-in defaults**. The API key comes from the environment or the home
@@ -744,14 +765,16 @@ impl Config {
 /// [`resolve_with`] starts from and the environment layer it ranks against the
 /// flags, so no variable is read twice or parsed under two policies.
 ///
-/// Returns an error for an unknown provider name on the command line, and for a
-/// `MUSH_CONTEXT`, `MUSH_REASONING_EFFORT`, `MUSH_THINKING` or `MUSH_PROVIDER`
-/// that does not parse.
+/// Returns an error for an unknown provider name on the command line or in the
+/// home config, and for a `MUSH_CONTEXT`, `MUSH_REASONING_EFFORT`,
+/// `MUSH_THINKING` or `MUSH_PROVIDER` that does not parse. A session's bad
+/// provider is a notice instead: that file is not hand-edited input, and a
+/// typo there must not take the TUI down (finding C2).
 pub fn resolve(
     cli: &Overrides,
     home: &UserConfig,
     session: Option<&Session>,
-) -> Result<Config, String> {
+) -> Result<Resolved, String> {
     let env = Overrides::from_env_checked()?;
     resolve_with(Config::from_env_layer(&env), cli, &env, home, session)
 }
@@ -765,7 +788,8 @@ pub fn resolve_with(
     env: &Overrides,
     home: &UserConfig,
     session: Option<&Session>,
-) -> Result<Config, String> {
+) -> Result<Resolved, String> {
+    let mut notices: Vec<String> = Vec::new();
     // 1. Command-line flags beat everything else.
     if let Some(url) = cli.url.as_deref() {
         config.set_base_url(url);
@@ -820,14 +844,26 @@ pub fn resolve_with(
     if config.api_key.is_none() {
         config.api_key = home.api_key.clone();
     }
-    if !provider_given {
-        if let Some(provider) = Provider::parse(&home.provider) {
-            config.provider = provider;
-            // Switching to a hosted provider also switches its endpoint,
-            // unless the home config names one.
-            if !url_given && home.base_url.is_empty() {
-                config.base_url = provider.default_base_url().to_string();
-            }
+    if !provider_given && !home.provider.is_empty() {
+        // A typo here is an error, exactly as it is for `--provider` and
+        // `MUSH_PROVIDER`: ignoring it would leave the provider at its default
+        // — `Custom`, whose default endpoint is a LAN host — so a key meant
+        // for somewhere else would be sent there (finding C2). The file's path
+        // is named because `MUSH_CONFIG` can point anywhere, so its own name
+        // is not enough for a human to find it.
+        let provider = Provider::parse(&home.provider).ok_or_else(|| {
+            format!(
+                "home config: unknown provider `{}` (try {}) — {}",
+                home.provider,
+                provider::names_hint(),
+                crate::userconfig::config_path().display()
+            )
+        })?;
+        config.provider = provider;
+        // Switching to a hosted provider also switches its endpoint,
+        // unless the home config names one.
+        if !url_given && home.base_url.is_empty() {
+            config.base_url = provider.default_base_url().to_string();
         }
     }
     if !url_given && !home.base_url.is_empty() {
@@ -873,9 +909,21 @@ pub fn resolve_with(
         if !url_given && !session.base_url.is_empty() {
             config.set_base_url(&session.base_url);
         }
-        if !provider_given {
-            if let Some(provider) = Provider::parse(&session.provider) {
-                config.provider = provider;
+        if !provider_given && !session.provider.is_empty() {
+            // A session is not hand-edited input the way the home config is —
+            // a build that named a provider this one does not know wrote it —
+            // so this must not take the TUI down. It must not be silent
+            // either: the provider is named and the endpoint the session
+            // stored (the one just applied above, or the one in force) is kept
+            // (finding C2).
+            match Provider::parse(&session.provider) {
+                Some(provider) => config.provider = provider,
+                None => notices.push(format!(
+                    "session: unknown provider `{}` (try {}) — keeping the endpoint {}",
+                    session.provider,
+                    provider::names_hint(),
+                    config.base_url
+                )),
             }
         }
         if !model_given && !session.model.is_empty() {
@@ -915,7 +963,7 @@ pub fn resolve_with(
         config.context_tokens = config.fallback_context();
     }
 
-    Ok(config)
+    Ok(Resolved { config, notices })
 }
 
 /// The number in a "context length" complaint, when a server names one. Hosted
@@ -1005,7 +1053,8 @@ mod tests {
             &home("custom", "http://home:4", "home-model"),
             Some(&session),
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(config.base_url, "http://cli:1");
         assert_eq!(config.model, "cli-model");
         assert_eq!(config.provider, Provider::DeepSeek);
@@ -1023,7 +1072,8 @@ mod tests {
             &home("custom", "http://home:4", "home-model"),
             Some(&stored("deepseek", "http://session:3", "session-model")),
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(config.base_url, "http://session:3");
         assert_eq!(config.provider, Provider::DeepSeek);
         assert_eq!(config.model, "session-model");
@@ -1040,7 +1090,8 @@ mod tests {
             &home("deepseek", "", ""),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(config.base_url, "https://api.deepseek.com");
 
         // The base (environment) names one: it is respected.
@@ -1054,7 +1105,8 @@ mod tests {
             &home("deepseek", "", ""),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(config.base_url, "http://env:2");
     }
 
@@ -1072,18 +1124,65 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("claude"), "{error}");
+        assert!(error.contains("deepseek or custom"), "{error}");
+    }
 
-        // An unparsable *stored* provider is simply ignored.
-        let config = resolve_with(
+    /// A typo in the home config's `provider` is an error, not a shrug (finding
+    /// C2): the value is carried, and so is the list mush knows, and so is the
+    /// file it came from — `MUSH_CONFIG` can point anywhere, so the file's own
+    /// name is not enough to find it. Nothing resolves, which is the point: the
+    /// old silent fallback left the provider at `Custom`, whose endpoint is a
+    /// LAN host, and sent the home key there.
+    #[test]
+    fn a_home_config_typo_names_the_value_and_the_file() {
+        let error = resolve_with(
             Config::new("http://base:0", "m", None),
             &Overrides::default(),
             &Overrides::default(),
-            &home("claude", "", ""),
-            Some(&stored("claude", "", "")),
+            &home("deepsek", "", ""),
+            None,
+        )
+        .unwrap_err();
+        assert!(error.contains("deepsek"), "{error}");
+        assert!(error.contains("deepseek or custom"), "{error}");
+        assert!(
+            error.contains(&crate::userconfig::config_path().display().to_string()),
+            "the file is named: {error}"
+        );
+        assert!(
+            !error.contains(Provider::Custom.default_base_url()),
+            "and the LAN endpoint is not what it resolves to: {error}"
+        );
+    }
+
+    /// The session's twin: a *notice*, not an error — that file is written by
+    /// mush itself, so a provider this build does not know must not take the
+    /// TUI down — and the endpoint the session stored is kept rather than
+    /// replaced by the default's LAN host (finding C2).
+    #[test]
+    fn a_session_typo_is_reported_and_keeps_its_endpoint() {
+        let resolved = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &UserConfig::default(),
+            Some(&stored("deepsek", "http://box:9", "m")),
         )
         .unwrap();
-        assert_eq!(config.provider, Provider::Custom);
-        assert_eq!(config.base_url, "http://base:0");
+        assert_eq!(
+            resolved.config.base_url, "http://box:9",
+            "the endpoint the session stored is kept"
+        );
+        assert_eq!(
+            resolved.config.provider,
+            Provider::Custom,
+            "the typo is not a provider"
+        );
+        assert_eq!(resolved.notices.len(), 1, "{:?}", resolved.notices);
+        let notice = &resolved.notices[0];
+        assert!(notice.contains("deepsek"), "{notice}");
+        assert!(notice.contains("deepseek or custom"), "{notice}");
+        assert!(notice.contains("http://box:9"), "{notice}");
     }
 
     /// The home config fills what every layer above it leaves unstated: the
@@ -1104,7 +1203,8 @@ mod tests {
             &home,
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(config.temperature(), 0.2);
         assert!(config.uses_max_completion_tokens());
         assert_eq!(config.context_tokens, 32_000);
@@ -1128,7 +1228,8 @@ mod tests {
             &home,
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(config.temperature(), 0.9);
         assert!(!config.uses_max_completion_tokens());
         assert_eq!(config.context_tokens, 8_000);
@@ -1140,7 +1241,8 @@ mod tests {
             &UserConfig::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(empty.temperature(), DEFAULT_TEMPERATURE);
         assert!(!empty.uses_max_completion_tokens());
 
@@ -1155,7 +1257,8 @@ mod tests {
             &home,
             Some(&session),
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(config.context_tokens, 16_000);
         assert_eq!(config.temperature(), 0.2, "the other knobs still come home");
     }
@@ -1221,7 +1324,8 @@ mod tests {
             &UserConfig::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(config.temperature(), 0.2);
         assert!(config.uses_max_completion_tokens());
 
@@ -1240,7 +1344,8 @@ mod tests {
             &UserConfig::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(from_env.temperature(), DEFAULT_TEMPERATURE);
         assert!(!from_env.uses_max_completion_tokens());
 
@@ -1252,7 +1357,8 @@ mod tests {
             &UserConfig::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(untouched.temperature(), DEFAULT_TEMPERATURE);
         assert!(!untouched.uses_max_completion_tokens());
     }
@@ -1272,7 +1378,8 @@ mod tests {
             &UserConfig::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(deepseek.provider, Provider::DeepSeek);
         assert!(deepseek.thinking_enabled());
         assert_eq!(deepseek.reasoning_effort(), Some("high"));
@@ -1286,7 +1393,8 @@ mod tests {
             &UserConfig::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(custom.provider, Provider::Custom);
         assert!(!custom.thinking_enabled());
         assert_eq!(custom.reasoning_effort(), None);
@@ -1317,12 +1425,16 @@ mod tests {
         };
 
         // Command line: beats both.
-        let config = resolve_with(base(), &cli, &env, &home, None).unwrap();
+        let config = resolve_with(base(), &cli, &env, &home, None)
+            .unwrap()
+            .config;
         assert_eq!(config.reasoning_effort(), Some("high"));
         assert!(config.thinking_enabled(), "the flag said on, the env off");
 
         // Environment: fills what the flag left alone.
-        let config = resolve_with(base(), &Overrides::default(), &env, &home, None).unwrap();
+        let config = resolve_with(base(), &Overrides::default(), &env, &home, None)
+            .unwrap()
+            .config;
         assert_eq!(config.reasoning_effort(), Some("max"));
         assert!(!config.thinking_enabled(), "the env said off, the file on");
         assert!(config.reasoning_effort_stated());
@@ -1335,7 +1447,8 @@ mod tests {
             &home,
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(config.reasoning_effort(), Some("low"));
         assert!(config.thinking_enabled());
         assert!(config.thinking_stated());
@@ -1358,7 +1471,8 @@ mod tests {
             },
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(config.provider, Provider::DeepSeek);
         assert_eq!(
             config.reasoning_effort(),
@@ -1391,7 +1505,8 @@ mod tests {
             },
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(config.provider, Provider::Custom, "the URL is the human's");
         assert_eq!(config.reasoning_effort(), Some("low"));
         assert!(config.thinking_enabled());
@@ -1410,7 +1525,8 @@ mod tests {
             &UserConfig::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(config.provider, Provider::DeepSeek);
         assert_eq!(config.reasoning_effort(), Some("high"));
         assert!(!config.thinking_enabled());
@@ -1704,6 +1820,7 @@ mod tests {
                 None,
             )
             .unwrap()
+            .config
         };
 
         // Nothing stated: the provider's own default, and a guess, not a
@@ -1967,7 +2084,8 @@ mod tests {
             &UserConfig::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(config.provider, Provider::DeepSeek);
         assert_eq!(config.base_url, "https://api.deepseek.com");
 
@@ -1983,7 +2101,8 @@ mod tests {
             &home("deepseek", "", ""),
             Some(&stored("deepseek", "", "")),
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(config.base_url, "http://localhost:11434");
         assert_eq!(config.provider, Provider::Custom);
         assert!(!config.thinking_enabled());
@@ -2001,7 +2120,8 @@ mod tests {
             &UserConfig::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .config;
         assert_eq!(config.base_url, "http://localhost:11434");
         assert_eq!(config.provider, Provider::DeepSeek);
         assert_eq!(config.reasoning_effort(), Some("high"));
