@@ -1092,6 +1092,26 @@ impl AgentCtx {
 /// Per-actor state that survives across runs (children, summaries).
 #[derive(Default)]
 struct ActorState {
+    /// This parent's children, by id — and *the* book of whose reports are
+    /// news, which used to be two books. A report is only ever produced by an
+    /// actor this parent spawned ([`spawn_tool`]) or was handed a row for
+    /// ([`note_child_book`], the tree's restore and revival roads), so an id
+    /// this map does not name has no row a report could be read against: the
+    /// completion is swallowed instead of re-opening books the reap closed
+    /// (`AgentMsg::ForgetChild`, finding H19).
+    ///
+    /// A separate `forgotten` tombstone set used to say the same thing, and
+    /// grew by one `u64` for every child the history window ever reaped — an
+    /// actor that forgot a thousand children held a thousand ids nothing could
+    /// clear (finding A16). Dropping the tombstone instead, once no in-flight
+    /// report could still name it, is not a question this parent can answer: it
+    /// never sees the child's thread die (the tree drops its sender, but the
+    /// child holds its own `my_tx` and may still send), so a parent-side drop
+    /// would either swallow a real report or keep every id, which is the set
+    /// again. The distinction the tombstone carried — "was a child, now
+    /// forgotten" against "never a child" — is one no report can make: a
+    /// report from an id this parent never had is stale junk either way, and
+    /// [`forget_child`] empties this map first for exactly that reason.
     children: HashMap<u64, Sender<AgentMsg>>,
     running: HashSet<u64>,
     /// The latest outcome of each child, with the run it came from, whether or
@@ -1125,16 +1145,11 @@ struct ActorState {
     /// one-shared-child rule is about: an isolated sibling edits its own tree
     /// and conflicts with nothing here (audit row 7).
     shared: HashSet<u64>,
-    /// The children the history window has reaped: their ids, remembered so a
-    /// report still travelling from one of them cannot re-open books the reap
-    /// closed (`AgentMsg::ForgetChild`). The ids are never reused (`crate::ids`
-    /// hands out one number per agent), so the memory cannot name a *new* child
-    /// by mistake. One `u64` per forgotten child, held until the tree hands the
-    /// row *back* ([`note_child_book`]): a row can only be handed
-    /// over for a node that exists, so it is proof the forget has gone stale,
-    /// and the tombstone goes with the books it closed. Until then nothing
-    /// clears it — a report can be in flight for as long as an actor lives.
-    forgotten: HashSet<u64>,
+    /// The children the history window has reaped are simply absent from
+    /// `children`: a report still travelling from one of them is swallowed by
+    /// [`is_forgotten`], whose whole source is that book (see its doc) — there
+    /// is no second set of ids to hold, and nothing per-child grows here for
+    /// the life of an actor (finding A16).
     /// How each child's last finished run left its worktree, keyed by the run
     /// that left it: the branch, and whether the work is committed. A listing
     /// fact (`status`), never a delivery: reading it marks nothing, and
@@ -1238,15 +1253,17 @@ impl ActorState {
     /// Whether the tree has forgotten `id` — a child the history window reaped
     /// (`AgentMsg::ForgetChild`).
     ///
-    /// `children` is the book that names this parent's children; this is the
-    /// memory that the book was *closed* for an id, so the once-only delivery
-    /// rule has an other end: the same run reported twice is swallowed by
-    /// `delivered` (`docs/findings.md` B24), while a report from a forgotten
-    /// child is not delivered at all — there is no row it could be read
-    /// against, and folding it would put a line about a child nobody can see
-    /// into the parent's transcript.
+    /// One question with one source: the id is not in [`ActorState::children`].
+    /// The book that names the parent's children is the book the reap empties,
+    /// so its absence *is* the tombstone — and unlike a second set of ids, it
+    /// costs nothing that grows with the session (finding A16). The once-only
+    /// delivery rule has its other end here: the same run reported twice is
+    /// swallowed by `delivered` (`docs/findings.md` B24), while a report from a
+    /// child the tree has dropped is not delivered at all — there is no row it
+    /// could be read against, and folding it would put a line about a child
+    /// nobody can see into the parent's transcript (finding H19).
     fn is_forgotten(&self, id: u64) -> bool {
-        self.forgotten.contains(&id)
+        !self.children.contains_key(&id)
     }
 
     /// Record a child's completion and say whether its line is *fresh* — one
@@ -3771,11 +3788,13 @@ fn note_completion(state: &mut ActorState, id: u64, run: u64, outcome: Outcome) 
 /// here, where the mailbox changes hands, and nowhere else.
 fn note_mailbox(state: &mut ActorState, id: u64, cmd: Sender<AgentMsg>) {
     // A child the tree has dropped has no row a mailbox could belong to, and
-    // the tombstone is the last word about it: writing the book back would put
-    // a name into `status` with nothing on screen behind it, and hand `control`
-    // an actor nobody can see. The rule the other books of a child follow
+    // its absence from `children` is the last word about it (finding A16):
+    // writing the book back would put a name into `status` with nothing on
+    // screen behind it, and hand `control` an actor nobody can see. The rule
+    // the other books of a child follow
     // (`note_running`, `note_work`, `record_child`) belongs on this one too;
-    // only `note_child_book` clears a tombstone, by handing the row back.
+    // only `note_child_book` reopens a book the reap closed, by handing the
+    // row back.
     if state.is_forgotten(id) {
         return;
     }
@@ -3806,10 +3825,6 @@ fn note_child_book(
     shared: bool,
 ) {
     state.children.insert(id, cmd);
-    // The tree naming the child is the one proof that an earlier forget is
-    // stale — a row can only be handed over for a node that exists — so the
-    // tombstone goes with the books it closed.
-    state.forgotten.remove(&id);
     // A child with no branch of its own runs in its parent's workspace: the
     // one-shared-child rule and `control`'s worktree check both read this book.
     if shared {
@@ -3835,15 +3850,13 @@ fn note_child_book(
 /// outlived its row.
 ///
 /// `children` goes first, because it is the book that says whose reports are
-/// news. The id then goes into `forgotten`, which is what keeps it so: a
-/// forgotten child must not be able to re-deliver anything, and after this
-/// there is no book left to deliver into *and* no report of its that any road
-/// will accept. Every other per-child book follows, so no listing (`work`,
+/// news: after this there is no book left to deliver into *and* no report of
+/// the child's that any road will accept ([`is_forgotten`] reads exactly this
+/// map). Every other per-child book follows, so no listing (`work`,
 /// `completed`), no wait (`running`) and no shared-workspace guard (`shared`)
 /// can read a child the tree has dropped.
 fn forget_child(state: &mut ActorState, id: u64) {
     state.children.remove(&id);
-    state.forgotten.insert(id);
     state.completed.remove(&id);
     state.delivered.remove(&id);
     state.running.remove(&id);
@@ -3924,11 +3937,26 @@ fn note_work(state: &mut ActorState, id: u64, run: u64, work: Work) {
     }
 }
 
+/// How many job reports one actor's books keep — the registry's whole memory.
+///
+/// `jobs::MAX_JOBS` is how many jobs one workspace may run at once, and the
+/// registry lists as many finished ones *again* (`JOB_HISTORY`), so a report
+/// older than the newest `2 * MAX_JOBS` is one nothing else in the tree can
+/// still be holding: the registry has dropped it, and the line itself is in the
+/// transcript, where a delivery put it. The two books used to grow by one
+/// report per job the actor ever started — a thousand jobs held 61,893 bytes
+/// of line text, for the life of the actor (finding A16).
+const REMEMBERED_JOBS: usize = 2 * jobs::MAX_JOBS;
+
 /// The same bookkeeping for a job: it is no longer running, and its report is
 /// the line the model reads. A job ends once, under an id nothing else reuses,
 /// so a report recorded again is the *same* report: the delivery mark stands,
 /// and it is not cleared here. Clearing it unconditionally is what let a job's
 /// line fold twice (`docs/findings.md` B24, `note_completion`'s twin).
+///
+/// The books are forgetful on purpose: only the newest [`REMEMBERED_JOBS`]
+/// reports stay (finding A16), because an older one is a report the registry
+/// itself has dropped and the transcript already holds.
 fn note_job(state: &mut ActorState, id: JobId, line: String, news: bool) -> String {
     state.running_jobs.remove(&id);
     state.done_jobs.insert(
@@ -3938,7 +3966,38 @@ fn note_job(state: &mut ActorState, id: JobId, line: String, news: bool) -> Stri
             news,
         },
     );
+    prune_job_books(state);
     line
+}
+
+/// Drop the job reports this actor has already read, oldest first, until the
+/// book is no larger than the registry's own memory ([`REMEMBERED_JOBS`]).
+///
+/// The delivery mark goes with the report it marks: an id the registry can no
+/// longer report (a `CommandDone` is sent once, by a job that is gone) has no
+/// second arrival for the mark to swallow, and the mark is the other half of
+/// the growth finding A16 measured.
+///
+/// An *undelivered* report is never dropped, however old: `drain_signals`
+/// records one for the next boundary to fold in, and news is the one thing a
+/// book may not forget. Ids are handed out in order, so sorting by id is
+/// sorting by age.
+fn prune_job_books(state: &mut ActorState) {
+    if state.done_jobs.len() <= REMEMBERED_JOBS {
+        return;
+    }
+    let mut read: Vec<JobId> = state
+        .done_jobs
+        .keys()
+        .copied()
+        .filter(|id| state.delivered_jobs.contains(id))
+        .collect();
+    read.sort_unstable();
+    let excess = state.done_jobs.len() - REMEMBERED_JOBS;
+    for id in read.into_iter().take(excess) {
+        state.done_jobs.remove(&id);
+        state.delivered_jobs.remove(&id);
+    }
 }
 
 /// Fold one line into this actor's transcript *and* tell the UI to put it in
@@ -6886,6 +6945,7 @@ mod tests {
     fn adoption_does_not_re_arm_a_delivery_that_already_happened() {
         let (actor, _mailbox) = test_actor("stale-copy");
         let mut state = ActorState::default();
+        known_child(&mut state, 1);
         note_completion(&mut state, 1, 1, Outcome::Finished("did the thing".into()));
         let mut messages = vec![Message::system("you are mush")];
         assert!(fold_completions(&actor, &mut state, &mut messages));
@@ -7246,6 +7306,7 @@ mod tests {
     #[test]
     fn a_later_finish_replaces_a_stale_stop() {
         let mut state = ActorState::default();
+        known_child(&mut state, 1);
         note_completion(&mut state, 1, 1, Outcome::Stopped(Stop::Human));
         assert_eq!(state.outcome(1), Some(&Outcome::Stopped(Stop::Human)));
         let line = note_completion(&mut state, 1, 2, Outcome::Finished("done now".into()));
@@ -7378,6 +7439,7 @@ mod tests {
     fn a_child_completion_is_delivered_once_across_an_idle_run() {
         let (actor, events, _mailbox) = recording_actor("once-child");
         let mut state = ActorState::default();
+        known_child(&mut state, 1);
         note_completion(
             &mut state,
             1,
@@ -7475,6 +7537,7 @@ mod tests {
     fn a_child_run_reported_again_is_not_folded_twice() {
         let (actor, _events, mailbox) = recording_actor("re-reported");
         let mut state = ActorState::default();
+        known_child(&mut state, 2);
         let mut messages = vec![Message::system("you are mush")];
         let error = "Connection reset by peer (os error 104)";
         let line = format!("#2 failed: {error}");
@@ -7738,8 +7801,8 @@ mod tests {
             "the row's mailbox is the live one"
         );
 
-        // The tombstone goes with the closed books, not with the id: the child
-        // is bookable again, so a run of it that starts, reports and works is
+        // The forget goes with the closed books, not with the id: the child is
+        // bookable again, so a run of it that starts, reports and works is
         // recorded rather than swallowed as a report of something the tree has
         // already dropped.
         absorb(
@@ -7798,12 +7861,12 @@ mod tests {
     }
 
     /// A mailbox handed over for a child the tree has already dropped keeps no
-    /// book: the tombstone is the last word, and the one thing that clears it
-    /// is the tree handing the row back (finding H19).
+    /// book: the absence from `children` is the last word, and the one thing
+    /// that reopens it is the tree handing the row back (findings H19, A16).
     ///
     /// The other three books a revival can touch are guarded the same way
     /// (`note_running`, `note_work`, `record_child`); a `ChildMailbox` that
-    /// slipped past its tombstone would name a child in `status` with no row
+    /// slipped past the closed book would name a child in `status` with no row
     /// on screen to point at, which is exactly what the reap emptied the books
     /// to prevent.
     #[test]
@@ -7847,7 +7910,7 @@ mod tests {
         );
         assert!(
             state.is_forgotten(1),
-            "and the tombstone stands: only the row handed back clears one"
+            "and the child stays forgotten: only the row handed back reopens it"
         );
         drop(live_rx);
         let _ = fs::remove_dir_all(actor.ws.root());
@@ -8211,6 +8274,7 @@ mod tests {
     fn a_second_run_failing_the_same_way_is_news_again() {
         let (actor, _mailbox) = test_actor("same-text-twice");
         let mut state = ActorState::default();
+        known_child(&mut state, 3);
         let mut messages = vec![Message::system("you are mush")];
         let error = "Connection reset by peer (os error 104)";
         let line = format!("#3 failed: {error}");
@@ -8251,6 +8315,9 @@ mod tests {
     fn adoption_reads_a_failed_or_stopped_line_as_delivered() {
         let (actor, _mailbox) = test_actor("adopt-shapes");
         let mut state = ActorState::default();
+        known_child(&mut state, 2);
+        known_child(&mut state, 3);
+        known_child(&mut state, 4);
         note_completion(&mut state, 2, 1, Outcome::Failed("no route".into()));
         note_completion(&mut state, 3, 1, Outcome::Stopped(Stop::Human));
         note_completion(&mut state, 4, 1, Outcome::CutOff);
@@ -8330,6 +8397,111 @@ mod tests {
             messages.iter().filter(|m| m.text() == line).count(),
             1,
             "one report, one line: {messages:?}"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The books may not grow for the life of an actor (finding A16): a session
+    /// that started a thousand jobs left a thousand report lines and a thousand
+    /// delivery marks behind — 61,893 bytes of line text for the reports alone
+    /// in the audit's probe — and one that forgot a thousand children left a
+    /// thousand ids nothing could clear.
+    ///
+    /// The reports now stop at the registry's own memory ([`REMEMBERED_JOBS`]),
+    /// and only *read* ones go: a report `drain_signals` has recorded for the
+    /// next boundary is news, whatever its age, and never dropped. The child
+    /// half is the same absence read twice — the tombstone set is gone, so an
+    /// id no book names is an id whose report is not news.
+    #[test]
+    fn a_thousand_jobs_leave_the_job_books_the_size_of_the_registry() {
+        let (actor, _mailbox) = test_actor("job-books");
+        let mut state = ActorState::default();
+        let mut messages = vec![Message::system("you are mush")];
+
+        // The oldest report is the one nobody has read yet: it survives every
+        // prune, because that is the one thing a later boundary still has to
+        // fold in.
+        state.done_jobs.insert(
+            JobId(1),
+            JobReport {
+                line: "#c1 done: exit 0 · 1s · the one nobody has read".into(),
+                news: true,
+            },
+        );
+
+        for id in 2..=1_001u64 {
+            let line = format!("#c{id} done: exit 0 · 1s · cargo test — ok");
+            assert!(matches!(
+                absorb(
+                    &actor,
+                    &mut state,
+                    &mut messages,
+                    AgentMsg::CommandDone {
+                        id: JobId(id),
+                        line,
+                        news: true,
+                    }
+                ),
+                Fold::Run
+            ));
+        }
+
+        assert!(
+            state.done_jobs.len() <= REMEMBERED_JOBS,
+            "the reports stop at the registry's own memory: {}",
+            state.done_jobs.len()
+        );
+        assert!(
+            state.delivered_jobs.len() <= REMEMBERED_JOBS,
+            "and so do the delivery marks: {}",
+            state.delivered_jobs.len()
+        );
+        assert!(
+            state
+                .delivered_jobs
+                .iter()
+                .all(|id| state.done_jobs.contains_key(id)),
+            "a mark without a report behind it is a `wait` that can never answer"
+        );
+        assert!(
+            state.done_jobs.contains_key(&JobId(1)) && !state.delivered_jobs.contains(&JobId(1)),
+            "the unread report is news and outlives every prune: {:?}",
+            state.done_jobs.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !state.done_jobs.contains_key(&JobId(2)),
+            "the oldest *read* report is the one that goes"
+        );
+        assert!(
+            messages.iter().any(|m| m.text().contains("#c2 done:")),
+            "and it is not lost news: the transcript it was folded into holds it"
+        );
+
+        // The child half of the same finding: the tombstone set is gone, so the
+        // absence from `children` is the whole record — and a report from an id
+        // whose row the reap has taken is swallowed exactly as before.
+        known_child(&mut state, 7);
+        absorb(
+            &actor,
+            &mut state,
+            &mut messages,
+            AgentMsg::ForgetChild { id: 7 },
+        );
+        let line = "#7 done: and the parser";
+        absorb(
+            &actor,
+            &mut state,
+            &mut messages,
+            AgentMsg::ChildDone {
+                id: 7,
+                run: 1,
+                outcome: Outcome::Finished("and the parser".into()),
+            },
+        );
+        assert!(
+            !messages.iter().any(|m| m.text() == line),
+            "a report of a child the tree has dropped is not folded in: {:?}",
+            messages.last().unwrap().text()
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
@@ -10157,6 +10329,16 @@ mod tests {
         let (actor, _events, mailbox) =
             build_actor(label, Arc::new(HttpModel::new(cfg.clone())), cfg);
         (actor, mailbox)
+    }
+
+    /// Give `state` the book of a child it never spawned, the way `spawn_tool`
+    /// and `note_child_book` write one in production. `children` is the book
+    /// that says whose reports are news (finding A16), so a completion injected
+    /// for an id this map does not name is swallowed like any other report of a
+    /// child the tree has dropped.
+    fn known_child(state: &mut ActorState, id: u64) {
+        let (cmd, _rx) = crossbeam_channel::unbounded();
+        state.children.insert(id, cmd);
     }
 
     /// One picture with the pixels a test cares about. The bytes are a
@@ -13922,6 +14104,7 @@ mod tests {
     fn fold_completions_folds_results_and_leaves_nudges_parked() {
         let (actor, events, _mailbox) = recording_actor("fold-boundary");
         let mut state = ActorState::default();
+        known_child(&mut state, 1);
         state.deferred.push(AgentMsg::Nudge("steer".into()));
         note_completion(&mut state, 1, 1, Outcome::Finished("did the thing".into()));
         let mut messages = vec![
@@ -14038,6 +14221,19 @@ mod tests {
             scripted.clone(),
         )
         .tx;
+        // The child's row reaches the parent's books before the run starts: the
+        // books are where a report is news (finding A16), and this test injects
+        // the completion rather than spawning the child.
+        let (child_tx, _child_rx) = crossbeam_channel::unbounded();
+        root_tx
+            .send(AgentMsg::ChildBook {
+                id: 1,
+                cmd: child_tx,
+                outcome: None,
+                read: true,
+                shared: false,
+            })
+            .unwrap();
         root_tx
             .send(AgentMsg::Run(vec![
                 Message::system("you are mush"),
@@ -14110,6 +14306,7 @@ mod tests {
     fn replacing_the_transcript_keeps_an_unread_completion_deliverable() {
         let (actor, _mailbox) = test_actor("deliver");
         let mut state = ActorState::default();
+        known_child(&mut state, 1);
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
         // A completion that arrived between boundaries and has not been folded
         // into the model's transcript yet.
@@ -14309,6 +14506,9 @@ mod tests {
         );
         let (actor, _events, mailbox) = scripted_actor("child-done-mid-batch", &model);
         let mut state = ActorState::default();
+        // The child's own row: a report is news only from a child the parent's
+        // book names (finding A16).
+        known_child(&mut state, 1);
         let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![
             Message::system("you are mush"),
@@ -14349,6 +14549,7 @@ mod tests {
     fn a_completion_is_delivered_once() {
         let (actor, _mailbox) = test_actor("delivered-once");
         let mut state = ActorState::default();
+        known_child(&mut state, 1);
         let mut messages = vec![Message::system("you are mush")];
         note_completion(
             &mut state,
