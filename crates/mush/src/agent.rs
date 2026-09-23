@@ -970,11 +970,9 @@ impl AgentCtx {
     /// the UI never hears about. `Ok(false)` is the cell refusing a number —
     /// the human stated a window, or it was not plausible.
     fn learn_context(&self, id: u64, tokens: usize, source: WindowSource) -> Result<bool, String> {
-        if !self.cfg.learn_context(tokens, source)? {
-            return Ok(false);
-        }
-        self.emit(id, AgentEvent::Context { tokens, source });
-        Ok(true)
+        self.cfg.learn_context(tokens, source, || {
+            self.emit(id, AgentEvent::Context { tokens, source })
+        })
     }
 }
 
@@ -2797,7 +2795,7 @@ fn run_loop(
                 // would collapse the window by more than 8x is refused: a
                 // rate-limit body must not teach mush that the endpoint has ten
                 // tokens (finding A3).
-                if !learned_context && !cfg.context_explicit {
+                if !learned_context && !cfg.context_explicit() {
                     if let Some(tokens) = parse_context_hint(&detail) {
                         // The cell decides whether the number is worth taking
                         // (a plausible one, and never over a window the human

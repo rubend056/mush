@@ -2972,7 +2972,7 @@ mod tests {
             model: String::new(),
             api_key: None,
             context_tokens: 8192,
-            context_explicit: false,
+            context_source: mush_core::config::WindowSource::Table,
             temperature: mush_core::config::DEFAULT_TEMPERATURE,
             max_completion_tokens: false,
             reasoning_effort: None,

@@ -176,6 +176,32 @@ impl ThinkingMode {
     }
 }
 
+/// The road a context window came by: who said it, and how far it is to be
+/// trusted.
+///
+/// A number means the same thing whoever said it; how much it is worth does
+/// not. The human's own statement outranks everything discovery says; mush's
+/// documented table is only an assumption filling a silence; the endpoint's
+/// model list is a field mush takes as given; and a complaint is prose parsed
+/// out of a refusal body, so it has to look plausible against the window in
+/// force — otherwise a rate-limit body would teach mush a ten-token window
+/// (finding A3). The window carries its road because two sessions on one config
+/// can legitimately show different numbers, and a bare `~` could not say which
+/// of the three unstated roads a number had taken (the human's live finding).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowSource {
+    /// The human stated it: `--context`, `MUSH_CONTEXT`, the home config's
+    /// `context`, `/context`, or a workspace's stored session choice.
+    Stated,
+    /// Mush's documented table: [`known_context`] for the model, else the
+    /// provider's general fallback — the number a silence resolves to.
+    Table,
+    /// The endpoint's model list named it for the model in use.
+    Advertised,
+    /// The endpoint named it in a refusal.
+    Complaint,
+}
+
 #[derive(Clone, Debug)]
 pub struct Config {
     pub provider: Provider,
@@ -186,10 +212,11 @@ pub struct Config {
     /// every request under it, reserving room for the tool schemas and the
     /// reply.
     pub context_tokens: usize,
-    /// True when the human stated the window (flag, `MUSH_CONTEXT`, `/context`,
-    /// or a stored explicit choice). Only then does it beat what the endpoint
-    /// advertises: discovery is for guessing, not for overruling.
-    pub context_explicit: bool,
+    /// The road the window came by. [`Self::context_explicit`] is derived from
+    /// it rather than stored beside it, so a flag and a road cannot disagree
+    /// about whether the human stated the window; the meter's mark and
+    /// `--print-config`'s sentence both read it.
+    pub context_source: WindowSource,
     /// Sampling temperature sent with every request. Coding wants the model's
     /// own best judgement, not mush's idea of a cautious one, so the default is
     /// 1.0 — the value every OpenAI-compatible endpoint documents as "use the
@@ -492,7 +519,11 @@ impl Config {
             model: env.model.clone().unwrap_or_default(),
             api_key: env.api_key.clone(),
             context_tokens: context.unwrap_or(DEFAULT_CONTEXT_TOKENS),
-            context_explicit: context.is_some(),
+            context_source: if context.is_some() {
+                WindowSource::Stated
+            } else {
+                WindowSource::Table
+            },
             temperature: DEFAULT_TEMPERATURE,
             max_completion_tokens: false,
             // A stated effort or thinking mode is sent wherever the human
@@ -514,7 +545,7 @@ impl Config {
             model: model.into(),
             api_key,
             context_tokens: DEFAULT_CONTEXT_TOKENS,
-            context_explicit: false,
+            context_source: WindowSource::Table,
             temperature: DEFAULT_TEMPERATURE,
             max_completion_tokens: false,
             // Unstated: see the field docs for what the provider's own default
@@ -538,11 +569,22 @@ impl Config {
         self.max_completion_tokens
     }
 
-    /// Set the window from the human (`/context`, a stored choice). An explicit
-    /// window beats anything an endpoint says.
+    /// Whether the human stated the window (flag, `MUSH_CONTEXT`, the home
+    /// config, `/context`, or a stored explicit choice). Only then does it beat
+    /// what the endpoint advertises: discovery is for guessing, not for
+    /// overruling.
+    ///
+    /// Derived from [`Self::context_source`] rather than kept as a second flag,
+    /// so the two cannot say different things about one window.
+    pub fn context_explicit(&self) -> bool {
+        self.context_source == WindowSource::Stated
+    }
+
+    /// Set the window from the human (`/context`, a stored choice), and record
+    /// the road it came by: a stated window beats anything an endpoint says.
     pub fn set_context(&mut self, tokens: usize) {
         self.context_tokens = clamp_context(tokens);
-        self.context_explicit = true;
+        self.context_source = WindowSource::Stated;
     }
 
     /// The one cap on the text a tool result may carry — a command's output, a
@@ -646,13 +688,19 @@ impl Config {
         known_context(&self.model).unwrap_or(self.provider.spec().fallback_context_tokens)
     }
 
-    /// Adopt a window learned from the endpoint or the model table, unless the
-    /// human stated one explicitly. The value is endpoint metadata, i.e.
-    /// untrusted: a window below the floor is raised to it (the server is
-    /// saying the window is small, not that it is one token), and one past the
-    /// ceiling is lowered.
-    pub fn adopt_context(&mut self, tokens: usize) -> bool {
-        if self.context_explicit || tokens == 0 {
+    /// Adopt a window an endpoint named, unless the human stated one
+    /// explicitly, and record the road it came by. The value is endpoint
+    /// metadata, i.e. untrusted: a window below the floor is raised to it (the
+    /// server is saying the window is small, not that it is one token), and one
+    /// past the ceiling is lowered.
+    ///
+    /// `source` is the road, not a preference: it travels with the number
+    /// because the meter marks it and `--print-config` names it in words, so a
+    /// number adopted without its road would leave both surfaces guessing. A
+    /// [`WindowSource::Stated`] does not arrive here — the human's own write is
+    /// [`Self::set_context`].
+    pub fn adopt_context(&mut self, tokens: usize, source: WindowSource) -> bool {
+        if self.context_explicit() || tokens == 0 {
             return false;
         }
         let tokens = clamp_context(tokens);
@@ -660,6 +708,7 @@ impl Config {
             return false;
         }
         self.context_tokens = tokens;
+        self.context_source = source;
         true
     }
 
@@ -670,12 +719,13 @@ impl Config {
         self.rederive_context();
     }
 
-    /// Re-derive the window from the model/provider table. A window the human
-    /// stated explicitly is never touched; a window merely learned from the
-    /// previous endpoint is replaced.
+    /// Re-derive the window from the model/provider table, recording it as
+    /// that road. A window the human stated explicitly is never touched; a
+    /// window merely learned from the previous endpoint is replaced.
     pub fn rederive_context(&mut self) {
-        if !self.context_explicit {
+        if !self.context_explicit() {
             self.context_tokens = self.fallback_context();
+            self.context_source = WindowSource::Table;
         }
     }
 
@@ -895,7 +945,14 @@ pub fn resolve_with(
 
     // 2. Home config: machine-global defaults, and where the API key lives.
     if config.api_key.is_none() {
-        config.api_key = home.api_key.clone();
+        // An empty string in the file is no key, not a key. Hand-edited, it
+        // used to become `Some("")`, and three surfaces then disagreed about
+        // one state: `/key`'s ack read `api key set (••••…)`, `--print-config`
+        // read `(none)` (it filters the empty string itself), and every
+        // request carried `Authorization: Bearer ` with nothing after it
+        // (finding D22). `MUSH_API_KEY=""` is already dropped by
+        // `env_nonempty`, so this is the file's own road to that state.
+        config.api_key = home.api_key.clone().filter(|key| !key.is_empty());
     }
     if !provider_given && !home.provider.is_empty() {
         // A typo here is an error, exactly as it is for `--provider` and
@@ -999,7 +1056,7 @@ pub fn resolve_with(
         }
         // A window the human chose for this workspace, remembered. It is an
         // explicit statement, so it outranks anything discovered later.
-        if !config.context_explicit {
+        if !config.context_explicit() {
             if let Some(tokens) = session.context.filter(|n| *n > 0) {
                 config.set_context(tokens);
             }
@@ -1010,7 +1067,7 @@ pub fn resolve_with(
     // what an endpoint advertises; but a window this workspace remembers is the
     // more specific statement, which is why this waits for the session above.
     // The layers still read CLI > env > session > home.
-    if !config.context_explicit {
+    if !config.context_explicit() {
         if let Some(tokens) = home.context.filter(|n| *n > 0) {
             config.set_context(tokens);
         }
@@ -1025,10 +1082,12 @@ pub fn resolve_with(
     }
 
     // 5. Nothing was stated: assume the model's documented window, else the
-    //    provider's default. An endpoint that advertises one (llama.cpp's
-    //    `meta.n_ctx`, vLLM's `max_model_len`) overrides this at discovery.
-    if !config.context_explicit {
+    //    provider's default — the table's road. An endpoint that advertises one
+    //    (llama.cpp's `meta.n_ctx`, vLLM's `max_model_len`) overrides this at
+    //    discovery.
+    if !config.context_explicit() {
         config.context_tokens = config.fallback_context();
+        config.context_source = WindowSource::Table;
     }
 
     Ok(Resolved { config, notices })
@@ -1326,6 +1385,39 @@ mod tests {
         assert_eq!(resolved.config.api_key.as_deref(), Some("sk-home"));
     }
 
+    /// An empty string in the home config is no key: a hand-edited
+    /// `api_key: ""` used to resolve to `Some("")`, which `/key`'s ack read as
+    /// a set key, `--print-config` printed as `(none)`, and every request sent
+    /// as `Authorization: Bearer ` (finding D22).
+    #[test]
+    fn an_empty_config_key_is_no_key() {
+        let mut empty = home("custom", "http://home:4", "m");
+        empty.api_key = Some(String::new());
+        let config = resolve_with(
+            Config::new("http://home:4", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &empty,
+            None,
+        )
+        .unwrap()
+        .config;
+        assert_eq!(config.api_key, None, "an empty string is no key");
+
+        // A non-empty home key still travels: the host matches, so this is
+        // not D6's rule dropping it, and the layer is unchanged.
+        let config = resolve_with(
+            Config::new("http://home:4", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home("custom", "http://home:4", "m"),
+            None,
+        )
+        .unwrap()
+        .config;
+        assert_eq!(config.api_key.as_deref(), Some("sk-home"));
+    }
+
     /// The host is the part of an endpoint a key is minted for: the authority,
     /// port included; the scheme and the path are not part of the answer
     /// (findings C6, D6).
@@ -1361,9 +1453,10 @@ mod tests {
         assert_eq!(config.temperature(), 0.2);
         assert!(config.uses_max_completion_tokens());
         assert_eq!(config.context_tokens, 32_000);
-        assert!(config.context_explicit, "a stated window is not a guess");
+        assert!(config.context_explicit(), "a stated window is not a guess");
+        assert_eq!(config.context_source, WindowSource::Stated);
         assert!(
-            !config.adopt_context(4_096),
+            !config.adopt_context(4_096, WindowSource::Advertised),
             "so an endpoint cannot overrule it"
         );
 
@@ -1453,7 +1546,8 @@ mod tests {
         assert_eq!(base.provider, Provider::DeepSeek);
         assert_eq!(base.api_key.as_deref(), Some("sk-env"));
         assert_eq!(base.context_tokens, 9_000);
-        assert!(base.context_explicit);
+        assert!(base.context_explicit());
+        assert_eq!(base.context_source, WindowSource::Stated);
         assert_eq!(base.reasoning_effort, Some(ReasoningEffort::Max));
         assert_eq!(base.thinking, Some(ThinkingMode::On));
         assert_eq!(base.temperature(), DEFAULT_TEMPERATURE);
@@ -1744,7 +1838,7 @@ mod tests {
             model: String::new(),
             api_key: None,
             context_tokens: 8192,
-            context_explicit: false,
+            context_source: WindowSource::Table,
             temperature: DEFAULT_TEMPERATURE,
             max_completion_tokens: false,
             reasoning_effort: None,
@@ -1956,8 +2050,8 @@ mod tests {
     /// The window precedence the new default must not disturb: a window a human
     /// stated beats the built-in one, a window learned from the endpoint beats
     /// both, and a window nobody stated is never remembered as if somebody had.
-    /// `context_explicit` is what the session stores by, so it is what this
-    /// pins.
+    /// `context_explicit()` is what the session stores by, and the road is the
+    /// fact the meter and `--print-config` read, so this pins both.
     #[test]
     fn the_window_precedence_outlives_the_new_default() {
         let cli = Overrides {
@@ -1980,17 +2074,33 @@ mod tests {
         // statement — which is what keeps it out of the session and the file.
         let mut config = resolve(&cli, &UserConfig::default());
         assert_eq!(config.context_tokens, 120_000, "the shipped default");
-        assert!(!config.context_explicit);
+        assert!(!config.context_explicit());
+        assert_eq!(
+            config.context_source,
+            WindowSource::Table,
+            "the table's road"
+        );
 
         // The endpoint's own number overrides the default.
-        assert!(config.adopt_context(500_000), "learned, and adopted");
+        assert!(
+            config.adopt_context(500_000, WindowSource::Advertised),
+            "learned, and adopted"
+        );
         assert_eq!(config.context_tokens, 500_000);
-        assert!(!config.context_explicit, "still a guess, still not stored");
+        assert!(
+            !config.context_explicit(),
+            "still a guess, still not stored"
+        );
+        assert_eq!(config.context_source, WindowSource::Advertised);
 
         // ...and a window the human states overrides that, for good.
         config.set_context(64_000);
-        assert!(config.context_explicit);
-        assert!(!config.adopt_context(500_000), "the human's number stays");
+        assert!(config.context_explicit());
+        assert_eq!(config.context_source, WindowSource::Stated);
+        assert!(
+            !config.adopt_context(500_000, WindowSource::Advertised),
+            "the human's number stays"
+        );
         assert_eq!(config.context_tokens, 64_000);
 
         // The home config's window is a statement too — the layer under the
@@ -2003,7 +2113,7 @@ mod tests {
             },
         );
         assert_eq!(config.context_tokens, 200_000);
-        assert!(config.context_explicit);
+        assert!(config.context_explicit());
     }
 
     /// The window comes from the model when nobody said otherwise, and the
@@ -2012,7 +2122,7 @@ mod tests {
     #[test]
     fn the_window_and_the_caps_scale_together() {
         let mut cfg = Config::new("http://x:1", "deepseek-v4-pro", None);
-        assert!(!cfg.context_explicit);
+        assert!(!cfg.context_explicit());
         // `Config::new` does not resolve; the fallback is what the resolver uses.
         assert_eq!(cfg.fallback_context(), 500_000);
         cfg.context_tokens = cfg.fallback_context();
@@ -2046,10 +2156,16 @@ mod tests {
         // An explicit window is never overruled by discovery.
         let mut cfg = Config::new("http://x:1", "m", None);
         cfg.set_context(64_000);
-        assert!(!cfg.adopt_context(8_192), "the human's number stays");
+        assert!(
+            !cfg.adopt_context(8_192, WindowSource::Advertised),
+            "the human's number stays"
+        );
         assert_eq!(cfg.context_tokens, 64_000);
         let mut cfg = Config::new("http://x:1", "m", None);
-        assert!(cfg.adopt_context(32_768), "discovery fills in a guess");
+        assert!(
+            cfg.adopt_context(32_768, WindowSource::Advertised),
+            "discovery fills in a guess"
+        );
         assert_eq!(cfg.context_tokens, 32_768);
     }
 
@@ -2157,7 +2273,7 @@ mod tests {
     fn a_stated_window_is_clamped() {
         let mut cfg = Config::new("http://x:1", "m", None);
         cfg.set_context(usize::MAX);
-        assert!(cfg.context_explicit);
+        assert!(cfg.context_explicit());
         assert_eq!(cfg.context_tokens, MAX_CONTEXT_TOKENS);
         // The ledger still adds up at the ceiling: the reserve is what the
         // window does not get to spend on history.
@@ -2177,21 +2293,30 @@ mod tests {
     #[test]
     fn an_adopted_window_is_clamped_like_a_stated_one() {
         let mut cfg = Config::new("http://x:1", "m", None);
-        assert!(cfg.adopt_context(1), "raised to the floor, not ignored");
+        assert!(
+            cfg.adopt_context(1, WindowSource::Advertised),
+            "raised to the floor, not ignored"
+        );
         assert_eq!(cfg.context_tokens, 1_024);
         assert!(cfg.history_budget() > 0);
-        assert!(!cfg.adopt_context(0), "zero is still no answer");
-        assert!(!cfg.adopt_context(1), "nothing changed");
+        assert!(
+            !cfg.adopt_context(0, WindowSource::Advertised),
+            "zero is still no answer"
+        );
+        assert!(
+            !cfg.adopt_context(1, WindowSource::Advertised),
+            "nothing changed"
+        );
 
         let mut cfg = Config::new("http://x:1", "m", None);
-        assert!(cfg.adopt_context(usize::MAX));
+        assert!(cfg.adopt_context(usize::MAX, WindowSource::Advertised));
         assert_eq!(cfg.context_tokens, MAX_CONTEXT_TOKENS);
 
         // An explicit window is never touched, whatever the endpoint claims.
         let mut cfg = Config::new("http://x:1", "m", None);
         cfg.set_context(8_192);
-        assert!(!cfg.adopt_context(1));
-        assert!(!cfg.adopt_context(usize::MAX));
+        assert!(!cfg.adopt_context(1, WindowSource::Advertised));
+        assert!(!cfg.adopt_context(usize::MAX, WindowSource::Advertised));
         assert_eq!(cfg.context_tokens, 8_192);
     }
 
@@ -2212,10 +2337,11 @@ mod tests {
         // A window merely learned from the previous endpoint does not: a 4k
         // local server's answer must not survive `/provider deepseek`.
         let mut cfg = Config::new("http://x:1", "m", None);
-        assert!(cfg.adopt_context(4_096));
+        assert!(cfg.adopt_context(4_096, WindowSource::Advertised));
         cfg.provider = Provider::DeepSeek;
         cfg.rederive_context();
         assert_eq!(cfg.context_tokens, 120_000, "the new provider's default");
+        assert_eq!(cfg.context_source, WindowSource::Table);
     }
 
     /// A provider named on the command line reaches its own endpoint; a URL
