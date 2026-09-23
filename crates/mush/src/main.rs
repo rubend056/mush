@@ -1231,36 +1231,13 @@ fn drain_actors(app: &mut App, rx: &Receiver<Msg>) {
     }
 }
 
-/// The terminal's modes, entered and left in one place.
-///
-/// Each mode is a promise to the human's shell: leaving raw mode on breaks their
-/// typing, and leaving bracketed paste on makes their own pastes arrive wrapped
-/// in escape codes. Everything that can end the program — a clean quit, a
-/// signal (`crate::signals` turns one into the quit road), a panic, an error on
-/// the way out — has to undo all of them, so they are entered here
-/// and undone by [`restore_terminal_modes`].
-fn enter_terminal_modes() -> io::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    // Bracketed paste is what turns Ctrl-Shift-V from a stream of individual
-    // keystrokes — one event, one repaint, and a redraw per character — into a
-    // single `Event::Paste` carrying the whole paste.
-    //
-    // Mouse capture is deliberately NOT taken. It would let mush scroll by wheel
-    // notch instead of by arrow key, but it also takes away the terminal's own
-    // drag-to-select, and reading text out of the transcript is worth more than
-    // a wheel notch. The lag that made the wheel feel broken was the per-keystroke
-    // repaint, which the event loop no longer does.
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
-}
-
-/// Undo every mode [`enter_terminal_modes`] turned on.
+/// Undo every mode [`TerminalGuard::enter`] turned on.
 fn restore_terminal_modes() {
     let _ = disable_raw_mode();
     let _ = restore_mode_sequences(&mut io::stdout());
 }
 
-/// The escape sequences that leave the modes [`enter_terminal_modes`] entered,
+/// The escape sequences that leave the modes [`TerminalGuard::enter`] entered,
 /// written through a `Write` rather than straight to `stdout`: the panic hook's
 /// one effect on the terminal, so a test can read exactly what a panic puts on
 /// the wire without a terminal (finding E10).
@@ -1279,10 +1256,75 @@ struct TerminalGuard {
 }
 
 impl TerminalGuard {
+    /// Enter the terminal: raw mode, the alternate screen, bracketed paste —
+    /// and the ratatui terminal every frame is painted through.
+    ///
+    /// Each mode is a promise to the human's shell: leaving raw mode on breaks
+    /// their typing, and leaving bracketed paste on makes their own pastes
+    /// arrive wrapped in escape codes. Everything that can end the program — a
+    /// clean quit, a signal ([`crate::signals`] turns one into the quit road),
+    /// a panic, an error on the way out — has to undo all of them, so they are
+    /// entered in one place and undone by [`restore_terminal_modes`].
+    ///
+    /// The entry is all or nothing (finding PM8): `main` exits 1 when it fails,
+    /// and it must not do that from a raw shell. A failure in any step after
+    /// raw mode has succeeded undoes every promise already made before the
+    /// error travels.
     fn enter() -> io::Result<Self> {
-        enter_terminal_modes()?;
-        let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        Ok(Self { terminal })
+        Self::enter_with(
+            // Raw mode is the first promise and the first thing undone: it is
+            // what makes the human's typing stop echoing and `Ctrl-C` stop
+            // signalling.
+            enable_raw_mode,
+            // Bracketed paste is what turns Ctrl-Shift-V from a stream of
+            // individual keystrokes — one event, one repaint, and a redraw per
+            // character — into a single `Event::Paste` carrying the whole
+            // paste.
+            //
+            // Mouse capture is deliberately NOT taken. It would let mush
+            // scroll by wheel notch instead of by arrow key, but it also takes
+            // away the terminal's own drag-to-select, and reading text out of
+            // the transcript is worth more than a wheel notch. The lag that
+            // made the wheel feel broken was the per-keystroke repaint, which
+            // the event loop no longer does.
+            || execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste),
+            || Terminal::new(CrosstermBackend::new(io::stdout())),
+            restore_terminal_modes,
+        )
+    }
+
+    /// [`Self::enter`] with the four effects as parameters.
+    ///
+    /// The seam exists because the failure road is latent by construction: it
+    /// needs a terminal whose writes stop answering, which a test cannot make
+    /// real (finding PM8). Handing each step in — entering raw mode, writing
+    /// the screen modes, building the terminal, and the undo — lets a test fail
+    /// a named step after raw mode and read the undo, exactly as
+    /// [`restore_mode_sequences`] lets a test read what a panic writes.
+    ///
+    /// The order is the fact: `raw` first, `screen` second, `build` last, and
+    /// any failure after `raw` succeeded runs `restore` before returning the
+    /// error. `restore` undoes *every* promise, not only the failed step's,
+    /// because the escapes are written in one `execute!` and a half-written
+    /// one cannot be told from a whole one.
+    fn enter_with(
+        raw: impl FnOnce() -> io::Result<()>,
+        screen: impl FnOnce() -> io::Result<()>,
+        build: impl FnOnce() -> io::Result<Terminal<CrosstermBackend<Stdout>>>,
+        restore: impl FnOnce(),
+    ) -> io::Result<Self> {
+        raw()?;
+        if let Err(error) = screen() {
+            restore();
+            return Err(error);
+        }
+        match build() {
+            Ok(terminal) => Ok(Self { terminal }),
+            Err(error) => {
+                restore();
+                Err(error)
+            }
+        }
     }
 }
 
@@ -2615,6 +2657,50 @@ mod tests {
                 send: false,
             }
         );
+    }
+
+    /// The entry is all or nothing (finding PM8): a failure in a step after
+    /// `enable_raw_mode` has succeeded used to travel with no `TerminalGuard`
+    /// alive to undo the mode, so `main` exited 1 into a raw shell. Both
+    /// failing steps are here — the alternate-screen/paste write and the
+    /// terminal's own construction — because both happen after raw mode is on.
+    #[test]
+    fn a_failed_enter_restores_the_modes() {
+        fn enter(fail: &str, restored: Arc<AtomicBool>) -> io::Result<TerminalGuard> {
+            TerminalGuard::enter_with(
+                || Ok(()),
+                move || {
+                    if fail == "screen" {
+                        Err(io::Error::other("the screen write failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                move || {
+                    if fail == "terminal" {
+                        Err(io::Error::other("the terminal would not build"))
+                    } else {
+                        unreachable!("nothing leaves the entry unfinished")
+                    }
+                },
+                move || restored.store(true, Ordering::SeqCst),
+            )
+        }
+
+        for failed in ["screen", "terminal"] {
+            let restored = Arc::new(AtomicBool::new(false));
+            let error = enter(failed, restored.clone())
+                .err()
+                .unwrap_or_else(|| panic!("the {failed} step must fail"));
+            assert!(
+                !error.to_string().is_empty(),
+                "the failure still travels: {error}"
+            );
+            assert!(
+                restored.load(Ordering::SeqCst),
+                "a failure in the {failed} step left the modes entered"
+            );
+        }
     }
 
     /// The escape sequences a panic writes, captured: the `Write` seam
