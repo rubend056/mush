@@ -9758,3 +9758,20 @@ rather than the `openpt` family; whether current `nix` deprecates `forkpty`;
 availability in this ratatui (0.29); and whether a pty child with no controlling
 terminal still receives an ISIG-generated SIGINT.
 
+**The plan stops here (the human's ruling, 2026-09-23).** The two children this
+section stands on answered those uncertainties — the probe allocated real ptys
+under every road and measured them (no controlling terminal means `^C` delivers
+neither SIGINT nor the byte; `setsid` + `TIOCSCTTY` or `portable-pty` does;
+`Frame::buffer_mut` is there in 0.29; `rustix`'s `pty` feature has no safe
+`openpty`) — and then the human ruled on the milestone itself: asked what its
+real use case was, they said mush is what they want it to be and the plan's
+remainder is not to be built. **M5 is parked, not planned**; M6's three items
+stay the manual's own open questions (§11), and no part of this section is owed
+work. `docs/mush.md` §9 now says so in the manual's own voice, and the reason is
+the manual's own §1: M5 is the one phase that would change what mush *is* — a
+control surface for the built-in agent, not a terminal multiplexer; what a guest
+costs (a pty, an emulator, a second keyboard mode, 4–8 crates) is also what it
+loses (a box of bytes with no phases, no tool calls, no token count and no
+useful cancel). The probe's report, not a section here, is where its measurements
+live: with the milestone parked there is nothing left for them to decide.
+

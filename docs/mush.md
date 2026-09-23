@@ -1017,7 +1017,7 @@ tells the UI, and retries once — a backstop, not the mechanism.
 
 ---
 
-## 9. Roadmap
+## 9. Roadmap — the plan stops here
 
 **Done.** M0 core (workspace, sessions, messages, prompt, config); M1 editor
 `[REMOVED v0.2]`, whose message box is what §4 keeps; M2 the agent loop
@@ -1031,15 +1031,25 @@ keymap, the `Screen` value and the draw sweep); M2.8 concurrent work (jobs and
 the one lock, §5.6); M3 external agents (the attach socket, `mush
 read/agents/focus/edit`).
 
-**Next.** M5 spawn mode: `mush` launches a configured agent in a pty pane with
-the attach socket's path and the workspace root injected into its environment,
-so "works with any agent" covers binaries that know nothing about mush. M6
-polish: transcript search, an optional MCP bridge as a separate binary, and
-per-agent token accounting.
+**Parked, not planned.** M5 spawn mode and M6 polish are not work that was owed;
+they are what a roadmap has left over once the product is what it should be, and
+mush stops here deliberately. M5 — `mush` launching a configured agent in a pty
+pane with the attach socket's path and the workspace root in its environment, so
+"works with any agent" would cover binaries that know nothing about mush — has a
+real use case and a different shape: it is for running someone else's agent CLI
+(`claude`, `codex`, `aider`) inside mush's panes, and it is the one phase that
+would change what mush *is* (§1: a control surface for the built-in agent, not a
+terminal multiplexer). What a guest costs is also what it loses: a pty, a
+terminal emulator, a second keyboard mode, and a box of bytes with no phases, no
+tool calls, no token count and no useful cancel. M6's three items — transcript
+search, an optional MCP bridge as a separate binary, per-agent token accounting
+— stay the open questions they are in §11.
 
 M4 (FS watching) is `[OBSOLETE v0.2]`: there are no buffers to merge into, and
-the periodic git snapshot already tells the human what moved. Each milestone ends
-with a demoable, tested artifact; no milestone depends on a later one.
+the periodic git snapshot already tells the human what moved. Each milestone
+ends with a demoable, tested artifact and no milestone depends on a later one,
+which is why stopping between them costs nothing: what is above is either built
+or nothing at all.
 
 ---
 
