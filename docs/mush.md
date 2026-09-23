@@ -478,9 +478,14 @@ three `#` headings, list markers kept with a wrapped row hung under the item's
 own text, `> ` painted as a `│ ` bar, `[ ]`/`[x]` as `☐`/`☑`, three or more
 `-`/`*`/`_` as a rule across the pane, fenced code, links as `text (url)`, and
 tables — the delimiter row names each column's alignment and each column is
-sized to its content: a short column stops at its widest cell while the pane's
-width goes to the columns whose words still need it, each wrapping inside its
-own column — and painted in the reply's styles, with only the scaffolding a view
+sized to its content under a fair share of the pane: no column takes more than
+the pane's room split evenly for one unbreakable token (a longer token breaks
+inside its own column), a short column stops at its widest cell, the room the
+short columns cannot use goes to the columns whose words still need it, and a
+table narrower than the pane stops at its content instead of stretching to it —
+each cell wrapping inside its own column, and a blank row between two body rows
+when either of them wrapped — and painted in the reply's styles, with only the
+scaffolding a view
 does not read (a heading's `#`s, a quote's `>`, a checkbox's brackets, a table's
 pipes and delimiter row, a fence's two lines) left unpainted. It is
 deliberately not a document renderer — no paragraph reflow, no nested lists, no

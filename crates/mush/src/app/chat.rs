@@ -7167,7 +7167,8 @@ mod tests {
     /// A table reaches the frame the human reads: the header, the separator and
     /// the body are painted as rows of the pane — the separator in the rule's
     /// dim, since it is a line the pane draws and not words — and the reply's
-    /// own bytes are left alone.
+    /// own bytes are left alone. The table is as wide as its content, so the
+    /// pane's right margin is left alone too.
     #[test]
     fn a_table_is_painted_through_the_pane() {
         let source = "| name | age |\n| :--- | ---: |\n| ana | 3 |";
@@ -7177,9 +7178,9 @@ mod tests {
         assert_eq!(
             shown(&rows),
             vec![
-                "mush › name   │  age".to_string(),
-                "       ───────┼─────".to_string(),
-                "       ana    │    3".to_string(),
+                "mush › name │ age".to_string(),
+                "       ─────┼────".to_string(),
+                "       ana  │   3".to_string(),
                 String::new(),
             ]
         );
@@ -7219,13 +7220,17 @@ mod tests {
         // And the table the report was read off, through a pane: the short
         // columns stop at their content, so the path is painted whole instead
         // of broken mid-word and the token's column is not a field of blanks.
+        // The pane has to be wide enough for the path's 28 columns — at 126
+        // the table fills it, the sentence taking everything the others cannot
+        // use — and at a narrower one the path breaks by the fair share
+        // exactly as `text`' own test pins.
         let source = "| lane | agent | report | hunting for |\n| --- | --- | --- | --- |\n| 3 | #156 | docs/audits/runtime-risks.md | whether the table's cells share the pane's width fairly at every width the pane can have |";
         let mut rows = Vec::new();
         render_message(
             &mut rows,
             &Message::assistant(source),
             None,
-            60,
+            126,
             false,
             Fold::DEFAULT,
             &[],
