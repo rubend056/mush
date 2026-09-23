@@ -114,8 +114,13 @@ and never share state with the painter.
   corrupt the original.
 - **Workspace confinement is a convention, not a fence.** Every file tool
   resolves its `path` against the root and rejects an escape (`..`, absolute
-  paths; `write_file` refuses the root itself), but `run_command` is a real shell
-  and nothing confines it. So the rules name the
+  paths, and a component that is not a name at all — a Windows prefix — is
+  `invalid path`), and `write_file` refuses the workspace root itself; but
+  `run_command` is a real shell and nothing confines it. The *data* roads check
+  a name for a different reason: a name they cannot hand back as itself — bytes
+  that are not UTF-8, a line break, ends the tools' own trim would move — is
+  left out of a listing or a search and counted instead, because a path the
+  model cannot pass back to `read_file` is a dead end. So the rules name the
   workspace, tell the agent that paths are workspace-relative and that commands
   run with their cwd at its root, and say never to touch paths outside it — and
   the prompt says so in one place (`RULES`). There is no enforced *path jail*:
@@ -141,7 +146,9 @@ and never share state with the painter.
   no window: past 2 MB it is refused with a downscale as the road, and an image
   the run's model is not documented to see is refused *before* it is sent, so a
   request that cannot be read never costs a turn. Edit operations always work on
-  the complete file, and no *input* is capped: `write_file`'s `content` and
+  the complete file — a file whose bytes are not valid UTF-8 is refused rather
+  than read lossily, because the text this read hands back is what an edit
+  writes back — and no *input* is capped: `write_file`'s `content` and
   `edit_file`'s replacement are bytes the model already sent, in its own tool
   call and in the request that carries it, so a cap there would save the
   conversation nothing and cost a turn and the work. A write large enough to
@@ -200,7 +207,7 @@ second copy of it.
 | `write_file` | `path`, `content` | create or replace a whole file, parent directories included; the answer is one line naming what it replaced; the workspace root itself is refused |
 | `list_files` | `path?` | the files under a path, sorted, one per line; build and VCS directories are skipped; capped at 400 names with the way past it |
 | `search` | `pattern`, `path?`, `ignore_case?` | a literal string (no regex — a regex engine is a dependency, and `rg` is the shell's), one `path:line: text` per match; binary and huge files skipped |
-| `run_command` | `command`, `detach?`, `exclusive?` | a shell in the workspace root, own process group; 120 s timeout, output capped to fit the window, cancellable; `detach` starts a job at once, `exclusive` takes the machine lock (§5.6) |
+| `run_command` | `command`, `detach?`, `exclusive?` | a shell in the workspace root, own process group; 120 s timeout, output capped to fit the window, cancellable; a command that writes past 8 MiB of output is killed and its result says so, with a narrower command as the road on; `detach` starts a job at once, `exclusive` takes the machine lock (§5.6) |
 | `spawn_agent` | `brief`, `title`, `base?` | a new agent with its own transcript; `title` names its row, and `base` forks a worktree on `mush/<id>` for it (§5.5) |
 | `status` | — | your children and your jobs in one listing: each child's state and branch, each job's state, age and command; `✉` marks a result you have not read; a listing, not a delivery — `wait` hands results over |
 | `control` | `id`, `action`, `text?` | stop or message one, naming it as `status` prints it (`2` for a child, `c2` for a job); a job can only be stopped |
@@ -462,17 +469,18 @@ elided, and the cursor is always on screen.
 
 | Context | Keys |
 |---|---|
-| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning · `Ctrl-F` the focused pane takes the whole screen, and back · `Ctrl-Y` select the transcript: `Enter` copies, `Esc` leaves |
+| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (a second press confirms while the conversation is not empty; stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning · `Ctrl-O` show or hide the output · `Ctrl-F` the focused pane takes the whole screen, and back · `Ctrl-Y` select the transcript: `Enter` copies, `Esc` leaves |
 | selecting | `↑`/`↓` the cursor one transcript line, `Shift` holding the selection while it moves · `PgUp`/`PgDn` ten lines at a time · `Home`/`End` the oldest / newest · `Enter` copy the selection, or the cursor's own line · `Esc` leave without copying · the pane's own scroll keys are the cursor's while this is open, and a letter is not typing |
 | picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End`, `PgUp`/`PgDn` move the list, `Enter` take the row, `Esc` close |
 | agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them, `←` the row's parent, `→` its first child, `Enter` show its transcript, `c` cancel that agent, `Esc` back to the root |
-| chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `Ctrl-V` attach the image on the clipboard, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete` (at the start of the box, Backspace pops the newest attachment), `Ctrl-U` clear the words and keep the images, `Ctrl-Z` put back what the box last lost, `↑`/`↓`/`PgUp`/`PgDn` scroll (the select mode's cursor while it is open), `Esc` clear the box and its attachments · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/compact` `/notes` `/help` `/quit` |
+| chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `Ctrl-V` attach the image on the clipboard, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete` (at the start of the box, Backspace pops the newest attachment), `Ctrl-U` clear the words and keep the images, `Ctrl-Z` put back what the box last lost, `↑`/`↓`/`PgUp`/`PgDn` scroll (the select mode's cursor while it is open), `Esc` clear the box and its attachments · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/context` `/compact` `/notes` `/help` `/quit` |
 
 A paste whose every word is an image's path attaches them all — one or several,
 split on whitespace or newlines — and anything else is text and lands in the box
 as it always did (§3). The attachments are painted as dim `▣ path (format ·
-size)` rows above the text — one per image, at most three, the third counting the
-rest when there are more, with the title saying how many — and they travel with
+size)` rows above the text — one per image, at most three, fewer when the box has
+less room, the last of them counting the rest when there are more, with the
+title saying how many — and they travel with
 the send: `Enter` on an empty box with an image attached is still a send, because
 the picture *is* the message. A send that does not land puts the words and the
 images back in the box, and `Esc` clears both.
@@ -532,9 +540,11 @@ one line, `Shift` holds the selection while it moves, `PgUp`/`PgDn` ten,
 leaves without copying. While it is open the mode has the keyboard — a letter is
 not typing — and `Tab` leaves it for the pane cycle. What lands on the system
 clipboard is `Message::text()`, exactly: the selected source lines joined with
-the newlines they have, so a soft wrap never becomes one, a tab is a tab, a tool
-result is copied whole even past the eight rows the pane paints of it, and a
-picture a saved transcript shed copies as its placeholder. A copy that cannot
+the newlines they have, so a soft wrap never becomes one, a tab is a tab, a
+folded block — a tool result, mush's own report about a child or a job, and the
+brief a child's pane opens with — is copied whole even past the eight rows the
+pane paints of it, and a picture a saved transcript shed copies as its
+placeholder. A copy that cannot
 reach the clipboard says so in the bar instead: no writer on `PATH` names what
 to install, and a writer that never takes the text is killed at the deadline and
 reported, not waited on. The bar says `copied 12 lines from #1's reply — 1,284
@@ -549,6 +559,14 @@ thinking endpoint refuses a replayed turn without it — so the block adds a
 pane; the toggle writes nothing, sends nothing and is not stored, and a new chat
 keeps whatever the human chose. A reasoning that trims to nothing paints no row
 at all, so a reply that did no thinking costs no line.
+
+`Ctrl-O` is the same kind of view over the output: a tool's result, mush's own
+report about a child or a job, and the brief a child's pane opens with. It hides
+those rows and brings them back exactly as they were; like `Ctrl-T` the key
+writes nothing, sends nothing and is not stored, and a new chat keeps whatever
+the human chose. Two rows stay in both states, because a hidden failure would be
+a lie about what happened: a failed result's own `! error: …` row and a
+`#1 failed: …` report.
 
 ---
 
@@ -628,8 +646,11 @@ are computed in `App`.
   age appended once it is past ten seconds, so a cached fact cannot read as a
   live one. The meter is the run's own numbers: what the conversation weighs
   against the history budget (`full` at it, `over` one byte past it), the fold's
-  trigger inside that budget, and the window last with the `~` that says it was
-  assumed rather than stated. The window's size is never a mystery again, and
+  trigger inside that budget, and the window last with the mark of the road it
+  came by: `~` assumed from mush's model table, `≈` advertised by the endpoint's
+  model list, `≤` named by the endpoint in a refusal, and none when the human
+  stated it — `--print-config` and `/context` say that road in words. The
+  window's size is never a mystery again, and
   the repository survives the narrowest of them.
 - **R3 — Size tiers with a floor.** `[DONE]` `w<40 || h<10` → a single notice,
   centred on both axes, that falls back to a shorter spelling and always names
@@ -638,10 +659,11 @@ are computed in `App`.
   agent strip on top, chat below; `h≥24` → the two-line bar; the transcript is
   capped at 110 columns however wide the terminal is.
 - **R4 — Truthful glyphs.** `[DONE]` `·` idle/never ran, `◐` running, `✓`
-  finished, `✗` failed, `⚠` a run that was cut off (the process went away with it
-  and nothing was committed), `≡` a conversation being folded, `⧗` a run parked on
-  somebody else's result (`wait` — the icon a glance reads says the same thing
-  the row's words do, `waiting on results 3s`). A running agent
+  finished, `✗` failed, `⚠` a run that was cut off (the process went away with
+  it, or the actor's thread did, and nothing was committed), `≡` a conversation
+  being folded, `⧗` a run parked on somebody else's result (`wait` — the icon a
+  glance reads says the same thing the row's words do, `waiting on results 3s`).
+  A running agent
   with children out wears `⏸N` — the count, beside its own phase and never
   instead of it — and `⊘` marks both a cancel in flight and a run that landed
   stopped, so a guard-stop is not dressed as a failure. `✉` marks a result its
@@ -676,15 +698,17 @@ measured against its *parent's* branch, which is what makes the Σ in the title
 exact.
 
 The context window is resolved the same way: a window the human stated
-(`--context` / `MUSH_CONTEXT`, the home config's `context`, or this workspace's
-stored choice) › what the endpoint advertises (`max_model_len`, `context_length`,
-`context_window`, `n_ctx`, at the top level or under `meta`) › the model's
-documented window (`deepseek-flash` and `deepseek-v4-pro`: 500k) › the provider
-default. Derived windows are never persisted — they are re-read, so a stale guess
-cannot outlive its cause — and the caps a tool result may use follow the window,
-so one command's output can never fill an 8k transcript. A server that complains
-about the context length teaches mush the number it names, and the run retries
-once.
+(`--context` / `MUSH_CONTEXT`, the home config's `context`, `/context N`, or this
+workspace's stored choice) › what the endpoint advertises (`max_model_len`,
+`context_length`, `context_window`, `n_ctx`, at the top level or under `meta`) ›
+the model's documented window (`deepseek-flash` and `deepseek-v4-pro`: 500k) ›
+the provider default. `/context` with no argument reports the window in force and
+the road it came by; `/context auto` drops the statement and lets the window
+derive again. Derived windows are never persisted — they are re-read, so a stale
+guess cannot outlive its cause — and the caps a tool result may use follow the
+window, so one command's output can never fill an 8k transcript. A server that
+complains about the context length teaches mush the number it names, and the run
+retries once.
 
 Everything mush knows about a named vendor — the name a human types, its
 default endpoint, the models it documents, their windows, whether the thinking
@@ -713,11 +737,15 @@ every turn until the run gave up".
 
 **News** is a failure, or a run mush itself stopped. It belongs to its run, not
 to a moment: a new one replaces the agent's old one (two failures for one agent
-would disagree about which is current), it is written to `.mush/session.json` so
-a restart still says what broke, and only the agent's next run replaces it. A
-stop is not a failure — the loop guard ends a model that kept repeating one call,
-and nothing the model did broke — so it is painted `⊘` in yellow, the same
-reading the row gives that agent, and it is one line with the guard's own notice.
+would disagree about which is current), and only the agent's next run replaces
+it. Only the *failure* half is written to `.mush/session.json`, so a restart
+still says what broke. A stop is not a failure — the loop guard ends a model that
+kept repeating one call, and nothing the model did broke — so it is painted `⊘`
+in yellow, the same reading the row gives that agent, and it is one line with the
+guard's own notice; nothing of it is stored as news, and what a restart reads
+instead is the run's stored status (`session::StoredStatus`) — a stop the human
+asked for comes back as the row's `Phase::Stopped`, the guard's stop as the error
+it ended with, never as a stored `!` line.
 
 The foot paints the notes under the transcript, oldest first, headed by a failure
 and capped: two rows for the notes and one for the count, so a busy agent cannot
@@ -763,9 +791,10 @@ everything on it was and nothing about *whose* it was.
   of thirty hues. Canonicalizing first makes `cd work` and `cd work/.` one window
   in one colour; a path that does not resolve (a `--print-config` on a workspace
   that does not exist yet) is hashed as it was typed.
-- **Chrome wears the hue, content does not.** Seven sites take the accent: the
+- **Chrome wears the hue, content does not.** Nine sites take the accent: the
   focused borders, the picker's frame and its selected row, the message prompt,
-  the bar's badge, the selected agent row, and an activity line. The alert red,
+  the bar's badge, the selected agent row, an activity line, and the select
+  mode's cursor band and its selection. The alert red,
   the notice yellow, the dim gray and the body gray stay fixed — *what happened*
   reads the same in every window, and only *whose window this is* changes.
 - **The thirty are separated perceptually, not by name.** Sampled around the hue
@@ -805,13 +834,15 @@ for the alert red, because a failure has to look the same wherever it is read.
 <workspace>/
   .mush/
     .gitignore     # contains a single line: *
-    session.json   # the conversation, model, provider, endpoint, and stored failures
+    session.json   # the conversation, model, provider, endpoint, a stated window, and stored failures
+    session.json.previous  # the conversation the last new chat cleared
     wt/            # isolated agents' git worktrees (when used)
 ```
 
 The API key is never stored here — it lives in the machine-global home config
-(`$MUSH_CONFIG`, else `~/.config/mush/config.json`), set with `/key` or
-`MUSH_API_KEY`.
+(`$MUSH_CONFIG`, else `~/.config/mush/config.json`). `/key` is the one road that
+writes it there; `MUSH_API_KEY` supplies one from the environment for the run,
+and no other save copies it into the file (finding C11).
 
 That file is meant to be hand-edited, and it documents itself. Every field is
 optional — `api_key`, `provider`, `base_url`, `model`, `context` (a stated
@@ -843,12 +874,14 @@ default.
 
 `mush --print-config` prints what those layers resolved to — endpoint, provider,
 what the stored session was (`none`, how much of a conversation it read, or that
-the file is there and *unreadable*), model, window and whether a human stated
-it, temperature, reasoning effort and thinking mode (each with whether a human
-stated it), the reply cap's size and the name it travels under, the tool schemas
-every request reserves and the history budget those leave, the key masked, `-y`,
-and the hue the window would wear — and exits 0 without opening the terminal,
-creating `.mush/` or taking the workspace lock.
+the file is there and *unreadable*), an unreadable home config or a resolution
+notice when one is owed, model, whether that model is documented to see an image
+(`vision`), window and the road it came by, temperature, reasoning effort and
+thinking mode (each with whether a human stated it), the reply cap's size and the
+name it travels under, the tool schemas every request reserves and the history
+budget those leave, the key — always stated, masked, `(none)` when there is none
+— `-y`, and the hue the window would wear — and exits 0 without opening the
+terminal, creating `.mush/` or taking the workspace lock.
 It is the honest view of the precedence, and what makes a hand-edited file
 debuggable. The other flags a human would type are `--temperature F`,
 `--reasoning-effort LEVEL` (`low`, `high` or `max`; also
@@ -866,12 +899,17 @@ built-in defaults.
 needs to be added to the project's own `.gitignore`.
 
 `session.json` is written on its own thread. A streamed message only marks the
-conversation dirty, and the file is rewritten at most once a second — so a tool
+conversation dirty, and the file is rewritten at most once a minute — so a tool
 result costs the screen nothing — while a sent message, a command that changed
-what is stored, a compaction and a new chat (Ctrl-N) are written before they
-return, and quitting writes whatever is still only in memory. Quitting therefore
-loses nothing, and a crash can cost at most the last second of a streamed reply.
-On startup the conversation resumes where it left off. Ctrl-N clears it.
+what is stored, a compaction and a new chat (Ctrl-N's confirming press) are
+written before they return, and quitting writes whatever is still only in
+memory. Quitting therefore loses nothing, and a crash can cost at most the last
+minute of a streamed reply. On startup the conversation resumes where it left
+off. Over a conversation with something in it, `Ctrl-N` clears in two steps: the
+first press says what would go and where it is kept
+(`.mush/session.json.previous`), and the second writes that copy and clears; an
+empty conversation clears on one press, and a copy that cannot be written refuses
+the key.
 
 It carries every subagent's transcript too, so a relaunch brings the tree back
 with its briefs and its context. It also carries each agent's last **failure**
@@ -892,8 +930,13 @@ the UI observes via id-tagged events. Depth and live count are hard budgets; the
 delegation tool is simply omitted from a leaf's schema. Every agent does its own
 file I/O on its own thread. A child given a
 `base` gets its own git worktree (`.mush/wt/<id>`, branch `mush/<id>`) forked
-from that ref; without one it shares the checkout, and only one shared child may
-run at a time. A `base` git cannot resolve is a *failed delegation* —
+from that ref, resolved in the spawning agent's own workspace — so `HEAD` in a
+base is that agent's `HEAD`, not the application root's; without one it shares
+the spawning agent's workspace, and only one shared child may run there at a
+time. That count is the directory's live writers, asked across the whole tree —
+not one parent's books — and the spawner is never counted against itself, so a
+shared child may still delegate into the tree its own run is in. A `base` git
+cannot resolve is a *failed delegation* —
 `cannot start from <ref>` — refused before anything is created, never a child
 that quietly runs somewhere else.
 
@@ -914,11 +957,11 @@ the run restarts, so a result is never lost just because nobody called
 
 Two different messages end an agent's work, and the difference matters:
 `Stop` cancels the run in flight (Ctrl-C, `c` on a running row) and leaves the
-actor alive to be nudged again; `Shutdown` ends the actor (Ctrl-N, the new
-chat). An actor holds a handle to its own mailbox, so it can never infer that
-everyone else let go — it has to be told. Every event carries the conversation
-it belongs to, so an actor that is still finishing a request when the human
-starts a new chat cannot write into it.
+actor alive to be nudged again; `Shutdown` ends the actor (Ctrl-N, once the new
+chat is confirmed). An actor holds a handle to its own mailbox, so it can never
+infer that everyone else let go — it has to be told. Every event carries the
+conversation it belongs to, so an actor that is still finishing a request when
+the human starts a new chat cannot write into it.
 
 A `Stop` has two halves, because one of them cannot wait for a mailbox: the
 message reaches the actor, and the flag it sets is *shared with the UI* when the
@@ -1068,9 +1111,11 @@ mush/
     mush-core/   # pure domain: config, messages, prompt, session, tools, workspace. No UI.
       config.rs      endpoint/model/api-key/window resolution (the startup precedence)
       git.rs         branch, dirty count and per-branch diffstat, from `git` shell-outs
+      lib.rs         the crate root: the module list, the re-exports, and the command caps
       message.rs     OpenAI-compatible message + request/response types
       prompt.rs      the system prompt and the tool schemas
       provider.rs    the provider table: a vendor's endpoint, models and defaults
+      secrets.rs     the secrets mush holds, and why a process it starts never inherits one
       session.rs     `.mush/` creation and conversation persistence
       text.rs        display-column arithmetic: wrap, truncate, fit_row, mask, sanitize
                      and the line-local markdown view: markdown_rows, Run/RunStyle
@@ -1097,6 +1142,10 @@ mush/
       session_save.rs  the writer thread behind `.mush/session.json`
       input.rs       the message box's grapheme cursor and horizontal window
       http.rs        a few hundred lines of blocking HTTP/1.1 client
+      ids.rs         the two id spaces (`#1` agents, `#c2` jobs) and the one place either is drawn
+      lock.rs        one mush per workspace: the `flock` that keeps two off one store
+      signals.rs     the signals that mean end mush, all taking the clean-quit road
+      theme.rs       the per-workspace hue and the form the terminal can paint it in
       ui.rs          the painter: reads a `Screen` a value at a time and paints it
       app/screen.rs  every painted value, derived by `App` (layout, rows, words)
       attach.rs      the M3 socket: `.mush/mush.sock`, one JSON request per line
@@ -1147,18 +1196,25 @@ version, audit, and wait for.
 | Idle CPU | ~0% | blocked on a 30 ms poll, no repaint unless an agent is running |
 | Memory | < 15 MB | the agent tree, the transcripts, and one message box |
 
-An unreachable endpoint cannot hang startup: connections are bounded by a 5 s
-`connect_timeout`, and the model list by a 10 s read timeout — after which the
-window opens and reports no model. A chat completion, by contrast, may take as
-long as the model needs: one 10-minute deadline bounds the whole request, while
-the socket itself is read in 200 ms slices so the reader can notice a
+An unreachable endpoint cannot hang startup: every phase of a request takes the
+smaller of its own ceiling and what is left of the ask's one deadline — 5 s
+`CONNECT_TIMEOUT` per address to connect, 30 s `WRITE_TIMEOUT` to write (the
+socket's own bound is re-set for every chunk, with the watch checked between
+them), 10 s `RESOLVE_TIMEOUT` to wait for a name — and a phase that spends the
+budget ends the call as the deadline it is (`the endpoint stopped responding`),
+never as a wire failure to ask again. The model list is one such ask with a 10 s
+`LIST_READ_TIMEOUT` as its whole budget, after which the window opens and
+reports no model. A chat completion, by contrast, may take as long as the model
+needs: one `CHAT_DEADLINE` of 10 minutes bounds the whole request, while the
+socket itself is read in 200 ms slices so the reader can notice a
 cancellation — and the deadline and cancel flag are checked after every
 successful read too, not only on a timeout, so a server dribbling one byte per
 slice cannot outlive them. Ctrl-C therefore stops a model that has not answered
 instead of waiting for its reply, and a wedged endpoint still cannot pin a
 thread forever. Name resolution is the one step std cannot bound itself, so it
-runs on its own thread behind a 10 s deadline the caller waits on: a lookup
-that outlives it is abandoned with a `TimedOut` naming the host, never a hang.
+runs on its own thread and the caller waits on it behind the same rule: a
+lookup that outlives its bound is abandoned with a `TimedOut` naming the host,
+never a hang.
 
 Rules: no full-buffer scan per frame, no redraw without a state change, and no
 subprocess inside `draw` — the git snapshot is cached in `App`, read on its own
@@ -1288,9 +1344,13 @@ transitions.
   `python3`, though they do need `git`, and one scenario waits on a real shell
   sleep. `scripts/mock_llm.py` is kept for hand-driven runs; no test and no
   script refers to it.
-- **Live.** Three `#[ignore]`d tests keep the default suite green offline: two
-talk to the configured endpoint (the model list and the shipped reply cap), and
-one makes a TLS handshake against `https://api.deepseek.com`.
+- **Blind reads.** The tree has been read end to end by six blind audits and four
+  blind duplication passes — the reader knowing the code and not the findings —
+  and their findings are written down in `docs/findings.md` §8.51 and §8.70.
+- **Live.** Four `#[ignore]`d tests keep the default suite green offline: two
+talk to the configured endpoint (the model list and the shipped reply cap), one
+makes a TLS handshake against `https://api.deepseek.com` (no key, so a 401 is
+the pass), and one measures a frame against the 16 ms budget on an idle box.
 - **The checks.** `cargo fmt --all --check`, `cargo clippy --all-targets --
   -D warnings`, the unit tests, and the pty resize and cancel scenarios are the
   whole gate; they run anywhere rust and python3 do, so any CI can call them.
@@ -1306,7 +1366,7 @@ Run it:
 
 ```sh
 cargo test                 # offline, fast
-cargo test -- --ignored    # the three live-endpoint checks
+cargo test -- --ignored    # the three live-endpoint checks, plus the frame-budget test
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --resize
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
 ```
@@ -1415,13 +1475,19 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
 - **Notices have kinds and lifetimes.** A line about a moment ends with the
   moment; a failure belongs to its run, is written to the session, and outlives a
   restart.
-- **A transport hiccup is retried; an answer is not.** A reset or a refused
-  connection is asked again three times, each retry announced in the transcript; a
-  status the endpoint chose, a body past the cap, or a cancellation is returned as
-  it is, first time.
+- **A request that never left mush is retried; an answer is not.** Only
+  `ModelError::Unsent` is asked again — a dial that never connected (a name that
+  does not resolve, a refused or timed-out connect, a failed TLS handshake) or a
+  write that failed before the whole request was handed over — at most twice,
+  each retry announced in the transcript. Everything after the write is final,
+  first time: a reset, an end of stream, a read timeout, a status the endpoint
+  chose (4xx and 5xx), a body past a cap, a body that did not parse, a
+  cancellation. One ask spends one 600 s `CHAT_DEADLINE`, handed to every attempt
+  as what is left of it.
 - **A window a human states always beats a default.** `--context` / `MUSH_CONTEXT`
-  / the home config's `context` win over what an endpoint advertises, a model
-table and the provider's own fallback, and are remembered in the session.
+  / the home config's `context` / `/context N` win over what an endpoint
+  advertises, a model table and the provider's own fallback, and are remembered
+  in the session.
 - **A window says whose it is.** Each workspace hashes its canonical path to one
   of thirty hues and the chrome wears it (§4.5); the *content* colours do not
   move, because a failure has to read the same in every window. The hash is

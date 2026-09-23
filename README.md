@@ -63,8 +63,12 @@ Everything can be changed at runtime from the chat — no restart:
 - `/url http://host:port` — point at any endpoint. `https://` works too (TLS
   via rustls).
 - `/key <secret>` — set the API key. Shown masked, and saved to the home
-  config file (never to the workspace).
+  config file (never to the workspace). A key read from `MUSH_API_KEY` stays in
+  the environment — mush never copies it into that file.
 - `/models` — refresh the model list for the current endpoint.
+- `/context` — say the window and the road it came by; `/context N` states one
+  for this workspace (remembered in `.mush/session.json`), and `/context auto`
+  drops the statement so the window derives again.
 
 Resolution order on startup: **CLI flags > env vars (`MUSH_*`) > saved session
 > home config > built-in defaults**. `MUSH_CONTEXT` sets the endpoint's
@@ -152,7 +156,10 @@ reply.
 `base` gives a child its own git worktree (`.mush/wt/<id>` on branch
 `mush/<id>`), forked from that branch, tag or commit — so parallel agents edit
 real files without colliding. Without a `base` the child shares the checkout,
-and only one shared child may run at a time. A `base` git cannot resolve is a
+and a shared spawn is refused while another shared child is live in that
+checkout — the count is the directory's, across the whole tree, not one
+parent's books (the spawner is not counted, so a shared child may still
+delegate into the tree its own run is in). A `base` git cannot resolve is a
 **failed delegation**, refused before anything is created, never a child that
 quietly runs somewhere else. A run's work is **committed** to the child's branch
 when the run ends (`mush #3: <brief>`, with the outcome spelled into the subject
@@ -186,14 +193,15 @@ not fit is refused before the wire. Nothing goes out over the window.
 
 | Context | Keys |
 |---|---|
-| anywhere | `Tab`/`Shift-Tab` cycle panes (agents, chat) · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent, restarts the root) · `Ctrl-C` stop the focused agent — an idle one is left alone, and a cancel reaches a model that is still thinking · `Ctrl-X` stop every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning · `Ctrl-F` the focused pane takes the whole screen, and back · `Ctrl-Y` select the transcript: `Enter` copies, `Esc` leaves |
+| anywhere | `Tab`/`Shift-Tab` cycle panes (agents, chat) · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat — stops every agent, restarts the root; with a conversation to lose, the first press says what would go and where it is kept, and the second writes that copy (`.mush/session.json.previous`) and only then clears (an empty chat clears on one press; a copy that cannot be written refuses the key) · `Ctrl-C` stop the focused agent — an idle one is left alone, and a cancel reaches a model that is still thinking · `Ctrl-X` stop every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning · `Ctrl-O` show or hide the output — a tool's result, mush's report about a child or a job, and the brief a child's pane opens with; a failure always shows · `Ctrl-F` the focused pane takes the whole screen, and back · `Ctrl-Y` select the transcript: `Enter` copies, `Esc` leaves |
 | selecting | `↑`/`↓` move the cursor one transcript line, `Shift` holding the selection while it moves · `PgUp`/`PgDn` ten lines · `Home`/`End` the oldest / newest · `Enter` copy the selection, or the cursor's own line · `Esc` leave without copying · a letter is not typing while this is open: the mode has the keyboard, and `Tab` leaves it |
 | agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them · `←`/`→` the row's parent / its first child · `Enter` show its transcript, keys staying in the tree · `c` cancel it · `Esc` back to the root |
 | chat | typing · `Enter` send · `Shift`/`Alt-Enter` a new line · `Ctrl-V` attach the image on the clipboard · a paste whose every word is an image's path attaches them all (a picture from outside the workspace is copied into `.mush/paste/` first) · `←`/`→`, `Home`/`End` move the box cursor · `Backspace`/`Delete` (at the start of the box, `Backspace` pops the newest attachment) · `Ctrl-U` clear the words, keeping the images · `Ctrl-Z` put back what the box last lost · `↑`/`↓`, `PgUp`/`PgDn` scroll the transcript (the select mode's cursor while it is open) · `Esc` clear the box and its attachments |
 | picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move, `PgUp`/`PgDn` page the list · `Enter` take the row · `Esc` close |
 
-Chat commands: `/provider`, `/model`, `/url`, `/key`, `/models`, `/compact`,
-`/notes`, `/help`, `/quit` (`mush --help` prints this table and the keys).
+Chat commands: `/provider`, `/model`, `/url`, `/key`, `/models`, `/context`,
+`/compact`, `/notes`, `/help`, `/quit` (`mush --help` prints this table and the
+keys).
 
 ## The screen
 
@@ -213,8 +221,11 @@ is the stable facts, cut from the right when the terminal is narrow:
 `HEAD`, and the meter is the run's own numbers:
 `ctx 12k/430.5k (fold 387.4k) ~500k` weighs the conversation against the history
 budget the run trims and folds at, where the fold's trigger sits inside it, and
-the window itself — the `~` says the window was assumed rather than stated,
-`full` marks the budget and `over` one byte past it.
+the window itself: the one-column mark names the road the number came by — `~`
+assumed from mush's model table, `≈` advertised by the endpoint's model list,
+`≤` named by the endpoint in a refusal, and no mark when you stated it yourself
+(`--print-config` and `/context` name the road in words). `full` marks the
+budget and `over` one byte past it.
 
 Terminals narrower than 80 columns (or shorter than 20 rows) get a
 **compact** layout: the agent strip on top, chat below. Below 40×10 mush says
@@ -231,26 +242,38 @@ the run being replaced.
 
 ## When the network hiccups
 
-A failure of the transport — a connection reset or refused, an unexpected end
-of stream, a connect or read timeout — is the wire, not the endpoint refusing
-the request, so mush asks again: **three attempts in total**, with a short
-backoff between them. Each retry is a line in the agent's own transcript
-(`· Connection reset by peer (os error 104) — retrying (2/3)`) instead of a
-spinner that looks stuck, and Ctrl-C abandons the request at once, backoff
-included. What the endpoint *answered* — a 4xx or 5xx status, a reply past the
-body cap, a body that did not parse — is returned as it is, first time: an
-answer is not a hiccup. Every attempt is bounded by the client's own budget
-(5 s to connect, 30 s to write, a 10-minute read deadline), so three attempts
-plus the backoff is the worst case: seconds for the hiccup this is for, about
-half an hour for an endpoint that stalls and loses every time.
+A failure that happened *before the request was handed over* — a dial that
+never connected (refused, timed out, a name that did not resolve, a TLS
+handshake that failed), or a write that did not hand the whole request to the
+endpoint — is the wire, not the endpoint refusing the request, and no whole
+request reached it, so mush asks again: **three attempts in total** (the first
+try and two retries), with a short backoff between them. Each retry is a line in
+the agent's own transcript
+(`· Connection refused (os error 111) — retrying (2/3)`) instead of a spinner
+that looks stuck, and Ctrl-C abandons the request at once, backoff included.
+Everything after the write is final, first time, because the endpoint may
+already have read, run and charged for the request: a connection reset, an
+unexpected end of stream, a read timeout, a 4xx or 5xx status, a reply past the
+body cap, a body that did not parse. An answer is not a hiccup (the one
+learned-window retry of a context-length 400 is *Context window*'s backstop,
+not this section's). One ask spends one budget of ten minutes (600 s): the whole
+deadline is fixed once, and every attempt — and the backoff between them — gets
+only what is left of it, so a retry the call cannot afford is not made. Each
+phase of an attempt takes the smaller of its own ceiling — 5 s to connect to
+one address, 30 s to write one chunk, 10 s to resolve a name — and what is left
+of the call, so the worst case is that one ask's ten minutes, not a multiple of
+it: about a second and a half for a dial that is refused every time, ten minutes
+for an endpoint that accepts the connection and then stalls.
 
 ## Context window
 
 Every request fits inside the endpoint's window, and the window comes from the
 first of these that knows:
 
-1. **You**: `--context N`, `MUSH_CONTEXT=N`, or a `context` in the home config. A
-   number you state is remembered in `.mush/session.json` and never overruled.
+1. **You**: `--context N`, `MUSH_CONTEXT=N`, a `context` in the home config, or
+   `/context N` in the chat. A number you state is remembered in
+   `.mush/session.json` and never overruled; `/context auto` drops the statement
+   and lets the window derive again.
 2. **The endpoint**, when it advertises one and mush fetched its model list: the
    first of `max_model_len`, `context_length`, `context_window`, `n_ctx` it
    reports, at the top level or under `meta`. Discovery runs when no model was
@@ -281,8 +304,9 @@ not the mechanism.
 
 - `./.mush/` — workspace-local state, git-ignored by itself: `session.json`
   (the conversation and the whole agent tree, the provider, endpoint and model,
-  a context window you stated, and each agent's last failure), and `wt/` for
-  isolated agents' worktrees.
+  a context window you stated, and each agent's last failure),
+  `session.json.previous` (the conversation the last new chat kept), and `wt/`
+  for isolated agents' worktrees.
 - The platform config directory (e.g. `~/.config/mush/config.json`) —
   machine-global defaults **including the API key**. The key never touches the
   workspace.
@@ -291,6 +315,11 @@ not the mechanism.
 
 See [docs/mush.md](docs/mush.md) for the design: the single-owner event loop,
 the agent actor tree, the safety rules, and the roadmap.
+
+The tree has also been read cold, with no comment taken as true: six blind
+audits and four duplication passes, whose detail lives in
+[docs/findings.md](docs/findings.md) — the six audits in §8.51, the four passes
+in §8.70.
 
 ## Layout
 

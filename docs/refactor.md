@@ -54,7 +54,7 @@ for is gone.)
 
 Acceptance test for the whole program: **the default `cargo test` needs no
 socket, no subprocess, and no sleep longer than 50 ms; `--ignored` is only for
-live endpoints.**
+live endpoints and the idle-box frame budget.**
 
 ---
 
@@ -155,7 +155,7 @@ and "there is a mailbox / transcript / cancel flag for N" cannot disagree.
 pub struct AgentTree { nodes: Vec<AgentNode>, index: HashMap<AgentId, usize>, cursor: usize, focused: AgentId, .. }
 
 impl AgentTree {
-    fn reserve_ids(&mut self, floor: u64);                       // leftovers raise the floor  (B1)
+    fn reserve_agents(&mut self, floor: u64);                      // leftovers raise the floor  (B1)
     fn insert(&mut self, ev: Spawned) -> &mut AgentNode;         // ids validated, not parsed
     fn begin(&mut self, id: AgentId, cancel: Arc<AtomicBool>);   // Running: clears the summary (B14)
     fn activity(&mut self, id: AgentId, label: impl Into<String>); // Status: ignored after Done/Failed (B5)
@@ -287,7 +287,7 @@ no generics threading through the actor.
 
 | Seam | Signature (sketch) | Fake | Unlocks |
 |---|---|---|---|
-| `ModelClient` | `fn chat(&self, req: &ChatRequest, cancel: &AtomicBool) -> Result<ChatResponse, ModelError>` | scripted reply queue, including errors and cancellation | `run_loop`, compaction, the learned-context retry, cancel mid-reply, a run kept past the old 200-turn ceiling (H45) — all in-process |
+| `ModelClient` | `fn chat(&self, request: &ChatRequest<'_>, cancel: &AtomicBool, timeout: Duration) -> Result<ChatResponse, ModelError>` | scripted reply queue, including errors and cancellation | `run_loop`, compaction, the learned-context retry, cancel mid-reply, a run kept past the old 200-turn ceiling (H45) — all in-process |
 | `Machine` + `Job` | `fn spawn(&self, cmd: &ShellCommand) -> Result<Box<dyn Job>, String>`; `Job::{poll, written, output, kill}` | scripted end states, output sizes, kills | timeout, cancel, output cap, and M2.8's detach/exclusive lock without `sh`, `yes` or sleeps — landed in 2.3, with the timeout still decided by the watcher in `agent.rs` |
 | `Clock` | `fn now(&self) -> Instant; fn sleep(&self, d: Duration)` | advanceable by hand, `sleep` returns at once | `wait_tool`'s 50 ms poll, `wait_bounded`'s 10 ms poll, `Watch`'s deadline — landed in 2.3; `INFO_TTL` ageing still reads the wall clock in `app/mod.rs` |
 | `Events` | `fn emit(&self, id: AgentId, event: AgentEvent)` | recording sink | exactly-once completion delivery, fan-out refusal, dispatch, cancel mid-batch — asserted, instead of `mem::forget(ui_rx)` |
@@ -323,24 +323,26 @@ them (its finding was B7; A5 turned out to be closed already: `rederive_context`
 runs on every runtime switch).
 
 **Stage 2 — the seams.** ✅ Rewrite the `#[ignore]`d actor tests in-process and
-delete `scripts/mock_llm.py` from the test path (keep it for the pty smoke
-scenarios if they still want a scripted model). *Done when* the default suite
+delete `scripts/mock_llm.py` from the test path (it stays for hand-driven runs;
+nothing in the repo calls it). *Done when* the default suite
 needs no socket, no subprocess and no sleep over 50 ms, and `--ignored` contains
 only live-endpoint tests — held: the actor scenarios it used to hold (five, not
 the four this line first claimed; more have grown beside them since) run in the
 default suite, and `--ignored` is now exactly the three live-endpoint tests in
-`http.rs` (the model list, the reply cap, and the TLS handshake).
+`http.rs` (the model list, the reply cap, and the TLS handshake) plus
+`app/mod.rs`'s idle-box test of the 16 ms frame budget
+(`a_frame_fits_in_a_60fps_budget_on_a_long_transcript`).
 
 **Stage 2.1 — `ModelClient`.** ✅ `crates/mush/src/model.rs` holds one trait
-(`chat(&ChatRequest, &AtomicBool) -> Result<ChatResponse, ModelError>`), the
-real `HttpModel` over `http::post_json` (body encoding, and the classification
-of a cancellation, a refusal, a transport failure, a status the endpoint chose
-and an unreadable body), and a `#[cfg(test)]` `fake::Scripted` — a reply queue
-that also scripts a refusal and a cancellation, and records the requests it was
-given. `AgentCtx::model` carries it, children inherit it, so one client serves a
-whole tree (and one scripted client can too). `run_loop` and `compact_history`
-go through it with every branch and every error string unchanged; `http.rs` is
-untouched. Three in-process tests: a scripted run that runs its tool call and
+(`chat(&ChatRequest, &AtomicBool, Duration) -> Result<ChatResponse, ModelError>`),
+the real `HttpModel` over `http::post_json` (body encoding, and the
+classification of a cancellation, a refusal, a transport failure, a status the
+endpoint chose and an unreadable body), and a `#[cfg(test)]` `fake::Scripted` —
+a reply queue that also scripts a refusal and a cancellation, and records the
+requests it was given. `AgentCtx::model` carries it, children inherit it, so one
+client serves a whole tree (and one scripted client can too). `run_loop` and
+`compact_history` go through it with every branch and every error string
+unchanged; `http.rs` is untouched. Three in-process tests: a scripted run that runs its tool call and
 ends with the answer, the learned-context retry, and a cancellation mid-reply.
 
 **Stage 2.2 — the `#[ignore]`d actor tests.** ✅ All five now run in process on
@@ -359,18 +361,21 @@ in the second request, a run kept past the old 200-turn ceiling that ends on the
 model's own stop (H45). Gone with
 them: `start_mock*`, `stop_mock`, the four port constants (18731–18735), the
 `python3` readiness probe, and every sleep over 20 ms in these tests.
-`scripts/mock_llm.py` stays in the tree for the pty smoke scenarios; no test
-refers to it. The only surface the production code grew is `#[cfg(test)]`:
-`agent::spawn_scripted`, which starts the same root actor over a caller-supplied
-client.
+`scripts/mock_llm.py` stays in the tree for hand-driven runs; no test, and
+nothing else in the repo, refers to it. The only surface the production code
+grew is `#[cfg(test)]`: `agent::spawn_scripted`, which starts the same root
+actor over a caller-supplied client.
 
 **Stage 2.3 — `Machine` + `Job`, `Clock`, `Events`.** ✅ The last three seams of
 §4, plus B6. `machine.rs` holds `Machine::spawn(&ShellCommand) -> Box<dyn Job>`
 and `Job::{poll, written, output, kill}`; the real impl is the shell as it
-always was (own process group, scratch files, `kill -9 -pgid`), and `Scratch`
-and `kill_command` moved into it. `clock.rs` holds `Clock::{now, sleep}`, the
-system impl, and an advanceable fake; `wait_tool`'s 50 ms poll, `wait_bounded`'s
-10 ms poll and `Watch`'s deadline all read it through `AgentCtx`. `events.rs`
+always was (own process group, output to scratch files), and `Scratch` moved
+into it — the `kill -9 -pgid` child that moved with it is gone: `3bb1a5b`
+signals the group in process through `kill_group` and `rustix`. `clock.rs`
+holds `Clock::{now, sleep}`, the system impl, and an advanceable fake;
+`wait_tool`'s 50 ms poll and `wait_bounded`'s 10 ms poll read it through
+`AgentCtx`, while `Watch`'s deadline is handed `clock::system()` on the `http.rs`
+side — the exception `clock.rs` names. `events.rs`
 holds `Events::emit(id, event)`: the real sink is the UI channel with the
 conversation stamped on, and the fake records — which is what retires
 `mem::forget(ui_rx)` from the actor tests. B6 is closed on both ends: only a run
@@ -421,7 +426,7 @@ invariant knows its home. The `A1`–`A8` here are the starting audit's, not
 | A1 | cancel/deadline only consulted on read timeout | http `Watch` (regression test) |
 | A2 | `tokens * 3` overflow | `config::clamp_context` |
 | A3 | `parse_context_hint` misfires / misses | `config` (markers + range) |
-| A4 | caps as floors; reserve > window | `config::{cmd_cap, history_budget}` (the read and listing caps went with the file tools) |
+| A4 | caps as floors; reserve > window | `config::{cmd_cap, history_budget}`, plus the file tools' caps that came back with them: `workspace::{READ_FILE_CAP, SEARCH_FILE_CAP}` and `agent::LIST_LIMIT` (H31, `findings.md` §8.36) |
 | A5 | window derived once; runtime switches never re-derive | `git::rederive_context` on every runtime switch (`/url`, `/provider`, `set_model`, `set_base_url`), pinned in `config.rs` |
 | A6 | CLI provider never selects its endpoint | `config::resolve_with` test |
 | A7 | no cap on response body | `http` `MAX_BODY_BYTES` |
@@ -437,7 +442,7 @@ invariant knows its home. The `A1`–`A8` here are the starting audit's, not
 | A17 | `openai` alias sends the key to the LAN default | `Provider::parse` (aliases removed) |
 | A18 | git test hardcodes `master` | `git` test `init_repo` |
 | A19 | DNS resolution unbounded | `http::resolve_bounded` runs the lookup on its own thread and bounds the wait at 10 s on the `Clock`, so a hung resolver is a `TimedOut` naming the host |
-| B1 | leftover worktree id collides with a fresh child | `AgentTree::reserve_ids` — raised from the leftover scan (`discover_worktrees`), pinned in `tree.rs` |
+| B1 | leftover worktree id collides with a fresh child | `AgentTree::reserve_agents` — raised from the leftover scan (`discover_worktrees`), pinned in `tree.rs` |
 | B2 | `mask_key` slices on a byte boundary | core `text::mask_key` (3.6) |
 | B3 | zero-row pane still focusable | `App::below_floor` (`app/mod.rs`) refuses every intent but `Quit`, and `ui::draw` paints one notice below `min` — one `is_below_floor` predicate both read |
 | B4 | at 40×10 the only transcript row is a blank | `Chat::body` trims trailing blank separators before windowing (`trim_trailing_blanks`) |
@@ -456,7 +461,7 @@ invariant knows its home. The `A1`–`A8` here are the starting audit's, not
 | B17 | the layout sweep asserts "does not panic", not painted text | `app/screen.rs` + `ui::draw(frame, &Screen)`; `the_draw_sweep_asserts_painted_text_not_that_it_did_not_panic` over 15 sizes × 14 states, plus seven focused `the_sweep_*` tests (`7e123e1`) |
 | B18 | `~` elision matches a prefix, not a directory | `app/screen.rs::facts_line` (moved from `ui.rs` by B17) |
 | B19 | global notices render into every transcript | `Notice.agent` + `Chat::notices_for` — no unscoped read exists |
-| N1 | `MAX_TURNS` turns "long" into "failed" | `agent/run.rs`: `LOOP_ROUNDS` (a run ends when it stops calling tools; only a *loop* ends it early) — the 200-turn ceiling and its wrap-up turn were removed later (H45, §8.47) |
+| N1 | `MAX_TURNS` turns "long" into "failed" | `agent.rs`: `LOOP_ROUNDS` (a run ends when it stops calling tools; only a *loop* ends it early) — the 200-turn ceiling and its wrap-up turn were removed later (H45, §8.47) |
 | N2 | message box is append-only and clips at the right edge | `Input` (grapheme cursor + window), `Chat::key` owns the editing keys |
 | N3 | a stopped child is reported to its parent as `#N done: cancelled` | `agent::Outcome` (one enum, not a `summary == CANCELLED` string sentinel) |
 | N4 | Ctrl-C stopped *every* busy agent, and blanked a stopped one to `Idle` | `App::interrupt` (focused) + `Ctrl-X` (`interrupt_all`); `Phase::Stopped` |
@@ -471,13 +476,13 @@ invariant knows its home. The `A1`–`A8` here are the starting audit's, not
 | U6 | an agent is a bare number | `AgentNode::title` derives a handle from the brief (a path first, else the first non-filler word) |
 | U7 | a waiting agent still says `working…` | `Phase::waiting` (`app/tree.rs`) tells a model call from `wait`, and the row/foot say which |
 | U8 | a transient notice never leaves | `Chat`'s chatter lifetime (`clear_notes_for`, `dismiss_said`, `SAID_TTL`) + repeat collapse (`Notice.count`) |
-| U9 | the shipped DeepSeek window/reply cap is too small | `provider::PROVIDERS` fallback 120 000 + `Config::reply_cap` (a quarter of the window, floored at 1 024 and capped at 120 000) |
+| U9 | the shipped DeepSeek window/reply cap is too small | `provider::PROVIDERS` fallback 120 000 + `Config::reply_cap` (an eighth of the window — `REPLY_SHARE_DIVISOR`, spelled to humans by `REPLY_SHARE_WORDS` — floored at 1 024 and capped at `MAX_REPLY_TOKENS` 120 000) |
 | U10 | walking back up a deep tree costs a keypress per ancestor | `Intent::TreeWalk` on `←`/`→` (`app/keys.rs`) + `PickerMove(±PAGE)` |
 | U11 | compaction has no visible state anywhere | `Phase::Compacting(Parked\|Requested\|NearlyFull)` (`app/tree.rs`), `≡` + the fold's words (`app/screen.rs`), the bar's "keep typing" sentence (`App::tree_line`), and `compact_now` owning the fold's cancel flag (`mush/38`) |
 | B20 | a child's completion reaches the model but not the screen, and can fold twice | `agent::push_line` emits `AgentEvent::Message` with the fold, and `absorb` marks the adopted line delivered |
 | B21 | a parent in a tool-calling chain never heard its child finish | the fold runs at every message boundary (`fold_completions`), not only on the tool-free turn |
 | B22 | a steering message to a subagent is invisible / an idle target not woken | `AgentMsg::Steer` → `push_line` (delivered and emitted), and it is work to answer; the reply wording left over is H5's |
-| B23 | a transient transport failure ends the run instead of being retried | `model.rs::retrying` — `RETRY_ATTEMPTS = 3` over the `Clock` seam, transport failures only, each retry announced in the transcript |
+| B23 | a transient transport failure ends the run instead of being retried | `model.rs::retrying` — `RETRY_ATTEMPTS = 3` over the `Clock` seam, and only an `Unsent` failure is retried: a dial that never connected, or a write that did not hand the whole request over. Everything after the write is final — an answer, a refusal, a cancellation, a broken frame — and each retry is announced in the transcript (`b6a59c3`, `190886c`) |
 
 ---
 
@@ -505,11 +510,12 @@ was asked for, and what it now says:
   *is* the process group or the scratch file, and the local mock sockets in
   `http.rs` — with their 200–600 ms read slices — left after Stage 2.3.
 - §0's acceptance test: **held** for the default suite, whose only remaining
-  `#[ignore]`s are the three live-endpoint tests in `http.rs`.
+  `#[ignore]`s are the three live-endpoint tests in `http.rs` and `app/mod.rs`'s
+  idle-box frame-budget test.
 - §12: the decisions the wave made — one owner per fact; a trait is justified
   only by a fake a test actually uses; a delivered result has one owner; notices
-  have kinds and lifetimes; a transport hiccup is retried and an answer is not; a
-  window a human states beats a default.
+  have kinds and lifetimes; a request that never went out is retried and an
+  answer is not; a window a human states beats a default.
 
 Housekeeping: `.mush/wt/2` was still registered, and `mush/2` pointed at `d4f80ae`
 = master with a clean worktree, so `/discard 2` lost nothing. **Done**: wave 0
@@ -582,11 +588,14 @@ The rule the waves have settled into, so it is not re-derived each time:
 
 The review that follows every integration onto `master` (§10.3) reports the same
 fact, rule or shape written more than once, ranked by (net lines × confidence) ÷
-risk. This is the one ledger of what those reviews have found: a row per item,
-what it costs, and — while it is open — the risk the fix removes and the test
-that would protect it. The reviews themselves are the subsections below, kept for
-their evidence: what each measured, which bugs it injected, and which semantic
-changes it proved byte-identical.
+risk. This is the one ledger of the duplication queue's decisions: a row per
+item, what it costs, and — while it is open — the risk the fix removes and the
+test that would protect it. The queue's evidence is the record's, not this
+ledger's: `findings.md` §8.51 carries the six blind audits and their findings,
+§8.70 the four duplication passes that read the tree blind, each pointing back
+at the rows here. The reviews' own subsections below are kept for their
+evidence: what each measured, which bugs it injected, and which semantic changes
+it proved byte-identical.
 
 How to read a row. `Net` is the fix's size — the measured delta for a landed row,
 the review's estimate for an open one. `Status` names the commit that landed a
@@ -597,7 +606,7 @@ ledger that outlives it; the review subsection each row came from is where the
 evidence's commit is named, and a price re-set by a later review says so (the
 sixth review, after the `Screen` rewrite, re-priced `D9` and `R9`).
 
-The census the reviews read, and the tree this ledger anchors to, measured at
+The census the reviews read — the tree this ledger then anchored to — measured at
 `b8d8baa`: 42 394 lines (prod 11 543, tests 17 943, comments 10 153) — from the
 `960e073` baseline it was seeded with, 41 416 (prod 11 800, tests 17 299, comments
 9 635; `findings.md` §8.19), so prod −257 / tests +644 / comments +518.
@@ -609,11 +618,15 @@ The four blind passes below (the seventh through tenth reviews) read production
 code only, each in its own currency: 2 644 code lines in the pane and the text it
 wraps, ~4 600 production lines in the store's fifteen files, 4 865 non-test code
 lines in the actor's nine, 4 800 code lines in the app and its panes. The tree
-those rows were checked against at entry, and this ledger's new anchor, measured
-at `38d0438`: 79 208 lines — prod 18 232, tests 34 663, comments 21 708, blank 4 605
-(`scripts/census.py`). The `b8d8baa` sentence above is left as it stands: it is
-the census the reviews before these read, not a number to be overwritten, and the
-rows below say where a later wave re-priced one of them (`1e07c2e`).
+those rows were checked against at entry, measured at `38d0438`: 79 208 lines —
+prod 18 232, tests 34 663, comments 21 708, blank 4 605 (`scripts/census.py`).
+That sentence is kept as it stood: it is the census the four passes' rows were
+checked against at entry, not a number to be overwritten. This ledger's anchor is
+now `7338d81`: 86 623 lines — prod 19 092, tests 38 164, comments 24 395, blank
+4 972 (`scripts/census.py`); over `38d0438` that is prod +860, tests +3 501,
+comments +2 687, blank +367. The `b8d8baa` sentence above is left as it stands:
+it is the census the reviews before these read, not a number to be overwritten,
+and the rows below say where a later wave re-priced one of them (`1e07c2e`).
 
 | # | What is duplicated | Net | Risk | Protecting test | Status |
 |---|---|---|---|---|---|
@@ -643,7 +656,7 @@ rows below say where a later wave re-priced one of them (`1e07c2e`).
 | R14 | The registry's one reach was walked three times: `kill_owned`, `kill_all` and `Registry::drop` each walked `foregrounds`+`jobs` — except `Drop`, which walked only `jobs` while its own doc claimed the backstop. One `fn kill(&self, owner: Option<u64>)`; `drop` is `kill(None)`. | ≈ −8 | — | — | ✅ `45116ad` |
 | R15 | `Ended`'s three "mush stopped it" variants were `jobs::Stopped` copied: `wait_bounded` translated 1:1 and `watch` translated the same three into `JobOutcome`. `Ended::Stopped(jobs::Stopped)` is that reason, built by `jobs::stopping`, and the report's sentence table is one pure `end_note`. `Ended::Detached` is not an end `run_shell`'s report reaches — the handover returns first — and its sentence now says what it is (the command went to the job registry), not the timeout it never was. | ≈ −8 | A fourth stop reason is added to `Stopped` and one translator misses it — the model reads the wrong sentence. | `the_three_ways_a_foreground_command_ends_are_not_confusable` reads every arm of the table, the `Detached` one included. | ✅ `29700b3` |
 | R16 | The `/compact` refusal — the `asked` guard, the `emit` and the `Ok(false)` — is written twice in `compact_history`; the second copy was added by the `mush/47` merge. One `fn nothing_to_compact(actor)`. | ≈ −4 | A third "nothing to fold" arm tells the human something the other two do not, or stays silent where the row says `compacting…`. | the `NOTHING_TO_COMPACT` tests assert both arms' words. | ✅ `6a68a0e` |
-| R17 | `main::shown_under` re-states `Workspace::rel`: the same strip-prefix/unwrap-or dance, except `rel` also folds `\` to `/`. Pass the `&Workspace` the caller already has and delete `shown_under`. | ≈ −6 | A second elision rule drifts from `rel`'s (a path outside the root, a Windows separator), and the session's own name is shown by whichever one is used. | `a_path_outside_the_workspace_is_shown_whole` now lives in `workspace.rs` beside `rel`. | ✅ `421be43` |
+| R17 | `main::shown_under` re-stated `Workspace::rel`: the same strip-prefix/unwrap-or dance, with its own decode (`display()` against `rel`'s `to_string_lossy`) and none of the `\`-to-`/` fold `rel` then had — a fold `b13aeed` later removed, because it handed the model names no road could open (B9). Pass the `&Workspace` the caller already has and delete `shown_under`. | ≈ −6 | A second elision rule drifts from `rel`'s (a path outside the root, the decode), and the session's own name is shown by whichever one is used. | `a_path_outside_the_workspace_is_shown_whole` now lives in `workspace.rs` beside `rel`. | ✅ `421be43` |
 | R18 | `keep_unreadable`'s two `Err` branches repeated the name formatting and the sentence shape — one `cannot_keep(from, why)`. This was also the only untested path in the session code. | ≈ −4 | A third failure gets a sentence that does not name the file the human must go find. | `a_session_that_cannot_be_kept_still_names_the_file` walks both `Err` branches. | ✅ `d3517f6` |
 | R19 | `App::session_unreadable` was the second spelling of "a failure takes the notice, the bar and the dirty mark" against the `AgentEvent::Error` arm; `App::fail_for` is the one door, with the caller keeping only whether the bar is the place for the line and what it names. | ≈ −4 | The durable notice and the bar's line stop agreeing about one failure. | the session-unreadable tests, which assert the notice, the bar and the stored line. | ✅ `7185e90` |
 | R20 | `Launch::held` stated the owner `Registry::hold` already recorded — one owner per fact, so `Foreground` now carries it; and the same edit builds `Live` by hand twice → one `Live::new(job)`. | ≈ −2 | The owner on the record and the owner in the slot disagree, and `kill_owned` kills the wrong set. | `a_handed_over_command_belongs_to_the_agent_that_held_it` reads the job list back through the holder. | ✅ `d5ba536` |
@@ -676,29 +689,29 @@ rows below say where a later wave re-priced one of them (`1e07c2e`).
 | R47 | The once-only delivery rule, two books: `ActorState`'s `running`/`completed`/`delivered` and `running_jobs`/`done_jobs`/`delivered_jobs` with `record_child`/`record_job`, `note_completion`/`note_job`, `note_parked`'s `NO_RUN` re-arm and `fold_completions`' two folds. One `Delivery<K, R>` owner whose mark is a run, not a bare id. **Verified:** `absorb`'s adoption is no longer the quoted filtered snapshot — it scans `announced`/`announced_jobs` and only `delivered.entry(id).or_insert(run)` — and `wait_digest` filters through `ActorState::unread`; the rule, not every reader's shape, is what is copied. | ≈ 30 (25–35) | **Medium-high** — this is the B24 rule: `note_parked` has no job twin, and a merged mark that dropped the run would swallow a parked child's next report, while `note_completion` clears `running` only on a changed run and `note_job` always clears it. | — | ⬜ |
 | R48 | “Answer every call in the batch, and tell the UI” four times — a reply cut at the token cap, a reply the endpoint refused, a run stopped as a loop and a cancellation between calls each push a `Message::tool` per call into `messages` and emit `AgentEvent::Message`, with `push_line`'s rule (“a line that reaches `messages` alone is one the human cannot see”, B20) rewritten at each site. One `answer_calls(actor, messages, calls, why)`. | ≈ 16 | **Medium** — a fifth road copied from one of the four that forgets the `emit` leaves the human's copy without the line, and the next idle `Run` replaces the actor's transcript with the UI's, so the loss is permanent. | — | ⬜ |
 | R49 | The stdout+stderr join, two renderings: `command_report` and `jobs::preview` each test emptiness twice, spell the `--- stderr ---` heading and trim the ends, differing in the trailing newline against `tail_for_model`. One `streams_window(stdout, stderr)` beside `machine.rs`. Under it, the report's judged second half: `Job::output`/`tail` cap each stream while `preview` caps the joined text, so one command can give the model up to twice the cap as a foreground result and the cap as a job. | ≈ 13 | **Medium** — `preview`'s doc claims “exactly as a foreground result reads” and nothing tests the claim; the heading and the trim are kept in step by hand. | — | ⬜ |
-| R50 | `kill -9 -pgid`, twice: `Running::kill` and `Running::end_group` run the same eleven tokens through `scrub`, with mush's own streams nulled, differing only in whether the answer is read. One `kill_group(group) -> io::Result<ExitStatus>`. | ≈ 8 | **Medium** — a copy that loses `scrub` hands `MUSH_API_KEY` to the `kill` mush runs (C1); one that loses `Stdio::null()` prints into the TUI; nothing but reading the second copy catches either. | — | ⬜ |
+| R50 | `kill -9 -pgid`, twice: `Running::kill` and `Running::end_group` ran the same eleven tokens through `scrub`, with mush's own streams nulled, differing only in whether the answer was read. **Landed `3bb1a5b`:** one in-process `machine::kill_group(group) -> Result<(), rustix::io::Errno>` (`rustix::process::kill_process_group`) is what both read — `Running::kill` through `Running.killed`, which makes a second call a no-op, and `Running::end_group` only where `group_members` found someone — with `ESRCH` read as “already gone” and anything else owed once through `Job::kill_failure` (`a_second_kill_signals_nothing`, `a_kill_without_the_kill_program_still_ends_the_group`, `a_failed_kill_leaves_one_sentence_in_the_window`). | ≈ 8 | **Medium** — a copy that lost `scrub` handed `MUSH_API_KEY` to the `kill` mush ran (C1), one that lost `Stdio::null()` printed into the TUI, and the fork/exec did nothing at all where `kill` is not on `PATH` (E6); nothing but reading the second copy caught the first two. | — | ✅ `3bb1a5b` |
 | R51 | Who holds the machine, five sentences: the holder's own second claim, a queued sibling, the root and an unqueued sibling in `jobs.rs`, and `agent.rs`'s `machine_holding` and `beside_note`, all cutting the command with `truncate(&held.command, REFUSAL_COMMAND_COLUMNS)` in six places. One `Held::phrase()`/`Held::named()`. **Verified:** the report's “three of the five shapes are pinned” is stale — all five are read now. | ≈ 7 | **Medium** — the model reads the same hold described two ways (H13); a changed bound or a changed `#` spelling applied to four of five leaves two accounts of one hold in one conversation. | — | ⬜ |
 | R52 | Five one-liners of arithmetic with two spellings: the ceiling in hours (`JOB_MAX_AGE.as_secs() / 3600` in `JobOutcome::line` and `end_note`; owner `JOB_MAX_AGE_HOURS`), the count of live jobs (`Registry::running`, `launch`'s inline count against `MAX_JOBS`, `finish`'s negated count; owner `Inner::running`/`ended`), the bounded-listing tail (`list_tool`/`search_tool`; owner `bounded_listing`, which the `unnamed` note left more parallel, not less), the body cap (`MAX_BODY_BYTES` in three readers; owner `body_room`) and the wait's poll slice (two `Duration::from_millis(50)`; owner `WAIT_POLL`). | ≈ 7 (each item ≤ 4) | **Medium** — the ceiling in hours is spelled twice and one edit makes a sentence lie; the running-job count has two spellings for the budget and one for the pane. | — | ⬜ |
 | R53 | The model-failure sentence, translated twice — `run_loop`'s turn and `compact_history`'s `ask`: `CANCELLED`, “the endpoint's reply was refused”, `reply_broke`, “cannot reach” and “could not encode request” are verbatim in both (**five**, not the report's four), while the classes whose answer is the caller's (`Status`, `Malformed`, a cancellation) stay per-caller. One `transport_line(cfg, error) -> Option<String>`. | ≈ 7 | **Medium** — adding the endpoint's name (or a new class) in one path is a one-line edit with no test tying the two together, and `/compact` then reports a failure in different words from the run it belongs to. | — | ⬜ |
 | R54 | The bounded wait loop's scaffolding: `wait_tool` and `wait_on_tool` each build `clock.now() + WAIT_TIMEOUT_SECS`, run the same `wait_tick` match on the two things that outrank the wait, set `state.waited` and `clock.sleep(Duration::from_millis(50))` — the only unnamed poll cadence left, which `BACKOFF_SLICE`'s doc already claims. One `Wait` owner for the deadline and the slice; what each waits for stays its own. | ≈ 3 | **Low-medium** — change one sleep and the two waits poll at two rates, and the fake clock advances by whatever it is handed, so no test measures either slice. | — | ⬜ |
-| R55 | The attempt's budget against the transport's timeouts: `retrying` computes one deadline on the actor's clock and hands each attempt what is left, but `connect` uses `CONNECT_TIMEOUT` per address, `write_all` may block for `WRITE_TIMEOUT` and `resolve_bounded` waits `RESOLVE_TIMEOUT` on the system clock — none min'd with what is left. One `bounded(ceiling, left)` threaded into all three. **Verified:** the report's “the deadline is computed twice” is half overstatement — `Watch::new` anchors on the handed `left` (the system clock there is the deliberate choice its own not-list names) — but the three syscall bounds are the live divergence, and `retrying`'s doc still says “resolving a host has no timeout” while `RESOLVE_TIMEOUT` exists. | 0 | **High** — an endpoint that accepts the connection and stops reading can hold one attempt ~30 s past its deadline (~45 s with connect and resolve), so “one ask spends one deadline” is false and a `Stop` the human pressed waits with it. | — | ⬜ |
+| R55 | The attempt's budget against the transport's timeouts: `retrying` computed one deadline on the actor's clock and handed each attempt what was left, but `connect` used `CONNECT_TIMEOUT` per address, `write_all` could block for `WRITE_TIMEOUT` and `resolve_bounded` waited `RESOLVE_TIMEOUT` on the system clock — none min'd with what was left. (The report's “the deadline is computed twice” is half overstatement — `Watch::new` anchors on the handed `left`, the system clock there being its own deliberate choice — but the three syscall bounds were the live divergence.) **Landed `1dbea62`:** every per-phase bound is the smaller of its own ceiling and what is left of the call (`Watch::left`) — `CONNECT_TIMEOUT` per address, the write re-setting the socket's own timeout per chunk (`set_write_timeout`, `write_bounded`) with the watch checked between chunks, and `resolve_bounded` waiting `min(RESOLVE_TIMEOUT, left)` — and a phase that spends the budget answers as the deadline (`Watch::spend`), so the layer above classifies it as the deadline it is — a final `Transport`, not an `Unsent` failure to ask again with nothing left (`no_phase_outlives_the_calls_deadline`, `a_stop_lands_while_a_write_stalls`, `a_healthy_call_is_not_cut_by_the_ceilings`). | 0 | **High, and the reason the fix was needed** — an endpoint that accepts the connection and stops reading held one attempt ~30 s past its deadline (~45 s with connect and resolve), so “one ask spends one deadline” was false and a `Stop` the human pressed waited with it. | — | ✅ `1dbea62` |
 | R56 | The two-step warning — armed, armed-again, kept true, disarmed — written twice: `arm_quit`/`arm_new_chat`, `disarm_quit`/`disarm_new_chat` and `refresh_quit_warning`/`refresh_new_chat_warning` each re-derive the line and re-spell “keep the clock of an arming already standing”, while the attach road hand-writes the two kinds. One `armed`/`arm_warning`/`refresh_warning`/`disarm` and `StatusKind::waits_for_a_second_press`. | +29 | **Drift** — the warning kinds are hand-written at the attach road while two functions each know one, and the keep-the-clock rule exists twice (H9, C4). | — | ⬜ |
 | R57 | The image box weighed by two doors: `attach_images` (which calls the single door for a batch of one) and `attach_image` spell the same sums — `budget.saturating_sub(used_weight_for)`, the weight and byte folds over `self.chat.attachments()`, the running `over_budget`/`first_over` loop against the budget and `at_stake`/`first_at_stake` against the room — and `deliver` asks the same gate again at the send. One `Held::of`/`Held::plus` and `at_stake(images, from, bound)`, with `NO_MODEL_YET` for the literal written three times. | +18 | **Drift** — the three bounds are spelled twice, and the verdicts already differ in words: one picture over the window gets “even with every older turn dropped”, a paste of four gets “the pictures already in the box weigh {pending}”. | — | ⬜ |
 | R58 | Three `AgentNode` constructors, one field list: `with_root`, `insert` and `register` write the same **fourteen** fields in three orders (the report says fifteen). One `blank(id, parent, depth, brief)`; the root is one line over it, the spawn three fields, the restore eight. | +12 | **Low** — the literals are exhaustive, so a new field fails to compile; the hazard is field order, not drift. | — | ⬜ |
 | R59 | Four picker openers, one struct literal: `open_model_picker`, `open_notes_picker`, `open_help_picker` and `open_provider_picker` each build `Picker { kind, items, cursor }`, and the “open on the current value, else the top” rule is derived twice — by `model.id` once and by `item.id.as_deref()` the other. One `open_picker` and `PickerItem::choice`/`reading`. | +12 | **Low** — compiler-guarded; the cursor's default row is derived twice. | — | ⬜ |
-| R60 | The help page's two columns, once in `keys::help_table_at` and once in `commands::table_at`: measure the left column, reserve `4 + w + 2`, wrap the description into what is left and hang every continuation under the description column, both over `wrap_text`. One `columns(rows, width)` beside `wrap_text`. | +10 | **Drift** — `4 + w + 2` and the continuation indent are two spellings, and only a wrapped description shows `/help` disagreeing with `mush --help`. | — | ⬜ |
+| R60 | The help page's two columns, once in `keys::help_table_at` and once in `commands::table_at`: measure the left column, reserve `4 + w + 2`, wrap the description into what is left and hang every continuation under the description column, both over `wrap_text`. One `columns(rows, width)` beside `wrap_text`. **Landed `1afa368`:** one `mush_core::text::columns(left, left_width, description, width)` with one `MIN_DESCRIPTION_COLUMNS` (16) is what `commands::table_at` and `keys::help_table_at` loop over; below the floor the description hangs under its own left cell instead of wrapping to one column (`the_help_picker_keeps_a_readable_description_column`). | +10 | **Drift** — `4 + w + 2` and the continuation indent had two spellings, and only a wrapped description showed `/help` disagreeing with `mush --help`. | — | ✅ `1afa368` |
 | R61 | “The run may not be labelled”: `AgentTree::activity` and `thinking` are the same eight lines — busy, then not folding, then the phase and its clock — and `nudge` asks the fold half of the guard. One `folding(id)`. **Verified:** `nudge` keeps only the fold guard and no busy check, so the report's three versions are two full copies and one guard. | +9 | **Low-medium** — a new setter that forgets “only a run in flight” or “a fold is never replaced” is a lie on a row. | — | ⬜ |
 | R62 | The three dim footer lines: `agent_footer` cuts `detail`, `unread` and `jobs` to widths whose reserves (`2`, `2`, `14`, and `6` on the id line) are hand-counts of the label painted beside the text. One `footer_line(label, text, width)`. | +9 | **Minor drift** — `-2`, `-2`, `-14`, `-6` are hand-counts of the label beside them. | — | ⬜ |
 | R63 | The refusal road of `deliver`: six roads say and return by hand (`self.fail(line)` then `Err(line)`). One `refuse(line) -> Result<(), String>`. | +8 | **Low** — a road that forgets `fail` refuses silently. | — | ⬜ |
 | R64 | The bar's row budget derived three times: `CURSOR_LINE_COLUMNS = 72`, `UNKNOWN_NAME_COLUMNS = 36` and `QUIT_LINE_COLUMNS = 72` each re-spell the 80×24 row less the ` chat ` badge, and `JOB_TITLE_COLUMNS = 30` claims to be “the same bound as an agent's title” while `tree::TITLE_COLUMNS` is 24 — a false claim already in prose. One `BAR_ROW_COLUMNS = 72` with the others derived from it. | +6 | **Drift, already present in prose** — 30 against 24. | — | ⬜ |
 | R65 | A host change's ack, twice: the `/url` and `/provider` arms each build `head · context_label` and append the ` · ` and `no_key_hint()` when the new host took the key, and the model ack `model: label · context_label` is the same string in `adopt_models` and `pick`. One `host_line(head, forgotten)`. | +6 | **Drift** — the `" · {context}"` tail and the optional no-key clause exist twice, and the model ack string twice. | — | ⬜ |
-| R66 | A phase and its clock, written as a pair in eleven places: each setter writes the phase and `node.since = Instant::now()`. **A live lie:** `nudge` returns `Option<Phase>` and `nudge_failed` writes back only `node.phase = was` — against its own doc, “Put the row back exactly as it was” — so a row that said `waiting on results 4m` says `0s` after a failed nudge. One `AgentNode::enter(phase)`, with `nudge` returning the phase and the clock it replaced; `a_nudge_that_cannot_be_delivered_restores_the_previous_phase` reads the phase and `summary` and never `since`, so the lie is unpinned. | +5 | **Live drift** — the restored age is the failed nudge's, not the phase's, and the doc and the code already disagree. | — | ⬜ |
+| R66 | A phase and its clock, written as a pair in eleven places: each setter writes the phase and `node.since = Instant::now()`. **A live lie:** `nudge` returned `Option<Phase>` and `nudge_failed` wrote back only `node.phase = was` — against its own doc, “Put the row back exactly as it was” — so a row that said `waiting on results 4m` said `0s` after a failed nudge. **Landed `9f0a12c`:** `nudge` returns the displaced phase *and its clock* (`Replaced`), and `nudge_failed` restores both; the broader `AgentNode::enter(phase)` refactor of the eleven setters is deliberately not done — this closed the defect only, and `a_nudge_that_cannot_be_delivered_restores_the_previous_phase_and_its_clock` reads `since` too. | +5 | **Live drift** — the restored age was the failed nudge's, not the phase's, and the doc and the code disagreed. | — | ✅ `9f0a12c` |
 | R67 | Three endings of a run, one body: `finish`, `fail` and `stopped` each set `result_unread = node.parent.is_some()`, the phase, `since` and `agent_cancel.remove(&id)` (`finish` also `summary`). One `AgentNode::end(phase)`. | +4 | **Low-medium** — an ending that forgets `result_unread` silently drops the `✉` a parent's `wait` or fold reads. | — | ⬜ |
 | R68 | The wire's “no agent #N”, spelled three times in `attach_read`, `attach_focus` and `attach_edit` (`format!("no agent {id}")`). One `no_agent(id)`; the membership check keeps its three lines, so the helper costs five. | −5 | **Judged and left on purpose** — it costs lines rather than saves them; the refusal is a contract three arms write out, and the three spellings agree today. | — | ⬜ judged |
 | R69 | Below the line, five spans: `ConfigCell::learn_context`/`ConfigHandle::learn_context` (`believable` then `adopt_context`), the picker's two cursor clamps (`move_picker` against `set_picker_cursor`), `tree_walk` against `move_tree_cursor`, the two `take_error()` reads, and `Picker::title`'s `line {}/{}` in two arms. One `adopt_believable`, `Picker::set_cursor`, `walk_rows`, `take_save_error`, `Picker::position` — three of them zero-net consistency moves, worth doing only when the file is touched anyway. | +5 | **Low** — consistency moves, not savings; the only real bound is the picker's two clamps against two ends. | — | ⬜ |
 | R70 | The message box: the ask and the paint are two sums — `input_rows` adds the capped draft lines, the capped attachment rows and the two borders, while `content_rows` reads the same sum from the other end with the one-row-for-the-text kept only there; both docs say “the two agree whenever the ask is granted”, which is the hand-kept invariant. One `box_rows(draft_lines, attached, granted)`. | −7 | **Judged and left on purpose** — it costs lines: change the `+ 2` and a box granted one row fewer than it paints loses a draft line and an image while the title still counts the image. Kept for the invariant, not the line count. | — | ⬜ judged |
-| R71 | The chat column's split, twice: `screen`'s zen path and `chat_pane` both lay out `[Constraint::Min(3), Constraint::Length(self.input_rows())]`, and the zen comment claims “its own split, not a re-derivation”. One `chat_split(area)`. | −5 | **Judged and left on purpose** — costs lines; raise the floor in one and the zen view hands the box rows the two-pane layout does not, moving the box when the tree takes the screen. | — | ⬜ judged |
-| R72 | A share of the terminal, two integer types: `picker_width` computes `terminal_width * 60` in `u16`, `agents_columns` computes the same share in `u32`; one `share(whole, percent, min, max)`. **A real, narrow defect, not a style:** at 1093 columns the `u16` multiply overflows — a debug build panics on the multiply, a release build wraps and the clamp quietly yanks the popup to its floor. | 0 | **Real, narrow** — `terminal_width * 60` overflows `u16` above 1092 columns; no test sweeps past 240. | — | ⬜ |
+| R71 | The chat column's split, twice: `screen`'s zen path and `chat_pane` both laid out `[Constraint::Min(3), Constraint::Length(self.input_rows())]`, and the zen comment claimed “its own split, not a re-derivation”. **Landed `bc581ba`:** `App::screen` computes the split once and all three arms read it — the two-pane chat is `chat_pane_with(rows[0], rows[1])`, the zen Chat arm widens `rows[1]` to the frame and the zen Agents arm reuses those rows — and `chat_pane` is gone; `zen_keeps_the_boxes_rows_at_every_size` reads the box's rows at 40×12, 40×10, 60×17 and 79×24. | −5 | **Judged, then landed** — the zen arm handed the box rows the two-pane layout did not, moving the box when the tree took the screen. | — | ✅ `bc581ba` |
+| R72 | A share of the terminal, two integer types: `picker_width` computed `terminal_width * 60` in `u16`, `agents_columns` computed the same share in `u32`. **A real, narrow defect, not a style:** at 1093 columns the `u16` multiply overflowed — a debug build panicked on the multiply, a release build wrapped and the clamp quietly yanked the popup to its floor. **Landed `d56a10c`:** one `share(whole, percent, min, max)` does the multiply in `u32`, read by `picker_width` and `agents_columns`; `no_share_of_a_terminal_overflows_its_integer` sweeps 40..=2000 against the natural arithmetic. | 0 | **Real, narrow** — `terminal_width * 60` overflowed `u16` above 1092 columns; no test swept past 240. | — | ✅ `d56a10c` |
 | R73 | The reap window and the park window count different populations: `past_history` ranks `eligible` (what the tree may drop, with an unread result outside the count) while `parkable` ranks every parented child, under a comment that says “the warm window and the reap window are one arithmetic” — so with a kept child the parker's window is larger, a child in the band is asked `past_window`, and a report the parent's model has not read stops protecting its thread. One `past(len, cap)` fed the same population by both. | −4 | **Judged and left on purpose** — costs lines; with fifty-one children and one unread result the reaper's `over` is 0 while the parker's `window` is 1. The wake path recovers the message, so the cost is a promise broken, not a line lost. | — | ⬜ judged |
 
 ### The first review (after the `mush/39` integration, `0bd7e8a`)
@@ -974,8 +987,9 @@ a live lie, and the row the report would fix first); `picker_width` multiplies a
 `u16` and overflows above 1092 columns where `agents_columns` computes the same
 share in `u32` (`R72`); and the parker and the reaper count different populations
 under a comment that says "one arithmetic" (`R73`). Four findings cost lines rather
-than save them (`R68`, `R70`, `R71`, `R73`) and are entered `⬜ judged`, each with
-the contract or invariant it buys stated in the row. Nothing of the seven files
+than save them (`R68`, `R70`, `R71`, `R73`) and were entered `⬜ judged`, each with
+the contract or invariant it buys stated in the row; `R71` has since landed
+(`bc581ba`). Nothing of the seven files
 changed between `f47bfdb` and `38d0438`, so every span the report quotes still
 stands as written; its count of `AgentNode`'s fields is fourteen, not fifteen
 (`R58`), `nudge` carries only the fold guard and no busy check (`R61`), the three
