@@ -126,7 +126,7 @@ pub fn needs_compaction(messages: &[Message], budget_bytes: usize) -> bool {
 /// The other direction of the same pair is repaired too: a result whose call is
 /// not there. A second result for a call already answered, or one whose id names
 /// a call in another batch, is a shape a strict server rejects and is dropped
-/// ([`drop_orphan_results`]). But a result whose id names no call *anywhere* is
+/// (`drop_orphan_results`). But a result whose id names no call *anywhere* is
 /// the legacy shape of the same pair: a session saved before every call had an
 /// id (`1b70096`) holds `tool_call_id: ""` beside a call the deserializer has
 /// since named `call_0`. Re-pointing it keeps the model's real output, where

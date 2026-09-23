@@ -909,7 +909,7 @@ impl PublishedFacts {
 
     /// What this guard has published, in id order: the read the UI's own tests
     /// pin the wiring with (`App::refresh_git` → this book). Production asks
-    /// the book one id at a time through [`published_facts`].
+    /// the book one id at a time through `published_facts`.
     pub fn published(&self) -> Option<Vec<(u64, String, Option<String>)>> {
         worktree_facts()
             .live
@@ -969,7 +969,7 @@ fn published_facts(key: &Path, id: u64) -> Option<(String, Option<String>)> {
 /// count that cannot be taken is not a hundred worktrees, it is no answer.
 ///
 /// The question is the sweep's own for every worktree a tree has published
-/// ([`WorktreeFacts`]): the node's base — its parent's branch, or `HEAD` — and
+/// (`WorktreeFacts`): the node's base — its parent's branch, or `HEAD` — and
 /// its fork revision, exactly the pair `App::reclaim_worktrees` hands
 /// [`reclaimable`]. A nested child merged only into its parent's branch is
 /// therefore *not* counted, which is the arithmetic finding F7 proved wrong:

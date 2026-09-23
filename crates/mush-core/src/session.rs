@@ -106,7 +106,7 @@ pub fn previous_session_path(root: &Path) -> PathBuf {
 /// same serializer, the same atomic rename — because the caller clears the
 /// store the moment this returns: a copy that is late or half-written is not
 /// the copy the key promised. A failure is the caller's to refuse the clear
-/// with, told by [`cannot_keep`]'s one sentence, so a workspace that cannot
+/// with, told by `cannot_keep`'s one sentence, so a workspace that cannot
 /// take the copy keeps the conversation instead of losing it.
 ///
 /// Private, like the store it sits beside ([`crate::workspace::Fresh::Private`]):
@@ -346,7 +346,7 @@ fn cannot_keep(from: &Path, why: impl std::fmt::Display) -> String {
 /// file is one the human already needed — so the conversation and the home
 /// config keep their copies by one numbering rule and one bound. Returns where
 /// it went; a failure names the file and why it could not be moved
-/// ([`cannot_keep`]).
+/// (`cannot_keep`).
 ///
 /// This is deliberately not called for an [`Stored::Absent`] workspace: there
 /// is nothing to keep, and creating a backup of nothing would be a file a human
