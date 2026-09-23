@@ -16,8 +16,9 @@
 //! the whole process group — sent in process ([`kill_group`]), so no `kill`
 //! program on `PATH` can stand between mush and a group it must end — when the
 //! command's end is mush's doing ([`Job::kill`]) and when the command ended by
-//! itself with the group still standing ([`Job::end_group`]). One thing is not
-//! as it always was: the child is handed the inherited environment **minus
+//! itself with the group still standing ([`Job::end_group`]). Two things are
+//! not as they always were: the child is started at [`CHILD_NICE`], a guest on
+//! the human's machine, and it is handed the inherited environment **minus
 //! mush's secrets**, so a command cannot read the provider credential
 //! ([`Shell`]).
 //!
@@ -175,8 +176,43 @@ pub trait Machine: Send + Sync {
     fn spawn(&self, cmd: &ShellCommand) -> Result<Box<dyn Job>, String>;
 }
 
-/// The real one: `sh -c`, its own process group, output to scratch files — and
-/// **without mush's secrets**.
+/// The scheduling priority every command mush starts is given: `nice` 10.
+///
+/// Linux niceness runs from -20 (most urgent) to 19 (least), and 0 is the
+/// default a process starts at. Ten is *lower* priority than everything the
+/// human's own shell starts — their editor, their own tests, their typing —
+/// which is the whole point: a build an agent launched queues behind the
+/// human's machine, never in front of it. The value is one constant, so the
+/// human can ask for another one; 19 is the least urgent Linux allows.
+///
+/// Failure is ignored on purpose: the priority is a courtesy, never a
+/// precondition, and a command that cannot be niced still runs. The one
+/// refusal in practice is the harmless direction — a mush that is already
+/// *less* urgent than this (started under `nice -n 19`, as our own gates are)
+/// cannot hand a child a better priority without `CAP_SYS_NICE`, so the child
+/// keeps the inherited, even lower one. Still a guest, which is what the
+/// constant is for.
+///
+/// The few microseconds between the spawn and the `setpriority` are the only
+/// window where a command can run at the priority mush itself was started
+/// with before the call settles its priority — the default 0, when the
+/// human's own shell started mush. Nothing anyone can feel fits in that
+/// window: `fork` has barely returned, and no build has done a millisecond of
+/// work by the time it closes.
+///
+/// [`Shell::spawn`] is the one door every command mush runs passes through — a
+/// `run_command`, a `detach: true` job, a foreground call handed to the
+/// registry, the human's own command — so the priority is set there and
+/// nowhere else, and the fact holds for every one of them at once.
+const CHILD_NICE: i32 = 10;
+
+/// The real one: `sh -c`, its own process group, output to scratch files, a
+/// guest at [`CHILD_NICE`] — and **without mush's secrets**.
+///
+/// The priority is set on this spawn alone (the constant's doc has the
+/// reasons), and this is the one door every command mush runs passes through:
+/// a `run_command`, a `detach: true` job, a foreground call handed to the
+/// registry, the human's own command.
 ///
 /// A command sees the environment the human's own shell would have handed it —
 /// `PATH`, `HOME`, `LANG`, `EDITOR`, their tooling — minus
@@ -227,6 +263,16 @@ impl Machine for Shell {
         let child = shell
             .spawn()
             .map_err(|e| format!("could not run command: {e}"))?;
+        // A command is a guest on the human's machine: [`CHILD_NICE`]. This is
+        // the one door every command mush starts passes through, so the
+        // courtesy is set here and nowhere else. Failure is deliberately
+        // ignored — [`CHILD_NICE`]'s doc says why — and the window between the
+        // spawn above and this call is a few microseconds, the only ones a
+        // command can spend at the priority mush itself was started with
+        // before this call settles its priority.
+        if let Some(pid) = rustix::process::Pid::from_raw(child.id() as i32) {
+            let _ = rustix::process::setpriority_process(Some(pid), CHILD_NICE);
+        }
         Ok(Box::new(Running {
             child,
             out,
@@ -868,7 +914,7 @@ mod tests {
     #[cfg(unix)]
     use rustix::process::{kill_process, kill_process_group, Pid, Signal};
 
-    use super::{ended, reap_within, End};
+    use super::{ended, reap_within, End, CHILD_NICE};
 
     /// The one reading of a real status: an exit code, or the signal that killed
     /// the process. `ExitStatusExt::from_raw` is the inverse of the `into_raw` a
@@ -1040,6 +1086,62 @@ mod tests {
             "the command's PATH is the human's"
         );
         assert_eq!(end, End::Exited(0), "printenv found PATH");
+    }
+
+    /// A command mush starts is a guest on the human's machine: it runs at a
+    /// lower scheduling priority than mush's own process, read from *inside*
+    /// the command itself.
+    ///
+    /// `ps -o ni= -p $$` answers about the pid the command's own shell has
+    /// (`$$`), so the number is the one the spawned command runs at — not a
+    /// value the parent went looking for from the outside. The parent's own
+    /// niceness is read the same way through rustix, and it must not move: the
+    /// courtesy belongs to the child, and mush never reniced itself.
+    ///
+    /// The test process does not always start at the default 0 — the house rule
+    /// runs our own heavy commands (`nice -n 19 cargo test`) at a lower
+    /// priority too — so the assertion is the law the mechanism implements in
+    /// every environment: the child is at [`CHILD_NICE`], or, when mush was
+    /// already less urgent and the kernel refused the raise (the failure
+    /// [`Shell`] ignores), at the inherited, even lower value. It is never more
+    /// urgent than either. `own != CHILD_NICE` keeps the test from passing
+    /// because a machine reniced to exactly [`CHILD_NICE`] made inheritance the
+    /// answer.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_mush_spawns_runs_at_the_niceness_mush_gives_it() {
+        use rustix::process::getpriority_process;
+
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("nice");
+        let own = getpriority_process(None).expect("the test process reads its own niceness");
+        assert_ne!(
+            own, CHILD_NICE,
+            "a machine already sitting at CHILD_NICE would make the child's read \
+             inheritance rather than mush's doing"
+        );
+        let end = run_to_end(&format!("ps -o ni= -p $$ > {}", out.display()), dir.path());
+        assert_eq!(
+            end,
+            End::Exited(0),
+            "ps answered about the command's own pid"
+        );
+        let child: i32 = std::fs::read_to_string(&out)
+            .unwrap()
+            .trim()
+            .parse()
+            .expect("ps -o ni= prints one number");
+        assert!(
+            child == CHILD_NICE || (own > CHILD_NICE && child == own),
+            "a command mush spawned runs at CHILD_NICE ({CHILD_NICE}); the only other honest \
+             value is the no-more-urgent one it inherited from a mush that was already less \
+             urgent than that ({own}) — it read {child}"
+        );
+        assert_eq!(
+            getpriority_process(None).expect("the test process reads its own niceness"),
+            own,
+            "mush's own process keeps the priority it was started with"
+        );
     }
 
     /// The kill's reap is bounded (finding R4): a leader still running when the
