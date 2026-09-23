@@ -14265,6 +14265,56 @@ mod tests {
         assert_eq!(app.tree.cursor_id(), Some(AgentId::ROOT));
     }
 
+    /// The indent a row wears is the nesting the pane *paints*, not the depth
+    /// the agent was spawned at: [`AgentTree::rows`] has always ordered a
+    /// parentless row at the top level, so a child whose parent was reaped must
+    /// not keep an indent over a row it no longer sits under (finding D9).
+    ///
+    /// The audit's probe read `"│     ✓ #2 2  done"` — five columns of indent
+    /// with no `#1` row anywhere above it — where the painted order had one
+    /// level of nesting. The two must be one spelling of the tree: the indent
+    /// is derived from the painted chain, never from [`AgentNode::depth`],
+    /// which is where the agent was *spawned* (the system prompt and the spawn
+    /// limit read it).
+    #[test]
+    fn a_row_without_a_painted_parent_is_painted_at_the_top_level() {
+        let (mut app, _rx) = test_app("orphan-indent");
+        spawn_agent(&mut app, 1, 0, 1, "1", None);
+        spawn_agent(&mut app, 2, 1, 2, "2", None);
+        app.tree.finish(AgentId(2), Some("done".to_string()));
+        app.tree.result_read(AgentId(2));
+
+        // The pane's own columns only: the bar and the chat name agents too.
+        let row = |app: &mut App| -> String {
+            screen(app, 80, 24)
+                .into_iter()
+                .map(|row| row.chars().take(31).collect::<String>())
+                .find(|row| row.contains("#2"))
+                .expect("the row for #2 is painted")
+        };
+
+        // Under its parent, the row wears its nesting: two levels in, which is
+        // where it was spawned.
+        let nested = row(&mut app);
+        assert!(
+            nested.starts_with("     ✓ #2 2  done"),
+            "a child under its parent is painted two levels in: {nested:?}"
+        );
+
+        app.tree.reap(&[AgentId(1)]);
+
+        assert_eq!(
+            app.tree.node(AgentId(2)).unwrap().depth,
+            2,
+            "the stored depth is where it was spawned, and nothing may rewrite it"
+        );
+        let orphaned = row(&mut app);
+        assert!(
+            orphaned.starts_with(" ✓ #2 2  done"),
+            "a row whose parent is gone is painted at the top level: {orphaned:?}"
+        );
+    }
+
     /// A napping root with live children is derived from the tree: nobody has
     /// to remember to write it, so it cannot be forgotten either.
     #[test]
