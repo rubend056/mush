@@ -1344,9 +1344,10 @@ transitions.
   `python3`, though they do need `git`, and one scenario waits on a real shell
   sleep. `scripts/mock_llm.py` is kept for hand-driven runs; no test and no
   script refers to it.
-- **Live.** Three `#[ignore]`d tests keep the default suite green offline: two
-talk to the configured endpoint (the model list and the shipped reply cap), and
-one makes a TLS handshake against `https://api.deepseek.com`.
+- **Live.** Four `#[ignore]`d tests keep the default suite green offline: two
+talk to the configured endpoint (the model list and the shipped reply cap), one
+makes a TLS handshake against `https://api.deepseek.com` (no key, so a 401 is
+the pass), and one measures a frame against the 16 ms budget on an idle box.
 - **The checks.** `cargo fmt --all --check`, `cargo clippy --all-targets --
   -D warnings`, the unit tests, and the pty resize and cancel scenarios are the
   whole gate; they run anywhere rust and python3 do, so any CI can call them.
@@ -1362,7 +1363,7 @@ Run it:
 
 ```sh
 cargo test                 # offline, fast
-cargo test -- --ignored    # the three live-endpoint checks
+cargo test -- --ignored    # the three live-endpoint checks, plus the frame-budget test
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --resize
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
 ```
