@@ -5664,17 +5664,16 @@ the difference is its six below-the-bar rows, ≈11 more.
 **The conclusion the four support.** Each report's own share is a few percent,
 and 36 "looks duplicated and must stay separate" entries (8 + 8 + 11 + 9) argue
 the remaining repetition is deliberate — a per-surface refusal sentence is not
-the same fact as another surface's. Extraction over these files therefore cannot
-reach a production-line target on its own: the residue is per-surface policy,
-not deletable duplication. What it would need instead, in the reports' own
-terms, is decisions rather than line-shaving — the attach CLI's four subcommands
-rewritten from one table (store report §6, "the one candidate that can make the
-product worse while the tests stay green"); one delivery owner across the child
-and job books, arbitrated by the B24 tests (actor report §2, "the least certain
-number in this document"); and behaviour calls where the two copies genuinely
-disagree, like moving the cap into the output join (actor report §4), which the
-report says is "a behaviour change for the human to call, not a blind edit". A
-target beyond that needs a surface rewritten or deleted, not extracted.
+the same fact as another surface's; the residue is policy, not deletable
+duplication. What the reports ask for instead, in their own terms, is decisions
+rather than line-shaving — the attach CLI's four subcommands rewritten from one
+table (store report §6, "the one candidate that can make the product worse while
+the tests stay green"); one delivery owner across the child and job books,
+arbitrated by the B24 tests (actor report §2, "the least certain number in this
+document"); and behaviour calls where the two copies genuinely disagree, like
+moving the cap into the output join (actor report §4), which the report says is
+"a behaviour change for the human to call, not a blind edit". Past that the road
+is a surface rewritten or deleted, not extracted.
 
 **The contradictions the passes named.** The reports name ten places where two
 roads already disagree rather than merely repeat — the part of the campaign that
