@@ -186,7 +186,7 @@ not fit is refused before the wire. Nothing goes out over the window.
 
 | Context | Keys |
 |---|---|
-| anywhere | `Tab`/`Shift-Tab` cycle panes (agents, chat) · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (stops every agent, restarts the root) · `Ctrl-C` stop the focused agent — an idle one is left alone, and a cancel reaches a model that is still thinking · `Ctrl-X` stop every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning · `Ctrl-F` the focused pane takes the whole screen, and back · `Ctrl-Y` select the transcript: `Enter` copies, `Esc` leaves |
+| anywhere | `Tab`/`Shift-Tab` cycle panes (agents, chat) · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat — stops every agent, restarts the root; with a conversation to lose, the first press says what would go and where it is kept, and the second writes that copy (`.mush/session.json.previous`) and only then clears (an empty chat clears on one press; a copy that cannot be written refuses the key) · `Ctrl-C` stop the focused agent — an idle one is left alone, and a cancel reaches a model that is still thinking · `Ctrl-X` stop every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning · `Ctrl-F` the focused pane takes the whole screen, and back · `Ctrl-Y` select the transcript: `Enter` copies, `Esc` leaves |
 | selecting | `↑`/`↓` move the cursor one transcript line, `Shift` holding the selection while it moves · `PgUp`/`PgDn` ten lines · `Home`/`End` the oldest / newest · `Enter` copy the selection, or the cursor's own line · `Esc` leave without copying · a letter is not typing while this is open: the mode has the keyboard, and `Tab` leaves it |
 | agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them · `←`/`→` the row's parent / its first child · `Enter` show its transcript, keys staying in the tree · `c` cancel it · `Esc` back to the root |
 | chat | typing · `Enter` send · `Shift`/`Alt-Enter` a new line · `Ctrl-V` attach the image on the clipboard · a paste whose every word is an image's path attaches them all (a picture from outside the workspace is copied into `.mush/paste/` first) · `←`/`→`, `Home`/`End` move the box cursor · `Backspace`/`Delete` (at the start of the box, `Backspace` pops the newest attachment) · `Ctrl-U` clear the words, keeping the images · `Ctrl-Z` put back what the box last lost · `↑`/`↓`, `PgUp`/`PgDn` scroll the transcript (the select mode's cursor while it is open) · `Esc` clear the box and its attachments |
@@ -291,8 +291,9 @@ not the mechanism.
 
 - `./.mush/` — workspace-local state, git-ignored by itself: `session.json`
   (the conversation and the whole agent tree, the provider, endpoint and model,
-  a context window you stated, and each agent's last failure), and `wt/` for
-  isolated agents' worktrees.
+  a context window you stated, and each agent's last failure),
+  `session.json.previous` (the conversation the last new chat kept), and `wt/`
+  for isolated agents' worktrees.
 - The platform config directory (e.g. `~/.config/mush/config.json`) —
   machine-global defaults **including the API key**. The key never touches the
   workspace.
