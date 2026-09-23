@@ -1913,10 +1913,11 @@ mod tests {
     }
 
     /// The session the shipped DeepSeek defaults describe, as `--print-config`
-    /// spells it: the window the human asked for, and a reply cap a quarter of
-    /// it under the name every endpoint documents — not the 20_480 a real run
-    /// was cut off at. The cap's *size* is on the line precisely so this can be
-    /// read before a run instead of after one.
+    /// spells it: the window the human asked for, and a reply cap
+    /// `window / REPLY_SHARE_DIVISOR` (`mush_core::config` owns the number,
+    /// `Config::reply_cap` spends it) under the name every endpoint documents —
+    /// not the 20_480 a real run was cut off at. The cap's *size* is on the line
+    /// precisely so this can be read before a run instead of after one.
     #[test]
     fn the_shipped_deepseek_session_reports_the_cap_it_sends() {
         let mut config = Config::new("https://api.deepseek.com", "", None);
