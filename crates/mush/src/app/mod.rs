@@ -73,8 +73,13 @@ pub enum Msg {
         endpoint: String,
         models: Vec<http::Model>,
     },
-    /// A repository read that finished on its own thread.
+    /// A repository read that finished on its own thread. `conversation`
+    /// stamps the read the way [`Msg::Agent`]'s does: a read that outlives a
+    /// `Ctrl-N` belongs to the tree that asked for it, and a new tree must not
+    /// adopt a stat about agents it never had, a status read for a tree that
+    /// is gone, or a sweep decided from that tree's rows (finding D26).
     Git {
+        conversation: ConversationId,
         stats: HashMap<AgentId, git::Stat>,
         status: Option<git::RepoStatus>,
         /// What a sweep found at the worktree of every agent that is *at rest*
@@ -653,8 +658,10 @@ pub struct App {
     ui_tx: Sender<Msg>,
     /// When the git snapshot was last taken, so a long run refreshes it.
     git_at: Option<Instant>,
-    /// A `git` read is already running on its own thread; asking again would
-    /// only queue another one behind it.
+    /// A `git` read for *this* tree is already running on its own thread;
+    /// asking again would only queue another one behind it. A read from an
+    /// older tree is not one: it is dropped when it lands (finding D26), and
+    /// `Ctrl-N` clears this with the tree that started it.
     git_in_flight: bool,
     /// A transient line for the bar: what just happened, or what went wrong.
     /// Work in progress does not live here — it is derived from the phases.
@@ -1084,12 +1091,16 @@ impl App {
     /// subprocesses on the UI thread are dropped frames. This used to fork up to
     /// three per isolated agent, synchronously, every two seconds of a run —
     /// which is felt while an agent works, exactly when the screen is busiest.
+    /// The tree's conversation is stamped on the read before the thread starts,
+    /// because it outlives the tree that asked for it: `Ctrl-N` while one is
+    /// out, and its answer is not news about the next tree (finding D26).
     pub fn refresh_git(&mut self) {
         if self.git_in_flight {
             return;
         }
         self.git_in_flight = true;
         let root = self.ws.root().to_path_buf();
+        let conversation = self.tree.conversation();
         // Resolved here: the tree is UI state, and the worker must not touch it.
         // A nested agent forked from its parent's branch, so that is what its
         // work is measured against; a top-level one forked from HEAD. The node's
@@ -1147,6 +1158,7 @@ impl App {
                 .collect();
             let status = git::status(&root);
             let _ = tx.send(Msg::Git {
+                conversation,
                 stats,
                 status,
                 sweep,
@@ -1154,7 +1166,10 @@ impl App {
         });
     }
 
-    /// Adopt a repository read that finished on its own thread.
+    /// Adopt a repository read that finished on its own thread. Only a read
+    /// stamped with this tree's conversation reaches this door — `update` drops
+    /// the others, so a `Ctrl-N` cannot have an old tree's read adopted here
+    /// (finding D26).
     fn adopt_git(
         &mut self,
         stats: HashMap<AgentId, git::Stat>,
@@ -1503,10 +1518,22 @@ impl App {
         match msg {
             Msg::Models { endpoint, models } => self.adopt_models(endpoint, models),
             Msg::Git {
+                conversation,
                 stats,
                 status,
                 sweep,
-            } => self.adopt_git(stats, status, sweep),
+            } => {
+                // A read that outlives the chat that asked for it is not news
+                // about this chat: dropped, the way a stale `Msg::Clipboard`
+                // is. The stats are keyed by agent id and the ids restart with
+                // the tree, so `adopt_git`'s `tree.has` — an id test — would
+                // wave an old agent's stat onto a new row with the same
+                // number; and the sweep is a decision about the old tree's
+                // worktrees (finding D26).
+                if conversation == self.tree.conversation() {
+                    self.adopt_git(stats, status, sweep);
+                }
+            }
             Msg::Paste(text) => {
                 // A paste is something the human wants to say, so it lands in
                 // the message box whichever pane has focus. An open picker is
@@ -3468,6 +3495,12 @@ impl App {
         self.chat.clear();
         self.spin = 0;
         self.discover_worktrees();
+        // A read in flight belongs to the tree that just died: it is dropped
+        // when it lands (`Msg::Git`'s conversation), and the flag has to fall
+        // with it. Left up, this ask — and every later one — would be refused
+        // behind a read whose answer the new tree will never adopt, and the git
+        // facts would freeze at the first Ctrl-N (finding D26).
+        self.git_in_flight = false;
         self.refresh_git();
         // The old conversation is gone from this moment: if the write were left
         // to the debounce, a crash would bring it back with the next start.
@@ -9734,6 +9767,72 @@ mod tests {
         let (line, kind) = app.status_line().expect("the writer's failure");
         assert_eq!(kind, StatusKind::Error);
         assert!(line.contains("no clipboard writer"), "{line}");
+    }
+
+    /// A `git` read carries the conversation that asked for it, so one that
+    /// lands after `Ctrl-N` is dropped: its stats name agents by number (an id
+    /// test, not an identity test — the numbers restart with the tree), its
+    /// status is a reading of a tree that is gone, and its sweep decides about
+    /// the old tree's worktrees. It must not clear the new tree's own read
+    /// either, and the new chat has to leave that read able to start at all:
+    /// the flag the old read left up would otherwise refuse every later ask
+    /// (finding D26 — suspected, mechanism read, so this pins the drop and not
+    /// a live failure).
+    #[test]
+    fn a_git_read_from_the_old_chat_does_not_touch_the_new_tree() {
+        let (mut app, rx) = test_app("stale-git");
+        let old = app.tree.conversation();
+        // The first tree's read is out (`App::new` asks for one), so a new
+        // chat that kept the flag up would never start its own.
+        assert!(app.git_in_flight, "the first tree's read is out");
+        new_chat(&mut app);
+        assert_ne!(old, app.tree.conversation(), "a fresh conversation");
+        assert!(app.git_in_flight, "and the new tree's own read is out");
+        // A row the old read's stats could land on: the numbers restart with
+        // the tree, which is exactly what makes an id test wrong.
+        spawn_agent(&mut app, 1, 0, 1, "the new tree's own", None);
+
+        app.update(Msg::Git {
+            conversation: old,
+            stats: HashMap::from([(
+                AgentId(1),
+                git::Stat {
+                    files: 4,
+                    added: 40,
+                    removed: 4,
+                },
+            )]),
+            status: Some(git::RepoStatus {
+                branch: "the-dead-tree".to_string(),
+                dirty: 9,
+                stat: git::Stat {
+                    files: 1,
+                    added: 1,
+                    removed: 1,
+                },
+            }),
+            sweep: vec![],
+        });
+
+        assert!(
+            app.tree.agent_stats.is_empty(),
+            "no stat from a tree that never held this id: {:?}",
+            app.tree.agent_stats
+        );
+        assert!(app.git.is_none(), "no status either");
+        assert!(app.git_at.is_none(), "and it is not this tree's own read");
+        assert!(
+            app.git_in_flight,
+            "the new tree's read is still its own to finish"
+        );
+
+        // The new tree's read lands and clears the flag: the dropped one did
+        // not leave mush unable to read git again.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while app.git_in_flight && Instant::now() < deadline {
+            wait_git(&mut app, &rx);
+        }
+        assert!(!app.git_in_flight, "the new tree's read landed");
     }
 
     /// Backspace takes the thing immediately before the cursor, and at the very
