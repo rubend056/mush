@@ -323,8 +323,8 @@ them (its finding was B7; A5 turned out to be closed already: `rederive_context`
 runs on every runtime switch).
 
 **Stage 2 — the seams.** ✅ Rewrite the `#[ignore]`d actor tests in-process and
-delete `scripts/mock_llm.py` from the test path (keep it for the pty smoke
-scenarios if they still want a scripted model). *Done when* the default suite
+delete `scripts/mock_llm.py` from the test path (it stays for hand-driven runs;
+nothing in the repo calls it). *Done when* the default suite
 needs no socket, no subprocess and no sleep over 50 ms, and `--ignored` contains
 only live-endpoint tests — held: the actor scenarios it used to hold (five, not
 the four this line first claimed; more have grown beside them since) run in the
@@ -361,8 +361,8 @@ in the second request, a run kept past the old 200-turn ceiling that ends on the
 model's own stop (H45). Gone with
 them: `start_mock*`, `stop_mock`, the four port constants (18731–18735), the
 `python3` readiness probe, and every sleep over 20 ms in these tests.
-`scripts/mock_llm.py` stays in the tree for the pty smoke scenarios; no test
-refers to it. The only surface the production code grew is `#[cfg(test)]`:
+`scripts/mock_llm.py` stays in the tree for hand-driven runs; no test, and
+nothing else in the repo, refers to it. The only surface the production code grew is `#[cfg(test)]`:
 `agent::spawn_scripted`, which starts the same root actor over a caller-supplied
 client.
 
