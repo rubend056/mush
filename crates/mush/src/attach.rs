@@ -22,7 +22,7 @@
 //! with `conflict` rather than guessing.
 
 use std::io::{self, BufRead, BufReader, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -167,17 +167,61 @@ fn bound_words(bound: Duration) -> String {
     }
 }
 
+/// Ask the name at `path` what it is before either side follows it: `Ok(true)`
+/// when a socket holds it, `Ok(false)` when nothing does, `Err(sentence)` for
+/// anything else — a symlink, a directory, a plain file.
+///
+/// `Path::exists` follows a symlink and so do `bind` and `connect`, so a
+/// same-user process could plant `.mush/mush.sock` as a link to its own
+/// socket: the server's liveness probe would reach the stranger (and the bind
+/// then fail, disabling attach for the session), while `mush read`/`edit
+/// --send` would answer from — and steer — whatever the link points at. Both
+/// sides ask first, and a name that is not a socket is refused with a sentence
+/// naming what it is, never followed (finding IN8). A socket or an absent name
+/// goes on to the caller's own rule; a name whose shape cannot be read at all
+/// is a refusal too, because a name that cannot be established is not one to
+/// trust.
+fn a_socket_holds(path: &Path) -> Result<bool, String> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_socket() => Ok(true),
+        Ok(meta) => Err(format!(
+            "{} is {} — the attach surface only takes a socket, and a name that is not one is never followed",
+            path.display(),
+            shape_words(&meta.file_type())
+        )),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(format!("could not ask what {} is: {error}", path.display())),
+    }
+}
+
+/// The shape of a name, in the words [`a_socket_holds`] refuses with.
+fn shape_words(kind: &std::fs::FileType) -> &'static str {
+    if kind.is_symlink() {
+        "a symlink"
+    } else if kind.is_dir() {
+        "a directory"
+    } else if kind.is_file() {
+        "a regular file"
+    } else if kind.is_fifo() {
+        "a fifo"
+    } else {
+        "not a socket"
+    }
+}
+
 /// Bind the socket and serve it on a thread of its own.
 ///
 /// A bind that fails is never fatal — mush runs without attach and says so on
-/// stderr — so the error is returned rather than raised. A socket *file* with
-/// nothing listening behind it is a crash's leftover, not a live mush, and is
-/// cleared so this bind can take the name; a file a live listener holds is
-/// another mush, and the bind refuses the name rather than stealing its
-/// socket. A listener that takes longer than [`CONNECT_TIMEOUT`] to answer the
-/// probe is neither of those: a full accept queue also leaves a live listener's
-/// connect waiting, so the file is left in place rather than cleared, and the
-/// serve fails.
+/// stderr — so the error is returned rather than raised. The name's shape is
+/// asked before anything else: a name that is not a socket is refused with a
+/// sentence naming what it is, and never followed (finding IN8). A socket
+/// *file* with nothing listening behind it is a crash's leftover, not a live
+/// mush, and is cleared so this bind can take the name; a file a live listener
+/// holds is another mush, and the bind refuses the name rather than stealing
+/// its socket. A listener that takes longer than [`CONNECT_TIMEOUT`] to answer
+/// the probe is neither of those: a full accept queue also leaves a live
+/// listener's connect waiting, so the file is left in place rather than
+/// cleared, and the serve fails.
 pub fn serve(root: &Path, ui_tx: Sender<Msg>) -> Result<Guard, String> {
     serve_with(root, ui_tx, LIMITS, CONNECT_TIMEOUT, spawn_accept_loop)
 }
@@ -217,7 +261,10 @@ fn serve_with(
     start: impl FnOnce(UnixListener, Sender<Msg>, Limits) -> Result<(), String>,
 ) -> Result<Guard, String> {
     let path = socket_path(root);
-    if path.exists() {
+    // Only a socket — or no name at all — reaches the probe and the bind: a
+    // name that is not a socket is refused with a sentence, never followed
+    // (finding IN8).
+    if a_socket_holds(&path)? {
         match connect_bounded(&path, bound) {
             // A live listener holds the name; the bind below is what refuses to
             // steal it.
@@ -505,9 +552,12 @@ fn peer_label(stream: &UnixStream) -> String {
 /// The CLI's half of the protocol: connect to the socket under `dir`, send one
 /// request, read the one answer. `no mush is running in <dir>` when nothing is
 /// bound there, so the caller's message names the directory the human gave.
-/// The connect is bounded before anything else ([`CONNECT_TIMEOUT`] here,
-/// shorter in a test): a listener whose accept queue never drains is its own
-/// sentence, not a hang and not the same lie.
+/// The name is asked what it is before the connect ([`a_socket_holds`]): a
+/// name that is not a socket is refused with a sentence, never followed, where
+/// `mush read`/`edit --send` would otherwise answer from — and steer — whoever
+/// the name points at (finding IN8). The connect is bounded before anything
+/// else ([`CONNECT_TIMEOUT`] here, shorter in a test): a listener whose accept
+/// queue never drains is its own sentence, not a hang and not the same lie.
 pub fn ask(dir: &Path, request: &Request) -> Result<Response, String> {
     ask_with(dir, request, CONNECT_TIMEOUT)
 }
@@ -521,6 +571,10 @@ pub fn ask(dir: &Path, request: &Request) -> Result<Response, String> {
 /// clients.
 fn ask_with(dir: &Path, request: &Request, bound: Duration) -> Result<Response, String> {
     let socket = socket_path(dir);
+    // The name is asked before the connect follows it: a planted symlink at
+    // the socket's name would otherwise answer for whoever holds the other end
+    // (finding IN8).
+    a_socket_holds(&socket)?;
     let stream = connect_bounded(&socket, bound).map_err(|error| {
         if error.kind() == io::ErrorKind::TimedOut {
             format!(
@@ -1151,6 +1205,92 @@ mod tests {
             }
             Reply::Ok(_) => panic!("expected an error"),
         }
+    }
+
+    /// The socket's name is asked what it *is*, on both sides: a planted
+    /// symlink at `.mush/mush.sock` is refused with a sentence and never
+    /// followed — the server neither probes nor binds through it, and `mush
+    /// read`/`edit --send` do not answer from the stranger it points at
+    /// (finding IN8).
+    #[test]
+    fn a_name_that_is_not_a_socket_is_refused_and_never_followed() {
+        // The stranger: a live listener whose socket the planted link points
+        // at. Non-blocking, so an empty backlog can be told from a connection.
+        let stranger_root = Scratch::new("attach-stranger");
+        let stranger_path = stranger_root.join("stranger.sock");
+        let stranger = UnixListener::bind(&stranger_path).unwrap();
+        stranger.set_nonblocking(true).unwrap();
+
+        let root = Scratch::new("attach-planted");
+        std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+        let name = socket_path(&root);
+        std::os::unix::fs::symlink(&stranger_path, &name).unwrap();
+
+        // The server refuses the name by what it is, and leaves it alone.
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let error = match serve(&root, tx) {
+            Ok(_) => panic!("a name that is not a socket must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            error.contains("symlink"),
+            "the refusal names what the name is: {error}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&name)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted link is still there: nothing replaced or removed it"
+        );
+
+        // Neither side followed the link: a connect would have queued a
+        // connection in the stranger's backlog, and nothing has.
+        assert!(
+            matches!(stranger.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock),
+            "the stranger was never connected to"
+        );
+
+        // The CLI refuses the same name in the same words.
+        let request = Request {
+            id: json!(1),
+            op: Op::Agents,
+        };
+        let error = ask(&root, &request).unwrap_err();
+        assert!(
+            error.contains("symlink"),
+            "the CLI names what the name is: {error}"
+        );
+
+        // Every other shape takes the same road, both sides, refused by name:
+        // a plain file, a directory and a dangling link are not sockets either.
+        let not_a_socket = |label: &str, shape: &str, plant: fn(&Path)| {
+            let root = Scratch::new(label);
+            std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+            let name = socket_path(&root);
+            plant(&name);
+            let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+            let error = match serve(&root, tx) {
+                Ok(_) => panic!("{label}: a name that is not a socket must be refused"),
+                Err(error) => error,
+            };
+            assert!(error.contains(shape), "{label} server: {error}");
+            let request = Request {
+                id: json!(2),
+                op: Op::Agents,
+            };
+            let error = ask(&root, &request).unwrap_err();
+            assert!(error.contains(shape), "{label} CLI: {error}");
+        };
+        not_a_socket("attach-file", "regular file", |path| {
+            std::fs::write(path, "not a socket").unwrap();
+        });
+        not_a_socket("attach-dir", "directory", |path| {
+            std::fs::create_dir(path).unwrap();
+        });
+        not_a_socket("attach-dangling", "symlink", |path| {
+            std::os::unix::fs::symlink(path.with_extension("gone"), path).unwrap();
+        });
     }
 
     /// A socket file with nothing listening behind it is a crash's leftover and
