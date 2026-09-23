@@ -1206,8 +1206,14 @@ impl Chat {
     /// gate's room is the room the run will find, and the meter's fraction is
     /// the fraction of the request that follows.
     ///
-    /// An agent whose prompt has not been published, or that has no transcript
-    /// at all, weighs nothing. The prompt counted is the agent's own: the
+    /// An agent whose prompt has not been published weighs nothing: the number
+    /// is the actor's fact, not this table's guess. One whose prompt *has* been
+    /// published and that has said nothing yet weighs exactly that prompt — the
+    /// window between `AgentEvent::SystemPrompt` and the first `Message` is one
+    /// frame wide, and a meter or attach gate that read 0 there would be a
+    /// whole prompt short of the request it is pricing (finding D16; the early
+    /// return this replaced is why the audit measured 0 against a 3,006-byte
+    /// prompt). The prompt counted is the agent's own: the
     /// root's is the conversation's ([`Self::system`], which the root actor is
     /// handed with every run), and a child's is the one its actor published
     /// ([`Self::learn_system`]) — a child's prompt names the child's own
@@ -3601,6 +3607,43 @@ mod tests {
         let mut lines = Vec::new();
         render_message(&mut lines, message, voice, width, reasoning, fold);
         lines
+    }
+
+    /// The window between the two events an actor's first turn is made of: the
+    /// prompt is published (`AgentEvent::SystemPrompt`) and the first message
+    /// has not arrived yet. The meter, the bar and every attach gate that reads
+    /// the room left must weigh the prompt the actor *will* send — the audit
+    /// measured this window at 0 against a 3,006-byte prompt, a whole prompt
+    /// short (D16), and the bounded view is where it closed. This is the pin.
+    #[test]
+    fn an_agent_whose_actor_said_its_prompt_weighs_it_even_with_nothing_said() {
+        let budget = 500_000;
+        let mut chat = Chat::bare();
+        assert_eq!(
+            chat.used_weight_for(AgentId(1), budget),
+            0,
+            "no actor has said anything yet: an unpublished prompt weighs nothing"
+        );
+
+        // The actor's own prompt, published before the run it opens.
+        let prompt = Message::system("x".repeat(3_000).as_str());
+        let prompt_weight = prompt.weight();
+        assert_eq!(prompt_weight, 3_006, "the audit's own measurement");
+        chat.learn_system(AgentId(1), prompt);
+        assert_eq!(
+            chat.used_weight_for(AgentId(1), budget),
+            prompt_weight,
+            "nothing said yet: the prompt is the whole weight"
+        );
+
+        // The first line joins the prompt, it does not replace it.
+        chat.push_message(AgentId(1), Message::user("hi"));
+        assert_eq!(
+            chat.used_weight_for(AgentId(1), budget),
+            prompt_weight + Message::user("hi").weight(),
+            "the audit's after one line: 3,006 + 6"
+        );
+        assert_eq!(chat.used_weight_for(AgentId(1), budget), 3_012);
     }
 
     /// A 40×10 terminal leaves the transcript pane one row tall, and every
