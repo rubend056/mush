@@ -1023,9 +1023,12 @@ profile uses `lto = "thin"`, `codegen-units = 1`, `strip = true`.
 What bounds a request, and why an unreachable endpoint cannot hang startup: the
 phase deadlines and the read slices that let Ctrl-C stop a model that has not
 answered live in `crates/mush/src/http.rs` (`CONNECT_TIMEOUT`, `WRITE_TIMEOUT`,
-`RESOLVE_TIMEOUT`, `LIST_READ_TIMEOUT`, `CHAT_DEADLINE`). If a server rejects a
-request over its context length, mush reads the number out of the complaint,
-tells the UI, and retries once — a backstop, not the mechanism.
+`RESOLVE_TIMEOUT`, `LIST_READ_TIMEOUT`); the deadline those phases fit inside,
+and the retry rule itself, are `crates/mush/src/model.rs`'s (`CHAT_DEADLINE`,
+`RETRY_ATTEMPTS`, `retrying`), and the transport is handed the deadline as an
+argument. If a server rejects a request over its context length, mush reads the
+number out of the complaint, tells the UI, and retries once — a backstop, not
+the mechanism.
 
 ---
 

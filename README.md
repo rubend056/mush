@@ -343,8 +343,9 @@ already have read, run and charged for the request: a connection reset, an
 unexpected end of stream, a read timeout, a 4xx or 5xx status, a reply past the
 body cap, a body that did not parse. One ask spends one deadline (ten minutes),
 and every attempt — and the backoff between them — gets only what is left of it.
-The phase ceilings, the read slices that make Ctrl-C work, and the retry rule's
-own code: `crates/mush/src/http.rs`.
+The phase ceilings and the read slices that make Ctrl-C work:
+`crates/mush/src/http.rs`; the call's whole deadline and the retry rule's own
+code: `crates/mush/src/model.rs`.
 
 ## Context window
 
