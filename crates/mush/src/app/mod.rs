@@ -4161,12 +4161,12 @@ impl App {
     /// clipboard, and every other key is the chat's own.
     ///
     /// The mode belongs to the conversation the chat pane shows, so the agent
-    /// here is [`Tree::focused`] — the same agent every other chat key is about.
-    /// A pane with nothing to stand on says so in the bar rather than opening a
-    /// cursor over nothing, and so does an `Enter` whose copy did not happen:
-    /// [`Chat::select_apply`]'s `None` is a mode left with no line under it, and
-    /// a silent `Enter` was half of finding D18 (the focus-change half is
-    /// [`Self::attach_focus`]'s).
+    /// here is [`AgentTree::focused`] — the same agent every other chat key is
+    /// about. A pane with nothing to stand on says so in the bar rather than
+    /// opening a cursor over nothing, and so does an `Enter` whose copy did not
+    /// happen: [`Chat::select_apply`]'s `None` is a mode left with no line
+    /// under it, and a silent `Enter` was half of finding D18 (the focus-change
+    /// half is [`Self::attach_focus`]'s).
     ///
     /// `Ctrl-Y` is app-wide, so one state has to be refused *before* the chat
     /// is asked: the zen view with the tree full-screen, where the chat pane is

@@ -1173,9 +1173,9 @@ struct ActorState {
     shared: HashSet<u64>,
     /// The children the history window has reaped are simply absent from
     /// `children`: a report still travelling from one of them is swallowed by
-    /// [`is_forgotten`], whose whole source is that book (see its doc) — there
-    /// is no second set of ids to hold, and nothing per-child grows here for
-    /// the life of an actor (finding A16).
+    /// [`ActorState::is_forgotten`], whose whole source is that book (see its
+    /// doc) — there is no second set of ids to hold, and nothing per-child grows
+    /// here for the life of an actor (finding A16).
     /// How each child's last finished run left its worktree, keyed by the run
     /// that left it: the branch, and whether the work is committed. A listing
     /// fact (`status`), never a delivery: reading it marks nothing, and
@@ -4227,8 +4227,8 @@ fn note_child_book(
 ///
 /// `children` goes first, because it is the book that says whose reports are
 /// news: after this there is no book left to deliver into *and* no report of
-/// the child's that any road will accept ([`is_forgotten`] reads exactly this
-/// map). Every other per-child book follows, so no listing (`work`,
+/// the child's that any road will accept ([`ActorState::is_forgotten`] reads
+/// exactly this map). Every other per-child book follows, so no listing (`work`,
 /// `completed`), no wait (`running`) and no shared-workspace guard (`shared`)
 /// can read a child the tree has dropped.
 fn forget_child(state: &mut ActorState, id: u64) {

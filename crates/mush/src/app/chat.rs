@@ -409,7 +409,7 @@ struct Lost {
 ///
 /// The order is the transcript's: `Line(n)` before `Line(n+1)`, and a message's
 /// `Tail` after every one of its lines. The copy reads that order too: a
-/// selection's text is the source lines its stops cover ([`Stop::span`]).
+/// selection's text is the source lines its stops cover ([`Stops::span`]).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 enum Stop {
     /// An index into `Message::text().split('\n')`.
