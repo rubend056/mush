@@ -93,6 +93,25 @@ pub trait Job: Send {
     /// are the same bytes.
     fn tail(&self, cap: usize) -> (String, String);
 
+    /// The process group this job's command leads, where the machine gave it
+    /// one: the real [`Shell`] starts every command with `process_group(0)`, so
+    /// its leader's pid *is* the group's id.
+    ///
+    /// Test-only: the watcher never needs the number — [`Job::kill`] and
+    /// [`Job::end_group`] reach the group without naming it — and the one
+    /// caller that asks is the fixture that must guard a group the moment it
+    /// exists, before the file that claims to name it has been written.
+    ///
+    /// `None` is the default and the honest answer for a job that leads no
+    /// group of its own: a scripted stand-in, a machine whose commands share
+    /// mush's group. A job that *wraps* another answers `None` too — a decorator
+    /// leads nothing — so a caller that needs the group must ask the job that
+    /// leads it, never a wrapper around it.
+    #[cfg(test)]
+    fn process_group(&self) -> Option<u32> {
+        None
+    }
+
     /// Stop it, and everything still in the process group it was given. The
     /// group is the thing mush can signal, so it is also the reach: a process
     /// that left it (`setsid`, `setpgid`, a daemon that made its own session)
@@ -332,6 +351,21 @@ impl Job for Running {
 
     fn tail(&self, cap: usize) -> (String, String) {
         (self.out.read_tail(cap), self.err.read_tail(cap))
+    }
+
+    #[cfg(test)]
+    fn process_group(&self) -> Option<u32> {
+        // `Shell` gave the child `process_group(0)`, so the leader's pid is the
+        // group's id the moment the child exists; a platform without process
+        // groups has none to name.
+        #[cfg(unix)]
+        {
+            Some(self.child.id())
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
     }
 
     fn kill(&mut self) {
@@ -1225,44 +1259,187 @@ mod tests {
             .expect("this box has a kill program")
     }
 
-    /// A process group that must not outlive its test: an assertion that fails
-    /// before the kill would otherwise leave a spinning shell behind, so the
-    /// guard signals the group in process the way the fix does.
+    /// How long a guarded group is given to show it is up: time for the shell
+    /// to start, run `echo $$ > pgid`, and have the file readable and
+    /// parseable. The same bound the fixture had before the guard existed — the
+    /// difference is what passing it now does.
     #[cfg(unix)]
-    struct GroupGuard(i32);
+    const GROUP_START: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The command the waiting fixture runs. It writes its group id to `pgid`
+    /// — `$$` is the shell's pid, and `process_group(0)` made that pid the
+    /// group's id — and then blocks on a member it does not wait on, so a group
+    /// signal has something to end (the shape finding E6 is about).
+    #[cfg(unix)]
+    const WAITING: &str = "echo $$ > pgid; while :; do :; done & wait";
+
+    /// A process group a test spawned, owned from the moment it exists: the
+    /// guard holds the job the spawn returned and its `Drop` ends the group
+    /// through it, so every exit — a panic in the fixture's check, a failing
+    /// assertion in the caller, a deadline — ends the group.
+    ///
+    /// The guard comes *before* the read on purpose. `echo $$ > pgid` truncates
+    /// the file before it writes, so a read can catch the empty window, and
+    /// under load the shell may not have started at all. The fixture this
+    /// replaces read the file first, with `unwrap`s, and left the guard to its
+    /// caller: a parse of the empty window or a run past the deadline panicked
+    /// before any guard existed, and the group spun until somebody noticed it
+    /// in `htop`. The group id here is the job's own ([`super::Job::process_group`]:
+    /// the leader's pid, `process_group(0)`), never the file's — the file is
+    /// only the check that the shell is up.
+    #[cfg(unix)]
+    struct GroupGuard {
+        job: Box<dyn super::Job>,
+        /// Taken from the job while it is certainly alive, so no file has to
+        /// arrive before the group can be ended or named.
+        pgid: u32,
+    }
+
+    #[cfg(unix)]
+    impl GroupGuard {
+        /// Own the group the job leads, before anything else is asked of it.
+        fn own(job: Box<dyn super::Job>) -> Self {
+            let pgid = job
+                .process_group()
+                .expect("the real shell gives every command a process group of its own");
+            Self { job, pgid }
+        }
+
+        /// The group id the job named — the fact, where the file is only a
+        /// claim.
+        fn pgid(&self) -> u32 {
+            self.pgid
+        }
+
+        /// The job, for a test that drives the kill road itself.
+        fn job(&mut self) -> &mut dyn super::Job {
+            &mut *self.job
+        }
+    }
 
     #[cfg(unix)]
     impl Drop for GroupGuard {
         fn drop(&mut self) {
-            let _ = super::kill_group(self.0 as u32);
+            // A job that ended by itself is not killed at an id its leader's
+            // reap may have freed (finding E6); what it left is taken only
+            // where a member proves the id is still its own, which is what
+            // `end_group` does. A job still running is killed — the road that
+            // reaches the group it leads.
+            match self.job.poll() {
+                Ok(None) => self.job.kill(),
+                _ => {
+                    let _ = self.job.end_group();
+                }
+            }
         }
     }
 
-    /// One command running in its own process group with a member the leader
-    /// does not wait on, so a group signal has something to end: the shape
-    /// finding E6 is about. The command writes its group id to `pgid` in
-    /// `root` first.
+    /// One command running in its own process group, guarded from the moment
+    /// the group exists, with the group id known from the job rather than from
+    /// the file the command writes.
     #[cfg(unix)]
-    fn waiting_group(root: &std::path::Path) -> (Box<dyn super::Job>, i32) {
+    fn waiting_group(root: &std::path::Path) -> GroupGuard {
+        waiting_group_owned(root, WAITING, GROUP_START, |_| {})
+    }
+
+    /// [`waiting_group`] with its road's pieces named, for the test that drives
+    /// the check to failure: `tell` is handed the group id the moment the guard
+    /// owns it, before the first read, so a caller that expects the failure can
+    /// still name the group the unwind is about to end.
+    #[cfg(unix)]
+    fn waiting_group_owned(
+        root: &std::path::Path,
+        command: &str,
+        deadline: std::time::Duration,
+        tell: impl FnOnce(u32),
+    ) -> GroupGuard {
         use super::{Machine, Shell, ShellCommand};
 
         let job = Shell
-            .spawn(&ShellCommand {
-                command: "echo $$ > pgid; while :; do :; done & wait",
-                root,
-            })
+            .spawn(&ShellCommand { command, root })
             .expect("the real shell starts");
-        let pgid_file = root.join("pgid");
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while !pgid_file.exists() && std::time::Instant::now() < deadline {
+        let group = GroupGuard::own(job);
+        tell(group.pgid());
+        await_pgid_file(root, &group, deadline);
+        group
+    }
+
+    /// Wait, within `deadline`, until `root/pgid` holds the group id the guard
+    /// names: the check that the shell is up and in the group it was given.
+    ///
+    /// The read retries instead of trusting one look: `echo $$ > pgid`
+    /// truncates the file before it writes, so the first read can be the empty
+    /// window, and a parse that fails there is a look taken too early, not a
+    /// failure. Only the deadline is one, and the panic then names what did not
+    /// arrive — the file, or a group id in it. The caller's guard is already
+    /// alive, so saying so ends the group on the way out.
+    #[cfg(unix)]
+    fn await_pgid_file(root: &std::path::Path, group: &GroupGuard, deadline: std::time::Duration) {
+        let path = root.join("pgid");
+        let started = std::time::Instant::now();
+        loop {
+            let last = match std::fs::read_to_string(&path) {
+                Ok(text) => match text.trim().parse::<u32>() {
+                    // A match is the shell saying it is up: `$$` is the
+                    // leader's pid, and the guard's id came from the job.
+                    Ok(seen) if seen == group.pgid() => return,
+                    Ok(seen) => format!(
+                        "{} holds {seen}, not the job's group {}",
+                        path.display(),
+                        group.pgid()
+                    ),
+                    Err(_) => format!("{} held {text:?}, which is not a group id", path.display()),
+                },
+                Err(error) => format!("{} could not be read: {error}", path.display()),
+            };
+            if started.elapsed() >= deadline {
+                panic!("the shell's group id did not arrive within {deadline:?}: {last}");
+            }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        let pgid = std::fs::read_to_string(&pgid_file)
-            .unwrap()
-            .trim()
-            .parse()
-            .unwrap();
-        (job, pgid)
+    }
+
+    /// The fixture's own failure must not leave its group running. The command
+    /// here never writes `pgid`, so the check times out and panics — the road
+    /// the machine leaked on: the read panicked before any guard existed, and
+    /// the spinner outlived the test. The id is the job's, told to this test the
+    /// moment the guard owns the group and before the first read, so the group
+    /// can be named after the unwind; the assertion is that no member of it
+    /// survives, and the failure sentence is the one the fixture owes.
+    #[cfg(unix)]
+    #[test]
+    fn a_group_whose_file_never_arrives_is_ended_by_its_guard() {
+        let root = tempfile::tempdir().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _group = waiting_group_owned(
+                root.path(),
+                "while :; do :; done & wait",
+                std::time::Duration::from_millis(200),
+                |pgid| {
+                    tx.send(pgid).expect("this test is the only reader");
+                },
+            );
+        }));
+
+        let why = failed
+            .expect_err("the check must fail when the file never arrives")
+            .downcast_ref::<String>()
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            why.contains("did not arrive") && why.contains("pgid"),
+            "the failure names what did not arrive: {why}"
+        );
+        let pgid = rx
+            .recv()
+            .expect("the group id came from the job, before the first read");
+        let remaining = crate::jobs::wait_group_gone(pgid as i32);
+        if !remaining.is_empty() {
+            // The sentence below must not leak the group it is about.
+            let _ = super::kill_group(pgid);
+            panic!("the fixture's failure left its group running: {remaining:?}");
+        }
     }
 
     /// Two kills signal the group once. The first takes the leader and its
@@ -1284,15 +1461,14 @@ mod tests {
         let _shimmed = PrependedPath::new(dir.path());
 
         let root = tempfile::tempdir().unwrap();
-        let (mut job, pgid) = waiting_group(root.path());
-        let _guard = GroupGuard(pgid);
-        assert!(!group_members(pgid as u32).is_empty(), "the group is up");
+        let mut group = waiting_group(root.path());
+        assert!(!group_members(group.pgid()).is_empty(), "the group is up");
 
-        job.kill();
-        job.kill();
+        group.job().kill();
+        group.job().kill();
 
         assert!(
-            crate::jobs::wait_group_gone(pgid).is_empty(),
+            crate::jobs::wait_group_gone(group.pgid() as i32).is_empty(),
             "the first kill ended the group"
         );
         assert_eq!(
@@ -1301,7 +1477,7 @@ mod tests {
             "no `kill` program ran: the group signal is in process, once"
         );
         assert_eq!(
-            job.kill_failure(),
+            group.job().kill_failure(),
             None,
             "the second call is a no-op with nothing to report"
         );
@@ -1451,14 +1627,13 @@ mod tests {
         let _shimmed = PrependedPath::new(dir.path());
 
         let root = tempfile::tempdir().unwrap();
-        let (mut job, pgid) = waiting_group(root.path());
-        let _guard = GroupGuard(pgid);
-        assert!(!group_members(pgid as u32).is_empty(), "the group is up");
+        let mut group = waiting_group(root.path());
+        assert!(!group_members(group.pgid()).is_empty(), "the group is up");
 
-        job.kill();
+        group.job().kill();
 
         assert!(
-            crate::jobs::wait_group_gone(pgid).is_empty(),
+            crate::jobs::wait_group_gone(group.pgid() as i32).is_empty(),
             "the group ended without a working `kill` program"
         );
         assert_eq!(
