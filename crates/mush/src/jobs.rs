@@ -487,6 +487,14 @@ impl Live {
         }
     }
 
+    /// The one thing the last kill could not finish, through the same gripped
+    /// handle `kill` goes through: the watcher building the job's completion is
+    /// the reader, so the sentence lands in the window its owner reads
+    /// (finding E6).
+    fn kill_failure(&self) -> Option<String> {
+        self.job.lock().ok().and_then(|job| job.kill_failure())
+    }
+
     /// Whether mush stopped this command from outside its own watcher — a quit
     /// (`kill_all`), a Ctrl-N, or a `Stop` aimed at the agent that started it.
     fn stopped(&self) -> bool {
@@ -608,7 +616,7 @@ impl Drop for Foreground {
     /// Every path that ends the call early kills the command itself
     /// (`wait_bounded` does, before it returns), and a command that ended by
     /// itself must not be signalled afterwards: its process group id is free to
-    /// be handed to somebody else's process, and a `kill -9 -pgid` that landed
+    /// be handed to somebody else's process, and a group signal that landed
     /// there would kill work mush never started. What tells the two apart is
     /// the command's own answer: `poll` saying `Ok(None)` means it has not been
     /// *reaped*, so its pid — and therefore its group id — cannot have been
@@ -663,6 +671,10 @@ impl Job for Foreground {
 
     fn kill(&mut self) {
         self.live.kill();
+    }
+
+    fn kill_failure(&self) -> Option<String> {
+        self.live.kill_failure()
     }
 
     fn end_group(&mut self) -> Result<usize, String> {
@@ -1498,8 +1510,9 @@ fn watch(
     let mut note = String::new();
     // What the command's own end left in its group, when it ended by itself:
     // the completion says so (finding E3). A kill's roads below take the group
-    // themselves ([`Running::kill`]'s `kill -9 -pgid`), so there is nothing
-    // here for them to report.
+    // themselves ([`Running::kill`]'s in-process group signal), so there is
+    // nothing here for them to report — a group that signal could not end is
+    // [`Job::kill_failure`]'s sentence, added to the note below.
     let mut group = GroupEnding::Empty;
     let outcome = loop {
         if live.stop.load(Ordering::SeqCst) {
@@ -1553,6 +1566,18 @@ fn watch(
         }
     };
     let mut tail = live.tail(JOB_TAIL);
+    // A kill that could not end the group is the owner's to read, not a line
+    // for a log: the job's window says so, once, in the same breath as how the
+    // job ended (finding E6). The kill took the leader; this sentence is about
+    // the group it left.
+    if let Some(failure) = live.kill_failure() {
+        let sentence = format!("[mush: could not end the command's process group: {failure}]");
+        note = if note.is_empty() {
+            sentence
+        } else {
+            format!("{note}\n{sentence}")
+        };
+    }
     if !note.is_empty() {
         tail = if tail.is_empty() {
             note
@@ -1902,7 +1927,8 @@ mod tests {
         );
         // And a kill that did not land says *that*, rather than claiming the
         // group was stopped (the failure a silent `let _` used to swallow).
-        let unfinished = GroupEnding::from(Err("`kill -9 -7` answered exit status: 1".into()));
+        let unfinished =
+            GroupEnding::from(Err("could not signal the process group 7: EPERM".into()));
         let failed = JobOutcome::Exited(0).line(
             JobId(2),
             "sleep 60 & echo done",
@@ -1914,7 +1940,10 @@ mod tests {
             failed.contains("mush could not end its process group"),
             "{failed}"
         );
-        assert!(failed.contains("answered"), "{failed}");
+        assert!(
+            failed.contains("EPERM"),
+            "the reason reaches the line: {failed}"
+        );
     }
 
     /// A job that ends by itself reports itself to its owner exactly once, with
@@ -2958,5 +2987,42 @@ mod tests {
         wait_for("the tool call's process group", || {
             group_members(pgid).is_empty()
         });
+    }
+
+    /// A kill that could not end the group leaves one sentence in the job's own
+    /// window: the completion the owner reads says so, once, instead of the
+    /// silent `let _` the group call used to be (finding E6). The job is still
+    /// reported as stopped — the leader died; the sentence is about the group
+    /// the kill left behind.
+    #[test]
+    fn a_failed_kill_leaves_one_sentence_in_the_window() {
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::hangs().kill_fails("could not signal the process group 7: EPERM")),
+        );
+        let (registry, _events, _clock) = registry();
+        let (id, mailbox) = launch(&registry, &machine, 7);
+        assert_eq!(registry.stop(7, id).unwrap(), format!("stopping job {id}"));
+
+        let line = match mailbox.recv_timeout(Duration::from_secs(5)) {
+            Ok(AgentMsg::CommandDone { id: done, line, .. }) => {
+                assert_eq!(done, id);
+                line
+            }
+            other => panic!("no completion for {id}: {other:?}"),
+        };
+        assert!(line.contains("stopped"), "{line}");
+        assert_eq!(
+            line.matches("could not end the command's process group")
+                .count(),
+            1,
+            "one sentence, in the line the owner reads: {line}"
+        );
+        // The window `status` keeps is the line, so the fact outlives the wake
+        // that carried it.
+        assert!(registry
+            .status_for(7)
+            .expect("the finished job stays listed")
+            .contains("could not end the command's process group"));
     }
 }

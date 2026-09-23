@@ -8,12 +8,14 @@
 //! The real impl is the shell as it always was: `sh -c` in the workspace, its
 //! own process group, output to scratch *files* rather than pipes (a pipe is
 //! only complete once every holder exits, so a command that leaves a background
-//! job behind would pin the agent thread past its timeout), and
-//! `kill -9 -pgid` to take the whole group down — when the command's end is
-//! mush's doing ([`Job::kill`]) and when the command ended by itself with the
-//! group still standing ([`Job::end_group`]). One thing is not as it always
-//! was: the child is handed the inherited environment **minus mush's secrets**,
-//! so a command cannot read the provider credential ([`Shell`]).
+//! job behind would pin the agent thread past its timeout), and a `SIGKILL` to
+//! the whole process group — sent in process ([`kill_group`]), so no `kill`
+//! program on `PATH` can stand between mush and a group it must end — when the
+//! command's end is mush's doing ([`Job::kill`]) and when the command ended by
+//! itself with the group still standing ([`Job::end_group`]). One thing is not
+//! as it always was: the child is handed the inherited environment **minus
+//! mush's secrets**, so a command cannot read the provider credential
+//! ([`Shell`]).
 //!
 //! The fake scripts end states, output sizes and kills, so the timeout, the
 //! cancellation and the output cap — the three ways a command *stops* — are
@@ -84,8 +86,27 @@ pub trait Job: Send {
     /// are the same bytes.
     fn tail(&self, cap: usize) -> (String, String);
 
-    /// Stop it and everything it started. Idempotent.
+    /// Stop it and everything it started. Idempotent for real: the second call
+    /// is a no-op, because the first reaped the leader and the id a group call
+    /// would aim at is then free to be handed to somebody else's process group
+    /// (finding E6).
+    ///
+    /// A group the kill could not end is not swallowed: [`Job::kill_failure`]
+    /// owes the one sentence about it, and the job's own window is where the
+    /// watcher says it.
     fn kill(&mut self);
+
+    /// The one thing the last [`Job::kill`] could not finish, if anything: the
+    /// command's process group could not be signalled, so the kill took the
+    /// leader and left the rest of the group behind. A question of its own
+    /// rather than `kill`'s return value because the failure is read in one
+    /// other place — the watcher that builds the job's completion — and the
+    /// second kill is a no-op with nothing to report (finding E6).
+    ///
+    /// `None` for the ordinary kill, and for a job whose kill cannot fail.
+    fn kill_failure(&self) -> Option<String> {
+        None
+    }
 
     /// End what a command that has already ended left behind: the processes
     /// still in its process group, and how many of them that took.
@@ -155,7 +176,13 @@ impl Machine for Shell {
         let child = shell
             .spawn()
             .map_err(|e| format!("could not run command: {e}"))?;
-        Ok(Box::new(Running { child, out, err }))
+        Ok(Box::new(Running {
+            child,
+            out,
+            err,
+            killed: false,
+            failure: None,
+        }))
     }
 }
 
@@ -164,15 +191,22 @@ struct Running {
     child: Child,
     out: Scratch,
     err: Scratch,
+    /// Whether [`Job::kill`] has already run. The first kill reaps the leader,
+    /// which frees the group id; a second signal aimed at it would land on
+    /// whatever group the kernel handed the number to next (finding E6).
+    killed: bool,
+    /// The one sentence a kill that could not end the group owes, read through
+    /// [`Job::kill_failure`] (finding E6).
+    failure: Option<String>,
 }
 
 /// How a finished child ended.
 ///
 /// `ExitStatus::code()` is `None` exactly when a signal ended the process, and
 /// on unix the signal is there to be named instead. The `#[cfg]` is the one the
-/// rest of this module is written around (the process group, `kill -9 -pgid`):
-/// a death by signal is a unix death, and a platform without one has only the
-/// code its own status carries.
+/// rest of this module is written around (the process group, the in-process
+/// `SIGKILL` that ends it): a death by signal is a unix death, and a platform
+/// without one has only the code its own status carries.
 fn ended(status: ExitStatus) -> End {
     #[cfg(unix)]
     {
@@ -214,17 +248,36 @@ impl Job for Running {
     }
 
     fn kill(&mut self) {
-        let group = self.child.id();
+        // A second kill is a no-op (finding E6): the first reaped the leader,
+        // so the id a group signal would aim at is free to be reused, and a
+        // `SIGKILL` at a reused id kills work mush never started. The flag is
+        // the fake's own idempotence made real.
+        if self.killed {
+            return;
+        }
+        self.killed = true;
         let _ = self.child.kill();
         #[cfg(unix)]
         {
-            let _ = scrub(&mut Command::new("kill"))
-                .args(["-9", &format!("-{group}")])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
+            if let Err(error) = kill_group(self.child.id()) {
+                // `ESRCH` is "the group is already gone": the leader's own
+                // death took its last member with it, and there is nothing left
+                // to end. Anything else is the failure the old `kill`
+                // subprocess's discarded `let _` swallowed — a signal that did
+                // not land must not read as one that did (finding E6).
+                if error != rustix::io::Errno::SRCH {
+                    self.failure = Some(format!(
+                        "could not signal the process group {}: {error}",
+                        self.child.id()
+                    ));
+                }
+            }
         }
         let _ = self.child.wait();
+    }
+
+    fn kill_failure(&self) -> Option<String> {
+        self.failure.clone()
     }
 
     fn end_group(&mut self) -> Result<usize, String> {
@@ -242,20 +295,38 @@ impl Job for Running {
         if members.is_empty() {
             return Ok(0);
         }
-        let killed = scrub(&mut Command::new("kill"))
-            .args(["-9", &format!("-{group}")])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-        match killed {
-            Ok(status) if status.success() => Ok(members.len()),
+        match kill_group(group) {
+            Ok(()) => Ok(members.len()),
+            // The members the read found are gone: between the read and the
+            // signal the group died, and claiming to have stopped them would be
+            // a kill that did not happen.
+            Err(rustix::io::Errno::SRCH) => Ok(0),
             // The failure is the completion line's, not the log's: the owner is
             // told the group may still be running (finding E6's silent `let _`
             // is what this arm exists not to repeat).
-            Ok(status) => Err(format!("`kill -9 -{group}` answered {status}")),
-            Err(error) => Err(format!("`kill -9 -{group}` could not run: {error}")),
+            Err(error) => Err(format!(
+                "could not signal the process group {group}: {error}"
+            )),
         }
     }
+}
+
+/// `SIGKILL` to a whole process group, in process.
+///
+/// This used to be `Command::new("kill")` with `-9 -<pgid>`: a fork/exec whose
+/// failure was an `ExitStatus` a `let _` could swallow, and which did nothing at
+/// all on a machine where `kill` is not on `PATH` (finding E6). The signal is a
+/// syscall, and `rustix` wraps it without `unsafe`; nothing about ending a group
+/// mush started should depend on a program the environment can hide.
+///
+/// `ESRCH` — "the group is already gone" — is returned rather than read here:
+/// [`Job::kill`] reads it as a kill that had nothing left to take, and
+/// [`Job::end_group`] as nothing left to end.
+#[cfg(unix)]
+fn kill_group(group: u32) -> Result<(), rustix::io::Errno> {
+    let pgid = rustix::process::Pid::from_raw(group as i32)
+        .expect("a child's pid is never 0, and a process group id is a pid");
+    rustix::process::kill_process_group(pgid, rustix::process::Signal::KILL)
 }
 
 /// The pids a process group still holds, read from `/proc`.
@@ -462,6 +533,10 @@ pub(crate) mod fake {
         /// the `cmd &` shape, scripted, so the completion line and the kill
         /// are asserted without a real `sleep`.
         pub left_behind: usize,
+        /// The sentence a kill answers with instead of ending the group: the
+        /// shape finding E6's report is asserted on. `None` is the ordinary
+        /// kill, and either way a second kill is a no-op.
+        pub kill_error: Option<String>,
     }
 
     impl Script {
@@ -516,6 +591,12 @@ pub(crate) mod fake {
             self.left_behind = processes;
             self
         }
+
+        /// A kill that cannot end the group, saying this (finding E6).
+        pub fn kill_fails(mut self, why: &str) -> Self {
+            self.kill_error = Some(why.to_string());
+            self
+        }
     }
 
     /// A machine that runs whatever the test wrote down, in order.
@@ -566,6 +647,7 @@ pub(crate) mod fake {
                 polls: 0,
                 written: 0,
                 killed: false,
+                failure: None,
                 kills: self.kills.clone(),
             }))
         }
@@ -576,6 +658,9 @@ pub(crate) mod fake {
         polls: usize,
         written: u64,
         killed: bool,
+        /// What a kill that could not end the group said; read once by the
+        /// watcher building the completion (finding E6).
+        failure: Option<String>,
         kills: Arc<AtomicUsize>,
     }
 
@@ -586,8 +671,8 @@ pub(crate) mod fake {
             self.polls += 1;
             // A killed command is a *dead* command, and the real shell says so:
             // the child is reaped with no exit code at all, which is a death by
-            // signal — `kill` sends `SIGKILL`, and `Running::kill` follows with
-            // `kill -9 -pgid` for the group. A fake that kept a killed command
+            // signal — `Running::kill` sends `SIGKILL` to the child and to its
+            // group in process. A fake that kept a killed command
             // "running" forever could not tell a watcher that noticed the kill
             // from one that slept through it — which is finding S4's whole
             // question — so the death is scripted here too, signal and all.
@@ -627,7 +712,12 @@ pub(crate) mod fake {
             if !self.killed {
                 self.killed = true;
                 self.kills.fetch_add(1, Ordering::SeqCst);
+                self.failure = self.script.kill_error.clone();
             }
+        }
+
+        fn kill_failure(&self) -> Option<String> {
+            self.failure.clone()
         }
 
         fn end_group(&mut self) -> Result<usize, String> {
@@ -763,6 +853,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_command_keeps_the_environment_it_needs() {
+        // The `PATH` swap finding E6's shim tests do is process-wide: hold the
+        // same lock, so the child's `PATH` and the parent's are read in one
+        // state.
+        let _path = PATH_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let out = dir.path().join("path");
         let end = run_to_end(&format!("printenv PATH > {}", out.display()), dir.path());
@@ -836,5 +932,192 @@ mod tests {
         for path in &paths {
             let _ = std::fs::remove_file(path);
         }
+    }
+
+    /// The `PATH` is process-wide and the tests run in parallel: the ones that
+    /// prepend a shim hold this, and so does the one that asserts a child's
+    /// `PATH` is the human's — a swap must not be read halfway.
+    #[cfg(unix)]
+    static PATH_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// A `PATH` with `dir` first and the human's own after it: a program in
+    /// `dir` shadows one name (`kill`) without taking `sh`, `sleep` or
+    /// `printenv` out of every other test's environment. The guard puts the
+    /// human's `PATH` back, panic or not.
+    #[cfg(unix)]
+    struct PrependedPath(Option<std::ffi::OsString>);
+
+    #[cfg(unix)]
+    impl PrependedPath {
+        fn new(dir: &std::path::Path) -> Self {
+            let previous = std::env::var_os("PATH");
+            let mut paths = vec![dir.to_path_buf()];
+            paths.extend(
+                previous
+                    .as_deref()
+                    .map(std::env::split_paths)
+                    .into_iter()
+                    .flatten(),
+            );
+            std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+            Self(previous)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for PrependedPath {
+        fn drop(&mut self) {
+            match &self.0 {
+                Some(previous) => std::env::set_var("PATH", previous),
+                None => std::env::remove_var("PATH"),
+            }
+        }
+    }
+
+    /// A `kill` program in `dir`, ahead of the real one on `PATH`, that logs
+    /// every invocation and then does what `body` says. The logging is how a
+    /// test sees the fork/exec road (finding E6): once the group signal is in
+    /// process, the program is never run and the log stays empty.
+    #[cfg(unix)]
+    fn kill_shim(dir: &std::path::Path, body: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let log = dir.join("kill.log");
+        let shim = dir.join("kill");
+        std::fs::write(
+            &shim,
+            format!("#!/bin/sh\necho \"kill $*\" >> {}\n{body}\n", log.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        log
+    }
+
+    /// The real `kill` program's path, found before the shim shadows the name:
+    /// the body a shim delegates to when the test wants the group to die by the
+    /// program's own hand — the road the fix removes.
+    #[cfg(unix)]
+    fn real_kill() -> std::path::PathBuf {
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+            .map(|dir| dir.join("kill"))
+            .find(|path| path.is_file())
+            .expect("this box has a kill program")
+    }
+
+    /// A process group that must not outlive its test: an assertion that fails
+    /// before the kill would otherwise leave a spinning shell behind, so the
+    /// guard signals the group in process the way the fix does.
+    #[cfg(unix)]
+    struct GroupGuard(i32);
+
+    #[cfg(unix)]
+    impl Drop for GroupGuard {
+        fn drop(&mut self) {
+            let _ = super::kill_group(self.0 as u32);
+        }
+    }
+
+    /// One command running in its own process group with a member the leader
+    /// does not wait on, so a group signal has something to end: the shape
+    /// finding E6 is about. The command writes its group id to `pgid` in
+    /// `root` first.
+    #[cfg(unix)]
+    fn waiting_group(root: &std::path::Path) -> (Box<dyn super::Job>, i32) {
+        use super::{Machine, Shell, ShellCommand};
+
+        let job = Shell
+            .spawn(&ShellCommand {
+                command: "echo $$ > pgid; while :; do :; done & wait",
+                root,
+            })
+            .expect("the real shell starts");
+        let pgid_file = root.join("pgid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !pgid_file.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let pgid = std::fs::read_to_string(&pgid_file)
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        (job, pgid)
+    }
+
+    /// Two kills signal the group once. The first takes the leader and its
+    /// group in process; the second is a no-op, because the id the first freed
+    /// may already be somebody else's process group (finding E6). The shim logs
+    /// every time the `kill` program runs — the old road ran it twice, the
+    /// second time at a freed group; the fix runs it not at all.
+    #[cfg(unix)]
+    #[test]
+    fn a_second_kill_signals_nothing() {
+        use super::group_members;
+
+        let _path = PATH_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let real = real_kill();
+        let log = kill_shim(dir.path(), &format!("exec {} \"$@\"", real.display()));
+        let _shimmed = PrependedPath::new(dir.path());
+
+        let root = tempfile::tempdir().unwrap();
+        let (mut job, pgid) = waiting_group(root.path());
+        let _guard = GroupGuard(pgid);
+        assert!(!group_members(pgid as u32).is_empty(), "the group is up");
+
+        job.kill();
+        job.kill();
+
+        assert!(
+            crate::jobs::wait_group_gone(pgid).is_empty(),
+            "the first kill ended the group"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap_or_default(),
+            "",
+            "no `kill` program ran: the group signal is in process, once"
+        );
+        assert_eq!(
+            job.kill_failure(),
+            None,
+            "the second call is a no-op with nothing to report"
+        );
+    }
+
+    /// A group mush must end is ended even where the `kill` program cannot do
+    /// it: the shim answers what a machine without one answers (`exit 127`),
+    /// and the group dies anyway, because the signal is a syscall now (finding
+    /// E6's silent half). The old road's discarded `ExitStatus` left the
+    /// spinner running.
+    #[cfg(unix)]
+    #[test]
+    fn a_kill_without_the_kill_program_still_ends_the_group() {
+        use super::group_members;
+
+        let _path = PATH_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let log = kill_shim(dir.path(), "exit 127");
+        let _shimmed = PrependedPath::new(dir.path());
+
+        let root = tempfile::tempdir().unwrap();
+        let (mut job, pgid) = waiting_group(root.path());
+        let _guard = GroupGuard(pgid);
+        assert!(!group_members(pgid as u32).is_empty(), "the group is up");
+
+        job.kill();
+
+        assert!(
+            crate::jobs::wait_group_gone(pgid).is_empty(),
+            "the group ended without a working `kill` program"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&log).unwrap_or_default(),
+            "",
+            "and the program was never asked"
+        );
     }
 }
