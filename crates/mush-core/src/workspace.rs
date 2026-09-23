@@ -7,6 +7,7 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
+use crate::git;
 use crate::message::Image;
 use crate::session;
 use crate::text;
@@ -15,7 +16,12 @@ use crate::text;
 /// contents are never the workspace's work. Hidden names are *not* skipped —
 /// `.github/`, `.gitignore` and `.env.example` are exactly the files an agent is
 /// asked about (audit of the prompt vs behaviour, row 8) — and neither is
-/// `.mush`, whose session file a model may well be asked to look at.
+/// `.mush`, whose session file a model may well be asked to look at. One
+/// directory under `.mush` *is* skipped, and it is skipped by path rather than
+/// by name: `.mush/wt`, the isolated children's own checkouts
+/// ([`Workspace::is_worktree_path`]). A project's own `wt/` is nobody's
+/// checkout, and `.mush/paste`, `.mush/session.json` and a note beside them are
+/// this workspace's own files.
 const SKIP_DIRS: &[&str] = &[
     ".git",
     "target",
@@ -405,6 +411,15 @@ impl Workspace {
     /// A link that stays inside is not an escape and is not refused: it is the
     /// file the model named, and the returned real path is where a write
     /// through it lands (see [`atomic_write`]) while the link stays a link.
+    ///
+    /// One inside-the-root path is still refused: anything at or under this
+    /// workspace's worktree directory ([`Self::is_worktree_path`]). That is
+    /// where its isolated children have their own git checkouts, so a path
+    /// there names a *sibling* actor's tree rather than this workspace's
+    /// files — a listing of it would answer with a stranger's names and a
+    /// write into it would be committed onto that child's branch (finding
+    /// IN7). The check is asked of the resolved answer, so a link that points
+    /// into the worktrees is refused exactly like the path itself.
     fn real_path(&self, path: &Path, rel: &str) -> Result<PathBuf, String> {
         let mut tail: Vec<OsString> = Vec::new();
         let mut probe = path.to_path_buf();
@@ -421,6 +436,16 @@ impl Workspace {
                     for part in tail.iter().rev() {
                         out.push(part);
                     }
+                    if self.is_worktree_path(&out) {
+                        return Err(format!(
+                            "{rel} is inside {} — a live child agent's own checkout, where the \
+                             child's run-end commit would carry an edit onto its branch while this \
+                             workspace's copy stayed untouched; mush's file tools leave a \
+                             sibling's tree alone (the shell is the road that reaches a worktree \
+                             deliberately)",
+                            git::WORKTREE_DIR
+                        ));
+                    }
                     return Ok(out);
                 }
                 Err(_) => {
@@ -434,6 +459,30 @@ impl Workspace {
                 }
             }
         }
+    }
+
+    /// Whether a real path lies inside this workspace's worktree directory —
+    /// the `.mush/wt` every isolated child is checked out under
+    /// ([`git::worktree_dir`]).
+    ///
+    /// One directory holds one live git checkout per isolated child, and each
+    /// of them is a *sibling's* tree: the child actor runs there with that
+    /// path as its own root and its own branch as the thing its run-end
+    /// `git add -A` commits onto. A file road that reached in would be wrong
+    /// twice at once — a listing would answer with a sibling's checkout names,
+    /// and a write at one of them would be committed by the child's branch
+    /// while the file the model meant to change stayed untouched — so the walk
+    /// does not descend into it and every path [`Self::real_path`] answers is
+    /// checked for it (finding IN7).
+    ///
+    /// The rule is this one directory and not the name `wt`: a project's own
+    /// `wt/` is nobody's checkout. It is not `.mush` either — the session
+    /// file, the pastes and a note beside them are this workspace's own, and
+    /// `SKIP_DIRS`' doc says so. And a workspace rooted *at* a worktree — the
+    /// child's own — has only its own children's checkouts below it, so the
+    /// rule never locks an actor out of its own files.
+    fn is_worktree_path(&self, path: &Path) -> bool {
+        path.starts_with(git::worktree_dir(&self.root))
     }
 
     /// Workspace-relative display path for an absolute path: the name the
@@ -1297,8 +1346,9 @@ impl Workspace {
     }
 
     /// Walk every file under `start` — files only, [`SKIP_DIRS`] by name, no
-    /// symlinked directories — calling `visit` until it answers `false`. A
-    /// `start` that is itself a file visits that one file, so "list this path"
+    /// symlinked directories, and never this workspace's worktree directory
+    /// ([`Self::is_worktree_path`]) — calling `visit` until it answers
+    /// `false`. A `start` that is itself a file visits that one file, so "list this path"
     /// and "search this path" answer about the file the model named instead of
     /// claiming there is nothing there. The start's own type is asked with
     /// `symlink_metadata`, like every child's is: `is_file` would follow a
@@ -1353,7 +1403,7 @@ impl Workspace {
                 };
                 if kind.is_dir() {
                     let name = path.file_name().unwrap_or_default().to_string_lossy();
-                    if !SKIP_DIRS.contains(&name.as_ref()) {
+                    if !SKIP_DIRS.contains(&name.as_ref()) && !self.is_worktree_path(&path) {
                         next.push(path);
                     }
                     continue;
@@ -2275,6 +2325,85 @@ mod tests {
         assert_eq!(unnamed, 1, "the listing says it left one name out");
 
         let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// A live sibling's checkout is not a place mush lists, searches, reads or
+    /// writes (finding IN7). `.mush` is deliberately not skipped — the session
+    /// file is a file a model may be asked to look at — but `.mush/wt/<id>` is
+    /// one live git worktree per isolated child, and every one of them is a
+    /// *sibling's* tree: the walk descended into them, so `list_files("")`
+    /// filled with other agents' checkout names (which sort before the
+    /// workspace's own files), and a path it printed was one `edit_file` wrote
+    /// into a *live* sibling's tree, where that child's own run-end commit
+    /// carried the change onto `mush/<id>` while the file the model meant
+    /// stayed untouched. The positive twin at the end is why the rule is that
+    /// one directory and not the name `wt`: a child actor's own workspace *is*
+    /// `.mush/wt/<id>`, and its own files must stay readable and writable.
+    #[test]
+    fn a_siblings_worktree_is_invisible_to_the_file_roads() {
+        let ws = temp_workspace("worktree-road");
+        let checkout = ws.root().join(".mush/wt/3");
+        fs::create_dir_all(checkout.join("src")).unwrap();
+        fs::write(checkout.join("src/main.rs"), "fn sibling() {}\n").unwrap();
+        fs::write(ws.root().join("main.rs"), "fn mine() {}\n").unwrap();
+        fs::write(ws.root().join(".mush/session.json"), "{}\n").unwrap();
+        fs::create_dir_all(ws.root().join(".mush/paste")).unwrap();
+        fs::write(ws.root().join(".mush/paste/shot.png"), "not an image\n").unwrap();
+
+        // Neither listing answers with the checkout, and the workspace's own
+        // files — `.mush`'s included — still answer.
+        let (listed, _, _) = ws.list_files("", 100).unwrap();
+        assert!(
+            !listed.iter().any(|name| name.starts_with(".mush/wt")),
+            "a sibling's checkout is not listed: {listed:?}"
+        );
+        assert!(listed.contains(&"main.rs".to_string()), "{listed:?}");
+        let mush = ws.list_files(".mush", 100).unwrap().0;
+        assert!(mush.contains(&".mush/session.json".to_string()), "{mush:?}");
+        assert!(
+            mush.contains(&".mush/paste/shot.png".to_string()),
+            "{mush:?}"
+        );
+        assert!(ws.list_files(".mush/wt", 10).is_err());
+
+        // The search never reads the sibling's file.
+        let found = ws.search("fn sibling", "", false, 100).unwrap();
+        assert!(found.matches.is_empty(), "{:?}", found.matches);
+
+        // A read of the path the old listing handed over is refused...
+        let refused = ws
+            .read_window(".mush/wt/3/src/main.rs", 1, 50, 4000)
+            .unwrap_err();
+        assert!(refused.contains(".mush/wt/3/src/main.rs"), "{refused}");
+        assert!(ws.read_file(".mush/wt/3/src/main.rs").is_err());
+
+        // ... and so is a write: the edit cannot land in the sibling's tree.
+        let refused = ws
+            .write_file(".mush/wt/3/src/main.rs", "EDITED\n")
+            .unwrap_err();
+        assert!(refused.contains(".mush/wt/3/src/main.rs"), "{refused}");
+        assert_eq!(
+            fs::read_to_string(checkout.join("src/main.rs")).unwrap(),
+            "fn sibling() {}\n",
+            "nothing landed in the sibling's checkout"
+        );
+        // The rule is the directory, not what it happens to hold: a write to a
+        // path that does not exist yet under it is refused too, so no road can
+        // recreate a checkout-shaped tree.
+        assert!(ws.write_file(".mush/wt/9/new.rs", "x\n").is_err());
+        assert!(!checkout.parent().unwrap().join("9").exists());
+
+        // The positive twin: a workspace rooted *at* a worktree — a child
+        // actor's own — reaches its own files exactly as before.
+        let scratch = Scratch::new("worktree-road-child");
+        let child_root = scratch.path().join(".mush/wt/3");
+        fs::create_dir_all(&child_root).unwrap();
+        fs::write(child_root.join("own.rs"), "fn own() {}\n").unwrap();
+        let child = Workspace::new(&child_root).unwrap();
+        assert_eq!(child.read_file("own.rs").unwrap(), "fn own() {}\n");
+        child.write_file("own.rs", "fn own2() {}\n").unwrap();
+        let (own, _, _) = child.list_files("", 100).unwrap();
+        assert_eq!(own, vec!["own.rs".to_string()]);
     }
 
     #[test]
