@@ -101,8 +101,11 @@ pub fn unknown_job(id: JobId) -> String {
 /// nobody asked to read. Sixteen jobs — `MAX_JOBS` running plus `JOB_HISTORY`
 /// finished — at a full `JOB_TAIL` each would be 32 KB in one answer.
 ///
-/// Spent on the windows rather than on the list, so no job is ever dropped from
-/// a status for being old.
+/// Spent on the windows rather than on the list: this number is how much of
+/// each job's output a status carries, not which jobs it lists. The list's
+/// length is the other two numbers' business — [`MAX_JOBS`] running plus
+/// [`JOB_HISTORY`] ended — and a job *does* leave it for being old:
+/// [`Registry::finish`] forgets the oldest ended record once nine have ended.
 pub const STATUS_WINDOW: usize = 6_000;
 
 /// How much of a job's command a job's line carries, in columns.
