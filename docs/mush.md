@@ -720,7 +720,9 @@ What the audit that shaped this section found, and the defects each rule fixed:
 ```
 
 The API key is never stored here — it lives in the machine-global home config
-(`$MUSH_CONFIG`, else `~/.config/mush/config.json`). `/key` is the one road that
+(`$MUSH_CONFIG`, else `~/.config/mush/config.json`). With `HOME` unset and no
+`MUSH_CONFIG` there is no home config, and mush says so by name rather than
+write one beside the checkout. `/key` is the one road that
 writes it there; `MUSH_API_KEY` supplies one from the environment for the run,
 and no other save copies it into the file. `.mush/.gitignore` containing `*`
 ignores every file in the directory, **including itself**, so the directory never
