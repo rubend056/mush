@@ -36,9 +36,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// every phase of it is bounded by the smaller of its own ceiling and what is
 /// left, so a stalled lookup, connect or write cannot extend it either.
 const LIST_READ_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long one socket read waits before the reader checks for a cancellation.
-/// Short enough that a Stop lands promptly, long enough that a silent endpoint
-/// costs a handful of wake-ups per second, not a spin.
+/// How long one socket read waits before the watch is consulted — and, since a
+/// stalled handshake write cannot be told from a read waiting for the peer's
+/// next flight, the slice the TLS handshake is driven in. Short enough that a
+/// Stop lands promptly, long enough that a silent endpoint costs a handful of
+/// wake-ups per second, not a spin.
 const READ_SLICE: Duration = Duration::from_millis(200);
 /// The ceiling on one blocked write: a request body is small, and a write that
 /// blocks this long is a dead endpoint. A *ceiling*, not a schedule — the write
@@ -511,8 +513,9 @@ fn write_request(
     watch: &Watch,
 ) -> io::Result<()> {
     let mut head = format!(
-        "{} {path} HTTP/1.1\r\nHost: {host}:{port}\r\nConnection: keep-alive\r\nAccept: application/json\r\n",
-        ask.method
+        "{} {path} HTTP/1.1\r\nHost: {}:{port}\r\nConnection: keep-alive\r\nAccept: application/json\r\n",
+        ask.method,
+        host_header(host)
     );
     if let Some(key) = ask.api_key {
         // The key as the doors handed it over: a value that may not carry a
@@ -540,6 +543,23 @@ fn write_request(
         write_bounded(&mut **out, body.as_bytes(), watch)?;
     }
     flush_bounded(&mut **out, watch)
+}
+
+/// The authority a `Host` header spells: the host, with an IPv6 literal
+/// bracketed again.
+///
+/// [`parse_url`] strips the brackets so the literal can be resolved and its
+/// colons are not read as a port separator — but RFC 7230 §5.4 wants the
+/// authority bracketed on the wire, and a server that validates `Host` answers
+/// 400 to `::1:8443`, a refusal the human then reads as the endpoint's fault
+/// (audit IN13). A colon is the whole test: a DNS name has none, and every
+/// colon that survives [`parse_url`] belongs to an IPv6 literal.
+fn host_header(host: &str) -> String {
+    if host.contains(':') {
+        format!("[{host}]")
+    } else {
+        host.to_string()
+    }
 }
 
 /// Write `bytes` whole, and let nothing outlive the call: before every chunk
@@ -604,8 +624,9 @@ fn flush_bounded(out: &mut dyn ReadWrite, watch: &Watch) -> io::Result<()> {
 /// everything an attempt does — the name lookup, the connect, the write, every
 /// read — must fit inside what it was handed. So each phase takes the *smaller*
 /// of its own ceiling ([`CONNECT_TIMEOUT`], [`WRITE_TIMEOUT`],
-/// [`RESOLVE_TIMEOUT`]; [`READ_SLICE`] is polled between reads inside the
-/// deadline) and [`left`](Self::left), and a phase that runs out of the budget
+/// [`RESOLVE_TIMEOUT`]; [`READ_SLICE`] is polled between reads, and between the
+/// TLS handshake's slices, inside the deadline) and [`left`](Self::left), and a
+/// phase that runs out of the budget
 /// says so through [`spend`](Self::spend) — the sentence the deadline itself
 /// uses, so `model.rs` classifies it as the deadline it already is and never as
 /// a wire failure it may ask again. A phase that kept its own schedule instead
@@ -732,10 +753,11 @@ fn is_timeout(error: &io::Error) -> bool {
 /// in a moment instead of being retried around the signal.
 ///
 /// `watch` is the call behind the operation — the request's reads and writes,
-/// the connect, and the name-lookup wait all carry it, so a Stop or a spent
-/// deadline is returned as itself rather than retried after. Only a call with
-/// no request behind it at all passes `None`: the lookup that runs on the
-/// resolver's own thread, where there is no flag to read.
+/// the connect and its TLS handshake, and the name-lookup wait all carry it —
+/// so a Stop or a spent deadline is returned as itself rather than retried
+/// after. Only a call with no request behind it at all passes `None`: the
+/// lookup that runs on the resolver's own thread, where there is no flag to
+/// read.
 fn retrying_interrupted<T>(
     watch: Option<&Watch>,
     mut operation: impl FnMut() -> io::Result<T>,
@@ -876,11 +898,13 @@ fn body_too_large() -> io::Error {
 
 /// Connect to the endpoint. Every step here is bounded by the *call's* deadline
 /// before its own ceiling: the name lookup by [`RESOLVE_TIMEOUT`], the TCP
-/// connect by [`CONNECT_TIMEOUT`], the TLS handshake by what is left, and every
-/// read by [`READ_SLICE`] with the watch between the slices. [`Watch`] owns the
-/// deadline the phases share, and a phase that runs out of it answers in the
-/// watch's own voice — never as a wire failure (finding A19; finding A2's one
-/// deadline).
+/// connect by [`CONNECT_TIMEOUT`], and the reads and the TLS handshake by
+/// [`READ_SLICE`] with the watch between the slices — the handshake's only
+/// ceiling is what is left of the call, because a stalled handshake write and a
+/// read waiting for the peer cannot be told apart (see [`tls_connect`]).
+/// [`Watch`] owns the deadline the phases share, and a phase that runs out of it
+/// answers in the watch's own voice — never as a wire failure (finding A19;
+/// finding A2's one deadline).
 fn connect(host: &str, port: u16, tls: bool, watch: &Watch<'_>) -> io::Result<Box<dyn ReadWrite>> {
     let mut last_error = None;
     // The lookup is the call's first phase: `resolve_bounded` ends its wait at
@@ -923,21 +947,26 @@ fn connect(host: &str, port: u16, tls: bool, watch: &Watch<'_>) -> io::Result<Bo
         if left.is_zero() {
             return Err(watch.spend());
         }
-        stream.set_write_timeout(Some(WRITE_TIMEOUT.min(left)))?;
         if tls {
-            // A TLS handshake is a conversation, not a read, so during setup it
-            // gets the whole remainder; only the reads after it get the short
-            // slice that lets a cancellation land while the model thinks. A
-            // handshake that spends the remainder is the call being over.
-            stream.set_read_timeout(Some(left))?;
-            let stream = match tls_connect(host, stream) {
-                Ok(stream) => stream,
-                Err(error) if is_timeout(&error) => return Err(watch.spend()),
-                Err(error) => return Err(error),
-            };
+            // A TLS handshake is a conversation, not a read: a write stalled
+            // mid-handshake cannot be told from a read waiting for the peer's
+            // next flight, so the phase gets no separate [`WRITE_TIMEOUT`]
+            // ceiling of its own. Both directions are sliced at [`READ_SLICE`],
+            // with the watch asked between slices ([`tls_connect`]), which
+            // makes what is left of the call the phase's only ceiling: a Stop
+            // lands within one slice, and a timeout is either a slice or the
+            // deadline itself — never the write ceiling spoken in the
+            // deadline's voice.
+            stream.set_read_timeout(Some(READ_SLICE))?;
+            stream.set_write_timeout(Some(READ_SLICE))?;
+            let stream = tls_connect(host, stream, watch)?;
+            // The reads that follow still wake every slice; the request's own
+            // writes take their bound per syscall from the write phase, so the
+            // handshake's slice is not a ceiling the request inherits.
             stream.sock.set_read_timeout(Some(READ_SLICE))?;
             return Ok(Box::new(stream));
         }
+        stream.set_write_timeout(Some(WRITE_TIMEOUT.min(left)))?;
         stream.set_read_timeout(Some(READ_SLICE))?;
         return Ok(Box::new(stream));
     }
@@ -1024,9 +1053,21 @@ fn resolve_bounded(
 /// Wrap a TCP connection in TLS for `https://` endpoints, verifying against
 /// the standard web PKI roots. The handshake is driven here so request errors
 /// surface before any body is written.
+///
+/// It is driven in [`READ_SLICE`] slices, with both socket timeouts at that
+/// slice for the phase ([`connect`] sets them), and the watch asked before
+/// every attempt. A handshake gets no separate [`WRITE_TIMEOUT`] ceiling of its
+/// own — a write stalled mid-handshake cannot be told from a read waiting for
+/// the peer's next flight — so the phase's own ceiling is what is left of the
+/// call, the watch owns it, and a Stop lands within one slice (audit IN11). A
+/// timeout is therefore either a slice ending, asked again because rustls keeps
+/// the handshake state when `complete_io` answers the underlying `WouldBlock`,
+/// or the deadline itself, which the watch answers as its own. Never is it
+/// [`WRITE_TIMEOUT`] spoken in the deadline's voice, as the old single arm did.
 fn tls_connect(
     host: &str,
     tcp: TcpStream,
+    watch: &Watch<'_>,
 ) -> io::Result<rustls::StreamOwned<rustls::ClientConnection, TcpStream>> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -1042,8 +1083,22 @@ fn tls_connect(
     // This drives the handshake, both directions of it. A signal landing in the
     // middle of one leaves rustls exactly where it was, so the way to finish it
     // is to ask again — and the way to lose a healthy endpoint is to report
-    // `EINTR` as a bad TLS host instead.
-    retrying_interrupted(None, || stream.flush())?; // completes the handshake
+    // `EINTR` as a bad TLS host instead. A slice ending in a read or write
+    // timeout leaves that same state: ask again while the call has room, and
+    // let the watch end the phase when it has none — a Stop lands within one
+    // slice, and a spent deadline answers in the deadline's own voice.
+    loop {
+        watch.check()?;
+        match retrying_interrupted(Some(watch), || stream.flush()) {
+            Ok(()) => break,
+            Err(error) if is_timeout(&error) => {
+                if watch.at_deadline() {
+                    return Err(watch.spend());
+                }
+            }
+            Err(error) => return Err(error),
+        }
+    }
     Ok(stream)
 }
 
@@ -1339,13 +1394,19 @@ fn read_chunked<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<String>
             break;
         }
         // A chunk-size line *is* the framing, so a size past the cap is a reply
-        // that broke where mush reads it — never an answer mush refuses.
-        // `FFFFFFFF` is what a garbled line parses to, and it is
+        // that broke where mush reads it — never an answer mush refuses. The
+        // claim is compared with the cap's *remainder*, not added to what was
+        // read: `FFFFFFFFFFFFFFFF` is a legal `usize` on a later chunk, and
+        // `out.len() + size` wrapped it back under the cap — a panic in a
+        // debug build, and in release a `body_too_large()` *refusal* that
+        // blamed the endpoint for the framing's own lie. `out.len() <=
+        // MAX_BODY_BYTES` is this loop's invariant, so the subtraction cannot
+        // underflow. `FFFFFFFF` is what a garbled line parses to, and it is
         // indistinguishable from an honest 4 GiB chunk: mush only ever has the
         // claim, so it reports the claim (with the size and the cap in the
         // words) rather than `body_too_large()`'s sentence about a body the
         // endpoint never handed over (finding A10).
-        if out.len() + size > MAX_BODY_BYTES {
+        if size > MAX_BODY_BYTES - out.len() {
             return Err(framing(format!(
                 "a chunk size of {size} bytes would put the body past the {MAX_BODY_BYTES}-byte body cap"
             )));
@@ -1461,6 +1522,49 @@ mod tests {
         assert!(
             elapsed >= Duration::from_millis(250),
             "returned before the cancel was asked for: {elapsed:?}"
+        );
+    }
+
+    /// A Stop has to reach a TLS handshake too. The handshake used to carry no
+    /// watch and to run with the socket's read timeout set to the whole
+    /// remaining call, so the flag was consulted only when that timeout fired —
+    /// up to the ten-minute deadline. The phase is sliced at [`READ_SLICE`]
+    /// now, with the watch asked between slices, so a Stop lands within a slice
+    /// and the call answers `request cancelled` (audit IN11).
+    #[test]
+    fn a_cancelled_tls_handshake_stops_within_a_slice() {
+        use std::net::TcpListener;
+
+        // A peer that accepts the TCP connection and then says nothing: the
+        // ClientHello goes out and no ServerHello ever comes back.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            if let Ok((connection, _)) = listener.accept() {
+                std::thread::sleep(Duration::from_secs(30));
+                drop(connection);
+            }
+        });
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let setter = cancel.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            setter.store(true, Ordering::SeqCst);
+        });
+
+        let watch = Watch::new(Some(&cancel), Duration::from_secs(3), clock::system());
+        let started = Instant::now();
+        let error = match connect("127.0.0.1", port, true, &watch) {
+            Ok(_) => panic!("a silent peer is not a finished handshake"),
+            Err(error) => error,
+        };
+        let elapsed = started.elapsed();
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
+        assert_eq!(error.to_string(), "request cancelled", "{error}");
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "the Stop waited out the socket's own timeout: {elapsed:?}"
         );
     }
 
@@ -1735,6 +1839,41 @@ mod tests {
         assert_eq!(
             up_to_next_header, "\r\n",
             "exactly one CRLF after the bearer token: {sent}"
+        );
+    }
+
+    /// An IPv6 endpoint is addressed with the brackets its URL carried.
+    /// [`parse_url`] strips them so a literal can be resolved — its colons are
+    /// not a port separator — and RFC 7230 §5.4 wants the `Host` header's
+    /// authority bracketed again. A server that validates `Host` answers 400
+    /// to `::1:8443`, and the human reads that as the endpoint's fault (audit
+    /// IN13).
+    #[test]
+    fn an_ipv6_endpoint_is_addressed_with_a_bracketed_host_header() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(wire(&written, &[&ok("{}")]));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| match queue
+            .pop_front()
+        {
+            Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+            None => Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "the test scripted no more connections",
+            )),
+        };
+        send(
+            &Pool::new(),
+            &mut opener,
+            "http://[::1]:8443/v1/chat/completions",
+            "{}",
+        )
+        .unwrap();
+
+        let sent = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        assert!(
+            sent.starts_with("POST /v1/chat/completions HTTP/1.1\r\nHost: [::1]:8443\r\n"),
+            "the Host header brackets the IPv6 literal: {sent}"
         );
     }
 
@@ -2093,6 +2232,51 @@ mod tests {
                 "a chunk size of 4294967295 bytes would put the body past the {MAX_BODY_BYTES}-byte body cap"
             ),
             "the claim names the size it read and the cap it passed"
+        );
+    }
+
+    /// The same refusal one chunk later. A sixteen-hex-digit size is a legal
+    /// `usize` on this target, and with a completed chunk in `out` the old
+    /// check's `out.len() + size` **wrapped**: debug builds panicked with
+    /// *attempt to add with overflow*, and release builds slipped the sum
+    /// under the cap and let `read_exact` raise `body_too_large()` — an answer
+    /// mush *refuses*, blaming the endpoint for the framing's own lie. The
+    /// check compares the claim with the cap's remainder instead, so this is
+    /// the framing refusal the first chunk already gets (finding A10's class,
+    /// one chunk on; audit IN1).
+    #[test]
+    fn a_late_chunk_size_claim_past_the_cap_is_framing_too() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(wire(
+            &written,
+            &["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\nFFFFFFFFFFFFFFFF\r\n0\r\n\r\n"],
+        ));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| match queue
+            .pop_front()
+        {
+            Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+            None => Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "the test scripted no more connections",
+            )),
+        };
+        let pool = Pool::new();
+        let error = send(
+            &pool,
+            &mut opener,
+            "http://models.test:8078/v1/chat/completions",
+            "{}",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(is_framing(&error), "a chunk-size claim is framing: {error}");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "a chunk size of 18446744073709551615 bytes would put the body past the {MAX_BODY_BYTES}-byte body cap"
+            ),
+            "the claim names the wrapped size it read and the cap it passed"
         );
     }
 

@@ -1058,13 +1058,14 @@ impl App {
     /// an ignore rule does not untrack a tracked file — so its rows are not
     /// trusted. A stored id has to be a *child's*: nonzero (0 is
     /// [`AgentId::ROOT`]), not already taken by the root or by a row accepted
-    /// before it, and one the id counter can be kept above — the floor
-    /// [`AgentTree::reserve_agents`] exists to keep (finding B1) — so a
-    /// `u64::MAX` row, which has nothing above it, is refused too. Trusting the
-    /// file instead registered a `0` row *as the root*: its transcript replaced
-    /// the root's conversation on screen and its mailbox replaced the root's
-    /// actor, and a `u64::MAX` row panicked the debug build at `agent.id + 1`
-    /// (finding C9).
+    /// before it, and no larger than [`git::MAX_AGENT_ID`] — the last id whose
+    /// floor, one past it, is still a number the counter can hold *and* count
+    /// from. Trusting the file instead registered a `0` row *as the root*: its
+    /// transcript replaced the root's conversation on screen and its mailbox
+    /// replaced the root's actor, and a `u64::MAX` row panicked the debug build
+    /// at `agent.id + 1` (finding C9) — while the id one *below* the ceiling was
+    /// accepted and pinned the counter at `u64::MAX`, where the next draw's
+    /// `+ 1` overflows (finding IN2).
     ///
     /// A parent link the file does not follow through is *not* a reason to
     /// refuse a row. The tree holds a node whose parent is not in it as the
@@ -1093,22 +1094,32 @@ impl App {
     /// much of the file a row hangs under makes the restore not depend on that,
     /// and leaves the file's own order alone wherever it was already fine.
     ///
-    /// Every row the file names raises the floor before it is judged — refused
-    /// rows included, because the repository may hold a `mush/<id>` branch or a
-    /// `.mush/wt/<id>` checkout whatever the row said. The reservation is
-    /// saturated, and skipped where it saturates: a row at the ceiling has no
-    /// floor above it, and pinning the counter there would hand the next draw a
-    /// number it cannot pass. One bad row is refused and reported in one line;
-    /// the rows after it still restore, because a file is not all-or-nothing.
+    /// Every row the file names that the id space can hold raises the floor
+    /// before it is judged — refused rows included, because the repository may
+    /// hold a `mush/<id>` branch or a `.mush/wt/<id>` checkout whatever the row
+    /// said. A row above [`git::MAX_AGENT_ID`] reserves nothing: it names no id
+    /// a `mush/<id>` branch could be read back from ([`git::worktree_id`]
+    /// refuses every name above that id), so there is no branch for a floor to
+    /// collide with, and there is no floor to keep — the counter cannot be kept
+    /// above such a row, which is why the row is refused. One bad row is refused
+    /// and reported in one line; the rows after it still restore, because a file
+    /// is not all-or-nothing.
     fn vet_stored_agents(
         &mut self,
         stored: Vec<session::AgentSession>,
     ) -> (Vec<session::AgentSession>, Option<String>) {
         let file = self.ws.rel(&session::session_path(self.ws.root()));
         for agent in &stored {
-            let floor = agent.id.saturating_add(1);
-            if floor > agent.id {
-                self.tree.reserve_agents(floor);
+            // A row above the last holdable id names no branch
+            // [`git::worktree_id`] can adopt, so there is nothing for a floor to
+            // collide with — and no floor to keep: the row is refused below.
+            // Reserving `id + 1` anyway would put the counter at or above the
+            // end of the space, where the next draw has no room to count
+            // (finding IN2). Written with `+` and not `saturating_add`: the
+            // guard on this arm is what makes it safe, and a row in this range
+            // cannot reach the end of the `u64` space.
+            if agent.id <= git::MAX_AGENT_ID {
+                self.tree.reserve_agents(agent.id + 1);
             }
         }
         // The file's own links: the first row of each id, and the parent that id
@@ -1123,7 +1134,7 @@ impl App {
         for (index, agent) in stored.iter().enumerate() {
             refused[index] = if agent.id == AgentId::ROOT.0 {
                 Some("it holds the root's id")
-            } else if agent.id == u64::MAX {
+            } else if agent.id > git::MAX_AGENT_ID {
                 Some("the counter cannot be kept above its id")
             } else {
                 match links.entry(agent.id) {
@@ -1198,7 +1209,14 @@ impl App {
         for agent in stored {
             // Keep the counter above every restored id, or the next spawn hands
             // a live child an id a restored agent already holds (finding B1).
-            self.tree.reserve_agents(agent.id + 1);
+            // [`Self::vet_stored_agents`] refused every row above
+            // [`git::MAX_AGENT_ID`] before this loop, so `id + 1` has room; it
+            // is written saturating anyway because the road begins in a file,
+            // and a later edit that moves that vet must not turn a stored id
+            // into an overflow. A saturated floor is the spent space —
+            // [`crate::ids::Ids::next_agent`] answers `None` rather than a name
+            // [`git::worktree_id`] refuses.
+            self.tree.reserve_agents(agent.id.saturating_add(1));
             let (phase, summary) = match &agent.status {
                 session::StoredStatus::Done => (Phase::Done, agent.summary.clone()),
                 session::StoredStatus::Stopped => (Phase::Stopped, agent.summary.clone()),
@@ -1688,9 +1706,9 @@ impl App {
     /// named.
     ///
     /// Every reservation here saturates (`saturating_add`): the id comes from a
-    /// branch name, and a name at the top of the id space has no `id + 1` —
-    /// `worktree_id` refuses that name at the door, and this is the belt for a
-    /// floor that arrives anyway (D3).
+    /// branch name, and a name above [`git::MAX_AGENT_ID`] leaves no floor the
+    /// next draw can count from — `worktree_id` refuses that name at the door,
+    /// and this is the belt for a floor that arrives anyway (D3).
     fn reclaim_isolated(&mut self) {
         let root = self.ws.root().to_path_buf();
         for id in git::isolated_ids(&root).unwrap_or_default() {
@@ -1813,8 +1831,9 @@ impl App {
             // number free spends a spawn on a name git will keep refusing
             // (finding B1, P13). No row is registered for the residue below:
             // reserving a number claims nothing about work. The add saturates:
-            // a name at the top of the space has no `id + 1`, and refusing that
-            // name is `worktree_id`'s job, not this arithmetic's.
+            // a name above the last holdable id leaves no floor the next draw
+            // can count from, and refusing that name is `worktree_id`'s job, not
+            // this arithmetic's.
             self.tree.reserve_agents(id.saturating_add(1));
             // A dead registry entry is git's residue, not a worktree: a row for
             // it would claim a directory that is not there (finding P13).
@@ -8154,6 +8173,56 @@ mod tests {
         assert!(
             app.tree.handles().ids.agents_floor() > 2,
             "the counter is above every id the file held"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The id one *below* the ceiling was the one D3's rule missed: the row was
+    /// accepted, the reservation put the counter at `u64::MAX`, and the next
+    /// draw's `+ 1` was left to overflow — a debug panic, and in release a child
+    /// on the root's own id `0` (finding IN2). The refusal now covers every id
+    /// with no room above it, and the space the file did not spend is still
+    /// drawable.
+    #[test]
+    fn a_stored_id_one_below_the_ceiling_is_refused_and_the_counter_still_answers() {
+        let root = repo("stored-max-minus-one-id");
+        let id = u64::MAX - 1;
+        let stored = stored_with_rows(vec![(
+            id,
+            Some(0),
+            "one below the ceiling",
+            "IMPOSTOR LINE",
+        )]);
+        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+        assert_eq!(
+            app.chat.transcript(AgentId::ROOT)[0].text(),
+            "the root's own words"
+        );
+        assert_eq!(
+            app.tree.agents.len(),
+            1,
+            "no row was registered one below the ceiling"
+        );
+        let lines: Vec<String> = app
+            .chat
+            .notices_for(AgentId::ROOT)
+            .map(|notice| notice.text.clone())
+            .collect();
+        assert!(
+            lines
+                .iter()
+                .any(|line| line.contains("session.json") && line.contains(&id.to_string())),
+            "the refused row is named by file and id: {lines:?}"
+        );
+        let floor = app.tree.handles().ids.agents_floor();
+        assert!(
+            floor <= git::MAX_AGENT_ID,
+            "the counter is still inside the id space: {floor}"
+        );
+        assert!(
+            app.tree.handles().ids.next_agent().is_some(),
+            "so the next draw answers rather than panicking"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
@@ -19108,6 +19177,69 @@ mod tests {
         );
         assert!(
             text_of(&app).contains("mush/18446744073709551615"),
+            "and the refusal names it: {:?}",
+            text_of(&app)
+        );
+        drop(app);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The name one below the ceiling — `mush/18446744073709551614` — is the
+    /// one D3's rule missed: `worktree_id` read it as a child, the sweep left
+    /// the unmerged branch alone and reserved `id + 1`, and the counter stood at
+    /// `u64::MAX` with the next draw's `+ 1` left to overflow — a debug panic,
+    /// and in release a child on the root's own id `0` (finding IN2). Refusing
+    /// every id with no room above it leaves the counter inside the space and
+    /// says the branch's name, exactly as the top name already was.
+    #[test]
+    fn a_branch_one_below_the_ceiling_is_refused_by_name() {
+        use std::fs;
+
+        let root = repo("max-minus-one-agent-id");
+        let name = "mush/18446744073709551614";
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                name,
+                ".mush/wt/max-minus-one",
+            ],
+        );
+        // Unmerged work: a branch already in HEAD is reclaimed before any
+        // reservation, and the pinned counter lives on the held-branch road.
+        let worktree = root.join(".mush/wt/max-minus-one");
+        fs::write(worktree.join("work.txt"), "unmerged\n").unwrap();
+        git(&worktree, &["add", "-A"]);
+        git(&worktree, &["commit", "-qm", "work"]);
+
+        let (mut app, _rx) = app_root(&root, None, session_save::fake::Recorder::new());
+        // `App::new` already discovered the repository; this is the same pass,
+        // read back through the bar, so the sentence asserted below is the one
+        // this road wrote and not something a later refresh replaced.
+        app.discover_worktrees();
+
+        assert!(
+            !app.tree.agents.iter().any(|node| node.id.0 == u64::MAX - 1),
+            "the name is refused, not registered as a child"
+        );
+        let floor = app.tree.handles().ids.agents_floor();
+        assert!(
+            floor <= git::MAX_AGENT_ID,
+            "and the counter stays inside the id space: {floor}"
+        );
+        assert!(
+            app.tree.handles().ids.next_agent().is_some(),
+            "so the next draw still answers"
+        );
+        assert!(
+            git::resolve(&root, name).is_some(),
+            "the branch mush cannot hold as a child is left where it is"
+        );
+        assert!(
+            text_of(&app).contains(name),
             "and the refusal names it: {:?}",
             text_of(&app)
         );

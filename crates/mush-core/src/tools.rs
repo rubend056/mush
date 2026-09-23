@@ -183,6 +183,23 @@ pub fn arg_path(args: &Value, key: &str) -> Result<String, String> {
     }
 }
 
+/// The one key [`sanitize_tool_calls`](crate::transcript::sanitize_tool_calls)
+/// puts on arguments it could not read: the marker is how that fact travels
+/// from the rewrite to the executor.
+///
+/// The rewrite exists because a message whose `arguments` is not a JSON object
+/// is rejected outright by some servers, so the wire has to keep carrying one.
+/// The marker keeps it a valid object *and* names the fact, in place of the
+/// model's broken text: the executor refuses the call on this key, where the
+/// empty `{}` the rewrite used to leave ran the tool on its own defaults —
+/// `list_files` has no required field, so a mangled call answered with a full
+/// listing of the workspace root, a question the model never asked.
+///
+/// `__mush_` is not a namespace a model reaches by accident: no schema
+/// declares a key shaped like it, so a real argument cannot collide with the
+/// marker and the check cannot refuse a readable call.
+pub const UNREADABLE_ARGUMENTS: &str = "__mush_unreadable_arguments";
+
 /// One replacement in a batch. `replace_all` is what a rename needs: the same
 /// pattern several times in a file is otherwise refused as ambiguous.
 #[derive(Clone, Debug)]

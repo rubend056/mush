@@ -324,17 +324,35 @@ pub fn branch_name(id: u64) -> String {
 /// holds.
 pub const MAX_WORKTREES: usize = 70;
 
+/// The largest agent id the id space can hold: `u64::MAX - 2`.
+///
+/// A holdable id needs a floor above it the counter can *count from*, because
+/// mush keeps that floor for as long as the id is named and the draw that takes
+/// the next id adds one more: `id + 1` at the floor has to stay below
+/// `u64::MAX`. At `u64::MAX - 1` the floor is `u64::MAX`, where the next draw's
+/// `+ 1` overflows — a panic in a debug build, and in release a wrap onto the
+/// root's own id `0` — and a draw at such a floor hands out a name
+/// [`worktree_id`] cannot read back, so that child would get no row and no
+/// reclaim. `u64::MAX` itself has nothing above it at all. The id space
+/// therefore ends two below the `u64` ceiling, and every door an outside id
+/// passes — a `mush/<id>` branch name, a stored session row — refuses a larger
+/// one rather than spending the space.
+pub const MAX_AGENT_ID: u64 = u64::MAX - 2;
+
 /// The agent id in a `mush/<id>` branch name, `None` for any other name.
 ///
 /// A branch the human made by hand must not be adopted as mush's leftover, so
 /// everything that is not exactly this shape stays unnamed. Neither does a name
-/// the id space can keep no floor above: the floor mush keeps is one past the
-/// largest id the repository has named, so `mush/18446744073709551615` would
-/// pin that counter at the end of its space and the next draw would overflow
-/// it (`attempt to add with overflow` in a debug build). Refusing the name here
-/// — where every road from a branch to an id passes — keeps the floor usable;
-/// `saturating_add` at the reservation sites is the belt for the roads a
-/// hand-edited file reaches.
+/// above [`MAX_AGENT_ID`]: mush keeps a floor one past the largest id the
+/// repository has named, and the draw that takes the next id adds one more, so
+/// an id the counter cannot be kept above leaves no room to count from.
+/// `mush/18446744073709551615` has no `id + 1` at all — the add itself
+/// overflows, an `attempt to add with overflow` in a debug build — and
+/// `mush/18446744073709551614` has a floor of `u64::MAX`, where the next draw's
+/// `+ 1` overflows: in release it wraps, and the child after the last draw
+/// lands on the root's own id `0`. Refusing the name here — where every road
+/// from a branch to an id passes — keeps the floor usable; `saturating_add` at
+/// the reservation sites is the belt for the roads a hand-edited file reaches.
 ///
 /// Callers that need to tell a refusable name from a branch that was never
 /// mush's ask [`is_child_branch`].
@@ -343,7 +361,7 @@ pub fn worktree_id(branch: &str) -> Option<u64> {
         .strip_prefix(BRANCH_PREFIX)?
         .parse()
         .ok()
-        .filter(|id| *id < u64::MAX)
+        .filter(|id| *id <= MAX_AGENT_ID)
 }
 
 /// Whether `branch` sits in mush's own branch namespace — `mush/<…>`, the shape
@@ -1384,10 +1402,17 @@ mod tests {
         assert_eq!(worktree_id("main"), None);
         assert_eq!(worktree_id("refs/heads/mush/1"), None);
         // The top of the id space has no floor above it, so it names no child
-        // mush could hold; one past the space reads as no name at all.
+        // mush could hold; one past the space reads as no name at all, and the
+        // name one below the top is the one D3's rule missed: its floor is
+        // `u64::MAX`, and the draw after that floor overflows.
         assert_eq!(worktree_id("mush/18446744073709551615"), None);
         assert_eq!(worktree_id("mush/18446744073709551616"), None);
-        assert_eq!(worktree_id("mush/18446744073709551614"), Some(u64::MAX - 1));
+        assert_eq!(
+            worktree_id("mush/18446744073709551614"),
+            None,
+            "a floor of u64::MAX has no room for the next draw's + 1"
+        );
+        assert_eq!(worktree_id("mush/18446744073709551613"), Some(MAX_AGENT_ID));
 
         // The namespace and the id are two questions: a refusable name is still
         // in mush's namespace, and a branch outside it never was mush's.
@@ -1395,6 +1420,25 @@ mod tests {
         assert!(is_child_branch("mush/18446744073709551615"));
         assert!(is_child_branch("mush/x"));
         assert!(!is_child_branch("main"));
+    }
+
+    /// The last holdable id is [`MAX_AGENT_ID`]: it has a floor the counter can
+    /// still count from, while the name above it does not. The drawing half of
+    /// the rule lives in `Ids::next_agent`, but the branch door is where every
+    /// outside road passes, so the equality is pinned here as the fact it is.
+    #[test]
+    fn a_name_with_no_room_to_count_above_its_id_is_not_a_child() {
+        assert_eq!(worktree_id(&branch_name(MAX_AGENT_ID)), Some(MAX_AGENT_ID));
+        assert_eq!(
+            worktree_id(&branch_name(MAX_AGENT_ID + 1)),
+            None,
+            "the floor above it is u64::MAX, where the next draw's + 1 overflows"
+        );
+        assert_eq!(worktree_id(&branch_name(u64::MAX)), None);
+        assert!(
+            is_child_branch(&branch_name(MAX_AGENT_ID + 1)),
+            "and it is still mush's namespace, so a caller names it for the human"
+        );
     }
 
     /// "No commits yet" and "no git at all" are different answers for a human:

@@ -2977,7 +2977,7 @@ mod tests {
         assert!(tree.handles().ids.agents_floor() >= 8);
         assert_ne!(
             tree.handles().ids.next_agent(),
-            AgentId(7),
+            Some(AgentId(7)),
             "the next spawn must not reuse the leftover's id"
         );
     }

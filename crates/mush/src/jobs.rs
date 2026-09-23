@@ -2165,7 +2165,7 @@ mod tests {
         assert_eq!(ids.agents_floor(), 1, "the agent counter did not move");
         assert_eq!(
             ids.next_agent(),
-            AgentId(1),
+            Some(AgentId(1)),
             "and the first child is #1, not #2"
         );
         registry.kill_all();

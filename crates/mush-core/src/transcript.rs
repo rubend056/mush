@@ -12,6 +12,7 @@ use serde_json::Value;
 use std::collections::HashSet;
 
 use crate::message::Message;
+use crate::tools::UNREADABLE_ARGUMENTS;
 
 /// Ceiling on a compaction summary. A summary is prose, not a transcript, but
 /// reasoning tokens count against it too.
@@ -273,8 +274,14 @@ fn drop_orphan_results(messages: &mut Vec<Message>) {
 
 /// A model occasionally emits `tool_call` arguments that are not valid JSON.
 /// Sending that message back into history verbatim makes some servers reject
-/// the whole request with a parse error; rewrite invalid arguments to `{}` so
-/// the tool executor returns a clear per-call error instead.
+/// the whole request with a parse error; rewrite those arguments to a valid
+/// JSON object carrying [`UNREADABLE_ARGUMENTS`] instead. The marker is what
+/// the executor refuses the call on, with one clear sentence — where the `{}`
+/// this used to write did not, because `{}` parses and every tool's defaults
+/// applied: a mangled `list_files` answered with a full listing of the
+/// workspace root, a question the model never asked. The model's broken text
+/// is what must not ride the wire back into history; the marker names the fact
+/// in its place while keeping `arguments` a valid object.
 ///
 /// The ids are already the deserializer's (`tool_calls_from_wire`): a batch
 /// with a missing or repeated id got one there, so it cannot arrive here as
@@ -285,12 +292,14 @@ pub fn sanitize_tool_calls(mut message: Message) -> Message {
     };
     for call in calls {
         // Arguments must be a JSON object; a bare string passes JSON parsing
-        // but makes servers reject the message outright.
+        // but makes servers reject the message outright. The marker object is
+        // what the rewrite leaves in their place: still one valid object, and
+        // one key the executor reads.
         if !matches!(
             serde_json::from_str::<Value>(&call.function.arguments),
             Ok(Value::Object(_))
         ) {
-            call.function.arguments = "{}".to_string();
+            call.function.arguments = format!("{{\"{UNREADABLE_ARGUMENTS}\":true}}");
         }
     }
     message
@@ -1629,6 +1638,22 @@ mod tests {
         let repaired = sanitize_tool_calls(message);
         let calls = repaired.tool_calls();
         assert_eq!(calls[0].function.arguments, "{\"path\": \"ok.rs\"}");
-        assert_eq!(calls[1].function.arguments, "{}");
+        // The unreadable call is not an empty `{}`: that parses, so every
+        // tool's own defaults apply — a mangled `list_files` answered with a
+        // listing of the workspace root. The rewrite leaves one valid JSON
+        // object carrying the marker, and the marker is what the executor
+        // refuses the call on.
+        let repaired_args: Value =
+            serde_json::from_str(&calls[1].function.arguments).expect("still valid JSON");
+        assert_eq!(
+            repaired_args.get(UNREADABLE_ARGUMENTS),
+            Some(&Value::Bool(true)),
+            "{repaired_args}"
+        );
+        assert_eq!(
+            repaired_args.as_object().unwrap().len(),
+            1,
+            "the marker is all the rewrite puts there: {repaired_args}"
+        );
     }
 }

@@ -7,10 +7,11 @@
 //! to the UI thread as [`Msg::Attach`] with a one-shot reply channel, and the
 //! answer is written back. `App` stays the only effector.
 //!
-//! Every road in — the line, the connections, the time a client may say
-//! nothing — is bounded (see [`MAX_REQUEST_BYTES`], [`MAX_CONNECTIONS`] and
-//! [`IDLE_TIMEOUT`]), because a surface a same-user process can reach is a
-//! surface that must not be able to spend mush's heap, threads or patience.
+//! Every road in — the connect, the line, the connections, the time a client
+//! may say nothing — is bounded (see [`CONNECT_TIMEOUT`],
+//! [`MAX_REQUEST_BYTES`], [`MAX_CONNECTIONS`] and [`IDLE_TIMEOUT`]), because a
+//! surface a same-user process can reach is a surface that must not be able to
+//! spend mush's heap, threads or patience.
 //!
 //! The protocol is newline-delimited JSON: one request and one response per
 //! line. Every request carries an `id` (any JSON value, echoed verbatim), and
@@ -18,11 +19,11 @@
 //! `"error": {"kind": …, …}`. An edit carries a base revision and is answered
 //! with `conflict` rather than guessing.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 
@@ -43,6 +44,17 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(20);
 /// the write. A mush that is alive but not answering must not hang a script
 /// (the client half of finding A2).
 const ASK_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long a connect to the socket may wait for a listener to take it.
+///
+/// A connect is not a send: when a listener's accept queue is full the kernel
+/// parks it until a slot frees, and both callers here run before their other
+/// bounds exist — the startup probe before the accept loop (and mush's first
+/// frame), and [`ask`] before the socket's own read and write timeouts are set
+/// — so a listener that never drains would hang the CLI, or a mush before its
+/// first frame, with no deadline anywhere. Five seconds is long enough that a
+/// busy listener draining its backlog is not mistaken for a dead one.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How much of a request line the socket will hold before it refuses it.
 ///
@@ -102,6 +114,56 @@ impl Drop for Guard {
     }
 }
 
+/// Connect to `path`, waiting no longer than `bound` for the listener to take
+/// the connection.
+///
+/// The connect itself still blocks — a full accept queue leaves it parked in
+/// the kernel — so it runs on a thread of its own, and what is bounded is the
+/// wait for it, exactly as `http.rs`'s `resolve_bounded` bounds a lookup. A
+/// connect that outlives its bound is abandoned, not killed: the thread
+/// belongs to the OS to collect, exactly as the resolver thread does, and a
+/// connect that answers after the wait is dropped by its own thread. A real
+/// connect failure comes back unchanged; the wait running out is an
+/// [`io::ErrorKind::TimedOut`] naming the path and the deadline, and a connect
+/// thread that goes away without answering is an `io::Error::other`.
+fn connect_bounded(path: &Path, bound: Duration) -> io::Result<UnixStream> {
+    let socket = path.to_path_buf();
+    let (tx, rx) = mpsc::channel();
+    thread::Builder::new()
+        .name("mush-attach-connect".to_string())
+        .spawn(move || {
+            // The receiver may be gone (the bound won), and then the stream is
+            // nobody's to close but this thread's.
+            let _ = tx.send(UnixStream::connect(&socket));
+        })
+        .map_err(io::Error::other)?;
+    match rx.recv_timeout(bound) {
+        Ok(result) => result,
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            format!(
+                "the connect to {} did not answer within {}",
+                path.display(),
+                bound_words(bound)
+            ),
+        )),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(io::Error::other(format!(
+            "the connect thread for {} went away",
+            path.display()
+        ))),
+    }
+}
+
+/// The bound as a sentence says it: whole seconds as seconds, anything shorter
+/// as milliseconds, so a 20 ms test bound reads `20ms` and never `0s`.
+fn bound_words(bound: Duration) -> String {
+    if bound.subsec_nanos() == 0 {
+        format!("{}s", bound.as_secs())
+    } else {
+        format!("{}ms", bound.as_millis())
+    }
+}
+
 /// Bind the socket and serve it on a thread of its own.
 ///
 /// A bind that fails is never fatal — mush runs without attach and says so on
@@ -109,9 +171,12 @@ impl Drop for Guard {
 /// nothing listening behind it is a crash's leftover, not a live mush, and is
 /// cleared so this bind can take the name; a file a live listener holds is
 /// another mush, and the bind refuses the name rather than stealing its
-/// socket.
+/// socket. A listener that takes longer than [`CONNECT_TIMEOUT`] to answer the
+/// probe is neither of those: a full accept queue also leaves a live listener's
+/// connect waiting, so the file is left in place rather than cleared, and the
+/// serve fails.
 pub fn serve(root: &Path, ui_tx: Sender<Msg>) -> Result<Guard, String> {
-    serve_with(root, ui_tx, LIMITS, spawn_accept_loop)
+    serve_with(root, ui_tx, LIMITS, CONNECT_TIMEOUT, spawn_accept_loop)
 }
 
 /// The accept loop's thread, named the way the rest of the tree's threads are,
@@ -128,20 +193,43 @@ fn spawn_accept_loop(
         .map_err(|error| format!("could not start the attach thread: {error}"))
 }
 
-/// [`serve`] with the limits a test holds and the one step no test can make
-/// fail injected: starting the thread that runs the accept loop. A spawn the OS
-/// refuses is exactly what finding A7 is about — the socket file must go with
-/// the failed serve — and a thread the OS will not give cannot be asked for on
-/// purpose, so the failing start is the test's own.
+/// [`serve`] with the limits a test holds, the connect bound a test holds
+/// short, and the one step no test can make fail injected: starting the thread
+/// that runs the accept loop. A spawn the OS refuses is exactly what finding A7
+/// is about — the socket file must go with the failed serve — and a thread the
+/// OS will not give cannot be asked for on purpose, so the failing start is the
+/// test's own.
+///
+/// The probe before the bind is the stale-file rule: a connect that *fails* is
+/// a file with nothing listening behind it, cleared so this bind can take the
+/// name, while a connect that succeeds is a live listener, left for the bind to
+/// refuse. A connect that does not answer within `bound` is neither — the
+/// listener may be alive with a full accept queue — so nothing is cleared,
+/// bound or started, and the error says the file was left alone.
 fn serve_with(
     root: &Path,
     ui_tx: Sender<Msg>,
     limits: Limits,
+    bound: Duration,
     start: impl FnOnce(UnixListener, Sender<Msg>, Limits) -> Result<(), String>,
 ) -> Result<Guard, String> {
     let path = socket_path(root);
-    if path.exists() && UnixStream::connect(&path).is_err() {
-        let _ = std::fs::remove_file(&path);
+    if path.exists() {
+        match connect_bounded(&path, bound) {
+            // A live listener holds the name; the bind below is what refuses to
+            // steal it.
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::TimedOut => {
+                return Err(format!(
+                    "{} did not answer a connect within {} — a live listener may still hold it, so it is left in place",
+                    path.display(),
+                    bound_words(bound)
+                ));
+            }
+            Err(_) => {
+                let _ = std::fs::remove_file(&path);
+            }
+        }
     }
     let listener = UnixListener::bind(&path)
         .map_err(|error| format!("could not bind {}: {error}", path.display()))?;
@@ -391,10 +479,33 @@ fn peer_label(stream: &UnixStream) -> String {
 /// The CLI's half of the protocol: connect to the socket under `dir`, send one
 /// request, read the one answer. `no mush is running in <dir>` when nothing is
 /// bound there, so the caller's message names the directory the human gave.
+/// The connect is bounded before anything else ([`CONNECT_TIMEOUT`] here,
+/// shorter in a test): a listener whose accept queue never drains is its own
+/// sentence, not a hang and not the same lie.
 pub fn ask(dir: &Path, request: &Request) -> Result<Response, String> {
+    ask_with(dir, request, CONNECT_TIMEOUT)
+}
+
+/// [`ask`] with the connect bound in the caller's hand. The connect is bounded
+/// *before* the socket's own read and write timeouts exist, so a listener that
+/// never takes the connection cannot park the CLI past every other bound
+/// (finding IN15). A refused or failed connect keeps the old sentence — nothing
+/// is bound at the name — while the bound running out names the directory and
+/// the deadline, because something may well be listening and simply not taking
+/// clients.
+fn ask_with(dir: &Path, request: &Request, bound: Duration) -> Result<Response, String> {
     let socket = socket_path(dir);
-    let stream = UnixStream::connect(&socket)
-        .map_err(|_| format!("no mush is running in {}", dir.display()))?;
+    let stream = connect_bounded(&socket, bound).map_err(|error| {
+        if error.kind() == io::ErrorKind::TimedOut {
+            format!(
+                "mush in {} did not accept the connection within {}",
+                dir.display(),
+                bound_words(bound)
+            )
+        } else {
+            format!("no mush is running in {}", dir.display())
+        }
+    })?;
     // The CLI's own bound: a mush that accepts the connection and then stops
     // answering must not hang a script forever (the client half of finding A2).
     stream
@@ -1078,7 +1189,7 @@ mod tests {
         let root = Scratch::new("attach-cap");
         std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
-        let guard = serve_with(&root, tx, LIMITS, spawn_accept_loop).unwrap();
+        let guard = serve_with(&root, tx, LIMITS, CONNECT_TIMEOUT, spawn_accept_loop).unwrap();
         let socket = socket_path(&root);
         let mut client = UnixStream::connect(&socket).unwrap();
         let mut reader = BufReader::new(client.try_clone().unwrap());
@@ -1144,6 +1255,7 @@ mod tests {
                 connections: 2,
                 idle: IDLE_TIMEOUT,
             },
+            CONNECT_TIMEOUT,
             spawn_accept_loop,
         )
         .unwrap();
@@ -1182,6 +1294,7 @@ mod tests {
                 connections: MAX_CONNECTIONS,
                 idle: Duration::from_millis(250),
             },
+            CONNECT_TIMEOUT,
             spawn_accept_loop,
         )
         .unwrap();
@@ -1242,7 +1355,7 @@ mod tests {
         std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
         let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
 
-        let error = match serve_with(&root, tx, LIMITS, |_, _, _| {
+        let error = match serve_with(&root, tx, LIMITS, CONNECT_TIMEOUT, |_, _, _| {
             Err("no threads today".to_string())
         }) {
             Ok(_) => panic!("a start that fails fails the serve"),
@@ -1257,5 +1370,175 @@ mod tests {
             "the bound socket went with the failed serve"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A listener that never accepts, with its accept queue full: the fixture
+    /// connects to it in a loop until the kernel parks the next connect, which
+    /// is exactly the state IN15's deadline is for.
+    ///
+    /// Each connected stream is dropped rather than held. On this toolchain
+    /// `UnixListener::bind` listens with `backlog = -1`, which Linux caps at
+    /// `somaxconn` (4096 in this environment), while the test process's soft
+    /// descriptor limit is 1024 — so keeping every stream alive hits `EMFILE`
+    /// around 1020, before the queue is full (measured). Dropping a stream does
+    /// not free its queued connection: the listener holds the entry until it
+    /// accepts, so the loop still reaches the cap and the queue stays full for
+    /// the fixture's life.
+    struct FullAcceptQueue {
+        root: Scratch,
+        /// Kept so the path has a live listener behind it for the fixture's
+        /// life; it never accepts.
+        _listener: UnixListener,
+    }
+
+    impl FullAcceptQueue {
+        fn new(label: &str) -> Self {
+            let root = Scratch::new(label);
+            std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+            let path = socket_path(&root);
+            let listener = UnixListener::bind(&path).unwrap();
+            let (tx, rx) = crossbeam_channel::unbounded::<()>();
+            thread::spawn(move || {
+                // Until the queue fills this succeeds at once; then `connect`
+                // parks in the kernel and the signals stop. The stream is
+                // dropped here, with the connection it queued: the listener
+                // holds the entry until it accepts, so the slot is not freed.
+                while let Ok(stream) = UnixStream::connect(&path) {
+                    drop(stream);
+                    if tx.send(()).is_err() {
+                        return;
+                    }
+                }
+            });
+            // A quiet channel means the queue is full: the filler is parked in
+            // `connect`. The deadline guards the fixture itself — a queue that
+            // never fills is a broken premise, not a hang to wait out.
+            let mut filled = 0_usize;
+            let deadline = std::time::Instant::now() + FILL_DEADLINE;
+            loop {
+                match rx.recv_timeout(FILL_QUIET) {
+                    Ok(()) => {
+                        filled += 1;
+                        assert!(
+                            std::time::Instant::now() < deadline,
+                            "the accept queue never filled after {filled} connects"
+                        );
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => break,
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                        panic!("the filler stopped before the queue filled after {filled} connects")
+                    }
+                }
+            }
+            Self {
+                root,
+                _listener: listener,
+            }
+        }
+
+        fn dir(&self) -> &Path {
+            &self.root
+        }
+    }
+
+    /// How long the filler fixture waits for another queued connection before
+    /// deciding the accept queue is full.
+    const FILL_QUIET: Duration = Duration::from_millis(100);
+
+    /// How long the fixture goes on filling before it calls the queue
+    /// unfillable. Filling takes one connect per backlog slot, and the depth is
+    /// the kernel's number, not the test's.
+    const FILL_DEADLINE: Duration = Duration::from_secs(10);
+
+    /// A connect whose listener never drains is cut by its own bound: a full
+    /// accept queue parks `connect` in the kernel, and without a deadline the
+    /// caller would wait on it forever (finding IN15). The bound is short here;
+    /// production's is [`CONNECT_TIMEOUT`].
+    #[test]
+    fn a_full_accept_queue_does_not_wedge_a_connect() {
+        let full = FullAcceptQueue::new("attach-connect-bound");
+        let path = socket_path(full.dir());
+        let started = std::time::Instant::now();
+        let error = connect_bounded(&path, Duration::from_millis(20)).unwrap_err();
+        let waited = started.elapsed();
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::TimedOut,
+            "the bound, not the kernel, ended the wait: {error}"
+        );
+        assert!(
+            waited < Duration::from_millis(200),
+            "a 20 ms bound and {waited:?} waited"
+        );
+        assert!(
+            error.to_string().contains(&path.display().to_string()),
+            "the sentence names the path: {error}"
+        );
+    }
+
+    /// The CLI's own sentence when the connect's bound runs out: something is
+    /// at the name — it took the whole backlog — so `no mush is running` is a
+    /// lie; the message names the directory and the deadline instead (finding
+    /// IN15).
+    #[test]
+    fn the_cli_connect_names_its_deadline_rather_than_claiming_nothing_runs() {
+        let full = FullAcceptQueue::new("attach-ask-bound");
+        let request = Request {
+            id: json!(1),
+            op: Op::Agents,
+        };
+        let started = std::time::Instant::now();
+        let error = ask_with(full.dir(), &request, Duration::from_millis(20)).unwrap_err();
+        let waited = started.elapsed();
+        assert!(
+            waited < Duration::from_millis(200),
+            "the CLI's own bound ended the wait: {waited:?}"
+        );
+        let dir = full.dir().display().to_string();
+        assert!(
+            error.contains(&dir),
+            "the sentence names the directory: {error}"
+        );
+        assert!(error.contains("20ms"), "and the deadline: {error}");
+        assert!(
+            !error.contains("no mush is running"),
+            "a busy-but-live listener is not a missing one: {error}"
+        );
+    }
+
+    /// A connect that times out proves neither state, so `serve` leaves the
+    /// file in place rather than clearing the name a live listener may hold —
+    /// and starts nothing (finding IN15).
+    #[test]
+    fn a_probe_that_times_out_leaves_a_socket_a_live_listener_may_hold() {
+        let full = FullAcceptQueue::new("attach-probe-bound");
+        let path = socket_path(full.dir());
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+        let (started_tx, started_rx) = bounded::<()>(1);
+        let error = match serve_with(
+            full.dir(),
+            tx,
+            LIMITS,
+            Duration::from_millis(20),
+            move |_, _, _| {
+                let _ = started_tx.send(());
+                Ok(())
+            },
+        ) {
+            Ok(_) => panic!("a probe that times out must fail the serve"),
+            Err(error) => error,
+        };
+        assert!(
+            started_rx.try_recv().is_err(),
+            "the start never ran: the probe failed before it"
+        );
+        assert!(
+            path.exists(),
+            "the file is left where it was: a timeout is not proof the listener is dead"
+        );
+        assert!(
+            error.contains("20ms"),
+            "the error names the deadline: {error}"
+        );
     }
 }
