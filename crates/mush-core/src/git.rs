@@ -1186,6 +1186,7 @@ pub fn parse_shortstat(text: &str) -> Stat {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::Scratch;
     use std::fs;
     use std::process::Command;
 
@@ -1430,9 +1431,7 @@ mod tests {
 
         // A directory that is not a repository refuses before touching git's
         // worktree state, and says so.
-        let plain = std::env::temp_dir().join(format!("mush-git-plain-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&plain);
-        fs::create_dir_all(&plain).unwrap();
+        let plain = Scratch::new("git-plain");
         assert_eq!(
             worktree_add(&plain, 6, None).unwrap_err(),
             "not a git repository"
@@ -1441,9 +1440,7 @@ mod tests {
 
         // A repository with no commit yet is the other refusal: there is
         // nothing to branch from, and the reason says so.
-        let unborn = std::env::temp_dir().join(format!("mush-git-unborn-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&unborn);
-        fs::create_dir_all(&unborn).unwrap();
+        let unborn = Scratch::new("git-unborn");
         let init = |args: &[&str]| {
             Command::new("git")
                 .arg("-C")
@@ -1478,10 +1475,7 @@ mod tests {
     /// on the actor's side of the door).
     #[test]
     fn a_base_worktree_in_a_repo_without_commits_refuses_with_that_reason() {
-        let unborn =
-            std::env::temp_dir().join(format!("mush-git-unborn-base-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&unborn);
-        fs::create_dir_all(&unborn).unwrap();
+        let unborn = Scratch::new("git-unborn-base");
         run(&unborn, &["init", "-q"]).unwrap();
         assert_eq!(has_commits(&unborn), Some(false));
 
@@ -1630,14 +1624,12 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    fn init_repo(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("mush-git-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
+    fn init_repo(name: &str) -> Scratch {
+        let dir = Scratch::new(&format!("git-{name}"));
         let run = |args: &[&str]| {
             Command::new("git")
                 .arg("-C")
-                .arg(&dir)
+                .arg(dir.path())
                 .args(args)
                 .output()
                 .unwrap();
@@ -2273,10 +2265,7 @@ mod tests {
         assert_eq!(branch(&path).as_deref(), Some("mush/1"));
 
         // A directory that is not in any repository keeps its own sentence.
-        let plain =
-            std::env::temp_dir().join(format!("mush-git-below-plain-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&plain);
-        fs::create_dir_all(&plain).unwrap();
+        let plain = Scratch::new("git-below-plain");
         assert_eq!(
             worktree_add(&plain, 2, None).unwrap_err(),
             "not a git repository"

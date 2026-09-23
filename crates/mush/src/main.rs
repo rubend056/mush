@@ -1354,6 +1354,7 @@ fn install_panic_hook_for(
 mod tests {
     use super::*;
     use mush_core::config::WindowSource;
+    use mush_core::scratch::{Held, Scratch};
     use mush_core::Message;
 
     #[test]
@@ -1549,12 +1550,12 @@ mod tests {
     }
 
     /// A workspace in a directory of its own, for the tests that read a path
-    /// the way a human does.
-    fn scratch_workspace(name: &str) -> Workspace {
-        let dir = std::env::temp_dir().join(format!("mush-main-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        Workspace::new(&dir).unwrap()
+    /// the way a human does: the guard comes back with the workspace, so the
+    /// directory and what the test wrote in it go when the test ends.
+    fn scratch_workspace(name: &str) -> Held<Workspace> {
+        let dir = Scratch::new(&format!("main-{name}"));
+        let ws = Workspace::new(&dir).unwrap();
+        dir.hold(ws)
     }
 
     /// A directory mush cannot open names the directory and what to do about
@@ -1565,8 +1566,8 @@ mod tests {
     /// from the start.
     #[test]
     fn an_unopenable_workspace_names_the_directory() {
-        let dir = std::env::temp_dir().join(format!("mush-main-typo-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        let scratch = Scratch::new("main-typo");
+        let dir = scratch.join("typo");
         let error = open_workspace(&dir).unwrap_err();
         assert!(error.contains(&dir.display().to_string()), "{error}");
         assert!(error.contains("No such file or directory"), "{error}");
@@ -2063,9 +2064,7 @@ mod tests {
     /// is half-read out of it (finding C3).
     #[test]
     fn an_unreadable_home_config_travels_to_the_dump() {
-        let dir = std::env::temp_dir().join(format!("mush-main-home-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+        let dir = Scratch::new("main-home");
         let path = dir.join("config.json");
         std::fs::write(&path, "{ \"api_key\": \"sk-secret\", ").unwrap();
 
@@ -2116,9 +2115,8 @@ mod tests {
             term: None,
         };
 
-        let missing =
-            std::env::temp_dir().join(format!("mush-main-dump-missing-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&missing);
+        let scratch = Scratch::new("main-dump-missing");
+        let missing = scratch.join("never-opened");
         let home = UserConfig::default();
         let (_, stored, _) = resolved_config(&missing, &Overrides::default(), &env, &home).unwrap();
         assert!(matches!(stored, session::Stored::Absent), "{stored:?}");

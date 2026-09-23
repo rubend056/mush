@@ -2165,12 +2165,15 @@ fn invalid(message: String) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::{Held, Scratch};
 
-    fn temp_workspace(name: &str) -> Workspace {
-        let dir = std::env::temp_dir().join(format!("mush-test-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
-        fs::create_dir_all(&dir).unwrap();
-        Workspace::new(&dir).unwrap()
+    /// A workspace on a scratch root of its own: `mush-test-<name>-<pid>`. The
+    /// returned guard travels with the workspace, so the files it makes are
+    /// removed when the test ends — including when it fails.
+    fn temp_workspace(name: &str) -> Held<Workspace> {
+        let dir = Scratch::new(&format!("test-{name}"));
+        let ws = Workspace::new(&dir).unwrap();
+        dir.hold(ws)
     }
 
     /// A path's permission bits as a human reads them (`0755`): the low twelve,
@@ -2181,17 +2184,14 @@ mod tests {
 
     /// A picture file *outside* every test workspace — the paste road's own
     /// case: a name the human may give and the model's tools may not resolve.
-    /// The test's name and the process id keep two tests from sharing (and so
-    /// overwriting) one outside file, and a stale one from an earlier run is
-    /// replaced.
-    fn outside_image(name: &str, bytes: &[u8]) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "mush-test-outside-{name}-{}.png",
-            std::process::id()
-        ));
-        let _ = fs::remove_file(&path);
+    /// A scratch root of its own holds it, and the guard comes back with the
+    /// path, so the file is removed when the test ends (the name it carries is
+    /// the one the outside-paste tests already spell).
+    fn outside_image(name: &str, bytes: &[u8]) -> Held<PathBuf> {
+        let dir = Scratch::new(&format!("test-outside-{name}"));
+        let path = dir.path().join(format!("{name}.png"));
         fs::write(&path, bytes).unwrap();
-        path
+        dir.hold(path)
     }
 
     /// A path that is not under the root is shown as it is: a workspace opened
@@ -3112,7 +3112,7 @@ mod tests {
         let originals: Vec<Vec<u8>> = (0..4)
             .map(|i| png_of(100 + i, 50, 4 + i as usize))
             .collect();
-        let outside: Vec<PathBuf> = originals
+        let outside: Vec<_> = originals
             .iter()
             .enumerate()
             .map(|(i, bytes)| outside_image(&format!("paste-many-outside-{i}"), bytes))
@@ -3433,9 +3433,7 @@ mod tests {
     /// own reason for the copy in its own doc.
     #[test]
     fn a_backup_name_is_the_first_free_one_beside_the_file() {
-        let root = std::env::temp_dir().join(format!("mush-backup-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = Scratch::new("backup");
         let file = root.join("thing.json");
         fs::write(&file, "x").unwrap();
 
@@ -3602,11 +3600,7 @@ mod tests {
     fn a_link_inside_the_root_cannot_leave_it() {
         use std::os::unix::fs::symlink;
 
-        let outside = std::env::temp_dir().join(format!(
-            "mush-test-root-link-outside-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&outside);
+        let outside = Scratch::new("test-root-link-outside");
         fs::create_dir_all(outside.join("sub")).unwrap();
         fs::write(outside.join("secret.txt"), "SEKRIT\n").unwrap();
         fs::write(outside.join("sub/deep.txt"), "DEEP\n").unwrap();

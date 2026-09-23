@@ -35,5 +35,12 @@ signal-hook = "0.3"
 rustls = "0.23"
 webpki-roots = "0.26"
 
+# The same crate, with the test-support feature on, for this binary's tests
+# only: the scratch guard (`mush_core::scratch`) a test root is owned by. A
+# plain `cargo build` does not consult this table, so the guard is never in the
+# product.
+[dev-dependencies]
+mush-core = { path = "../mush-core", features = ["test-support"] }
+
 [lints]
 workspace = true

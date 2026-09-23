@@ -184,6 +184,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::OnceLock;
 
+    use mush_core::scratch::{Held, Scratch};
+
     use super::*;
 
     /// A pid that is really gone — a child of this test binary, waited for — for
@@ -205,14 +207,16 @@ mod tests {
         })
     }
 
-    fn root(label: &str) -> PathBuf {
+    fn root(label: &str) -> Held<PathBuf> {
         // Force the dead pid's fork before this test — or any sibling — can hold
         // a lock (see `dead_pid`).
         dead_pid();
-        let dir = std::env::temp_dir().join(format!("mush-lock-{}-{label}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
+        // The root carries the label and the process, in that order, so the
+        // sweep can read the pid off the end of the name.
+        let dir = Scratch::new(&format!("lock-{label}"));
         mush_core::session::ensure_mush_dir(&dir).unwrap();
-        dir
+        let path = dir.path().to_path_buf();
+        dir.hold(path)
     }
 
     fn lock_path(root: &Path) -> PathBuf {

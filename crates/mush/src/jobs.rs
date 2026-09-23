@@ -1723,6 +1723,7 @@ mod tests {
     use crate::events::fake::Recorder;
     use crate::machine::fake::{Script, Scripted as ScriptedMachine};
     use crate::machine::{Machine, ShellCommand};
+    use mush_core::scratch::Scratch;
     use mush_core::tools::ToolName;
 
     /// The fixed part of a status headline — the id, the state (or the outcome),
@@ -2436,9 +2437,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_dropped_hold_ends_a_real_process_group() {
-        let root = std::env::temp_dir().join(format!("mush-drop-hold-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
+        let root = Scratch::new("drop-hold");
         let (registry, _events, _clock) = registry();
         let job = crate::machine::Shell
             .spawn(&ShellCommand {

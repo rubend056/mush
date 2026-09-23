@@ -357,13 +357,15 @@ fn keep_unparsable(path: &Path) -> std::io::Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::scratch::{Held, Scratch};
 
-    fn temp_path(name: &str) -> PathBuf {
-        let dir =
-            std::env::temp_dir().join(format!("mush-userconfig-{name}-{}", std::process::id()));
-        // A leftover from an interrupted run must not merge into this one.
-        let _ = fs::remove_dir_all(&dir);
-        dir.join("config.json")
+    fn temp_path(name: &str) -> Held<PathBuf> {
+        // A root of its own, and the guard comes back with the path: a
+        // leftover from an interrupted run must not merge into this one, and
+        // this run's file must go when the test does.
+        let dir = Scratch::new(&format!("userconfig-{name}"));
+        let path = dir.path().join("config.json");
+        dir.hold(path)
     }
 
     /// The header the written file carries, joined into one string, so a test

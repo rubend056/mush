@@ -5235,6 +5235,7 @@ mod tests {
     use super::*;
     use crate::attach;
     use crate::ids::JobId;
+    use mush_core::scratch::{Held, Scratch};
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Mutex;
 
@@ -5312,11 +5313,11 @@ mod tests {
     /// A real `App` on a scratch directory, with a real (idle) root actor. The
     /// returned receiver keeps the UI channel alive for the life of the test.
     /// A real repository, because worktree discovery shells out to git — a fake
-    /// would test nothing it actually does.
-    fn repo(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("mush-land-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
+    /// would test nothing it actually does. The root is a guard the caller
+    /// holds: the repository and everything committed into it go when the test
+    /// ends, however the test ends.
+    fn repo(label: &str) -> Scratch {
+        let dir = Scratch::new(&format!("land-{label}"));
         git(&dir, &["-c", "init.defaultBranch=master", "init", "-q"]);
         git(&dir, &["config", "user.email", "mush@test"]);
         git(&dir, &["config", "user.name", "mush"]);
@@ -5624,8 +5625,9 @@ mod tests {
             },
         ];
         for event in events {
+            let conversation = app.tree.conversation();
             app.update(Msg::Agent {
-                conversation: app.tree.conversation(),
+                conversation,
                 id: gone,
                 event,
             });
@@ -5875,7 +5877,7 @@ mod tests {
     #[test]
     fn a_parked_child_is_woken_by_a_message_and_runs() {
         let root = repo("parked-wake");
-        let (mut app, rx) = app_and_rx(root.clone());
+        let (mut app, rx) = app_and_rx(root.to_path_buf());
         // A finished child whose actor is parked: the tree holds the mailbox and
         // nobody holds the receiver, which is what a reclaimed thread leaves.
         let (tx, parked) = crossbeam_channel::unbounded::<AgentMsg>();
@@ -5925,7 +5927,7 @@ mod tests {
     #[test]
     fn a_parents_message_wakes_a_parked_child_through_the_ui() {
         let root = repo("parent-wake");
-        let (mut app, rx) = app_and_rx(root.clone());
+        let (mut app, rx) = app_and_rx(root.to_path_buf());
         // A parked child: the tree holds the mailbox and nobody holds the
         // receiver, which is what a reclaimed thread leaves.
         let (tx, parked) = crossbeam_channel::unbounded::<AgentMsg>();
@@ -6160,7 +6162,7 @@ mod tests {
     #[test]
     fn a_childs_report_reaches_the_parent_the_tree_names() {
         let root = repo("parent-asleep");
-        let (mut app, rx) = app_and_rx(root.clone());
+        let (mut app, rx) = app_and_rx(root.to_path_buf());
         // A parent whose actor is parked: the tree holds the mailbox and nobody
         // holds the receiver.
         let (parent_tx, parked) = crossbeam_channel::unbounded::<AgentMsg>();
@@ -6237,8 +6239,9 @@ mod tests {
 
         // What the parent's actor emits when its send finds no actor there,
         // and the UI revives the child to take the words.
+        let conversation = app.tree.conversation();
         app.update(Msg::Agent {
-            conversation: app.tree.conversation(),
+            conversation,
             id: AgentId::ROOT,
             event: AgentEvent::ChildAsleep {
                 child: 2,
@@ -6272,8 +6275,9 @@ mod tests {
         // is readable — and it must do nothing at all with it.
         let (root_tx, root_rx) = crossbeam_channel::unbounded::<AgentMsg>();
         app.tree.agent_tx.insert(AgentId::ROOT, root_tx);
+        let conversation = app.tree.conversation();
         app.update(Msg::Agent {
-            conversation: app.tree.conversation(),
+            conversation,
             id: AgentId::ROOT,
             event: AgentEvent::ParentAsleep {
                 command: AgentMsg::ChildDone {
@@ -6318,8 +6322,9 @@ mod tests {
         // the node and the mailbox go.
         app.tree.reap(&[AgentId(2)]);
 
+        let conversation = app.tree.conversation();
         app.update(Msg::Agent {
-            conversation: app.tree.conversation(),
+            conversation,
             id: AgentId::ROOT,
             event: AgentEvent::ChildAsleep {
                 child: 2,
@@ -6447,7 +6452,7 @@ mod tests {
     #[test]
     fn a_focus_change_and_a_command_refresh_the_git_read() {
         let root = repo("refresh-git");
-        let (mut app, rx) = app_and_rx(root.clone());
+        let (mut app, rx) = app_and_rx(root.to_path_buf());
         wait_git(&mut app, &rx);
         assert_eq!(
             app.git.as_ref().map(|g| g.dirty),
@@ -6751,18 +6756,17 @@ mod tests {
 
     /// An `App` on a scratch directory whose saves are recorded instead of
     /// written, so a test sees what the UI thread handed over and when.
-    fn app_recording(label: &str) -> (App, Arc<session_save::fake::Recorder>) {
+    fn app_recording(label: &str) -> (Held<App>, Arc<session_save::fake::Recorder>) {
         let recorder = session_save::fake::Recorder::new();
-        let (app, _rx) = app_root(&dir(label), None, recorder.clone());
-        (app, recorder)
+        let root = dir(label);
+        let (app, _rx) = app_root(&root, None, recorder.clone());
+        (root.hold(app), recorder)
     }
 
-    /// An empty directory for a session to be written into.
-    fn dir(label: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("mush-save-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+    /// An empty directory for a session to be written into, and the guard that
+    /// removes it — with whatever the test wrote there — when the test ends.
+    fn dir(label: &str) -> Scratch {
+        Scratch::new(&format!("save-{label}"))
     }
 
     /// A real `App` that adopted what is on disk in `root`, the way a restart
@@ -7222,7 +7226,7 @@ mod tests {
     fn a_leftover_worktree_recovers_its_brief_from_git() {
         let root = repo("recover");
         isolated_work(&root, 3, "port the parser module");
-        let app = app_at(root.clone());
+        let app = app_at(root.to_path_buf());
 
         let node = app
             .tree
@@ -7246,7 +7250,7 @@ mod tests {
     #[test]
     fn ctrl_n_never_reclaims_a_worktree_a_live_node_holds() {
         let root = repo("ctrl-n-live");
-        let (mut app, _rx) = app_and_rx(root.clone());
+        let (mut app, _rx) = app_and_rx(root.to_path_buf());
 
         // A worktree whose branch adds nothing to HEAD and whose checkout is
         // clean: exactly the state the isolated pass takes.
@@ -7313,7 +7317,7 @@ mod tests {
         git(&worktree, &["add", "-A"]);
         git(&worktree, &["commit", "-qm", "my own commit message"]);
 
-        let app = app_at(root.clone());
+        let app = app_at(root.to_path_buf());
         let node = app
             .tree
             .agents
@@ -8825,7 +8829,7 @@ mod tests {
     #[test]
     fn the_session_records_a_run_in_flight_as_running() {
         let root = dir("stored-running");
-        let mut app = app_at(root.clone());
+        let mut app = app_at(root.to_path_buf());
         crowd(&mut app, 1);
         assert_eq!(
             app.tree.node(AgentId(1)).map(|node| node.phase.clone()),
@@ -9073,10 +9077,7 @@ mod tests {
         let_the_model_see(&mut app);
         let (child_root, _mailbox) = isolate_child(&mut app, 1);
         // The human's file, outside the workspace mush was opened on.
-        let outside =
-            std::env::temp_dir().join(format!("mush-child-carry-outside-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&outside);
-        std::fs::create_dir_all(&outside).unwrap();
+        let outside = Scratch::new("child-carry-outside");
         let shot = outside.join("shot.png");
         std::fs::write(&shot, png(64)).unwrap();
 
@@ -10073,8 +10074,9 @@ mod tests {
         app.chat.push_message(AgentId::ROOT, Message::user("third"));
         ctrl(&mut app, 'y');
         assert!(app.chat.selecting(), "the mode is on");
+        let conversation = app.tree.conversation();
         app.update(Msg::Agent {
-            conversation: app.tree.conversation(),
+            conversation,
             id: AgentId::ROOT,
             event: AgentEvent::Compact {
                 in_run: false,
@@ -10173,8 +10175,9 @@ mod tests {
         });
         assert_eq!(text_of(&app), before, "a stale copy is not news here");
 
+        let conversation = app.tree.conversation();
         app.update(Msg::Copied {
-            conversation: app.tree.conversation(),
+            conversation,
             line: "copied 2 lines from #0's reply — 12 bytes".to_string(),
             result: Err("no clipboard writer on PATH".to_string()),
         });
@@ -12548,11 +12551,10 @@ mod tests {
         );
     }
 
-    fn test_app(label: &str) -> (App, Receiver<Msg>) {
-        let root = std::env::temp_dir().join(format!("mush-app-{label}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        app_root(&root, None, session_save::fake::Recorder::new())
+    fn test_app(label: &str) -> (Held<App>, Receiver<Msg>) {
+        let root = Scratch::new(&format!("app-{label}"));
+        let (app, rx) = app_root(&root, None, session_save::fake::Recorder::new());
+        (root.hold(app), rx)
     }
 
     /// Point the home-config *write* at a throwaway file, once per test binary.
@@ -12563,14 +12565,18 @@ mod tests {
     /// `~/.config/mush/config.json` with a fixture's endpoint and model.
     /// `MUSH_CONFIG` is the override `mush_core::userconfig` documents for
     /// exactly this, and nothing else here reads the home config.
+    ///
+    /// The path lives under a root of its own, created once and held in a
+    /// `static` because the name is process-wide. A `static` is never dropped,
+    /// so this run leaves that one root behind; it is named
+    /// `mush-user-config-<pid>` so the next run's first use sweeps it by the
+    /// dead pid in its name.
     fn isolate_user_config() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| {
-            let path = std::env::temp_dir().join(format!(
-                "mush-user-config-{}/config.json",
-                std::process::id()
-            ));
-            std::env::set_var("MUSH_CONFIG", path);
+        static SET: std::sync::Once = std::sync::Once::new();
+        SET.call_once(|| {
+            static ROOT: std::sync::OnceLock<Scratch> = std::sync::OnceLock::new();
+            let root = ROOT.get_or_init(|| Scratch::new("user-config"));
+            std::env::set_var("MUSH_CONFIG", root.path().join("config.json"));
         });
     }
 
@@ -13294,8 +13300,9 @@ mod tests {
             "the stale reply and summary are dropped"
         );
 
+        let conversation = app.tree.conversation();
         app.update(Msg::Agent {
-            conversation: app.tree.conversation(),
+            conversation,
             id: AgentId::ROOT,
             event: AgentEvent::Message(Message::assistant("fresh reply")),
         });
@@ -13691,8 +13698,9 @@ mod tests {
         let first = app.cfg().context_tokens;
         assert_ne!(first, 4_096, "the test wants a window that changes");
 
+        let conversation = app.tree.conversation();
         app.update(Msg::Agent {
-            conversation: app.tree.conversation(),
+            conversation,
             id: AgentId::ROOT,
             event: AgentEvent::Context {
                 tokens: 4_096,
@@ -13724,8 +13732,9 @@ mod tests {
         app.cell.edit(|cfg| cfg.set_context(32_768));
         let handle = app.cell.handle();
 
+        let conversation = app.tree.conversation();
         app.update(Msg::Agent {
-            conversation: app.tree.conversation(),
+            conversation,
             id: AgentId::ROOT,
             event: AgentEvent::Context {
                 tokens: 4_096,
@@ -14300,12 +14309,8 @@ mod tests {
     #[test]
     fn an_unrelated_command_does_not_move_an_environment_key_into_the_home_config() {
         let (mut app, _rx) = test_app("env-key-stays-out");
-        let path = std::env::temp_dir().join(format!(
-            "mush-app-env-key-{}/config.json",
-            std::process::id()
-        ));
-        let _ = std::fs::remove_dir_all(path.parent().unwrap());
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let home = Scratch::new("app-env-key");
+        let path = home.join("config.json");
         app.home_config = path.clone();
 
         // The file's own key for the endpoint in force, and a key the run got
@@ -15807,7 +15812,7 @@ mod tests {
     /// V7).
     struct Sweep {
         name: &'static str,
-        app: App,
+        app: Held<App>,
         words: Vec<&'static str>,
         roomy: Vec<&'static str>,
         absent: Vec<&'static str>,
@@ -15888,7 +15893,7 @@ mod tests {
     /// Twenty agents three levels deep, with a branch on one of them, a run in
     /// flight, a failure and a dirty repository: the shape the audit's worst
     /// screen was.
-    fn a_twenty_agent_tree(label: &str) -> (App, Receiver<Msg>) {
+    fn a_twenty_agent_tree(label: &str) -> (Held<App>, Receiver<Msg>) {
         let (mut app, rx) = test_app(label);
         for id in 1..=12u64 {
             // One isolated child, one working, one failed: the three states a
@@ -16280,7 +16285,7 @@ mod tests {
     /// A workspace whose `.mush/session.json` was written by hand: two root
     /// messages, a child whose last run failed, and the failure notice mush
     /// stored about the root. The app that adopts it is what a restart paints.
-    fn restored_session(label: &str) -> App {
+    fn restored_session(label: &str) -> Held<App> {
         let root = dir(label);
         let session = root.join(".mush/session.json");
         std::fs::create_dir_all(session.parent().unwrap()).unwrap();
@@ -16325,7 +16330,8 @@ mod tests {
 "#,
         )
         .unwrap();
-        reopened(&root)
+        let app = reopened(&root);
+        root.hold(app)
     }
 
     /// The draw sweep: every state, at every size, read as *text*.
@@ -17559,9 +17565,7 @@ mod tests {
         use std::fs;
         use std::process::Command;
 
-        let root = std::env::temp_dir().join(format!("mush-app-wt-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = Scratch::new("app-wt");
         let git = |args: &[&str]| {
             let status = Command::new("git")
                 .arg("-C")
@@ -17627,9 +17631,7 @@ mod tests {
         use std::fs;
         use std::process::Command;
 
-        let root = std::env::temp_dir().join(format!("mush-app-residue-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
+        let root = Scratch::new("app-residue");
         let git = |args: &[&str]| {
             let status = Command::new("git")
                 .arg("-C")
@@ -17852,7 +17854,7 @@ mod tests {
         use std::fs;
 
         let root = repo("reclaim-refresh");
-        let (mut app, rx) = app_and_rx(root.clone());
+        let (mut app, rx) = app_and_rx(root.to_path_buf());
         wait_git(&mut app, &rx);
         // The revision the worktree below is forked at, read the way the spawn
         // path reads it: the reply's `at <sha>` and the sweep's question 2.
@@ -17950,7 +17952,7 @@ mod tests {
         use std::fs;
 
         let root = repo("reclaim-nothing-committed");
-        let (mut app, rx) = app_and_rx(root.clone());
+        let (mut app, rx) = app_and_rx(root.to_path_buf());
         wait_git(&mut app, &rx);
         let fork = git_of(&root, &["rev-parse", "HEAD"]).expect("HEAD");
         let conversation = app.tree.conversation();
@@ -18022,7 +18024,7 @@ mod tests {
         use std::fs;
 
         let root = repo("reclaim-nested-landing");
-        let (mut app, rx) = app_and_rx(root.clone());
+        let (mut app, rx) = app_and_rx(root.to_path_buf());
         wait_git(&mut app, &rx);
         // The parent's worktree, forked from HEAD, with a commit of its own —
         // the base a nested child forks from.
@@ -18384,13 +18386,14 @@ mod tests {
         assert!(app.quit_armed(), "and the human's warning is still there");
         assert_eq!(text_of(&app), warning, "word for word, and with its clock");
 
+        let base = app.chat.revision(AgentId(1));
         attach_ok(app.handle_attach(
             "a client",
             &attach_request(
                 2,
                 attach::Op::Edit {
                     agent: 1,
-                    base: app.chat.revision(AgentId(1)),
+                    base,
                     text: "half typed".to_string(),
                     send: false,
                 },
@@ -18429,13 +18432,14 @@ mod tests {
         ctrl(&mut app, 'q');
         assert!(app.quit_armed());
 
+        let base = app.chat.revision(AgentId(1));
         let error = attach_err(app.handle_attach(
             "a client",
             &attach_request(
                 3,
                 attach::Op::Edit {
                     agent: 1,
-                    base: app.chat.revision(AgentId(1)),
+                    base,
                     text: "are you there?".to_string(),
                     send: true,
                 },
