@@ -261,10 +261,10 @@ pub fn tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "brief": { "type": "string" },
-                    "title": { "type": "string", "description": "A 3 word description of this agent's brief." },
+                    "title": { "type": "string", "description": "A 3 word, one-line description of the brief." },
                     "base": { "type": "string", "description": "Branch, tag or commit; resolved in this agent's workspace, so `HEAD` is this agent's own HEAD. Without one: this workspace." }
                 },
-                "required": ["brief", "title"]
+                "required": ["brief"]
             }),
         ),
         tool(
@@ -454,6 +454,34 @@ mod tests {
             .unwrap()
             .to_lowercase()
             .contains("agent-only"));
+    }
+
+    /// The spawn schema's `title` is the row's name and nothing the code
+    /// requires: a missing or blank one leaves `spawn_tool` to derive the row's
+    /// handle from the brief, so requiring it in the schema made the model pay
+    /// for a field the code treats as optional — and a title is *one line*, a
+    /// fact the schema has to say because the row paints one (finding F14; the
+    /// folding a newline still needs lives in `spawn_tool`, in `agent.rs`).
+    #[test]
+    fn the_spawn_schemas_title_is_optional_and_named_as_one_line() {
+        let spawn = tool_schemas()
+            .into_iter()
+            .find(|schema| schema["function"]["name"] == "spawn_agent")
+            .expect("the tool has a schema")["function"]
+            .clone();
+        let parameters = &spawn["parameters"];
+        assert_eq!(
+            parameters["required"],
+            serde_json::json!(["brief"]),
+            "the code takes a missing title and derives the row's handle"
+        );
+        let title = parameters["properties"]["title"]["description"]
+            .as_str()
+            .expect("the title is described");
+        assert!(
+            title.contains("one-line"),
+            "the row paints one line: {title}"
+        );
     }
 
     #[test]
