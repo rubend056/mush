@@ -460,7 +460,7 @@ invariant knows its home. The `A1`–`A8` here are the starting audit's, not
 | B14 | the row's summary is from the first run, forever | `AgentTree::{begin, finish}` |
 | B15 | `screen.py` mis-reads CSI / `--keys` escapes | `scripts/screen.py` — cursor clamped to the grid (a row past the bottom, or a shrink under a low cursor, raised `IndexError` on the next `X`), and `--keys` decodes the escapes it means instead of `unicode_escape`, which turned `é` into `Ã©` and left `\e` literal. `--self-test` pins both. |
 | B16 | `smoke.py --cancel` forks after starting a thread | `scripts/smoke.py` — the pty is forked before the endpoint's thread exists; verified by running the scenario. |
-| B17 | the layout sweep asserts "does not panic", not painted text | `app/screen.rs` + `ui::draw(frame, &Screen)`; `the_draw_sweep_asserts_painted_text_not_that_it_did_not_panic` over 15 sizes × 14 states, plus seven focused `the_sweep_*` tests (`7e123e1`) |
+| B17 | the layout sweep asserts "does not panic", not painted text | `app/screen.rs` + `ui::draw(frame, &Screen)`; `the_draw_sweep_asserts_painted_text_not_that_it_did_not_panic` over 15 sizes × 18 states, plus seven focused `the_sweep_*` tests (`7e123e1`) |
 | B18 | `~` elision matches a prefix, not a directory | `app/screen.rs::facts_line` (moved from `ui.rs` by B17) |
 | B19 | global notices render into every transcript | `Notice.agent` + `Chat::notices_for` — no unscoped read exists |
 | N1 | `MAX_TURNS` turns "long" into "failed" | `agent.rs`: `LOOP_ROUNDS` (a run ends when it stops calling tools; only a *loop* ends it early) — the 200-turn ceiling and its wrap-up turn were removed later (H45, §8.47) |
