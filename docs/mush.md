@@ -986,6 +986,9 @@ wrapping) is where the tests live.
 | `tempfile` | secure scratch files for command output, atomic replace |
 | `dirs` | platform-correct config directory |
 | `rustls`, `webpki-roots` | TLS for hosted https endpoints (DeepSeek); the client stays hand-rolled |
+| `rustix` | `flock(2)` for the one-mush-per-workspace lock, and the process-group kill that ends a command's group; the workspace forbids `unsafe`, so the syscalls come through its safe wrappers rather than a hand-written `extern "C"` (already in the tree under tempfile and rustls) |
+| `signal-hook` | one handler per ending signal that only sets a flag the event loop reads, so a killed mush takes the same clean-quit road `Ctrl-Q` does (already linked by crossterm) |
+| `mush-core` | the workspace's own core crate — pure domain, no UI (this repository, a path dependency) |
 
 Not used, on purpose: `tokio`, `reqwest`, `clap`, `ropey`, `notify`, `anyhow`,
 `blake3`, `diffy`. HTTP is hand-rolled because the target is a plain-HTTP server
