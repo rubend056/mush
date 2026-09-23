@@ -310,17 +310,6 @@ impl std::fmt::Debug for Stored {
         }
     }
 }
-/// How many backup names mush will try beside an unreadable session before it
-/// gives up looking. A workspace that has been hand-broken a hundred times has
-/// a problem that no file name solves.
-const BACKUP_TRIES: u32 = 100;
-
-/// Where an unreadable session is kept, before the caller starts numbering:
-/// `.mush/session.json.bak`.
-fn first_backup(root: &Path) -> PathBuf {
-    mushroom_dir(root).join(format!("{SESSION_FILE}.bak"))
-}
-
 /// The sentence a session mush could not set aside is told: the file the human
 /// has to go and find, then why it could not be moved.
 ///
@@ -339,30 +328,22 @@ fn cannot_keep(from: &Path, why: impl std::fmt::Display) -> String {
 /// follows cannot destroy the only copy of the human's conversation.
 ///
 /// A rename in the same directory: the bytes are never rewritten and never
-/// leave the workspace. A backup that is already there is *not* overwritten —
-/// the next free name (`.bak.2`, `.bak.3`, …) is used instead, so hand-breaking
-/// the file twice does not lose the first copy either. Returns where it went.
+/// leave the workspace. The name is [`crate::workspace::backup_name`]'s — the
+/// next free `.bak` name, never a copy already there, because a copy beside the
+/// file is one the human already needed — so the conversation and the home
+/// config keep their copies by one numbering rule and one bound. Returns where
+/// it went; a failure names the file and why it could not be moved
+/// ([`cannot_keep`]).
 ///
 /// This is deliberately not called for an [`Stored::Absent`] workspace: there
 /// is nothing to keep, and creating a backup of nothing would be a file a human
 /// has to wonder about.
 pub fn keep_unreadable(root: &Path) -> Result<PathBuf, String> {
     let from = session_path(root);
-    let base = first_backup(root);
-    for step in 1..=BACKUP_TRIES {
-        let to = if step == 1 {
-            base.clone()
-        } else {
-            PathBuf::from(format!("{}.{step}", base.display()))
-        };
-        if to.exists() {
-            continue;
-        }
-        return fs::rename(&from, &to)
-            .map(|()| to)
-            .map_err(|error| cannot_keep(&from, error));
-    }
-    Err(cannot_keep(&from, "every backup name beside it is taken"))
+    let to = crate::workspace::backup_name(&from).map_err(|why| cannot_keep(&from, why))?;
+    fs::rename(&from, &to)
+        .map(|()| to)
+        .map_err(|error| cannot_keep(&from, error))
 }
 
 impl Session {
@@ -560,7 +541,9 @@ mod tests {
         // Every name beside it taken — the other `Err`, and the one a workspace
         // that has been hand-broken a hundred times reaches.
         fs::write(session_path(&root), "{}").unwrap();
-        for step in 1..=BACKUP_TRIES {
+        // Every name the shared rule will try, so the bound is the one in
+        // [`crate::workspace::backup_name`] rather than a number repeated here.
+        for step in 1..=crate::workspace::BACKUP_TRIES {
             let name = if step == 1 {
                 format!("{SESSION_FILE}.bak")
             } else {

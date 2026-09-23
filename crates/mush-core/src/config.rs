@@ -350,14 +350,32 @@ fn env_nonempty(name: &str) -> Option<String> {
     std::env::var(name).ok().filter(|value| !value.is_empty())
 }
 
-/// Parse `MUSH_CONTEXT`. A value that is present but wrong is an error rather
-/// than a silent fallback: the variable is how a human states the window, and
-/// running with a different one than asked for is the harder bug to notice.
-pub fn parse_context_env(value: &str) -> Result<usize, String> {
+/// A window a human stated, and the road they stated it by: the one read of a
+/// token count for `--context` and `MUSH_CONTEXT`, so the flag and the variable
+/// cannot answer the same number two ways.
+///
+/// Surrounding space is part of the statement: `MUSH_CONTEXT=" 8192"` was
+/// always accepted, and `--context " 8192"` was a refusal for the same number
+/// until both doors read this function — the flag had never had the trim.
+/// Trimming is the one reading, not a courtesy, because a value a human can
+/// state two ways must mean one thing.
+///
+/// A value that is present but wrong is an error rather than a silent fallback:
+/// running with a different window than the one asked for is the harder bug to
+/// notice. The sentence names the road the value came in by, because the human
+/// has two doors and has to know which one refused them.
+pub fn parse_context(value: &str, road: &str) -> Result<usize, String> {
     match value.trim().parse::<usize>() {
         Ok(tokens) if tokens > 0 => Ok(tokens),
-        _ => Err(format!("MUSH_CONTEXT needs a token count, got `{value}`")),
+        _ => Err(format!("{road} needs a token count, got `{value}`")),
     }
+}
+
+/// Parse `MUSH_CONTEXT`, the environment's road to [`parse_context`]: present
+/// and wrong is an error rather than a silent fallback, because the variable is
+/// how a human states the window.
+pub fn parse_context_env(value: &str) -> Result<usize, String> {
+    parse_context(value, "MUSH_CONTEXT")
 }
 
 /// Validate `MUSH_PROVIDER` the way the command line is validated. Ignoring a

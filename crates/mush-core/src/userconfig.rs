@@ -285,33 +285,18 @@ impl UserConfig {
 /// Move a home config mush cannot use beside itself, before a save that would
 /// replace it.
 ///
-/// The name is the session store's ([`crate::session::keep_unreadable`]), and
-/// so is the rule that an existing backup is never overwritten: the next free
-/// name (`.bak`, `.bak.2`, …) is taken instead, because a copy already beside
-/// the file is one the human already needed and this must not be the second
-/// accident. A failure is returned, and the caller refuses the write: a save
-/// that cannot keep what it is about to replace must not replace it.
+/// Why this road keeps a copy is its own: the file holds the human's key and
+/// their settings, and the first `/key`, `/url` or picker would replace what
+/// mush could not read. The name is the one numbering rule both store files
+/// take ([`crate::workspace::backup_name`]): the next free `.bak` name, with
+/// one bound for both roads, because a copy already beside the file is one the
+/// human already needed and this must not be the second accident. A failure is
+/// returned, and the caller refuses the write: a save that cannot keep what it
+/// is about to replace must not replace it.
 fn keep_unparsable(path: &Path) -> std::io::Result<PathBuf> {
-    /// How many names a hand-broken file may burn before the problem is not
-    /// the name.
-    const TRIES: u32 = 100;
-    let base = PathBuf::from(format!("{}.bak", path.display()));
-    for step in 1..=TRIES {
-        let to = if step == 1 {
-            base.clone()
-        } else {
-            PathBuf::from(format!("{}.{step}", base.display()))
-        };
-        if to.exists() {
-            continue;
-        }
-        fs::rename(path, &to)?;
-        return Ok(to);
-    }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        format!("every backup name beside {} is taken", path.display()),
-    ))
+    let to = crate::workspace::backup_name(path).map_err(std::io::Error::other)?;
+    fs::rename(path, &to)?;
+    Ok(to)
 }
 
 #[cfg(test)]
@@ -447,6 +432,36 @@ mod tests {
         let reloaded = UserConfig::load_from(&path);
         assert!(reloaded.complaint.is_none(), "what mush wrote reads back");
         assert_eq!(reloaded.config.provider, "deepseek");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The home config's copy is numbered by the one rule both store files take
+    /// ([`crate::workspace::backup_name`]): a second unparsable file goes to
+    /// `.bak.2`, never over the first copy — even though the two roads keep
+    /// their copies for different reasons, this one for the key and the
+    /// settings the file holds.
+    #[test]
+    fn a_second_unparsable_config_does_not_overwrite_the_first() {
+        let path = temp_path("second-backup");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let saved = UserConfig {
+            provider: "deepseek".into(),
+            ..UserConfig::default()
+        };
+
+        fs::write(&path, "{ \"api_key\": \"sk-first\", ").unwrap();
+        saved.save_to(&path).unwrap();
+        fs::write(&path, "{ \"api_key\": \"sk-second\", ").unwrap();
+        saved.save_to(&path).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(format!("{}.bak", path.display())).unwrap(),
+            "{ \"api_key\": \"sk-first\", "
+        );
+        assert_eq!(
+            fs::read_to_string(format!("{}.bak.2", path.display())).unwrap(),
+            "{ \"api_key\": \"sk-second\", "
+        );
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 

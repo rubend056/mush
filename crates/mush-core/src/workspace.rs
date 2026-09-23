@@ -847,16 +847,15 @@ impl Workspace {
     fn write_pasted_image(&self, bytes: Vec<u8>, mime: &str) -> Result<Image, String> {
         session::ensure_mush_dir(self.root())
             .map_err(|e| format!("cannot create {}: {e}", session::MUSH_DIR))?;
-        let dir = self.root().join(session::MUSH_DIR).join("paste");
-        fs::create_dir_all(&dir)
-            .map_err(|e| format!("cannot create {}/paste: {e}", session::MUSH_DIR))?;
+        let dir = paste_dir(self.root());
+        fs::create_dir_all(&dir).map_err(|e| format!("cannot create {PASTE_REL}: {e}"))?;
         let (name, mut file) = create_paste_file(&dir, now_millis(), mime)?;
         file.write_all(&bytes)
-            .map_err(|e| format!("cannot write {}/{name}: {e}", session::MUSH_DIR))?;
+            .map_err(|e| format!("cannot write {}: {e}", paste_rel(&name)))?;
         drop(file);
         let pixels = image_dimensions(mime, &bytes);
         Ok(Image {
-            path: format!("{}/paste/{name}", session::MUSH_DIR),
+            path: paste_rel(&name),
             mime: mime.to_string(),
             bytes,
             pixels,
@@ -1103,9 +1102,11 @@ impl Workspace {
     /// Literal on purpose: a regex engine is a dependency and a search that
     /// runs one is the `rg` the shell already has, while this tool exists for
     /// the one case the shell cannot serve (a held machine lock). Binary files
-    /// (a NUL byte) and files past [`SEARCH_FILE_CAP`] are skipped, and a
-    /// matching line is cut to [`MATCH_LINE_CAP`] bytes with the cut said, so
-    /// one minified file cannot spend the result.
+    /// (a NUL byte) and files past [`SEARCH_FILE_CAP`] are skipped — the read
+    /// is bounded to the cap + 1 like [`Self::whole_read`]'s, so a file that
+    /// grew behind the stat is caught by its length rather than loaded whole —
+    /// and a matching line is cut to [`MATCH_LINE_CAP`] bytes with the cut
+    /// said, so one minified file cannot spend the result.
     ///
     /// The match line is the *file's* line: no paint-time sanitizing, no
     /// `trim_end`, and a CRLF ending's `\r` stays ([`text::file_lines`]). This
@@ -1174,10 +1175,17 @@ impl Workspace {
                 skipped += 1;
                 return true;
             }
-            let Ok(bytes) = fs::read(path) else {
+            // Bounded like the other two readers: the stat above saw a file
+            // within the cap, and one that grew past it since is a skip rather
+            // than a whole load.
+            let Ok(bytes) = read_bounded(path, SEARCH_FILE_CAP) else {
                 skipped += 1;
                 return true;
             };
+            if bytes.len() as u64 > SEARCH_FILE_CAP {
+                skipped += 1;
+                return true;
+            }
             if bytes.contains(&0) {
                 skipped += 1;
                 return true;
@@ -1711,7 +1719,28 @@ fn now_millis() -> u128 {
         .unwrap_or(0)
 }
 
-/// Create the file a paste's bytes go in under `dir` (`.mush/paste/`), and
+/// Where pasted pictures live under a workspace, as the one spelling every
+/// road that names the directory reads: the join that creates it, the path an
+/// [`Image`] carries, and every message about a paste.
+///
+/// The spelling is one because two write failures used to say `.mush/<name>`
+/// for a file whose path is `.mush/paste/<name>` — a refusal a human is meant
+/// to act on, naming a file that is not there. A path spelled twice is a path
+/// that can disagree with itself.
+pub const PASTE_REL: &str = ".mush/paste";
+
+/// The directory under `root` that pasted pictures are written into.
+pub fn paste_dir(root: &Path) -> PathBuf {
+    root.join(PASTE_REL)
+}
+
+/// The workspace-relative name of a file in [`paste_dir`]: the path an
+/// [`Image`] carries and the path a message about a pasted file spells.
+pub fn paste_rel(name: &str) -> String {
+    format!("{PASTE_REL}/{name}")
+}
+
+/// Create the file a paste's bytes go in under `dir` (a [`paste_dir`]), and
 /// hand back the name it took: `pasted-<unix millis>.<ext>`, or
 /// `pasted-<millis>-2.<ext>` and on when that name is already there.
 ///
@@ -1738,9 +1767,24 @@ fn create_paste_file(dir: &Path, millis: u128, mime: &str) -> Result<(String, fs
         {
             Ok(file) => return Ok((name, file)),
             Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(format!("cannot write {}/{name}: {e}", session::MUSH_DIR)),
+            Err(e) => return Err(format!("cannot write {}: {e}", paste_rel(&name))),
         }
     }
+}
+
+/// The bytes of `path` read under `cap`, bounded to `cap + 1` so a file that
+/// grew behind the caller's own stat is caught by its length instead of loaded
+/// whole — the bound [`Workspace::whole_read`] and [`Workspace::image_at`]
+/// keep, and the one [`Workspace::search`]'s read used to keep only from the
+/// stat. A bound checked from `metadata` alone is no bound on a file that is
+/// still growing; `cap + 1` is what lets the caller answer "past the cap"
+/// without coming back for the file's real size.
+fn read_bounded(path: &Path, cap: u64) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::new();
+    fs::File::open(path)?
+        .take(cap + 1)
+        .read_to_end(&mut bytes)?;
+    Ok(bytes)
 }
 
 /// One matched line, as `search` hands it to a model: the file's own bytes,
@@ -1886,6 +1930,44 @@ pub fn atomic_write(path: &Path, bytes: &[u8], fresh: Fresh) -> io::Result<()> {
     }
     tmp.persist(&entry).map_err(|error| error.error)?;
     Ok(())
+}
+
+/// How many backup names mush will try beside a file it cannot use before it
+/// gives up looking. A store that has been hand-broken a hundred times has a
+/// problem that no file name solves.
+pub(crate) const BACKUP_TRIES: u32 = 100;
+
+/// The first free backup name beside `path` — `<path>.bak`, then `<path>.bak.2`,
+/// `<path>.bak.3`, … up to [`BACKUP_TRIES`] — for the two files mush sets aside
+/// rather than let the next write replace them: the unreadable session
+/// ([`crate::session::keep_unreadable`]) and the unparsable home config
+/// ([`crate::userconfig`]'s save).
+///
+/// The numbering is one rule so the two roads cannot disagree about it, and a
+/// copy already beside the file is never overwritten: it is one the human
+/// already needed, so the next free name is taken instead. The bound on how
+/// hard mush looks is this one constant. `Err` is the sentence both callers
+/// carry on: every name beside the file is taken.
+///
+/// The rename itself is each caller's, because *why* the copy is kept differs —
+/// a conversation that must not be lost and a key that must not be replaced are
+/// different accidents, kept for different reasons in the callers' own docs.
+pub fn backup_name(path: &Path) -> Result<PathBuf, String> {
+    let base = PathBuf::from(format!("{}.bak", path.display()));
+    for step in 1..=BACKUP_TRIES {
+        let to = if step == 1 {
+            base.clone()
+        } else {
+            PathBuf::from(format!("{}.{step}", base.display()))
+        };
+        if !to.exists() {
+            return Ok(to);
+        }
+    }
+    Err(format!(
+        "every backup name beside {} is taken",
+        path.display()
+    ))
 }
 
 /// What a write to `path` must land on, or why it cannot: the file the name
@@ -2951,6 +3033,33 @@ mod tests {
         );
     }
 
+    /// A refusal a paste that cannot be written is told names the file where it
+    /// would have been — `.mush/paste/<name>` — not `.mush/<name>`: the message
+    /// is what the human acts on, and the two write failures used to point
+    /// beside the directory. One spelling ([`PASTE_REL`]) serves the join that
+    /// makes the directory, the refusal and the path an [`Image`] carries.
+    #[test]
+    fn a_paste_that_cannot_be_written_names_the_paste_directory() {
+        let ws = temp_workspace("paste-spelling");
+        // `.mush/paste` is a file, so the directory cannot be made and a file
+        // inside it cannot be opened.
+        fs::create_dir_all(ws.root().join(".mush")).unwrap();
+        fs::write(ws.root().join(PASTE_REL), "not a directory").unwrap();
+
+        let refused = ws.save_pasted_image(png(4), false).unwrap_err();
+        assert!(refused.contains("cannot create .mush/paste: "), "{refused}");
+
+        let refused = create_paste_file(&ws.root().join(PASTE_REL), 1_700_000_000_000, "image/png")
+            .unwrap_err();
+        assert!(
+            refused.contains("cannot write .mush/paste/pasted-1700000000000.png: "),
+            "{refused}"
+        );
+
+        assert_eq!(paste_rel("shot.png"), ".mush/paste/shot.png");
+        assert_eq!(paste_dir(ws.root()), ws.root().join(PASTE_REL));
+    }
+
     /// An image past the cap is a refusal, not the text fallback, whichever
     /// way it was named: a batch holding one says the read's own sentence and
     /// attaches nothing — the app lands the whole paste as text.
@@ -3116,6 +3225,40 @@ mod tests {
         assert_eq!(mode_of(&path), 0o640);
         assert_eq!(fs::read(&path).unwrap(), b"{\"a\":1}");
         let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// One numbering rule for the copy kept beside a file mush cannot use: the
+    /// first free `.bak` name, then `.bak.2`, …, and the shared bound is what
+    /// stops it. The session store and the home config both take this road
+    /// ([`crate::session::keep_unreadable`], [`crate::userconfig`]), so the two
+    /// cannot disagree about which copy is the second accident; each keeps its
+    /// own reason for the copy in its own doc.
+    #[test]
+    fn a_backup_name_is_the_first_free_one_beside_the_file() {
+        let root = std::env::temp_dir().join(format!("mush-backup-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("thing.json");
+        fs::write(&file, "x").unwrap();
+
+        assert_eq!(backup_name(&file).unwrap(), root.join("thing.json.bak"));
+        fs::write(root.join("thing.json.bak"), "kept").unwrap();
+        assert_eq!(backup_name(&file).unwrap(), root.join("thing.json.bak.2"));
+
+        // Every name the bound allows, taken: the answer is the refusal, not a
+        // hundred-and-first name.
+        for step in 1..=BACKUP_TRIES {
+            let name = if step == 1 {
+                "thing.json.bak".to_string()
+            } else {
+                format!("thing.json.bak.{step}")
+            };
+            fs::write(root.join(name), "kept").unwrap();
+        }
+        let refused = backup_name(&file).unwrap_err();
+        assert!(refused.contains("every backup name beside"), "{refused}");
+        assert!(refused.contains("thing.json"), "{refused}");
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The one fact a rename cannot keep, pinned as the fact it is: a hard link
@@ -3779,6 +3922,28 @@ mod tests {
         );
         assert!(reported.contains("line cut at"), "{reported}");
         assert!(reported.len() < long.len(), "the cut is real");
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// A reader that stats a file before it reads it still bounds the read:
+    /// [`read_bounded`] hands back at most `cap + 1` bytes, so a file that grew
+    /// behind the stat is caught by the length rather than loaded whole. This
+    /// is the bound `whole_read` and `image_at` keep, and the one `search`'s
+    /// read kept only from the stat (finding: the drift the dedup report named
+    /// at workspace.rs:1068 vs :509, :878).
+    #[test]
+    fn a_bounded_read_stops_at_the_cap() {
+        let ws = temp_workspace("read-bounded");
+        let path = ws.root().join("grew.txt");
+        fs::write(&path, vec![b'x'; 4096]).unwrap();
+
+        let bytes = read_bounded(&path, 1024).unwrap();
+        assert_eq!(bytes.len(), 1025, "cap + 1 is what says `past the cap`");
+        assert_eq!(
+            read_bounded(&path, 4096).unwrap().len(),
+            4096,
+            "a file inside the cap is read whole"
+        );
         let _ = fs::remove_dir_all(ws.root());
     }
 
