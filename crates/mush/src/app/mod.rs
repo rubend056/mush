@@ -764,16 +764,18 @@ pub struct App {
     /// unrelated command triggers leaves the file's own key alone (finding
     /// C11).
     key_stated: bool,
-    /// Where [`Self::persist_user_config`] writes the home config. The real
-    /// value is [`userconfig::config_path`] — the machine-global file every
-    /// mush on this machine shares — and the field is here so a test can
-    /// point the write at a throwaway path: the fact C11 is about is which key
-    /// reaches the *file*, and a test reading the human's own config (or one
-    /// process-wide `MUSH_CONFIG` path shared by every test in this binary)
+    /// Where [`Self::persist_user_config`] writes the home config, or `None`
+    /// for a machine that has none ([`userconfig::config_path`], finding
+    /// IN14). The real value is [`userconfig::config_path`] — the machine-global
+    /// file every mush on this machine shares — and the field is here so a test
+    /// can point the write at a throwaway path: the fact C11 is about is which
+    /// key reaches the *file*, and a test reading the human's own config (or
+    /// one process-wide `MUSH_CONFIG` path shared by every test in this binary)
     /// would be reading every test's writes. It is also the one place the
     /// `/key` acks read their destination from, so the line and the write
-    /// cannot name two paths.
-    home_config: std::path::PathBuf,
+    /// cannot name two paths. `None` is not silence: [`Self::saved_to`] says
+    /// the home is missing by name, and a save refuses with the same words.
+    home_config: Option<std::path::PathBuf>,
     pub focus: Focus,
     /// Whether the zen view is on: the focused pane takes the whole screen
     /// (`Ctrl-F`).
@@ -3471,8 +3473,8 @@ impl App {
                 // so, so the promise was wrong in the one direction that costs
                 // a secret (finding A1).
                 None => self.say(format!(
-                    "no api key — /key <secret> sets one (saved to {})",
-                    self.home_config.display()
+                    "no api key — /key <secret> sets one ({})",
+                    self.saved_to()
                 )),
             },
             Command::ApiKey(Some(secret)) => {
@@ -3488,10 +3490,7 @@ impl App {
                 // only said for a write that landed: the failure keeps the one
                 // status slot `persist_user_config` put it in (finding IN12).
                 if self.persist_user_config() {
-                    self.say(format!(
-                        "api key set ({shown}…) — saved to {}",
-                        self.home_config.display()
-                    ));
+                    self.say(format!("api key set ({shown}…) — {}", self.saved_to()));
                 }
             }
             Command::Models => {
@@ -3579,8 +3578,21 @@ impl App {
     /// the same arm replaced the failure, so a human read that the key was on
     /// disk when it lived only in the config cell — and the next start had
     /// none (finding IN12). The failure names the file it could not reach, the
-    /// one thing a human needs to fix it.
+    /// one thing a human needs to fix it — and a machine with no home config
+    /// at all gets the refusal naming `HOME` instead of a write into the cwd
+    /// (finding IN14).
     fn persist_user_config(&mut self) -> bool {
+        let Some(path) = self.home_config.clone() else {
+            // There is no file to write, and there is no path to invent: the
+            // same sentence every reader of the home config gets names the
+            // missing home (finding IN14).
+            self.fail(
+                "could not save home config: HOME is not set and MUSH_CONFIG names no file \
+                 — set HOME or MUSH_CONFIG"
+                    .to_string(),
+            );
+            return false;
+        };
         let user = UserConfig {
             api_key: self.cfg().api_key.clone(),
             provider: self.cfg().provider.name().to_string(),
@@ -3600,10 +3612,10 @@ impl App {
         } else {
             KeyWrite::Keep
         };
-        if let Err(error) = user.save_to(&self.home_config, key) {
+        if let Err(error) = user.save_to(&path, key) {
             self.fail(format!(
                 "could not save home config {}: {error}",
-                self.home_config.display()
+                path.display()
             ));
             return false;
         }
@@ -3858,9 +3870,25 @@ impl App {
     /// stating its own destination, as it already does (findings C6, D6).
     fn no_key_hint(&self) -> String {
         format!(
-            "no api key for this endpoint — /key <secret> sets one (saved to {})",
-            self.home_config.display()
+            "no api key for this endpoint — /key <secret> sets one ({})",
+            self.saved_to()
         )
+    }
+
+    /// Where a `/key` ack says the key goes, in one spelling for all three
+    /// acks: `saved to <path>` where the machine has a home config, and the
+    /// refusal that stands in it where it has none — `HOME` unset with no
+    /// `MUSH_CONFIG` is a machine whose home config would be the workspace's
+    /// own directory, and mush refuses to invent one (finding IN14). The save
+    /// itself fails with a sentence naming `HOME`, so the promise is never
+    /// made on that machine.
+    fn saved_to(&self) -> String {
+        match &self.home_config {
+            Some(path) => format!("saved to {}", path.display()),
+            None => "no home config: HOME is not set and MUSH_CONFIG names no file \
+                     — a key set here is not saved"
+                .to_string(),
+        }
     }
 
     /// Point mush at another endpoint, re-deriving the window for it (finding
@@ -15713,10 +15741,7 @@ mod tests {
         run(&mut app, "/key");
         assert_eq!(
             text_of(&app),
-            format!(
-                "no api key — /key <secret> sets one (saved to {})",
-                app.home_config.display()
-            )
+            format!("no api key — /key <secret> sets one ({})", app.saved_to())
         );
     }
 
@@ -15732,7 +15757,7 @@ mod tests {
         let (mut app, _rx) = test_app("env-key-stays-out");
         let home = Scratch::new("app-env-key");
         let path = home.join("config.json");
-        app.home_config = path.clone();
+        app.home_config = Some(path.clone());
 
         // The file's own key for the endpoint in force, and a key the run got
         // from the environment: both are in play, and a `/url` may write only
@@ -15781,6 +15806,42 @@ mod tests {
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// The audit's IN14: with `HOME` unset and no `MUSH_CONFIG`, the home
+    /// config was the *relative* `.mush-user-config.json`, so the API key — in
+    /// plain text — landed in whatever directory mush was launched from,
+    /// usually a git repository, and a second workspace read a different
+    /// config. The path is now refused with a sentence naming `HOME` instead
+    /// of being substituted with the cwd.
+    #[test]
+    fn a_key_on_a_machine_with_no_home_config_says_home_is_not_set() {
+        let (mut app, _rx) = test_app("no-home-config");
+        app.home_config = None;
+
+        // The promise arm first, while the cell holds no key: where a key would
+        // go is what it says, and on this machine that is nowhere.
+        run(&mut app, "/key");
+        let line = text_of(&app).to_string();
+        assert!(line.contains("HOME is not set"), "{line}");
+        assert!(
+            !line.contains("saved to"),
+            "no path in the cwd is promised: {line}"
+        );
+
+        // And the save: the key reaches the cell, the file does not exist.
+        run(&mut app, "/key sk-typed-0123456789");
+        let line = text_of(&app).to_string();
+        assert!(line.contains("HOME is not set"), "{line}");
+        assert!(
+            !line.contains("saved to") && !line.contains("api key set"),
+            "no ack promised a file that cannot exist: {line}"
+        );
+        assert_eq!(
+            app.cfg().api_key.as_deref(),
+            Some("sk-typed-0123456789"),
+            "the run still uses the key the cell holds"
+        );
+    }
+
     /// The audit's IN12: `saved to …` is a promise about the file, and `/key`,
     /// `/provider` and a picked model all said it after the save had failed.
     /// The failure had one status slot and the ack took it, so the human read
@@ -15798,7 +15859,7 @@ mod tests {
         let blocked = dir.join("blocked");
         std::fs::write(&blocked, "not a directory\n").unwrap();
         let path = blocked.join("config.json");
-        app.home_config = path.clone();
+        app.home_config = Some(path.clone());
 
         // `/key`: the key reaches the cell — the run has it — but the file did
         // not get it, and the line says so instead of `saved to …`.
