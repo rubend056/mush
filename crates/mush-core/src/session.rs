@@ -13,6 +13,49 @@ use crate::message::Message;
 
 pub const MUSH_DIR: &str = ".mush";
 pub const SESSION_FILE: &str = "session.json";
+/// The workspace lock's own name, under `.mush/`. The lock itself — the flock
+/// on this file and the rule that one mush holds it at a time — lives in the
+/// `mush` crate's `lock` module; the *name* lives here, with the store's other
+/// paths, because it is one of the store's own files (see [`STORE_FILES`]).
+pub const LOCK_FILE: &str = "lock";
+
+/// The store's own files under `.mush/`, and what a whole-file write to each
+/// costs, in one list beside the paths above.
+///
+/// A name is listed by its *prefix*, so the session's family — the
+/// `session.json.bak`, `.bak.2`, … copies `keep_unreadable` sets aside — is
+/// covered by the session's own entry rather than by a list that has to grow
+/// with the copies. The window is a file *directly* under `.mush/`; a
+/// subdirectory is the human's (a paste lives in `.mush/paste/`), and a file
+/// under one is not one of these names. `mush`'s write doors ask
+/// [`store_file`] before replacing a name, so a store file added here is
+/// covered by construction rather than by somebody remembering.
+pub const STORE_FILES: &[(&str, &str)] = &[
+    (
+        LOCK_FILE,
+        "the workspace lock, which one mush holds for as long as it runs — replacing it would \
+         let a second mush lock the new file and write over this conversation",
+    ),
+    (
+        SESSION_FILE,
+        "this workspace's conversation — replacing it would lose the chat",
+    ),
+];
+
+/// Why `name` — a file directly under `.mush/` — is one of the store's own,
+/// or `None` when it is not.
+///
+/// The answer is the *name*, not the file's shape: every store file is a
+/// regular file by construction, so a shape check (finding B3's socket/FIFO
+/// refusal) cannot see them, and the harm of replacing one is not the loss of
+/// some bytes but of what the name means — the lock that keeps two mushes off
+/// one store (finding E2), or the conversation itself.
+pub fn store_file(name: &str) -> Option<&'static str> {
+    STORE_FILES.iter().find_map(|(file, why)| {
+        let family = name.strip_prefix(file)?;
+        (family.is_empty() || family.starts_with('.')).then_some(*why)
+    })
+}
 
 /// A `.gitignore` that ignores everything, itself included.
 const SELF_IGNORE: &str = "*\n";

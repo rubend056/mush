@@ -20,6 +20,14 @@
 //! two processes believe they hold the workspace. A file that is always there
 //! cannot be raced, and it holds one pid at most, so it never grows.
 //!
+//! Keeping the *name* is the other half, and it is not this module's alone:
+//! the lock is a file inside the workspace, and the workspace's own roads
+//! replace names — `write_file` is a temp file plus `rename` — which puts a
+//! fresh inode at the path and leaves this process's flock on an orphaned one.
+//! The model's write road refuses the store's own names
+//! ([`mush_core::session::STORE_FILES`], where this file's name lives now), so
+//! a tool call cannot do it (finding E2).
+//!
 //! A filesystem that cannot `flock` is refused, not ignored: a lock that
 //! silently does nothing is the silent damage this module exists to prevent,
 //! and the human is better told the workspace cannot be locked at all.
@@ -30,8 +38,7 @@ use std::path::Path;
 
 use rustix::fs::{flock, FlockOperation};
 
-/// The lock file, under `<root>/.mush/`.
-const LOCK_FILE: &str = "lock";
+use mush_core::session::LOCK_FILE;
 
 /// The workspace, for as long as this process is the one mush in it.
 ///
@@ -135,6 +142,50 @@ mod tests {
         assert!(path.exists(), "{} must stay on disk", path.display());
         // And a lock that was released this way is takeable again.
         assert!(acquire(&root).is_ok());
+    }
+
+    /// The lock's *name* is as load-bearing as its shape: `write_file` is a
+    /// temp file plus `rename`, so it puts a fresh inode at `.mush/lock` — the
+    /// flock this process holds is then on an orphaned inode, the next process
+    /// locks the new file, and two mushes write whole-file sessions over each
+    /// other on one store. The model's write road refuses the store's own
+    /// names, so the road is closed where the tool call lands; the positive
+    /// twin keeps the rest of `.mush/` the human's (finding E2).
+    #[test]
+    fn a_write_cannot_replace_the_workspace_lock() {
+        let root = root("store");
+        let first = acquire(&root).expect("the first acquire takes it");
+        let ws = mush_core::workspace::Workspace::new(&root).unwrap();
+
+        let error = ws
+            .write_file(".mush/lock", "a file, not a lock\n")
+            .expect_err("the lock's own name is refused");
+        assert!(
+            error.contains(".mush/lock"),
+            "the refusal names the file: {error}"
+        );
+        assert!(
+            error.contains("second mush"),
+            "the refusal says what a replace would cost: {error}"
+        );
+
+        // The lock the first acquire holds is still the one at the path, and
+        // the flock is still the test: a second process is refused for the same
+        // reason it was before the write was attempted.
+        let error = acquire(&root).expect_err("the second acquire is still refused");
+        assert!(error.contains("already running"), "{error}");
+
+        // The positive twin: a name that is not the store's still writes, so the
+        // refusal is the store's own files and not the directory.
+        ws.write_file(".mush/note.txt", "a note\n")
+            .expect("an ordinary file under .mush/ writes");
+        assert_eq!(
+            std::fs::read_to_string(root.join(".mush/note.txt")).unwrap(),
+            "a note\n"
+        );
+
+        drop(first);
+        assert!(acquire(&root).is_ok(), "the lock goes with its holder");
     }
 
     /// Two workspaces do not see each other's lock: the store is the unit.

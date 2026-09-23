@@ -1096,10 +1096,23 @@ impl Workspace {
     /// mode, but a model may not. The type refusal is shared with
     /// [`atomic_write`], because a rename over a socket destroys it whatever
     /// door it came through.
+    ///
+    /// The store's own files are refused *by name* ([`Self::store_file_refusal`])
+    /// on top of all that. They are regular files by construction, so the
+    /// shape check cannot see them, and what a rename over one costs is not
+    /// bytes but the workspace's own bookkeeping: `.mush/lock` is the flock
+    /// that keeps two mushes off one store (finding E2), and `.mush/session.json`
+    /// is the conversation. An ordinary file under `.mush/` is not one of
+    /// those names — the human's pastes live in `.mush/paste/`, a note is a
+    /// note — so it still writes; the refusal is the store's own names, not
+    /// the directory.
     pub fn write_file(&self, rel: &str, content: &str) -> Result<(), String> {
         let path = self.real_path(&self.resolve(rel)?, rel)?;
         if path == self.root {
             return Err("refusing to write to the workspace root".to_string());
+        }
+        if let Some(refusal) = self.store_file_refusal(&path, rel) {
+            return Err(refusal);
         }
         let entry = entry_for_write(&path, rel)?;
         if let Ok(meta) = fs::metadata(&entry) {
@@ -1117,6 +1130,26 @@ impl Workspace {
         }
         atomic_write(&entry, content.as_bytes(), Fresh::Box)
             .map_err(|e| format!("cannot write {rel}: {e}"))
+    }
+
+    /// The refusal a write to `real` gets when it would replace one of the
+    /// store's own files ([`session::store_file`]), or `None` when it would
+    /// not.
+    ///
+    /// The question is asked of the *real* path — what [`Self::real_path`]
+    /// answered — and not of the name the model typed, because a link inside
+    /// the workspace that points at `.mush/session.json` would otherwise be a
+    /// write to that file under another name. Only the store's own level
+    /// counts: `.mush/paste/lock` is a pasted picture that happens to be named
+    /// `lock`, not the lock, and the files under `.mush/`'s subdirectories are
+    /// mush's only in the sense that mush made the directory.
+    fn store_file_refusal(&self, real: &Path, name: &str) -> Option<String> {
+        let rel = real.strip_prefix(session::mushroom_dir(&self.root)).ok()?;
+        if rel.components().count() != 1 {
+            return None;
+        }
+        let why = session::store_file(rel.to_str()?)?;
+        Some(format!("{name} is {why}; refusing to replace it"))
     }
 }
 
@@ -2758,6 +2791,56 @@ mod tests {
         ws.write_file("fresh.txt", "b\n").unwrap();
         assert_eq!(ws.read_file("fresh.txt").unwrap(), "b\n");
         drop(listener);
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// The store's own files are refused by *name*, on top of the shape check
+    /// above: the lock (finding E2) and the conversation — with the `.bak`,
+    /// `.bak.2`, … copies `keep_unreadable` sets aside — are regular files, so
+    /// a socket/FIFO refusal cannot see them, and a rename over one of them is
+    /// how one tool call ("clean up stale locks", "reset .mush") puts a second
+    /// mush on the store or loses the chat. The names are the store's own list
+    /// ([`session::STORE_FILES`]), and everything else under `.mush/` is a
+    /// name like any other: a note, a paste.
+    #[test]
+    fn a_write_will_not_replace_the_stores_own_files() {
+        use std::os::unix::fs::symlink;
+
+        let ws = temp_workspace("write-store");
+        session::ensure_mush_dir(ws.root()).unwrap();
+        for name in [
+            ".mush/lock",
+            ".mush/session.json",
+            ".mush/session.json.bak",
+            ".mush/session.json.bak.2",
+        ] {
+            let refused = ws.write_file(name, "replaced\n").unwrap_err();
+            assert!(
+                refused.contains(name),
+                "the refusal names the file: {refused}"
+            );
+            assert!(refused.contains("refusing to replace it"), "{refused}");
+        }
+        // A link that resolves to a store file is a write to that file whatever
+        // it is called: the real path is what the refusal is asked about.
+        fs::write(ws.root().join(".mush/session.json"), "{}").unwrap();
+        symlink(
+            ws.root().join(".mush/session.json"),
+            ws.root().join(".mush/notes"),
+        )
+        .unwrap();
+        let refused = ws.write_file(".mush/notes", "replaced\n").unwrap_err();
+        assert!(refused.contains(".mush/notes"), "{refused}");
+        assert!(refused.contains("conversation"), "{refused}");
+        // The positive twin: names that are not the store's still write, in
+        // mush's directory and under one of its subdirectories.
+        ws.write_file(".mush/note.txt", "a note\n").unwrap();
+        ws.write_file(".mush/paste/lock", "a pasted picture named lock\n")
+            .unwrap();
+        assert_eq!(
+            ws.read_file(".mush/paste/lock").unwrap(),
+            "a pasted picture named lock\n"
+        );
         let _ = fs::remove_dir_all(ws.root());
     }
 
