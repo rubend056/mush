@@ -460,7 +460,7 @@ invariant knows its home. The `A1`–`A8` here are the starting audit's, not
 | B17 | the layout sweep asserts "does not panic", not painted text | `app/screen.rs` + `ui::draw(frame, &Screen)`; `the_draw_sweep_asserts_painted_text_not_that_it_did_not_panic` over 15 sizes × 14 states, plus seven focused `the_sweep_*` tests (`7e123e1`) |
 | B18 | `~` elision matches a prefix, not a directory | `app/screen.rs::facts_line` (moved from `ui.rs` by B17) |
 | B19 | global notices render into every transcript | `Notice.agent` + `Chat::notices_for` — no unscoped read exists |
-| N1 | `MAX_TURNS` turns "long" into "failed" | `agent/run.rs`: `LOOP_ROUNDS` (a run ends when it stops calling tools; only a *loop* ends it early) — the 200-turn ceiling and its wrap-up turn were removed later (H45, §8.47) |
+| N1 | `MAX_TURNS` turns "long" into "failed" | `agent.rs`: `LOOP_ROUNDS` (a run ends when it stops calling tools; only a *loop* ends it early) — the 200-turn ceiling and its wrap-up turn were removed later (H45, §8.47) |
 | N2 | message box is append-only and clips at the right edge | `Input` (grapheme cursor + window), `Chat::key` owns the editing keys |
 | N3 | a stopped child is reported to its parent as `#N done: cancelled` | `agent::Outcome` (one enum, not a `summary == CANCELLED` string sentinel) |
 | N4 | Ctrl-C stopped *every* busy agent, and blanked a stopped one to `Idle` | `App::interrupt` (focused) + `Ctrl-X` (`interrupt_all`); `Phase::Stopped` |
