@@ -400,6 +400,11 @@ fn subject_brief(brief: &str) -> String {
 /// stopped and failed shapes therefore carry the outcome *and* the brief, each
 /// bounded. [`parse_commit_subject`] is the inverse, and the two are tested
 /// against each other.
+///
+/// The failed shape's error is free text an endpoint chose, and it is written
+/// through [`escape_subject`]: without it, an error carrying `"): "` (a
+/// `refused (429): slow down`) puts the parser's own delimiter inside the head,
+/// and the row reads a brief that is really the error's tail (finding F15).
 pub fn commit_subject(id: u64, brief: &str, outcome: &Outcome) -> String {
     let brief = subject_brief(brief);
     match Committed::from(outcome) {
@@ -412,9 +417,81 @@ pub fn commit_subject(id: u64, brief: &str, outcome: &Outcome) -> String {
         // work up.
         Committed::CutOff => format!("mush #{id} (cut off, work in progress): {brief}"),
         Committed::Failed(error) => {
-            format!("mush #{id} (failed: {}): {brief}", truncate(&error, 40))
+            format!(
+                "mush #{id} (failed: {}): {brief}",
+                escape_subject(&truncate(&error, 40))
+            )
         }
     }
+}
+
+/// Write `text` so that [`parse_commit_subject`] can find the `"): "`
+/// `commit_subject` wrote, whatever the text holds.
+///
+/// The delimiter is `"): "`, so an occurrence inside the text would be found
+/// first. Escaping inserts a backslash before the `)` of every such sequence,
+/// and doubles every backslash first so the two operations are exact inverses
+/// ([`unescape_subject`] reads `\\` as one backslash and `\)` as a
+/// parenthesis): a text that already contained the escape's own output still
+/// round-trips.
+fn escape_subject(text: &str) -> String {
+    text.replace('\\', "\\\\").replace("): ", "\\): ")
+}
+
+/// The inverse of [`escape_subject`], run over the head's error text only.
+///
+/// The scan is total: a backslash followed by anything else is kept as it was,
+/// and a trailing backslash is a backslash, so a hand-written subject can never
+/// make this panic or silently drop a byte.
+fn unescape_subject(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            out.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some(')') => out.push(')'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Find the `"): "` `commit_subject` wrote: the first one that is not escaped.
+///
+/// [`escape_subject`] marks an occurrence inside the error by putting a
+/// backslash before its `)` — after doubling every backslash — so an escaped
+/// `"): "` has an *odd* run of backslashes before the parenthesis, while the
+/// delimiter has the even run the error's own tail doubled into. A plain
+/// `split_once("): ")` would land inside an escaped error and hand back its
+/// tail as the brief, which is the shape finding F15 measured.
+///
+/// Bytes are enough: `)`, `:` and ` ` are ASCII, so the two slices are always
+/// char boundaries.
+fn split_subject_head(rest: &str) -> Option<(&str, &str)> {
+    let bytes = rest.as_bytes();
+    for index in 0..bytes.len().saturating_sub(2) {
+        if bytes[index] != b')' || bytes[index + 1] != b':' || bytes[index + 2] != b' ' {
+            continue;
+        }
+        let mut backslashes = 0;
+        let mut before = index;
+        while before > 0 && bytes[before - 1] == b'\\' {
+            backslashes += 1;
+            before -= 1;
+        }
+        if backslashes % 2 == 0 {
+            return Some((&rest[..index], &rest[index + 3..]));
+        }
+    }
+    None
 }
 
 /// Read back what [`commit_subject`] wrote: how the run ended, and the task it
@@ -435,15 +512,20 @@ pub fn parse_commit_subject(subject: &str) -> Option<(Committed, String)> {
         return Some((Committed::Finished, brief.to_string()));
     }
     let rest = rest.strip_prefix(" (")?;
-    let (head, brief) = rest.split_once("): ")?;
+    // The first `"): "` in the subject that is *not* escaped is the delimiter
+    // `commit_subject` wrote: the head's error is escaped, so its own `"): "`
+    // occurrences are all preceded by an odd run of backslashes and the real
+    // delimiter by an even one. The brief after the delimiter is taken verbatim.
+    let (head, brief) = split_subject_head(rest)?;
     let ended = if head == "stopped, work in progress" {
         Committed::Stopped
     } else if head == "cut off, work in progress" {
         Committed::CutOff
     } else {
         // Any other shape must name a failure; if it does not, this subject is
-        // not one mush wrote.
-        Committed::Failed(head.strip_prefix("failed: ")?.to_string())
+        // not one mush wrote. The bounded error comes back as the text the
+        // caller wrote, its escaping undone ([`unescape_subject`]).
+        Committed::Failed(unescape_subject(head.strip_prefix("failed: ")?))
     };
     Some((ended, brief.to_string()))
 }
@@ -6637,6 +6719,55 @@ mod tests {
                 .unwrap_or_else(|| panic!("{subject} must parse back"));
             assert_eq!(ended, expected, "{subject}");
             assert_eq!(brief, "port the parser", "{subject}");
+        }
+    }
+
+    /// The round trip holds for *any* error text, including one that carries the
+    /// parser's own delimiter. `commit_subject` writes the failure's error into
+    /// the head and closes the head with `"): "`, while the error itself is free
+    /// text an endpoint chose — `refused (429): slow down` puts one inside it,
+    /// and a `split_once` then splits at the error's own sequence: the head
+    /// parses as a shortened error and the *brief* becomes the error's tail,
+    /// showing the row the wrong task (finding F15). The escaping is what makes
+    /// the first `"): "` the one `commit_subject` wrote.
+    #[test]
+    fn the_commit_subject_round_trips_for_any_error_text() {
+        let errors = [
+            "no route",
+            "the endpoint refused (429): slow down",
+            "a (b): c (d): e",
+            "): ",
+            "\\",
+            "\\): \\",
+            "trailing \\",
+            "refused (429): slow down \\ and ): again",
+            "编码 (429): 慢一点，再试一次，不要着急，等一会",
+        ];
+        let briefs = [
+            "port the parser",
+            // The brief is *not* the echo of an error: if the parser leaned on
+            // `rsplit_once` to dodge the error's `"): "`, a brief holding one
+            // would swallow the head instead.
+            "port the parser (again): from scratch",
+        ];
+        for error in errors {
+            for brief in briefs {
+                let subject = commit_subject(7, brief, &Outcome::Failed(error.to_string()));
+                let (ended, parsed) = parse_commit_subject(&subject)
+                    .unwrap_or_else(|| panic!("{subject:?} must parse back"));
+                assert_eq!(parsed, brief, "the brief survived: {subject:?}");
+                let Committed::Failed(parsed) = ended else {
+                    panic!("a failed run parsed as {ended:?}: {subject:?}")
+                };
+                // The error is bounded on the way in, so the bound is what
+                // round-trips — exactly the text the caller wrote into the
+                // subject, no more and no less.
+                assert_eq!(
+                    parsed,
+                    truncate(error, 40),
+                    "{subject:?} did not round-trip {error:?}"
+                );
+            }
         }
     }
 
