@@ -376,11 +376,14 @@ tells the UI, and retries once — a backstop, not the mechanism.
 
 ## What it writes
 
-- `./.mush/` — workspace-local state, git-ignored by itself: `session.json`
-  (the conversation and the whole agent tree, the provider, endpoint and model,
-  a context window you stated, and each agent's last failure),
-  `session.json.previous` (the conversation the last new chat kept), `wt/` for
-  isolated agents' worktrees, and `paste/` for pictures pasted into the chat.
+- `./.mush/` — workspace-local state, git-ignored by itself: `lock` (the
+  workspace lock, held while mush runs; replacing it lets a second mush write
+  over this conversation), `session.json` (the conversation and the whole agent
+  tree, the provider, endpoint and model, a context window you stated, and
+  each agent's last failure), an unreadable session set aside as
+  `session.json.bak` (then `.bak.2`, …), `session.json.previous` (the
+  conversation the last new chat kept), `wt/` for isolated agents' worktrees,
+  and `paste/` for pictures pasted into the chat.
 - The platform config directory (e.g. `~/.config/mush/config.json`) —
   machine-global defaults **including the API key**. The key never touches the
   workspace.

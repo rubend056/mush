@@ -694,8 +694,10 @@ What the audit that shaped this section found, and the defects each rule fixed:
 <workspace>/
   .mush/
     .gitignore     # contains a single line: *
+    lock           # the workspace lock, held while mush runs; replacing it would let a second mush write over this conversation
     session.json   # the conversation, model, provider, endpoint, a stated window, and stored failures
     session.json.previous  # the conversation the last new chat cleared
+    session.json.bak, .bak.2, …  # an unreadable session, set aside so the next save cannot destroy it
     wt/            # isolated agents' git worktrees (when used)
     paste/         # pictures pasted into the chat (Ctrl-V, or a path from outside)
     mush.sock      # the attach socket, while mush runs
