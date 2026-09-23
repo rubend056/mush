@@ -9,7 +9,9 @@
 //! own process group, output to scratch *files* rather than pipes (a pipe is
 //! only complete once every holder exits, so a command that leaves a background
 //! job behind would pin the agent thread past its timeout), and
-//! `kill -9 -pgid` to take the whole group down. One thing is not as it always
+//! `kill -9 -pgid` to take the whole group down — when the command's end is
+//! mush's doing ([`Job::kill`]) and when the command ended by itself with the
+//! group still standing ([`Job::end_group`]). One thing is not as it always
 //! was: the child is handed the inherited environment **minus mush's secrets**,
 //! so a command cannot read the provider credential ([`Shell`]).
 //!
@@ -84,6 +86,29 @@ pub trait Job: Send {
 
     /// Stop it and everything it started. Idempotent.
     fn kill(&mut self);
+
+    /// End what a command that has already ended left behind: the processes
+    /// still in its process group, and how many of them that took.
+    ///
+    /// A command's end is its leader's end ([`Job::poll`]), and a command that
+    /// ended by itself was never signalled — so `cmd &` (the shell exits, its
+    /// child stays in the group mush gave it) and a script that double-forks
+    /// would leave a process running in a group mush made, in no registry and
+    /// on no clock: not `stop`, not `kill_all`, not the age ceiling, and not
+    /// the output cap, whose watcher has gone (finding E3). The group is mush's
+    /// by construction (`process_group(0)`), so the watcher takes it here,
+    /// before it reports the command's own end.
+    ///
+    /// `Ok(0)` is the ordinary answer and means there was nothing left to end.
+    /// The leader must already be reaped: while it runs, the group is led by a
+    /// live process and [`Job::kill`] is the road that takes it — which is also
+    /// the whole answer for a command mush *stopped* rather than one that
+    /// finished, so a stop road calls nothing here and reports nothing about
+    /// the group. An implementation that cannot prove the group is still this
+    /// command's must answer `Ok(0)` rather than signal an id the kernel may
+    /// have reissued — a pid is not reissued while a process group still holds
+    /// it, so finding a member is the proof.
+    fn end_group(&mut self) -> Result<usize, String>;
 }
 
 /// How a command is started. One method: there is nothing else the watcher
@@ -201,6 +226,79 @@ impl Job for Running {
         }
         let _ = self.child.wait();
     }
+
+    fn end_group(&mut self) -> Result<usize, String> {
+        // The leader must have ended: while it runs, its group is led by a live
+        // process and `kill` is the road that takes it. `try_wait` on a reaped
+        // child answers its cached status, so this is the same question `poll`
+        // answered, asked again.
+        match self.child.try_wait() {
+            Ok(Some(_)) => {}
+            Ok(None) => return Err("the command is still running — kill it instead".to_string()),
+            Err(error) => return Err(format!("could not wait for command: {error}")),
+        }
+        let group = self.child.id();
+        let members = group_members(group);
+        if members.is_empty() {
+            return Ok(0);
+        }
+        let killed = scrub(&mut Command::new("kill"))
+            .args(["-9", &format!("-{group}")])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        match killed {
+            Ok(status) if status.success() => Ok(members.len()),
+            // The failure is the completion line's, not the log's: the owner is
+            // told the group may still be running (finding E6's silent `let _`
+            // is what this arm exists not to repeat).
+            Ok(status) => Err(format!("`kill -9 -{group}` answered {status}")),
+            Err(error) => Err(format!("`kill -9 -{group}` could not run: {error}")),
+        }
+    }
+}
+
+/// The pids a process group still holds, read from `/proc`.
+///
+/// A process group id *is* its leader's pid, and `/proc/<pid>/stat`'s fourth
+/// field is the group each process is in (`pid (comm) state ppid pgrp …`). The
+/// `comm` in the middle may contain spaces and parentheses, so the parse starts
+/// after its last `)`. Nothing is signalled to ask the question and nothing is
+/// signalled on a guess: a pid is not reissued while a process group still
+/// holds it, so a member found here is proof that the id is still the
+/// command's own (see [`Job::end_group`]).
+///
+/// A platform without `/proc` cannot be asked; the honest answer there is the
+/// empty one, because this file will not signal an id it cannot prove.
+pub(crate) fn group_members(pgid: u32) -> Vec<u32> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    let mut members = Vec::new();
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        let Some((_, rest)) = stat.rsplit_once(')') else {
+            continue;
+        };
+        if rest
+            .split_whitespace()
+            .nth(2)
+            .and_then(|group| group.parse::<u32>().ok())
+            == Some(pgid)
+        {
+            members.push(pid);
+        }
+    }
+    members
 }
 
 /// A command's output file, removed when it is dropped.
@@ -360,6 +458,10 @@ pub(crate) mod fake {
         /// The signal that killed it instead of an exit code. The two are one
         /// or the other, as they are in a real status (finding B6).
         pub signal: Option<i32>,
+        /// Processes the command leaves in its group when its leader ends —
+        /// the `cmd &` shape, scripted, so the completion line and the kill
+        /// are asserted without a real `sleep`.
+        pub left_behind: usize,
     }
 
     impl Script {
@@ -405,6 +507,13 @@ pub(crate) mod fake {
         pub fn writes_without_end(mut self, grows: u64) -> Self {
             self.grows = grows;
             self.exits_after = None;
+            self
+        }
+
+        /// A command that ends with `processes` still in its group: the
+        /// `sleep 60 & echo done` shape (finding E3).
+        pub fn leaves(mut self, processes: usize) -> Self {
+            self.left_behind = processes;
             self
         }
     }
@@ -519,6 +628,14 @@ pub(crate) mod fake {
                 self.killed = true;
                 self.kills.fetch_add(1, Ordering::SeqCst);
             }
+        }
+
+        fn end_group(&mut self) -> Result<usize, String> {
+            // Answered once, like the real one: after the kill the group is
+            // empty, and a second ask finds nothing.
+            let left = self.script.left_behind;
+            self.script.left_behind = 0;
+            Ok(left)
         }
     }
 }

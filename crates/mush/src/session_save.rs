@@ -26,6 +26,8 @@ use crossbeam_channel::{bounded, Receiver, Sender};
 
 use mush_core::session::Session;
 
+use crate::lock;
+
 /// Where a snapshot of the session is written.
 ///
 /// The snapshot is the caller's; the serialization and the disk are the
@@ -67,6 +69,11 @@ pub struct Writer {
 
 struct Inner {
     root: PathBuf,
+    /// The lock this store belongs to, when the caller has one: every save asks
+    /// it whether the name still leads to the inode that was locked, and writes
+    /// nothing when it does not. `None` for a writer built without a lock (a
+    /// test, or a road that never took one).
+    lock: Option<lock::Identity>,
     pending: Mutex<Pending>,
     /// How many writes have been attempted. Only a test reads it — a burst's
     /// cost is otherwise invisible from outside the writer.
@@ -92,8 +99,15 @@ impl Pending {
 }
 
 impl Writer {
-    pub fn new(root: PathBuf) -> Self {
-        let mut writer = Self::parked(root);
+    /// The writer for `root`. `lock` is the store's lock when the caller has
+    /// one: every save then first asks the lock's name whether it still leads
+    /// to the inode that was locked, and writes nothing when it does not
+    /// ([`lock::Identity::still_mine`]). A whole-file write or an `mv` over the
+    /// lock's name is the one way a store comes to have two owners that no
+    /// tool-level guard can see (finding E2); `None` is a writer built with no
+    /// lock to check (a test, or a road that never took one).
+    pub fn new(root: PathBuf, lock: Option<lock::Identity>) -> Self {
+        let mut writer = Self::parked(root, lock);
         writer.run();
         writer
     }
@@ -101,10 +115,11 @@ impl Writer {
     /// Everything but the thread, so a test can hand snapshots over before
     /// anything can write them — which is how what a burst costs is seen
     /// instead of raced. `new` is this and then [`Self::run`].
-    fn parked(root: PathBuf) -> Self {
+    fn parked(root: PathBuf, lock: Option<lock::Identity>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 root,
+                lock,
                 pending: Mutex::new(Pending::default()),
                 #[cfg(test)]
                 writes: AtomicUsize::new(0),
@@ -202,15 +217,28 @@ fn drain(inner: &Inner) {
             return;
         }
         if let Some(session) = snapshot {
-            let attempt = session.save(&inner.root);
-            #[cfg(test)]
-            inner.writes.fetch_add(1, Ordering::SeqCst);
-            // Nobody is waiting on a background write, so the failure is left
-            // where the UI's next tick will find it. A later success does not
-            // clear it: the tick polls every frame, and a failure that arrives
-            // and is overwritten unseen is a failure that was swallowed.
-            if let Err(error) = attempt {
-                *inner.failed.lock().unwrap() = Some(error.to_string());
+            // The store is one writer's only while the lock's name still leads
+            // to the inode this process locked. The model's write road refuses
+            // the store's own names, but the name is on the human's own disk:
+            // a whole-file write or an `mv` over it replaces it in one step,
+            // and from then on a second mush owns the store. Writing the
+            // conversation into somebody else's store is exactly the damage the
+            // lock exists to prevent, so a save that cannot prove the store is
+            // still this mush's writes nothing and leaves the refusal where the
+            // UI's tick reads it.
+            if let Some(Err(why)) = inner.lock.as_ref().map(lock::Identity::still_mine) {
+                *inner.failed.lock().unwrap() = Some(why);
+            } else {
+                let attempt = session.save(&inner.root);
+                #[cfg(test)]
+                inner.writes.fetch_add(1, Ordering::SeqCst);
+                // Nobody is waiting on a background write, so the failure is left
+                // where the UI's next tick will find it. A later success does not
+                // clear it: the tick polls every frame, and a failure that arrives
+                // and is overwritten unseen is a failure that was swallowed.
+                if let Err(error) = attempt {
+                    *inner.failed.lock().unwrap() = Some(error.to_string());
+                }
             }
         }
         // After the write, never before it: a waiter is asking for a file it can
@@ -321,7 +349,7 @@ mod tests {
     #[test]
     fn a_handed_over_snapshot_is_on_disk_when_flush_returns() {
         let root = root("roundtrip");
-        let writer = Writer::new(root.clone());
+        let writer = Writer::new(root.clone(), None);
         writer.save(saying("hello"));
         writer.flush();
         assert_eq!(last_message(&root), "hello");
@@ -335,7 +363,7 @@ mod tests {
     #[test]
     fn a_burst_of_handovers_costs_one_write_and_lands_the_newest() {
         let root = root("newest");
-        let mut writer = Writer::parked(root.clone());
+        let mut writer = Writer::parked(root.clone(), None);
         writer.save(saying("one"));
         writer.save(saying("two"));
         writer.save(saying("three"));
@@ -351,7 +379,7 @@ mod tests {
     #[test]
     fn a_flush_with_nothing_pending_still_returns() {
         let root = root("empty");
-        let writer = Writer::new(root.clone());
+        let writer = Writer::new(root.clone(), None);
         writer.flush();
         assert!(!session_path(&root).exists(), "nothing was handed over");
         writer.save(saying("after"));
@@ -368,12 +396,49 @@ mod tests {
         // `.mush` as a *file* is a workspace the session cannot be written to,
         // exactly as a full disk or a read-only checkout would be.
         fs::write(root.join(".mush"), "not a directory").unwrap();
-        let writer = Writer::new(root.clone());
+        let writer = Writer::new(root.clone(), None);
         writer.save(saying("lost"));
         writer.flush();
         let error = writer.take_error().expect("the failure is reported");
         assert!(!error.is_empty(), "it says what went wrong: {error}");
         assert!(writer.take_error().is_none(), "and it is reported once");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The lock's name is what makes a store this process's. Once it has been
+    /// replaced — the human's own `mv`; no tool can do it, `write_file` refuses
+    /// the store's own names — this mush's flock is on an orphaned inode and a
+    /// second mush owns the store, so the save road refuses to write the
+    /// conversation over it and leaves the refusal for the UI (finding E2).
+    #[test]
+    fn a_save_refuses_a_lock_file_that_was_replaced() {
+        let root = root("lock-replaced");
+        mush_core::session::ensure_mush_dir(&root).unwrap();
+        let guard = crate::lock::acquire(&root).unwrap();
+        let writer = Writer::new(root.clone(), Some(guard.identity()));
+
+        // While the name still leads to the locked inode, the writer writes:
+        // the check is the lock's identity, not a refusal.
+        writer.save(saying("before"));
+        writer.flush();
+        assert_eq!(last_message(&root), "before");
+        assert!(writer.take_error().is_none());
+
+        // A fresh file renamed over the lock's name: the guard's flock is now on
+        // a file nobody looks at, and the next start locks this new one.
+        let fresh = root.join(".mush/lock.new");
+        fs::write(&fresh, "0\n").unwrap();
+        fs::rename(&fresh, root.join(".mush/lock")).unwrap();
+
+        writer.save(saying("after the lock was replaced"));
+        writer.flush();
+        let error = writer.take_error().expect("the refusal is reported");
+        assert!(error.contains("was replaced"), "{error}");
+        assert_eq!(
+            last_message(&root),
+            "before",
+            "the store still holds the last write it was this mush's to make"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 }

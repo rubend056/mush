@@ -5870,7 +5870,7 @@ mod tests {
     /// the tests that read the file back. The writer is returned so a test can
     /// see how many writes the conversation cost.
     fn app_writing(root: &std::path::Path) -> (App, Arc<session_save::Writer>) {
-        let writer = Arc::new(session_save::Writer::new(root.to_path_buf()));
+        let writer = Arc::new(session_save::Writer::new(root.to_path_buf(), None));
         let (app, _rx) = app_root(root, None, writer.clone());
         (app, writer)
     }

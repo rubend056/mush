@@ -286,7 +286,19 @@ impl JobOutcome {
     /// The command is cut to [`STATUS_COMMAND_COLUMNS`] here, where the line is
     /// built: `status` prints this line for a job that has ended, and the
     /// command it names is uncapped upstream.
-    pub fn line(&self, id: JobId, command: &str, age: Duration, tail: &str) -> String {
+    ///
+    /// A command that ended with its group still standing says so where its own
+    /// end is said — `#c2 done: exit 0 · 1s — 1 process in its group was
+    /// stopped · sleep 60 & echo done` — because that is news the same reader
+    /// needs in the same breath ([`GroupEnding`], finding E3).
+    pub fn line(
+        &self,
+        id: JobId,
+        command: &str,
+        age: Duration,
+        tail: &str,
+        group: &GroupEnding,
+    ) -> String {
         let command = truncate(command, STATUS_COMMAND_COLUMNS);
         let head = match self {
             JobOutcome::Exited(code) => format!("{id} done: exit {code} · {}", short_age(age)),
@@ -314,11 +326,64 @@ impl JobOutcome {
                 short_age(age)
             ),
         };
+        // Right after how it ended, before the age or the command: a group mush
+        // had to end is part of the ending, not an aside about the output.
+        let head = match group.clause() {
+            None => head,
+            Some(clause) => format!("{head} — {clause}"),
+        };
         let tail = preview_tail(tail);
         if tail.is_empty() {
             format!("{head} · {command}")
         } else {
             format!("{head} · {command} — {tail}")
+        }
+    }
+}
+
+/// What was left in a command's process group when the command itself had
+/// ended: the fact a completion line and a tool result both carry, because a
+/// human — or a model that wrote `server &` — must be told the group is gone.
+///
+/// The three states are [`Job::end_group`]'s answer, kept as one value so the
+/// completion line, `status` and the model's report cannot disagree about what
+/// happened: nothing left, a count that was stopped, or the reason it could not
+/// be.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum GroupEnding {
+    /// The ordinary case: the command's group died with it.
+    Empty,
+    /// These processes were still in the group; mush ended them.
+    Stopped(usize),
+    /// The group could not be ended, and why — the line says the truth instead
+    /// of claiming a kill that did not happen.
+    Unfinished(String),
+}
+
+impl From<Result<usize, String>> for GroupEnding {
+    fn from(answer: Result<usize, String>) -> Self {
+        match answer {
+            Ok(0) => GroupEnding::Empty,
+            Ok(count) => GroupEnding::Stopped(count),
+            Err(why) => GroupEnding::Unfinished(why),
+        }
+    }
+}
+
+impl GroupEnding {
+    /// The clause a sentence about how a command ended carries, or `None` when
+    /// there is nothing to say. One home for the wording, so the completion
+    /// line and the model's tool result read the same.
+    pub fn clause(&self) -> Option<String> {
+        match self {
+            GroupEnding::Empty => None,
+            GroupEnding::Stopped(1) => Some("1 process in its group was stopped".to_string()),
+            GroupEnding::Stopped(count) => {
+                Some(format!("{count} processes in its group were stopped"))
+            }
+            GroupEnding::Unfinished(why) => {
+                Some(format!("mush could not end its process group: {why}"))
+            }
         }
     }
 }
@@ -443,6 +508,17 @@ impl Live {
         self.job.lock().map(|job| job.written()).unwrap_or(0)
     }
 
+    /// End what the command left in its group, through the same gripped handle
+    /// `kill` goes through. One caller — the watcher, when the command's own
+    /// end has just been seen — because that is the moment the group's id is
+    /// still provably the command's (see [`Job::end_group`]).
+    fn end_group(&self) -> Result<usize, String> {
+        match self.job.lock() {
+            Ok(mut job) => job.end_group(),
+            Err(_) => Err("the command's handle was poisoned".to_string()),
+        }
+    }
+
     fn output(&self, cap: usize) -> (String, String) {
         self.job
             .lock()
@@ -480,6 +556,13 @@ impl Live {
 /// machine-wide budget: the model is the one waiting for its result, and the
 /// transcript is where that result is read. What it has is an entry in the
 /// registry's foreground map, which is what a kill can find.
+///
+/// A command that ends by itself with its group still standing is the one thing
+/// a tool call can leave behind that no kill on the way out would reach: mush
+/// stopped it for no reason — it exited — so [`Job::kill`] is never called, and
+/// `cmd &` stays in the group the call made. [`Foreground::poll`] ends the group
+/// when it sees that end, and keeps the count so the model's report can say it
+/// ([`Foreground::left_behind`], finding E3).
 pub struct Foreground {
     registry: Arc<Registry>,
     /// The agent whose command this is — the key the registry's `foregrounds`
@@ -493,6 +576,11 @@ pub struct Foreground {
     /// sets it once the record exists, and the `Drop` that follows the handover
     /// must not kill the job the command just became.
     handed_over: bool,
+    /// What the command's group held when the command ended by itself, once
+    /// that end has been seen: `None` while it runs, and for a command a kill
+    /// ended (that kill took the group with it, so there is nothing to
+    /// report).
+    left: Option<GroupEnding>,
 }
 
 impl Foreground {
@@ -501,6 +589,14 @@ impl Foreground {
     /// watcher gives the model must not read as the command's own exit code.
     pub fn stopped(&self) -> bool {
         self.live.stopped()
+    }
+
+    /// What the command left in its group when it ended by itself, or `None`
+    /// when there is nothing to say — it is still running, or mush's own kill
+    /// ended it and took the group. Read by `run_shell` once the wait returns,
+    /// for the note in the model's result.
+    pub fn left_behind(&self) -> Option<&GroupEnding> {
+        self.left.as_ref()
     }
 }
 
@@ -517,7 +613,9 @@ impl Drop for Foreground {
     /// the command's own answer: `poll` saying `Ok(None)` means it has not been
     /// *reaped*, so its pid — and therefore its group id — cannot have been
     /// reused, and killing is safe. `Ok(Some(_))` is a command that ended, and
-    /// the kill is the one that must not happen.
+    /// the kill is the one that must not happen — what such a command left in
+    /// its group is taken where that end is seen ([`Foreground::poll`]), while
+    /// the id is still provably the command's, not here.
     ///
     /// The road this exists for is the panic road (finding E4): a tool that
     /// panics while the command runs unwinds through this `Drop`, and the old
@@ -536,7 +634,16 @@ impl Drop for Foreground {
 
 impl Job for Foreground {
     fn poll(&mut self) -> Result<Option<End>, String> {
-        self.live.poll()
+        let ended = self.live.poll()?;
+        if ended.is_some() && self.left.is_none() {
+            // The command ended by itself, so nothing has signalled its group:
+            // end what is left of it now, while the leader is reaped and the
+            // group id is still provably this command's (`Job::end_group`). The
+            // answer is kept for the report `run_shell` builds; the `is_none`
+            // guard is for a caller that asks again, which would find nothing.
+            self.left = Some(self.live.end_group().into());
+        }
+        Ok(ended)
     }
 
     fn written(&self) -> u64 {
@@ -556,6 +663,10 @@ impl Job for Foreground {
 
     fn kill(&mut self) {
         self.live.kill();
+    }
+
+    fn end_group(&mut self) -> Result<usize, String> {
+        self.live.end_group()
     }
 }
 
@@ -890,6 +1001,7 @@ impl Registry {
             owner,
             live,
             handed_over: false,
+            left: None,
         }
     }
 
@@ -1384,6 +1496,11 @@ fn watch(
     // is a reason to stop it, and the reason belongs in the window its owner
     // reads rather than in a log nobody sees.
     let mut note = String::new();
+    // What the command's own end left in its group, when it ended by itself:
+    // the completion says so (finding E3). A kill's roads below take the group
+    // themselves ([`Running::kill`]'s `kill -9 -pgid`), so there is nothing
+    // here for them to report.
+    let mut group = GroupEnding::Empty;
     let outcome = loop {
         if live.stop.load(Ordering::SeqCst) {
             break JobOutcome::Stopped;
@@ -1403,11 +1520,15 @@ fn watch(
                 // A kill that landed between the poll and the flag is what the
                 // flag is for: report it as a stop rather than as the command's
                 // own end — its code or the signal mush sent it.
-                break if live.stop.load(Ordering::SeqCst) {
-                    JobOutcome::Stopped
-                } else {
-                    JobOutcome::from(end)
-                };
+                if live.stop.load(Ordering::SeqCst) {
+                    break JobOutcome::Stopped;
+                }
+                // The command ended by itself, so nothing has signalled its
+                // group: end what is left of it now, while the leader is
+                // reaped and the id is still provably this command's, and keep
+                // the answer for the line below (`Job::end_group`).
+                group = live.end_group().into();
+                break JobOutcome::from(end);
             }
             Err(None) => {}
             Err(Some(error)) => {
@@ -1444,7 +1565,7 @@ fn watch(
     // record it ends, so `finish` has no case where there is no record to report
     // — the old fallback for one of those spelled the age as `0s`.
     let age = registry.clock.now().saturating_duration_since(started);
-    let line = outcome.line(id, &command, age, &tail);
+    let line = outcome.line(id, &command, age, &tail, &group);
     registry.finish(id, line.clone(), tail);
     registry.events.emit(
         AgentId(owner),
@@ -1643,8 +1764,13 @@ mod tests {
     #[test]
     fn a_completion_line_names_the_status_the_age_the_command_and_the_tail() {
         let tail = "running 12 tests\ntest result: ok. 12 passed";
-        let line =
-            JobOutcome::Exited(0).line(JobId(2), "cargo test", Duration::from_secs(192), tail);
+        let line = JobOutcome::Exited(0).line(
+            JobId(2),
+            "cargo test",
+            Duration::from_secs(192),
+            tail,
+            &GroupEnding::Empty,
+        );
         assert_eq!(
             line,
             "#c2 done: exit 0 · 3m12s · cargo test — running 12 tests · test result: ok. 12 passed"
@@ -1653,18 +1779,35 @@ mod tests {
         // A signal death is its own outcome and its own sentence: `-1` was not
         // an exit code, and it said nothing about what ended the job — an OOM
         // kill and a `SIGSEGV` read the same through it (finding B6).
-        let signalled =
-            JobOutcome::Signalled(9).line(JobId(2), "cargo test", Duration::from_secs(192), "");
+        let signalled = JobOutcome::Signalled(9).line(
+            JobId(2),
+            "cargo test",
+            Duration::from_secs(192),
+            "",
+            &GroupEnding::Empty,
+        );
         assert_eq!(signalled, "#c2 killed by signal 9 · 3m12s · cargo test");
         assert!(
             JobOutcome::Signalled(9).is_news(),
             "a result nobody has read, whoever ended it"
         );
-        let stopped = JobOutcome::Stopped.line(JobId(2), "cargo test", Duration::from_secs(4), "");
+        let stopped = JobOutcome::Stopped.line(
+            JobId(2),
+            "cargo test",
+            Duration::from_secs(4),
+            "",
+            &GroupEnding::Empty,
+        );
         assert_eq!(stopped, "#c2 stopped after 4s · cargo test");
         assert!(!JobOutcome::Stopped.is_news(), "a kill is not a result");
         assert!(JobOutcome::TooMuchOutput
-            .line(JobId(2), "yes", Duration::from_secs(1), "y")
+            .line(
+                JobId(2),
+                "yes",
+                Duration::from_secs(1),
+                "y",
+                &GroupEnding::Empty
+            )
             .contains("wrote past"));
         assert!(
             JobOutcome::TooMuchOutput.is_news(),
@@ -1672,7 +1815,13 @@ mod tests {
         );
         // The ceiling says what it was, because the one thing its owner needs
         // to know is that the command was still running after four hours.
-        let long = JobOutcome::RanTooLong.line(JobId(3), "cargo run", JOB_MAX_AGE, "");
+        let long = JobOutcome::RanTooLong.line(
+            JobId(3),
+            "cargo run",
+            JOB_MAX_AGE,
+            "",
+            &GroupEnding::Empty,
+        );
         assert_eq!(
             long,
             "#c3 killed: it ran past the 4h ceiling · 4h00m · cargo run"
@@ -1687,8 +1836,13 @@ mod tests {
         // (finding H26). No job mush starts ends this way — `machine::ended`
         // reads an exit or a death by signal from the statuses `wait` produces
         // — and the line is what a status naming neither would report.
-        let unknown =
-            JobOutcome::Unknown.line(JobId(2), "cargo test", Duration::from_secs(192), tail);
+        let unknown = JobOutcome::Unknown.line(
+            JobId(2),
+            "cargo test",
+            Duration::from_secs(192),
+            tail,
+            &GroupEnding::Empty,
+        );
         assert_eq!(
             unknown,
             "#c2 ended without an exit code or a signal · 3m12s · cargo test — running 12 \
@@ -1710,10 +1864,57 @@ mod tests {
         // The kept window is a tail, so a long one keeps its *end* and says
         // where it was cut off — the head is what a foreground result keeps.
         let long = format!("start{}{}", "x".repeat(4000), "the end that matters");
-        let line =
-            JobOutcome::Exited(0).line(JobId(3), "cargo build", Duration::from_secs(1), &long);
+        let line = JobOutcome::Exited(0).line(
+            JobId(3),
+            "cargo build",
+            Duration::from_secs(1),
+            &long,
+            &GroupEnding::Empty,
+        );
         assert!(line.contains("the end that matters"), "{line}");
         assert!(!line.contains("startxxxx"), "the head was dropped: {line}");
+
+        // A command that ended with its group still standing says so where its
+        // own end is said — the count is part of how it ended, and a reader
+        // deciding what to do next needs it in the same breath (finding E3).
+        let with_group = JobOutcome::Exited(0).line(
+            JobId(2),
+            "sleep 60 & echo done",
+            Duration::from_secs(1),
+            "done",
+            &GroupEnding::Stopped(2),
+        );
+        assert_eq!(
+            with_group,
+            "#c2 done: exit 0 · 1s — 2 processes in its group were stopped · sleep 60 & echo \
+             done — done"
+        );
+        let one = JobOutcome::Exited(0).line(
+            JobId(2),
+            "sleep 60 & echo done",
+            Duration::from_secs(1),
+            "done",
+            &GroupEnding::Stopped(1),
+        );
+        assert!(
+            one.contains("1 process in its group was stopped"),
+            "a count of one is singular: {one}"
+        );
+        // And a kill that did not land says *that*, rather than claiming the
+        // group was stopped (the failure a silent `let _` used to swallow).
+        let unfinished = GroupEnding::from(Err("`kill -9 -7` answered exit status: 1".into()));
+        let failed = JobOutcome::Exited(0).line(
+            JobId(2),
+            "sleep 60 & echo done",
+            Duration::from_secs(1),
+            "done",
+            &unfinished,
+        );
+        assert!(
+            failed.contains("mush could not end its process group"),
+            "{failed}"
+        );
+        assert!(failed.contains("answered"), "{failed}");
     }
 
     /// A job that ends by itself reports itself to its owner exactly once, with
@@ -2614,5 +2815,148 @@ mod tests {
             registry.live_for(7).is_empty(),
             "the slot, the process group and the scratch are given back"
         );
+    }
+
+    /// A command that ends with its group still standing is reported with the
+    /// group's ending in the same line, and it is not a kill that did it: the
+    /// group's end is a handover at the command's own end, so the job's slot,
+    /// its thread and its scratch are untouched (finding E3).
+    #[test]
+    fn a_completion_line_says_the_group_was_stopped() {
+        let machine =
+            Arc::new(ScriptedMachine::new().runs(Script::exits(0).says("done").leaves(2)));
+        let (registry, _events, _clock) = registry();
+        let (id, mailbox) = launch(&registry, &machine, 7);
+
+        let line = match mailbox.recv_timeout(Duration::from_secs(5)) {
+            Ok(AgentMsg::CommandDone {
+                id: done,
+                line,
+                news,
+            }) => {
+                assert_eq!(done, id);
+                assert!(news, "the group's end is part of the result: {line}");
+                line
+            }
+            other => panic!("the completion must arrive: {other:?}"),
+        };
+        assert!(line.contains("done: exit 0"), "{line}");
+        assert!(
+            line.contains("2 processes in its group were stopped"),
+            "the line says the group was ended: {line}"
+        );
+        assert_eq!(
+            machine.kills(),
+            0,
+            "the command ended by itself; the sweep is not a kill"
+        );
+        // The window `status` shows is the line, so the fact outlives the wake
+        // that carried it.
+        assert!(registry
+            .status_for(7)
+            .expect("the finished job stays listed")
+            .contains("were stopped"));
+    }
+
+    /// The group is mush's by construction, so a leader that exits while its
+    /// group still lives — `sleep 60 & echo done` — is a handover, not an
+    /// exit: the job takes the group with it and says so, and the same command
+    /// as a tool call leaves nothing behind either. Before this the job said
+    /// `done: exit 0` while the `sleep` outlived the registry, the ceiling,
+    /// `Stop`, `Ctrl-N` and the quit (finding E3).
+    #[test]
+    fn a_job_takes_the_whole_group_with_it() {
+        use crate::clock::System;
+        use crate::machine::{group_members, Machine, Shell, ShellCommand};
+        use crossbeam_channel::unbounded;
+
+        /// A bounded wait for a fact the kernel may take a moment to make true:
+        /// `SIGKILL` is delivered at once, but the process still has to be
+        /// scheduled to die and reaped (an orphan by init).
+        fn wait_for(what: &str, mut gone: impl FnMut() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(10);
+            while !gone() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "{what} is still there"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let read = |name: &str| -> u32 {
+            std::fs::read_to_string(root.join(name))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        // The registry with the real clock: this test drives real `sh` and real
+        // `sleep`, and the scripted clock would never advance a job's polls.
+        let clock: Arc<dyn crate::clock::Clock> = Arc::new(System);
+        let registry = Registry::new(clock, Recorder::new(), Ids::default());
+
+        // The job road: the shell exits at once, the `sleep` stays behind in
+        // the group `process_group(0)` gave it. It writes its own pid and its
+        // group's, so the test can look for the very processes the line talks
+        // about.
+        let command = "echo $$ > pgid; sleep 60 & echo $! > pid; echo done";
+        let job = Shell
+            .spawn(&ShellCommand { command, root })
+            .expect("the real shell starts");
+        let (tx, mailbox) = unbounded();
+        let id = registry
+            .launch(Launch::started(7, command.to_string(), false, tx, job))
+            .expect("the job is admitted");
+        let line = match mailbox.recv_timeout(Duration::from_secs(30)) {
+            Ok(AgentMsg::CommandDone { line, .. }) => line,
+            other => panic!("no completion for {id}: {other:?}"),
+        };
+        let pgid = read("pgid");
+        let pid = read("pid");
+        assert!(line.contains("done: exit 0"), "{line}");
+        assert!(
+            line.contains("1 process in its group was stopped"),
+            "the line says the group was ended: {line}"
+        );
+        // What the line says is what the machine did: once the kernel is done,
+        // no `/proc` entry holds that pgid — the `sleep` included.
+        wait_for("the job's process group", || group_members(pgid).is_empty());
+        assert!(
+            !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+            "the background child the line counted is gone"
+        );
+
+        // The tool call's road: what `run_shell` holds while it waits. Nothing
+        // there calls `kill` — the command ended by itself — so the group has
+        // to be taken by the end that saw it, or `sleep 60 &` walks out of the
+        // call unseen.
+        let command = "echo $$ > pgid2; sleep 60 & echo $! > pid2; echo done";
+        let job = Shell
+            .spawn(&ShellCommand { command, root })
+            .expect("the real shell starts");
+        let mut held = registry.hold(8, job);
+        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        loop {
+            match held.poll() {
+                Ok(Some(_)) => break,
+                Ok(None) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(5))
+                }
+                Ok(None) => panic!("the tool call's command did not end"),
+                Err(error) => panic!("{error}"),
+            }
+        }
+        assert_eq!(
+            held.left_behind(),
+            Some(&GroupEnding::Stopped(1)),
+            "the call's own end took the process the call left behind"
+        );
+        let pgid = read("pgid2");
+        wait_for("the tool call's process group", || {
+            group_members(pgid).is_empty()
+        });
     }
 }
