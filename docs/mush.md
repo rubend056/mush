@@ -845,14 +845,14 @@ not the top. Jobs are budgeted (`MAX_JOBS`, machine-wide and beside `MAX_AGENTS`
 because each is a thread, a process group, and disk; a job does **not** count
 against `MAX_AGENTS`, and the budget is one machine-wide cap rather than a
 per-agent one, since a per-agent cap would let every agent `MAX_AGENTS` allows
-hold eight builds each. They die with their agent (`Shutdown`, Ctrl-N), with mush itself — its
-process groups are killed on exit — and with a `Stop` aimed at their owner,
-because Ctrl-C means “stop the work in flight”, and a job is work in flight. A
-job also has an age ceiling, `JOB_MAX_AGE` (4 h of wall time, hardcoded): without
-it a hung `detach` held its slot, its process group and its scratch files until
-mush quit, and the kill says so — `#c3 killed: it ran past the 4h ceiling ·
-4h00m · cargo run`. There is no knob, on purpose: a ceiling a config can raise
-is not a ceiling on the disk every agent shares.
+hold eight builds each. They die with their agent (`Shutdown`, Ctrl-N), with
+mush itself — its process groups are killed on exit — and with a `Stop` aimed at
+their owner, because Ctrl-C means “stop the work in flight”, and a job is work
+in flight. A job also has an age ceiling, `JOB_MAX_AGE` (4 h of wall time,
+hardcoded): without it a hung `detach` held its slot, its process group and its
+scratch files until mush quit, and the kill says so — `#c3 killed: it ran past
+the 4h ceiling · 4h00m · cargo run`. There is no knob, on purpose: a ceiling a
+config can raise is not a ceiling on the disk every agent shares.
 
 **3. One command at a time may own the machine.**
 `run_command({command, exclusive: true})` takes a workspace-wide lock.
