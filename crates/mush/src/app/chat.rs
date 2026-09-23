@@ -24,12 +24,16 @@
 //! human's next send ends it, and `SAID_TTL` ends it if neither happens. A
 //! repeated chatter line collapses into one with a count, so an empty-reply
 //! loop cannot spend the foot row by row. **News** — a failure, a run mush
-//! stopped — belongs to its run: a new one replaces the agent's old one, it is
-//! written to the session so a restart still says what broke, and no clock
-//! takes it away. Before this, every notice ever written stayed until Ctrl-N, a
-//! failure from twenty runs ago was painted under the newest message as if it
-//! were the newest thing said, none of it survived a restart, and a line about
-//! one moment spent the foot for the life of the session.
+//! stopped — belongs to its run: a new one replaces the agent's old one, and no
+//! clock takes either away. Only the failure is the half written to the
+//! session, because that is the line a restart owes; a stop is news on the run
+//! and stays on the row, and the session's own stored status carries it across
+//! the restart (an agent that stopped comes back `Phase::Stopped`, never a red
+//! `!` for a run where nothing broke). Before this, every notice ever written
+//! stayed until Ctrl-N, a failure from twenty runs ago was painted under the
+//! newest message as if it were the newest thing said, none of it survived a
+//! restart, and a line about one moment spent the foot for the life of the
+//! session.
 //!
 //! What a pane paints is built here too (`painted`), because which rows it shows
 //! is a fact about the conversation, its scrollback and its notes — not about the
@@ -4791,6 +4795,44 @@ mod tests {
             .map(|notice| notice.text.as_str())
             .collect();
         assert_eq!(texts, vec!["no route to host"]);
+    }
+
+    /// The other half of the guard's one line: a stop is news on the run — the
+    /// pane paints it until a newer run replaces it — but it is not the line a
+    /// restart owes. The session stores the *status* (`Stopped`), and a
+    /// restored process paints it as the row's `Phase::Stopped` rather than as
+    /// a failure's red `!`. The module doc claimed both halves of News were
+    /// written to the session — "a restart still says what broke" — and that
+    /// false sentence is what finding D17 was (the probe: `kind=Some(Stopped)
+    /// stored_notices=0`).
+    #[test]
+    fn a_stopped_run_is_either_stored_as_a_stop_or_not_claimed_to_be() {
+        let mut chat = Chat::bare();
+        // The two lines one loop guard writes, in its order: the notice as it
+        // fires, the stop when the run ends a moment later.
+        chat.note_for(AgentId::ROOT, LOOP_NOTICE);
+        chat.note_error_for(
+            AgentId::ROOT,
+            "the run was stopped as a loop: the same tool call repeated 5 times",
+        );
+
+        // News on the run: the line is still there, and it is marked a stop —
+        // the agent's next run ends it, no clock takes it.
+        let notice = chat
+            .notices_for(AgentId::ROOT)
+            .next()
+            .expect("the stop is on the run");
+        assert_eq!(notice.kind, NoticeKind::Stopped);
+
+        // And the store claims nothing: the failures are the line a restart
+        // owes, and this is not a failure. The stop survives as the row's
+        // stored status, which is `tree.rs`'s fact (`Phase::Stopped`).
+        let stored: Vec<String> = chat
+            .stored_notices()
+            .into_iter()
+            .map(|notice| notice.text)
+            .collect();
+        assert!(stored.is_empty(), "{stored:?}");
     }
 
     /// A line the human did not say is not painted in the human's voice. Three
