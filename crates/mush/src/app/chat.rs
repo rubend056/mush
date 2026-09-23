@@ -3010,12 +3010,12 @@ fn marked(out: &mut Vec<Line<'static>>, mark: &str, style: Style, text: &str, wi
 /// new surface cannot invent its own reading of one.
 ///
 /// The palette is the pane's own. Bold, italic and strike are the modifiers a
-/// terminal already has; code, a fence, a link's URL and a rule are the dim
-/// grey the pane paints its secondary facts in — a rule is the pane's own
-/// line, drawn rather than read; a heading is the reply's accent, in
-/// bold, because the heading is the reply's; a link is underlined, and a
-/// bullet's marker — the one part of a row that is layout rather than words —
-/// is the accent too.
+/// terminal already has; code, a fence, a link's URL, a rule and a quote's bar
+/// are the dim grey the pane paints its secondary facts in — a bar is layout
+/// and a rule is the pane's own line, drawn rather than read; a heading is the
+/// reply's accent, in bold, because the heading is the reply's; a link is
+/// underlined, and a bullet's marker — the one part of a row that is layout
+/// rather than words — is the accent too.
 fn reply_style(style: mush_core::text::RunStyle) -> Style {
     use mush_core::text::RunStyle;
     use ratatui::style::Modifier;
@@ -3027,6 +3027,7 @@ fn reply_style(style: mush_core::text::RunStyle) -> Style {
         RunStyle::Strike => Style::default().add_modifier(Modifier::CROSSED_OUT),
         RunStyle::Code | RunStyle::Fence | RunStyle::Url => Style::default().fg(Color::DarkGray),
         RunStyle::Rule => dim(),
+        RunStyle::Quote => dim(),
         RunStyle::Heading(_) => Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
@@ -6700,6 +6701,33 @@ mod tests {
             !painted.iter().any(|row| row.contains("---")),
             "the source's own characters are scaffolding: {painted:?}"
         );
+    }
+
+    /// A quote's bar is dim and the words beside it are not: the `>` a model
+    /// wrote is layout, and in a coding tool it reads as a shell redirect.
+    #[test]
+    fn a_quote_is_a_dim_bar_beside_the_source_of_its_words() {
+        let message = Message::assistant("> quoted words\n\n> **bold** and plain");
+        let mut rows = Vec::new();
+        render_message(&mut rows, &message, None, 40, false, Fold::DEFAULT, &[]);
+        let painted = shown(&rows);
+        assert_eq!(painted[0], "mush › │ quoted words");
+        assert_eq!(painted[2], "       │ bold and plain");
+        let bar = rows[0]
+            .spans
+            .iter()
+            .find(|span| span.content.contains('│'))
+            .expect("the bar");
+        assert_eq!(bar.style.fg, Some(Color::DarkGray));
+        let bold = rows[2]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "bold")
+            .expect("the strong span");
+        assert!(bold
+            .style
+            .add_modifier
+            .contains(ratatui::style::Modifier::BOLD));
     }
 
     /// A tool result is data, not prose: its bytes are what the human copies

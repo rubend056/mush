@@ -356,6 +356,9 @@ pub enum RunStyle {
     /// keeps — a rule is a line across the *pane*, and the pane's own width is
     /// the only width it can be drawn at.
     Rule,
+    /// The `│ ` a block quote's `>` became. The quoted words keep their own
+    /// runs; this is the bar beside them.
+    Quote,
     /// The text of `[text](url)`.
     Link,
     /// The ` (url)` beside it. A URL is never dropped: this is a coding tool,
@@ -373,13 +376,13 @@ pub enum RunStyle {
 /// paragraph, join two lines, re-indent a list or turn `- a\n- b` into a layout
 /// the source did not have. That boundary is the point — the human called the
 /// full version a rabbit hole, and a chat reply needs a reading, not a document
-/// renderer. Tables, block quotes, setext headings, reference links, HTML,
-/// task-list checkboxes, nested lists and indented code blocks are all *not*
-/// rules; a line that uses one is simply the text it is.
+/// renderer. Tables, setext headings, reference links, HTML, task-list
+/// checkboxes, nested lists and indented code blocks are all *not* rules; a
+/// line that uses one is simply the text it is.
 ///
 /// It is **additive** too. The only text a rule removes is scaffolding a human
-/// does not read in a view — the `#`s of a heading and the two fence lines of a
-/// code block. Every word is kept; a list keeps its marker and only styles it,
+/// does not read in a view — the `#`s of a heading, the `>` a quote's bar
+/// replaced, and the two fence lines of a code block. Every word is kept; a list keeps its marker and only styles it,
 /// because the marker is information; and a link always shows its URL beside
 /// its text, because a dropped URL is data loss. Above all this is a *view*:
 /// what the human copies out of the pane is still the model's own bytes,
@@ -427,6 +430,19 @@ pub enum RunStyle {
 /// - one, two or three `#`s and a space → [`RunStyle::Heading`]. The `#`s and
 ///   that one space are not painted: the heading's style says what they said.
 ///   Four or more `#`s, or a `#` with no space after it, are text.
+/// - a line whose first non-space text is `>` → the `>` and the one space that
+///   may follow it become `│ ` in [`RunStyle::Quote`], and the quoted words
+///   follow it as they were typed. The bar is not the `>`: in a coding tool a
+///   `>` at the head of a line reads as a shell redirect, and a quote is not a
+///   command — the same reason the words are kept, since the quote is
+///   something a human wrote and this is a view of it, not an edit. `>text`
+///   with no space is the same quote as `> text`: the space is the marker's
+///   separator, not a word. The source's own indentation is kept, because an
+///   indented `> ` is a quote inside a list item and moving it to column 0
+///   would move it out of the item it belongs to. A second `>` is text
+///   exactly as it is — `> > x` is `│ > x` — because this view reads one
+///   marker per line, and a bar for the inner one would be a nesting there is
+///   no layout for.
 /// - `- `, `* `, `+ `, or `1. `–`99. ` → the marker keeps its place and is
 ///   styled [`RunStyle::Bullet`]. A marker with no space after it is not one,
 ///   and an ordered marker is at most two digits, because `1998. It was a good
@@ -582,6 +598,22 @@ fn block(line: &str, width: usize) -> Vec<Run> {
             style: RunStyle::Rule,
         }];
     }
+    if let Some((indent, text)) = quote(line) {
+        let bar = if text.is_empty() { "│" } else { "│ " };
+        let mut runs = Vec::with_capacity(2);
+        if !indent.is_empty() {
+            runs.push(Run {
+                text: indent.to_string(),
+                style: RunStyle::Plain,
+            });
+        }
+        runs.push(Run {
+            text: bar.to_string(),
+            style: RunStyle::Quote,
+        });
+        runs.extend(inline(text));
+        return runs;
+    }
     if let Some((level, text)) = heading(line) {
         // The heading's style is the whole heading: a marker inside it is read
         // (so `## **Title**` does not paint its asterisks) but the runs all
@@ -625,6 +657,15 @@ fn rule_line(line: &str) -> bool {
     }
     chars.all(|ch| ch == marker || ch == ' ')
         && rest.chars().filter(|ch| *ch == marker).count() >= 3
+}
+
+/// `> quoted`, `>quoted`: the source's own indentation and the text after the
+/// marker — the marker's one optional space is not part of the text, since a
+/// quote's words start at the first character that is not the marker.
+fn quote(line: &str) -> Option<(&str, &str)> {
+    let indent = line.len() - line.trim_start().len();
+    let body = line[indent..].strip_prefix('>')?;
+    Some((&line[..indent], body.strip_prefix(' ').unwrap_or(body)))
 }
 
 /// `# Title`, `## Title`, `### Title`: the level and the text after one space.
@@ -1756,6 +1797,51 @@ mod tests {
                 "a rule at {width} columns"
             );
         }
+    }
+
+    /// A quote's `>` becomes a bar: in a coding tool a `>` at the head of a
+    /// line reads as a shell redirect, and the quote is not a command. The
+    /// quoted words are kept as they were typed — additive, nothing of the
+    /// quote is dropped — `>text` is the same quote as `> text`, the source's
+    /// own indentation is kept (it is a `> ` inside a list), and a second `>`
+    /// stays the character it is.
+    #[test]
+    fn a_quote_is_a_bar_and_the_words_are_untouched() {
+        assert_eq!(
+            runs("> quoted words"),
+            vec![
+                ("│ ".to_string(), RunStyle::Quote),
+                ("quoted words".to_string(), RunStyle::Plain),
+            ]
+        );
+        // No space after the `>`: the same marker, so the same row.
+        assert_eq!(runs(">text"), runs("> text"));
+        // The words inside a quote are read like any other words.
+        assert_eq!(
+            runs("> **bold** words"),
+            vec![
+                ("│ ".to_string(), RunStyle::Quote),
+                ("bold".to_string(), RunStyle::Strong),
+                (" words".to_string(), RunStyle::Plain),
+            ]
+        );
+        // An indented quote is a quote, and it keeps the indent it was
+        // written with: re-indenting it would move it out of its list item.
+        assert_eq!(rows("  > indented", 40), vec!["  │ indented"]);
+        // One marker per line: the inner `>` is the quoter's own character.
+        assert_eq!(rows("> > nested", 40), vec!["│ > nested"]);
+        // A `>` with no words is a row with the bar and nothing after it.
+        assert_eq!(rows(">", 40), vec!["│"]);
+        assert_eq!(rows("> ", 40), vec!["│"]);
+        // The bar is a block rule: a `>` inside a line is the text it is, and
+        // a quote line is one row in the map like any other line.
+        for text in ["a > b", "=> arrow", "# > not a quote"] {
+            assert!(
+                !rows(text, 40)[0].contains('│'),
+                "{text:?} was read as a quote"
+            );
+        }
+        assert_eq!(markdown_row_counts("> a\n> b", 40), vec![1, 1]);
     }
 
     /// A fence is a block, and the fence lines are not painted: everything
