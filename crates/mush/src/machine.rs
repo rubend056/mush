@@ -2,8 +2,12 @@
 //!
 //! `run_command` asks a running command exactly three questions — has it
 //! ended, how much has it written, what did it write — and performs exactly one
-//! action on it: stop it, and everything it started. [`Machine`] + [`Job`] are
-//! those four things and nothing else.
+//! action on it: stop it — the process group it was given, and everything still
+//! in it. The group is the reach, because the group is the thing mush can
+//! signal: a command that leaves it (`setsid`, `setpgid`, a daemon that makes
+//! its own session) is outside cleanup's reach, and neither [`Job::kill`] nor
+//! [`Job::end_group`] can follow it. [`Machine`] + [`Job`] are those four
+//! things and nothing else.
 //!
 //! The real impl is the shell as it always was: `sh -c` in the workspace, its
 //! own process group, output to scratch *files* rather than pipes (a pipe is
@@ -86,10 +90,13 @@ pub trait Job: Send {
     /// are the same bytes.
     fn tail(&self, cap: usize) -> (String, String);
 
-    /// Stop it and everything it started. Idempotent for real: the second call
-    /// is a no-op, because the first reaped the leader and the id a group call
-    /// would aim at is then free to be handed to somebody else's process group
-    /// (finding E6).
+    /// Stop it, and everything still in the process group it was given. The
+    /// group is the thing mush can signal, so it is also the reach: a process
+    /// that left it (`setsid`, `setpgid`, a daemon that made its own session)
+    /// is outside the kill and no cleanup here can follow it. Idempotent for
+    /// real: the second call is a no-op, because the first reaped the leader
+    /// and the id a group call would aim at is then free to be handed to
+    /// somebody else's process group (finding E6).
     ///
     /// A group the kill could not end is not swallowed: [`Job::kill_failure`]
     /// owes the one sentence about it, and the job's own window is where the
@@ -111,14 +118,22 @@ pub trait Job: Send {
     /// End what a command that has already ended left behind: the processes
     /// still in its process group, and how many of them that took.
     ///
+    /// The boundary is the group itself: a process that left it (`setsid`,
+    /// `setpgid`, a daemon that made its own session) is not a member this read
+    /// can find, so it is not in the count and no signal from here reaches it.
+    /// Re-parenting alone does not put a process outside: the parent dying
+    /// changes who reaps it, not the group it is in, so the `cmd &` child and
+    /// the double-forked grandchild that did not make its own session are still
+    /// members here.
+    ///
     /// A command's end is its leader's end ([`Job::poll`]), and a command that
     /// ended by itself was never signalled — so `cmd &` (the shell exits, its
     /// child stays in the group mush gave it) and a script that double-forks
-    /// would leave a process running in a group mush made, in no registry and
-    /// on no clock: not `stop`, not `kill_all`, not the age ceiling, and not
-    /// the output cap, whose watcher has gone (finding E3). The group is mush's
-    /// by construction (`process_group(0)`), so the watcher takes it here,
-    /// before it reports the command's own end.
+    /// without a new session would leave a process running in a group mush
+    /// made, in no registry and on no clock: not `stop`, not `kill_all`, not
+    /// the age ceiling, and not the output cap, whose watcher has gone (finding
+    /// E3). The group is mush's by construction (`process_group(0)`), so the
+    /// watcher takes it here, before it reports the command's own end.
     ///
     /// `Ok(0)` is the ordinary answer and means there was nothing left to end.
     /// The leader must already be reaped: while it runs, the group is led by a
@@ -167,7 +182,10 @@ impl Machine for Shell {
         // says what is taken out and why.
         scrub(&mut shell);
         // Its own process group, so a signal aimed at mush never lands on a
-        // build and cleanup can target everything the command started.
+        // build and cleanup can target the group the command was given — every
+        // process still in it. A command that leaves that group (`setsid`,
+        // `setpgid`, a daemon that makes its own session) puts itself outside
+        // cleanup's reach, and nothing here can follow it.
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
@@ -732,6 +750,9 @@ pub(crate) mod fake {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use rustix::process::{kill_process, kill_process_group, Pid, Signal};
+
     use super::{ended, End};
 
     /// The one reading of a real status: an exit code, or the signal that killed
@@ -1084,6 +1105,132 @@ mod tests {
             None,
             "the second call is a no-op with nothing to report"
         );
+    }
+
+    /// A survivor the test must not leak: `setsid` left it outside mush's
+    /// process group, so an assertion that fails before the kill would leave it
+    /// running. The `SIGKILL` goes to the pid and to the process group that pid
+    /// leads — its own, since `setsid` made it a session leader — which is
+    /// where the `sleep` it did not wait on lives.
+    #[cfg(unix)]
+    struct SurvivorGuard(i32);
+
+    #[cfg(unix)]
+    impl Drop for SurvivorGuard {
+        fn drop(&mut self) {
+            if let Some(pid) = Pid::from_raw(self.0) {
+                let _ = kill_process_group(pid, Signal::KILL);
+                let _ = kill_process(pid, Signal::KILL);
+            }
+        }
+    }
+
+    /// A process that leaves the process group mush gave it is outside every
+    /// cleanup this module can run: mush's reach is the group, because the
+    /// group is the only thing a signal here can name. A command that runs
+    /// `setsid` gets a session and a process group of its own, so when the
+    /// command's leader ends, [`Job::end_group`] finds nothing in mush's group
+    /// and answers `Ok(0)` while the survivor is still running — and no
+    /// [`Job::kill`] can reach it either, because it signals the same group.
+    /// Leaving the group is the escape; being re-parented (the parent dying)
+    /// is not, because such a process is still in the group.
+    #[cfg(unix)]
+    #[test]
+    fn a_command_that_left_its_process_group_is_outside_cleanup() {
+        use super::{Machine, Shell, ShellCommand};
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let survivor_file = root.join("survivor");
+        // The outer `sh` backgrounds the command and ends at once; `setsid`
+        // puts the inner command in a session of its own, and its pid file
+        // carries the id its own `$$` wrote.
+        let command = format!(
+            "setsid sh -c 'echo $$ > {}; sleep 30' &",
+            survivor_file.display()
+        );
+        let mut job = Shell
+            .spawn(&ShellCommand {
+                command: &command,
+                root,
+            })
+            .expect("the real shell starts");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !survivor_file.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let survivor: i32 = std::fs::read_to_string(&survivor_file)
+            .expect("the survivor wrote its pid")
+            .trim()
+            .parse()
+            .expect("the survivor's pid is a number");
+        let _survivor = SurvivorGuard(survivor);
+
+        // The leader is the outer `sh`, and it is gone the moment it has
+        // backgrounded the command. Bounded — a defect in the test must not
+        // hang the suite — and killed on the way out.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match job.poll().expect("a status is readable") {
+                Some(_) => break,
+                None if std::time::Instant::now() >= deadline => {
+                    job.kill();
+                    panic!("the leader did not end within 10s");
+                }
+                None => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+
+        // The group mush made is empty, so the cleanup that takes what a
+        // finished command left behind has nothing to take — and answers the
+        // ordinary `Ok(0)` — while the survivor is a live process in a session
+        // mush never made.
+        assert_eq!(
+            job.end_group().expect("the group is readable"),
+            0,
+            "the survivor left mush's process group: end_group cannot see it"
+        );
+        assert!(
+            std::path::Path::new(&format!("/proc/{survivor}/stat")).exists(),
+            "the survivor is still in the process table after cleanup"
+        );
+        let (_, pgrp, sid) = stat_fields(survivor);
+        assert_eq!(
+            pgrp, survivor,
+            "the survivor leads a process group of its own, outside mush's"
+        );
+        assert_eq!(
+            sid, survivor,
+            "and a session of its own: that is the escape cleanup cannot follow"
+        );
+
+        // The assertions are made; take the survivor and the group its own
+        // session holds down, and wait, bounded, for the pid to leave `/proc`.
+        // The `sleep 30` is long enough that no assertion raced it.
+        let _ = kill_process(Pid::from_raw(survivor).unwrap(), Signal::KILL);
+        let _ = kill_process_group(Pid::from_raw(pgrp).unwrap(), Signal::KILL);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while std::path::Path::new(&format!("/proc/{survivor}/stat")).exists()
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+    }
+
+    /// `ppid`, `pgrp` and `sid` out of `/proc/<pid>/stat`: the fields after
+    /// the `comm` in parentheses, which may itself contain spaces (the same
+    /// parse [`super::group_members`] makes).
+    #[cfg(unix)]
+    fn stat_fields(pid: i32) -> (i32, i32, i32) {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();
+        let rest = stat.rsplit_once(')').unwrap().1;
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        (
+            fields[1].parse().unwrap(),
+            fields[2].parse().unwrap(),
+            fields[3].parse().unwrap(),
+        )
     }
 
     /// A group mush must end is ended even where the `kill` program cannot do
