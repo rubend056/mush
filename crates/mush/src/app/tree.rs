@@ -418,6 +418,11 @@ impl Landed {
 pub struct AgentNode {
     pub id: AgentId,
     pub parent: Option<AgentId>,
+    /// Where this agent was *spawned*: the depth its system prompt is written
+    /// against, and the `MAX_DEPTH` spawn limit reads it (`agent.rs`). It is not
+    /// the indent its row wears — a node whose parent is no longer in the tree
+    /// is painted as a top-level row, and the indent comes from
+    /// [`AgentTree::painted_depth`] (finding D9).
     pub depth: usize,
     pub brief: String,
     /// The name the caller gave this agent, if it gave one: what the row
@@ -1603,6 +1608,31 @@ impl AgentTree {
     /// The parent this node hangs under, when that parent is still in the tree.
     fn parent_in_tree(&self, node: &AgentNode) -> Option<AgentId> {
         node.parent.filter(|parent| self.has(*parent))
+    }
+
+    /// The depth this node's row is *painted* at: zero for a row whose parent
+    /// is not in the tree — a leftover worktree, an agent whose parent the
+    /// history window forgot — and one more than its painted parent's
+    /// otherwise.
+    ///
+    /// [`AgentNode::depth`] is where the agent was *spawned*, and it stays that
+    /// because the actor's system prompt and the spawn limit read it
+    /// (`agent.rs`). But [`Self::rows`] has always ordered a parentless row at
+    /// the top level, so the indent has to be derived from the painted chain
+    /// too: an orphan that kept its stored depth was painted five columns in
+    /// over a `#1` row that was not on screen, while the row above it sat at
+    /// the top level — the painted order and the painted indent two spellings
+    /// of the nesting (finding D9).
+    ///
+    /// The walk is up the same parent links [`Self::rows`] orders by, and spawn
+    /// depth is bounded by `MAX_DEPTH = 3`, so asking this per row is cheap.
+    pub fn painted_depth(&self, node: &AgentNode) -> usize {
+        match self.parent_in_tree(node) {
+            None => 0,
+            Some(parent) => self
+                .node(parent)
+                .map_or(0, |parent| self.painted_depth(parent) + 1),
+        }
     }
 
     /// `agents[index]` and then its subtree, in spawn order among siblings —

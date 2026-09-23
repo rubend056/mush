@@ -571,6 +571,11 @@ impl App {
     /// One row, with the parent's busy-child count supplied: [`Self::rows`] has
     /// already built them all in one walk, so this does not ask the tree for
     /// them (finding R29).
+    ///
+    /// The indent is the tree's *painted* depth, not [`AgentNode::depth`]: a
+    /// node whose parent is not in the tree is a top-level row in `rows()`'s
+    /// order, and its indent has to be the same nesting the order paints
+    /// (finding D9).
     fn row(&self, node: &AgentNode, waiting: usize) -> AgentRow {
         // Two facts, two marks: `glyph · id` is this agent's own phase, and
         // `⏸N` counts the children that are working. The old row derived the
@@ -607,7 +612,7 @@ impl App {
         // columns it has.
         AgentRow {
             id: node.id,
-            depth: node.depth,
+            depth: self.tree.painted_depth(node),
             glyph: phase_glyph(&node.phase),
             focused: self.tree.focused == node.id,
             waiting,
