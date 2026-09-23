@@ -2437,14 +2437,31 @@ fn adopted(mut messages: Vec<Message>) -> Vec<Message> {
 /// sentence's shape — one road over).
 ///
 /// The tool half asks `contains` rather than equality because a `wait` result
-/// may carry several lines at once. It does not ask whether the result's call
-/// *was* a `wait`, so a file whose contents quote the line — read back by
-/// `read_file` or `grep` — would still count: that narrowing needs the call
-/// above the result, and is left named rather than guessed at.
+/// may carry several lines at once, and it counts a result only when the call
+/// above it was a `wait` ([`answers_a_wait`]): a `read_file` or `grep` output
+/// that quotes the line is evidence the model saw the words, not that it read
+/// the report, and it must not silence the fold.
 fn reads_report(transcript: &[Message], line: &str) -> bool {
     transcript.iter().any(|message| {
         (message.mush && message.text() == line)
-            || (message.role == "tool" && message.text().contains(line))
+            || (message.role == "tool"
+                && message.text().contains(line)
+                && answers_a_wait(transcript, message))
+    })
+}
+
+/// Whether `result` is the answer to a `wait` call in `transcript`: the result
+/// names its call by id, and the call names its tool ([`ToolName::Wait`]) — the
+/// fact that tells a report a `wait` handed over from a file whose contents
+/// quote it.
+fn answers_a_wait(transcript: &[Message], result: &Message) -> bool {
+    let Some(id) = result.tool_call_id.as_deref() else {
+        return false;
+    };
+    transcript.iter().any(|message| {
+        message.tool_calls().iter().any(|call| {
+            call.id == id && ToolName::parse(&call.function.name) == Some(ToolName::Wait)
+        })
     })
 }
 
@@ -6880,6 +6897,19 @@ mod tests {
         message
     }
 
+    /// A batch that called `tool` once per id — `wait` for the road a report
+    /// comes home on, a file tool for one that only quotes it — so a fixture
+    /// names the call above its result the way `reads_report` reads it.
+    fn calling(tool: ToolName, ids: &[&str]) -> Message {
+        let mut message = Message::assistant("working");
+        message.tool_calls = Some(
+            ids.iter()
+                .map(|id| tool_call(id, tool.as_str(), json!({})))
+                .collect(),
+        );
+        message
+    }
+
     fn roles(messages: &[Message]) -> Vec<&str> {
         messages
             .iter()
@@ -7994,7 +8024,7 @@ mod tests {
         let fresh = vec![
             Message::system("you are mush"),
             Message::user("task"),
-            assistant_calling(&["a"]),
+            calling(ToolName::Wait, &["a"]),
             Message::tool("a", "#1 done: did the thing"),
         ];
 
@@ -8091,6 +8121,76 @@ mod tests {
             messages.iter().filter(|m| m.text() == child).count(),
             1,
             "one report, one line: {messages:?}"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The tool half of `reads_report` is the call, not the words: a report
+    /// arrives in a `wait` result, whose call names `wait`, so a `read_file` or
+    /// `grep` output that quotes the line — the model saw the words, not the
+    /// report — must not silence the fold. Before this, any `tool` message
+    /// holding the line counted, so a file's contents were a read.
+    #[test]
+    fn a_report_is_read_from_a_wait_result_not_from_a_file_quoting_it() {
+        let (actor, _mailbox) = test_actor("quoted-report");
+        let child = "#1 done: wrote the parser";
+
+        // A file quoting the line: the model read the file, not the report, so
+        // the fold still hands it over.
+        let mut state = ActorState::default();
+        known_child(&mut state, 1);
+        note_completion(
+            &mut state,
+            1,
+            1,
+            Outcome::Finished("wrote the parser".into()),
+        );
+        let mut messages = vec![Message::system("you are mush")];
+        let quoted = vec![
+            Message::system("you are mush"),
+            Message::user("read the log"),
+            calling(ToolName::ReadFile, &["r"]),
+            Message::tool("r", format!("{child}\nand then it stopped")),
+        ];
+        assert!(matches!(
+            absorb(&actor, &mut state, &mut messages, AgentMsg::Run(quoted)),
+            Fold::Run
+        ));
+        assert!(state.unread(1), "a file quoting the line is not a read");
+        assert!(
+            fold_completions(&actor, &mut state, &mut messages),
+            "so the report is still news"
+        );
+        assert!(
+            messages.iter().any(|m| m.mush && m.text() == child),
+            "and it reaches the model: {messages:?}"
+        );
+
+        // The same line in a `wait` result — several lines at once, which is
+        // why the match asks `contains` — is the read the scan is for.
+        let mut state = ActorState::default();
+        known_child(&mut state, 1);
+        note_completion(
+            &mut state,
+            1,
+            1,
+            Outcome::Finished("wrote the parser".into()),
+        );
+        let mut messages = vec![Message::system("you are mush")];
+        let waited = vec![
+            Message::system("you are mush"),
+            Message::user("wait for it"),
+            calling(ToolName::Wait, &["a"]),
+            Message::tool("a", format!("{child}\n#2 done: another one")),
+        ];
+        assert!(matches!(
+            absorb(&actor, &mut state, &mut messages, AgentMsg::Run(waited)),
+            Fold::Run
+        ));
+        assert_eq!(state.delivered.get(&1), Some(&1), "a wait result is a read");
+        assert!(
+            !fold_completions(&actor, &mut state, &mut messages),
+            "so it is not handed over again"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
@@ -8997,8 +9097,8 @@ mod tests {
             // The results need the batch that asked for them: adoption drops a
             // `tool` message whose call is not above it, exactly as a strict
             // server would reject one, and the scan these lines feed reads what
-            // a real session stores.
-            assistant_calling(&["a", "b", "c"]),
+            // a real session stores — a `wait` handing a report home.
+            calling(ToolName::Wait, &["a", "b", "c"]),
             Message::tool("a", "#2 failed: no route"),
             Message::tool("b", Outcome::Stopped(Stop::Human).line(3)),
             Message::tool("c", Outcome::CutOff.line(4)),
@@ -17374,9 +17474,10 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A fold the window triggered — nobody asked, the history is three quarters
-    /// of the budget — reaches the same visible state, and says *why* it is
-    /// happening: the human did not ask for this one. It folds once.
+    /// A fold the window triggered — nobody asked, the history is past
+    /// [`mush_core::transcript::compaction_trigger`] — reaches the same visible
+    /// state, and says *why* it is happening: the human did not ask for this
+    /// one. It folds once.
     #[test]
     fn a_full_history_folds_once_and_says_the_window_asked() {
         let root = scratch_dir("compact-auto-visible");
