@@ -231,12 +231,13 @@ dispatcher, still no `ToolHost`.
 
 ### 3.5 `Intent` keys and parsed commands — `app/keys.rs`, `app/commands.rs`
 
-**Landed.** `keys::key(focus, picker_open, key) -> Intent` is pure and calls no
-side effect of its own; `App::apply_intent` is the only thing that carries an
-intent out, and nothing below `App::on_key` reads a `KeyCode`, so a binding is
-testable without an `App` (the `mask_key` class, B2). The sketch's `mode`
-argument is not there: the only modal state the keyboard has is the picker, held
-as a bool, and the editor that had insert and normal modes is gone.
+**Landed.** `keys::key(focus, picker_open, selecting, key) -> Intent` is pure and
+calls no side effect of its own; `App::apply_intent` is the only thing that
+carries an intent out, and nothing below `App::on_key` reads a `KeyCode`, so a
+binding is testable without an `App` (the `mask_key` class, B2). The sketch's
+`mode` argument is not there: the modal state the keyboard has is two bools —
+the picker, and the Ctrl-Y select mode — and the editor that had insert and
+normal modes is gone.
 `commands::parse_command(&str) -> Result<Command, CommandError>` is pure, and
 both help surfaces — `mush --help`'s KEYS/COMMANDS blocks and the in-app
 `/help` notice — render from `keys::KEYS` and `commands::COMMANDS`, so neither
@@ -395,9 +396,10 @@ has `age` for tests. The default suite still opens local mock sockets in
 both help surfaces rendered from the one table (§3.5). Stage 3 — `App::screen(&self,
 area) -> Screen` (`app/screen.rs`) now derives every painted value (tiers, pane
 rects, rows, words, ranks, the picker's window) and `ui::draw(frame, &Screen)`
-paints it, so `ui.rs` is 298 lines of column arithmetic and **no render function
-takes `&App`**; the draw sweep asserts the painted text over fifteen sizes ×
-fourteen states (B17, `7e123e1`).
+paints it, so `ui.rs` holds only the column arithmetic the painter needs and
+**no render function takes `&App`**; the draw sweep asserts the painted text over
+every size `SWEEP_SIZES` names and every state `sweep_states` pushes (B17,
+`7e123e1`).
 
 **Stage 4 — roadmap.** M2.8 = a job registry + `Machine`; M3 = the socket server
 over the two dispatchers; M4 = a base revision on `Buffer` + merge in core

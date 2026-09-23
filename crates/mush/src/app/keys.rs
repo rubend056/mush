@@ -446,7 +446,7 @@ pub enum Intent {
 /// from both panes while it is open, then the select mode, which does the same,
 /// then the focused pane.
 ///
-/// The three modal facts are bools the caller already holds, and one of them is
+/// The two modal facts are bools the caller already holds, and one of them is
 /// [`super::Chat::selecting`]'s: a mode whose keyboard this is, is a mode the
 /// keymap asks about rather than a second table somewhere below.
 pub fn key(focus: Focus, picker_open: bool, selecting: bool, key: KeyEvent) -> Intent {

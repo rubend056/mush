@@ -186,7 +186,7 @@ delegation tool, and three that manage what an agent started:
 | `edit_file` | `path`, `edits` | exact-and-unique replacement; `edits` is always a list (a lone edit is a list of one), `replace_all` opts into an ambiguous match, and the batch lands all-or-nothing in one call |
 | `read_file` | `path`, `offset?`, `limit?` | a file as a window of lines, with no line numbers, and one trailing sentence saying what the window left; a png, jpeg, gif or webp — sniffed from the file's own bytes, never its name — comes back as the image itself, if the model is documented to see; works beside a held lock |
 | `write_file` | `path`, `content` | create or replace a whole file, parent directories included; the answer is one line naming what it replaced; the workspace root itself is refused |
-| `list_files` | `path?` | the files under a path, sorted, one per line; build and VCS directories are skipped; capped at `LIST_LIMIT` names with the way past it |
+| `list_files` | `path?` | the files under a path, one per line in the walk's own order (the cap ends the walk, so there is no global sort); build and VCS directories are skipped, as is `.mush/wt`, the isolated children's own checkout directory; capped at `LIST_LIMIT` names with the way past it |
 | `search` | `pattern`, `path?`, `ignore_case?` | a literal string (no regex — a regex engine is a dependency, and `rg` is the shell's), one `path:line: text` per match; binary and huge files skipped |
 | `run_command` | `command`, `detach?`, `exclusive?` | a shell in the workspace root, own process group; 120 s timeout, output capped to fit the window, cancellable; a command that writes past the output limit is killed and its result says so; `detach` starts a job at once, `exclusive` takes the machine lock (§5.6) |
 | `spawn_agent` | `brief`, `title?`, `base?` | a new agent with its own transcript; `title` names its row, and `base` forks a worktree on `mush/<id>` for it (§5.5) |
@@ -460,17 +460,18 @@ content is read again, so emphasis nests), `` `code` ``, `~~strike~~`, one to
 three `#` headings, list markers kept with a wrapped row hung under the item's
 own text, `> ` painted as a `│ ` bar, `[ ]`/`[x]` as `☐`/`☑`, three or more
 `-`/`*`/`_` as a rule across the pane, fenced code, links as `text (url)`, and
-tables — the delimiter row names each column's alignment and the cells share the
-pane's width exactly, wrapping inside their columns — and painted in the reply's
-styles, with only the scaffolding a view does not read (a heading's `#`s, a
-quote's `>`, a checkbox's brackets, a table's pipes and delimiter row, a fence's
-two lines) left unpainted. It is deliberately not a document renderer — no
-paragraph reflow, no nested lists, no HTML — and it changes no bytes: tool
-results and `run_command` output, the human's own lines, briefs, notices and the
-model's reasoning rows are painted raw, so a `#` there is a comment and an `*` a
-glob. What the copy road hands another program is the *source* lines of a reply,
-never the painted screen. Both rules live in `crates/mush-core/src/text.rs`
-(`sanitize`, `markdown_rows`).
+tables — the delimiter row names each column's alignment and each column is
+sized to its content: a short column stops at its widest cell while the pane's
+width goes to the columns whose words still need it, each wrapping inside its
+own column — and painted in the reply's styles, with only the scaffolding a view
+does not read (a heading's `#`s, a quote's `>`, a checkbox's brackets, a table's
+pipes and delimiter row, a fence's two lines) left unpainted. It is
+deliberately not a document renderer — no paragraph reflow, no nested lists, no
+HTML — and it changes no bytes: tool results and `run_command` output, the
+human's own lines, briefs, notices and the model's reasoning rows are painted
+raw, so a `#` there is a comment and an `*` a glob. What the copy road hands
+another program is the *source* lines of a reply, never the painted screen. Both
+rules live in `crates/mush-core/src/text.rs` (`sanitize`, `markdown_rows`).
 
 `Ctrl-Y` is that copy road. mush never captures the mouse, so the terminal owns
 selection and a drag is a rectangle of screen cells; the mode is a cursor over
@@ -529,10 +530,13 @@ lingering `thinking…` impossible rather than merely fixed.
 state (`glyph · id`), then the marks, then `branch +add −del`, then the activity
 with its age, then the title — facts that exist nowhere else survive longest, and
 the title yields first because the footer and the transcript carry the brief in
-full. The title is derived from the brief (`deep.txt`, `lexer`), so two children
-never read the same. The selected row's full facts get a footer under the list,
-up to three lines when the pane is tall and one when it is compact, isolated
-agents included (`.mush/wt/2 · git diff HEAD...mush/2` — git's own spellings).
+full. The title is derived from the brief (a given `title` first, else the
+brief's first line's first path-like word, else its first non-filler word —
+`deep.txt`, `lexer`), so two briefs that share that word paint the same title;
+give a child a `title` where the rows must read apart. The selected row's full
+facts get a footer under the list, up to three lines when the pane is tall and
+one when it is compact, isolated agents included (`.mush/wt/2 · git diff
+HEAD...mush/2` — git's own spellings).
 The pane's title totals the tree (`agents · 2 working · 1 waiting · Σ +324 −40`
 — each count named, each agent in exactly one). `fit_row` is
 `crates/mush-core/src/text.rs`; the derivation is `App::rows` in
@@ -627,12 +631,14 @@ parked on somebody else's result (`wait` — the icon a glance reads says the sa
 thing the row's words do, `waiting on results 3s`), `⊘` a cancel in flight or a
 run that landed stopped, so a guard-stop is not dressed as a failure, `✉` a
 result a parent has not read, `✉N` the ones from an agent's own children, `⚮` a
-row whose parent the history window has reaped (it is drawn at the top level like
-a root child, and the mark is what says it is not one; how many children a parent
-keeps is `CHILD_HISTORY` in `crates/mush/src/app/tree.rs`), `▶` the focused
-agent, and `⚙N` jobs on their owner's row. A running agent with children out wears *no*
-count of them: the children's own rows say they run, and the title's
-`N waiting` counts the agents at rest with work out. Tool calls are
+row whose parent the history window has reaped (it is drawn under its nearest
+surviving ancestor — the root when none of its own survive — at that ancestor's
+depth plus one, dim, and the mark is what says its own parent is not the row it
+sits under; how many children a parent keeps is `CHILD_HISTORY` in
+`crates/mush/src/app/tree.rs`), `▶` the focused agent, and `⚙N` jobs on their
+owner's row. A running agent with children out wears *no* count of them: the
+children's own rows say they run, and the title's `N waiting` counts the agents
+at rest with work out. Tool calls are
 `⚙ name summarized-args` (never raw JSON, the tools that steer a run included:
 `⚙ control #4 message "…"`), and notices are neutral `·` unless something
 actually failed (`!`).
@@ -694,8 +700,10 @@ What the audit that shaped this section found, and the defects each rule fixed:
 <workspace>/
   .mush/
     .gitignore     # contains a single line: *
+    lock           # the workspace lock, held while mush runs; replacing it would let a second mush write over this conversation
     session.json   # the conversation, model, provider, endpoint, a stated window, and stored failures
     session.json.previous  # the conversation the last new chat cleared
+    session.json.bak, .bak.2, …  # an unreadable session, set aside so the next save cannot destroy it
     wt/            # isolated agents' git worktrees (when used)
     paste/         # pictures pasted into the chat (Ctrl-V, or a path from outside)
     mush.sock      # the attach socket, while mush runs
@@ -752,7 +760,12 @@ an empty conversation clears on one press, and a copy that cannot be written
 refuses the key. The session carries every subagent's transcript too, so a
 relaunch brings the tree back with its briefs and its context; it also carries
 each agent's last **failure** (and only a failure), so a broken run is still on
-screen next time the workspace opens. A restored agent comes back **at rest**:
+screen next time the workspace opens. A row whose parent the file does not name
+comes back as the orphan it is — the same row, with its stored parent, its
+transcript and its unread mark, wearing `⚮` — and a row the restore could not
+hold is said at *that* open, in the bar and the pane's foot, and never written
+to the session: it is a reading of the file, and the next open derives it
+again. A restored agent comes back **at rest**:
 its row shows how its last run ended, its mailbox is live, and the human's next
 message is what starts it. Opening mush is not a request.
 
@@ -839,15 +852,15 @@ A job's kept output is a **tail**, consistently, in the completion line and in
 not the top. Jobs are budgeted (`MAX_JOBS`, machine-wide and beside `MAX_AGENTS`)
 because each is a thread, a process group, and disk; a job does **not** count
 against `MAX_AGENTS`, and the budget is one machine-wide cap rather than a
-per-agent one, since a per-agent cap would let eight agents hold eight builds
-each. They die with their agent (`Shutdown`, Ctrl-N), with mush itself — its
-process groups are killed on exit — and with a `Stop` aimed at their owner,
-because Ctrl-C means “stop the work in flight”, and a job is work in flight. A
-job also has an age ceiling, `JOB_MAX_AGE` (4 h of wall time, hardcoded): without
-it a hung `detach` held its slot, its process group and its scratch files until
-mush quit, and the kill says so — `#c3 killed: it ran past the 4h ceiling · 4h0m
-· cargo run`. There is no knob, on purpose: a ceiling a config can raise is not a
-ceiling on the disk every agent shares.
+per-agent one, since a per-agent cap would let every agent `MAX_AGENTS` allows
+hold eight builds each. They die with their agent (`Shutdown`, Ctrl-N), with
+mush itself — its process groups are killed on exit — and with a `Stop` aimed at
+their owner, because Ctrl-C means “stop the work in flight”, and a job is work
+in flight. A job also has an age ceiling, `JOB_MAX_AGE` (4 h of wall time,
+hardcoded): without it a hung `detach` held its slot, its process group and its
+scratch files until mush quit, and the kill says so — `#c3 killed: it ran past
+the 4h ceiling · 4h00m · cargo run`. There is no knob, on purpose: a ceiling a
+config can raise is not a ceiling on the disk every agent shares.
 
 **3. One command at a time may own the machine.**
 `run_command({command, exclusive: true})` takes a workspace-wide lock.
@@ -986,6 +999,9 @@ wrapping) is where the tests live.
 | `tempfile` | secure scratch files for command output, atomic replace |
 | `dirs` | platform-correct config directory |
 | `rustls`, `webpki-roots` | TLS for hosted https endpoints (DeepSeek); the client stays hand-rolled |
+| `rustix` | `flock(2)` for the one-mush-per-workspace lock, and the process-group kill that ends a command's group; the workspace forbids `unsafe`, so the syscalls come through its safe wrappers rather than a hand-written `extern "C"` (already in the tree under tempfile and rustls) |
+| `signal-hook` | one handler per ending signal that only sets a flag the event loop reads, so a killed mush takes the same clean-quit road `Ctrl-Q` does (already linked by crossterm) |
+| `mush-core` | the workspace's own core crate — pure domain, no UI (this repository, a path dependency) |
 
 Not used, on purpose: `tokio`, `reqwest`, `clap`, `ropey`, `notify`, `anyhow`,
 `blake3`, `diffy`. HTTP is hand-rolled because the target is a plain-HTTP server
@@ -1018,9 +1034,12 @@ profile uses `lto = "thin"`, `codegen-units = 1`, `strip = true`.
 What bounds a request, and why an unreachable endpoint cannot hang startup: the
 phase deadlines and the read slices that let Ctrl-C stop a model that has not
 answered live in `crates/mush/src/http.rs` (`CONNECT_TIMEOUT`, `WRITE_TIMEOUT`,
-`RESOLVE_TIMEOUT`, `LIST_READ_TIMEOUT`, `CHAT_DEADLINE`). If a server rejects a
-request over its context length, mush reads the number out of the complaint,
-tells the UI, and retries once — a backstop, not the mechanism.
+`RESOLVE_TIMEOUT`, `LIST_READ_TIMEOUT`); the deadline those phases fit inside,
+and the retry rule itself, are `crates/mush/src/model.rs`'s (`CHAT_DEADLINE`,
+`RETRY_ATTEMPTS`, `retrying`), and the transport is handed the deadline as an
+argument. If a server rejects a request over its context length, mush reads the
+number out of the complaint, tells the UI, and retries once — a backstop, not
+the mechanism.
 
 ---
 
@@ -1094,7 +1113,9 @@ them should ask rather than build.
   SIGWINCH behave as they do in a terminal. Scenarios: agent (needs a model),
   resize (needs nothing), cancel (needs nothing — a socket that accepts the chat
   request and never answers must be abandoned by a single Ctrl-C, which is only
-  observable from outside the process), and sigterm (needs nothing).
+  observable from outside the process), sigterm (needs nothing), and lock (needs
+  nothing — one mush holds the workspace lock and a second start on the same
+  workspace is refused; it runs last, because it needs the workspace to itself).
 - **Deterministic orchestration.** More than twenty `cargo test` scenarios drive
   the real actor loop in process, on a scripted `ModelClient` rather than a
   server; six of them spawn a real subagent actor. Between them: a root → child →
@@ -1113,7 +1134,7 @@ them should ask rather than build.
   makes a TLS handshake against `https://api.deepseek.com` (no key, so a 401 is
   the pass), and one measures a frame against the 16 ms budget on an idle box.
 - **The checks.** `cargo fmt --all --check`, `cargo clippy --all-targets --
-  -D warnings`, the unit tests, and the pty resize and cancel scenarios are the
+  -D warnings`, the unit tests, and the endpoint-free pty scenarios are the
   whole gate; they run anywhere rust and python3 do, so any CI can call them.
   `scripts/census.py` prints the production/test/comment split.
 - **Screen review.** `scripts/screen.py` drives the real binary over a pty and

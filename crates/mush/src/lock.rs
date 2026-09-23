@@ -32,8 +32,10 @@
 //! ([`mush_core::session::STORE_FILES`], where this file's name lives now), so
 //! a tool call cannot do it; what no tool-level guard can stop is the human's
 //! own `mv` over the path, and that is what [`Identity::still_mine`] is for —
-//! the session's save road asks it before every write, so a mush whose lock was
-//! taken stops writing instead of sharing the store (finding E2).
+//! the store's two write roads ask it before they write: the session writer
+//! before every save, and [`crate::session_save::SessionSave::store_is_mine`]
+//! before the `.mush/session.json.previous` copy `Ctrl-N` keeps. A mush whose
+//! lock was taken stops writing instead of sharing the store (finding E2, R9).
 //!
 //! A filesystem that cannot `flock` is refused, not ignored: a lock that
 //! silently does nothing is the silent damage this module exists to prevent,
@@ -65,7 +67,7 @@ pub struct Guard {
 
 impl Guard {
     /// The identity of the lock this guard holds, for a road that has to ask
-    /// later — the session's writer asks before every save
+    /// later — every store write asks before it writes
     /// ([`Identity::still_mine`]).
     pub fn identity(&self) -> Identity {
         Identity {
@@ -94,19 +96,19 @@ impl Identity {
     /// this process holds is then on an orphaned one, while a second mush locks
     /// the new file and owns the store. The model's write road refuses the
     /// store's own names ([`mush_core::session::STORE_FILES`]); what no
-    /// tool-level guard can stop is the human's own hand, so the session's save
-    /// road asks this before it writes.
+    /// tool-level guard can stop is the human's own hand, so every store write
+    /// asks this before it writes.
     pub fn still_mine(&self) -> Result<(), String> {
         match std::fs::metadata(&self.path) {
             Ok(meta) if meta.ino() == self.inode => Ok(()),
             Ok(_) => Err(format!(
                 "{} was replaced by another file — this mush's lock is on the orphaned one, so \
-                 the session was not written (another mush may own this workspace)",
+                 the store was not written (another mush may own this workspace)",
                 self.path.display()
             )),
             Err(error) => Err(format!(
                 "{} cannot be read ({error}) — this mush's lock is not the store's any more, so \
-                 the session was not written",
+                 the store was not written",
                 self.path.display()
             )),
         }

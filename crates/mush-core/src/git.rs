@@ -1002,8 +1002,9 @@ fn published_facts(key: &Path, id: u64) -> Option<(String, Option<String>)> {
 ///
 /// The question is the sweep's own for every worktree a tree has published
 /// (`WorktreeFacts`): the node's base — its parent's branch, or `HEAD` — and
-/// its fork revision, exactly the pair `App::reclaim_worktrees` hands
-/// [`reclaimable`]. A nested child merged only into its parent's branch is
+/// its fork revision, exactly the pair `App::refresh_git` hands
+/// [`reclaimable`] — whose answers `App::sweep_worktrees` applies. A nested
+/// child merged only into its parent's branch is
 /// therefore *not* counted, which is the arithmetic finding F7 proved wrong:
 /// asking every worktree against `HEAD` with no fork counted it although the
 /// sweep would land it. A worktree no tree names — a leftover on disk, an agent

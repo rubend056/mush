@@ -9,7 +9,8 @@ execution, atomic writes, and session persistence.
 Usage:
     python3 scripts/smoke.py [BINARY] [WORKDIR] [--agent|--resize|--cancel|--sigterm|--lock]
 
-The resize, cancel and sigterm scenarios need no model endpoint; the others do.
+The resize, cancel, sigterm and lock scenarios need no model endpoint; the
+others do.
 
 Defaults to ./target/debug/mush and a fresh directory under /tmp.
 Requires a reachable model endpoint (see the MUSH_URL / MUSH_MODEL variables).

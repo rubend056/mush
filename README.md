@@ -42,8 +42,11 @@ and see what changed.
 
 The rest of this file is the user-facing contract. The manual
 ([docs/mush.md](docs/mush.md)) adds the map into the code — the spec itself is
-the doc comments beside it — and every table in either file is generated from
-the code and checked by a test, so a table cannot drift silently.
+the doc comments beside it. Every block between `<!-- generated: … -->` markers
+is generated from the code and checked by a test named in its own head, so such
+a block cannot drift silently; the tables written by hand outside those blocks
+are prose, and a number in one is a claim to check rather than a fact a test
+keeps true.
 
 ## Quick start
 
@@ -170,11 +173,13 @@ wear — painted by the code's own row painter:
 <!-- /generated: marks -->
 
 `✉`/`✉N` are unread results (the parent's, and an agent's own children's), `⚮`
-is a row whose parent the history window has reaped (it is drawn at the top
-level like a root child, and the mark is what says it is not one), and `⚙N`
-counts the jobs on their owner's row. A running agent with children out wears
-**no** count of them: the children's own rows say they run, and the pane title's
-`N waiting` counts the agents at rest with work out. A row spends its columns on
+is a row whose parent the history window has reaped (it is drawn under its
+nearest surviving ancestor — the root when none of its own survive — at that
+ancestor's depth plus one, dim, and the mark is what says its own parent is not
+the row it sits under), and `⚙N` counts the jobs on their owner's row. A running
+agent with children out wears **no** count of them: the children's own rows say
+they run, and the pane title's `N waiting` counts the agents at rest with work
+out. A row spends its columns on
 state, then the branch and line delta (`mush/2 +8−0`), then the activity with its
 age (`edit_file src/lex.rs 12s`), then a short title derived from the brief
 (`lexer`); the pane title totals the tree (`agents · 1 working · 1 waiting · Σ
@@ -340,8 +345,9 @@ already have read, run and charged for the request: a connection reset, an
 unexpected end of stream, a read timeout, a 4xx or 5xx status, a reply past the
 body cap, a body that did not parse. One ask spends one deadline (ten minutes),
 and every attempt — and the backoff between them — gets only what is left of it.
-The phase ceilings, the read slices that make Ctrl-C work, and the retry rule's
-own code: `crates/mush/src/http.rs`.
+The phase ceilings and the read slices that make Ctrl-C work:
+`crates/mush/src/http.rs`; the call's whole deadline and the retry rule's own
+code: `crates/mush/src/model.rs`.
 
 ## Context window
 
@@ -373,11 +379,14 @@ tells the UI, and retries once — a backstop, not the mechanism.
 
 ## What it writes
 
-- `./.mush/` — workspace-local state, git-ignored by itself: `session.json`
-  (the conversation and the whole agent tree, the provider, endpoint and model,
-  a context window you stated, and each agent's last failure),
-  `session.json.previous` (the conversation the last new chat kept), `wt/` for
-  isolated agents' worktrees, and `paste/` for pictures pasted into the chat.
+- `./.mush/` — workspace-local state, git-ignored by itself: `lock` (the
+  workspace lock, held while mush runs; replacing it lets a second mush write
+  over this conversation), `session.json` (the conversation and the whole agent
+  tree, the provider, endpoint and model, a context window you stated, and
+  each agent's last failure), an unreadable session set aside as
+  `session.json.bak` (then `.bak.2`, …), `session.json.previous` (the
+  conversation the last new chat kept), `wt/` for isolated agents' worktrees,
+  and `paste/` for pictures pasted into the chat.
 - The platform config directory (e.g. `~/.config/mush/config.json`) —
   machine-global defaults **including the API key**. The key never touches the
   workspace.
@@ -411,12 +420,14 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke           # needs a m
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --resize  # needs none
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel  # needs none
 python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --sigterm # needs none
+python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --lock    # needs none
 ```
 
 The endpoint-free scenarios drive the real binary over a pty: `--resize` checks
 that it repaints on its own, `--cancel` points it at a socket that accepts the
 request and never answers and checks that a single `Ctrl-C` frees the agent to
-work again, and `--sigterm` checks the clean-quit road a signal takes. The
+work again, `--sigterm` checks the clean-quit road a signal takes, and `--lock`
+checks that a second mush on one workspace is refused while the first works. The
 manual's §10 lists what the suite covers.
 
 ## Development
