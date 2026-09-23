@@ -1116,21 +1116,13 @@ mod tests {
     /// tests: big enough to sway a budget, small enough to read. No pixels, so
     /// it weighs its bytes — the fallback those tests exercise.
     fn image(path: &str, bytes: usize) -> Image {
-        Image {
-            path: path.into(),
-            mime: "image/png".into(),
-            bytes: vec![0x41; bytes],
-            pixels: None,
-        }
+        Image::new(path, "image/png", vec![0x41; bytes], None)
     }
 
     /// A picture `width × height` big stored in `bytes` bytes: what the budget
     /// weighs by its pixels, whatever the file happens to be.
     fn picture(path: &str, width: u32, height: u32, bytes: usize) -> Image {
-        Image {
-            pixels: Some((width, height)),
-            ..image(path, bytes)
-        }
+        Image::new(path, "image/png", vec![0x41; bytes], Some((width, height)))
     }
 
     /// A transcript over the ceiling because of an image does not lose the
@@ -1361,22 +1353,22 @@ mod tests {
         let mut messages = long_transcript(260);
         for (i, message) in messages.iter_mut().enumerate() {
             if message.role == "assistant" {
-                message.images.push(Image {
-                    path: format!("shots/{i}.png"),
-                    mime: "image/png".into(),
-                    bytes: vec![],
-                    pixels: Some((u32::MAX, u32::MAX)),
-                });
+                message.images.push(Image::new(
+                    format!("shots/{i}.png"),
+                    "image/png",
+                    Vec::new(),
+                    Some((u32::MAX, u32::MAX)),
+                ));
             }
         }
         // The newest turn is what survives every drain, so it carries the one
         // picture that can prove the drain did not shed payloads on its way.
-        messages.last_mut().unwrap().images.push(Image {
-            path: "shots/newest.png".into(),
-            mime: "image/png".into(),
-            bytes: vec![],
-            pixels: Some((u32::MAX, u32::MAX)),
-        });
+        messages.last_mut().unwrap().images.push(Image::new(
+            "shots/newest.png",
+            "image/png",
+            Vec::new(),
+            Some((u32::MAX, u32::MAX)),
+        ));
         let before = messages.len();
 
         let _ = trim_history(&mut messages, 1_000);

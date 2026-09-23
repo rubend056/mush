@@ -3,6 +3,8 @@
 //! These are intentionally loose (`Option` everywhere, `#[serde(default)]`) so
 //! that the many "OpenAI-compatible" servers out there all round-trip cleanly.
 
+use std::borrow::Cow;
+
 use serde::ser::{SerializeSeq, SerializeStruct};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::Value;
@@ -202,26 +204,42 @@ pub struct ToolCall {
 /// server to put them on: a request is the only thing that leaves this
 /// machine, so anything the model is to look at has to travel in it. `path` is
 /// workspace-relative, the name the producer read it from — the one fact that
-/// makes the image findable again once the bytes are gone (a trimmed history
-/// or a saved session keeps the path and drops the bytes). `mime` is what the
-/// `data:` URL tells the endpoint the bytes are. `pixels` is what the picture
-/// *costs*, which is a different fact from how many bytes it took to write:
-/// [`Image::weight`] prices an image by this, so a 70 KB and a 724 KB
-/// screenshot of the same size weigh the same.
+/// makes the image findable again once the bytes are gone (the byte cap gives
+/// a picture's payload up, a trimmed history and a saved session drop the
+/// turn or the bytes). `mime` is what the `data:` URL tells the endpoint the
+/// bytes are. `pixels` is what the picture *costs*, which is a different fact
+/// from how many bytes it took to write: [`Image::weight`] prices an image by
+/// this, so a 70 KB and a 724 KB screenshot of the same size weigh the same.
+/// `size` is how many bytes the payload was, which outlives the payload itself
+/// ([`Image::give_up_payload`]).
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct Image {
     pub path: String,
     pub mime: String,
     pub bytes: Vec<u8>,
+    /// The payload's size in bytes, as it was when the picture was built.
+    ///
+    /// `bytes` is where the payload lives while the picture travels, and a
+    /// copy that cannot keep the bytes empties it
+    /// ([`Image::give_up_payload`]) — so after that `bytes` is no way to say
+    /// how big the picture ever was. This is the fact that stays, and the
+    /// readers that need it do not measure the buffer: the pane's `▣` row
+    /// reads it (the app's `image_label`), so the line says the picture's real
+    /// size after the payload is gone. Set by [`Image::new`] — and only there,
+    /// `Default`'s empty picture aside: a literal that spelled it by hand
+    /// would be a size the picture can change under.
+    #[serde(default)]
+    size: usize,
     /// The picture's width and height, read from its own header
     /// ([`crate::workspace::image_dimensions`]) when it was read from disk.
     ///
     /// `None` when no size could be read — a truncated file, a format whose
     /// header carries none, bytes that are not what the mime claims — and then
-    /// [`Image::weight`] falls back to the raw byte count, which errs high for
-    /// a picture: the safe direction, because a transcript that weighs too
-    /// little is the request that goes out over the window, while a picture
-    /// that weighs too much costs the conversation its oldest turn.
+    /// [`Image::weight`] falls back to the payload's own size ([`Image::size`]),
+    /// which errs high for a picture: the safe direction, because a transcript
+    /// that weighs too little is the request that goes out over the window,
+    /// while a picture that weighs too much costs the conversation its oldest
+    /// turn.
     ///
     /// `serde(default)` so an `Image` stored before this field existed still
     /// reads as "size unknown" instead of failing. Nothing mush writes carries
@@ -233,10 +251,60 @@ pub struct Image {
 }
 
 impl Image {
+    /// A picture built from the bytes a road read: the payload, and the size
+    /// the payload has. The one way an `Image` is built *from bytes* — the
+    /// size is taken from them here, so no construction can put the two facts
+    /// out of step, and no caller has to remember to keep them so.
+    pub fn new(
+        path: impl Into<String>,
+        mime: impl Into<String>,
+        bytes: Vec<u8>,
+        pixels: Option<(u32, u32)>,
+    ) -> Self {
+        Self {
+            path: path.into(),
+            mime: mime.into(),
+            size: bytes.len(),
+            bytes,
+            pixels,
+        }
+    }
+
+    /// The payload's size in bytes, from when the picture held them
+    /// ([`Self::new`]) — a fact that survives the payload itself.
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// Give up the payload: the bytes go, everything else stays — the path,
+    /// the mime, [`Self::size`] and the pixels. What a copy that cannot keep
+    /// the bytes does with a picture — a conversation's byte cap empties the
+    /// payload of every picture past it, and a view that will never send one
+    /// leaves it behind whole. The buffer is dropped, not cleared, so the
+    /// memory goes back with it; the path names the file a reader can read
+    /// again.
+    pub fn give_up_payload(&mut self) {
+        self.bytes = Vec::new();
+    }
+
+    /// The same picture with the payload left behind: [`Self::new`]'s facts
+    /// without the bytes. The clone [`Message::without_image_payloads`] builds
+    /// a view from, so a reader that will never send a picture does not copy
+    /// its payload first.
+    fn without_payload(&self) -> Image {
+        Image {
+            path: self.path.clone(),
+            mime: self.mime.clone(),
+            size: self.size,
+            bytes: Vec::new(),
+            pixels: self.pixels,
+        }
+    }
+
     /// What this picture costs the context budget, in the byte-shaped currency
     /// [`Message::weight`] counts — its pixels at the
-    /// [`PIXELS_PER_TOKEN`](crate::config::PIXELS_PER_TOKEN) rule, or its raw
-    /// bytes when no header named a size, plus the path and mime that travel
+    /// [`PIXELS_PER_TOKEN`](crate::config::PIXELS_PER_TOKEN) rule, or its own
+    /// size when no header named one, plus the path and mime that travel
     /// with it.
     ///
     /// Pixels are the estimate because pixels are what a vision endpoint's
@@ -245,15 +313,21 @@ impl Image {
     /// to read as ~247k ([`crate::config::tokens_for_pixels`] turns the
     /// picture into tokens, and [`BYTES_PER_TOKEN`](crate::config::BYTES_PER_TOKEN)
     /// turns them back, so text and pictures stay in one currency).
+    ///
+    /// The fallback reads the stored size, not the live buffer, so a picture
+    /// costs the same whether or not its payload has been given up: the byte
+    /// cap is a byte cap, and the window it is weighed against keeps the
+    /// picture's price.
     pub fn weight(&self) -> usize {
         let payload = match self.pixels {
             Some((width, height)) => {
                 crate::config::tokens_for_pixels(u64::from(width) * u64::from(height))
                     .saturating_mul(crate::config::BYTES_PER_TOKEN)
             }
-            // No size to read: the bytes are the fallback, and for a picture
-            // they overcount, which is the safe direction (see the field).
-            None => self.bytes.len(),
+            // No size to read: the picture's own size is the fallback, and for
+            // a picture it overcounts, which is the safe direction (see the
+            // field).
+            None => self.size,
         };
         // Saturating, because a header may claim `u32::MAX × u32::MAX` pixels:
         // the estimate is then as large as a `usize` can hold on a 32-bit
@@ -263,6 +337,72 @@ impl Image {
         payload
             .saturating_add(self.path.len())
             .saturating_add(self.mime.len())
+    }
+}
+
+/// How many bytes of picture payload a conversation keeps, besides the newest
+/// message's own.
+///
+/// The unit is bytes because the thing bounded is memory, and a picture's
+/// window price is not its size: a 100×100 png weighing 2 MB costs fourteen
+/// tokens ([`Image::weight`]), so a hundred of them pass every token bound the
+/// window has while the process holds 200 MB of payload. Four of the files the
+/// transport already caps one at ([`crate::workspace::IMAGE_FILE_CAP`]) is the
+/// working set a pane's scrollback is worth keeping; past it
+/// [`retain_image_bytes`] gives a picture's payload up and keeps its path,
+/// which is what reads the picture again.
+pub const IMAGE_BYTES_KEPT: usize = 8 * 1024 * 1024;
+
+/// Give up the picture payloads a conversation cannot keep: the newest
+/// pictures keep theirs while they fit `cap`, and an older picture keeps
+/// everything but its bytes.
+///
+/// The walk goes from the newest message back, and within a message from its
+/// newest picture back. A picture keeps its payload while its [`Image::size`]
+/// fits what the cap has left, and every picture that does not fit gives its
+/// payload up ([`Image::give_up_payload`]) — its path, mime, size and pixels
+/// stay. The newest message's own pictures are never given up, whatever they
+/// weigh: the box accepts eight of the transport's 2 MiB files in one message,
+/// so a paste larger than `cap` must still reach the model whole, and the peak
+/// a conversation holds is therefore the newest message plus `cap`.
+///
+/// This is the one rule for both places a conversation's bytes live: the
+/// pane's record, on every line appended to it, and the actor's own history,
+/// before it builds a request. A picture whose payload is gone is spelled on
+/// the wire as the `placeholder` sentence — never an empty `data:` URL — so
+/// the model is told the bytes are gone and which file reads them again.
+///
+/// The cost, and the reason the value was ruled rather than derived: giving a
+/// picture's payload up rewrites what the request says at that message, and an
+/// endpoint that cached the request's prefix re-prefills the tail from there.
+/// With 2 MiB screenshots this cap keeps about four pictures behind the newest
+/// message, so the changed point sits about four pictures back — the ruling's
+/// estimate is a re-prefill about every fourth new picture. The shape weighed
+/// beside it and set aside is one constant away: keep to a 32 MiB ceiling and
+/// shed back down to this cap in one pass, which changes the request about
+/// every twelfth new picture for a 32 MiB bound but moves the changed point
+/// much further back when it does. The human chose the flat cap.
+///
+/// It is not a wire bound, and it never keeps a picture out of a request that
+/// could carry it: only payloads a conversation has already given up are
+/// missing from a request, and a request whose body is past the transport's
+/// ceiling is refused with its own line (`MAX_REQUEST_BYTES`, in the agent) —
+/// never silently shrunk here.
+pub fn retain_image_bytes(messages: &mut [Message], cap: usize) {
+    let mut kept = 0usize;
+    let newest = messages.len().saturating_sub(1);
+    for (index, message) in messages.iter_mut().enumerate().rev() {
+        if index == newest {
+            continue;
+        }
+        for picture in message.images.iter_mut().rev() {
+            let size = picture.size();
+            if size.saturating_add(kept) <= cap {
+                kept = kept.saturating_add(size);
+            } else {
+                picture.give_up_payload();
+            }
+        }
     }
 }
 
@@ -566,27 +706,75 @@ impl Message {
         self.content.as_deref().unwrap_or("")
     }
 
+    /// A clone for a reader that will not send the picture bytes: every image
+    /// keeps its facts — path, mime, [`Image::size`], pixels — and none of its
+    /// payload (finding R17). It is hand-written rather than [`Clone`] because
+    /// `clone` would copy the payloads first, which is the memcpy this exists
+    /// to avoid, and because the field list is then checked by the compiler
+    /// when a field is added.
+    ///
+    /// The bounded view (`Chat::bounded_transcript`, in the app) is the reader:
+    /// [`Message::weight`] prices a picture by its pixels or its stored size
+    /// and never reads the buffer, and
+    /// [`Session::save`](crate::session::Session::save) writes the same
+    /// `placeholder` line it always wrote — so the bytes an old clone copied
+    /// on the UI thread were bytes the writer dropped a moment later, parked
+    /// beside the record for the length of the write.
+    pub fn without_image_payloads(&self) -> Message {
+        let mut view = Message {
+            role: self.role.clone(),
+            content: self.content.clone(),
+            images: Vec::with_capacity(self.images.len()),
+            reasoning_content: self.reasoning_content.clone(),
+            tool_calls: self.tool_calls.clone(),
+            tool_call_id: self.tool_call_id.clone(),
+            note: self.note,
+            mush: self.mush,
+        };
+        view.images
+            .extend(self.images.iter().map(Image::without_payload));
+        view
+    }
+
     pub fn tool_calls(&self) -> &[ToolCall] {
         self.tool_calls.as_deref().unwrap_or(&[])
     }
 
     /// The `content` a message with images goes out as: the text first (omitted
-    /// when there is none), then one `image_url` part per image, each holding a
-    /// `data:` URL. This is the vision form of the spec, and the only way an
-    /// image rides in a request: [`ChatRequest`] knows nothing about it.
+    /// when there is none), then one part per image — an `image_url` part
+    /// holding a `data:` URL, or, for a picture whose payload was given up
+    /// ([`Image::give_up_payload`], [`retain_image_bytes`]), the same
+    /// `placeholder` sentence [`Message::drop_images`] writes, as a text part.
+    /// This is the vision form of the spec, and the only way an image rides in
+    /// a request: [`ChatRequest`] knows nothing about it.
+    ///
+    /// A picture with no payload is never an empty `data:` URL: the endpoint
+    /// would read a broken picture, and the model is owed the one fact that
+    /// matters — the bytes were dropped to save room, and the path names the
+    /// file that reads them again.
     fn content_parts(&self) -> Vec<ContentPart<'_>> {
         let mut parts = Vec::with_capacity(self.images.len() + 1);
         if !self.text().is_empty() {
             parts.push(ContentPart {
                 kind: "text",
-                text: Some(self.text()),
+                text: Some(Cow::Borrowed(self.text())),
                 url: None,
             });
         }
-        parts.extend(self.images.iter().map(|image| ContentPart {
-            kind: "image_url",
-            text: None,
-            url: Some(data_url(image)),
+        parts.extend(self.images.iter().map(|image| {
+            if image.bytes.is_empty() {
+                ContentPart {
+                    kind: "text",
+                    text: Some(Cow::Owned(placeholder(image))),
+                    url: None,
+                }
+            } else {
+                ContentPart {
+                    kind: "image_url",
+                    text: None,
+                    url: Some(data_url(image)),
+                }
+            }
         }));
         parts
     }
@@ -611,6 +799,12 @@ impl Message {
     /// Idempotent on purpose: a message that already lost its images has
     /// nothing left to shed, so re-saving a loaded session cannot stack a
     /// second placeholder on the first one's text.
+    ///
+    /// A payload can leave a live message without the image: the byte cap
+    /// ([`retain_image_bytes`]) gives it up and the entry stays — the pane's
+    /// `▣` row still names the picture and reads its [`Image::size`] — where
+    /// the wire spells it as this same sentence (`Message::content_parts`).
+    /// This method is what removes the entry itself.
     pub fn drop_images(&mut self) {
         if self.images.is_empty() {
             return;
@@ -631,8 +825,8 @@ impl Message {
     /// counted: it goes back out with the turn, so it is part of what the
     /// request costs. An image is counted by [`Image::weight`] — its pixels at
     /// the [`PIXELS_PER_TOKEN`](crate::config::PIXELS_PER_TOKEN) rule, or its
-    /// raw bytes when its header named no size — plus the path and mime that
-    /// travel with it. Base64's 4/3 inflation is deliberately *not* modeled:
+    /// own stored size when its header named no size — plus the path and mime
+    /// that travel with it. Base64's 4/3 inflation is deliberately *not* modeled:
     /// that is what the transport carries, not what the endpoint charges (the
     /// one caveat, an endpoint that tokenized the `data:` text itself, is
     /// stated on the constant and not modeled).
@@ -663,7 +857,9 @@ impl Message {
 struct ContentPart<'a> {
     /// The part's `type`: `text` or `image_url`.
     kind: &'static str,
-    text: Option<&'a str>,
+    /// The part's text: borrowed from the message, or owned when it is a
+    /// `placeholder` sentence built for a picture whose payload is gone.
+    text: Option<Cow<'a, str>>,
     url: Option<String>,
 }
 
@@ -674,7 +870,7 @@ impl Serialize for ContentPart<'_> {
     {
         let mut part = serializer.serialize_struct("content_part", 2)?;
         part.serialize_field("type", self.kind)?;
-        if let Some(text) = self.text {
+        if let Some(text) = &self.text {
             part.serialize_field("text", text)?;
         }
         if let Some(url) = &self.url {
@@ -1430,12 +1626,12 @@ mod tests {
     #[test]
     fn a_shed_payload_leaves_only_the_placeholders_weight() {
         let mut message = Message::assistant("here it is");
-        message.images.push(Image {
-            path: "shots/screen.png".into(),
-            mime: "image/png".into(),
-            bytes: vec![0x41; 741_396],
-            pixels: Some((1_920, 1_080)),
-        });
+        message.images.push(Image::new(
+            "shots/screen.png",
+            "image/png",
+            vec![0x41; 741_396],
+            Some((1_920, 1_080)),
+        ));
         let with_image = message.weight();
 
         message.drop_images();
@@ -1487,12 +1683,12 @@ mod tests {
     fn a_screenshot_weighs_its_pixels_not_its_bytes() {
         let mut message = Message::user("look");
         let text_only = message.weight();
-        message.images.push(Image {
-            path: "shots/screen.png".into(),
-            mime: "image/png".into(),
-            bytes: vec![0x41; 741_396],
-            pixels: Some((1_920, 1_080)),
-        });
+        message.images.push(Image::new(
+            "shots/screen.png",
+            "image/png",
+            vec![0x41; 741_396],
+            Some((1_920, 1_080)),
+        ));
 
         let tokens = (message.weight() - text_only) / BYTES_PER_TOKEN;
         let by_pixels = (1_920 * 1_080) / PIXELS_PER_TOKEN;
@@ -1512,12 +1708,7 @@ mod tests {
     /// truncated file can say makes a picture cheap.
     #[test]
     fn an_image_with_unknown_pixels_weighs_its_bytes_the_erring_high_road() {
-        let image = Image {
-            path: "shots/cut.png".into(),
-            mime: "image/png".into(),
-            bytes: vec![0x41; 500_000],
-            pixels: None,
-        };
+        let image = Image::new("shots/cut.png", "image/png", vec![0x41; 500_000], None);
         assert_eq!(
             image.weight(),
             image.bytes.len() + image.path.len() + image.mime.len(),
@@ -1525,6 +1716,187 @@ mod tests {
         );
         // The pixels rule would have said ~2k tokens; the bytes say ~166k.
         assert!(image.weight() / BYTES_PER_TOKEN > 160_000);
+    }
+
+    /// The size is a fact about the picture, not a measurement of the buffer it
+    /// happens to be holding: when a copy gives the payload up
+    /// ([`Image::give_up_payload`]) the size stays — and so does the price,
+    /// because the byte cap is a cap on bytes and not on the tokens the window
+    /// is stated in: [`Image::weight`]'s fallback reads the stored size, never
+    /// the emptied buffer.
+    #[test]
+    fn a_picture_keeps_its_size_and_its_price_when_its_payload_is_given_up() {
+        let mut headerless = Image::new("shots/cut.png", "image/png", vec![0x41; 500_000], None);
+        let mut pictured = Image::new(
+            "shots/screen.png",
+            "image/png",
+            vec![0x41; 741_396],
+            Some((1_920, 1_080)),
+        );
+        let prices = [headerless.weight(), pictured.weight()];
+
+        for image in [&mut headerless, &mut pictured] {
+            image.give_up_payload();
+            assert!(image.bytes.is_empty(), "the payload is gone");
+        }
+        assert_eq!(headerless.size(), 500_000, "the size is not");
+        assert_eq!(pictured.size(), 741_396);
+        assert_eq!(
+            [headerless.weight(), pictured.weight()],
+            prices,
+            "and the price is not: the cap is bytes, the window is tokens"
+        );
+    }
+
+    /// Every payload in a transcript, for the cap's tests: what a copy that has
+    /// not given anything up yet is holding.
+    fn payload_bytes(messages: &[Message]) -> usize {
+        messages
+            .iter()
+            .flat_map(|message| &message.images)
+            .map(|image| image.bytes.len())
+            .sum()
+    }
+
+    /// A picture of `bytes` bytes in its own message, for the cap's tests.
+    fn paste(path: &str, bytes: usize) -> Message {
+        Message::user_with_images(
+            format!("paste {path}"),
+            vec![Image::new(path, "image/png", vec![0x41; bytes], None)],
+        )
+    }
+
+    /// The cap's walk, one 2 MiB picture per message: the newest message's own
+    /// is on top of the cap, and the pictures behind it are kept newest-first
+    /// while they fit. Five payloads survive — the newest plus the four the cap
+    /// holds — and the sixth and oldest gives its payload up with its facts
+    /// intact.
+    #[test]
+    fn the_cap_keeps_the_newest_pictures_and_gives_up_the_older_ones() {
+        const PICTURE: usize = 2 * 1024 * 1024;
+        let mut messages: Vec<Message> = (0..6)
+            .map(|i| paste(&format!("shots/{i}.png"), PICTURE))
+            .collect();
+
+        retain_image_bytes(&mut messages, IMAGE_BYTES_KEPT);
+
+        assert_eq!(
+            payload_bytes(&messages),
+            IMAGE_BYTES_KEPT + PICTURE,
+            "the newest message's own picture plus the cap's worth"
+        );
+        assert!(
+            messages[0].images[0].bytes.is_empty(),
+            "the oldest payload is gone"
+        );
+        assert_eq!(messages[0].images[0].size(), PICTURE, "its size is not");
+        assert_eq!(messages[0].images[0].path, "shots/0.png", "nor is its path");
+        for message in &messages[1..] {
+            assert!(
+                !message.images[0].bytes.is_empty(),
+                "the newer payloads stay: {message:?}"
+            );
+        }
+    }
+
+    /// The newest message's own pictures are never given up, whatever they
+    /// weigh: the box accepts 8 × 2 MiB in one message, and a paste larger than
+    /// the cap still reaches the model whole.
+    #[test]
+    fn the_newest_messages_pictures_are_never_given_up() {
+        let pictures: Vec<Image> = (0..3)
+            .map(|i| {
+                Image::new(
+                    format!("shots/{i}.png"),
+                    "image/png",
+                    vec![0x41; 4 * 1024 * 1024],
+                    None,
+                )
+            })
+            .collect();
+        let mut messages = vec![Message::user_with_images("look", pictures)];
+
+        retain_image_bytes(&mut messages, IMAGE_BYTES_KEPT);
+
+        assert_eq!(
+            payload_bytes(&messages),
+            12 * 1024 * 1024,
+            "12 MiB in one message, past the cap and whole"
+        );
+    }
+
+    /// The walk is per picture, not per message: a message that straddles the
+    /// cap keeps the newest of its own pictures and gives up the older ones.
+    #[test]
+    fn a_message_that_straddles_the_cap_keeps_its_newest_pictures() {
+        const PICTURE: usize = 4 * 1024 * 1024;
+        let straddling = Message::user_with_images(
+            "three wide",
+            (0..3)
+                .map(|i| {
+                    Image::new(
+                        format!("shots/{i}.png"),
+                        "image/png",
+                        vec![0x41; PICTURE],
+                        None,
+                    )
+                })
+                .collect(),
+        );
+        let mut messages = vec![
+            Message::user("older words"),
+            straddling,
+            paste("shots/newest.png", 1_024),
+        ];
+
+        retain_image_bytes(&mut messages, IMAGE_BYTES_KEPT);
+
+        let kept: Vec<usize> = messages[1]
+            .images
+            .iter()
+            .map(|image| image.bytes.len())
+            .collect();
+        assert_eq!(
+            kept,
+            vec![0, PICTURE, PICTURE],
+            "the newest two of its pictures fit; the oldest gives up"
+        );
+    }
+
+    /// What the model sees for a picture past the cap is the sentence the tree
+    /// already writes when bytes cannot travel — `Message::drop_images`'s own
+    /// line, word for word — as a text part, and never an empty `data:` URL.
+    /// The path in it is what reads the file again.
+    #[test]
+    fn a_picture_past_the_cap_reads_as_the_placeholder_on_the_wire() {
+        let mut messages = vec![
+            paste("shots/big.png", 2 * 1024 * 1024),
+            paste("shots/beside.png", 2 * 1024 * 1024),
+        ];
+        // A cap smaller than the older picture: the newest message's own stays,
+        // and the older one gives its payload up.
+        retain_image_bytes(&mut messages, 1_024);
+        assert!(messages[0].images[0].bytes.is_empty());
+
+        let wire = serde_json::to_string(&messages[0]).unwrap();
+        let mut shed = messages[0].clone();
+        shed.drop_images();
+        let sentence = shed
+            .text()
+            .lines()
+            .nth(1)
+            .expect("the line drop_images writes")
+            .to_string();
+        assert!(
+            wire.contains(&sentence),
+            "one wording, part for part: {wire}"
+        );
+        assert!(
+            sentence.contains("shots/big.png"),
+            "it names the file: {sentence}"
+        );
+        assert!(!wire.contains("data:"), "no empty data URL: {wire}");
+        assert!(!wire.contains("image_url"), "and no image part: {wire}");
     }
 
     /// A header can claim the largest size a pair of `u32`s can hold, and the
@@ -1535,12 +1907,12 @@ mod tests {
     /// arithmetic it is checking.
     #[test]
     fn the_largest_pixels_a_header_can_claim_do_not_overflow_the_weight() {
-        let image = Image {
-            path: "shots/max.png".into(),
-            mime: "image/png".into(),
-            bytes: vec![],
-            pixels: Some((u32::MAX, u32::MAX)),
-        };
+        let image = Image::new(
+            "shots/max.png",
+            "image/png",
+            Vec::new(),
+            Some((u32::MAX, u32::MAX)),
+        );
         let pixels = u128::from(u32::MAX) * u128::from(u32::MAX);
         let tokens = pixels.div_ceil(PIXELS_PER_TOKEN as u128);
         let expected = usize::try_from(tokens * BYTES_PER_TOKEN as u128)
@@ -1581,12 +1953,12 @@ mod tests {
     #[test]
     fn a_dropped_image_whose_path_holds_a_newline_still_leaves_one_line() {
         let mut message = Message::user("look");
-        message.images.push(Image {
-            path: "shots/a\nb.png".into(),
-            mime: "image/png".into(),
-            bytes: vec![0xFF, 0xFE],
-            pixels: None,
-        });
+        message.images.push(Image::new(
+            "shots/a\nb.png",
+            "image/png",
+            vec![0xFF, 0xFE],
+            None,
+        ));
         message.drop_images();
         let text = message.text().to_string();
         assert_eq!(
@@ -1615,12 +1987,12 @@ mod tests {
     #[test]
     fn a_dropped_image_whose_path_holds_an_escape_sequence_leaves_no_command() {
         let mut message = Message::user("");
-        message.images.push(Image {
-            path: "a\x1b]0;PWNED\x07b.png".into(),
-            mime: "image/png".into(),
-            bytes: vec![0xFF, 0xFE],
-            pixels: None,
-        });
+        message.images.push(Image::new(
+            "a\x1b]0;PWNED\x07b.png",
+            "image/png",
+            vec![0xFF, 0xFE],
+            None,
+        ));
         message.drop_images();
         let text = message.text().to_string();
         assert!(
@@ -1637,11 +2009,6 @@ mod tests {
     /// small enough to read in an assertion. Its header names no size (there
     /// is not one in those bytes), so it weighs its bytes — the fallback.
     fn tiny_image() -> Image {
-        Image {
-            path: "shots/tiny.png".into(),
-            mime: "image/png".into(),
-            bytes: vec![0xFF, 0xFE],
-            pixels: None,
-        }
+        Image::new("shots/tiny.png", "image/png", vec![0xFF, 0xFE], None)
     }
 }
