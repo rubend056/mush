@@ -61,9 +61,28 @@ pub(crate) fn auto_approve() -> bool {
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("mush: {error}");
+        eprintln!("{}", error_line(&error.to_string()));
         std::process::exit(1);
     }
+}
+
+/// The line [`main`] prints when the run fails.
+///
+/// Split out so a test can read the bytes a real failure would put on stderr,
+/// which `eprintln!` inside `main` cannot be asked for.
+///
+/// The text is sanitized here, at the one place it is printed, because it is
+/// not always prose this process chose. A `Cli` failure is a sentence the app
+/// made and this process only *decoded off the attach socket*
+/// ([`attach::decode`]), and the app's refusal vocabulary includes lines that
+/// quote outside hands: `blind_model_line` names the model id, and a model id
+/// is a name an endpoint chose (`/v1/models`) — [`Config::label`] defangs that
+/// same name for the facts line for exactly this reason. Nothing on the way
+/// out sanitizes a `ReplyError`'s message, so an `ESC ]0;PWNED BEL` in a model
+/// id would retitle the window through the CLI's stderr, and a bare `\r`
+/// would paint over the line before it.
+fn error_line(error: &str) -> String {
+    format!("mush: {}", mush_core::text::sanitize(error))
 }
 
 struct Args {
@@ -2663,5 +2682,42 @@ mod tests {
         // The hook is the process's: put the default back, so whatever panic
         // comes next is not shaped by this test.
         let _ = std::panic::take_hook();
+    }
+
+    /// The attach CLI's refusal reaches the terminal through [`error_line`],
+    /// and its text can quote a model id an *endpoint* chose: `blind_model_line`
+    /// writes `Config::model` into the sentence, a model id can be the first
+    /// entry of the endpoint's `/v1/models` list, and a `ReplyError`'s message
+    /// crosses the socket as a plain `String` nothing defangs on the way. The
+    /// pin: what `main` prints for such a refusal carries no ESC, no OSC and no
+    /// carriage return, and the id's own visible words still read.
+    #[test]
+    fn an_endpoint_chosen_model_id_cannot_reach_the_terminal_raw() {
+        // The id is hostile in the three ways a terminal acts on it: an OSC
+        // that retitles the window, a CSI that clears the frame, and a bare
+        // `\r` that paints over the line it was printed on. The second half of
+        // each pair is what a defanged painting of the id still says.
+        for (id, visible) in [
+            ("\u{1b}]0;pwned\u{7}evil-model", "evil-model"),
+            ("\u{1b}[2Jevil-model", "evil-model"),
+            ("evil\r-model", "evil␍-model"),
+        ] {
+            // The sentence `blind_model_line` makes of the id
+            // (app/mod.rs:269), after `ReplyError::describe` prefixed its kind.
+            let error = format!(
+                "bad_request: `{id}` is not a model mush knows to accept images — Ctrl-P picks \
+                 one whose row documents vision"
+            );
+            let line = error_line(&error);
+            assert!(line.starts_with("mush: bad_request: "), "{line:?}");
+            assert!(
+                !line.contains('\u{1b}') && !line.contains('\u{7}') && !line.contains('\r'),
+                "an escape reached the terminal through {id:?}: {line:?}"
+            );
+            assert!(
+                line.contains(visible),
+                "the id's own words still read, defanged: {line:?}"
+            );
+        }
     }
 }

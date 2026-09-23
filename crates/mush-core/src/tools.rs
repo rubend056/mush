@@ -136,8 +136,9 @@ pub fn arg_string(args: &Value, key: &str) -> Result<String, String> {
 /// A fallback here is the most expensive default in the tool set: a `base` that
 /// reads as "no base" drops the child's worktree and puts its edits in the
 /// parent's checkout (finding F12), and a `title` that reads as "no title"
-/// drops the row's name — both answer a question nobody asked, exactly the trap
-/// [`arg_usize`] documents.
+/// drops the name its caller chose, leaving the row a handle derived from the
+/// brief — both answer a question nobody asked, exactly the trap [`arg_usize`]
+/// documents.
 pub fn arg_string_opt(args: &Value, key: &str) -> Result<Option<String>, String> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(None),

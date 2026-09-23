@@ -170,6 +170,30 @@ fn refusal_error(reason: &str) -> String {
 /// on. It is bounded because a model that cannot write small enough is not
 /// going to start now.
 const TRUNCATION_ROUNDS: usize = 3;
+/// How many consecutive replies mush may fail to *read* before the run ends
+/// with the parse failure.
+///
+/// One, not [`TRUNCATION_ROUNDS`]: a truncated body is the model writing more
+/// than it was allowed (asking for a smaller answer is the road back), while a
+/// malformed body is the endpoint not answering in the protocol at all — the
+/// retry exists for the transient shape, and a second one would just bill the
+/// human for a server that is systematically broken (finding B12).
+const MALFORMED_ROUNDS: usize = 1;
+/// What the model is told when the endpoint's reply could not be read as a
+/// reply: nothing of it was recorded, so the ask stands and the answer has to
+/// be written again.
+///
+/// The words name the *wire's* failure, never the model's — the model's last
+/// turn was never seen — and the road back is the one every other refusal
+/// names: write the answer again, or the tool call with its arguments as JSON.
+/// It travels as a line in the transcript the next request is built from, the
+/// same way [`TRUNCATION_INSTRUCTION`] does, so the model and the human read
+/// the same fact.
+const MALFORMED_INSTRUCTION: &str = "\
+mush could not read the endpoint's last reply, so nothing of it was recorded. \
+Answer the message before this one again: a tool call with its arguments \
+written as JSON, or the answer as plain text.";
+
 /// How deep subagent chains may go (0 = root agent only).
 pub const MAX_DEPTH: usize = 3;
 /// Hard ceiling on simultaneously running agents across the whole tree.
@@ -289,9 +313,9 @@ pub enum Work {
 }
 
 impl Work {
-    /// The line the UI prints when this happened. One home for the sentence,
-    /// so the transcript's status line and the listing agree about the same
-    /// commit.
+    /// The line the UI prints when this happened. One home for the sentence, so
+    /// the row's status line, the transcript line a failed commit leaves
+    /// ([`report_work`]) and the listing agree about the same commit.
     fn status_line(&self) -> Option<String> {
         match self {
             Work::Committed { branch, revision } => {
@@ -1492,7 +1516,34 @@ fn root_actor(
         ids: ids.clone(),
         live: live.clone(),
     });
-    let ws = Workspace::new(&ctx.root).expect("workspace root must exist");
+    let ws = match Workspace::new(&ctx.root) {
+        Ok(ws) => ws,
+        Err(error) => {
+            // The directory mush was opened in is gone — an agent's own
+            // `rm -rf`, or a worktree removed from under the process — and
+            // there is no `Workspace` to resolve a path in. This runs on the
+            // UI thread (`App::new_chat`, the Ctrl-N road), where unwrapping
+            // took the whole process down with the terminal unrestored
+            // (finding A21). The refusal is the honest answer: the new
+            // conversation has no root, every message to it says so plainly
+            // (`App::deliver`'s `root agent is gone`), and the failure itself
+            // is filed where a failure lives. The mailbox is dead, so a send
+            // into it fails instead of queueing into nothing.
+            ctx.emit(
+                AgentId::ROOT.0,
+                AgentEvent::Error(workspace_gone_line(&ctx.root, &error)),
+            );
+            let (cmd_tx, _cmd_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+            return RootHandle {
+                tx: cmd_tx,
+                cfg: shared,
+                conversation: conversation.0,
+                ids,
+                live,
+                jobs: registry,
+            };
+        }
+    };
     let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded::<AgentMsg>();
     let actor = Actor {
         ctx,
@@ -1603,7 +1654,32 @@ pub fn revive(
         .map(|_| git::worktree_path(&root, id))
         .filter(|path| path.exists());
     let ws_root = isolated.clone().unwrap_or_else(|| root.clone());
-    let ws = Workspace::new(&ws_root).expect("workspace root must exist");
+    // The copy this revival resumes from is the one record that outlives the
+    // process, and it names the jobs its lines carry: the tree-wide job
+    // counter is fresh every launch, so it is raised before the actor can
+    // start a job of its own (finding A22).
+    raise_job_floor(&ids, &messages);
+    let ws = match Workspace::new(&ws_root) {
+        Ok(ws) => ws,
+        Err(error) => {
+            // The one window `live_branch`'s existence check cannot close:
+            // the worktree was there when it was asked and is gone by the time
+            // the workspace is built (a sibling's `git worktree remove` — the
+            // repair mush's own refusal sentence tells a model to run). This
+            // runs on the UI thread (`App::deliver_to_actor`,
+            // `App::restore_agents`), where the old `expect` panicked the
+            // process (finding A21). The command is refused, not lost: the
+            // dead mailbox makes the caller's own send fail, and its refusal
+            // sentence reaches the human — this event says *why* the
+            // workspace could not be built.
+            let sink: Arc<dyn Events> = Arc::new(Ui::new(tx, ConversationId(conversation)));
+            sink.emit(
+                AgentId(id),
+                AgentEvent::Error(workspace_gone_line(&ws_root, &error)),
+            );
+            return dead_mailbox();
+        }
+    };
     let ws_root_str = ws.root_str();
     let ctx = Arc::new(AgentCtx {
         cfg: cfg.clone(),
@@ -1644,17 +1720,16 @@ pub fn revive(
     // The system prompt is regenerated, and an agent with no transcript but a
     // known brief is seeded with the task — so a worktree found on disk resumes
     // knowing what it was for, even though it has no memory of the run.
-    let mut transcript = vec![Message::system(prompt::subagent_prompt(
-        &ws_root_str,
-        depth,
-        isolated.is_some(),
-        depth < MAX_DEPTH,
-    ))];
-    if messages.is_empty() && !brief.is_empty() {
-        transcript.push(Message::user(brief));
-    } else {
-        transcript.extend(adopted(messages));
-    }
+    let transcript = revived_transcript(
+        Message::system(prompt::subagent_prompt(
+            &ws_root_str,
+            depth,
+            isolated.is_some(),
+            depth < MAX_DEPTH,
+        )),
+        &brief,
+        messages,
+    );
     // It comes back at rest, not running: a restart is not a request. Starting
     // a run here replayed every restored agent's task against the endpoint the
     // moment mush opened — thirteen agents, thirteen requests nobody asked for,
@@ -1664,6 +1739,96 @@ pub fn revive(
     // resumes, and the human's next message is what starts it.
     start(actor, transcript, false);
     cmd_tx
+}
+
+/// The transcript a revived agent starts from: a freshly built system prompt,
+/// then the copy it had, repaired — with the dropped-turns note back in the
+/// place the *request* gives it, after the system prompt and the opening task.
+///
+/// The copy arrives in the UI's shape: the same conversation without a system
+/// prompt, and with the note where the UI appends what it is told — the end.
+/// [`place_dropped_note`] (through [`adopted`]) puts a carried note back at
+/// index 2 *of the list it is given*, and index 2 is the note's place only when
+/// the prompt heads that list. For the root it always does, because the UI's
+/// own copy of the root's conversation carries the prompt ([`AgentMsg::Run`]'s
+/// hand-over); a child's prompt is the one message a revival cannot bring back
+/// (it names a workspace that may have moved), so a note in a child's copy
+/// used to be placed one line into the conversation instead of after its brief
+/// (finding A18). One door for both roads: the whole request-shaped list —
+/// prompt included — goes through [`adopted`].
+fn revived_transcript(prompt: Message, brief: &str, messages: Vec<Message>) -> Vec<Message> {
+    if messages.is_empty() && !brief.is_empty() {
+        return vec![prompt, Message::user(brief)];
+    }
+    let mut carried = Vec::with_capacity(messages.len() + 1);
+    carried.push(prompt);
+    carried.extend(messages);
+    adopted(carried)
+}
+
+/// Raise the job counter above every job id a restored conversation names.
+///
+/// A job's name is written into its owner's transcript (`#c2 done: …`), and
+/// every process starts the job counter at 1: without this, a restart over a
+/// transcript that names `#c2` hands the next launch's first job `#c1`, and a
+/// `control stop #c1` the model reads out of the restored conversation aims at
+/// a command the id never named (finding A22). The books cannot answer this —
+/// they are fresh, and there are no jobs behind them — so the transcript, the
+/// one record that survives the process, is where the floor is read.
+///
+/// Any occurrence counts, not only a line in the report grammar: a restored
+/// conversation can name a job in the model's own words too (a `status`
+/// listing quoted back, a `control` the model typed), and a number a reader
+/// can see is a number that must not be handed out again. A name that turns
+/// out to be a coincidence costs one skipped number; a missed name costs the
+/// wrong command stopped. A name at the top of the space is skipped — there is
+/// no floor above `u64::MAX`, the same refusal the agent space makes for a
+/// stored id at the ceiling (finding C9).
+fn raise_job_floor(ids: &Ids, messages: &[Message]) {
+    let highest = messages
+        .iter()
+        .map(|message| highest_job_named(message.text()))
+        .max()
+        .unwrap_or(0);
+    if let Some(floor) = highest.checked_add(1) {
+        ids.reserve_jobs(floor);
+    }
+}
+
+/// The highest `#cN` one line names, or 0.
+///
+/// Deliberately looser than the report grammar: this is a *floor*, and the
+/// directions are not symmetric (see [`raise_job_floor`]).
+fn highest_job_named(text: &str) -> u64 {
+    let mut highest = 0u64;
+    let mut rest = text;
+    while let Some(at) = rest.find("#c") {
+        rest = &rest[at + 2..];
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if let Ok(id) = rest[..digits].parse::<u64>() {
+            highest = highest.max(id);
+        }
+        rest = &rest[digits..];
+    }
+    highest
+}
+
+/// Why an actor could not be built where it was asked to run: the directory is
+/// gone, and a [`Workspace`] is a canonicalized path — there is nothing to
+/// resolve a tool's argument in.
+///
+/// Both callers run on the UI thread — `root_actor` from Ctrl-N (`App::new_chat`),
+/// `revive` from the human's message to a parked child or a session restore —
+/// and both used to `expect("workspace root must exist")` here: a panic that
+/// took the whole process down with the terminal unrestored. The refusal is the
+/// sentence the human needs, because the cause is not something the agent can
+/// work around (finding A21).
+fn workspace_gone_line(root: &Path, error: &std::io::Error) -> String {
+    format!(
+        "cannot start an agent in {}: the directory is gone ({error}) — open mush in a \
+         directory that exists",
+        root.display()
+    )
 }
 
 /// A mailbox nobody is listening on: what a child is given when its caller
@@ -2045,8 +2210,8 @@ fn actor_body(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
                 commit_worktree(actor.ws.root(), actor.id, &actor.brief, &outcome),
             )
         });
-        if let Some(line) = work.as_ref().and_then(Work::status_line) {
-            actor.ctx.emit(actor.id, AgentEvent::Status(line));
+        if let Some(work) = &work {
+            report_work(&actor, &mut transcript, work);
         }
         // …and the run's own worktree, swept now that the run is finished with
         // it: a branch that adds nothing to the base this run was forked from —
@@ -2357,6 +2522,12 @@ fn absorb(
         // newer one, which is the same reason `Run` is only folded in at an idle
         // boundary (`drain_mailbox`).
         AgentMsg::Adopt(messages) => {
+            // The conversation a restart resumes from carries the job ids its
+            // lines name, and this process's job counter is fresh: the floor
+            // goes above them before a new job can be handed a name the model
+            // has already read (finding A22). Done whether or not this actor
+            // adopts the copy — the names are spent either way.
+            raise_job_floor(&actor.ctx.ids, &messages);
             if transcript.is_empty() {
                 *transcript = adopted(messages);
             }
@@ -2936,6 +3107,11 @@ fn run_turns(
     state.waited = false;
     // Consecutive replies the endpoint cut off at the token cap.
     let mut cut_offs = 0usize;
+    // Consecutive replies the endpoint sent and mush could not read as a reply
+    // at all (a body that does not parse into `ChatResponse`). Bounded, like the
+    // cut-offs: an endpoint that answers garbage every time must not be asked
+    // forever (finding B12).
+    let mut malformed_rounds = 0usize;
 
     loop {
         drain_mailbox(actor, cancel, messages, state);
@@ -3068,7 +3244,40 @@ fn run_turns(
                 return Err(format!("could not encode request: {error}"));
             }
             Err(ModelError::Malformed(error)) => {
-                return Err(format!("could not parse model response: {error}"));
+                // The endpoint *answered*, and the answer cannot be read as a
+                // reply. `message.rs`'s opening promise is that the loose wire
+                // shapes are deliberately tolerated so a reply is not lost to a
+                // parse; a body that still does not parse is the one road where
+                // a bad reply ended the run, losing the transcript, the tokens
+                // spent and the work in flight (finding B12). It is a refusal
+                // the model can answer instead: the ask stands, the model is
+                // told the reply was not recorded and answers again, and the
+                // run carries on. Bounded — a malformed body is the endpoint
+                // not speaking the protocol, not a model slip, so one retry
+                // covers the transient shape (a proxy's hiccup, a half-written
+                // body) without billing a user for a systematically broken one.
+                //
+                // The reset below the truncation check counts this "in a row"
+                // like the cut-offs: a good reply between two bad ones is not a
+                // server answering garbage every time.
+                malformed_rounds += 1;
+                if malformed_rounds > MALFORMED_ROUNDS {
+                    return Err(format!(
+                        "could not parse model response {malformed_rounds} times in a row: \
+                         {error}"
+                    ));
+                }
+                actor.ctx.emit(
+                    actor.id,
+                    AgentEvent::Notice(format!(
+                        "the endpoint's reply could not be read ({error}) — asking again"
+                    )),
+                );
+                // One door, so the model and the human see the same fact: the
+                // instruction travels in the transcript the next request is
+                // built from.
+                push_line(actor, messages, MALFORMED_INSTRUCTION.to_string());
+                continue;
             }
             Err(ModelError::Status { status, body }) => {
                 let parsed = serde_json::from_str::<ChatResponse>(&body).ok();
@@ -3187,8 +3396,11 @@ fn run_turns(
         }
         // A reply that was not cut off ends the run of them: the guard counts
         // *consecutive* truncations, and four scattered over a long run are not
-        // "in a row" (audit row 16).
+        // "in a row" (audit row 16). The same for a reply that was not
+        // malformed: an endpoint that read one request fine is not one that
+        // answers garbage every time (finding B12).
         cut_offs = 0;
+        malformed_rounds = 0;
 
         if let Some(reason) = refused {
             // A refused reply may still carry tool calls (a filtering endpoint
@@ -3488,10 +3700,29 @@ fn compact_history(
         },
     );
 
-    // Fold pending nudges/completions in first; a Stop cancels the run.
-    drain_mailbox(actor, cancel, messages, state);
-    if cancel.load(Ordering::SeqCst) {
-        return Err(CANCELLED.to_string());
+    // Fold pending nudges/completions in first; a Stop cancels the run — but
+    // only a fold that belongs to a run may drain this mailbox. What a run
+    // parked is the run's own work, and the summarize request is built from
+    // the run's transcript on purpose.
+    //
+    // A fold from rest owns no run, and every command its mailbox can hold is
+    // a command for the *idle loop*: a nudge, a steering line or a completion
+    // means "start a run". Draining it here pushed the words into the
+    // transcript the fold was about to replace — the human's line travelled
+    // inside the summarize request and was then erased with the transcript it
+    // had landed in, and the `Fold::Run` the command carried was never seen,
+    // so the idle loop's next act was a blocking `recv` and the words were
+    // never answered (finding A14). The mailbox is left exactly as it is, and
+    // the idle loop folds what it holds into the run it asks for. A Stop
+    // behind a `/compact` is not lost either: the fold's own cancel flag
+    // travels to the UI with its `Compacting` event, so Ctrl-C reaches the
+    // request through the flag, and the command itself is folded (as every
+    // idle Stop is) when the loop reads it next.
+    if in_run {
+        drain_mailbox(actor, cancel, messages, state);
+        if cancel.load(Ordering::SeqCst) {
+            return Err(CANCELLED.to_string());
+        }
     }
 
     let mut folded = messages.clone();
@@ -3803,6 +4034,12 @@ fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
 /// Fold pending mailbox commands into the current run: nudges become user
 /// messages, stops set the cancel flag, child completions update the registry.
 /// Everything parked by `drain_signals` goes in first, in order.
+///
+/// A *run's* door only: an actor at rest folds its mailbox through [`absorb`]
+/// (and what a previous run parked through [`fold_parked`]), where a command
+/// that means "start a run" can still do so. A fold from rest is the one
+/// caller that had to be told — it drained this queue into a transcript it
+/// then replaced, swallowing the run the command asked for (finding A14).
 fn drain_mailbox(
     actor: &Actor,
     cancel: &AtomicBool,
@@ -5533,6 +5770,29 @@ fn work_from_commit(branch: String, found: Result<git::Commit, String>) -> Work 
     }
 }
 
+/// File what the run did to its worktree: the row's tail, and — for a commit
+/// that failed — the transcript line that outlives the run.
+///
+/// The status line is a *tail*: `AgentTree::activity` refuses it for an agent
+/// that is not running, and the next run's `begin` clears it, so by the time a
+/// human looks, the one line that says the work is unlanded may be gone — while
+/// the model sees the fact only if it thinks to ask (`Work::digest`). A commit
+/// that failed (a lock, a conflict, a full disk) leaves real work behind in a
+/// worktree, so that line becomes a message as well: the pane keeps it, the
+/// session stores it, and the model reads it at its next request — the sentence
+/// is about *its* work, and it is the hand that can repair a commit (finding
+/// F17). The other two shapes are progress reports the row and the listing
+/// already carry; only unlanded work must not be missable.
+fn report_work(actor: &Actor, transcript: &mut Vec<Message>, work: &Work) {
+    let Some(line) = work.status_line() else {
+        return;
+    };
+    actor.ctx.emit(actor.id, AgentEvent::Status(line.clone()));
+    if matches!(work, Work::Uncommitted { .. }) {
+        push_line(actor, transcript, line);
+    }
+}
+
 /// `read_file`: a window of a text file, or an image.
 ///
 /// It takes no lock and runs no process, which is what makes it the read that
@@ -6755,6 +7015,91 @@ mod tests {
             .digest(),
             " · mush/1 uncommitted (/repo/.mush/wt/1 is no longer a worktree)"
         );
+    }
+
+    /// A commit that failed is not a row tail the next run clears: the line is
+    /// filed as a transcript line too, so the human keeps it and the model —
+    /// the hand that can repair a commit — reads it at its next request
+    /// (finding F17). Staged with a real commit that really fails: the repo
+    /// holds a `.git/index.lock`, the "a lock" shape the finding names, so
+    /// `git add` refuses before anything is written.
+    #[test]
+    fn a_failed_commit_is_a_transcript_line_that_outlives_the_next_run() {
+        let scripted = Arc::new(Scripted::new().says("carried on"));
+        let (actor, events, _mailbox) = build_actor_about(
+            "failed-commit",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let root = actor.ctx.root.clone();
+        let git = |args: &[&str]| git_in(&root, args);
+        git(&["init", "-q", "-b", "main"]);
+        git(&["config", "user.email", "t@t"]);
+        git(&["config", "user.name", "t"]);
+        fs::write(root.join("work.txt"), "the work\n").unwrap();
+        // The lock that makes the commit fail, and leaves the change behind.
+        fs::write(root.join(".git/index.lock"), "").unwrap();
+
+        let work = work_from_commit(
+            "mush/1".into(),
+            commit_worktree(&root, 1, "the brief", &Outcome::Finished("done".into())),
+        );
+        assert!(
+            matches!(work, Work::Uncommitted { .. }),
+            "the commit must really fail: {work:?}"
+        );
+        let line = work
+            .status_line()
+            .expect("an uncommitted worktree has a line");
+
+        let mut state = ActorState::default();
+        let mut transcript = vec![
+            Message::system("you are mush"),
+            Message::user("do the work"),
+        ];
+        report_work(&actor, &mut transcript, &work);
+
+        // The row is still told (the same sentence, from the one home), and
+        // the transcript keeps it as well.
+        let status: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Status(what) => Some(what),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(status, vec![line.clone()], "the row's tail is unchanged");
+        assert!(
+            transcript.iter().any(|message| message.text() == line),
+            "and the line is a transcript line: {transcript:?}"
+        );
+
+        // The next run neither clears it nor keeps it from the model: the
+        // request that run makes carries the sentence.
+        let cancel = Arc::new(AtomicBool::new(false));
+        let result = run_loop(&actor, &mut state, &mut transcript, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("carried on"));
+        assert!(
+            transcript.iter().any(|message| message.text() == line),
+            "the next run does not clear it: {transcript:?}"
+        );
+        let asked = scripted.asked();
+        assert!(
+            asked[0]
+                .messages
+                .iter()
+                .any(|message| message.text() == line),
+            "and the model reads it: {:?}",
+            asked[0]
+                .messages
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>()
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The work fact is a listing, not a signal: it starts no run and changes
@@ -9138,6 +9483,51 @@ mod tests {
             "the actor's own list too"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The dropped-turns note's place is a fact about the *request*: after the
+    /// system prompt and the opening task. A child's history is rebuilt
+    /// without its prompt — the prompt names a workspace that may have moved —
+    /// while the UI's copy appends the note where it appends every line it is
+    /// told, at the end. Putting the note back at index 2 of *that* copy landed
+    /// it one line into the conversation; the root's copy carries its prompt,
+    /// which is why the placement was right only there (finding A18). Probed
+    /// before the fix: the revived child's list opened
+    /// `[system, brief, reading, note, …]`; after, the note is where the model
+    /// expects a statement about the transcript's front.
+    #[test]
+    fn a_revived_childs_note_comes_back_after_its_brief() {
+        let note = Message::user(mush_core::transcript::DROPPED_TURNS_NOTE);
+        let carried = vec![
+            Message::user("the brief"),
+            Message::assistant("reading"),
+            Message::user("more"),
+            Message::assistant("done"),
+            note.clone(),
+            Message::user("carry on"),
+        ];
+        let transcript = revived_transcript(Message::system("the child's prompt"), "", carried);
+        assert_eq!(transcript[0].role, "system", "the prompt heads the request");
+        assert_eq!(transcript[1].text(), "the brief", "then the opening task");
+        assert_eq!(
+            transcript[2].text(),
+            mush_core::transcript::DROPPED_TURNS_NOTE,
+            "and the note where the dropped turns were, as on the root's road"
+        );
+        assert_eq!(
+            transcript[3].text(),
+            "reading",
+            "the turns after it keep their order"
+        );
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|message| mush_core::transcript::is_dropped_note(message))
+                .count(),
+            1,
+            "a carried note is moved, not stacked"
+        );
+        assert_eq!(transcript.len(), 7, "nothing else was added or lost");
     }
 
     /// The window's last resort before a refusal: the newest turn's own tool
@@ -12378,6 +12768,76 @@ mod tests {
             result.is_ok(),
             "scattered cut-offs are not a row: {result:?}"
         );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A reply the endpoint sent but mush cannot read is a refusal the model
+    /// can answer, not the end of the run: `message.rs`'s own promise is that
+    /// the loose wire shapes must not cost a run, and a 200 whose body does not
+    /// parse into a reply was the one road left where they did (finding B12).
+    /// The ask stands, the model is told the reply was not recorded and answers
+    /// again, and the run carries on.
+    #[test]
+    fn a_malformed_reply_is_a_refusal_the_model_can_answer() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .fails(ModelError::Malformed(
+                    "expected value at line 1 column 1".to_string(),
+                ))
+                .says("carried on"),
+        );
+        let (actor, events, _mailbox) = scripted_actor("malformed-refusal", &scripted);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![Message::user("say hi")];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel)
+            .expect("a bad reply is not the run's ending");
+
+        assert_eq!(result.as_deref(), Some("carried on"));
+        let asked = scripted.asked();
+        assert_eq!(asked.len(), 2, "the bad reply was asked again, once");
+        assert!(
+            asked[1].messages.iter().any(|message| message
+                .text()
+                .contains("could not read the endpoint's last reply")),
+            "the model is told why it is answering again: {:?}",
+            asked[1]
+                .messages
+                .iter()
+                .map(Message::text)
+                .collect::<Vec<_>>()
+        );
+        let notices: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(what) if what.contains("could not be read") => Some(what),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1, "and the human is told once: {notices:?}");
+        assert!(notices[0].contains("expected value"), "{}", notices[0]);
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The retry is bounded: an endpoint that answers something unreadable
+    /// every time ends the run with the parse failure it always did — after
+    /// one retry, not a loop of paid asks (finding B12).
+    #[test]
+    fn a_malformed_reply_that_repeats_ends_the_run() {
+        let malformed = || ModelError::Malformed("expected value at line 1 column 1".to_string());
+        let scripted = Arc::new(Scripted::new().fails(malformed()).fails(malformed()));
+        let (actor, _events, _mailbox) = scripted_actor("malformed-bound", &scripted);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![Message::user("say hi")];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+
+        assert!(error.contains("could not parse model response"), "{error}");
+        assert!(error.contains("in a row"), "{error}");
+        assert_eq!(scripted.asked().len(), MALFORMED_ROUNDS + 1);
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -16419,6 +16879,118 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// The window finding A14 names: a `Compact` and the command behind it
+    /// arrive in one batch while the actor is at rest. The fold must not drain
+    /// the mailbox — what it holds is the *idle* loop's to fold, and the
+    /// transcript the fold replaces is exactly where those words would have
+    /// landed. Probed before the fix: `Nudge("carry on")` already in the
+    /// mailbox with `compact_requested` set, `compact_now` made exactly one
+    /// call — the words inside the summarize request — and the command was
+    /// gone from the transcript the fold replaced it with.
+    #[test]
+    fn an_idle_fold_leaves_a_parked_command_in_the_mailbox() {
+        let scripted = Arc::new(Scripted::new().says("the summary"));
+        let (actor, _events, mailbox) = build_actor_about(
+            "idle-fold-mailbox",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState {
+            compact_requested: true,
+            ..ActorState::default()
+        };
+        let mut transcript = vec![
+            Message::system("you are mush"),
+            Message::user("say hi"),
+            Message::assistant("hi"),
+        ];
+        mailbox
+            .send(AgentMsg::Nudge(Message::user("carry on")))
+            .unwrap();
+
+        compact_now(&actor, &mut state, &mut transcript);
+
+        assert_eq!(scripted.asked().len(), 1, "the fold is one summarize call");
+        assert!(
+            matches!(actor.rx.try_recv(), Ok(AgentMsg::Nudge(_))),
+            "the words stay in the mailbox, where the idle loop folds them into \
+             the run they asked for"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The same window end to end: `Compact` and `Nudge` queued together at
+    /// rest. The fold happens (one summarize call), and the nudge is not
+    /// swallowed by it — the idle loop reads the command behind it and starts
+    /// the run the words asked for, so the model answers them. Before the fix
+    /// the only ask was the summarize one, with `carry on` inside it, and no
+    /// second run ever started.
+    #[test]
+    fn a_compact_and_a_nudge_queued_together_start_the_run_the_nudge_asked_for() {
+        let root = scratch_dir("compact-nudge-batch");
+        let summary = "the task was to say something; it was said";
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary)
+                .says("first answer")
+                .says("carried on"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("say something".to_string()),
+            ]))
+            .unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the first run must finish before the batch: {seen:?}"
+        );
+
+        // One batch, at rest: the fold first, the words the human typed behind
+        // it — the two sends are ordered in the one channel the actor reads.
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
+        root_tx
+            .send(AgentMsg::Nudge(Message::user("carry on")))
+            .unwrap();
+
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 2),
+            "the nudge must be answered, not swallowed by the fold: {seen:?}"
+        );
+        assert_eq!(
+            seen.summaries,
+            vec![summary.to_string()],
+            "the fold happened"
+        );
+        let asked = scripted.asked();
+        assert!(
+            asked.iter().any(|ask| ask.saw(COMPACT_INSTRUCTION)),
+            "one ask carried the summarize instruction"
+        );
+        assert!(
+            asked
+                .last()
+                .is_some_and(|ask| ask.messages.iter().any(|m| m.text() == "carry on")),
+            "and the words reached the run they asked for: {:?}",
+            asked
+                .last()
+                .map(|ask| ask.messages.iter().map(Message::text).collect::<Vec<_>>())
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A `Compact` that arrives while the model is working is parked like a
     /// nudge: the fold happens at the next message boundary, after the tool
     /// batch it arrived behind has been executed and answered — never between
@@ -17699,6 +18271,189 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         root
+    }
+
+    /// The two `expect("workspace root must exist")` that used to sit on the UI
+    /// thread refused nothing and killed the process instead: `Workspace::new`
+    /// is `fs::canonicalize`, which fails for a directory that is gone, and
+    /// both of these callers run where a panic takes the terminal down with it
+    /// (finding A21). The unit fact is certain — `Workspace::new` can fail
+    /// here — and the road is a root that is already gone: Ctrl-N over a cwd a
+    /// model's own `rm -rf` removed.
+    #[test]
+    fn a_root_actor_over_a_gone_workspace_refuses_and_files_it() {
+        let root = scratch_dir("root-gone");
+        let _ = fs::remove_dir_all(&root);
+        let events = Recorder::new();
+        let handle = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            Arc::new(Scripted::new()),
+        );
+
+        let errors: Vec<String> = events
+            .events_for(AgentId::ROOT)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Error(why) => Some(why),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "the refusal is filed where a failure lives: {errors:?}"
+        );
+        assert!(
+            errors[0].contains(&root.display().to_string()),
+            "and it names the directory that is gone: {}",
+            errors[0]
+        );
+        assert!(
+            handle.tx.send(AgentMsg::Shutdown).is_err(),
+            "no actor was started: every send into the handle's mailbox fails"
+        );
+    }
+
+    /// The same door for a revival — the audit's suspected race, a worktree
+    /// removed between `live_branch`'s existence check and the workspace
+    /// build. The unit road is a root that is already gone: the revival is
+    /// refused (the dead mailbox fails the caller's own send, whose refusal
+    /// sentence reaches the human) and the reason is filed, where the old
+    /// `expect` panicked the process instead (finding A21).
+    #[test]
+    fn a_revive_over_a_gone_workspace_is_refused_not_panicked() {
+        let root = scratch_dir("revive-gone");
+        let _ = fs::remove_dir_all(&root);
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let events = Recorder::new();
+        let ids = Ids::default();
+        let clock: Arc<dyn clock::Clock> = Arc::new(clock::System);
+        let handles = TreeHandles {
+            ids: ids.clone(),
+            live: Arc::new(AtomicU64::new(0)),
+            jobs: jobs::Registry::new(clock, events.clone(), ids),
+        };
+
+        let mailbox = revive(
+            handles,
+            test_cfg(),
+            tx,
+            1,
+            root.clone(),
+            ReviveSpec {
+                id: 5,
+                depth: 1,
+                brief: "the brief".to_string(),
+                branch: None,
+                messages: Vec::new(),
+                parent: None,
+            },
+        );
+
+        let error = match rx.try_recv() {
+            Ok(Msg::Agent {
+                id,
+                event: AgentEvent::Error(why),
+                ..
+            }) => {
+                assert_eq!(id, AgentId(5), "the refusal names the agent it refused");
+                why
+            }
+            _ => panic!("expected one refusal event, nothing else"),
+        };
+        assert!(
+            error.contains(&root.display().to_string()),
+            "the sentence names the workspace that is gone: {error}"
+        );
+        assert!(
+            mailbox.send(AgentMsg::Shutdown).is_err(),
+            "there is no actor behind the refused revival"
+        );
+    }
+
+    /// A restored conversation keeps the `#cN …` lines of the jobs it names,
+    /// while every process starts its job counter at 1: a `control stop #c1`
+    /// the model reads out of the restored transcript would address the new
+    /// launch's first command instead (finding A22). The floor is raised from
+    /// the names the copy carries, at both hand-over doors.
+    #[test]
+    fn a_restored_transcript_raises_the_job_floor_above_the_names_it_carries() {
+        let root = scratch_dir("job-floor-revive");
+        let ids = Ids::default();
+        let events = Recorder::new();
+        let clock: Arc<dyn clock::Clock> = Arc::new(clock::System);
+        let handles = TreeHandles {
+            ids: ids.clone(),
+            live: Arc::new(AtomicU64::new(0)),
+            jobs: jobs::Registry::new(clock, events, ids.clone()),
+        };
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+
+        let _mailbox = revive(
+            handles,
+            test_cfg(),
+            tx,
+            1,
+            root.clone(),
+            ReviveSpec {
+                id: 5,
+                depth: 1,
+                brief: "the brief".to_string(),
+                branch: None,
+                messages: vec![
+                    Message::user("the brief"),
+                    Message::assistant("running it"),
+                    Message::tool("call_1", "#c7 done: exit 0 · 1s · cargo test — ok"),
+                    Message::user("and #c2 finished too"),
+                ],
+                parent: None,
+            },
+        );
+
+        assert_eq!(
+            ids.next_job(),
+            JobId(8),
+            "the highest name the revived copy carries is spent"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The root's door for the same fact: the conversation a restart resumes
+    /// from arrives as an `Adopt`, and its names are spent whether or not this
+    /// actor uses the copy (finding A22).
+    #[test]
+    fn an_adopted_root_conversation_raises_the_job_floor_too() {
+        let (actor, _events, _mailbox) = build_actor_about(
+            "job-floor-adopt",
+            Arc::new(Scripted::new()),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let mut transcript = Vec::new();
+
+        let fold = absorb(
+            &actor,
+            &mut state,
+            &mut transcript,
+            AgentMsg::Adopt(vec![
+                Message::system("you are mush"),
+                Message::user("start the build"),
+                Message::assistant("started"),
+                Message::tool("call_1", "#c9 done: exit 0 · 1s · sleep 60 — ok"),
+            ]),
+        );
+
+        assert_eq!(fold, Fold::Idle, "restoring is not a run");
+        assert_eq!(
+            actor.ctx.ids.next_job(),
+            JobId(10),
+            "the names the adopted copy carries are spent"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// A named base is the history the child gets: the worktree forks from that

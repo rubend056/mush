@@ -51,8 +51,9 @@ not block on the lock.";
 /// had to be self-contained (audit row 6).
 const DELEGATION: &str = "\
 Delegation:\n\
-- spawn_agent(brief, title, base?) starts a subagent with no memory of this conversation: the brief \
-must carry every fact, file, and the exact deliverable; title is three words naming it in the tree.\n\
+- spawn_agent(brief, title?, base?) starts a subagent with no memory of this conversation: the brief \
+must carry every fact, file, and the exact deliverable; title is optional — three words naming it in \
+the tree — and without one the row derives a handle from the brief.\n\
 - base gives the child its own worktree and branch forked from that ref, resolved in this agent's own \
 workspace — `HEAD` is this agent's own HEAD, not the application root's — so siblings with bases run in \
 parallel; without one the child works in this workspace, and only one such child may run at a time. \
@@ -263,7 +264,7 @@ pub fn tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "brief": { "type": "string" },
-                    "title": { "type": "string", "description": "A 3 word, one-line description of the brief." },
+                    "title": { "type": "string", "description": "Optional. A 3 word, one-line description of the brief." },
                     "base": { "type": "string", "description": "Branch, tag or commit, resolved in this agent's workspace (`HEAD` is this agent's own). Without one: this workspace." }
                 },
                 "required": ["brief"]
@@ -492,27 +493,58 @@ mod tests {
     }
 
     /// The spawn schema's `title` is the row's name and nothing the code
-    /// requires: a missing or blank one leaves `spawn_tool` to derive the row's
-    /// handle from the brief, so requiring it in the schema made the model pay
-    /// for a field the code treats as optional — and a title is *one line*, a
-    /// fact the schema has to say because the row paints one (finding F14; the
-    /// folding a newline still needs lives in `spawn_tool`, in `agent.rs`).
+    /// requires: `spawn_tool` reads it with [`crate::tools::arg_string_opt`], so
+    /// a missing or blank one is a real answer — the row derives its handle from
+    /// the brief — and `required` holds exactly what the call cannot run
+    /// without, `brief`. The title's own sentence says the two facts the code
+    /// makes true: it is *optional*, and it is *one line*, because the row
+    /// paints one (finding F14; the newline fold itself is `spawn_tool`'s now,
+    /// in `agent.rs`, pinned by
+    /// `a_title_with_a_newline_cannot_reach_a_one_line_row`).
     #[test]
-    fn the_spawn_schemas_title_is_optional_and_named_as_one_line() {
+    fn the_spawn_schema_does_not_require_a_title_the_code_treats_as_optional() {
         let spawn = tool_schemas()
             .into_iter()
             .find(|schema| schema["function"]["name"] == "spawn_agent")
             .expect("the tool has a schema")["function"]
             .clone();
         let parameters = &spawn["parameters"];
+        // Exactly what the call cannot run without: `spawn_tool` reads `brief`
+        // with `tools::arg_string` and refuses without it, while `title` and
+        // `base` go through `arg_string_opt`. An exact list, so a field added
+        // tomorrow is a failing test rather than a silent requirement.
         assert_eq!(
             parameters["required"],
             serde_json::json!(["brief"]),
             "the code takes a missing title and derives the row's handle"
         );
+        let required = parameters["required"].as_array().unwrap();
+        assert!(
+            !required.iter().any(|key| key == "title"),
+            "a title the code treats as optional is not required: {required:?}"
+        );
+        // The code half this crate holds: `arg_string_opt` — the helper
+        // `spawn_tool` reads the field with — answers an absent title with
+        // `None`, never an error.
+        assert_eq!(
+            crate::tools::arg_string_opt(&json!({ "brief": "port the parser" }), "title").unwrap(),
+            None
+        );
+        // And the other surface the model reads before it calls: the delegation
+        // line marks `title` optional the way it marks `base`, and says where a
+        // missing one leaves the row.
+        assert!(
+            DELEGATION.contains("spawn_agent(brief, title?, base?)")
+                && DELEGATION.contains("title is optional"),
+            "the policy says the call's real shape: {DELEGATION}"
+        );
         let title = parameters["properties"]["title"]["description"]
             .as_str()
             .expect("the title is described");
+        assert!(
+            title.to_lowercase().contains("optional"),
+            "the schema calls optional what the code takes optionally: {title}"
+        );
         assert!(
             title.contains("one-line"),
             "the row paints one line: {title}"
