@@ -962,21 +962,32 @@ mod tests {
     /// A start reaps a dead mush's pair — the road a SIGTERM'ed mush's own
     /// files leave — and never touches a live mush's, or a name it cannot read
     /// a pid out of (finding E5).
+    ///
+    /// Every name carries *this* test process's pid in the second field, the
+    /// old-shaped one included: the fixture files are removed at the end of the
+    /// test, so fixed names let a sibling worktree's suite running the same test
+    /// delete them from under this one — the legacy name especially, which no
+    /// reaper removes and which every suite used to write by hand.
     #[test]
     fn a_start_reaps_a_dead_mushs_scratch() {
         // A pid that is really gone: a child of this test, waited for.
         let mut child = std::process::Command::new("true").spawn().unwrap();
         let dead = child.id();
         child.wait().unwrap();
+        // The live pid is this process's own, alive by definition.
         let live = std::process::id();
+        // The pid the reaper reads stays the first field after `mush-cmd-`;
+        // this one only separates two suites' fixtures.
+        let mine = std::process::id();
         let names = [
-            format!("mush-cmd-{dead}-aaaaaa-out"),
-            format!("mush-cmd-{dead}-bbbbbb-err"),
-            format!("mush-cmd-{live}-cccccc-out"),
-            format!("mush-cmd-{live}-dddddd-err"),
-            // The old shape, without a pid: a live mush of an older build could
-            // still be writing one, so the reaper does not guess.
-            "mush-cmd-out-legacy".to_string(),
+            format!("mush-cmd-{dead}-{mine}-aaaaaa-out"),
+            format!("mush-cmd-{dead}-{mine}-bbbbbb-err"),
+            format!("mush-cmd-{live}-{mine}-cccccc-out"),
+            format!("mush-cmd-{live}-{mine}-dddddd-err"),
+            // The old shape, without a pid where the reaper reads one: a live
+            // mush of an older build could still be writing one, so the reaper
+            // does not guess.
+            format!("mush-cmd-out-legacy-{mine}"),
         ];
         let paths: Vec<std::path::PathBuf> = names
             .iter()
