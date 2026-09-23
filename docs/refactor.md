@@ -231,12 +231,13 @@ dispatcher, still no `ToolHost`.
 
 ### 3.5 `Intent` keys and parsed commands — `app/keys.rs`, `app/commands.rs`
 
-**Landed.** `keys::key(focus, picker_open, key) -> Intent` is pure and calls no
-side effect of its own; `App::apply_intent` is the only thing that carries an
-intent out, and nothing below `App::on_key` reads a `KeyCode`, so a binding is
-testable without an `App` (the `mask_key` class, B2). The sketch's `mode`
-argument is not there: the only modal state the keyboard has is the picker, held
-as a bool, and the editor that had insert and normal modes is gone.
+**Landed.** `keys::key(focus, picker_open, selecting, key) -> Intent` is pure and
+calls no side effect of its own; `App::apply_intent` is the only thing that
+carries an intent out, and nothing below `App::on_key` reads a `KeyCode`, so a
+binding is testable without an `App` (the `mask_key` class, B2). The sketch's
+`mode` argument is not there: the modal state the keyboard has is two bools —
+the picker, and the Ctrl-Y select mode — and the editor that had insert and
+normal modes is gone.
 `commands::parse_command(&str) -> Result<Command, CommandError>` is pure, and
 both help surfaces — `mush --help`'s KEYS/COMMANDS blocks and the in-app
 `/help` notice — render from `keys::KEYS` and `commands::COMMANDS`, so neither
