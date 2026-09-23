@@ -66,8 +66,8 @@ use crate::machine::{End, Job};
 ///
 /// Each job is a thread, a process group and disk, and it can outlive the run
 /// that started it — so this is a budget for the *machine*, not for one agent: a
-/// per-agent cap would let eight agents hold eight builds each, which is the
-/// situation the cap exists to prevent.
+/// per-agent cap would let every agent `MAX_AGENTS` allows hold eight builds
+/// each, which is the situation the cap exists to prevent.
 pub const MAX_JOBS: usize = 8;
 
 /// How many bytes of each stream a job keeps. The window is a tail (see the
