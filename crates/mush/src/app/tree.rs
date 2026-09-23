@@ -1647,6 +1647,28 @@ impl AgentTree {
         node.parent.filter(|parent| self.has(*parent))
     }
 
+    /// Whether this node's parent is *gone*: `parent` names an id the tree no
+    /// longer holds, so the row hangs at the painted top level while its
+    /// stored link points at nothing.
+    ///
+    /// This is the fact the row's `⚮` says (`AgentRow::parent_gone`,
+    /// `ui::agent_line`), and it is the one shape a human cannot read off the
+    /// pane: [`Self::rows`] has always ordered a parentless node as a top-level
+    /// row, and after D9 its indent is the top level's too, which is exactly
+    /// what a child of the root wears — so a reaped parent left its children
+    /// sitting among the root's own children, passed off as those.
+    ///
+    /// `parent` being `None` is deliberately not this fact: the root and a
+    /// leftover worktree found on disk never had a parent in this tree, so
+    /// there is no link to have lost. Neither is a parent the tree *does*
+    /// hold, the root included: `#2` under `#0` is a root child, not an
+    /// orphan. The history window is the live road into this state
+    /// ([`Self::past_history`]: it drops the oldest children and a node does
+    /// not inherit its parent's age), and the row is where it has to be said.
+    pub fn parent_gone(&self, node: &AgentNode) -> bool {
+        node.parent.is_some_and(|parent| !self.has(parent))
+    }
+
     /// The depth this node's row is *painted* at: zero for a row whose parent
     /// is not in the tree — a leftover worktree, an agent whose parent the
     /// history window forgot — and one more than its painted parent's
@@ -2436,6 +2458,58 @@ mod tests {
         let ids: Vec<u64> = tree.rows().iter().map(|node| node.id.0).collect();
         assert_eq!(ids, vec![0, 1, 2, 3]);
         assert_eq!(tree.rows().len(), tree.agents.len());
+    }
+
+    /// The fact the row's `⚮` reads: a node whose parent id the tree does not
+    /// hold. `None` is a different fact — the root and a leftover never had a
+    /// parent here — and a parent that *is* in the tree, the root included, is
+    /// a parent like any other. Staged the way the history window makes it: a
+    /// reaped parent whose child is still in the tree, with the stored depth
+    /// untouched and the painted one at the top level.
+    #[test]
+    fn a_reaped_parent_is_a_parent_gone() {
+        let mut tree = AgentTree::bare();
+        let _root_child = spawn(&mut tree, 1, 0, 1);
+        let _probe = spawn(&mut tree, 2, 1, 2);
+        let _other_child = spawn(&mut tree, 4, 0, 1);
+        tree.register(leftover(3));
+
+        {
+            let root = tree.node(AgentId::ROOT).unwrap();
+            let child = tree.node(AgentId(1)).unwrap();
+            let probe = tree.node(AgentId(2)).unwrap();
+            let leftover = tree.node(AgentId(3)).unwrap();
+            assert!(!tree.parent_gone(root), "the root has no parent to lose");
+            assert!(
+                !tree.parent_gone(child),
+                "#1 hangs under the root, which is in the tree"
+            );
+            assert!(!tree.parent_gone(probe), "#2's parent is in the tree");
+            assert!(
+                !tree.parent_gone(leftover),
+                "a leftover was registered with no parent at all"
+            );
+        }
+
+        // The window's own road: the parent goes, the probe stays.
+        tree.reap(&[AgentId(1)]);
+
+        let probe = tree.node(AgentId(2)).unwrap();
+        let other = tree.node(AgentId(4)).unwrap();
+        assert!(
+            tree.parent_gone(probe),
+            "the tree forgot #1, so #2's parent is gone"
+        );
+        assert!(
+            !tree.parent_gone(other),
+            "a reap around it does not mark a root child"
+        );
+        assert_eq!(probe.depth, 2, "the stored depth is where it was spawned");
+        assert_eq!(
+            tree.painted_depth(probe),
+            0,
+            "and the row is still painted at the top level (D9)"
+        );
     }
 
     /// Two nodes of one id are two rows: the walk is keyed by a node's place in

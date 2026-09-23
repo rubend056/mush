@@ -260,6 +260,14 @@ pub struct AgentRow {
     pub id: AgentId,
     /// How many `  ` indents the row is drawn with.
     pub depth: usize,
+    /// This row's parent is gone: `parent` names an id the tree no longer
+    /// holds, so the row is a top-level row by order (and by indent, D9) and
+    /// says so with `⚮` (`ui::agent_line`).
+    ///
+    /// `false` for the root and for a node that never had a parent in this
+    /// tree (a leftover worktree): those are top-level by construction, not by
+    /// a link the history window cut, and a root child is a root child.
+    pub parent_gone: bool,
     /// `·`, `◐`, `✓`, `✗`, `⊘`, `≡` — derived from the node's own phase.
     pub glyph: &'static str,
     /// The tree's focused agent: the row wearing `▶`.
@@ -639,6 +647,7 @@ impl App {
         AgentRow {
             id: node.id,
             depth: self.tree.painted_depth(node),
+            parent_gone: self.tree.parent_gone(node),
             glyph: phase_glyph(&node.phase),
             focused: self.tree.focused == node.id,
             waiting,
@@ -1318,6 +1327,111 @@ fn phase_detail(node: &AgentNode) -> String {
 mod tests {
     use super::*;
     use crate::app::Compacting;
+    use crate::Msg;
+    use crossbeam_channel::Receiver;
+
+    /// A real `App` on a scratch directory with a real (idle) root actor, for
+    /// the tests that read a painted frame. The model-picker test builds this
+    /// fixture by hand; the parent-gone sweeps want it twice, so it is one
+    /// function here.
+    ///
+    /// The receiver keeps the UI channel's sender alive (a dropped receiver is
+    /// a message that never lands) and the path comes back so the test can
+    /// remove what it made.
+    fn frame_app(label: &str) -> (App, Receiver<Msg>, std::path::PathBuf) {
+        use crate::agent::spawn;
+        use crate::app::ConfigCell;
+        use crate::session_save;
+        use crossbeam_channel::unbounded;
+
+        let root = std::env::temp_dir().join(format!("mush-{label}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = mush_core::Workspace::new(&root).unwrap();
+        let cell = ConfigCell::own(mush_core::Config::new(
+            "http://127.0.0.1:1",
+            "test-model",
+            None,
+        ));
+        let (tx, rx) = unbounded::<Msg>();
+        let handle = spawn(cell.handle(), tx.clone(), root.clone());
+        let app = App::new(
+            ws,
+            cell,
+            None,
+            handle,
+            tx,
+            session_save::fake::Recorder::new(),
+        );
+        (app, rx, root)
+    }
+
+    /// One agent through the tree's own door, with a mailbox nobody reads:
+    /// these tests paint rows, and a row does not need an actor. The node is
+    /// left `Thinking` for the caller to move.
+    fn insert(app: &mut App, id: u64, parent: u64, depth: usize, brief: &str) {
+        use crate::app::Spawn;
+        use crossbeam_channel::unbounded;
+
+        let (cmd, _rx) = unbounded();
+        app.tree.insert(Spawn {
+            id: AgentId(id),
+            parent: AgentId(parent),
+            brief: brief.to_string(),
+            depth,
+            branch: None,
+            fork: None,
+            cmd,
+        });
+    }
+
+    /// One painted frame's agents pane: the pane's own rect, border and title
+    /// included, one string per screen row. Reading the *cells* is the point —
+    /// a `Screen` value can say a row carries a mark while the painter never
+    /// spends the column — and the rect is what keeps the chat's copies of the
+    /// same ids out of the reading.
+    fn pane_frame(
+        app: &mut App,
+        width: u16,
+        height: u16,
+        theme: &crate::theme::Theme,
+    ) -> Vec<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::Terminal;
+
+        app.set_term_size(width, height);
+        let screen = app.screen(Rect::new(0, 0, width, height));
+        let rect = match &screen {
+            Screen::Panes(panes) => panes.agents.area,
+            Screen::Floor { .. } => panic!("{width}×{height} is below the floor"),
+        };
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal
+            .draw(|frame| crate::ui::draw(frame, &screen, theme))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (rect.y..rect.y + rect.height)
+            .map(|y| {
+                (rect.x..rect.x + rect.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    /// The one painted *list* row naming `#id`, as the cells show it: borders
+    /// and padding stripped, and read up to the separator the painter draws
+    /// above the footer — the footer repeats the cursor row's id and brief.
+    fn row_for(frame: &[String], id: u64) -> String {
+        let needle = format!("#{id} ");
+        let rows: Vec<&String> = frame
+            .iter()
+            .take_while(|line| !line.chars().all(|c| "─│".contains(c)))
+            .filter(|line| line.contains(&needle))
+            .collect();
+        assert_eq!(rows.len(), 1, "one list row names {needle}: {frame:#?}");
+        rows[0].trim_matches('│').trim_end().to_string()
+    }
 
     #[test]
     fn an_error_outranks_the_tree_line() {
@@ -1503,8 +1617,10 @@ mod tests {
             phase_glyph(&Phase::Done),
             phase_glyph(&Phase::Failed("boom".into())),
         ];
-        // The marks `ui::agent_line` adds beside the glyph, in the same head.
-        for mark in glyphs.into_iter().chain(["▶", "⏸", "✉", "⚙", "⚠"]) {
+        // The marks `ui::agent_line` adds beside the glyph, in the same head:
+        // the pane cursor, the counts, and the severed-link `⚮` a row whose
+        // parent the tree forgot wears (`AgentRow::parent_gone`).
+        for mark in glyphs.into_iter().chain(["▶", "⏸", "✉", "⚙", "⚠", "⚮"]) {
             assert_eq!(
                 UnicodeWidthStr::width(mark),
                 1,
@@ -1754,6 +1870,238 @@ mod tests {
         // An empty branch is a detached HEAD, not a blank cell.
         let detached = git::RepoStatus::default();
         assert_eq!(git_cell(&detached, None), "detached");
+    }
+
+    /// A row whose parent the history window reaped was painted as if it hung
+    /// under the root: `AgentTree::rows` orders a parentless node at the top
+    /// level and (after D9) indents it there, which is exactly the shape a root
+    /// child wears — the human's own frame read `✓ #58 Adversarial write-road …`
+    /// among the root's current children, claiming a parent it does not have.
+    /// The row says its parent is gone instead.
+    ///
+    /// The reap is the window's own road, not a shape poked into the tree:
+    /// `past_history` drops the oldest children over `CHILD_HISTORY` and a node
+    /// does not inherit its parent's age, so the parent goes while its newest
+    /// child stays; `App::reap_history` is what a tick does with that answer.
+    /// The cells are read at the 80×24 floor, with the cursor on the probe so
+    /// the list scrolls to its row and the title carries its `▲` count.
+    #[test]
+    fn a_row_whose_parent_the_window_reaped_says_its_parent_is_gone() {
+        use crate::app::tree::CHILD_HISTORY;
+
+        let (mut app, _rx, root) = frame_app("parent-gone-window");
+        // #1 is the oldest child; 50 newer root children fill the window, and
+        // #1's own probe is spawned last of all — newer than every one of them,
+        // which is the design's "a node does not inherit its parent's age".
+        insert(&mut app, 1, 0, 1, "watch the probes");
+        for id in 3..=CHILD_HISTORY as u64 + 2 {
+            insert(&mut app, id, 0, 1, &format!("task {id}"));
+        }
+        insert(&mut app, 2, 1, 2, "probe the write-road");
+        let children: Vec<AgentId> = app
+            .tree
+            .agents
+            .iter()
+            .map(|node| node.id)
+            .filter(|id| *id != AgentId::ROOT)
+            .collect();
+        for id in children {
+            app.tree.finish(id, Some("done".to_string()));
+            app.tree.result_read(id);
+        }
+
+        // Before the reap: the probe is painted under its parent, two levels
+        // in, with nothing on the row about the link.
+        app.tree.point_cursor_at(AgentId(2));
+        let before = pane_frame(&mut app, 80, 24, &crate::theme::Theme::default());
+        assert_eq!(
+            row_for(&before, 2),
+            "     ✓ #2 probe  done",
+            "a child under its parent is painted two levels in"
+        );
+        assert!(
+            !row_for(&before, 0).contains('⚮'),
+            "the root is never marked"
+        );
+        assert!(
+            !row_for(&before, 4).contains('⚮'),
+            "and a root child is not marked while its parent is here"
+        );
+
+        let reap = app.tree.past_history();
+        assert_eq!(
+            reap,
+            vec![AgentId(1), AgentId(3)],
+            "the window drops the oldest children"
+        );
+        assert!(
+            !reap.contains(&AgentId(2)),
+            "the probe is newer than the window and stays: {reap:?}"
+        );
+        app.reap_history();
+
+        // After the reap: the parent is gone, the probe is a top-level row by
+        // D9's rule, and the row says why it is there.
+        let after = pane_frame(&mut app, 80, 24, &crate::theme::Theme::default());
+        assert_eq!(
+            row_for(&after, 2),
+            " ✓ #2 ⚮ probe  done",
+            "the reaped parent is said, at the top level the order paints"
+        );
+        assert!(
+            after[0].contains('▲'),
+            "the list scrolled to the probe and the title counts what it hides: {:?}",
+            after[0]
+        );
+        let marked: Vec<&String> = after.iter().filter(|line| line.contains('⚮')).collect();
+        assert_eq!(
+            marked.len(),
+            1,
+            "only the probe's row has a parent to miss: {after:#?}"
+        );
+        // Scrolled back to the top, the root and the root child are painted
+        // again — neither wears the mark, whatever the window is showing.
+        app.tree.cursor_top();
+        let top = pane_frame(&mut app, 80, 24, &crate::theme::Theme::default());
+        assert!(!row_for(&top, 0).contains('⚮'), "the root is never marked");
+        assert!(
+            !row_for(&top, 4).contains('⚮'),
+            "a root child is a root child, reaped parent nearby or not"
+        );
+
+        // The pane's focus is not this fact: the mark is in the row, not the
+        // chrome.
+        app.focus = Focus::Chat;
+        app.tree.point_cursor_at(AgentId(2));
+        let unfocused = pane_frame(&mut app, 80, 24, &crate::theme::Theme::default());
+        assert!(
+            row_for(&unfocused, 2).contains("#2 ⚮"),
+            "the mark is not the pane's focus: {:#?}",
+            row_for(&unfocused, 2)
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Every state a marked row can also wear, and every state that must not
+    /// carry the mark: `⚮` is about the parent alone.
+    ///
+    /// #2..#5 hang under #1 and are orphaned together by one reap, each with a
+    /// different own state — a finished probe, a stopped run (`⊘`), a landed
+    /// worktree, and a napping parent with a child in flight (`⏸1`); #6 is that
+    /// child and #7 a root child, both with a parent in the tree; #8 is a
+    /// leftover worktree, top-level by construction rather than by a lost link;
+    /// the root is never marked. Read at the 80×24 floor and on a roomy pane, in
+    /// the pane's two focus states and the four themes, so the mark is a fact
+    /// about the row and not about the frame around it.
+    #[test]
+    fn a_parent_gone_row_says_so_in_every_state_it_can_wear() {
+        use crate::app::Existing;
+
+        let (mut app, _rx, root) = frame_app("parent-gone-states");
+        insert(&mut app, 1, 0, 1, "watch the probes");
+        insert(&mut app, 2, 1, 2, "probe the write-road");
+        insert(&mut app, 3, 1, 2, "port the parser");
+        insert(&mut app, 4, 1, 2, "land the lexer");
+        insert(&mut app, 5, 1, 2, "hold the line");
+        // A child in flight under #5: the `⏸1` a marked row also wears.
+        insert(&mut app, 6, 5, 3, "probe the tokens");
+        insert(&mut app, 7, 0, 1, "task seven");
+        // A leftover worktree: no parent in this tree, and nothing lost.
+        app.tree.register(Existing {
+            id: AgentId(8),
+            parent: None,
+            depth: 1,
+            brief: "leftover worktree".to_string(),
+            title: None,
+            phase: Phase::Done,
+            branch: Some("mush/8".to_string()),
+            fork: None,
+            summary: Some("found on startup".to_string()),
+            leftover: true,
+            landed: None,
+            result_unread: false,
+            tx: None,
+        });
+
+        app.tree.finish(AgentId(2), Some("done".to_string()));
+        app.tree.result_read(AgentId(2));
+        app.tree.stopped(AgentId(3));
+        app.tree.finish(AgentId(4), Some("landed".to_string()));
+        app.tree.mark_reclaimed(AgentId(4), Landed::Merged);
+        app.tree.idle(AgentId(5));
+        app.tree.finish(AgentId(7), Some("done".to_string()));
+        app.tree.result_read(AgentId(7));
+        // #6 stays thinking: that is the `⏸1` on #5's row.
+
+        app.tree.reap(&[AgentId(1)]);
+
+        let env = |theme: Option<&str>, colorterm: Option<&str>, term: Option<&str>| {
+            crate::theme::EnvText {
+                theme: theme.map(str::to_string),
+                colorterm: colorterm.map(str::to_string),
+                term: term.map(str::to_string),
+            }
+        };
+        // The four forms a theme comes in: the fixed palette, `MUSH_THEME=off`,
+        // a named hue on a truecolor terminal, and the workspace's own hue in
+        // the indexed form.
+        let themes = [
+            crate::theme::Theme::default(),
+            crate::theme::Theme::resolve(&env(Some("off"), None, None), &root).unwrap(),
+            crate::theme::Theme::resolve(&env(Some("mint"), Some("truecolor"), None), &root)
+                .unwrap(),
+            crate::theme::Theme::resolve(&env(None, None, Some("xterm-256color")), &root).unwrap(),
+        ];
+
+        for theme in &themes {
+            for (width, height) in [(80u16, 24u16), (120, 40)] {
+                for focus in [Focus::Agents, Focus::Chat] {
+                    app.focus = focus;
+                    let frame = pane_frame(&mut app, width, height, theme);
+                    for id in [2u64, 3, 4, 5] {
+                        let row = row_for(&frame, id);
+                        assert!(
+                            row.contains('⚮'),
+                            "#{id}'s parent was reaped at {width}×{height} {focus:?}: {row:?}"
+                        );
+                    }
+                    for id in [0u64, 6, 7, 8] {
+                        let row = row_for(&frame, id);
+                        assert!(
+                            !row.contains('⚮'),
+                            "#{id} has a parent in the tree at {width}×{height} {focus:?}: {row:?}"
+                        );
+                    }
+                    // The marks the row already carried are not displaced: the
+                    // stop is the agent's own phase and the `⏸1` is about the
+                    // child it holds, and both sit with the severed link.
+                    assert!(
+                        row_for(&frame, 3).contains("⊘ #3 ⚮"),
+                        "a stopped orphan wears both: {:#?}",
+                        row_for(&frame, 3)
+                    );
+                    assert!(
+                        row_for(&frame, 5).contains("⏸1"),
+                        "a napping orphan keeps its count: {:#?}",
+                        row_for(&frame, 5)
+                    );
+                }
+            }
+        }
+
+        // The landed row's own fact is not displaced either: with the cursor on
+        // it, the footer still spells how its work landed.
+        app.tree.point_cursor_at(AgentId(4));
+        app.focus = Focus::Agents;
+        let landed = pane_frame(&mut app, 80, 24, &crate::theme::Theme::default());
+        assert!(row_for(&landed, 4).contains('⚮'));
+        assert!(
+            landed.iter().any(|line| line.contains("merged")),
+            "the footer still says how #4 landed: {landed:#?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The `/model` bullet marks the row being painted, not the row the cursor
