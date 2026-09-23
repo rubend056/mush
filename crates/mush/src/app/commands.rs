@@ -25,6 +25,7 @@
 //! | `/url <url>` | required | point at another endpoint |
 //! | `/key [SECRET]` | optional | show the key in use, or set one |
 //! | `/models` | ignored | re-read the endpoint's model list |
+//! | `/context` | ignored | say the window's size and the road it came by |
 //! | `/compact` | ignored | fold the focused conversation into a summary |
 //! | `/notes` | ignored | read every note about the focused agent |
 //! | `/help` (`/?`) | ignored | list the keys and the commands |
@@ -33,7 +34,9 @@
 //! Git is not a command surface: the tree names the branch and the worktree,
 //! and `git` itself is the tool for acting on them. The worktree commands mush
 //! used to wrap (`/diff`, `/merge`, `/discard`, `/forget`, `/worktrees`) are
-//! gone, and so is `/context` (the meter is on screen) and `/new` (Ctrl-N).
+//! gone, and so is `/new` (Ctrl-N). `/context` went with them once — the meter
+//! is on screen — and is back because the meter paints the number, and only a
+//! command can say which road the number came by.
 //!
 //! Anything else is an error value: an unknown slash, or a real command whose
 //! argument does not read.
@@ -56,6 +59,8 @@ pub enum Command {
     ApiKey(Option<String>),
     /// `/models`: re-read the endpoint's list.
     Models,
+    /// `/context`: say the window in force and the road it came by.
+    Context(ContextArg),
     Compact,
     /// `/notes`: read every note about the focused agent, in full.
     ///
@@ -63,6 +68,16 @@ pub enum Command {
     /// lists the agent's whole set of notices, the ones the foot already showed
     /// included, because that is what the lines mush wrote about the agent are.
     Notes,
+}
+
+/// `/context`'s argument: what the human asked of the window.
+///
+/// Read here like every other argument, so the arm that carries it out matches
+/// a value rather than parsing text a second time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ContextArg {
+    /// No argument: say the window in force and the road it came by.
+    Report,
 }
 
 /// Why a typed line is not a command to run.
@@ -145,6 +160,12 @@ pub const COMMANDS: &[Spec] = &[
         aliases: &[],
         args: "",
         help: "refresh the model list from the endpoint",
+    },
+    Spec {
+        name: "/context",
+        aliases: &[],
+        args: "",
+        help: "say the window's size and the road it came by",
     },
     Spec {
         name: "/compact",
@@ -240,6 +261,15 @@ pub fn parse_command(line: &str) -> Result<Command, CommandError> {
         "/help" => Command::Help,
         "/model" => Command::Model,
         "/models" => Command::Models,
+        "/context" if argument.is_empty() => Command::Context(ContextArg::Report),
+        // The number and `auto` roads are read where they are answered; a line
+        // that carries an argument now is refused as the shape this command
+        // does not take yet.
+        "/context" => {
+            return Err(CommandError::Usage(
+                "usage: /context — say the window and the road it came by".to_string(),
+            ))
+        }
         "/compact" => Command::Compact,
         "/notes" => Command::Notes,
         "/provider" => Command::Provider(optional(argument)),
@@ -417,6 +447,10 @@ mod tests {
         assert_eq!(parse_command("/models all"), Ok(Command::Models));
         assert_eq!(parse_command("/compact harder"), Ok(Command::Compact));
         assert_eq!(parse_command("/notes please"), Ok(Command::Notes));
+        assert_eq!(
+            parse_command("/context"),
+            Ok(Command::Context(ContextArg::Report))
+        );
     }
 
     /// The table renders with the provider list filled in, and nothing left

@@ -57,7 +57,7 @@ use crate::http;
 use crate::session_save::SessionSave;
 
 use chat::{Copied, SelectKey};
-use commands::{Command, CommandError};
+use commands::{Command, CommandError, ContextArg};
 use keys::Intent;
 
 pub enum Msg {
@@ -3159,6 +3159,17 @@ impl App {
                 // answers, not now: a road that read the list here would be
                 // reading an answer that has not arrived (finding D4).
                 self.refresh_models();
+            }
+            Command::Context(ContextArg::Report) => {
+                // The window in force and the road it came by, in one line: the
+                // meter's own label plus the words `--print-config` prints,
+                // from the one definition
+                // ([`mush_core::config::WindowSource::words`]).
+                self.say(format!(
+                    "{} · {}",
+                    self.context_label(),
+                    self.cfg().context_source.words()
+                ));
             }
         }
         // A command is a transition the human drove: whatever they asked for
@@ -13300,6 +13311,39 @@ mod tests {
         let stated = app.context_meter();
         assert!(!stated.contains('~'), "{stated}");
         assert!(stated.ends_with(&tokens_label(32_768)), "{stated}");
+    }
+
+    /// `/context` says the window in force *and the road it came by*, in the
+    /// words `--print-config` prints: the meter has one column for the mark,
+    /// and a human who asks has a whole line for the sentence. The words come
+    /// from `WindowSource::words`, so the two surfaces cannot describe one
+    /// window differently.
+    #[test]
+    fn the_context_command_names_the_road_the_window_came_by() {
+        let (mut app, _rx) = test_app("context-road");
+        for (source, words) in [
+            (WindowSource::Stated, "stated by the human"),
+            (WindowSource::Table, "assumed from mush's model table"),
+            (
+                WindowSource::Advertised,
+                "advertised by the endpoint's model list",
+            ),
+            (
+                WindowSource::Complaint,
+                "named by the endpoint in a refusal",
+            ),
+        ] {
+            app.cell.edit(|cfg| {
+                cfg.context_source = source;
+                cfg.context_tokens = 500_000;
+            });
+            run(&mut app, "/context");
+            assert_eq!(
+                text_of(&app),
+                format!("{} · {words}", app.context_label()),
+                "{source:?}: the window and its road in one line"
+            );
+        }
     }
 
     /// A window an actor learned reaches the UI's cell, through the event that
