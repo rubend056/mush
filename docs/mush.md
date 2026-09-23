@@ -469,7 +469,7 @@ elided, and the cursor is always on screen.
 
 | Context | Keys |
 |---|---|
-| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (a second press confirms while the conversation is not empty; stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning · `Ctrl-F` the focused pane takes the whole screen, and back · `Ctrl-Y` select the transcript: `Enter` copies, `Esc` leaves |
+| anywhere | `Tab`/`Shift-Tab` cycle panes · `Ctrl-Q` quit (a second press confirms while work is running) · `Ctrl-N` new chat (a second press confirms while the conversation is not empty; stops every agent and restarts the root) · `Ctrl-C` stops the focused agent (reaches a model that is still thinking) · `Ctrl-X` stops every running agent · `Ctrl-P` model picker · `Ctrl-T` show or hide the model's reasoning · `Ctrl-O` show or hide the output · `Ctrl-F` the focused pane takes the whole screen, and back · `Ctrl-Y` select the transcript: `Enter` copies, `Esc` leaves |
 | selecting | `↑`/`↓` the cursor one transcript line, `Shift` holding the selection while it moves · `PgUp`/`PgDn` ten lines at a time · `Home`/`End` the oldest / newest · `Enter` copy the selection, or the cursor's own line · `Esc` leave without copying · the pane's own scroll keys are the cursor's while this is open, and a letter is not typing |
 | picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End`, `PgUp`/`PgDn` move the list, `Enter` take the row, `Esc` close |
 | agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them, `←` the row's parent, `→` its first child, `Enter` show its transcript, `c` cancel that agent, `Esc` back to the root |
@@ -556,6 +556,14 @@ thinking endpoint refuses a replayed turn without it — so the block adds a
 pane; the toggle writes nothing, sends nothing and is not stored, and a new chat
 keeps whatever the human chose. A reasoning that trims to nothing paints no row
 at all, so a reply that did no thinking costs no line.
+
+`Ctrl-O` is the same kind of view over the output: a tool's result, mush's own
+report about a child or a job, and the brief a child's pane opens with. It hides
+those rows and brings them back exactly as they were; like `Ctrl-T` the key
+writes nothing, sends nothing and is not stored, and a new chat keeps whatever
+the human chose. Two rows stay in both states, because a hidden failure would be
+a lie about what happened: a failed result's own `! error: …` row and a
+`#1 failed: …` report.
 
 ---
 
