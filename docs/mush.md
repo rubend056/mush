@@ -114,8 +114,13 @@ and never share state with the painter.
   corrupt the original.
 - **Workspace confinement is a convention, not a fence.** Every file tool
   resolves its `path` against the root and rejects an escape (`..`, absolute
-  paths; `write_file` refuses the root itself), but `run_command` is a real shell
-  and nothing confines it. So the rules name the
+  paths, and a component that is not a name at all — a Windows prefix — is
+  `invalid path`), and `write_file` refuses the workspace root itself; but
+  `run_command` is a real shell and nothing confines it. The *data* roads check
+  a name for a different reason: a name they cannot hand back as itself — bytes
+  that are not UTF-8, a line break, ends the tools' own trim would move — is
+  left out of a listing or a search and counted instead, because a path the
+  model cannot pass back to `read_file` is a dead end. So the rules name the
   workspace, tell the agent that paths are workspace-relative and that commands
   run with their cwd at its root, and say never to touch paths outside it — and
   the prompt says so in one place (`RULES`). There is no enforced *path jail*:
