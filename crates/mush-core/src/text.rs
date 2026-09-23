@@ -3,6 +3,11 @@
 //! Wrapping, truncation, row budgets and secret masks all count *display
 //! columns*, so they live together and cannot drift (finding B9). Nothing here
 //! touches a terminal: this is string arithmetic over `unicode-width`.
+//!
+//! The line arithmetic is here for the other side of the same question: what a
+//! *file's* line is, as bytes, versus what a display makes of it
+//! ([`file_lines`]). The model's roads read a file and must hand back its own
+//! bytes; the pane's painter is the one road that rewrites them ([`sanitize`]).
 
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -75,6 +80,20 @@ fn has_bare_lf(text: &str) -> bool {
 /// ending the file does not use (finding B7).
 pub fn is_crlf(text: &str) -> bool {
     text.contains("\r\n") && !has_bare_lf(text)
+}
+
+/// The lines `text` holds as the file's own bytes: split at every `\n`, with
+/// the `\r` of a `\r\n` kept at the end of the line it ends.
+///
+/// [`str::lines`] is a *reader's* split — it drops the `\r` of a CRLF ending —
+/// and this is the splitter a *model's* road reads a file through: a searched
+/// line must be the line the file holds, so its trailing spaces, its escape
+/// sequences and the `\r` of its ending all come back (finding B8). What the
+/// pane paints is the painter's own copy, [`sanitize`]d; what a read window
+/// shows is a line's text and says so when an ending is missing (finding B7).
+pub fn file_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split_inclusive('\n')
+        .map(|line| line.strip_suffix('\n').unwrap_or(line))
 }
 
 /// Consume one escape sequence, whole.

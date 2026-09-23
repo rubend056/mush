@@ -58,8 +58,10 @@ pub const IMAGE_FILE_CAP: u64 = 2 * 1024 * 1024;
 /// is the road to that file.
 pub const SEARCH_FILE_CAP: u64 = 2 * 1024 * 1024;
 
-/// How much of one matching line `search` shows, so one minified line cannot
-/// spend the whole result.
+/// How much of one matching line `search` shows, in *bytes*, so one minified
+/// line cannot spend the whole result. A line past the cap is cut on a
+/// character boundary and the cut is marked ([`match_line`]): a partial line a
+/// model mistakes for the whole is a wrong fact, not a short one.
 const MATCH_LINE_CAP: usize = 240;
 
 /// The mime an image's own first bytes name, or `None` when they are not an
@@ -1035,8 +1037,16 @@ impl Workspace {
     /// runs one is the `rg` the shell already has, while this tool exists for
     /// the one case the shell cannot serve (a held machine lock). Binary files
     /// (a NUL byte) and files past [`SEARCH_FILE_CAP`] are skipped, and a
-    /// matching line is cut to [`MATCH_LINE_CAP`] so one minified file cannot
-    /// spend the result.
+    /// matching line is cut to [`MATCH_LINE_CAP`] bytes with the cut said, so
+    /// one minified file cannot spend the result.
+    ///
+    /// The match line is the *file's* line: no paint-time sanitizing, no
+    /// `trim_end`, and a CRLF ending's `\r` stays ([`text::file_lines`]). This
+    /// is a model road, and the model's roads are data — a line a search shows
+    /// that the file does not hold is a line the model copies into an
+    /// `old_string` and reads "not found" (finding B8). The pane that paints
+    /// the result sanitizes its own copy ([`text::sanitize`]), which is where
+    /// the escape sequences go.
     ///
     /// The decode is **lossy on purpose**, like [`Self::read_window`]'s and for
     /// the same reason: a search only shows what it found, so a file in another
@@ -1095,7 +1105,7 @@ impl Workspace {
                 return true;
             }
             let text = String::from_utf8_lossy(&bytes);
-            for (number, line) in text.lines().enumerate() {
+            for (number, line) in text::file_lines(&text).enumerate() {
                 let haystack = if ignore_case {
                     line.to_lowercase()
                 } else {
@@ -1112,7 +1122,7 @@ impl Workspace {
                     "{}:{}: {}",
                     self.rel(path),
                     number + 1,
-                    text::truncate(line.trim_end(), MATCH_LINE_CAP)
+                    match_line(line)
                 ));
             }
             true
@@ -1657,6 +1667,28 @@ fn create_paste_file(dir: &Path, millis: u128, mime: &str) -> Result<(String, fs
             Err(e) => return Err(format!("cannot write {}/{name}: {e}", session::MUSH_DIR)),
         }
     }
+}
+
+/// One matched line, as `search` hands it to a model: the file's own bytes,
+/// cut only past [`MATCH_LINE_CAP`] and with the cut said.
+///
+/// It is deliberately not [`text::truncate`]: that sanitizes for a pane, and it
+/// would delete the line's escape sequences and control bytes, turn a bare `\r`
+/// into `␍` and trim the line's own trailing whitespace — a line the file does
+/// not hold (finding B8). Nor is it `trim_end`ed: a search result is a
+/// location, and the model may ask about the spaces. The cut uses
+/// [`text::boundary_at_or_before`] and the marker names the road that prints
+/// the whole line, the same shape [`truncate_for_model`] uses for output; a
+/// line the cap did not touch comes back exactly.
+fn match_line(line: &str) -> String {
+    if line.len() <= MATCH_LINE_CAP {
+        return line.to_string();
+    }
+    let cut = text::boundary_at_or_before(line, MATCH_LINE_CAP);
+    format!(
+        "{}… [mush: line cut at {MATCH_LINE_CAP} bytes — run_command (`rg -n`) prints it whole]",
+        &line[..cut]
+    )
 }
 
 /// Cap text handed to a model, cutting on a char boundary and marking the
@@ -3569,6 +3601,48 @@ mod tests {
             crate::tools::edit_text("a\nb\r\nc\n", "a\nb", "A\nB", false, "mixed.txt").unwrap(),
             "A\nB\r\nc\n"
         );
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// A search result is the file's line, not a display's: the trailing
+    /// spaces, the control byte and the escape sequence all come back, and so
+    /// does the `\r` of a CRLF ending — the bytes the file holds at that line
+    /// number. A line past the cap is cut on a character boundary and the cut
+    /// is said, never silently shortened (finding B8).
+    #[test]
+    fn a_searched_line_is_the_files_own_bytes() {
+        let ws = temp_workspace("search-bytes");
+        let line = "before\rneedle \x1b[31m \x07  ";
+        fs::write(ws.root().join("raw.txt"), format!("{line}\n")).unwrap();
+        assert_eq!(
+            ws.read_file("raw.txt").unwrap(),
+            format!("{line}\n"),
+            "the strict read and the search line are the same bytes"
+        );
+        let found = ws.search("needle", ".", false, 10).unwrap();
+        assert_eq!(
+            found.matches,
+            vec![format!("raw.txt:1: {line}")],
+            "no sanitizing, no trim_end: the line comes back byte for byte"
+        );
+
+        // The `\r` of a CRLF ending is the file's byte too.
+        fs::write(ws.root().join("crlf.txt"), "needle\r\nnext\r\n").unwrap();
+        let found = ws.search("needle", "crlf.txt", false, 10).unwrap();
+        assert_eq!(found.matches, vec!["crlf.txt:1: needle\r".to_string()]);
+
+        // A line past the cap is cut on a character boundary and marked, never
+        // silently shortened.
+        let long = format!("needle{}", "x".repeat(2 * MATCH_LINE_CAP));
+        ws.write_file("long.txt", &format!("{long}\n")).unwrap();
+        let found = ws.search("needle", "long.txt", false, 10).unwrap();
+        let reported = &found.matches[0];
+        assert!(
+            reported.starts_with(&format!("long.txt:1: {}", &long[..MATCH_LINE_CAP])),
+            "{reported}"
+        );
+        assert!(reported.contains("line cut at"), "{reported}");
+        assert!(reported.len() < long.len(), "the cut is real");
         let _ = fs::remove_dir_all(ws.root());
     }
 
