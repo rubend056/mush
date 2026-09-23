@@ -824,7 +824,7 @@ impl App {
         }
         let (stored, refused) = self.vet_stored_agents(stored);
         for line in refused {
-            self.session_unreadable(line);
+            self.stored_unreadable(line);
         }
         let cfg = self.cell.handle();
         let ui_tx = self.ui_tx.clone();
@@ -2036,17 +2036,19 @@ impl App {
         format!("ctx {used_label}/{budget_label}{state} (fold {fold_label}) {mark}{window_label}")
     }
 
-    /// The conversation this workspace was left holding could not be read, and
-    /// the human has to hear it before they mistake the empty screen for an
-    /// empty workspace (finding S3). A stored *row* the restore refuses is said
-    /// through the same door for the same reason (finding C9).
+    /// A stored layer this process was handed could not be read, and the human
+    /// has to hear it before they mistake the empty screen for an empty world:
+    /// this workspace's conversation (finding S3), or the machine-global home
+    /// config whose key and settings the run is going without (finding C3). A
+    /// stored *row* the restore refuses is said through the same door for the
+    /// same reason (finding C9).
     ///
     /// It takes the two homes a failure takes: the root pane's foot — wrapped
     /// to the pane, ranked `Alert`, read back whole by `/notes` — and the bar's
     /// line one, so it is visible without opening anything and stays visible
     /// until something replaces it. It is news rather than chatter, so the
     /// human's next send does not end it, and the session is marked dirty so
-    /// the next save writes it: a workspace that could not be read is a fact
+    /// the next save writes it: a stored layer that could not be read is a fact
     /// about the workspace, not about the moment it was noticed. (The root's
     /// own next run supersedes it, as it supersedes any failure — but by then
     /// the human has run something in the conversation it opened.) The words
@@ -2054,7 +2056,7 @@ impl App {
     /// path, the reason and where the only copy went — and they take the same
     /// three homes [`Self::fail_for`] gives a run's own failure, so the two
     /// cannot drift about what a failure does (refactor R19).
-    pub fn session_unreadable(&mut self, text: impl Into<String>) {
+    pub fn stored_unreadable(&mut self, text: impl Into<String>) {
         let text = text.into();
         self.fail_for(AgentId::ROOT, text.clone(), Some(text));
     }
@@ -10189,7 +10191,7 @@ mod tests {
 
         let notice = "could not read .mush/session.json — expected value at line 1 column 2; \
                       kept as .mush/session.json.bak · starting a new conversation";
-        app.session_unreadable(notice);
+        app.stored_unreadable(notice);
 
         // The bar says it without anything being opened: line one, in red,
         // after the focus badge — and the pane's foot carries it whole.

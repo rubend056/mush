@@ -141,20 +141,76 @@ pub fn config_path() -> PathBuf {
     PathBuf::from(".mush-user-config.json")
 }
 
+/// A home config file as it was read: the values, and what to say when the file
+/// was there and could not be used.
+///
+/// "Missing" and "there and unusable" are different facts about a layer, and
+/// flattening them into the same silence is what let an unreadable file be
+/// replaced by mush's four fields and its header on the first save — with the
+/// human's key inside it (finding C3). The complaint carries the path and the
+/// reason; the sentence around it is the caller's, because `main` is where the
+/// human reads it.
+pub struct Loaded {
+    /// The values. [`UserConfig::default`] when the file is absent, or when it
+    /// is there and could not be used.
+    pub config: UserConfig,
+    /// `Some` when the file was there and could not be read or parsed: why, and
+    /// where. `None` when it was read, or when there was no file at all — the
+    /// two silences are the same only because there is nothing to say in
+    /// either.
+    pub complaint: Option<String>,
+}
+
 impl UserConfig {
-    pub fn load() -> Self {
+    pub fn load() -> Loaded {
         Self::load_from(&config_path())
     }
 
-    /// Read the file, or the defaults if it is missing or unreadable. An
-    /// unknown key is ignored: forward compatibility costs nothing a human
-    /// editing this by hand would miss, and a hard failure here would take the
-    /// whole TUI down over a typo.
-    pub fn load_from(path: &Path) -> Self {
-        fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+    /// Read the file, or the defaults.
+    ///
+    /// A missing file is silence: a machine that never wrote one has nothing to
+    /// complain about. A file that is *there* and cannot be used — unreadable,
+    /// not JSON, or one field of the wrong type — is the defaults *with a
+    /// complaint*: a hard failure would take the whole TUI down over one wrong
+    /// character, and silence would let the human's key and settings vanish into
+    /// the built-ins without a word (finding C3). An unknown *key* is ignored:
+    /// forward compatibility costs nothing a human editing this by hand would
+    /// miss.
+    ///
+    /// Two values in a file that *did* parse are reported by name instead, where
+    /// they are read: the home config's `provider` and its `reasoning_effort`
+    /// ([`crate::config::resolve`]), because a name mush does not know must
+    /// never fall through to a default host (findings A17, C2).
+    pub fn load_from(path: &Path) -> Loaded {
+        let complaint = |why: String| Loaded {
+            config: UserConfig::default(),
+            complaint: Some(why),
+        };
+        let bytes = match fs::read(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Loaded {
+                    config: UserConfig::default(),
+                    complaint: None,
+                }
+            }
+            Err(error) => {
+                return complaint(format!(
+                    "could not read {} — {error}; using defaults",
+                    path.display()
+                ))
+            }
+            Ok(bytes) => bytes,
+        };
+        match serde_json::from_slice(&bytes) {
+            Ok(config) => Loaded {
+                config,
+                complaint: None,
+            },
+            Err(error) => complaint(format!(
+                "could not read {} — {error}; using defaults",
+                path.display()
+            )),
+        }
     }
 
     pub fn save(&self) -> std::io::Result<()> {
@@ -169,14 +225,33 @@ impl UserConfig {
     /// (a `/key` writes the connection and nothing else), and a hand-edited
     /// `temperature`, or a setting only a newer mush understands, must survive
     /// that. Fields that are stated overwrite.
+    ///
+    /// A file that is there and is not an object mush can merge into — not
+    /// JSON, JSON that is not an object, or unreadable — is moved beside itself
+    /// as `<name>.bak` (then `.bak.2`, …) before anything is written: this save
+    /// states four fields and rewrites the header, so without that it would be
+    /// the thing that destroys the file the human's key is in (finding C3). A
+    /// backup that fails refuses the save rather than writing over the only
+    /// copy.
     pub fn save_to(&self, path: &Path) -> std::io::Result<()> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let mut merged = serde_json::to_value(self).unwrap_or_else(|_| json!({}));
+        // What the merge can read. An object is the shape a file mush wrote
+        // (and the human edited); anything else is not content the merge can
+        // preserve, so it is the backup's business instead.
         let existing = fs::read(path)
             .ok()
-            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
+            .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+            .filter(Value::is_object);
+        // `missing` is the one case with a right answer of its own: there is
+        // nothing to keep, so nothing is kept. Everything else that does not
+        // merge gets the backup first.
+        let missing = matches!(fs::metadata(path), Err(error) if error.kind() == std::io::ErrorKind::NotFound);
+        if existing.is_none() && !missing {
+            keep_unparsable(path)?;
+        }
         if let (Some(fields), Some(Value::Object(before))) = (merged.as_object_mut(), &existing) {
             for (key, value) in before {
                 let unstated = fields.get(key).map_or(true, |current| {
@@ -197,6 +272,38 @@ impl UserConfig {
         // API key, and a `022` umask must not make it group-readable.
         atomic_write(path, &json, Fresh::Private)
     }
+}
+
+/// Move a home config mush cannot use beside itself, before a save that would
+/// replace it.
+///
+/// The name is the session store's ([`crate::session::keep_unreadable`]), and
+/// so is the rule that an existing backup is never overwritten: the next free
+/// name (`.bak`, `.bak.2`, …) is taken instead, because a copy already beside
+/// the file is one the human already needed and this must not be the second
+/// accident. A failure is returned, and the caller refuses the write: a save
+/// that cannot keep what it is about to replace must not replace it.
+fn keep_unparsable(path: &Path) -> std::io::Result<PathBuf> {
+    /// How many names a hand-broken file may burn before the problem is not
+    /// the name.
+    const TRIES: u32 = 100;
+    let base = PathBuf::from(format!("{}.bak", path.display()));
+    for step in 1..=TRIES {
+        let to = if step == 1 {
+            base.clone()
+        } else {
+            PathBuf::from(format!("{}.{step}", base.display()))
+        };
+        if to.exists() {
+            continue;
+        }
+        fs::rename(path, &to)?;
+        return Ok(to);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        format!("every backup name beside {} is taken", path.display()),
+    ))
 }
 
 #[cfg(test)]
@@ -239,6 +346,8 @@ mod tests {
         };
         user.save_to(&path).unwrap();
         let loaded = UserConfig::load_from(&path);
+        assert!(loaded.complaint.is_none(), "the file read");
+        let loaded = loaded.config;
         assert_eq!(loaded.api_key.as_deref(), Some("sk-test-1234"));
         assert_eq!(loaded.provider, "deepseek");
         assert_eq!(loaded.model, "deepseek-flash");
@@ -284,9 +393,63 @@ mod tests {
         let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
+    /// A home config that is *there* and cannot be used is the defaults with a
+    /// complaint — never silence — and the save that follows keeps the human's
+    /// bytes beside the file it is about to replace (finding C3): the key and
+    /// the settings in an unreadable file used to be dropped without a word,
+    /// and the first `/key`, `/url` or picker replaced the file with mush's own
+    /// fields.
+    #[test]
+    fn an_unreadable_home_config_is_said_and_kept() {
+        let path = temp_path("unreadable");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let original = "{ \"api_key\": \"sk-secret-0123456789\", ";
+        fs::write(&path, original).unwrap();
+
+        let loaded = UserConfig::load_from(&path);
+        let complaint = loaded
+            .complaint
+            .clone()
+            .expect("a file that is there and cannot be read is not silence");
+        assert!(
+            complaint.contains(&path.display().to_string()),
+            "{complaint}"
+        );
+        assert!(complaint.contains("using defaults"), "{complaint}");
+        assert!(
+            loaded.config.api_key.is_none(),
+            "nothing is taken from a file mush could not read"
+        );
+
+        // The save states the connection and cannot merge into this file, so
+        // the original goes to `<name>.bak` first: a save must not be the thing
+        // that loses the human's key.
+        let saved = UserConfig {
+            provider: "deepseek".into(),
+            base_url: "https://api.deepseek.com".into(),
+            ..UserConfig::default()
+        };
+        saved.save_to(&path).unwrap();
+        let backup = PathBuf::from(format!("{}.bak", path.display()));
+        assert_eq!(
+            fs::read_to_string(&backup).unwrap(),
+            original,
+            "the human's bytes are beside the file, not gone"
+        );
+        let reloaded = UserConfig::load_from(&path);
+        assert!(reloaded.complaint.is_none(), "what mush wrote reads back");
+        assert_eq!(reloaded.config.provider, "deepseek");
+        let _ = fs::remove_dir_all(path.parent().unwrap());
+    }
+
     #[test]
     fn missing_file_is_defaults() {
-        let user = UserConfig::load_from(Path::new("/nonexistent/mush/config.json"));
+        let loaded = UserConfig::load_from(Path::new("/nonexistent/mush/config.json"));
+        assert!(
+            loaded.complaint.is_none(),
+            "a machine that never wrote one has nothing to complain about"
+        );
+        let user = loaded.config;
         assert!(user.api_key.is_none());
         assert!(user.provider.is_empty());
     }
@@ -309,7 +472,7 @@ mod tests {
         )
         .unwrap();
 
-        let user = UserConfig::load_from(&path);
+        let user = UserConfig::load_from(&path).config;
         assert_eq!(user.api_key.as_deref(), Some("sk-old"));
         assert_eq!(user.provider, "deepseek");
         assert_eq!(user.base_url, "https://api.deepseek.com");
@@ -349,7 +512,7 @@ mod tests {
         )
         .unwrap();
 
-        let user = UserConfig::load_from(&path);
+        let user = UserConfig::load_from(&path).config;
         assert_eq!(user.api_key.as_deref(), Some("sk-all"));
         assert_eq!(user.provider, "custom");
         assert_eq!(user.base_url, "http://host:1");
@@ -370,7 +533,7 @@ mod tests {
             ..UserConfig::default()
         };
         saved.save_to(&path).unwrap();
-        let reloaded = UserConfig::load_from(&path);
+        let reloaded = UserConfig::load_from(&path).config;
         assert_eq!(reloaded.api_key.as_deref(), Some("sk-new"));
         assert_eq!(reloaded.context, Some(64_000));
         assert_eq!(reloaded.temperature, Some(0.3));
