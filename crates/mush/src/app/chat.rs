@@ -1412,9 +1412,20 @@ impl Chat {
     /// answer different questions — the pane keeps what was said, this keeps
     /// what the next request pays for — and the pane is the one that can be
     /// reconstructed from nothing, since it is on screen.
+    ///
+    /// No picture payload is copied into the view (finding R17): the clone
+    /// leaves every one behind ([`Message::without_image_payloads`]), because
+    /// neither reader sends one — the weigh prices a picture by its pixels or
+    /// its stored size, and the session writer writes the placeholder line it
+    /// always wrote. Copying them was a memcpy of bytes `Session::save` dropped
+    /// a moment later, and a second copy alive for the length of the write.
     pub fn bounded_transcript(&self, id: AgentId, budget: usize) -> Vec<Message> {
         let mut messages: Vec<Message> = self.system_for(id).into_iter().cloned().collect();
-        messages.extend(self.transcript(id).iter().cloned());
+        messages.extend(
+            self.transcript(id)
+                .iter()
+                .map(Message::without_image_payloads),
+        );
         // The note — the one the trim adds, or the one the copy already carried
         // and the trim moves back into place — is part of the view: a transcript
         // that lost turns says so once, and the stored row and the meter count
@@ -5062,6 +5073,49 @@ mod tests {
             retained,
             mush_core::message::IMAGE_BYTES_KEPT + PICTURE,
             "the newest message's own picture plus the cap's worth"
+        );
+    }
+
+    /// The bounded view holds no picture payload (finding R17): the clone the
+    /// meter weighs and the session stores keeps every fact of a picture —
+    /// path, size, pixels — and none of its bytes, so a snapshot no longer
+    /// copies on the UI thread what `Session::save` drops on the writer's. The
+    /// pane's record itself keeps its payload; only the view leaves it behind.
+    #[test]
+    fn the_bounded_view_carries_no_picture_payloads() {
+        const PICTURE: usize = 2 * 1024 * 1024;
+        let mut chat = Chat::bare();
+        let picture = Image::new(
+            "shots/screen.png",
+            "image/png",
+            vec![0u8; PICTURE],
+            Some((1_920, 1_080)),
+        );
+        chat.push_message(
+            AgentId::ROOT,
+            Message::user_with_images("look", vec![picture]),
+        );
+
+        let record = chat.transcript(AgentId::ROOT);
+        assert_eq!(
+            record[0].images[0].bytes.len(),
+            PICTURE,
+            "the record keeps its payload"
+        );
+        let record_weight: usize = record.iter().map(Message::weight).sum();
+
+        let view = chat.bounded_transcript(AgentId::ROOT, usize::MAX);
+        let picture = view
+            .last()
+            .and_then(|message| message.images.first())
+            .expect("the view keeps the picture's facts");
+        assert!(picture.bytes.is_empty(), "and no payload was copied");
+        assert_eq!(picture.size(), PICTURE, "the size came with the facts");
+        assert_eq!(picture.pixels, Some((1_920, 1_080)), "so did the pixels");
+        assert_eq!(
+            view.iter().map(Message::weight).sum::<usize>(),
+            chat.system().weight() + record_weight,
+            "and the view weighs what the record weighs: no price changed"
         );
     }
 

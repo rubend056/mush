@@ -287,6 +287,20 @@ impl Image {
         self.bytes = Vec::new();
     }
 
+    /// The same picture with the payload left behind: [`Self::new`]'s facts
+    /// without the bytes. The clone [`Message::without_image_payloads`] builds
+    /// a view from, so a reader that will never send a picture does not copy
+    /// its payload first.
+    fn without_payload(&self) -> Image {
+        Image {
+            path: self.path.clone(),
+            mime: self.mime.clone(),
+            size: self.size,
+            bytes: Vec::new(),
+            pixels: self.pixels,
+        }
+    }
+
     /// What this picture costs the context budget, in the byte-shaped currency
     /// [`Message::weight`] counts — its pixels at the
     /// [`PIXELS_PER_TOKEN`](crate::config::PIXELS_PER_TOKEN) rule, or its own
@@ -690,6 +704,36 @@ impl Message {
 
     pub fn text(&self) -> &str {
         self.content.as_deref().unwrap_or("")
+    }
+
+    /// A clone for a reader that will not send the picture bytes: every image
+    /// keeps its facts — path, mime, [`Image::size`], pixels — and none of its
+    /// payload (finding R17). It is hand-written rather than [`Clone`] because
+    /// `clone` would copy the payloads first, which is the memcpy this exists
+    /// to avoid, and because the field list is then checked by the compiler
+    /// when a field is added.
+    ///
+    /// The bounded view (`Chat::bounded_transcript`, in the app) is the reader:
+    /// [`Message::weight`] prices a picture by its pixels or its stored size
+    /// and never reads the buffer, and
+    /// [`Session::save`](crate::session::Session::save) writes the same
+    /// `placeholder` line it always wrote — so the bytes an old clone copied
+    /// on the UI thread were bytes the writer dropped a moment later, parked
+    /// beside the record for the length of the write.
+    pub fn without_image_payloads(&self) -> Message {
+        let mut view = Message {
+            role: self.role.clone(),
+            content: self.content.clone(),
+            images: Vec::with_capacity(self.images.len()),
+            reasoning_content: self.reasoning_content.clone(),
+            tool_calls: self.tool_calls.clone(),
+            tool_call_id: self.tool_call_id.clone(),
+            note: self.note,
+            mush: self.mush,
+        };
+        view.images
+            .extend(self.images.iter().map(Image::without_payload));
+        view
     }
 
     pub fn tool_calls(&self) -> &[ToolCall] {

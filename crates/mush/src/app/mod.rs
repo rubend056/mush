@@ -4328,9 +4328,13 @@ impl App {
     /// Every row is the **bounded view** of its agent's conversation
     /// ([`Chat::bounded_transcript`]): the same trim the actor's own list gets,
     /// so the file is bounded by the history budget rather than by the pane's
-    /// record, which keeps every turn a cut dropped. The system prompts are
-    /// left out either way — a prompt names a workspace that may have moved, and
-    /// the actor builds a fresh one on the way back in.
+    /// record, which keeps every turn a cut dropped. No picture payload rides in
+    /// it (finding R17): the view leaves every one behind, and
+    /// [`Session::save`](mush_core::session::Session::save) writes the
+    /// placeholder line in the picture's place, as it always did — without a
+    /// second copy of the bytes alive for the length of the write. The system
+    /// prompts are left out either way — a prompt names a workspace that may
+    /// have moved, and the actor builds a fresh one on the way back in.
     fn session_snapshot(&self) -> Session {
         let budget = self.cfg().history_budget();
         // Every subagent, not just the root: without this a relaunch forgot
