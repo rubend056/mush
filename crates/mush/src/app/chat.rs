@@ -34,8 +34,10 @@
 //! What a pane paints is built here too (`painted`), because which rows it shows
 //! is a fact about the conversation, its scrollback and its notes — not about the
 //! terminal: width and height are arguments, the blank separator that closes a
-//! message is trimmed before the window is cut, and the foot is capped and
-//! counted. `ui.rs` keeps the frame around it — the border, the prompt and the
+//! message is trimmed before the window is cut, every block that is not the
+//! human's own words or the model's reply is folded to its kind's number of rows
+//! ([`Fold`], with the `…` row that says what is hidden), and the foot is capped
+//! and counted. `ui.rs` keeps the frame around it — the border, the prompt and the
 //! cursor — and paints what this returns, title included, because a pane one row
 //! tall has no row to spend on saying what it is hiding, or that the human has
 //! scrolled away from the bottom.
@@ -481,10 +483,11 @@ fn cleared_line(had_words: bool, images: usize) -> Option<String> {
 /// The rows one message paints, and the source line each row is the reading of.
 ///
 /// The map is what lets a *source line* be found among painted rows at all: a
-/// wrapped row is not a line of the text, and a tool result's cap paints fewer
-/// rows than its text has lines. `rows` runs parallel to `lines` and is `None`
-/// for a row that is not the message's own words — the reasoning, a tool call, a
-/// picture label, the blank that closes a message.
+/// wrapped row is not a line of the text, and a block the fold paints
+/// ([`folded_marked`]) shows fewer rows than its text has lines. `rows` runs
+/// parallel to `lines` and is `None` for a row that is not the message's own
+/// words — the reasoning, a tool call, a picture label, the blank that closes a
+/// message.
 #[derive(Default)]
 struct Chunk {
     lines: Vec<Line<'static>>,
@@ -536,10 +539,10 @@ impl Body {
 ///
 /// The predicate is the `render_message` arms' own: a user line is always
 /// painted (the mark is, even for a message that is only a picture), a reply
-/// with no words paints nothing, and a tool result is painted from its first
-/// row — its cap decides *which* rows, never whether the line exists, so the
-/// cursor can still walk the lines a long result hides behind its `…` and copy
-/// them whole.
+/// with no words paints nothing, and a folded block — a tool result, a report,
+/// a brief — is painted from its first row: the fold decides *which* rows,
+/// never whether the line exists, so the cursor can still walk the lines a long
+/// block hides behind its `…` and copy them whole.
 fn lines_of(message: &Message) -> Option<Vec<&str>> {
     match message.role.as_str() {
         "user" | "tool" => Some(message.text().split('\n').collect()),
@@ -551,7 +554,7 @@ fn lines_of(message: &Message) -> Option<Vec<&str>> {
 }
 
 /// The first row of a message that is the reading of source line `line`, or —
-/// for a line the pane's cap hid — the last row that is the reading of a line at
+/// for a line the fold hid — the last row that is the reading of a line at
 /// or before it: the result's `…`, which stands for the rows that did not fit.
 fn first_row(rows: &[Option<(usize, usize)>], message: usize, line: usize) -> Option<usize> {
     rows.iter()
@@ -759,6 +762,10 @@ pub struct Chat {
     /// rather than in `App`, because every pane paints through this one
     /// transcript and the choice is about the reading, not about the frame.
     reasoning: bool,
+    /// How much of each kind of block this conversation's panes paint: the one
+    /// [`Fold`] behind every pane, so two panes cannot fold the same kind to
+    /// two numbers — and so a view that sets one has one place to set it.
+    fold: Fold,
 }
 
 impl Chat {
@@ -778,6 +785,7 @@ impl Chat {
             revisions: HashMap::new(),
             pending: None,
             reasoning: true,
+            fold: Fold::DEFAULT,
         }
     }
 
@@ -1542,8 +1550,8 @@ impl Chat {
     /// The text is the *source lines* joined with `\n` — the separator the
     /// transcript has between them — so a whole message is `Message::text()`
     /// byte for byte, a soft wrap at this pane's width is not a newline, and a
-    /// tab is a tab. A tool result is copied whole even where the pane's cap
-    /// hides its tail.
+    /// tab is a tab. A folded block — a tool result, a report, a brief — is
+    /// copied whole even where the pane's cap hides its tail.
     fn copy(&self, on: AgentId, cursor: (usize, usize)) -> Copied {
         let select = self.select.as_ref().expect("the mode is on");
         let (from, to) = match select.anchor {
@@ -1770,7 +1778,7 @@ impl Chat {
         }
         // The window the state carries no longer shows the cursor: the terminal
         // was resized, the transcript moved under it, or the cursor's
-        // own line is behind a tool result's cap. Put it where the pane can hold
+        // own line is behind a block's fold. Put it where the pane can hold
         // it — the cursor's line at the top when it is above the window, at the
         // bottom when it is below — and leave the placement where the next
         // frame finds it.
@@ -1826,7 +1834,7 @@ impl Chat {
         let message = &self.transcript(on)[index];
         let voice = self.voice_at(on, index, message);
         let mut lines = Vec::new();
-        let rows = render_message(&mut lines, message, voice, width, self.reasoning);
+        let rows = render_message(&mut lines, message, voice, width, self.reasoning, self.fold);
         debug_assert_eq!(lines.len(), rows.len(), "one map entry per painted row");
         Chunk {
             lines,
@@ -1838,8 +1846,8 @@ impl Chat {
     }
 
     /// The window's top with the cursor's own line as its first row: where the
-    /// line begins in its message. A line the pane's cap hid begins at the
-    /// result's `…`, which is the row that stands for it.
+    /// line begins in its message. A line the fold hid begins at the `…`, which
+    /// is the row that stands for it.
     fn top_at_cursor(&self, on: AgentId, width: usize, cursor: (usize, usize)) -> (usize, usize) {
         let chunk = self.chunk(on, cursor.0, width);
         (
@@ -2336,29 +2344,32 @@ fn tool_label(call: &mush_core::ToolCall, width: usize) -> String {
 /// *inside* the indent plus the mark's own columns so nothing is clipped from
 /// the right edge. Dim, because it is what the model thought and not what it
 /// told the human, and marked `⋯ ` — a thought trails off into the reply under
-/// it. Nothing is capped: see the arm that calls this.
-fn reasoning_rows(out: &mut Vec<Line<'static>>, message: &Message, width: usize) {
-    const INDENT: usize = 2;
-    const MARK: &str = "⋯ ";
+/// it. It is [`Kind::Reasoning`] to the fold, whose number for it is
+/// `usize::MAX`: shown whole today, because this is the text the human pressed
+/// `Ctrl-T` to read — and folded like any other block the day a setting lowers
+/// the number, because the fold's number, not this function, is where that
+/// decision lives.
+///
+/// The map is dropped: a thought is not a source line the select mode walks to
+/// — the cursor moves over what the model *said* and what a tool returned — and
+/// `render_message`'s caller marks every row of this block `None` afterwards.
+fn reasoning_rows(out: &mut Vec<Line<'static>>, message: &Message, width: usize, fold: Fold) {
     let Some(reasoning) = message.reasoning_content.as_deref() else {
         return;
     };
     if reasoning.trim().is_empty() {
         return;
     }
-    let style = dim();
-    let lead = INDENT + MARK.width();
-    for (index, line) in wrap_text(reasoning, width.saturating_sub(lead))
-        .into_iter()
-        .enumerate()
-    {
-        let head = if index == 0 {
-            format!("{}{MARK}", " ".repeat(INDENT))
-        } else {
-            " ".repeat(lead)
-        };
-        out.push(Line::from(Span::styled(format!("{head}{line}"), style)));
-    }
+    let mut map = Vec::new();
+    folded_marked(
+        out,
+        &mut map,
+        Head::solid("  ⋯ ", dim()),
+        reasoning,
+        width,
+        Kind::Reasoning,
+        fold,
+    );
 }
 
 /// The rows a message's pictures get, one dim row each: `▣ path (format ·
@@ -2501,8 +2512,9 @@ fn footnote_lines(notice: &Notice, width: usize) -> Vec<Line<'static>> {
     rows
 }
 
-/// How a pane says it is showing an excerpt. One wording, because the foot's own
-/// count row and the title are two places saying the same number.
+/// How a pane says it is showing an excerpt. One wording, because the foot's
+/// count row, the pane's title and a block's `…` row ([`elision`]) are places
+/// saying the same number.
 fn more_label(hidden: usize) -> String {
     format!("+{hidden} more lines")
 }
@@ -2581,24 +2593,254 @@ fn report(text: &str) -> bool {
             .any(|tail| rest[digits..].starts_with(tail))
 }
 
+/// The kinds of multi-line block a conversation paints, one number each in
+/// [`Fold`].
+///
+/// The list is closed on purpose. [`Kind::slot`] is a `match` with no wildcard,
+/// and [`Fold`]'s table is exactly [`Kind::COUNT`] long, so a block that
+/// arrives as a new variant cannot inherit a default number by accident: the
+/// compiler names every place the new kind has to be given one before the crate
+/// builds again.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Kind {
+    /// A tool call's result: a file dump — a diff, a test log, a shell
+    /// transcript — read from its head and copied whole behind its `…`.
+    Result,
+    /// The model's own reasoning — the `Ctrl-T` block [`reasoning_rows`]
+    /// paints.
+    Reasoning,
+}
+
+impl Kind {
+    /// How many kinds there are: the length of [`Fold`]'s table, so a new
+    /// variant that is given a slot but not a table entry is a compile error,
+    /// and one given a table entry but not a slot is too.
+    const COUNT: usize = 2;
+
+    /// This kind's own number in [`Fold`]'s table. No wildcard arm: a new kind
+    /// cannot compile until it is given a slot here, and the slot is where its
+    /// number is read from.
+    fn slot(self) -> usize {
+        match self {
+            Kind::Result => 0,
+            Kind::Reasoning => 1,
+        }
+    }
+}
+
+/// The one place a conversation's "how much of this thing does the human see"
+/// decision lives: how many rows, per [`Kind`] of block, a pane paints before
+/// the `…` row that stands for the rest.
+///
+/// It is a *value* and not a `const` per arm. A view can hold one and set it
+/// ([`Fold::with`]) — the `Ctrl-O` child is the first setting, a `0`-rows
+/// number for one kind — and a setting will later read the numbers from
+/// configuration, which is why they are here and not spelled at a paint site.
+/// `Chat` holds the one a conversation paints through.
+///
+/// The numbers are **per kind** because the kinds are read differently. A tool
+/// result is a dump: the human reads its head and copies the rest, and the pane
+/// exists to keep a long transcript scrollable — eight rows, the number the
+/// `"tool"` arm used to keep as a `const` of its own. Wrapping a block only as
+/// far as the fold is also why a long result stopped being most of a frame's
+/// cost on a long session (see [`wrap_text_capped`]). A reasoning block is the
+/// text the human pressed `Ctrl-T` to read, so its number is `usize::MAX`:
+/// shown whole today, with the slot in place because the setting the human
+/// already asked for is "one for child/tool calls and another for thinking rows
+/// shown".
+///
+/// A block that reports a **failure** is kept even where the fold would hide
+/// it: the failure is never what the fold gives up. The rule lives here, not in
+/// an arm and not in the handler of a key that changes a number, so a `0`-rows
+/// setting still paints a failed result's own `! error: …` row — the same rule
+/// the foot's cap already holds ("the failure is never the line the cap gives
+/// up").
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fold {
+    /// One number per kind, indexed by [`Kind::slot`].
+    rows: [usize; Kind::COUNT],
+}
+
+impl Fold {
+    /// The numbers a conversation opens with: eight rows for a result, and no
+    /// bound for the reasoning.
+    pub const DEFAULT: Fold = Fold {
+        rows: [8, usize::MAX],
+    };
+
+    /// How many of `text`'s rows this fold lets a pane paint for `kind` — the
+    /// kind's number, and the one exception at a `0`-rows setting: a block that
+    /// reports a failure keeps its failure row (see the type's doc).
+    pub fn shown(&self, kind: Kind, text: &str) -> usize {
+        let rows = self.rows[kind.slot()];
+        if rows == 0 && fails(kind, text) {
+            1
+        } else {
+            rows
+        }
+    }
+
+    /// The same fold with one kind's number changed — how a view sets it: a
+    /// setting that will read a number from configuration, and the key that
+    /// lowers one at runtime (the `Ctrl-O` child), both hand the result down
+    /// through here. The setter is test-only until that child lands, which is
+    /// why the attribute is here: the value is settable, and this is the door.
+    #[cfg(test)]
+    pub fn with(mut self, kind: Kind, rows: usize) -> Self {
+        self.rows[kind.slot()] = rows;
+        self
+    }
+}
+
+/// Whether a block of this kind reports a failure — the one thing the fold
+/// never gives up (see [`Fold`]'s own doc). The vocabulary is the kinds' own: a
+/// tool result fails when it opens with mush's `error:` prefix. A thought is
+/// nobody's failure to report.
+fn fails(kind: Kind, text: &str) -> bool {
+    match kind {
+        Kind::Result => text.trim_start().starts_with(FAILED),
+        Kind::Reasoning => false,
+    }
+}
+
+/// The one row a fold spends on saying what it hid: the `…` and the tree's own
+/// excerpt count ([`more_label`]) — the same words the foot's count row and the
+/// pane's title use, so no surface invents a second.
+fn elision(hidden: usize) -> String {
+    format!("… {}", more_label(hidden))
+}
+
+/// The head of a folded block: the mark that leads its first row, and the
+/// styles its mark and its words are painted in.
+///
+/// A tool result and a working note paint the whole row in one colour, while a
+/// voice colours only its mark and leaves the words plain ([`marked`]); the two
+/// styles are bundled here, so the painter takes them as one argument.
+#[derive(Clone, Copy)]
+struct Head<'a> {
+    mark: &'a str,
+    mark_style: Style,
+    body: Style,
+}
+
+impl<'a> Head<'a> {
+    /// A row painted in one style throughout: a tool result, a reasoning row.
+    fn solid(mark: &'a str, style: Style) -> Self {
+        Self {
+            mark,
+            mark_style: style,
+            body: style,
+        }
+    }
+}
+
+/// The rows of one folded block, and the source line each is the reading of:
+/// [`marked`]'s plain path, stopped at the kind's number.
+///
+/// The mark leads the first row and its own width of blank stands under it,
+/// exactly as [`marked`] paints a voice's rows; what is added is the fold — at
+/// most [`Fold::shown`] wrapped rows, then the one `…` row [`elision`] spells,
+/// whenever the text runs on. The block is always a plain line: a folded block
+/// is a dump, a report or a working note, and never the reply the markdown view
+/// is for.
+///
+/// The `…` row carries the source line the first hidden row came from, so the
+/// select cursor can stand on the line the fold hid — and, through the fallback
+/// in [`first_row`], on the lines after it. `hidden` is the number of source
+/// lines the `…` stands for (that line and every line after it), counted
+/// without wrapping them: counting painted rows would wrap the very text the
+/// fold exists not to wrap, and a line is what a reader counts in a dump
+/// anyway.
+fn folded_marked(
+    out: &mut Vec<Line<'static>>,
+    rows: &mut Vec<Option<usize>>,
+    head: Head<'_>,
+    text: &str,
+    width: usize,
+    kind: Kind,
+    fold: Fold,
+) {
+    let start = out.len();
+    let base = rows.len();
+    // A pane too narrow for the mark and a few words drops the mark, exactly as
+    // [`marked`] does for a voice's rows: a mark the pane clips is a row that
+    // says who spoke and nothing about what was said.
+    let lead = head.mark.width();
+    let (mark, lead) = if width >= lead + MIN_BODY {
+        (head.mark, lead)
+    } else {
+        ("", 0)
+    };
+    let mark_style = head.mark_style;
+    let body_style = head.body;
+    let wrap = width.saturating_sub(lead);
+    let shown = fold.shown(kind, text);
+    // Wrapped only as far as the fold: one row past the number is what tells
+    // the fold it has more to stand for.
+    let wrapped = wrap_text_capped(text, wrap, shown.saturating_add(1));
+    let clipped = wrapped.len() > shown;
+    // Which source line each painted row is the reading of, and how many lines
+    // the block has: the walk wraps only the lines the fold may paint and scans
+    // the rest, so the count cannot cost what the cap exists to avoid.
+    let mut tags: Vec<usize> = Vec::new();
+    let mut total = 0usize;
+    let mut left = shown.saturating_add(1);
+    for (line, raw) in text.split('\n').enumerate() {
+        total = line + 1;
+        if left == 0 {
+            continue;
+        }
+        let count = wrap_text_capped(raw, wrap, left).len();
+        tags.extend(std::iter::repeat(line).take(count));
+        left -= count;
+    }
+    debug_assert_eq!(tags.len(), wrapped.len(), "one source per wrapped row");
+    for (index, line) in wrapped.iter().take(shown).enumerate() {
+        let head = if index == 0 {
+            Span::styled(mark.to_string(), mark_style)
+        } else {
+            Span::styled(" ".repeat(lead), body_style)
+        };
+        out.push(Line::from(vec![
+            head,
+            Span::styled(line.clone(), body_style),
+        ]));
+        rows.push(tags.get(index).copied());
+    }
+    if clipped {
+        // The `…` stands for the first wrapped row the fold did not paint, so
+        // the cursor can stand on the line it hides — and, through the fallback
+        // in [`first_row`], on the lines after it.
+        let hidden = total - tags[shown];
+        out.push(Line::from(Span::styled(
+            format!("{}{}", " ".repeat(lead), elision(hidden)),
+            mark_style,
+        )));
+        rows.push(tags.get(shown).copied());
+    }
+    debug_assert_eq!(out.len() - start, rows.len() - base, "one entry per row");
+}
+
 /// One message's rows: who said it, wrapped at the pane's width — and, beside
 /// them, the source line of the message's own text each row is the reading of.
 ///
 /// The map is *returned* rather than kept by the painter because a source line
 /// is one or more painted rows, and only the pass that paints a row knows
 /// whether the row is a soft wrap of the line above it, a markdown view of it,
-/// or the `…` that stands for the tail a tool result's cap hid. A second pass
-/// that counted them could disagree with the rows on screen, and the cursor
-/// would then sit on the wrong one. The caller adds the message's index.
+/// or the `…` a fold hid. A second pass that counted them could disagree with
+/// the rows on screen, and the cursor would then sit on the wrong one. The
+/// caller adds the message's index.
 ///
-/// `reasoning` is the pane's `Ctrl-T` choice, threaded in rather than read off a
-/// `Chat` this free function has no handle on.
+/// `reasoning` is the pane's `Ctrl-T` choice and `fold` the pane's [`Fold`] —
+/// how much of each kind of block it paints. Both are threaded in rather than
+/// read off a `Chat` this free function has no handle on.
 fn render_message(
     out: &mut Vec<Line<'static>>,
     message: &Message,
     voice: Option<Voice>,
     width: usize,
     reasoning: bool,
+    fold: Fold,
 ) -> Vec<Option<usize>> {
     let start = out.len();
     let mut rows: Vec<Option<usize>> = Vec::new();
@@ -2630,15 +2872,19 @@ fn render_message(
             // The reasoning comes first because that is the order it decided
             // the turn in: the human reading down the pane sees what the model
             // thought, then what it said. It is a block of its own rather than
-            // a third colour on the reply, and it carries no cap — the "tool"
-            // arm caps a result because a result is a file dump, while this is
-            // the text the human pressed `Ctrl-T` to read.
+            // a third colour on the reply, and it is[`Kind::Reasoning`] to the
+            // fold, whose number for it is `usize::MAX`: what the human pressed
+            // `Ctrl-T` to read is shown whole, and only a setting that lowers
+            // the number makes it fold like any other block.
             if reasoning {
-                reasoning_rows(out, message, width);
+                reasoning_rows(out, message, width, fold);
                 rows.resize(out.len() - start, None);
             }
             let text = message.text();
             if !text.trim().is_empty() {
+                // The reply is the conversation's own text: the one block the
+                // fold never touches ([`voice_kind`]'s other exemption), so it
+                // goes to the plain painter, not through the fold.
                 mark_rows(
                     out,
                     &mut rows,
@@ -2662,67 +2908,32 @@ fn render_message(
             rows.push(None);
         }
         "tool" => {
-            // Only the first eight lines are ever shown, so only those are
-            // wrapped; the ninth is what tells us to print the `…`. Wrapping
-            // the whole result was most of a frame's cost on a long session.
-            const SHOWN: usize = 8;
-            // A result that came back `error: …` — mush's own spelling for a
-            // call that was refused or that failed — is not a result, and it was
-            // painted exactly like one, with only the word at the front to tell
-            // them apart. The mark is the difference now, and it is red, because
-            // this is the one kind of line in the transcript that reports
-            // something did not happen.
+            // A result is a file dump, so it arrives folded: the number of rows
+            // it gets, and the reason it is eight, are [`Fold`]'s
+            // ([`Kind::Result`]) — the one place a conversation's "how much of
+            // this thing does the human see" lives. A result that came back
+            // `error: …` — mush's own spelling for a call that was refused or
+            // that failed — is not a result, and it was painted exactly like
+            // one, with only the word at the front to tell them apart. The mark
+            // is the difference now, and it is red, because this is the one
+            // kind of line in the transcript that reports something did not
+            // happen. Its failure row is the one the fold never gives up, at
+            // any number, because that rule lives on [`Fold`] too.
             let failed = message.text().trim_start().starts_with(FAILED);
             let (mark, style) = if failed {
-                ("! ", Style::default().fg(Color::Red))
+                ("  ! ", Style::default().fg(Color::Red))
             } else {
-                ("", dim())
+                ("  ", dim())
             };
-            // The lead is the block's indent plus the mark's own columns, and
-            // the text is wrapped inside what is left: a flagged result is not
-            // `mark` columns wider than a successful one.
-            const INDENT: usize = 2;
-            let lead = INDENT + mark.width();
-            let wrap = width.saturating_sub(lead);
-            let wrapped = wrap_text_capped(message.text(), wrap, SHOWN + 1);
-            let clipped = wrapped.len() > SHOWN;
-            // Which source line each painted row is the reading of. The wrap is
-            // per source line, so walking the lines and counting their rows is
-            // where the boundaries are — and where the cap's ninth row falls,
-            // which is the line the `…` stands for. The walk stops at the cap:
-            // it is the same arithmetic `wrap_text_capped` just did, over the
-            // rows it was allowed to do it for, never a second wrap of the
-            // whole result.
-            let mut tags: Vec<usize> = Vec::with_capacity(SHOWN + 1);
-            let mut left = SHOWN + 1;
-            for (line, raw) in message.text().split('\n').enumerate() {
-                if left == 0 {
-                    break;
-                }
-                let count = wrap_text_capped(raw, wrap, left).len();
-                tags.extend(std::iter::repeat(line).take(count));
-                left -= count;
-            }
-            debug_assert_eq!(tags.len(), wrapped.len(), "one source per wrapped row");
-            for (index, line) in wrapped.iter().take(SHOWN).enumerate() {
-                let head = if index == 0 {
-                    format!("{}{mark}", " ".repeat(INDENT))
-                } else {
-                    " ".repeat(lead)
-                };
-                out.push(Line::from(Span::styled(format!("{head}{line}"), style)));
-                rows.push(tags.get(index).copied());
-            }
-            if clipped {
-                // The `…` stands for the first wrapped row the cap did not
-                // paint, so the cursor can stand on the line it hides — and,
-                // through the fallback in [`first_row`], on the lines after it.
-                out.push(Line::from(Span::styled(
-                    format!("{}…", " ".repeat(lead)),
-                    style,
-                )));
-                rows.push(tags.get(SHOWN).copied());
-            }
+            folded_marked(
+                out,
+                &mut rows,
+                Head::solid(mark, style),
+                message.text(),
+                width,
+                Kind::Result,
+                fold,
+            );
             image_rows(out, message);
             rows.resize(out.len() - start, None);
             out.push(Line::from(""));
@@ -2909,8 +3120,21 @@ mod tests {
         width: usize,
         reasoning: bool,
     ) -> Vec<Line<'static>> {
+        message_rows_under(message, voice, width, reasoning, Fold::DEFAULT)
+    }
+
+    /// [`message_rows`] through a fold of the caller's choosing: the pane's
+    /// number under the test's control, where the conversation's own is a
+    /// `Chat` field.
+    fn message_rows_under(
+        message: &Message,
+        voice: Option<Voice>,
+        width: usize,
+        reasoning: bool,
+        fold: Fold,
+    ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        render_message(&mut lines, message, voice, width, reasoning);
+        render_message(&mut lines, message, voice, width, reasoning, fold);
         lines
     }
 
@@ -4938,7 +5162,7 @@ mod tests {
         let source = "# Steps\n\n- **run** `cargo test`\n\nsee [the docs](https://example.com/a)";
         let message = Message::assistant(source);
         let mut rows = Vec::new();
-        render_message(&mut rows, &message, None, 60, false);
+        render_message(&mut rows, &message, None, 60, false, Fold::DEFAULT);
         assert_eq!(
             shown(&rows),
             vec![
@@ -4991,7 +5215,14 @@ mod tests {
         let text =
             "# not a heading\n\n- **not strong** `not code`\n\n[not a link](https://example.com/a)";
         let mut rows = Vec::new();
-        render_message(&mut rows, &Message::tool("call_1", text), None, 60, false);
+        render_message(
+            &mut rows,
+            &Message::tool("call_1", text),
+            None,
+            60,
+            false,
+            Fold::DEFAULT,
+        );
         assert_eq!(
             shown(&rows),
             vec![
@@ -5020,6 +5251,7 @@ mod tests {
             Some(Voice::Human),
             80,
             false,
+            Fold::DEFAULT,
         );
         assert_eq!(shown(&rows)[0], format!("you › {source}"));
 
@@ -5051,7 +5283,7 @@ mod tests {
         let message = Message::assistant(text);
         for width in [10usize, 12, 14, 20, 33, 40, 80] {
             let mut rows = Vec::new();
-            render_message(&mut rows, &message, None, width, false);
+            render_message(&mut rows, &message, None, width, false, Fold::DEFAULT);
             let painted = shown(&rows);
             for row in &painted {
                 assert!(
@@ -5092,5 +5324,134 @@ mod tests {
                 "no marker survives the view at {width}: {painted:?}"
             );
         }
+    }
+
+    /// Every multi-line block a pane writes goes through the fold, each kind
+    /// with its own number: a tool result to eight rows, the reasoning to its
+    /// own slot, which is `usize::MAX` — shown whole, because that is the text
+    /// the human pressed `Ctrl-T` to read, and folded the day a setting lowers
+    /// the number. The report and the brief the `user` arm paints join this
+    /// list with that arm's own commit.
+    ///
+    /// A new kind is a compile-time question, not a silent omission: [`Kind`]'s
+    /// table is exactly [`Kind::COUNT`] long and [`Kind::slot`] is a `match`
+    /// with no wildcard, so a variant added without a number stops the crate
+    /// from building.
+    #[test]
+    fn every_multi_line_block_the_pane_writes_goes_through_the_fold() {
+        let many = (0..25)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let fold = Fold::DEFAULT;
+        assert_eq!(fold.shown(Kind::Result, &many), 8);
+        assert_eq!(
+            fold.shown(Kind::Reasoning, &many),
+            usize::MAX,
+            "a thought is shown whole until a setting says otherwise"
+        );
+
+        // A result paints eight rows and the `…` — ten rows with the blank.
+        let result = message_rows(&Message::tool("call_1", &many), None, 60, true);
+        let rows = shown(&result);
+        assert_eq!(rows.len(), 10, "eight rows and the `…`: {rows:?}");
+        assert!(
+            rows[8].ends_with("… +17 more lines"),
+            "the ninth row names what is hidden: {rows:?}"
+        );
+        assert_eq!(rows[9], "", "and the blank closes the message");
+        assert_eq!(rows[0], "  line 0", "the result's own indent");
+
+        // The reasoning is whole today — every row, no `…`...
+        let thought = thinking("", &many);
+        let whole = message_rows(&thought, None, 60, true);
+        assert_eq!(shown(&whole).len(), 26, "25 rows and the blank");
+        assert!(
+            !shown(&whole).iter().any(|row| row.contains('…')),
+            "nothing is elided: {:?}",
+            shown(&whole)
+        );
+        // ...and the slot is real: a lower number folds it like any other block.
+        let folded = message_rows_under(&thought, None, 60, true, fold.with(Kind::Reasoning, 3));
+        assert_eq!(
+            shown(&folded),
+            vec![
+                "  ⋯ line 0".to_string(),
+                "    line 1".to_string(),
+                "    line 2".to_string(),
+                "    … +22 more lines".to_string(),
+                String::new(),
+            ]
+        );
+    }
+
+    /// A block that reports a failure is kept even where the fold would hide
+    /// it: the foot's cap already refuses to drop the failure row ("the failure
+    /// is never the line the cap gives up"), and the fold holds the same rule —
+    /// it lives on [`Fold`], not in an arm, so a `0`-rows setting still paints
+    /// the `! error: …` result's own row.
+    #[test]
+    fn a_failure_is_never_what_the_fold_gives_up() {
+        let zero = Fold::DEFAULT.with(Kind::Result, 0);
+
+        // A failed result: the failure row stays, and the log it came with is
+        // what the fold gives up.
+        let failed = "error: the call was refused\nthe log line one\nthe log line two";
+        let rows = shown(&message_rows_under(
+            &Message::tool("call_1", failed),
+            None,
+            60,
+            true,
+            zero,
+        ));
+        assert_eq!(
+            rows,
+            vec![
+                "  ! error: the call was refused".to_string(),
+                "    … +2 more lines".to_string(),
+                String::new(),
+            ]
+        );
+
+        // The same text as a *success* vanishes into its `…` at 0: the
+        // exemption is the block's, not the setting's.
+        let ok = "wrote three lines\nthe log line one\nthe log line two";
+        let rows = shown(&message_rows_under(
+            &Message::tool("call_1", ok),
+            None,
+            60,
+            true,
+            zero,
+        ));
+        assert_eq!(rows, vec!["  … +3 more lines".to_string(), String::new()]);
+    }
+
+    /// The two blocks the fold never touches, whatever it says: the human's own
+    /// lines, because their words are theirs however long, and the model's
+    /// reply, because it is the conversation's own text. A `0`-rows setting for
+    /// every kind the fold owns leaves both whole.
+    #[test]
+    fn the_humans_lines_and_the_reply_are_never_folded() {
+        let many = (0..25)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let zero = Fold::DEFAULT.with(Kind::Result, 0).with(Kind::Reasoning, 0);
+
+        let human = message_rows_under(&Message::user(&many), Some(Voice::Human), 60, true, zero);
+        assert_eq!(
+            shown(&human).len(),
+            26,
+            "the human's 25 lines and the blank, in full"
+        );
+        assert_eq!(shown(&human)[0], "you › line 0");
+
+        let reply = message_rows_under(&Message::assistant(&many), None, 60, true, zero);
+        assert_eq!(
+            shown(&reply).len(),
+            26,
+            "the reply's 25 lines and the blank, in full"
+        );
+        assert_eq!(shown(&reply)[0], "mush › line 0");
     }
 }
