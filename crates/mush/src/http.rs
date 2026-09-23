@@ -215,8 +215,11 @@ type Socket = BufReader<Box<dyn ReadWrite>>;
 /// opens a fresh connection, and no leftover chunk line can be read as its
 /// reply (finding B27). Anything else — a body that ended at the stream's end,
 /// a server that hangs up — leaves the pool empty too, so no request can ever
-/// be handed a connection that failed. A kept connection the server has since
-/// closed is retried once on a fresh one, and never counted twice.
+/// be handed a connection that failed. The pool never replaces a dead
+/// connection itself: replacing one means writing the request again, and only
+/// the layer that can prove no whole request was ever written may do that
+/// ([`Unsent`]); a connection that dies after the request was written is final
+/// (finding A2).
 #[derive(Default)]
 struct Pool {
     /// Made on first keep rather than up front, so the pool can be a `static`
@@ -270,7 +273,9 @@ type Open<'a> = &'a mut dyn FnMut(&str, u16, bool, Duration) -> io::Result<Box<d
 fn request(ask: &Ask<'_>, clock: &dyn Clock, pool: &Pool, open: Open<'_>) -> io::Result<Response> {
     let watch = Watch::new(ask.cancel, ask.timeout, clock);
     // A Stop that arrived before the request did: do not pay for a call the
-    // human already cancelled.
+    // human already cancelled. A deadline that has passed before the first
+    // byte is the same kind of decision — the call is over, and it is not a
+    // retry's to make.
     watch.check()?;
 
     let (host, port, path, tls) = parse_url(ask.url)?;
@@ -281,67 +286,44 @@ fn request(ask: &Ask<'_>, clock: &dyn Clock, pool: &Pool, open: Open<'_>) -> io:
     };
 
     // The connection the last request to this endpoint left behind, or a fresh
-    // one. `reused` is what tells a dead kept connection apart from an endpoint
-    // that will not talk to us.
-    let pooled = pool.take(&endpoint);
-    let reused = pooled.is_some();
-    let stream = match pooled {
+    // one. Opening is the one step that happens before a request exists, so
+    // everything it can fail with — a name that does not resolve, a connect
+    // that is refused or times out, a TLS handshake — is `Unsent`: no byte of
+    // the request was written, and asking again cannot duplicate or bill
+    // anything (finding A2).
+    let stream = match pool.take(&endpoint) {
         Some(stream) => stream,
-        None => BufReader::new(open(&host, port, tls, ask.timeout)?),
+        None => BufReader::new(open(&host, port, tls, ask.timeout).map_err(unsent)?),
     };
 
-    match exchange(stream, ask, &host, port, &path, &watch) {
-        Ok((response, stream, reusable)) => {
-            if reusable {
-                pool.keep(endpoint, stream);
-            }
-            Ok(response)
-        }
-        Err((error, heard)) => {
-            // A kept connection the server had already closed. Nothing was
-            // heard from it — not one byte of an answer — so the request was
-            // never answered and sending it again cannot duplicate anything.
-            // One retry, only for a connection that was reused, and never for a
-            // cancellation or a deadline: those are decisions, not a dead
-            // socket, and must be reported as themselves. A cancellation is
-            // the watch's own `Interrupted`, and `!watch.cancelled()` above
-            // already excludes it: a signal that interrupted the socket was
-            // retried inside the read or the write that met it. That leaves
-            // `TimedOut` as the one kind to name here.
-            let dead_kept =
-                reused && !heard && !watch.cancelled() && error.kind() != io::ErrorKind::TimedOut;
-            if !dead_kept {
-                return Err(error);
-            }
-            watch.check()?;
-            let fresh = BufReader::new(open(&host, port, tls, ask.timeout)?);
-            match exchange(fresh, ask, &host, port, &path, &watch) {
-                Ok((response, stream, reusable)) => {
-                    if reusable {
-                        pool.keep(endpoint, stream);
-                    }
-                    Ok(response)
-                }
-                Err((error, _)) => Err(error),
-            }
-        }
+    // One request, one reply, one connection: no second send hides in here.
+    // Every failure after the write is final, whatever it is, because the
+    // endpoint was handed the whole request and may already have read, run and
+    // charged for it — only the layer that can prove nothing was written may
+    // ask again (finding A2). The `?` drops the connection with the error, so
+    // a failed exchange is never handed to the next request.
+    let (response, stream, reusable) = exchange(stream, ask, &host, port, &path, &watch)?;
+    if reusable {
+        pool.keep(endpoint, stream);
     }
+    Ok(response)
 }
 
 /// One request and its reply on one connection.
 ///
 /// `Ok` hands the connection back so the caller can keep it, with whether the
-/// reply framed itself well enough to be worth keeping. `Err` says whether any
-/// byte of the answer had arrived: nothing heard means the connection was dead
-/// before the endpoint saw the request, which is the only failure a retry on a
-/// fresh connection cannot duplicate.
+/// reply framed itself well enough to be worth keeping. An `Err` is final for
+/// every failure after the request was written: the endpoint may already have
+/// received it, and mush never sends a request the endpoint may have seen
+/// twice (finding A2). The one failure that is not final is the write itself,
+/// which hands over no whole request and carries [`Unsent`] so `model.rs`
+/// knows a repeat cannot duplicate anything.
 ///
 /// A `Response` exists only for a reply whose body framed itself completely
 /// (to the `Content-Length`, through the zero chunk and its trailer, or to the
 /// stream's end). Every `Err` is therefore a reply of which *nothing was handed
-/// over* — the wire broke, the body was cut off, a frame did not parse — and
-/// that is the rule `model.rs::retrying` reads when it decides what may be
-/// asked again, and why asking again cannot duplicate anything a run has read.
+/// over* — the wire broke, the body was cut off, a frame did not parse — and no
+/// partial answer can ever be mistaken for the caller's reply.
 fn exchange(
     mut stream: Socket,
     ask: &Ask<'_>,
@@ -349,18 +331,25 @@ fn exchange(
     port: u16,
     path: &str,
     watch: &Watch,
-) -> Result<(Response, Socket, bool), (io::Error, bool)> {
-    let mut heard = false;
+) -> io::Result<(Response, Socket, bool)> {
     if let Err(error) = write_request(&mut stream, ask, host, port, path, watch) {
-        return Err((error, heard));
+        // The write did not hand the whole request over: no complete request
+        // ever reached the endpoint, so this is the one failure a repeat cannot
+        // duplicate — marked `Unsent`, the class `model.rs::retrying` asks
+        // again (finding A2). A cancellation is the human's own decision and is
+        // reported as itself.
+        return Err(if error.kind() == io::ErrorKind::Interrupted {
+            error
+        } else {
+            unsent(error)
+        });
     }
 
     // A blank line is not an answer: a kept connection can carry one from the
     // exchange before it (a server's keep-alive probe, or framing that left a
     // CRLF behind — see `read_chunked`). Read as the status line it was
     // reported as `malformed status line: ""`, refusing a reply that had not
-    // even started. Skipping it keeps `heard` false, so a connection that dies
-    // after the blank line is still "nothing heard" and gets its one retry.
+    // even started.
     // What the head has cost so far: each line is bounded by [`MAX_HEAD_BYTES`],
     // and this is the head's own share of the same number, so an endpoint that
     // sends short lines forever cannot sit in mush's memory either. Each line
@@ -370,13 +359,11 @@ fn exchange(
     let status_line = loop {
         match read_line(&mut stream, watch) {
             Ok(Some(line)) if line.is_empty() => continue,
-            Err(error) if is_overlong(&error) => {
-                return Err((head_too_large(ask.url), heard));
-            }
+            Err(error) if is_overlong(&error) => return Err(head_too_large(ask.url)),
             Ok(Some(line)) => {
                 head_bytes += line.len() + 2;
                 if head_bytes > MAX_HEAD_BYTES {
-                    return Err((head_too_large(ask.url), heard));
+                    return Err(head_too_large(ask.url));
                 }
                 break line;
             }
@@ -385,22 +372,15 @@ fn exchange(
             // not the same thing as a malformed status line, and must not be
             // reported as one.
             Ok(None) => {
-                return Err((
-                    io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "the connection ended before it answered",
-                    ),
-                    heard,
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionAborted,
+                    "the connection ended before it answered",
                 ))
             }
-            Err(error) => return Err((error, heard)),
+            Err(error) => return Err(error),
         }
     };
-    heard = true;
-    let status = match parse_status(&status_line) {
-        Ok(status) => status,
-        Err(error) => return Err((error, heard)),
-    };
+    let status = parse_status(&status_line)?;
 
     let mut content_length: Option<usize> = None;
     let mut chunked = false;
@@ -411,14 +391,12 @@ fn exchange(
             // The headers ended at the stream's end: the framing they would
             // have given is simply absent, exactly as it was before.
             Ok(None) => break,
-            Err(error) if is_overlong(&error) => {
-                return Err((head_too_large(ask.url), heard));
-            }
-            Err(error) => return Err((error, heard)),
+            Err(error) if is_overlong(&error) => return Err(head_too_large(ask.url)),
+            Err(error) => return Err(error),
         };
         head_bytes += line.len() + 2;
         if head_bytes > MAX_HEAD_BYTES {
-            return Err((head_too_large(ask.url), heard));
+            return Err(head_too_large(ask.url));
         }
         if line.is_empty() {
             break;
@@ -430,10 +408,10 @@ fn exchange(
             match value.trim().parse() {
                 Ok(length) => content_length = Some(length),
                 Err(_) => {
-                    return Err((
-                        framing(format!("malformed Content-Length: {:?}", value.trim())),
-                        heard,
-                    ))
+                    return Err(framing(format!(
+                        "malformed Content-Length: {:?}",
+                        value.trim()
+                    )))
                 }
             }
         } else if lower.starts_with("transfer-encoding:") && lower.contains("chunked") {
@@ -451,10 +429,7 @@ fn exchange(
     } else {
         read_to_end(&mut stream, watch).map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
     };
-    let body = match body {
-        Ok(body) => body,
-        Err(error) => return Err((error, heard)),
-    };
+    let body = body?;
 
     // A connection is only worth keeping when the reply said where it ended: a
     // body framed as "until the stream closes" *is* the closed stream. HTTP/1.1
@@ -912,6 +887,40 @@ fn parse_port(port: &str, url: &str) -> io::Result<u16> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, format!("bad port in {url}")))
 }
 
+/// A request that never left mush: the endpoint could not be dialled at all
+/// (a name that does not resolve, a connect that is refused or times out, a
+/// TLS handshake that fails), or the write failed before the request was whole.
+/// No complete request ever arrived, so the endpoint has nothing to have read,
+/// run or charged for — the one failure class a repeat cannot duplicate, and
+/// the reason it is marked rather than derived from the error kind: a
+/// `ConnectionReset` while writing means the request was not whole, while one
+/// while reading means it may already have been answered (finding A2).
+#[derive(Debug)]
+struct Unsent(String);
+
+impl fmt::Display for Unsent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Unsent {}
+
+/// `error`, marked as a request that never left mush, keeping its kind so a
+/// caller that reports the wire can still say what happened.
+fn unsent(error: io::Error) -> io::Error {
+    io::Error::new(error.kind(), Unsent(error.to_string()))
+}
+
+/// Whether `error` is a request that never left mush — [`Unsent`] as
+/// [`is_framing`] is [`Framing`]. `model.rs` asks this to decide the one
+/// failure a repeat may ask again.
+pub fn is_unsent(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<Unsent>().is_some())
+}
+
 /// A reply whose framing broke before its body could be read: a status line or
 /// `Content-Length` that is not one, a chunk size that is not hex, a chunk
 /// terminator that is not the terminator the framing promised.
@@ -920,9 +929,10 @@ fn parse_port(port: &str, url: &str) -> io::Result<u16> {
 /// say whether the endpoint *answered* or its reply *broke on the way in* — and
 /// the two want opposite treatment. A body past [`MAX_BODY_BYTES`] is an answer
 /// mush refuses (a `Refused`, never retried); a frame that never parsed was
-/// never handed to the caller, so asking again on a fresh connection cannot
-/// duplicate anything the run has read, and the connection that carried the
-/// broken frame is dropped rather than kept (finding B27, `model.rs`).
+/// never handed to the caller, so it is reported as what it is — bytes that
+/// failed to frame themselves, not the endpoint's opinion of the request — and
+/// the connection that carried it is dropped rather than kept (finding B27,
+/// `model.rs`).
 #[derive(Debug)]
 struct Framing(String);
 
@@ -1416,11 +1426,13 @@ mod tests {
         assert!(sent.contains("{\"ask\":2}"), "the second body was sent");
     }
 
-    /// A server closes an idle connection eventually. The stale one is
-    /// discovered, dropped, and the request is answered on a fresh connection —
-    /// not reported as a parse failure, and not retried forever.
+    /// A kept connection the server has since closed, whose request was written
+    /// onto it anyway: nothing comes back, and the call is **final**. The write
+    /// succeeded, so the endpoint may already have received the request, and
+    /// mush does not quietly write it a second time (finding A2). The next call
+    /// opens its own connection, and the failed one is not kept.
     #[test]
-    fn a_kept_connection_the_server_closed_is_replaced_once() {
+    fn a_kept_connection_that_died_after_the_write_is_final() {
         let written = Arc::new(Mutex::new(Vec::new()));
         let opened = Arc::new(AtomicUsize::new(0));
         let opens = opened.clone();
@@ -1446,13 +1458,26 @@ mod tests {
             send(&pool, &mut opener, url, "{}").unwrap().body,
             "{\"one\":1}"
         );
-        let second = send(&pool, &mut opener, url, "{}").unwrap();
+        let second = send(&pool, &mut opener, url, "{}").unwrap_err();
+        assert_eq!(second.kind(), io::ErrorKind::ConnectionAborted, "{second}");
         assert_eq!(
-            second.body, "{\"two\":2}",
-            "the stale connection was replaced"
+            second.to_string(),
+            "the connection ended before it answered",
+            "the wire failing, not a parse error the endpoint sent: {second}"
         );
-        assert_eq!(opened.load(Ordering::SeqCst), 2, "one retry, no more");
-        assert_eq!(pool.idle(), 1, "the fresh connection is kept");
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            1,
+            "no replacement: the request may already have been received"
+        );
+        assert_eq!(pool.idle(), 0, "the failed connection is never kept");
+
+        // And the pool is still usable: the next call opens its own.
+        assert_eq!(
+            send(&pool, &mut opener, url, "{}").unwrap().body,
+            "{\"two\":2}"
+        );
+        assert_eq!(opened.load(Ordering::SeqCst), 2);
     }
 
     /// A chunked reply ends with a trailer section, and the blank line that
@@ -1509,8 +1534,8 @@ mod tests {
     /// the wire failing under a reply nobody was handed, and says so.
     ///
     /// The second half is the pool rule: a body that was not read to its end is
-    /// never kept, so the retry (or the next request) opens a fresh connection
-    /// and cannot read leftover framing as its own reply.
+    /// never kept, so the next request opens a fresh connection and cannot read
+    /// leftover framing as its own reply.
     #[test]
     fn a_chunked_body_cut_off_before_its_zero_chunk_is_a_cut_off_body() {
         let written = Arc::new(Mutex::new(Vec::new()));
@@ -1526,8 +1551,7 @@ mod tests {
             &["HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
                Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n"],
         ));
-        // The connection opened after it — the retry, or the next call —
-        // answers normally.
+        // The connection opened after it — the next call — answers normally.
         queue.push_back(wire(&written, &[&ok("{\"after\":1}")]));
         let mut opener = move |_host: &str, _port: u16, _tls: bool, _timeout: Duration| {
             opens.fetch_add(1, Ordering::SeqCst);
@@ -1574,7 +1598,7 @@ mod tests {
         assert_eq!(
             opened.load(Ordering::SeqCst),
             2,
-            "the retry is on a fresh connection, never the broken one"
+            "the next call opens a fresh connection, never the broken one"
         );
     }
 
@@ -1656,10 +1680,11 @@ mod tests {
         );
     }
 
-    /// The classification `model.rs` retries on: a frame that did not parse is a
-    /// *framing* error — the reply broke on the way in, nothing of it was handed
-    /// over — while a body past the cap is an answer mush refuses. The kind is
-    /// `InvalidData` for both, which is exactly why the marker exists.
+    /// The classification apart from the policy: a frame that did not parse is
+    /// a *framing* error — the reply broke on the way in, nothing of it was
+    /// handed over — while a body or head past a cap is an answer mush refuses.
+    /// The kind is `InvalidData` for both, which is exactly why the marker
+    /// exists.
     #[test]
     fn a_frame_that_did_not_parse_is_marked_apart_from_a_refusal() {
         let huge = format!(
@@ -1856,11 +1881,12 @@ mod tests {
     }
 
     /// The blank line and then the server is gone (the shape the pool sees
-    /// when a server probes an idle connection and closes it). Nothing was
-    /// heard from the connection, so the request is answered on a fresh one —
-    /// not refused as a malformed status line.
+    /// when a server probes an idle connection and closes it). It must not be
+    /// read as a malformed status line: the call ends as the connection that
+    /// ended before it answered — and it is final, because the request was
+    /// written on it first (finding A2).
     #[test]
-    fn a_blank_line_then_a_closed_connection_is_retried() {
+    fn a_blank_line_then_a_closed_connection_is_not_a_parse_error() {
         let written = Arc::new(Mutex::new(Vec::new()));
         let opened = Arc::new(AtomicUsize::new(0));
         let opens = opened.clone();
@@ -1884,12 +1910,17 @@ mod tests {
             send(&pool, &mut opener, url, "{}").unwrap().body,
             "{\"one\":1}"
         );
-        let second = send(&pool, &mut opener, url, "{}").unwrap();
-        assert_eq!(
-            second.body, "{\"two\":2}",
-            "the request was answered on a fresh connection"
+        let second = send(&pool, &mut opener, url, "{}").unwrap_err();
+        assert_eq!(second.kind(), io::ErrorKind::ConnectionAborted, "{second}");
+        assert!(
+            !is_framing(&second),
+            "a closed connection is not a frame that did not parse: {second}"
         );
-        assert_eq!(opened.load(Ordering::SeqCst), 2, "one retry, no more");
+        assert_eq!(
+            opened.load(Ordering::SeqCst),
+            1,
+            "the request was written, so it is not sent again"
+        );
     }
 
     /// A connection whose reads a signal interrupts a few times before it
@@ -2196,7 +2227,7 @@ mod tests {
         assert_eq!(
             opened.load(Ordering::SeqCst),
             1,
-            "no retry of a heard request"
+            "no second send hides inside one request"
         );
         assert_eq!(pool.idle(), 0, "a failed connection is never kept");
 

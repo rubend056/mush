@@ -2577,10 +2577,14 @@ fn run_loop(
             Err(ModelError::Framing(error)) => {
                 return Err(reply_broke(&cfg.base_url, &error));
             }
-            // Unreachable and Transport reach the human the same way; the
-            // difference between them is that a Transport failure was already
-            // retried, and its message says so.
-            Err(ModelError::Unreachable(error)) | Err(ModelError::Transport(error)) => {
+            // Unreachable, Unsent and Transport reach the human the same way;
+            // the difference is what happened before this point. An Unsent
+            // failure was retried — nothing of the request ever left mush, so
+            // repeating it was honest — while a Transport one was not, because
+            // the endpoint may already have received the request (finding A2).
+            Err(ModelError::Unreachable(error))
+            | Err(ModelError::Unsent(error))
+            | Err(ModelError::Transport(error)) => {
                 return Err(format!("cannot reach {}: {error}", cfg.base_url));
             }
             Err(ModelError::Encode(error)) => {
@@ -3074,10 +3078,12 @@ fn compact_history(
         Ok(reply) => reply,
         // A cancelled run is already ending; do not report a network failure.
         Err(ModelError::Cancelled) => return Err(CANCELLED.to_string()),
-        // The run will fail on its real request anyway; surface it. A
-        // `Transport` failure got its retries here, the same as the run's own
-        // ask: compaction is a model call like any other.
-        Err(ModelError::Unreachable(error)) | Err(ModelError::Transport(error)) => {
+        // The run will fail on its real request anyway; surface it. An
+        // `Unsent` failure got its retries here, the same as the run's own ask:
+        // compaction is a model call like any other (finding A2).
+        Err(ModelError::Unreachable(error))
+        | Err(ModelError::Unsent(error))
+        | Err(ModelError::Transport(error)) => {
             return Err(format!("cannot reach {}: {error}", cfg.base_url));
         }
         // A reply that broke on the way in is not a connection failure either:
@@ -10294,18 +10300,17 @@ mod tests {
         let _ = mailbox;
     }
 
-    /// The third case of the class B23 and B25 each closed half of: a reply
-    /// whose *framing* broke used to reach the run as `Refused`, so the human
-    /// read "the endpoint's reply was refused" about a chunk line that may just
-    /// as well have been mush's own leftover — and no bounded retry touched it
-    /// (finding B27). Now the reply gets the retries the wire's failures get,
-    /// each one announced in B23's shape, and the final line names what broke:
-    /// the *reply*, never the endpoint's opinion.
+    /// A reply whose *framing* broke used to reach the run as `Refused`, so the
+    /// human read "the endpoint's reply was refused" about a chunk line that
+    /// may just as well have been mush's own leftover (finding B27). It is
+    /// still its own class — the final line names the *reply*, never the
+    /// endpoint's opinion — but it is final now: the request went out whole, so
+    /// the endpoint may already have read it and charged for it (finding A2).
     #[test]
-    fn a_broken_frame_is_retried_and_named_as_a_broken_reply() {
+    fn a_broken_frame_is_named_as_a_broken_reply_once() {
         let broken = "malformed chunk size: \"\"";
         let frame = || ModelError::Framing(broken.to_string());
-        let scripted = Arc::new(Scripted::new().fails(frame()).fails(frame()).fails(frame()));
+        let scripted = Arc::new(Scripted::new().fails(frame()).says("too late"));
         let clock = Arc::new(Advanceable::new());
         let (actor, events, mailbox) = scripted_actor_on_clock("framing", &scripted, clock);
         let mut state = ActorState::default();
@@ -10323,7 +10328,11 @@ mod tests {
             !error.contains("refused"),
             "a broken frame is not the endpoint refusing the request: {error}"
         );
-        assert_eq!(scripted.asked().len(), 3, "the bounded retry ran");
+        assert_eq!(
+            scripted.asked().len(),
+            1,
+            "the request may already have been received, so it is not asked again"
+        );
         let notices: Vec<String> = events
             .events_for(AgentId(7))
             .into_iter()
@@ -10332,9 +10341,10 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(notices.len(), 2, "each retry was announced: {notices:?}");
-        assert!(notices[0].contains("retrying (2/3)"), "{notices:?}");
-        assert!(notices[1].contains("retrying (3/3)"), "{notices:?}");
+        assert!(
+            notices.is_empty(),
+            "nothing was announced as a retry: {notices:?}"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
         let _ = mailbox;
     }
@@ -12684,23 +12694,24 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
-    /// A hiccup on the wire is not the end of the run (finding B23: three
-    /// agents in one session died mid-work on `Connection reset by peer`, and
-    /// one of them had committed nothing). The run asks again, the human is
-    /// told each time in the transcript rather than left with a stuck spinner,
-    /// and the pause costs the clock seam rather than this suite.
+    /// A request that never went out is not the end of the run: nothing of it
+    /// reached the endpoint, so asking again cannot duplicate or bill anything,
+    /// and the human is told each time in the transcript rather than left with
+    /// a stuck spinner. The pause costs the clock seam rather than this suite
+    /// (finding A2's one retryable class; B23's "a hiccup need not kill a run",
+    /// kept for the road where it is honest).
     #[test]
-    fn a_transport_hiccup_is_retried_and_the_run_carries_on() {
-        let hiccup = "Connection reset by peer (os error 104)";
+    fn an_unsent_request_is_retried_and_the_run_carries_on() {
+        let hiccup = "Connection refused (os error 111)";
         let model = Arc::new(
             Scripted::new()
-                .fails_transport(hiccup)
-                .fails_transport(hiccup)
+                .fails_unsent(hiccup)
+                .fails_unsent(hiccup)
                 .says("done"),
         );
         let clock = Arc::new(Advanceable::new());
         let (actor, events, _mailbox) =
-            scripted_actor_on_clock("transport-hiccup", &model, clock.clone());
+            scripted_actor_on_clock("unsent-hiccup", &model, clock.clone());
         let mut state = ActorState::default();
         let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
@@ -12731,17 +12742,56 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
-    /// Every attempt loses: the run fails the way it failed before this, with
+    /// The other half of the same ruling: a wire failure *after* the request
+    /// went out ends the run on the first attempt. The endpoint may already
+    /// have read the request and charged for it, so the run says so and the
+    /// human asks again deliberately (finding A2) — B23's automatic retry on a
+    /// connection reset is gone, and that is the ruling's cost.
+    #[test]
+    fn a_wire_that_drops_after_the_request_went_out_ends_the_run_once() {
+        let hiccup = "Connection reset by peer (os error 104)";
+        let model = Arc::new(Scripted::new().fails_transport(hiccup).says("too late"));
+        let (actor, events, _mailbox) =
+            scripted_actor_on_clock("transport-final", &model, Arc::new(Advanceable::new()));
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![Message::system("you are mush"), Message::user("task")];
+
+        let error = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap_err();
+
+        assert!(
+            error.starts_with(&format!(
+                "cannot reach {}: {hiccup}",
+                actor.ctx.cfg.config().unwrap().base_url
+            )),
+            "the wire's own words reach the human: {error}"
+        );
+        assert_eq!(
+            model.asked().len(),
+            1,
+            "the endpoint may have received the request, so it is not asked again"
+        );
+        let mut seen = Watched::default();
+        seen.drain(&events);
+        assert!(
+            seen.notices.is_empty(),
+            "nothing was announced: {:?}",
+            seen.notices
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// Every attempt fails before the request can go out: the run fails with
     /// the wire's own words in front and the attempts named after them — never
     /// a bare "gave up" that hides what the endpoint's side actually said.
     #[test]
     fn a_run_that_never_reaches_the_model_names_the_attempts() {
-        let hiccup = "Connection reset by peer (os error 104)";
+        let hiccup = "Connection refused (os error 111)";
         let model = Arc::new(
             Scripted::new()
-                .fails_transport(hiccup)
-                .fails_transport(hiccup)
-                .fails_transport(hiccup),
+                .fails_unsent(hiccup)
+                .fails_unsent(hiccup)
+                .fails_unsent(hiccup),
         );
         let (actor, _events, _mailbox) =
             scripted_actor_on_clock("transport-dead", &model, Arc::new(Advanceable::new()));
