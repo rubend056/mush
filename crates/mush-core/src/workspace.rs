@@ -1090,10 +1090,12 @@ impl Workspace {
     /// renamed over ([`entry_for_write`]), and a file with no owner-write bit
     /// is refused with the mode it has, so a `0444` file the human marked
     /// read-only is a sentence the model can read instead of an override it
-    /// cannot see. Those two refusals live here, at the model's door, and not
-    /// in [`atomic_write`], which `session::save` and the human's own
+    /// cannot see. The mode refusal lives here, at the model's door, and not in
+    /// [`atomic_write`], which `session::save` and the human's own
     /// `config.json` writer also use: they may replace a file whatever its
-    /// mode, but a model may not.
+    /// mode, but a model may not. The type refusal is shared with
+    /// [`atomic_write`], because a rename over a socket destroys it whatever
+    /// door it came through.
     pub fn write_file(&self, rel: &str, content: &str) -> Result<(), String> {
         let path = self.real_path(&self.resolve(rel)?, rel)?;
         if path == self.root {
@@ -1478,9 +1480,9 @@ impl Fresh {
 /// pass through the tool's door (`session::save`, the human's own
 /// `config.json`) cannot rename over a socket either.
 ///
-/// The mode is a fact of the file, not of this function. `tempfile` makes its
-/// scratch file `0600` and the rename would carry that onto the target, so an
-/// existing target's mode is copied onto the temp file before the rename
+/// The mode is a fact of the file, not of this function. `tempfile`'s scratch
+/// file is `0600` by default and the rename would carry that onto the target,
+/// so an existing target's mode is copied onto the temp file before the rename
 /// (finding B1: an executable script stopped being executable, and `git`
 /// recorded the mode change); a name that did not exist is made the way
 /// `fresh` says. A hard-linked twin is the one fact this cannot keep: `rename`
@@ -1515,9 +1517,10 @@ pub fn atomic_write(path: &Path, bytes: &[u8], fresh: Fresh) -> io::Result<()> {
 /// really is.
 ///
 /// A write is a `rename`, and a `rename` replaces the *name*, so the name is
-/// asked what it is first. A symlink is followed one link deep, because that is
-/// where the write belongs: the model edited the file the name points at, and a
-/// rename over the link would delete the link and leave that file untouched.
+/// asked what it is first. A symlink is resolved to its final target — the
+/// whole chain, because that is where the write belongs: the model edited the
+/// file the name points at, and a rename over the link would delete the link
+/// and leave that file untouched.
 /// A socket, a FIFO or a device is refused, because it is not content: renaming
 /// a regular file over the workspace's own `.mush/mush.sock` unlinks the attach
 /// socket and every `mush read`/`agents`/`edit` in that directory answers "no
@@ -2735,6 +2738,10 @@ mod tests {
             atomic_write(&sock, b"x", Fresh::Box).is_err(),
             "the guard is kept beside the rename too"
         );
+        // A socket's inode is not the fact that matters: a client must still be
+        // able to connect, because that is what mush's attach road does.
+        std::os::unix::net::UnixStream::connect(&sock)
+            .expect("the attach socket must still accept a client");
 
         let fifo = ws.root().join("pipe");
         let made = std::process::Command::new("mkfifo").arg(&fifo).status();
