@@ -1339,13 +1339,19 @@ fn read_chunked<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<String>
             break;
         }
         // A chunk-size line *is* the framing, so a size past the cap is a reply
-        // that broke where mush reads it — never an answer mush refuses.
-        // `FFFFFFFF` is what a garbled line parses to, and it is
+        // that broke where mush reads it — never an answer mush refuses. The
+        // claim is compared with the cap's *remainder*, not added to what was
+        // read: `FFFFFFFFFFFFFFFF` is a legal `usize` on a later chunk, and
+        // `out.len() + size` wrapped it back under the cap — a panic in a
+        // debug build, and in release a `body_too_large()` *refusal* that
+        // blamed the endpoint for the framing's own lie. `out.len() <=
+        // MAX_BODY_BYTES` is this loop's invariant, so the subtraction cannot
+        // underflow. `FFFFFFFF` is what a garbled line parses to, and it is
         // indistinguishable from an honest 4 GiB chunk: mush only ever has the
         // claim, so it reports the claim (with the size and the cap in the
         // words) rather than `body_too_large()`'s sentence about a body the
         // endpoint never handed over (finding A10).
-        if out.len() + size > MAX_BODY_BYTES {
+        if size > MAX_BODY_BYTES - out.len() {
             return Err(framing(format!(
                 "a chunk size of {size} bytes would put the body past the {MAX_BODY_BYTES}-byte body cap"
             )));
@@ -2093,6 +2099,51 @@ mod tests {
                 "a chunk size of 4294967295 bytes would put the body past the {MAX_BODY_BYTES}-byte body cap"
             ),
             "the claim names the size it read and the cap it passed"
+        );
+    }
+
+    /// The same refusal one chunk later. A sixteen-hex-digit size is a legal
+    /// `usize` on this target, and with a completed chunk in `out` the old
+    /// check's `out.len() + size` **wrapped**: debug builds panicked with
+    /// *attempt to add with overflow*, and release builds slipped the sum
+    /// under the cap and let `read_exact` raise `body_too_large()` — an answer
+    /// mush *refuses*, blaming the endpoint for the framing's own lie. The
+    /// check compares the claim with the cap's remainder instead, so this is
+    /// the framing refusal the first chunk already gets (finding A10's class,
+    /// one chunk on; audit IN1).
+    #[test]
+    fn a_late_chunk_size_claim_past_the_cap_is_framing_too() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(wire(
+            &written,
+            &["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\nFFFFFFFFFFFFFFFF\r\n0\r\n\r\n"],
+        ));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| match queue
+            .pop_front()
+        {
+            Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+            None => Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "the test scripted no more connections",
+            )),
+        };
+        let pool = Pool::new();
+        let error = send(
+            &pool,
+            &mut opener,
+            "http://models.test:8078/v1/chat/completions",
+            "{}",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(is_framing(&error), "a chunk-size claim is framing: {error}");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "a chunk size of 18446744073709551615 bytes would put the body past the {MAX_BODY_BYTES}-byte body cap"
+            ),
+            "the claim names the wrapped size it read and the cap it passed"
         );
     }
 
