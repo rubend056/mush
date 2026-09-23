@@ -10,11 +10,11 @@
 //! answer is written back. `App` stays the only effector.
 //!
 //! Every road in and out — the connect, the request line, the connections, the
-//! time a client may say nothing, and the answer — is bounded (see
-//! [`CONNECT_TIMEOUT`], [`MAX_REQUEST_BYTES`], [`MAX_CONNECTIONS`],
-//! [`IDLE_TIMEOUT`] and [`MAX_ANSWER_BYTES`]), because a surface a same-user
-//! process can reach is a surface that must not be able to spend mush's heap,
-//! threads or patience.
+//! time a connection may make no progress in either direction, and the answer
+//! — is bounded (see [`CONNECT_TIMEOUT`], [`MAX_REQUEST_BYTES`],
+//! [`MAX_CONNECTIONS`], [`IDLE_TIMEOUT`] and [`MAX_ANSWER_BYTES`]), because a
+//! surface a same-user process can reach is a surface that must not be able to
+//! spend mush's heap, threads or patience.
 //!
 //! The protocol is newline-delimited JSON: one request and one response per
 //! line. Every request carries an `id` (any JSON value, echoed verbatim), and
@@ -91,12 +91,16 @@ const MAX_ANSWER_BYTES: usize = 16 * 1024 * 1024;
 /// and closed: the client can retry, and the surface does not grow.
 const MAX_CONNECTIONS: usize = 64;
 
-/// How long a connection may say nothing before it is reaped.
+/// How long a connection may make no progress in either direction before it is
+/// reaped.
 ///
 /// The protocol is one request and one answer per line, so a client that has
-/// connected and then said nothing is either gone or not a client. This is the
-/// server's half of the bound [`ask`] already puts on itself ([`ASK_TIMEOUT`]),
-/// and the two numbers are the same on purpose.
+/// connected and then said nothing is either gone or not a client — and a
+/// client that has asked and then stopped taking its answer is not waiting
+/// either: the same window bounds the read that waits for the request and the
+/// write that answers it, because a thread parked in `write_all` is not idle on
+/// the read side. This is the server's half of the bound [`ask`] already puts
+/// on itself ([`ASK_TIMEOUT`]), and the two numbers are the same on purpose.
 const IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// What a serve is allowed: the live-connection cap and the idle window. One
@@ -479,12 +483,13 @@ fn read_line_capped(reader: &mut impl BufRead, cap: usize) -> std::io::Result<Li
 /// and never reuses the connection, so a line past the cap ends here — the
 /// socket goes with the refusal instead of draining a stream the cap has
 /// already refused. The cap is the protocol's own answer ceiling
-/// ([`MAX_ANSWER_BYTES`]): without it, a process that binds a free
+/// ([`MAX_ANSWER_BYTES`]): the CLI's own read and write timeouts bound
+/// *silence*, not size, so without it a process that binds a free
 /// `.mush/mush.sock` and answers with an endless stream grows the CLI's heap
-/// by the stream's size, and no bound the CLI set for itself is a size (finding
-/// R15). A read a signal interrupts is retried here too (finding R13); a read
-/// that times out is the sender's own window ([`ASK_TIMEOUT`], the socket's
-/// read timeout) running out, not the sender closing.
+/// by the stream's size (finding R15). A read a signal interrupts is retried
+/// here too (finding R13); a read that times out is the sender's own window
+/// ([`ASK_TIMEOUT`], the socket's read timeout) running out, not the sender
+/// closing.
 fn read_answer_capped(reader: &mut impl BufRead, cap: usize) -> Result<String, String> {
     let mut line: Vec<u8> = Vec::new();
     loop {
@@ -546,11 +551,23 @@ fn finish(bytes: Vec<u8>, oversize: bool) -> Line {
 ///
 /// The reads are bounded by the client's own words: a line within the cap, and
 /// something said inside the idle window — a signal's interruption is retried,
-/// not read as a close (finding R13). Both bounds are the socket's, so the
-/// waiting is the kernel's and this thread is not woken to check a clock.
+/// not read as a close (finding R13). The writes answer under the same window:
+/// a client that stops reading is reaped at the bound rather than parking this
+/// thread in `write_all` and holding the slot for the session (finding
+/// R12/IN4). Both bounds are the socket's, so the waiting is the kernel's and
+/// this thread is not woken to check a clock.
 fn serve_connection(stream: UnixStream, ui_tx: &Sender<Msg>, idle: Duration) {
     let from = peer_label(&stream);
-    if stream.set_read_timeout(Some(idle)).is_err() {
+    // The read bound alone does not cover the write: `SO_RCVTIMEO` cannot fire
+    // while this thread is inside `write_all`, so a client that sent a request
+    // and stopped reading — `Ctrl-Z` on `mush read` is the shipped shape —
+    // parks the thread in the kernel for as long as it likes, and 64 of them
+    // hold every slot for the session (finding R12/IN4). The write bound ends
+    // that: a connection that cannot be drained inside the window is closed
+    // with the answer unfinished — the client reads part of the line and then
+    // EOF — and its slot goes back to the surface to serve the next client.
+    if stream.set_read_timeout(Some(idle)).is_err() || stream.set_write_timeout(Some(idle)).is_err()
+    {
         return;
     }
     let Ok(read_side) = stream.try_clone() else {
@@ -1060,7 +1077,7 @@ impl Transcript {
 mod tests {
     use super::*;
     use mush_core::scratch::Scratch;
-    use std::io::Write;
+    use std::io::{Read, Write};
 
     fn round_trip(request: Request) -> Request {
         let line = request.encode();
@@ -1394,6 +1411,116 @@ mod tests {
         not_a_socket("attach-dangling", "symlink", |path| {
             std::os::unix::fs::symlink(path.with_extension("gone"), path).unwrap();
         });
+    }
+
+    /// A client that asks and then stops reading is not idle: `SO_RCVTIMEO`
+    /// cannot fire while the connection thread is inside `write_all`, so the
+    /// answer's own write carries the idle window — the thread is reaped at the
+    /// bound with the answer unfinished and its slot goes back to the surface
+    /// (finding R12/IN4). `Ctrl-Z` on `mush read` is the shipped shape of the
+    /// client this is for.
+    #[test]
+    fn a_client_that_stops_reading_mid_answer_is_reaped_at_the_write_bound() {
+        let root = Scratch::new("attach-write-bound");
+        std::fs::create_dir_all(root.join(mush_core::session::MUSH_DIR)).unwrap();
+        let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        let idle = Duration::from_millis(500);
+        let guard = serve_with(
+            &root,
+            tx,
+            Limits {
+                connections: 1,
+                idle,
+            },
+            CONNECT_TIMEOUT,
+            spawn_accept_loop,
+        )
+        .unwrap();
+        let socket = socket_path(&root);
+
+        // One client asks for an answer far past any socket buffer and then
+        // stops reading: its thread parks in the write.
+        let mut parked = UnixStream::connect(&socket).unwrap();
+        writeln!(parked, r#"{{"id":1,"op":"read","agent":0,"since":0}}"#).unwrap();
+        let answer = "x".repeat(8 * 1024 * 1024);
+        match rx.recv_timeout(Duration::from_secs(5)).unwrap() {
+            Msg::Attach { request, reply, .. } => {
+                reply
+                    .send(Response::ok(
+                        request.id,
+                        json!({"lines": [{"line": 0, "text": answer}]}),
+                    ))
+                    .unwrap();
+            }
+            _ => panic!("expected Msg::Attach"),
+        }
+
+        // The slot comes back at the bound. Poll it rather than sleeping a
+        // guess at the deadline: the bound is the server's clock, and a loaded
+        // box can stretch a sleep. A refused connection reaches the channel as
+        // nothing — the accept thread may close it under the request, so even
+        // the write is allowed to fail — and a served one is replied to. Ids
+        // tell a reply that raced an earlier drop from this attempt's.
+        let deadline = std::time::Instant::now() + Duration::from_secs(15);
+        let mut attempt = 0_u64;
+        let mut reader = loop {
+            attempt += 1;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the parked connection's slot never came back (after {attempt} attempts)"
+            );
+            let mut second = UnixStream::connect(&socket).unwrap();
+            second
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            if writeln!(second, r#"{{"id":{attempt},"op":"agents"}}"#).is_err() {
+                // Refused and closed before the request landed: ask again.
+                continue;
+            }
+            match rx.recv_timeout(Duration::from_secs(1)) {
+                Ok(Msg::Attach { request, reply, .. }) if request.id == json!(attempt) => {
+                    reply
+                        .send(Response::ok(request.id, json!({"agents": []})))
+                        .unwrap();
+                    break BufReader::new(second);
+                }
+                // A reply to an attempt that raced its own drop: it has no
+                // client to reach, and it is not this attempt's.
+                Ok(Msg::Attach { reply, .. }) => drop(reply),
+                Ok(_) => panic!("expected Msg::Attach"),
+                // Refused, or the reap has not happened: ask again.
+                Err(_) => {}
+            }
+        };
+        let mut line = String::new();
+        reader.read_line(&mut line).unwrap();
+        assert!(
+            matches!(decode(line.trim_end()).unwrap().reply, Reply::Ok(_)),
+            "the second client was served: {line}"
+        );
+
+        // And the parked client's answer was cut at the bound, not finished:
+        // it can read only what the socket buffers held.
+        parked
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut reader = BufReader::new(parked);
+        let mut got = 0_usize;
+        let mut chunk = [0_u8; 64 * 1024];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => got += n,
+                Err(error) => panic!("the parked client could not read its cut answer: {error}"),
+            }
+        }
+        assert!(
+            got < answer.len(),
+            "the answer was completed ({got} bytes) instead of cut at the bound"
+        );
+
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A socket file with nothing listening behind it is a crash's leftover and
