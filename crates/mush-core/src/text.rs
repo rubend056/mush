@@ -351,6 +351,11 @@ pub enum RunStyle {
     Heading(u8),
     /// A list's own marker (`-`, `*`, `+`, `1.`), kept rather than hidden.
     Bullet,
+    /// A horizontal rule's row: `─` across the pane, painted where the source
+    /// line's `---` was. The one run whose text the view writes rather than
+    /// keeps — a rule is a line across the *pane*, and the pane's own width is
+    /// the only width it can be drawn at.
+    Rule,
     /// The text of `[text](url)`.
     Link,
     /// The ` (url)` beside it. A URL is never dropped: this is a coding tool,
@@ -409,6 +414,16 @@ pub enum RunStyle {
 ///
 /// Block, at the start of a line:
 ///
+/// - three or more `-`, `*` or `_` and nothing else on the line, spaces
+///   between them allowed → a row of `─` across the pane in
+///   [`RunStyle::Rule`]. The line's own characters are scaffolding, like a
+///   heading's `#`s: what the line says is "a break", and the characters it
+///   says it with are not words. `---` directly under a paragraph is the case
+///   worth writing down: CommonMark reads it as a *setext heading*, and this
+///   view deliberately reads it as a rule — a setext heading is still not a
+///   rule here — so `Title` above a `---` is a paragraph and the `---` is a
+///   rule across the pane. The row is exactly `width` columns, so a rule can
+///   never paint past the narrowest pane.
 /// - one, two or three `#`s and a space → [`RunStyle::Heading`]. The `#`s and
 ///   that one space are not painted: the heading's style says what they said.
 ///   Four or more `#`s, or a `#` with no space after it, are text.
@@ -474,7 +489,7 @@ fn markdown_walk(text: &str, width: usize) -> (Vec<Vec<Run>>, Vec<usize>) {
     let mut at = 0;
     while at < lines.len() {
         if !fence_line(&lines[at]) {
-            let rows = wrap_runs(&block(&lines[at]), width);
+            let rows = wrap_runs(&block(&lines[at], width), width);
             counts.push(rows.len());
             out.extend(rows);
             at += 1;
@@ -551,9 +566,22 @@ fn fence_line(line: &str) -> bool {
     line.trim_start().starts_with("```")
 }
 
-/// One source line, parsed before it is wrapped: a heading, a list item, or
-/// whatever the inline rules make of it.
-fn block(line: &str) -> Vec<Run> {
+/// One source line, parsed before it is wrapped: a rule, a heading, a list
+/// item, or whatever the inline rules make of it.
+fn block(line: &str, width: usize) -> Vec<Run> {
+    if rule_line(line) {
+        // The one run the view writes itself. A rule is a line across the
+        // pane, not the characters a model typed to ask for one: `-`, `*` and
+        // `_` are how markdown spells it, and painting them would show the
+        // spelling instead of the break. The pane's width is the only width
+        // the row can honour, so it is the width the row is built at — and it
+        // is then wrapped like any other run, which is one row of exactly
+        // `width` columns because `─` is one column.
+        return vec![Run {
+            text: "─".repeat(width),
+            style: RunStyle::Rule,
+        }];
+    }
     if let Some((level, text)) = heading(line) {
         // The heading's style is the whole heading: a marker inside it is read
         // (so `## **Title**` does not paint its asterisks) but the runs all
@@ -573,6 +601,30 @@ fn block(line: &str) -> Vec<Run> {
         return runs;
     }
     inline(line)
+}
+
+/// Whether a line is a horizontal rule: three or more `-`, `*` or `_` and
+/// nothing else, spaces between them allowed.
+///
+/// The same character all the way across, which is CommonMark's rule and the
+/// only reading that cannot be confused with text: `- * -` is prose about
+/// bullets, not a break. Two markers are not a rule — `--` is a longer
+/// hyphen, `**` an unclosed strong — and neither is a marker run with anything
+/// beside it. A rule line is checked before every other block rule because it
+/// is the one that would otherwise be read as something else: `* * *` is a
+/// bullet whose item is `* *` by the list rule, and CommonMark reads it as a
+/// break.
+fn rule_line(line: &str) -> bool {
+    let rest = line.trim();
+    let mut chars = rest.chars();
+    let Some(marker) = chars.next() else {
+        return false;
+    };
+    if !matches!(marker, '-' | '*' | '_') {
+        return false;
+    }
+    chars.all(|ch| ch == marker || ch == ' ')
+        && rest.chars().filter(|ch| *ch == marker).count() >= 3
 }
 
 /// `# Title`, `## Title`, `### Title`: the level and the text after one space.
@@ -1654,6 +1706,58 @@ mod tests {
         }
     }
 
+    /// A line of three or more `-`, `*` or `_` — nothing else on it, spaces
+    /// between them allowed — is a horizontal rule: the pane draws `─` across
+    /// its own width, and the characters the line was written with are
+    /// scaffolding, like a heading's `#`s.
+    ///
+    /// `---` directly under a paragraph is the case the doc writes down:
+    /// CommonMark reads it as a *setext heading*, and this view deliberately
+    /// reads it as a rule, because a setext heading is not a rule here. The
+    /// row is the pane's width and never a column more, which is what the
+    /// narrowest-pane half of this test is for.
+    #[test]
+    fn a_rule_is_a_row_across_the_pane_and_its_characters_are_scaffolding() {
+        for text in ["---", "- - -", "***", "___", "  ----  ", "- -- -"] {
+            assert_eq!(rows(text, 12), vec!["─".repeat(12)], "{text:?} is a rule");
+            assert_eq!(
+                markdown_rows(text, 12),
+                vec![vec![Run {
+                    text: "─".repeat(12),
+                    style: RunStyle::Rule,
+                }]],
+                "{text:?} is a rule"
+            );
+        }
+        // Two markers are not a rule: `--` is a longer hyphen, `**` an
+        // unclosed strong, `- -` a bullet whose item is a dash — and `- * -`
+        // is prose about two markers, not a break.
+        for text in ["--", "**", "__", "- -", "- * -", "a ---", "--- x", "~~~"] {
+            assert!(
+                rows(text, 12).iter().all(|row| !row.contains('─')),
+                "{text:?} was read as a rule"
+            );
+        }
+        // A rule under a paragraph is still a rule, and a rule is a row the
+        // human can see — one entry in the map, not a source line that paints
+        // nothing.
+        assert_eq!(rows("Title\n---", 6), vec!["Title", "──────"]);
+        assert_eq!(markdown_row_counts("a\n---\nb", 40), vec![1, 1, 1]);
+        // The row is the pane's own width at every pane: a rule can never
+        // paint past the edge it was drawn on.
+        for width in 1..=8usize {
+            assert_eq!(markdown_row_counts("---", width), vec![1]);
+            assert_eq!(
+                markdown_rows("---", width),
+                vec![vec![Run {
+                    text: "─".repeat(width),
+                    style: RunStyle::Rule,
+                }]],
+                "a rule at {width} columns"
+            );
+        }
+    }
+
     /// A fence is a block, and the fence lines are not painted: everything
     /// between them is code, one style, with no inline parsing — so the markers
     /// a model writes in code stay the characters they are. A fence that never
@@ -1932,10 +2036,10 @@ mod tests {
             );
         }
         // A run beside a space is text, whichever side the space is on; so is a
-        // run of nothing but markers, at the start or the end of a row.
-        for text in [
-            "** a**", "**a **", "~~a ~~", "***a ***", "***", "****", "******",
-        ] {
+        // run of nothing but markers at the *end* of a row. At the start of a
+        // row three or more of one marker are a rule instead — the rule test
+        // pins that reading — so those lines are not in this list.
+        for text in ["** a**", "**a **", "~~a ~~", "***a ***"] {
             assert_eq!(
                 runs(text),
                 vec![(text.to_string(), RunStyle::Plain)],

@@ -3010,8 +3010,9 @@ fn marked(out: &mut Vec<Line<'static>>, mark: &str, style: Style, text: &str, wi
 /// new surface cannot invent its own reading of one.
 ///
 /// The palette is the pane's own. Bold, italic and strike are the modifiers a
-/// terminal already has; code, a fence and a link's URL are the dim grey the
-/// pane paints its secondary facts in; a heading is the reply's accent, in
+/// terminal already has; code, a fence, a link's URL and a rule are the dim
+/// grey the pane paints its secondary facts in — a rule is the pane's own
+/// line, drawn rather than read; a heading is the reply's accent, in
 /// bold, because the heading is the reply's; a link is underlined, and a
 /// bullet's marker — the one part of a row that is layout rather than words —
 /// is the accent too.
@@ -3025,6 +3026,7 @@ fn reply_style(style: mush_core::text::RunStyle) -> Style {
         RunStyle::Emphasis => Style::default().add_modifier(Modifier::ITALIC),
         RunStyle::Strike => Style::default().add_modifier(Modifier::CROSSED_OUT),
         RunStyle::Code | RunStyle::Fence | RunStyle::Url => Style::default().fg(Color::DarkGray),
+        RunStyle::Rule => dim(),
         RunStyle::Heading(_) => Style::default()
             .fg(Color::Green)
             .add_modifier(Modifier::BOLD),
@@ -6668,6 +6670,36 @@ mod tests {
             .find(|span| span.content.as_ref() == "cargo test")
             .expect("the code span");
         assert_eq!(code.style.fg, Some(Color::DarkGray));
+    }
+
+    /// A rule is the pane's own line: a reply's `---` paints one `─` row,
+    /// exactly as wide as the columns the pane gave the words, in the dim
+    /// style the pane paints its layout in — and none of the source line's
+    /// characters are painted at all.
+    #[test]
+    fn a_rule_is_a_dim_pane_wide_line() {
+        let message = Message::assistant("before\n\n---\n\nafter");
+        let mut rows = Vec::new();
+        render_message(&mut rows, &message, None, 40, false, Fold::DEFAULT, &[]);
+        let painted = shown(&rows);
+        let rule = painted
+            .iter()
+            .position(|row| row.contains('─'))
+            .expect("the rule's row");
+        // `mush › ` leads the reply's first row, and every row after it is
+        // indented by the mark's own width: the rule is the source line's own
+        // row, so what is left of the pane is what it fills.
+        assert_eq!(painted[rule], format!("       {}", "─".repeat(33)));
+        let ink = rows[rule]
+            .spans
+            .iter()
+            .find(|span| span.content.contains('─'))
+            .expect("the rule's run");
+        assert_eq!(ink.style.fg, Some(Color::DarkGray));
+        assert!(
+            !painted.iter().any(|row| row.contains("---")),
+            "the source's own characters are scaffolding: {painted:?}"
+        );
     }
 
     /// A tool result is data, not prose: its bytes are what the human copies
