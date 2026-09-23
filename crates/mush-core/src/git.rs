@@ -423,6 +423,12 @@ fn head_answer(probe: Result<String, String>) -> Option<bool> {
 /// here, while the word `HEAD` is not (finding F9). Nothing about whose `HEAD`
 /// a base meant can be decided at this door.
 ///
+/// Whether the repository has a commit *at all* is asked before the base is
+/// used: a child needs a fork revision, and the repository that has none must
+/// refuse with the sentence written for that state rather than with git's own
+/// about whatever name was handed in (finding F16). The answer is one process,
+/// asked once, for both roads — with and without a base.
+///
 /// `dir` is the caller's workspace, and may be any directory *inside* a
 /// repository: git's own questions are answered from there and the checkout is
 /// made under it, so `mush crates/mush` gets `.mush/wt/<id>` below its own
@@ -447,14 +453,22 @@ pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf,
         Err(error) if error == GIT_UNAVAILABLE => return Err(error),
         Err(_) => return Err("not a git repository".to_string()),
     }
-    match (base, has_commits(dir)) {
-        (None, Some(false)) => {
+    // The question is "can a branch be made here at all", and its answer does
+    // not depend on which base was asked for: an isolated child needs *a*
+    // commit to fork from. The match this replaces asked it only when `base`
+    // was `None` — the one arm the production road never takes, because
+    // `spawn_tool` resolves the name first and always passes `Some` — and
+    // evaluated it in the other case only to throw the answer away (finding
+    // F16). Asking once, first, makes the sentence written for this case the
+    // one a human reads.
+    match has_commits(dir) {
+        Some(false) => {
             return Err("the repo has no commits yet — commit first or drop isolated".to_string())
         }
         // A missing git is not a missing commit, and saying so would send a
         // human looking for a `git commit` they cannot run either.
-        (None, None) => return Err(GIT_UNAVAILABLE.to_string()),
-        _ => {}
+        None => return Err(GIT_UNAVAILABLE.to_string()),
+        Some(true) => {}
     }
     let path = worktree_path(dir, id);
     let branch = branch_name(id);
@@ -482,8 +496,41 @@ pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf,
             path_arg,
             base.unwrap_or("HEAD"),
         ],
-    )
-    .map(|_| (path, branch))
+    )?;
+    // A worktree is a checkout of *refs*, and git's `worktree add` does not
+    // populate submodules — there is no flag to ask for it (`git worktree add
+    // -h` has no submodule option on git 2.55). A base tree that records a
+    // submodule leaves an empty directory in the new checkout while `git
+    // status` stays clean, so a child told to build or test pays for a tree it
+    // was never told is incomplete (finding F5). The contents are brought in
+    // here, at the one moment mush owns the checkout.
+    populate_submodules(&path);
+    Ok((path, branch))
+}
+
+/// Bring the new checkout's submodules in, when its tree records any.
+///
+/// `git worktree add` copies refs, not submodule contents: a base tree that
+/// records one at `lib/sub` leaves that directory empty in the new worktree,
+/// and `git status --porcelain` is empty — a tracked directory that is not
+/// populated is not a change git reports (measured: `worktree_add` for a
+/// repository with one local submodule leaves `lib/sub` empty and the status
+/// clean, finding F5). `git submodule update --init --recursive` is git's own
+/// road for filling it, run only when the checkout carries `.gitmodules`, so an
+/// ordinary spawn spends no process on the question.
+///
+/// Deliberately best-effort: the branch and the refs are right, and a submodule
+/// that cannot be fetched (no network, a private remote, a protocol the human's
+/// git refuses) is a fact the child can act on — its prompt names the road it
+/// would run by hand — never a reason to lose the worktree a spawn is standing
+/// on. There is no surface here to *name* the failure on: the answer a caller
+/// gets back is the path and the branch, and the one who reads the empty
+/// directory is the child.
+fn populate_submodules(worktree: &Path) {
+    if !worktree.join(".gitmodules").is_file() {
+        return;
+    }
+    let _ = run(worktree, &["submodule", "update", "--init", "--recursive"]);
 }
 
 /// Which of the two ways a branch adds nothing to its base: what one word,
@@ -836,10 +883,18 @@ pub enum Commit {
 /// must be the root of its own working tree; anything else is refused as
 /// "`<dir>` is no longer a worktree" and never commits somewhere up the tree.
 ///
-/// The identity and the message are supplied here (`-c user.name=…`,
-/// `--no-verify`) so a commit does not depend on the human's identity and never
-/// runs their commit hooks. The index is that worktree's own, so a commit here
-/// cannot touch the human's index either.
+/// The identity, the message and the *signature* are supplied here (`-c
+/// user.name=…`, `-c user.email=…`, `-c commit.gpgsign=false`, `--no-verify`),
+/// so a commit does not depend on the human's identity, never runs their
+/// commit hooks, and never signs. Signing is configuration, not a hook, and it
+/// is the one part of the human's git setup a put-away commit cannot inherit: a
+/// machine that signs every commit by default (`commit.gpgsign=true`, in a
+/// config or in the repository) has no key here, so without the flag every
+/// isolated run ended as uncommitted work — the parent read an error instead of
+/// a revision, the worktree was correctly kept for holding it, and the count
+/// that refuses spawns at [`MAX_WORKTREES`] rose by one per child (finding
+/// F2). The index is that worktree's own, so a commit here cannot touch the
+/// human's index either.
 pub fn commit_all(dir: &Path, subject: &str) -> Result<Commit, String> {
     if !is_its_own_worktree(dir) {
         return Err(format!("{} is no longer a worktree", dir.display()));
@@ -862,6 +917,13 @@ pub fn commit_all(dir: &Path, subject: &str) -> Result<Commit, String> {
             "user.name=mush",
             "-c",
             "user.email=mush@local",
+            // The one config key a commit must not inherit: a machine that
+            // signs by default fails a commit it cannot sign, and this commit
+            // has no key and no human to ask for one (finding F2). A `-c`
+            // outranks both the repository's and the human's config, so the
+            // signing policy never decides whether a run's work is kept.
+            "-c",
+            "commit.gpgsign=false",
             "commit",
             "--no-verify",
             "-qm",
@@ -1218,9 +1280,127 @@ mod tests {
             worktree_add(&unborn, 7, None).unwrap_err(),
             "the repo has no commits yet — commit first or drop isolated"
         );
-        // With a base branch named, the refusal is git's own.
-        assert!(worktree_add(&unborn, 7, Some("HEAD")).is_err());
+        // With a base revision named, the refusal is the same: the
+        // repository's question outranks the base's name, so the human reads
+        // the sentence written for this case and not git's own about the
+        // revision (finding F16).
+        assert_eq!(
+            worktree_add(&unborn, 7, Some("HEAD")).unwrap_err(),
+            "the repo has no commits yet — commit first or drop isolated"
+        );
         let _ = fs::remove_dir_all(&unborn);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A repository with no commit refuses *a base spawn too* with the sentence
+    /// written for it, and spends no process on resolving a base that could not
+    /// exist: the gate is the repository's own state, asked before git is made
+    /// to look at the name (finding F16). The production road
+    /// (`spawn_tool`) still resolves the name before calling here, which is the
+    /// residual this fix cannot reach from `git.rs` alone.
+    #[test]
+    fn a_base_worktree_in_a_repo_without_commits_refuses_with_that_reason() {
+        let unborn =
+            std::env::temp_dir().join(format!("mush-git-unborn-base-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&unborn);
+        fs::create_dir_all(&unborn).unwrap();
+        run(&unborn, &["init", "-q"]).unwrap();
+        assert_eq!(has_commits(&unborn), Some(false));
+
+        assert_eq!(
+            worktree_add(&unborn, 9, Some("HEAD")).unwrap_err(),
+            "the repo has no commits yet — commit first or drop isolated"
+        );
+        assert_eq!(
+            worktree_add(&unborn, 9, None).unwrap_err(),
+            "the repo has no commits yet — commit first or drop isolated"
+        );
+        assert!(
+            !unborn.join(".mush").exists(),
+            "and nothing was made before the refusal"
+        );
+        let _ = fs::remove_dir_all(&unborn);
+    }
+
+    /// A worktree is a checkout of refs, and git's `worktree add` does not
+    /// populate submodules: a repository whose base tree records one gets an
+    /// empty directory in the child's checkout with a clean `git status`, and
+    /// the child is told to build in it (finding F5). The add fills it.
+    #[test]
+    fn a_submodule_repo_gets_its_submodules_in_the_new_worktree() {
+        let source = init_repo("submodule-source");
+        fs::write(source.join("s.txt"), "the submodule's file\n").unwrap();
+        run(&source, &["add", "-A"]).unwrap();
+        run(&source, &["commit", "-qm", "the submodule"]).unwrap();
+
+        let dir = init_repo("submodule");
+        run(
+            &dir,
+            &[
+                "-c",
+                "protocol.file.allow=always",
+                "submodule",
+                "add",
+                source.to_str().unwrap(),
+                "lib/sub",
+            ],
+        )
+        .unwrap();
+        run(&dir, &["commit", "-qm", "add the submodule"]).unwrap();
+
+        // A local submodule clones over the `file` transport, which git
+        // refuses for submodules unless the human says otherwise; the test is
+        // that human, through git's own road for saying it. mush itself never
+        // sets this: the protocol policy in a child's checkout is the human's
+        // (a repository must not be able to make mush clone a local path).
+        let previous = std::env::var_os("GIT_ALLOW_PROTOCOL");
+        std::env::set_var("GIT_ALLOW_PROTOCOL", "file");
+        let added = worktree_add(&dir, 6, Some("HEAD"));
+        match previous {
+            Some(value) => std::env::set_var("GIT_ALLOW_PROTOCOL", value),
+            None => std::env::remove_var("GIT_ALLOW_PROTOCOL"),
+        }
+        let (path, _branch) = added.unwrap();
+
+        assert_eq!(
+            fs::read_to_string(path.join("lib/sub/s.txt")).unwrap(),
+            "the submodule's file\n",
+            "the new checkout carries what the base tree records"
+        );
+        assert!(
+            changes(&path).unwrap().is_empty(),
+            "and the populated submodule is not a change git reports"
+        );
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&source);
+    }
+
+    /// A put-away commit carries its own identity and its own answer to
+    /// signing: a machine whose git signs every commit by default — and has no
+    /// key to sign with, which is what a missing signer is — must not be able
+    /// to stop a run's work from landing (finding F2).
+    #[test]
+    fn a_signing_config_does_not_stop_the_commit() {
+        let dir = init_repo("gpgsign");
+        run(&dir, &["config", "commit.gpgsign", "true"]).unwrap();
+        // The signer is not there, the shape a machine with no key has.
+        run(&dir, &["config", "gpg.program", "/nonexistent/mush-no-gpg"]).unwrap();
+        let (path, _branch) = worktree_add(&dir, 8, Some("HEAD")).unwrap();
+        fs::write(path.join("work.txt"), "the work\n").unwrap();
+
+        let made = commit_all(&path, "mush #8: port the parser").unwrap();
+        assert!(
+            matches!(made, Commit::Made(_)),
+            "the work is committed, not left behind by a signing config: {made:?}"
+        );
+        assert_eq!(
+            subject_of(&path, "HEAD").as_deref(),
+            Some("mush #8: port the parser")
+        );
+        assert!(
+            changes(&path).unwrap().is_empty(),
+            "and the worktree is clean afterwards"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

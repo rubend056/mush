@@ -115,7 +115,10 @@ pub fn subagent_prompt(root: &str, depth: usize, isolated: bool, delegates: bool
             "You work at `{root}`, a worktree of your own branch. It is your workspace root, \
              and every command already starts there — so never `cd` to an absolute path a brief \
              or a task names: that is another checkout, and work done there lands outside your \
-             branch."
+             branch. A worktree is a checkout of refs, not a copy of the parent's tree: its \
+             submodules come with it when the base's tree records any (mush fetches them as the \
+             worktree is made), and `git submodule update --init` is the road if one is still \
+             empty."
         )
     } else {
         format!("Your workspace is `{root}`.")
@@ -160,8 +163,9 @@ pub fn tool_schemas() -> Vec<Value> {
         tool(
             ToolName::EditFile,
             "Replace exact text in one file: every edit lands or none do, so prefer one call for \
-             multi-part changes. A missing `old_string` is refused; a non-unique one is refused \
-             unless `replace_all` is set.",
+             multi-part changes. Applied to the file as read: a concurrent change is lost. A \
+             missing `old_string` is refused; a non-unique one is refused unless \
+             `replace_all` is set.",
             json!({
                 "type": "object",
                 "properties": {
@@ -258,10 +262,10 @@ pub fn tool_schemas() -> Vec<Value> {
                 "type": "object",
                 "properties": {
                     "brief": { "type": "string" },
-                    "title": { "type": "string", "description": "A 3 word description of this agent's brief." },
+                    "title": { "type": "string", "description": "A 3 word, one-line description of the brief." },
                     "base": { "type": "string", "description": "Branch, tag or commit; resolved in this agent's workspace, so `HEAD` is this agent's own HEAD. Without one: this workspace." }
                 },
-                "required": ["brief", "title"]
+                "required": ["brief"]
             }),
         ),
         tool(
@@ -453,6 +457,34 @@ mod tests {
             .contains("agent-only"));
     }
 
+    /// The spawn schema's `title` is the row's name and nothing the code
+    /// requires: a missing or blank one leaves `spawn_tool` to derive the row's
+    /// handle from the brief, so requiring it in the schema made the model pay
+    /// for a field the code treats as optional — and a title is *one line*, a
+    /// fact the schema has to say because the row paints one (finding F14; the
+    /// folding a newline still needs lives in `spawn_tool`, in `agent.rs`).
+    #[test]
+    fn the_spawn_schemas_title_is_optional_and_named_as_one_line() {
+        let spawn = tool_schemas()
+            .into_iter()
+            .find(|schema| schema["function"]["name"] == "spawn_agent")
+            .expect("the tool has a schema")["function"]
+            .clone();
+        let parameters = &spawn["parameters"];
+        assert_eq!(
+            parameters["required"],
+            serde_json::json!(["brief"]),
+            "the code takes a missing title and derives the row's handle"
+        );
+        let title = parameters["properties"]["title"]["description"]
+            .as_str()
+            .expect("the title is described");
+        assert!(
+            title.contains("one-line"),
+            "the row paints one line: {title}"
+        );
+    }
+
     #[test]
     fn subagent_prompt_keeps_role_and_depth_out_of_the_task() {
         let prompt = subagent_prompt("/tmp/x", 2, false, true);
@@ -507,9 +539,19 @@ mod tests {
         let prompt = subagent_prompt("/tmp/wt/3", 1, true, false);
         assert!(prompt.contains("worktree of your own branch"), "{prompt}");
         assert!(prompt.contains("`/tmp/wt/3`"), "{prompt}");
+        // What a fresh worktree *is*, and the road for a submodule that did
+        // not come with it: a child that finds an empty `third_party/` must
+        // know both that the tree is a checkout of refs and what to run
+        // (finding F5).
+        assert!(
+            prompt.contains("a checkout of refs, not a copy of the parent's tree"),
+            "{prompt}"
+        );
+        assert!(prompt.contains("git submodule update --init"), "{prompt}");
         // A shared child gets the shared-workspace sentence instead.
         let shared = subagent_prompt("/tmp/wt/3", 1, false, false);
         assert!(!shared.contains("worktree of your own branch"), "{shared}");
+        assert!(!shared.contains("git submodule update --init"), "{shared}");
     }
 
     /// Every tool already runs in the workspace with its cwd at the root, so

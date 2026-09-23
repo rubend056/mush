@@ -296,6 +296,15 @@ fn webp_dimensions(bytes: &[u8]) -> Option<(u32, u32)> {
 #[derive(Clone, Debug)]
 pub struct Workspace {
     root: PathBuf,
+    /// When this workspace was opened, in unix milliseconds: the line a prune
+    /// draws between the pastes *this run* wrote — a live transcript's images
+    /// are exactly those — and the ones an earlier run left behind
+    /// ([`Workspace::prune_pastes`]).
+    ///
+    /// A fact of the run, not of the directory: the root workspace is opened
+    /// once per app run and a child's once per spawn, and nothing here asks the
+    /// filesystem or a transcript the workspace cannot see.
+    opened: u128,
 }
 
 /// What a search found: the matching lines, whether the cap cut the list short,
@@ -342,6 +351,7 @@ impl Workspace {
     pub fn new(root: impl AsRef<Path>) -> io::Result<Self> {
         Ok(Self {
             root: fs::canonicalize(root)?,
+            opened: now_millis(),
         })
     }
 
@@ -844,6 +854,13 @@ impl Workspace {
     /// within the cap. What must not differ is where under-cap bytes land.
     /// `Err` here is "the copy cannot be written": the IO problem the directory
     /// or the file named.
+    ///
+    /// The write is also where the directory is *bounded*: every paste road
+    /// ends here, so this is the one place a prune has to sit, and the file
+    /// just written is never one of its candidates ([`Self::prune_pastes`] says
+    /// which pastes are). `.mush/paste/` therefore holds this run's pictures
+    /// plus a day of the run before it, rather than every picture the workspace
+    /// has ever pasted (finding B13).
     fn write_pasted_image(&self, bytes: Vec<u8>, mime: &str) -> Result<Image, String> {
         session::ensure_mush_dir(self.root())
             .map_err(|e| format!("cannot create {}: {e}", session::MUSH_DIR))?;
@@ -853,6 +870,7 @@ impl Workspace {
         file.write_all(&bytes)
             .map_err(|e| format!("cannot write {}: {e}", paste_rel(&name)))?;
         drop(file);
+        self.prune_pastes(&name);
         let pixels = image_dimensions(mime, &bytes);
         Ok(Image {
             path: paste_rel(&name),
@@ -860,6 +878,68 @@ impl Workspace {
             bytes,
             pixels,
         })
+    }
+
+    /// Delete the pastes this run can no longer be reading, and answer the
+    /// names that are gone.
+    ///
+    /// Every road that pastes runs this as it writes (see
+    /// [`Self::write_pasted_image`]), which is what makes the directory a
+    /// bound rather than a pile; the files a *live* transcript names are the
+    /// ones it never takes. A candidate is decided by two facts, both of them
+    /// read from the name the writer gave the file:
+    ///
+    /// - a paste whose moment is at or after this workspace's own open is this
+    ///   run's, and a live transcript's images are exactly that — an [`Image`]
+    ///   is in memory because this run read or wrote it — so it stays, however
+    ///   long the run has been going. That is the conservative form of "never
+    ///   remove one the live transcript still points at": the workspace cannot
+    ///   see a transcript, and the run's start is the line it can draw without
+    ///   one (finding B13);
+    /// - a paste older than [`PASTE_MAX_AGE_MILLIS`] is one an earlier run left
+    ///   behind, and past this run's own pictures it is the history a prune
+    ///   takes.
+    ///
+    /// `just_written` is the name being written as the prune runs: it is live
+    /// by definition, so it is never a candidate even if the wall clock moved
+    /// backwards between the write and the prune. A file whose name is not
+    /// `pasted-<moment>.<ext>` is not mush's, is not aged by this rule, and is
+    /// left alone — the directory is mush's, but a file a human put there is
+    /// not the prune's to delete.
+    fn prune_pastes(&self, just_written: &str) -> Vec<String> {
+        let dir = paste_dir(self.root());
+        let Ok(entries) = fs::read_dir(&dir) else {
+            return Vec::new();
+        };
+        let now = now_millis();
+        let mut gone = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(moment) = paste_moment(&name) else {
+                continue;
+            };
+            if name == just_written
+                || moment >= self.opened
+                || now.saturating_sub(moment) <= PASTE_MAX_AGE_MILLIS
+            {
+                continue;
+            }
+            // A directory named like a paste is not a paste: only a regular
+            // file is ever removed, and a refusal (permissions, a race with
+            // the human) leaves the file where it was rather than failing the
+            // write that pruned.
+            if !entry
+                .file_type()
+                .map(|kind| kind.is_file())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if fs::remove_file(dir.join(&name)).is_ok() {
+                gone.push(name);
+            }
+        }
+        gone
     }
 
     /// The image at `path`, named `name` in the refusal and in the returned
@@ -1712,11 +1792,45 @@ fn pasted_extension(mime: &str) -> &'static str {
 /// Unix milliseconds, the tail of a saved clipboard image's name: two pastes
 /// are two files, and a name that sorts by when it happened is the one fact
 /// about a clipboard image the clipboard itself does not have.
+///
+/// It is also the fact a prune ages a paste by ([`Workspace::prune_pastes`]),
+/// read back out of the name with [`paste_moment`] — the name is the one place
+/// the moment is written, so it is the one place it is read.
 fn now_millis() -> u128 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis())
         .unwrap_or(0)
+}
+
+/// How long a paste outlives the run that wrote it, in milliseconds.
+///
+/// A paste may still be named by a transcript that has been reloaded from disk,
+/// so mush does not delete one the moment the run that made it ends: a file is
+/// a candidate only when that run is over *and* it is older than this. One day,
+/// because a working day is the shortest window in which "the picture from this
+/// morning" is still being asked about; a prune never takes a paste the
+/// *current* run wrote, however old its name says it is
+/// ([`Workspace::prune_pastes`]).
+pub const PASTE_MAX_AGE_MILLIS: u128 = 24 * 60 * 60 * 1000;
+
+/// The moment a paste's name carries, in unix milliseconds — the number
+/// [`create_paste_file`] writes after `pasted-`, before the extension or the
+/// `-<n>` a same-millisecond collision adds — or `None` when the name is not
+/// one mush wrote.
+///
+/// The name *is* the paste's age for a prune: it is the moment the writer
+/// chose, it is the same on every machine that sees the file, and it is the one
+/// a test can set without owning a wall clock or an `mtime` API. A name that is
+/// not this shape is not mush's to age, which is why it answers `None` rather
+/// than a guess.
+fn paste_moment(name: &str) -> Option<u128> {
+    let rest = name.strip_prefix("pasted-")?;
+    let digits: String = rest.chars().take_while(|ch| ch.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
 }
 
 /// Where pasted pictures live under a workspace, as the one spelling every
@@ -1749,7 +1863,10 @@ pub fn paste_rel(name: &str) -> String {
 /// name to overwrite. `create_new` is what makes the test and the create one
 /// step, so two pastes can never land in one file however they interleave.
 /// `millis` is a parameter rather than `now_millis()` inside because the
-/// naming rule is a fact a test can pin: same millisecond, second name.
+/// naming rule is a fact a test can pin: same millisecond, second name — and
+/// because the name is also where [`paste_moment`] reads a paste's age back
+/// out ([`Workspace::prune_pastes`]), so the rule that writes it and the rule
+/// that ages by it are one spelling apart, not two.
 fn create_paste_file(dir: &Path, millis: u128, mime: &str) -> Result<(String, fs::File), String> {
     let extension = pasted_extension(mime);
     let mut taken = 0u32;
@@ -2176,6 +2293,38 @@ mod tests {
         ws.write_file("src/lib.rs", "fn a() {}\n").unwrap();
         assert_eq!(ws.read_file("src/lib.rs").unwrap(), "fn a() {}\n");
         assert!(!ws.resolve("src/missing.rs").unwrap().exists());
+    }
+
+    /// The edit road is read → transform → write, and the write is the whole
+    /// file: a change another writer lands between the two is lost, silently
+    /// (finding B16). This is the audit's staged window, kept as the fact the
+    /// tool's description and [`crate::tools::edit_text_many`]'s doc now
+    /// state — the decision is to name the loss, not to compare-and-swap it
+    /// away.
+    #[test]
+    fn an_edit_written_from_a_stale_read_loses_the_other_writers_change() {
+        let ws = temp_workspace("edit-stale-read");
+        fs::write(ws.root().join("f.txt"), "line one\n").unwrap();
+
+        // What the model reads before it decides on an edit ...
+        let read = ws.read_file("f.txt").unwrap();
+        // ... and what another writer — a sibling agent in the same checkout,
+        // or the human's own editor — lands before the model's write.
+        fs::write(ws.root().join("f.txt"), "line one\nline 2\n").unwrap();
+
+        let edits = [crate::tools::Edit {
+            old: "line one".to_string(),
+            new: "LINE ONE".to_string(),
+            replace_all: false,
+        }];
+        let updated = crate::tools::edit_text_many(&read, &edits, "f.txt").unwrap();
+        ws.write_file("f.txt", &updated).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(ws.root().join("f.txt")).unwrap(),
+            "LINE ONE\n",
+            "the sibling's line is gone: the write was the file as it was read"
+        );
     }
 
     /// The bytes of a "png" for a paste test: the magic number is the whole of
@@ -3031,6 +3180,55 @@ mod tests {
             png(4),
             "and the second its own"
         );
+    }
+
+    /// The paste directory is a bound, not a pile: a picture an earlier run
+    /// left behind — older than this run and older than a day — is gone the
+    /// next time anything is pasted, while the picture a live transcript names
+    /// is never touched (finding B13: "5 pastes leave 5 files", and the
+    /// directory lived in `.mush/.gitignore`, so only `du` ever said so).
+    #[test]
+    fn the_paste_directory_is_pruned_but_not_under_a_live_image() {
+        let day = PASTE_MAX_AGE_MILLIS;
+        let now = now_millis();
+        let mut ws = temp_workspace("paste-prune");
+        // A run that began three days ago, as a long session's workspace is.
+        ws.opened = now - 3 * day;
+        let dir = paste_dir(ws.root());
+        fs::create_dir_all(&dir).unwrap();
+
+        // Two pastes from a run that ended before this one began: older than
+        // the run and older than a day, so the prune's candidates.
+        let (old_a, mut file) = create_paste_file(&dir, now - 5 * day, "image/png").unwrap();
+        file.write_all(&png(0)).unwrap();
+        let (old_b, mut file) = create_paste_file(&dir, now - 5 * day - 1, "image/png").unwrap();
+        file.write_all(&png(4)).unwrap();
+        // The live one: this run pasted it on its first day, and its
+        // transcript still names the path. It is *older than a day* on purpose
+        // — the run's start, not the age, is what protects it.
+        let (live_old, mut file) = create_paste_file(&dir, now - 2 * day, "image/png").unwrap();
+        file.write_all(&png(8)).unwrap();
+
+        // The paste the write road is making now, and the prune it runs.
+        let live = ws.save_pasted_image(png(12), false).unwrap();
+
+        assert!(!dir.join(&old_a).exists(), "{old_a} is older than the run");
+        assert!(!dir.join(&old_b).exists(), "and {old_b} with it");
+        assert!(
+            dir.join(&live_old).exists(),
+            "the live transcript's picture stays, however old it is: {live_old}"
+        );
+        let name = live.path.rsplit('/').next().unwrap();
+        assert!(
+            dir.join(name).exists(),
+            "and the paste just written is never a candidate: {name}"
+        );
+        assert_eq!(
+            fs::read_dir(&dir).unwrap().count(),
+            2,
+            "the directory holds the run's pictures and nothing older"
+        );
+        let _ = fs::remove_dir_all(ws.root());
     }
 
     /// A refusal a paste that cannot be written is told names the file where it
