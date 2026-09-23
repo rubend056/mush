@@ -288,9 +288,18 @@ pub fn branch_name(id: u64) -> String {
 /// The number is deliberately above the window of children a reaped session
 /// keeps: the cap bounds what a run leaves on disk, and it must never be the
 /// thing that refuses a delegation the history could still hold. It counts
-/// checkouts that are **not landable** — the ones no sweep will take — so a
-/// worktree whose work is already merged, or one whose run committed nothing
-/// and left no path a commit cannot keep, never spends a slot on its way out.
+/// checkouts that are **not landable against `HEAD`** — the question
+/// [`unlandable`] can ask from here — so a worktree whose work is already
+/// merged, or one whose run committed nothing and left no path a commit cannot
+/// keep, never spends a slot on its way out.
+///
+/// That question is the repo-wide half of the sweep's, not the sweep's own:
+/// the sweep measures a nested child against the branch its parent holds, so a
+/// child merged only into its parent's branch is counted here although the
+/// sweep would take it. The facts that would close the gap — each node's base
+/// and fork — live in the UI's tree, which the spawn road cannot reach; until
+/// it can, the refusal says which question was asked rather than claiming the
+/// worktrees are unmerged (finding F7).
 ///
 /// Ignored work does spend one, and that is the price of finding F1's rule: a
 /// child that merely compiled has a `target/` no commit can keep, so its
@@ -411,6 +420,39 @@ fn head_answer(probe: Result<String, String>) -> Option<bool> {
     }
 }
 
+/// Whether an isolated child can be branched from `dir` at all, in the words a
+/// human reads when it cannot.
+///
+/// Two states refuse before any base name matters, and this is their one home:
+/// `dir` is no repository git can answer for, or it is a repository with no
+/// commit. A fresh `git init` has no `HEAD`, so *every* base name fails to
+/// resolve there — and the sentence written for the state is the one to read,
+/// not git's own about the name a model happened to speak (finding F16).
+///
+/// [`worktree_add`] asks this before it looks at a base; a caller that holds a
+/// base *name* asks it before resolving the name, so the broken case does not
+/// spend a resolve it cannot use. The `.git` test this replaces asked a question
+/// git does not: a linked worktree's `.git` is a file, and a workspace that is a
+/// subdirectory of a repository has none at all while `rev-parse` answers every
+/// question inside it, so the whole isolated road was refused about a directory
+/// the human had opened mush in (finding F11). The question is git's own.
+pub fn can_branch_from(dir: &Path) -> Result<(), String> {
+    match run(dir, &["rev-parse", "--git-dir"]) {
+        Ok(_) => {}
+        Err(error) if error == GIT_UNAVAILABLE => return Err(error),
+        Err(_) => return Err("not a git repository".to_string()),
+    }
+    match has_commits(dir) {
+        Some(true) => Ok(()),
+        Some(false) => {
+            Err("the repo has no commits yet — commit first or drop isolated".to_string())
+        }
+        // A missing git is not a missing commit, and saying so would send a
+        // human looking for a `git commit` they cannot run either.
+        None => Err(GIT_UNAVAILABLE.to_string()),
+    }
+}
+
 /// Create the worktree at [`worktree_path`] on a new [`branch_name`], based on
 /// `base` — the resolved revision the branch forks from, or `HEAD` in `dir`
 /// when the caller has none. Returns the path and the branch, both from the
@@ -441,35 +483,12 @@ fn head_answer(probe: Result<String, String>) -> Option<bool> {
 /// base is a promise about history, and a child running on the wrong one is
 /// worse than no child.
 pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf, String), String> {
-    // The `.git` test that used to stand here asked a question git does not: a
-    // linked worktree's `.git` is a file, and a workspace that is a
-    // subdirectory of a repository has none at all while `rev-parse` answers
-    // every question inside it — so the whole isolated road was refused, with
-    // "not a git repository" about a directory the human had opened mush in
-    // (finding F11). The refusal is kept for a directory git really cannot
-    // answer for; the question is git's own.
-    match run(dir, &["rev-parse", "--git-dir"]) {
-        Ok(_) => {}
-        Err(error) if error == GIT_UNAVAILABLE => return Err(error),
-        Err(_) => return Err("not a git repository".to_string()),
-    }
-    // The question is "can a branch be made here at all", and its answer does
-    // not depend on which base was asked for: an isolated child needs *a*
-    // commit to fork from. The match this replaces asked it only when `base`
-    // was `None` — the one arm the production road never takes, because
-    // `spawn_tool` resolves the name first and always passes `Some` — and
-    // evaluated it in the other case only to throw the answer away (finding
-    // F16). Asking once, first, makes the sentence written for this case the
-    // one a human reads.
-    match has_commits(dir) {
-        Some(false) => {
-            return Err("the repo has no commits yet — commit first or drop isolated".to_string())
-        }
-        // A missing git is not a missing commit, and saying so would send a
-        // human looking for a `git commit` they cannot run either.
-        None => return Err(GIT_UNAVAILABLE.to_string()),
-        Some(true) => {}
-    }
+    // The two states that refuse before any name matters are one question, and
+    // [`can_branch_from`] is its one home: a directory git cannot answer for,
+    // and a repository with no commit for a branch to fork from. Asking it
+    // first makes the sentence written for the state the one a human reads,
+    // whatever base was named (finding F16).
+    can_branch_from(dir)?;
     let path = worktree_path(dir, id);
     let branch = branch_name(id);
     // A path git cannot be given is refused *before* anything is created: the
@@ -811,8 +830,8 @@ pub fn isolated_ids(dir: &Path) -> Option<Vec<u64>> {
     Some(ids)
 }
 
-/// The isolated worktrees that exist and are **not** landable: what
-/// [`MAX_WORKTREES`] counts.
+/// The isolated worktrees that exist and are **not** landable against `HEAD`:
+/// what [`MAX_WORKTREES`] counts.
 ///
 /// A landable worktree is one the next sweep takes, so it must not be what
 /// refuses a spawn — the cap exists to turn today's failure, a `git worktree add`
@@ -820,6 +839,16 @@ pub fn isolated_ids(dir: &Path) -> Option<Vec<u64>> {
 /// clear (finding H17). Read-only, so a caller may ask without changing the
 /// repository, and it answers with nothing when git cannot answer at all: a
 /// count that cannot be taken is not a hundred worktrees, it is no answer.
+///
+/// What it asks is every worktree against `HEAD` with no fork revision, while
+/// the sweep that takes worktrees asks each node against the branch its own
+/// parent holds and with the fork it was created at (`App::reclaim_worktrees`).
+/// A nested child merged only into its parent's branch is therefore counted here
+/// although the sweep would take it, and the worktree is *reported*, not refused
+/// for it: [`MAX_WORKTREES`] and the spawn road's refusal say which question was
+/// asked rather than claiming the branch is unmerged (finding F7). The facts
+/// that would make the two questions one — each node's base and fork — live in
+/// the UI's tree, not on this side of the door.
 pub fn unlandable(root: &Path) -> Vec<u64> {
     let Some(worktrees) = worktrees(root) else {
         return Vec::new();
@@ -1295,9 +1324,9 @@ mod tests {
     /// A repository with no commit refuses *a base spawn too* with the sentence
     /// written for it, and spends no process on resolving a base that could not
     /// exist: the gate is the repository's own state, asked before git is made
-    /// to look at the name (finding F16). The production road
-    /// (`spawn_tool`) still resolves the name before calling here, which is the
-    /// residual this fix cannot reach from `git.rs` alone.
+    /// to look at the name — and the production road asks the same gate, in the
+    /// same words, before it resolves the name (`spawn_tool`'s residual, fixed
+    /// on the actor's side of the door).
     #[test]
     fn a_base_worktree_in_a_repo_without_commits_refuses_with_that_reason() {
         let unborn =

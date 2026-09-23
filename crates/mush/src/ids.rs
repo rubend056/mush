@@ -65,9 +65,12 @@ impl fmt::Display for JobId {
 
 /// How many failed-spawn numbers are kept for reuse. A failed spawn is a rare
 /// event; the pool only exists so the common case — one bad `base`, one retry —
-/// does not leave a permanent hole in the numbering. Past this, the oldest lost
-/// number is forgotten and simply stays a gap, which costs nothing: gaps are
-/// what the counter is for.
+/// does not leave a permanent hole in the numbering. When a ninth loss arrives
+/// the oldest entry is the one forgotten, and it simply stays a gap, which
+/// costs nothing: gaps are what the counter is for. The newest loss is kept
+/// because [`Ids::next_agent`] pops the newest: the retry that follows a
+/// failure is the draw that asks for the number just lost, and dropping the
+/// incoming id instead would leave that retry the one number it cannot get.
 const LOST_POOL: usize = 8;
 
 /// The two counters of one conversation, shared by every actor in its tree and
@@ -98,7 +101,8 @@ pub struct Ids {
 struct Agents {
     /// The next agent number if none was handed back.
     counter: u64,
-    /// Numbers a failed spawn gave back, newest last: see [`Ids::lose_agent`].
+    /// Numbers a failed spawn gave back, newest last and never more than
+    /// [`LOST_POOL`] of them: see [`Ids::lose_agent`].
     lost: Vec<u64>,
 }
 
@@ -151,10 +155,19 @@ impl Ids {
     /// if the spawn fails afterwards (the worktree would be orphaned and the
     /// branch would make the next `add -b` fail — the very residue
     /// [`Ids::reserve_agents`] raises the floor for).
+    ///
+    /// The pool is bounded at [`LOST_POOL`] and keeps the newest losses: when
+    /// it is full the oldest entry is dropped to make room for the incoming
+    /// id. The retry the pool exists for follows the failure that just
+    /// happened, and that is the newest entry, so the oldest is the one to
+    /// forget; it stays a gap rather than being handed out again.
     pub fn lose_agent(&self, id: AgentId) {
         let mut agents = self.agents();
-        if id.0 >= agents.counter || agents.lost.len() >= LOST_POOL {
+        if id.0 >= agents.counter {
             return;
+        }
+        if agents.lost.len() >= LOST_POOL {
+            agents.lost.remove(0);
         }
         agents.lost.push(id.0);
     }
@@ -232,6 +245,29 @@ mod tests {
         ids.lose_agent(burned);
         assert_eq!(ids.next_agent(), AgentId(1), "the retry is consecutive");
         assert_eq!(ids.next_agent(), AgentId(2));
+    }
+
+    /// The pool full, the oldest forgotten, the newest drawn first: nine
+    /// losses put #1 permanently out of reach — the gap — while #9, the newest
+    /// and so the number a retry actually draws, is the first one handed back.
+    #[test]
+    fn a_pool_full_names_which_lost_number_is_the_gap() {
+        let ids = Ids::default();
+        for n in 1..=9 {
+            assert_eq!(ids.next_agent(), AgentId(n), "draw #{n}");
+        }
+        for n in 1..=9 {
+            ids.lose_agent(AgentId(n));
+        }
+        let drawn: Vec<AgentId> = (0..9).map(|_| ids.next_agent()).collect();
+        let expected: Vec<AgentId> = [9, 8, 7, 6, 5, 4, 3, 2, 10]
+            .into_iter()
+            .map(AgentId)
+            .collect();
+        assert_eq!(
+            drawn, expected,
+            "#1 is the gap, #9 comes first, then down to #2, then a fresh #10"
+        );
     }
 
     /// The floor is a floor: it never goes down, and it retires any lost number

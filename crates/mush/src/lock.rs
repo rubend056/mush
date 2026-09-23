@@ -10,9 +10,10 @@
 //!
 //! `flock(2)` rather than a pid file: the kernel drops the lock when the
 //! process dies, so there is no stale-lock case to reason about, nothing to
-//! clean up after a `kill -9`, and no pid-reuse question to answer. The pid is
-//! *written* inside the file so the refusal can name who to quit — it is never
-//! the thing being tested.
+//! clean up after a `kill -9`, and no pid-reuse question to answer — the lock is
+//! the open descriptions, not a number. The pid is *written* inside the file
+//! only as a hint at the last holder to write it, for a refusal to offer a
+//! human — the flock is the test, and the number can be an earlier life's.
 //!
 //! The file is deliberately never unlinked, not even on a clean exit. Unlinking
 //! it is what makes a lock file racy: a third process that opens the path
@@ -112,9 +113,16 @@ impl Identity {
     }
 }
 
-/// Take the workspace lock, or say who holds it.
+/// Take the workspace lock, or say what can be said about the holder.
 ///
 /// `root` is the workspace root; the lock lives beside the session it protects.
+///
+/// The pid goes in *after* the flock, deliberately. Writing it *before* — the
+/// audit's suggested fix — would clobber the hint instead of improving it: a
+/// refused acquirer has the lock file open too, so it would overwrite the
+/// holder's pid with its own and the *next* refusal would name the process that
+/// was refused, not the one holding the flock. The flock is the lock; the pid
+/// is only ever a hint at the last real holder to write it.
 pub fn acquire(root: &Path) -> Result<Guard, String> {
     let path = mush_core::session::mushroom_dir(root).join(LOCK_FILE);
     let mut file = OpenOptions::new()
@@ -132,8 +140,10 @@ pub fn acquire(root: &Path) -> Result<Guard, String> {
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
             return Err(match holder(&mut file) {
                 Some(pid) => format!(
-                    "another mush is already running in this workspace (pid {pid}) — quit it \
-                     first, or ask it things with `mush agents`"
+                    "another mush is already running in this workspace — pid {pid} is the \
+                     lock file's last known holder; the flock is the lock, so that number \
+                     may be out of date — quit the running mush first, or ask it things \
+                     with `mush agents`"
                 ),
                 None => "another mush is already running in this workspace".to_string(),
             });
@@ -157,9 +167,11 @@ pub fn acquire(root: &Path) -> Result<Guard, String> {
     })
 }
 
-/// The pid the holder wrote, when it is readable. Read-only, best effort: the
-/// refusal is worth saying even when the file has nothing in it yet (a holder
-/// that died between `open` and `write` leaves it empty).
+/// The pid the last holder to write the file left, when it is readable. A hint
+/// and never a fact: the file is deliberately never unlinked, so the number can
+/// be an earlier life's, and the flock is what says a holder exists. Read-only,
+/// best effort — the refusal is worth saying without a number too (a lock file
+/// no holder has written yet).
 fn holder(file: &mut File) -> Option<u32> {
     let mut text = String::new();
     file.seek(SeekFrom::Start(0)).ok()?;
@@ -170,10 +182,33 @@ fn holder(file: &mut File) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
+    use std::sync::OnceLock;
 
     use super::*;
 
+    /// A pid that is really gone — a child of this test binary, waited for — for
+    /// a test that needs a number no process owns. The child is forked once, by
+    /// the first `root()` call, and that timing is the point: `fork` copies the
+    /// process's open descriptions into the child, so a fork beside a live
+    /// `Guard` leaves the child holding a copy of that flock until it execs —
+    /// and then the sibling lock tests' own drop-and-reacquire assertions go red
+    /// on a lock that is perfectly free (measured: 16–17 of 20 runs of this
+    /// filter when the child was forked inside the dead-holder test; 12 of 12
+    /// green with that test skipped).
+    fn dead_pid() -> u32 {
+        static DEAD: OnceLock<u32> = OnceLock::new();
+        *DEAD.get_or_init(|| {
+            let mut child = std::process::Command::new("true").spawn().unwrap();
+            let pid = child.id();
+            child.wait().unwrap();
+            pid
+        })
+    }
+
     fn root(label: &str) -> PathBuf {
+        // Force the dead pid's fork before this test — or any sibling — can hold
+        // a lock (see `dead_pid`).
+        dead_pid();
         let dir = std::env::temp_dir().join(format!("mush-lock-{}-{label}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         mush_core::session::ensure_mush_dir(&dir).unwrap();
@@ -184,8 +219,8 @@ mod tests {
         mush_core::session::mushroom_dir(root).join(LOCK_FILE)
     }
 
-    /// The second process is refused, told whose workspace it is, and the
-    /// refusal goes away with the process that held it.
+    /// The second acquire is refused, told the lock file's last known holder,
+    /// and the refusal goes away with the process that held it.
     #[test]
     fn a_second_acquire_is_refused_and_drop_releases_the_workspace() {
         let root = root("second");
@@ -199,6 +234,52 @@ mod tests {
         drop(first);
         let third = acquire(&root);
         assert!(third.is_ok(), "the lock goes with the holder: {third:?}");
+    }
+
+    /// A pid left in the lock file by a holder that is gone is a hint at the
+    /// last holder, not a statement about who holds the lock now: the flock is
+    /// what refuses, and the refusal must not tell the human to quit a process
+    /// that is already dead.
+    #[test]
+    fn a_refusal_does_not_name_a_dead_holder() {
+        let root = root("dead-holder");
+        let first = acquire(&root).expect("the first acquire takes it");
+        let dead = dead_pid();
+        std::fs::write(lock_path(&root), format!("{dead}\n")).unwrap();
+
+        let error = acquire(&root).expect_err("the lock is still held");
+        assert!(
+            error.contains(&format!("pid {dead} is the lock file's last known holder")),
+            "the refusal calls the dead pid the lock file's last known holder: {error}"
+        );
+        assert!(error.contains("already running"), "{error}");
+
+        // The flock, not the text in the file, is what refused: with the holder
+        // gone, the dead pid no longer stands between anyone and the workspace.
+        drop(first);
+        assert!(
+            acquire(&root).is_ok(),
+            "a dead pid in the file cannot refuse a workspace"
+        );
+    }
+
+    /// The positive half, honestly named: an in-process holder wrote its own pid
+    /// a moment ago, so the number is that holder's — and the refusal still
+    /// calls it the lock file's *last known* holder, because that is all the
+    /// file can know.
+    #[test]
+    fn the_pid_the_refusal_names_is_the_holder() {
+        let root = root("live-holder");
+        let _first = acquire(&root).expect("the first acquire takes it");
+        let error = acquire(&root).expect_err("the second is refused");
+        assert!(
+            error.contains(&format!(
+                "pid {} is the lock file's last known holder",
+                std::process::id()
+            )),
+            "the refusal names this process as the lock file's last known holder: {error}"
+        );
+        assert!(error.contains("already running"), "{error}");
     }
 
     /// The lock file outlives its holder on purpose: unlinking it is what lets

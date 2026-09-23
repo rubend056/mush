@@ -11,10 +11,10 @@
 //! sync. An isolated agent works in its own git worktree.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use crossbeam_channel::{Receiver, Sender};
@@ -83,19 +83,33 @@ impl RunUsage {
         }
     }
 
-    /// The line the run reports. A server that omits the total still gets one:
+    /// The line a *run* reports. A server that omits the total still gets one:
     /// the two parts are what it counted, and adding them invents nothing. That
     /// sum is of endpoint numbers too, so it saturates like the stored ones: a
     /// run whose parts are both over reads as a saturated count
     /// (`18446744073709.6M`) rather than as a wrapped one.
     fn line(&self) -> String {
+        self.words("this run")
+    }
+
+    /// The same numbers for a fold that no run owns — a `/compact` asked from
+    /// rest. The summarize call is a model call like any other and costs the
+    /// same; the only thing that changes is which noun is true, and "this run"
+    /// would name a run that does not exist.
+    fn fold_line(&self) -> String {
+        self.words("this fold")
+    }
+
+    /// The one spelling of the sentence, so the run's line and the fold's
+    /// cannot drift apart.
+    fn words(&self, what: &str) -> String {
         let total = if self.total_missing {
             self.prompt.saturating_add(self.completion)
         } else {
             self.total
         };
         format!(
-            "the endpoint counted {} prompt + {} completion tokens this run ({} total)",
+            "the endpoint counted {} prompt + {} completion tokens {what} ({} total)",
             tokens_label(self.prompt as usize),
             tokens_label(self.completion as usize),
             tokens_label(total as usize),
@@ -103,9 +117,15 @@ impl RunUsage {
     }
 }
 
-/// Report the endpoint's own numbers once, when the run ends. Cheap and rare
-/// (one line per run), and the only place a real count can come from: the
-/// UI's meter is bytes/3, which is all a server without `usage` offers.
+/// Report the endpoint's own numbers once, when the run ends — *every* ending,
+/// not only the clean one. Cheap and rare (one line per run), and the only place
+/// a real count can come from: the UI's meter is bytes/3, which is all a server
+/// without `usage` offers.
+///
+/// It is called by the wrapper around the run's turns ([`run_loop`]) rather than
+/// at the clean end inside them: a Stop, a failure, the loop guard, a refusal
+/// and the over-window refusal all end a run before that point, and the counts
+/// the endpoint already reported are the run's however it ended (finding A6).
 fn report_usage(actor: &Actor, usage: Option<RunUsage>) {
     if let Some(usage) = usage {
         actor.ctx.emit(actor.id, AgentEvent::Notice(usage.line()));
@@ -380,6 +400,11 @@ fn subject_brief(brief: &str) -> String {
 /// stopped and failed shapes therefore carry the outcome *and* the brief, each
 /// bounded. [`parse_commit_subject`] is the inverse, and the two are tested
 /// against each other.
+///
+/// The failed shape's error is free text an endpoint chose, and it is written
+/// through [`escape_subject`]: without it, an error carrying `"): "` (a
+/// `refused (429): slow down`) puts the parser's own delimiter inside the head,
+/// and the row reads a brief that is really the error's tail (finding F15).
 pub fn commit_subject(id: u64, brief: &str, outcome: &Outcome) -> String {
     let brief = subject_brief(brief);
     match Committed::from(outcome) {
@@ -392,9 +417,81 @@ pub fn commit_subject(id: u64, brief: &str, outcome: &Outcome) -> String {
         // work up.
         Committed::CutOff => format!("mush #{id} (cut off, work in progress): {brief}"),
         Committed::Failed(error) => {
-            format!("mush #{id} (failed: {}): {brief}", truncate(&error, 40))
+            format!(
+                "mush #{id} (failed: {}): {brief}",
+                escape_subject(&truncate(&error, 40))
+            )
         }
     }
+}
+
+/// Write `text` so that [`parse_commit_subject`] can find the `"): "`
+/// `commit_subject` wrote, whatever the text holds.
+///
+/// The delimiter is `"): "`, so an occurrence inside the text would be found
+/// first. Escaping inserts a backslash before the `)` of every such sequence,
+/// and doubles every backslash first so the two operations are exact inverses
+/// ([`unescape_subject`] reads `\\` as one backslash and `\)` as a
+/// parenthesis): a text that already contained the escape's own output still
+/// round-trips.
+fn escape_subject(text: &str) -> String {
+    text.replace('\\', "\\\\").replace("): ", "\\): ")
+}
+
+/// The inverse of [`escape_subject`], run over the head's error text only.
+///
+/// The scan is total: a backslash followed by anything else is kept as it was,
+/// and a trailing backslash is a backslash, so a hand-written subject can never
+/// make this panic or silently drop a byte.
+fn unescape_subject(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(character) = chars.next() {
+        if character != '\\' {
+            out.push(character);
+            continue;
+        }
+        match chars.next() {
+            Some('\\') => out.push('\\'),
+            Some(')') => out.push(')'),
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
+
+/// Find the `"): "` `commit_subject` wrote: the first one that is not escaped.
+///
+/// [`escape_subject`] marks an occurrence inside the error by putting a
+/// backslash before its `)` — after doubling every backslash — so an escaped
+/// `"): "` has an *odd* run of backslashes before the parenthesis, while the
+/// delimiter has the even run the error's own tail doubled into. A plain
+/// `split_once("): ")` would land inside an escaped error and hand back its
+/// tail as the brief, which is the shape finding F15 measured.
+///
+/// Bytes are enough: `)`, `:` and ` ` are ASCII, so the two slices are always
+/// char boundaries.
+fn split_subject_head(rest: &str) -> Option<(&str, &str)> {
+    let bytes = rest.as_bytes();
+    for index in 0..bytes.len().saturating_sub(2) {
+        if bytes[index] != b')' || bytes[index + 1] != b':' || bytes[index + 2] != b' ' {
+            continue;
+        }
+        let mut backslashes = 0;
+        let mut before = index;
+        while before > 0 && bytes[before - 1] == b'\\' {
+            backslashes += 1;
+            before -= 1;
+        }
+        if backslashes % 2 == 0 {
+            return Some((&rest[..index], &rest[index + 3..]));
+        }
+    }
+    None
 }
 
 /// Read back what [`commit_subject`] wrote: how the run ended, and the task it
@@ -415,15 +512,20 @@ pub fn parse_commit_subject(subject: &str) -> Option<(Committed, String)> {
         return Some((Committed::Finished, brief.to_string()));
     }
     let rest = rest.strip_prefix(" (")?;
-    let (head, brief) = rest.split_once("): ")?;
+    // The first `"): "` in the subject that is *not* escaped is the delimiter
+    // `commit_subject` wrote: the head's error is escaped, so its own `"): "`
+    // occurrences are all preceded by an odd run of backslashes and the real
+    // delimiter by an even one. The brief after the delimiter is taken verbatim.
+    let (head, brief) = split_subject_head(rest)?;
     let ended = if head == "stopped, work in progress" {
         Committed::Stopped
     } else if head == "cut off, work in progress" {
         Committed::CutOff
     } else {
         // Any other shape must name a failure; if it does not, this subject is
-        // not one mush wrote.
-        Committed::Failed(head.strip_prefix("failed: ")?.to_string())
+        // not one mush wrote. The bounded error comes back as the text the
+        // caller wrote, its escaping undone ([`unescape_subject`]).
+        Committed::Failed(unescape_subject(head.strip_prefix("failed: ")?))
     };
     Some((ended, brief.to_string()))
 }
@@ -990,6 +1092,26 @@ impl AgentCtx {
 /// Per-actor state that survives across runs (children, summaries).
 #[derive(Default)]
 struct ActorState {
+    /// This parent's children, by id — and *the* book of whose reports are
+    /// news, which used to be two books. A report is only ever produced by an
+    /// actor this parent spawned ([`spawn_tool`]) or was handed a row for
+    /// ([`note_child_book`], the tree's restore and revival roads), so an id
+    /// this map does not name has no row a report could be read against: the
+    /// completion is swallowed instead of re-opening books the reap closed
+    /// (`AgentMsg::ForgetChild`, finding H19).
+    ///
+    /// A separate `forgotten` tombstone set used to say the same thing, and
+    /// grew by one `u64` for every child the history window ever reaped — an
+    /// actor that forgot a thousand children held a thousand ids nothing could
+    /// clear (finding A16). Dropping the tombstone instead, once no in-flight
+    /// report could still name it, is not a question this parent can answer: it
+    /// never sees the child's thread die (the tree drops its sender, but the
+    /// child holds its own `my_tx` and may still send), so a parent-side drop
+    /// would either swallow a real report or keep every id, which is the set
+    /// again. The distinction the tombstone carried — "was a child, now
+    /// forgotten" against "never a child" — is one no report can make: a
+    /// report from an id this parent never had is stale junk either way, and
+    /// [`forget_child`] empties this map first for exactly that reason.
     children: HashMap<u64, Sender<AgentMsg>>,
     running: HashSet<u64>,
     /// The latest outcome of each child, with the run it came from, whether or
@@ -1019,20 +1141,17 @@ struct ActorState {
     /// where the run's outcome is decided.
     runs: u64,
     /// The children that run in *this* agent's workspace rather than their own
-    /// worktree — including one whose isolation degraded. They are what the
-    /// one-shared-child rule is about: an isolated sibling edits its own tree
-    /// and conflicts with nothing here (audit row 7).
+    /// worktree — including one whose isolation degraded. What the
+    /// one-shared-child rule marks a *child* by; the count the rule takes is
+    /// the directory's, not this book's, because a grandchild is never in it
+    /// ([`Writers`], finding F13). An isolated sibling edits its own tree and
+    /// conflicts with nothing here (audit row 7).
     shared: HashSet<u64>,
-    /// The children the history window has reaped: their ids, remembered so a
-    /// report still travelling from one of them cannot re-open books the reap
-    /// closed (`AgentMsg::ForgetChild`). The ids are never reused (`crate::ids`
-    /// hands out one number per agent), so the memory cannot name a *new* child
-    /// by mistake. One `u64` per forgotten child, held until the tree hands the
-    /// row *back* ([`note_child_book`]): a row can only be handed
-    /// over for a node that exists, so it is proof the forget has gone stale,
-    /// and the tombstone goes with the books it closed. Until then nothing
-    /// clears it — a report can be in flight for as long as an actor lives.
-    forgotten: HashSet<u64>,
+    /// The children the history window has reaped are simply absent from
+    /// `children`: a report still travelling from one of them is swallowed by
+    /// [`is_forgotten`], whose whole source is that book (see its doc) — there
+    /// is no second set of ids to hold, and nothing per-child grows here for
+    /// the life of an actor (finding A16).
     /// How each child's last finished run left its worktree, keyed by the run
     /// that left it: the branch, and whether the work is committed. A listing
     /// fact (`status`), never a delivery: reading it marks nothing, and
@@ -1136,15 +1255,17 @@ impl ActorState {
     /// Whether the tree has forgotten `id` — a child the history window reaped
     /// (`AgentMsg::ForgetChild`).
     ///
-    /// `children` is the book that names this parent's children; this is the
-    /// memory that the book was *closed* for an id, so the once-only delivery
-    /// rule has an other end: the same run reported twice is swallowed by
-    /// `delivered` (`docs/findings.md` B24), while a report from a forgotten
-    /// child is not delivered at all — there is no row it could be read
-    /// against, and folding it would put a line about a child nobody can see
-    /// into the parent's transcript.
+    /// One question with one source: the id is not in [`ActorState::children`].
+    /// The book that names the parent's children is the book the reap empties,
+    /// so its absence *is* the tombstone — and unlike a second set of ids, it
+    /// costs nothing that grows with the session (finding A16). The once-only
+    /// delivery rule has its other end here: the same run reported twice is
+    /// swallowed by `delivered` (`docs/findings.md` B24), while a report from a
+    /// child the tree has dropped is not delivered at all — there is no row it
+    /// could be read against, and folding it would put a line about a child
+    /// nobody can see into the parent's transcript (finding H19).
     fn is_forgotten(&self, id: u64) -> bool {
-        self.forgotten.contains(&id)
+        !self.children.contains_key(&id)
     }
 
     /// Record a child's completion and say whether its line is *fresh* — one
@@ -1244,6 +1365,16 @@ struct Actor {
 }
 
 impl Actor {
+    /// Whether this actor is a *shared* child: one whose runs write in the
+    /// directory its parent owns rather than in a worktree of its own — the
+    /// child the one-shared-child rule counts ([`Writers`], finding F13). The
+    /// root owns its checkout and an isolated child owns its worktree, so
+    /// neither is booked — the sentence promises one such *child*, not one
+    /// writer beside the owner.
+    fn shared_child(&self) -> bool {
+        self.branch.is_none() && self.parent_tx.is_some()
+    }
+
     /// Say one thing about this run to whoever owns this agent, or hand it to
     /// the UI when there is nobody at the other end ([`tell_parent`]).
     fn tell_parent(&self, command: AgentMsg) {
@@ -1667,6 +1798,114 @@ fn actor_main(actor: Actor, initial: Vec<Message>, start_immediately: bool) {
     }
 }
 
+/// The directories a delegated child is working in, tree-wide — the fact the
+/// one-shared-child rule needs and one parent's books cannot hold (finding
+/// F13).
+///
+/// The rule is the prompt's own sentence — "without one the child works in this
+/// workspace, and only one such child may run at a time" — and it is a fact
+/// about a *directory*: the books are per-parent, and a grandchild is never in
+/// its grandparent's `shared` set. The root spawns shared A, A's run ends while
+/// *its* shared child B — in the same checkout by construction — is still
+/// running, and the root is free to spawn shared C into it: two writers, and
+/// the guard that says "already runs in this shared workspace" holding a book
+/// that never named B. This is the book that names it.
+///
+/// Keyed by the canonical workspace root, which is the directory the writers
+/// collide in and nothing else: a *shared* child's workspace root is its
+/// parent's, an isolated one's is its own worktree, so the key tells the two
+/// apart by itself. Only a delegated child is booked ([`Actor::shared_child`]):
+/// the root owns its checkout and an isolated child owns its worktree, and the
+/// sentence promises one such *child*, not one writer beside its owner. A
+/// parent's own children are the one thing the book is not asked about —
+/// [`spawn_tool`] has their books and judges them there, because a child's run
+/// starts and ends in the messages it sends its parent, and only the writers
+/// the parent cannot see (a grandchild) need a book of their own.
+///
+/// A `static` rather than a handle carried through [`TreeHandles`]: the writers
+/// are threads of one process, and a revived actor is rebuilt with an `AgentCtx`
+/// of its own ([`revive`]) that no such handle travels through. One process
+/// serves one tree; a test's tree is keyed by its own directory like any other,
+/// so two of them cannot see each other.
+#[derive(Default)]
+struct Writers {
+    /// Canonical directory -> the ids running in it, each one present for as
+    /// long as its run lives ([`WriterGuard`]). A set, so an id that booked
+    /// itself twice is one writer, and the refusal reads its ids in order
+    /// without a second sort.
+    live: Mutex<HashMap<PathBuf, BTreeSet<u64>>>,
+}
+
+/// The process's own book of who is writing where — see [`Writers`].
+static WRITERS: OnceLock<Writers> = OnceLock::new();
+
+fn writers() -> &'static Writers {
+    WRITERS.get_or_init(Writers::default)
+}
+
+/// The book's key: one path per directory. `canonicalize` follows symlinks
+/// (`/tmp` on a mac is one), so the same checkout named two ways is one key;
+/// a path that cannot be resolved — a directory deleted under a dying tree —
+/// is its own name, which only ever adds a book nobody reads again.
+fn writer_key(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+impl Writers {
+    /// Book this run as a writer of `dir`, for as long as the guard lives.
+    fn writing(&self, dir: &Path, id: u64) -> WriterGuard {
+        let dir = writer_key(dir);
+        self.live
+            .lock()
+            .expect("no writer holds the book while it is poisoned")
+            .entry(dir.clone())
+            .or_default()
+            .insert(id);
+        WriterGuard { dir, id }
+    }
+
+    /// The live writers of `dir` other than `id`, in id order: the count the
+    /// one-shared-child rule is.
+    fn others(&self, dir: &Path, id: u64) -> Vec<u64> {
+        let dir = writer_key(dir);
+        self.live
+            .lock()
+            .expect("no writer holds the book while it is poisoned")
+            .get(&dir)
+            .map(|ids| ids.iter().copied().filter(|writer| *writer != id).collect())
+            .unwrap_or_default()
+    }
+}
+
+/// One run's place in [`Writers`], given up when the run ends — however it ends.
+///
+/// The same guard as [`LiveGuard`], for the same reason: a run that dies on the
+/// way to its ending never reaches a line that would take its name back, and a
+/// writer left in the book is a sibling refused forever with a sentence naming
+/// an agent that is not running.
+struct WriterGuard {
+    dir: PathBuf,
+    id: u64,
+}
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        let mut live = writers()
+            .live
+            .lock()
+            .expect("no writer holds the book while it is poisoned");
+        if let Some(ids) = live.get_mut(&self.dir) {
+            ids.remove(&self.id);
+            if ids.is_empty() {
+                // The directory is not a fact once nobody writes in it: a book
+                // of every path a session ever touched is the growth finding
+                // A16 is about, one book over.
+                live.remove(&self.dir);
+            }
+        }
+    }
+}
+
 /// The last act of an actor whose thread died: file the ending the unwinding
 /// skipped, with the two readers a run's ending has.
 ///
@@ -1756,6 +1995,14 @@ fn actor_body(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         // message order closes it: the parent drains the completion first, then
         // this, and the books end where the child really is. The root has no
         // parent, so it says none of this (`tell_parent`).
+        // And this run's place in the directory, if it writes in somebody
+        // else's: a delegated child with no worktree of its own is what the
+        // one-shared-child rule promises there is one of, and the book has to
+        // hold it *before* the parent is told it is running — a parent that
+        // spawns on that message must see this writer (finding F13).
+        let writer = actor
+            .shared_child()
+            .then(|| writers().writing(actor.ws.root(), actor.id));
         actor.tell_parent(AgentMsg::ChildRunning { id: actor.id });
         // The slot this run holds in the tree's count of running agents. It is
         // held for the whole ending — the commit and both reports — and released
@@ -1763,6 +2010,13 @@ fn actor_body(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         // the count claiming it is still running (see [`LiveGuard`]).
         let _live = LiveGuard::take(&actor.ctx.live);
         let result = run_loop(&actor, &mut state, &mut transcript, &cancel);
+        // The run is over, so this agent is no longer writing in that directory:
+        // given up here rather than at the end of the ending, because the report
+        // below is what a parent acts on — a parent that hears the ending and
+        // spawns at once must not count a writer that has stopped. (The commit
+        // that follows an *isolated* run writes in a worktree of its own, so it
+        // is nobody else's directory.)
+        drop(writer);
         // How the run ended decides both the commit subject and what the parent
         // is told. A stopped run still has work worth keeping, but its commit
         // must not read like a finished one.
@@ -2612,11 +2866,36 @@ fn count_round(last_batch: &mut String, repeats: &mut usize, batch: &str, did_no
 /// Nothing counts turns: the run goes on until the model calls no more tools.
 /// Its one early end is [`LOOP_ROUNDS`] identical rounds (finding H45); the
 /// other is the human's Stop.
+///
+/// This is the run's *ending*: every road out of [`run_turns`] — the answer, a
+/// Stop, a failure, the loop guard, a refusal, a request that does not fit —
+/// passes back through here, and the endpoint's own counts are reported on all
+/// of them ([`report_usage`]). A run that was stopped, cancelled or refused has
+/// spent the money just the same, and its number is the only non-estimate there
+/// is (finding A6).
 fn run_loop(
     actor: &Actor,
     state: &mut ActorState,
     messages: &mut Vec<Message>,
     cancel: &Arc<AtomicBool>,
+) -> Result<Option<String>, String> {
+    // What the endpoint itself counted over this run's calls, folds included:
+    // `run_turns` feeds it as replies arrive, so it survives every early
+    // return.
+    let mut usage: Option<RunUsage> = None;
+    let result = run_turns(actor, state, messages, cancel, &mut usage);
+    report_usage(actor, usage);
+    result
+}
+
+/// The turn loop itself: asking, running the batch, and the roads that end the
+/// run early. [`run_loop`] owns the ending and the usage report.
+fn run_turns(
+    actor: &Actor,
+    state: &mut ActorState,
+    messages: &mut Vec<Message>,
+    cancel: &Arc<AtomicBool>,
+    usage: &mut Option<RunUsage>,
 ) -> Result<Option<String>, String> {
     let schemas = tool_schemas(actor);
     // A run that follows a loop-stop opens with the guard's own words: the one
@@ -2657,9 +2936,6 @@ fn run_loop(
     state.waited = false;
     // Consecutive replies the endpoint cut off at the token cap.
     let mut cut_offs = 0usize;
-    // What the endpoint itself counted, when it says: the UI's meter is an
-    // estimate, and this is the one number that is not.
-    let mut usage: Option<RunUsage> = None;
 
     loop {
         drain_mailbox(actor, cancel, messages, state);
@@ -2681,7 +2957,7 @@ fn run_loop(
             // says so itself: the run carries on, and the phase the fold put on
             // the row goes back to what a run wears between the request and the
             // tool it names.
-            compact_history(actor, &cfg, messages, cancel, state, true)?;
+            compact_history(actor, &cfg, messages, cancel, state, true, usage)?;
         }
         // Keep the whole request inside the endpoint's context window. The
         // trimmer is the fallback the fold cannot help with: it bites only when
@@ -3007,7 +3283,6 @@ fn run_loop(
             if steered {
                 continue;
             }
-            report_usage(actor, usage);
             return Ok(if content.is_empty() {
                 None
             } else {
@@ -3162,6 +3437,7 @@ fn compact_history(
     cancel: &Arc<AtomicBool>,
     state: &mut ActorState,
     in_run: bool,
+    usage: &mut Option<RunUsage>,
 ) -> Result<bool, String> {
     // Whether the human asked for this fold, as opposed to the window filling
     // on its own. Only the first is owed a line when there is nothing to do:
@@ -3304,10 +3580,15 @@ fn compact_history(
             if asked {
                 // The endpoint's own words, the way a run reports them: a
                 // refusal and an unreadable body are different things, and the
-                // human is the one who can act on either.
+                // human is the one who can act on either. Bounded the way the
+                // run's own refusal arm bounds its body (`truncate(&body,
+                // 600)`), so the two refusals read alike and a notice stays a
+                // line: the endpoint's body is bounded only by `http.rs`'s
+                // `MAX_BODY_BYTES`, and a notice is wrapped and painted — 80 MiB
+                // of it through the notes list is not a sentence (finding C10).
                 let why = match &error {
                     ModelError::Status { status, body } => {
-                        format!("the endpoint answered {status}: {body}")
+                        format!("the endpoint answered {status}: {}", truncate(body, 600))
                     }
                     ModelError::Malformed(what) => {
                         format!("the endpoint's reply could not be read: {what}")
@@ -3327,6 +3608,16 @@ fn compact_history(
             return Ok(false);
         }
     };
+    // The fold is a model call like any other, and usually the largest one of
+    // the run: it re-sends the whole history. What the endpoint counted for it
+    // belongs to the run's number, so it goes into the same accumulator the
+    // run's own replies feed — a fold read only for its summary is the one
+    // place the endpoint's real counts were dropped (finding A6). A fold from
+    // rest has no run to belong to: its caller ([`compact_now`]) owns the
+    // line.
+    if let Some(reported) = reply.usage.as_ref() {
+        usage.get_or_insert_with(RunUsage::default).add(reported);
+    }
     let summary = reply
         .choices
         .into_iter()
@@ -3388,10 +3679,15 @@ fn compact_now(actor: &Actor, state: &mut ActorState, transcript: &mut Vec<Messa
     // a fold that spins an hourglass while no key can stop it is worse than one
     // nobody can see.
     let cancel = Arc::new(AtomicBool::new(false));
+    // A fold from rest has no run behind it, so this is the only accumulator it
+    // has: the summarize call costs money like any other, and the count is
+    // reported below whether the fold landed or failed (finding A6).
+    let mut usage: Option<RunUsage> = None;
     // A fold that landed needs nothing here: its `Compact` event is what the
     // pane, the session and the meter read. A fold that came to nothing emits
     // its own ending too, so only its *failures* are left to report.
-    if let Err(error) = compact_history(actor, &cfg, transcript, &cancel, state, false) {
+    if let Err(error) = compact_history(actor, &cfg, transcript, &cancel, state, false, &mut usage)
+    {
         // The human stopped it. A stop is its own event, not a failure: the
         // actor is alive and resumable, and the row must say which of the two
         // just happened.
@@ -3409,6 +3705,16 @@ fn compact_now(actor: &Actor, state: &mut ActorState, transcript: &mut Vec<Messa
                 .ctx
                 .emit(actor.id, AgentEvent::CompactingEnded { in_run: false });
         }
+    }
+    // What the endpoint counted for the fold is reported last, after whatever
+    // the fold had to say about itself: the human who typed `/compact` is the
+    // one paying for the call, and this is the only line that says what it
+    // cost. `fold_line` and not `line`: there is no run here for "this run" to
+    // name (finding A6).
+    if let Some(usage) = usage {
+        actor
+            .ctx
+            .emit(actor.id, AgentEvent::Notice(usage.fold_line()));
     }
 }
 
@@ -3617,11 +3923,13 @@ fn note_completion(state: &mut ActorState, id: u64, run: u64, outcome: Outcome) 
 /// here, where the mailbox changes hands, and nowhere else.
 fn note_mailbox(state: &mut ActorState, id: u64, cmd: Sender<AgentMsg>) {
     // A child the tree has dropped has no row a mailbox could belong to, and
-    // the tombstone is the last word about it: writing the book back would put
-    // a name into `status` with nothing on screen behind it, and hand `control`
-    // an actor nobody can see. The rule the other books of a child follow
+    // its absence from `children` is the last word about it (finding A16):
+    // writing the book back would put a name into `status` with nothing on
+    // screen behind it, and hand `control` an actor nobody can see. The rule
+    // the other books of a child follow
     // (`note_running`, `note_work`, `record_child`) belongs on this one too;
-    // only `note_child_book` clears a tombstone, by handing the row back.
+    // only `note_child_book` reopens a book the reap closed, by handing the
+    // row back.
     if state.is_forgotten(id) {
         return;
     }
@@ -3652,10 +3960,6 @@ fn note_child_book(
     shared: bool,
 ) {
     state.children.insert(id, cmd);
-    // The tree naming the child is the one proof that an earlier forget is
-    // stale — a row can only be handed over for a node that exists — so the
-    // tombstone goes with the books it closed.
-    state.forgotten.remove(&id);
     // A child with no branch of its own runs in its parent's workspace: the
     // one-shared-child rule and `control`'s worktree check both read this book.
     if shared {
@@ -3681,15 +3985,13 @@ fn note_child_book(
 /// outlived its row.
 ///
 /// `children` goes first, because it is the book that says whose reports are
-/// news. The id then goes into `forgotten`, which is what keeps it so: a
-/// forgotten child must not be able to re-deliver anything, and after this
-/// there is no book left to deliver into *and* no report of its that any road
-/// will accept. Every other per-child book follows, so no listing (`work`,
+/// news: after this there is no book left to deliver into *and* no report of
+/// the child's that any road will accept ([`is_forgotten`] reads exactly this
+/// map). Every other per-child book follows, so no listing (`work`,
 /// `completed`), no wait (`running`) and no shared-workspace guard (`shared`)
 /// can read a child the tree has dropped.
 fn forget_child(state: &mut ActorState, id: u64) {
     state.children.remove(&id);
-    state.forgotten.insert(id);
     state.completed.remove(&id);
     state.delivered.remove(&id);
     state.running.remove(&id);
@@ -3770,11 +4072,26 @@ fn note_work(state: &mut ActorState, id: u64, run: u64, work: Work) {
     }
 }
 
+/// How many job reports one actor's books keep — the registry's whole memory.
+///
+/// `jobs::MAX_JOBS` is how many jobs one workspace may run at once, and the
+/// registry lists as many finished ones *again* (`JOB_HISTORY`), so a report
+/// older than the newest `2 * MAX_JOBS` is one nothing else in the tree can
+/// still be holding: the registry has dropped it, and the line itself is in the
+/// transcript, where a delivery put it. The two books used to grow by one
+/// report per job the actor ever started — a thousand jobs held 61,893 bytes
+/// of line text, for the life of the actor (finding A16).
+const REMEMBERED_JOBS: usize = 2 * jobs::MAX_JOBS;
+
 /// The same bookkeeping for a job: it is no longer running, and its report is
 /// the line the model reads. A job ends once, under an id nothing else reuses,
 /// so a report recorded again is the *same* report: the delivery mark stands,
 /// and it is not cleared here. Clearing it unconditionally is what let a job's
 /// line fold twice (`docs/findings.md` B24, `note_completion`'s twin).
+///
+/// The books are forgetful on purpose: only the newest [`REMEMBERED_JOBS`]
+/// reports stay (finding A16), because an older one is a report the registry
+/// itself has dropped and the transcript already holds.
 fn note_job(state: &mut ActorState, id: JobId, line: String, news: bool) -> String {
     state.running_jobs.remove(&id);
     state.done_jobs.insert(
@@ -3784,7 +4101,38 @@ fn note_job(state: &mut ActorState, id: JobId, line: String, news: bool) -> Stri
             news,
         },
     );
+    prune_job_books(state);
     line
+}
+
+/// Drop the job reports this actor has already read, oldest first, until the
+/// book is no larger than the registry's own memory ([`REMEMBERED_JOBS`]).
+///
+/// The delivery mark goes with the report it marks: an id the registry can no
+/// longer report (a `CommandDone` is sent once, by a job that is gone) has no
+/// second arrival for the mark to swallow, and the mark is the other half of
+/// the growth finding A16 measured.
+///
+/// An *undelivered* report is never dropped, however old: `drain_signals`
+/// records one for the next boundary to fold in, and news is the one thing a
+/// book may not forget. Ids are handed out in order, so sorting by id is
+/// sorting by age.
+fn prune_job_books(state: &mut ActorState) {
+    if state.done_jobs.len() <= REMEMBERED_JOBS {
+        return;
+    }
+    let mut read: Vec<JobId> = state
+        .done_jobs
+        .keys()
+        .copied()
+        .filter(|id| state.delivered_jobs.contains(id))
+        .collect();
+    read.sort_unstable();
+    let excess = state.done_jobs.len() - REMEMBERED_JOBS;
+    for id in read.into_iter().take(excess) {
+        state.done_jobs.remove(&id);
+        state.delivered_jobs.remove(&id);
+    }
 }
 
 /// Fold one line into this actor's transcript *and* tell the UI to put it in
@@ -3974,6 +4322,17 @@ fn exec_tool(
 /// worktrees that no sweep will take: which ones, where they are, and the
 /// commands that clear one. Named rather than counted — a number a human cannot
 /// act on is exactly what this check exists to replace (finding H17).
+/// The refusal an isolated spawn gets when the cap is full, naming what to
+/// clear.
+///
+/// It says exactly what was measured: `unlandable` asks every worktree against
+/// `HEAD`, so a nested child merged only into its parent's branch is counted
+/// here, and the sentence names that case instead of claiming each branch is
+/// unmerged — the model cannot tell the real unlandable worktree from the
+/// counted landable one, and the old wording sent it to merge a branch that was
+/// already merged (finding F7). The remedy is the one that works for both:
+/// bring the branch's work to `HEAD` (which is what the sweep measures), or
+/// remove the checkout and delete the branch.
 fn too_many_worktrees(held: &[u64]) -> String {
     /// How many worktrees the refusal names before it counts the rest: the four
     /// fit a tool result's line, and the model needs the shape, not the roster.
@@ -3992,10 +4351,12 @@ fn too_many_worktrees(held: &[u64]) -> String {
     };
     format!(
         "cannot spawn: {} isolated worktrees already exist and none of them is landable \
-         (the limit is {}) — each holds an unmerged branch, uncommitted work, or ignored \
-         paths a commit cannot keep: {named}{more}. \
-         Land or drop one first: merge or delete its branch, then \
-         `git worktree remove --force .mush/wt/<id>` and `git branch -d mush/<id>`.",
+         against HEAD (the limit is {}) — each is dirty, or its branch holds commits HEAD does \
+         not have, and a nested child merged only into its parent's branch counts here: \
+         {named}{more}. \
+         Land or drop one first: bring its branch's work to this repository's HEAD (merge it), \
+         or remove the checkout and delete the branch (`git worktree remove --force \
+         .mush/wt/<id>` and `git branch -d mush/<id>`).",
         held.len(),
         git::MAX_WORKTREES
     )
@@ -4066,11 +4427,20 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // shared child in the parent's checkout (finding A7, F12).
     let named = tools::arg_string_opt(args, "base")?;
     let base: Option<String> = match named.as_deref() {
-        Some(name) => Some(git::resolve(actor.ws.root(), name).ok_or_else(|| {
-            format!(
-                "unknown base `{name}`: no commit, branch or tag by that name in this agent's workspace"
-            )
-        })?),
+        Some(name) => {
+            // The repository's own state has the first word on whether a name
+            // can mean anything here: a fresh `git init` has no commit for any
+            // base to resolve to, so the sentence written for that state is the
+            // one to read — not git's own about the name a model happened to
+            // speak (finding F16's residual). The gate [`git::worktree_add`]
+            // asks, asked *before* the name so the refusal costs no resolve.
+            git::can_branch_from(actor.ws.root())?;
+            Some(git::resolve(actor.ws.root(), name).ok_or_else(|| {
+                format!(
+                    "unknown base `{name}`: no commit, branch or tag by that name in this agent's workspace"
+                )
+            })?)
+        }
         None => None,
     };
     let isolated = base.is_some();
@@ -4082,12 +4452,14 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // where the model's workspace is; this is the *landing* question, and it
     // belongs to the tree the parent's work is in.
     let base_name = isolated.then(|| fork_base(actor.branch.as_deref()));
-    // The name the caller chose for the row, trimmed; blank means none, and the
-    // row falls back to its handle from the brief. A wrongly-typed title is
-    // refused, not silently dropped: the row is how the human finds the child
-    // (finding A7).
+    // The name the caller chose for the row, folded to the one line a row is:
+    // `first_line` drops a second line and collapses whitespace runs, so a
+    // model that wrote `parser\nport` names the row `parser` instead of putting
+    // a newline into a one-line painter (finding F14's newline half). A
+    // wrongly-typed title is refused, not silently dropped: the row is how the
+    // human finds the child (finding A7).
     let title = tools::arg_string_opt(args, "title")?
-        .map(|title| title.trim().to_string())
+        .map(|title| first_line(&title))
         .filter(|title| !title.is_empty());
     if !isolated {
         // Decide this *before* writing the brief: the check can only fail after
@@ -4098,14 +4470,34 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         // sibling edits its own worktree, so a running one must not block a
         // shared spawn — the old guard counted it and then said something false
         // about this workspace (audit row 7).
+        //
+        // The count is the *directory's*, not this parent's: the books hold only
+        // this agent's own children, and a grandchild — a shared child of a
+        // shared child, in the same checkout by construction — is never in them.
+        // A root whose shared child had ended was free to spawn a second writer
+        // into its checkout while the first's own child still worked there, and
+        // the refusal's sentence ("already runs in this shared workspace") was
+        // false of nothing but the books it read (finding F13). [`writers`] is
+        // the tree-wide book that names every live writer of the directory; the
+        // writers this parent's own books name are filtered out of it, because
+        // for *them* the books are the finer answer — they are written where a
+        // child's run starts and ends — and the books already judged them in
+        // the two lines above.
         let mut running_shared: Vec<u64> = state
             .shared
             .iter()
             .copied()
             .filter(|id| state.running.contains(id))
             .collect();
+        running_shared.extend(
+            writers()
+                .others(actor.ws.root(), actor.id)
+                .into_iter()
+                .filter(|id| !state.children.contains_key(id)),
+        );
+        running_shared.sort_unstable();
+        running_shared.dedup();
         if !running_shared.is_empty() {
-            running_shared.sort_unstable();
             let names = running_shared
                 .iter()
                 .map(|id| format!("#{id}"))
@@ -4114,7 +4506,7 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
             return Err(format!(
                 "cannot spawn: {names} already runs in this shared workspace, and only one shared child \
                  may run at a time. Pass base=<branch or commit> to give a sibling its own worktree, or \
-                 wait for it first."
+                 wait for it to finish."
             ));
         }
     }
@@ -4124,9 +4516,12 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // fatal a moment later with the number already spent and a gap on the screen
     // that nothing explains (finding H17); this is the same refusal, planned,
     // naming what to clear. Only an isolated spawn pays it (a shared child makes
-    // no worktree), and it counts what no sweep will take, so a worktree whose
-    // work is merged — one that is leaving on its own — never refuses anyone
-    // (finding H10).
+    // no worktree), and it counts worktrees that are not landable *against
+    // `HEAD`*, so one whose work reached `HEAD` — already leaving on its own —
+    // never refuses anyone (finding H10). A nested child merged only into its
+    // parent's branch is over-counted here, and the refusal says so (finding
+    // F7): the sweep's own question needs each node's base and fork, which live
+    // in the UI's tree.
     if isolated {
         let held = git::unlandable(&ctx.root);
         if held.len() >= git::MAX_WORKTREES {
@@ -4236,8 +4631,8 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
 
     state.children.insert(id.0, cmd_tx);
     state.running.insert(id.0);
-    // Which children share this workspace: the ones the one-shared-child rule
-    // is about.
+    // Which children share this workspace: this parent's half of the
+    // one-shared-child rule, whose count is the directory's (`Writers`).
     if shares_workspace {
         state.shared.insert(id.0);
     }
@@ -4724,6 +5119,14 @@ fn wait_digest(actor: &Actor, state: &mut ActorState, fresh_only: bool) -> Vec<S
 /// flight?" — and made it poll both. A listing is not a delivery: each child's
 /// outcome is a digest, each job's is its current line, `✉` marks the results
 /// nobody has read, and `wait` is what hands them over.
+///
+/// It is a big-text road and answers to [`result_cap`] like every other one: the
+/// registry bounds its own windows by [`jobs::STATUS_WINDOW`], but a status that
+/// spent that whole window would carry three times the room this turn has, and
+/// the *next* request would cross the context window — where H43's
+/// `shed_newest_results` drops the newest results, the very listing the model
+/// asked for (finding A11). The cut is `truncate_for_model`'s, so a cut listing
+/// says what it kept and how to ask narrower.
 fn status_tool(actor: &Actor, state: &ActorState) -> Result<String, String> {
     let jobs = actor.ctx.registry.status_for(actor.id);
     let mut sections = Vec::new();
@@ -4738,7 +5141,10 @@ fn status_tool(actor: &Actor, state: &ActorState) -> Result<String, String> {
     if sections.is_empty() {
         return Ok("no children and no jobs".to_string());
     }
-    Ok(sections.join("\n"))
+    Ok(truncate_for_model(
+        sections.join("\n"),
+        result_cap(actor, state),
+    ))
 }
 
 /// The child half of `status`: one line per child, in id order.
@@ -6557,6 +6963,55 @@ mod tests {
         }
     }
 
+    /// The round trip holds for *any* error text, including one that carries the
+    /// parser's own delimiter. `commit_subject` writes the failure's error into
+    /// the head and closes the head with `"): "`, while the error itself is free
+    /// text an endpoint chose — `refused (429): slow down` puts one inside it,
+    /// and a `split_once` then splits at the error's own sequence: the head
+    /// parses as a shortened error and the *brief* becomes the error's tail,
+    /// showing the row the wrong task (finding F15). The escaping is what makes
+    /// the first `"): "` the one `commit_subject` wrote.
+    #[test]
+    fn the_commit_subject_round_trips_for_any_error_text() {
+        let errors = [
+            "no route",
+            "the endpoint refused (429): slow down",
+            "a (b): c (d): e",
+            "): ",
+            "\\",
+            "\\): \\",
+            "trailing \\",
+            "refused (429): slow down \\ and ): again",
+            "编码 (429): 慢一点，再试一次，不要着急，等一会",
+        ];
+        let briefs = [
+            "port the parser",
+            // The brief is *not* the echo of an error: if the parser leaned on
+            // `rsplit_once` to dodge the error's `"): "`, a brief holding one
+            // would swallow the head instead.
+            "port the parser (again): from scratch",
+        ];
+        for error in errors {
+            for brief in briefs {
+                let subject = commit_subject(7, brief, &Outcome::Failed(error.to_string()));
+                let (ended, parsed) = parse_commit_subject(&subject)
+                    .unwrap_or_else(|| panic!("{subject:?} must parse back"));
+                assert_eq!(parsed, brief, "the brief survived: {subject:?}");
+                let Committed::Failed(parsed) = ended else {
+                    panic!("a failed run parsed as {ended:?}: {subject:?}")
+                };
+                // The error is bounded on the way in, so the bound is what
+                // round-trips — exactly the text the caller wrote into the
+                // subject, no more and no less.
+                assert_eq!(
+                    parsed,
+                    truncate(error, 40),
+                    "{subject:?} did not round-trip {error:?}"
+                );
+            }
+        }
+    }
+
     /// The subject is the brief's *first line*, cut at a word boundary with a
     /// trailing `…` (finding S8(i)). The docs' `mush #N: <brief>` is the
     /// imprecise side: a subject cannot be unbounded, and a subject that ends
@@ -6645,6 +7100,7 @@ mod tests {
     fn adoption_does_not_re_arm_a_delivery_that_already_happened() {
         let (actor, _mailbox) = test_actor("stale-copy");
         let mut state = ActorState::default();
+        known_child(&mut state, 1);
         note_completion(&mut state, 1, 1, Outcome::Finished("did the thing".into()));
         let mut messages = vec![Message::system("you are mush")];
         assert!(fold_completions(&actor, &mut state, &mut messages));
@@ -7005,6 +7461,7 @@ mod tests {
     #[test]
     fn a_later_finish_replaces_a_stale_stop() {
         let mut state = ActorState::default();
+        known_child(&mut state, 1);
         note_completion(&mut state, 1, 1, Outcome::Stopped(Stop::Human));
         assert_eq!(state.outcome(1), Some(&Outcome::Stopped(Stop::Human)));
         let line = note_completion(&mut state, 1, 2, Outcome::Finished("done now".into()));
@@ -7137,6 +7594,7 @@ mod tests {
     fn a_child_completion_is_delivered_once_across_an_idle_run() {
         let (actor, events, _mailbox) = recording_actor("once-child");
         let mut state = ActorState::default();
+        known_child(&mut state, 1);
         note_completion(
             &mut state,
             1,
@@ -7234,6 +7692,7 @@ mod tests {
     fn a_child_run_reported_again_is_not_folded_twice() {
         let (actor, _events, mailbox) = recording_actor("re-reported");
         let mut state = ActorState::default();
+        known_child(&mut state, 2);
         let mut messages = vec![Message::system("you are mush")];
         let error = "Connection reset by peer (os error 104)";
         let line = format!("#2 failed: {error}");
@@ -7497,8 +7956,8 @@ mod tests {
             "the row's mailbox is the live one"
         );
 
-        // The tombstone goes with the closed books, not with the id: the child
-        // is bookable again, so a run of it that starts, reports and works is
+        // The forget goes with the closed books, not with the id: the child is
+        // bookable again, so a run of it that starts, reports and works is
         // recorded rather than swallowed as a report of something the tree has
         // already dropped.
         absorb(
@@ -7557,12 +8016,12 @@ mod tests {
     }
 
     /// A mailbox handed over for a child the tree has already dropped keeps no
-    /// book: the tombstone is the last word, and the one thing that clears it
-    /// is the tree handing the row back (finding H19).
+    /// book: the absence from `children` is the last word, and the one thing
+    /// that reopens it is the tree handing the row back (findings H19, A16).
     ///
     /// The other three books a revival can touch are guarded the same way
     /// (`note_running`, `note_work`, `record_child`); a `ChildMailbox` that
-    /// slipped past its tombstone would name a child in `status` with no row
+    /// slipped past the closed book would name a child in `status` with no row
     /// on screen to point at, which is exactly what the reap emptied the books
     /// to prevent.
     #[test]
@@ -7606,7 +8065,7 @@ mod tests {
         );
         assert!(
             state.is_forgotten(1),
-            "and the tombstone stands: only the row handed back clears one"
+            "and the child stays forgotten: only the row handed back reopens it"
         );
         drop(live_rx);
         let _ = fs::remove_dir_all(actor.ws.root());
@@ -7830,6 +8289,72 @@ mod tests {
         }
     }
 
+    /// `status` is a big-text road like the ones [`result_cap`] names — a jobs
+    /// listing carries each job's output window — so it is bounded by the room
+    /// this turn has, not only by the registry's own [`jobs::STATUS_WINDOW`].
+    /// A result that spends three times the turn's whole room is what
+    /// `turn_room` exists to prevent: the *next* request crosses the window and
+    /// H43's `shed_newest_results` drops the newest results — the listing the
+    /// model just asked for — instead (finding A11).
+    #[test]
+    fn a_status_listing_is_bounded_by_the_turns_result_cap() {
+        use crate::machine::ShellCommand;
+
+        let mut cfg = Config::new("http://127.0.0.1:1", "test", None);
+        // The audit's window: 8 K tokens → budget 12,288 bytes, `cmd_cap`
+        // (and so `result_cap`) 2,458 — under which the probe measured **8,197
+        // bytes** of status with four ended jobs.
+        cfg.set_context(8 * 1024);
+        let mut machine = ScriptedMachine::new();
+        for _ in 0..4 {
+            machine = machine.runs(Script::hangs().says(&"x".repeat(jobs::JOB_TAIL)));
+        }
+        let machine = Arc::new(machine);
+        let (actor, _events, _mailbox) = build_actor_about(
+            "status-cap",
+            Arc::new(Scripted::new()),
+            ConfigHandle::own(cfg),
+            machine.clone(),
+            Arc::new(Advanceable::new()),
+        );
+        for index in 0..4 {
+            let command = format!("cargo build --release {index}");
+            let job = machine
+                .spawn(&ShellCommand {
+                    command: &command,
+                    root: std::path::Path::new("/tmp"),
+                })
+                .unwrap();
+            let (mailbox, _rx) = crossbeam_channel::unbounded();
+            actor
+                .ctx
+                .registry
+                .launch(jobs::Launch::started(
+                    actor.id, command, false, mailbox, job,
+                ))
+                .unwrap();
+        }
+
+        let state = ActorState::default();
+        let listing = status_tool(&actor, &state).unwrap();
+        let cap = result_cap(&actor, &state);
+        assert_eq!(cap, 2_458, "the 8 K window's cap, the audit's own number");
+        // Before the fix this was the whole jobs window — four 1,500-byte
+        // tails, 6,000 bytes plus headlines — some three times the turn's room.
+        assert!(
+            listing.len() <= cap + 128,
+            "a status is bounded by the turn's result cap, not only by the jobs window: \
+             {} bytes of a {cap}-byte cap",
+            listing.len()
+        );
+        assert!(
+            listing.ends_with("to see the rest]"),
+            "and a cut says so: {listing:?}"
+        );
+        assert!(listing.contains("jobs:"), "{listing}");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// The digest names the size of what it hides exactly when it hides
     /// something: a body the column holds whole gains no `(N chars total)`, and
     /// a body the cut shortened always does — even when the `…` stands in for a
@@ -7904,6 +8429,7 @@ mod tests {
     fn a_second_run_failing_the_same_way_is_news_again() {
         let (actor, _mailbox) = test_actor("same-text-twice");
         let mut state = ActorState::default();
+        known_child(&mut state, 3);
         let mut messages = vec![Message::system("you are mush")];
         let error = "Connection reset by peer (os error 104)";
         let line = format!("#3 failed: {error}");
@@ -7944,6 +8470,9 @@ mod tests {
     fn adoption_reads_a_failed_or_stopped_line_as_delivered() {
         let (actor, _mailbox) = test_actor("adopt-shapes");
         let mut state = ActorState::default();
+        known_child(&mut state, 2);
+        known_child(&mut state, 3);
+        known_child(&mut state, 4);
         note_completion(&mut state, 2, 1, Outcome::Failed("no route".into()));
         note_completion(&mut state, 3, 1, Outcome::Stopped(Stop::Human));
         note_completion(&mut state, 4, 1, Outcome::CutOff);
@@ -8023,6 +8552,111 @@ mod tests {
             messages.iter().filter(|m| m.text() == line).count(),
             1,
             "one report, one line: {messages:?}"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The books may not grow for the life of an actor (finding A16): a session
+    /// that started a thousand jobs left a thousand report lines and a thousand
+    /// delivery marks behind — 61,893 bytes of line text for the reports alone
+    /// in the audit's probe — and one that forgot a thousand children left a
+    /// thousand ids nothing could clear.
+    ///
+    /// The reports now stop at the registry's own memory ([`REMEMBERED_JOBS`]),
+    /// and only *read* ones go: a report `drain_signals` has recorded for the
+    /// next boundary is news, whatever its age, and never dropped. The child
+    /// half is the same absence read twice — the tombstone set is gone, so an
+    /// id no book names is an id whose report is not news.
+    #[test]
+    fn a_thousand_jobs_leave_the_job_books_the_size_of_the_registry() {
+        let (actor, _mailbox) = test_actor("job-books");
+        let mut state = ActorState::default();
+        let mut messages = vec![Message::system("you are mush")];
+
+        // The oldest report is the one nobody has read yet: it survives every
+        // prune, because that is the one thing a later boundary still has to
+        // fold in.
+        state.done_jobs.insert(
+            JobId(1),
+            JobReport {
+                line: "#c1 done: exit 0 · 1s · the one nobody has read".into(),
+                news: true,
+            },
+        );
+
+        for id in 2..=1_001u64 {
+            let line = format!("#c{id} done: exit 0 · 1s · cargo test — ok");
+            assert!(matches!(
+                absorb(
+                    &actor,
+                    &mut state,
+                    &mut messages,
+                    AgentMsg::CommandDone {
+                        id: JobId(id),
+                        line,
+                        news: true,
+                    }
+                ),
+                Fold::Run
+            ));
+        }
+
+        assert!(
+            state.done_jobs.len() <= REMEMBERED_JOBS,
+            "the reports stop at the registry's own memory: {}",
+            state.done_jobs.len()
+        );
+        assert!(
+            state.delivered_jobs.len() <= REMEMBERED_JOBS,
+            "and so do the delivery marks: {}",
+            state.delivered_jobs.len()
+        );
+        assert!(
+            state
+                .delivered_jobs
+                .iter()
+                .all(|id| state.done_jobs.contains_key(id)),
+            "a mark without a report behind it is a `wait` that can never answer"
+        );
+        assert!(
+            state.done_jobs.contains_key(&JobId(1)) && !state.delivered_jobs.contains(&JobId(1)),
+            "the unread report is news and outlives every prune: {:?}",
+            state.done_jobs.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !state.done_jobs.contains_key(&JobId(2)),
+            "the oldest *read* report is the one that goes"
+        );
+        assert!(
+            messages.iter().any(|m| m.text().contains("#c2 done:")),
+            "and it is not lost news: the transcript it was folded into holds it"
+        );
+
+        // The child half of the same finding: the tombstone set is gone, so the
+        // absence from `children` is the whole record — and a report from an id
+        // whose row the reap has taken is swallowed exactly as before.
+        known_child(&mut state, 7);
+        absorb(
+            &actor,
+            &mut state,
+            &mut messages,
+            AgentMsg::ForgetChild { id: 7 },
+        );
+        let line = "#7 done: and the parser";
+        absorb(
+            &actor,
+            &mut state,
+            &mut messages,
+            AgentMsg::ChildDone {
+                id: 7,
+                run: 1,
+                outcome: Outcome::Finished("and the parser".into()),
+            },
+        );
+        assert!(
+            !messages.iter().any(|m| m.text() == line),
+            "a report of a child the tree has dropped is not folded in: {:?}",
+            messages.last().unwrap().text()
         );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
@@ -9852,6 +10486,16 @@ mod tests {
         (actor, mailbox)
     }
 
+    /// Give `state` the book of a child it never spawned, the way `spawn_tool`
+    /// and `note_child_book` write one in production. `children` is the book
+    /// that says whose reports are news (finding A16), so a completion injected
+    /// for an id this map does not name is swallowed like any other report of a
+    /// child the tree has dropped.
+    fn known_child(state: &mut ActorState, id: u64) {
+        let (cmd, _rx) = crossbeam_channel::unbounded();
+        state.children.insert(id, cmd);
+    }
+
     /// One picture with the pixels a test cares about. The bytes are a
     /// placeholder on purpose: [`Image::weight`] prices a picture by its pixels
     /// when its header named a size, and that is the pricing the window
@@ -11550,6 +12194,88 @@ mod tests {
         assert_eq!(
             usage[0],
             "the endpoint counted 18446744073709.6M prompt + 18446744073709.6M completion tokens this run (18446744073709.6M total)"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// A run is more than the calls that carry its result: a fold is a call
+    /// like any other, and usually the largest one of the run — it re-sends the
+    /// whole history. What the endpoint counted for it belongs to the run's
+    /// number, whatever the final reply does or does not report.
+    #[test]
+    fn a_fold_and_the_final_reply_both_report_the_endpoints_counts() {
+        let scripted = Arc::new(
+            Scripted::new()
+                // The fold the human asked for. The counts written for it are
+                // dropped by `compact_history` today: it reads the summary's
+                // text and never the reply's `usage`.
+                .says("the summary")
+                .with_usage(9_000, 100, 9_100)
+                .says("all done")
+                .with_usage(7, 5, 12),
+        );
+        let (actor, events, mailbox) = scripted_actor("usage-fold", &scripted);
+        let mut state = ActorState {
+            compact_requested: true,
+            ..ActorState::default()
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("say hi"),
+            Message::assistant("working on it"),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("all done"));
+
+        let usage: Vec<String> = notices(&events);
+        assert_eq!(usage.len(), 1, "one line per run: {usage:?}");
+        assert_eq!(
+            usage[0],
+            "the endpoint counted 9k prompt + 105 completion tokens this run (9.1k total)",
+            "the fold's call is the run's largest, and its counts are the run's"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+        let _ = mailbox;
+    }
+
+    /// A run that ended by a Stop is the one where the money number matters
+    /// most: the work in flight is gone, and what the endpoint counted so far
+    /// is the only honest account of what it cost. Every ending reports, not
+    /// only the clean one.
+    #[test]
+    fn a_cancelled_run_still_reports_what_the_endpoint_counted() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .calls(vec![tool_call(
+                    "c1",
+                    "run_command",
+                    json!({ "command": "ls" }),
+                )])
+                .with_usage(4_040, 0, 4_040)
+                .cancels(),
+        );
+        let (actor, events, mailbox) = build_actor_about(
+            "usage-cancel",
+            scripted,
+            test_cfg(),
+            Arc::new(ScriptedMachine::new().runs(Script::exits(0).says("ok"))),
+            Arc::new(Advanceable::new()),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![Message::user("look around")];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel);
+        assert_eq!(result.unwrap_err(), CANCELLED);
+
+        let usage: Vec<String> = notices(&events);
+        assert_eq!(usage.len(), 1, "one line per run: {usage:?}");
+        assert_eq!(
+            usage[0],
+            "the endpoint counted 4k prompt + 0 completion tokens this run (4k total)"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
         let _ = mailbox;
@@ -13533,6 +14259,7 @@ mod tests {
     fn fold_completions_folds_results_and_leaves_nudges_parked() {
         let (actor, events, _mailbox) = recording_actor("fold-boundary");
         let mut state = ActorState::default();
+        known_child(&mut state, 1);
         state.deferred.push(AgentMsg::Nudge("steer".into()));
         note_completion(&mut state, 1, 1, Outcome::Finished("did the thing".into()));
         let mut messages = vec![
@@ -13649,6 +14376,19 @@ mod tests {
             scripted.clone(),
         )
         .tx;
+        // The child's row reaches the parent's books before the run starts: the
+        // books are where a report is news (finding A16), and this test injects
+        // the completion rather than spawning the child.
+        let (child_tx, _child_rx) = crossbeam_channel::unbounded();
+        root_tx
+            .send(AgentMsg::ChildBook {
+                id: 1,
+                cmd: child_tx,
+                outcome: None,
+                read: true,
+                shared: false,
+            })
+            .unwrap();
         root_tx
             .send(AgentMsg::Run(vec![
                 Message::system("you are mush"),
@@ -13721,6 +14461,7 @@ mod tests {
     fn replacing_the_transcript_keeps_an_unread_completion_deliverable() {
         let (actor, _mailbox) = test_actor("deliver");
         let mut state = ActorState::default();
+        known_child(&mut state, 1);
         let mut messages = vec![Message::system("you are mush"), Message::user("task")];
         // A completion that arrived between boundaries and has not been folded
         // into the model's transcript yet.
@@ -13920,6 +14661,9 @@ mod tests {
         );
         let (actor, _events, mailbox) = scripted_actor("child-done-mid-batch", &model);
         let mut state = ActorState::default();
+        // The child's own row: a report is news only from a child the parent's
+        // book names (finding A16).
+        known_child(&mut state, 1);
         let cancel = Arc::new(AtomicBool::new(false));
         let mut messages = vec![
             Message::system("you are mush"),
@@ -13960,6 +14704,7 @@ mod tests {
     fn a_completion_is_delivered_once() {
         let (actor, _mailbox) = test_actor("delivered-once");
         let mut state = ActorState::default();
+        known_child(&mut state, 1);
         let mut messages = vec![Message::system("you are mush")];
         note_completion(
             &mut state,
@@ -14557,7 +15302,7 @@ mod tests {
         // text in the transcript is what the *second* call is answered with.
         let scripted = Arc::new(
             Scripted::new()
-                .when(|asked: &Asked| asked.saw("none of them is landable"))
+                .when(|asked: &Asked| asked.saw("none of them is landable against HEAD"))
                 .says("the spawn was refused")
                 .calls(vec![tool_call(
                     "c0",
@@ -14592,7 +15337,9 @@ mod tests {
             .into_iter()
             .find_map(|(_, event)| match event {
                 AgentEvent::Message(message)
-                    if message.text().contains("none of them is landable") =>
+                    if message
+                        .text()
+                        .contains("none of them is landable against HEAD") =>
                 {
                     Some(message.text().to_string())
                 }
@@ -14606,6 +15353,19 @@ mod tests {
         assert!(refusal.contains("#1 (.mush/wt/1)"), "{refusal}");
         assert!(refusal.contains("git worktree remove --force"), "{refusal}");
         assert!(refusal.contains("git branch -d mush/<id>"), "{refusal}");
+        // The question that was asked, and the case it over-counts: a nested
+        // child merged only into its parent's branch is landable by the sweep
+        // and counted here, so the refusal must not call it unmerged (finding
+        // F7). The old wording said "each holds an unmerged branch" about
+        // worktrees the sweep would take.
+        assert!(
+            refusal.contains("a nested child merged only into its parent's branch counts here"),
+            "the refusal names which question was asked: {refusal}"
+        );
+        assert!(
+            !refusal.contains("unmerged"),
+            "and never claims a branch the sweep can land is unmerged: {refusal}"
+        );
 
         assert!(
             !events
@@ -15453,6 +16213,106 @@ mod tests {
             37_210,
             "the transcript is untouched: a refused fold is not a trim"
         );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A `/compact` from rest is a model call like any other: the endpoint's
+    /// own counts for it are reported, and the sentence says "this fold"
+    /// because there is no run for "this run" to name.
+    #[test]
+    fn an_idle_fold_reports_the_endpoints_own_counts_for_this_fold() {
+        let scripted = Arc::new(
+            Scripted::new()
+                .says("the summary")
+                .with_usage(1_111, 222, 1_333),
+        );
+        let (actor, events, _mailbox) = build_actor_about(
+            "idle-fold-usage",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState {
+            compact_requested: true,
+            ..ActorState::default()
+        };
+        let mut transcript = vec![
+            Message::system("you are mush"),
+            Message::user("say hi"),
+            Message::assistant("hi"),
+        ];
+
+        compact_now(&actor, &mut state, &mut transcript);
+
+        let lines: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(line) if line.contains("endpoint counted") => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            lines,
+            vec![
+                "the endpoint counted 1.1k prompt + 222 completion tokens this fold \
+                 (1.3k total)"
+                    .to_string()
+            ],
+            "the fold's call is reported, and the noun is the fold's"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The fold's refusal is the run's refusal, in one sentence and one bound:
+    /// a notice is wrapped and painted (and `/notes` re-wraps it), while the
+    /// endpoint's body is bounded only by `http.rs`'s `MAX_BODY_BYTES = 80 MiB`
+    /// — a hostile or verbose endpoint plus one `/compact` used to put the whole
+    /// body through the notes list (finding C10).
+    #[test]
+    fn a_folds_refusal_is_bounded_like_the_runs() {
+        let body = "x".repeat(1 << 20);
+        let scripted = Arc::new(Scripted::new().fails_with(500, &body));
+        let (actor, events, _mailbox) = build_actor_about(
+            "fold-refusal",
+            scripted,
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let mut state = ActorState {
+            compact_requested: true,
+            ..ActorState::default()
+        };
+        let mut transcript = vec![
+            Message::system("you are mush"),
+            Message::user("say hi"),
+            Message::assistant("hi"),
+        ];
+
+        compact_now(&actor, &mut state, &mut transcript);
+
+        let refusals: Vec<String> = events
+            .events_for(AgentId(7))
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice(line) if line.contains("could not compact") => Some(line),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(refusals.len(), 1, "one line: {refusals:?}");
+        let line = &refusals[0];
+        assert!(
+            line.contains("the endpoint answered 500: xxx"),
+            "the refusal still says what the endpoint said: {line}"
+        );
+        assert!(
+            line.len() < 1_000,
+            "the notice is bounded, not the endpoint's whole body: {} bytes",
+            line.len()
+        );
+        assert!(line.ends_with('…'), "and it says it was cut: {line:?}");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -17075,7 +17935,10 @@ mod tests {
 
     /// A named base is resolved to a commit before anything is created: a
     /// scratch workspace that is no repository at all refuses the call, and no
-    /// child is spawned on some other history (finding H7).
+    /// child is spawned on some other history (finding H7). The sentence is the
+    /// repository's own first word about the state — the same gate
+    /// [`git::worktree_add`] asks — because a name cannot be resolved in a
+    /// directory git cannot answer for either (finding F16).
     #[test]
     fn a_named_base_is_resolved_before_anything_is_created() {
         let (actor, _mailbox) = scripted_tools_actor(
@@ -17099,8 +17962,52 @@ mod tests {
         let ToolError::Failed(error) = error else {
             panic!("an unknown base is a failed call");
         };
-        assert!(error.contains("unknown base"), "{error}");
+        assert!(error.contains("not a git repository"), "{error}");
         assert!(state.children.is_empty(), "nothing may be spawned");
+    }
+
+    /// A repository with no commit refuses a base spawn with the sentence
+    /// written for *that* state. The production road used to resolve the name
+    /// first, so a fresh `git init` answered `unknown base \`main\`` — git's own
+    /// word about a name that could never resolve — and spent a process on the
+    /// question `worktree_add` asks again a moment later (finding F16's
+    /// residual; the git door already asks `has_commits` first).
+    #[test]
+    fn a_base_spawn_in_a_repo_without_commits_refuses_with_that_reason() {
+        let (actor, _mailbox) = scripted_tools_actor(
+            "spawn-unborn-base",
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let root = actor.ctx.root.clone();
+        git_in(&root, &["init", "-q", "-b", "main"]);
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "b", "title": "unborn base", "base": "main" }),
+            &cancel,
+        )
+        .unwrap_err();
+        let ToolError::Failed(why) = refused else {
+            panic!("an unborn repository is a failed call");
+        };
+        assert_eq!(
+            why, "the repo has no commits yet — commit first or drop isolated",
+            "the repository's state outranks the name the model spoke"
+        );
+        assert!(state.children.is_empty(), "nothing may be spawned");
+        assert!(
+            !root.join(".mush/wt/1").exists(),
+            "and nothing was created before the refusal"
+        );
+        // The refusal comes before the id is drawn: the retry after a human
+        // commits is consecutive.
+        assert_eq!(actor.ctx.ids.agents_floor(), 1, "no id was drawn");
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// A wrongly-typed `base` is refused, never read as "no base":
@@ -17235,6 +18142,112 @@ mod tests {
         assert!(refused.contains("shared workspace"), "{refused}");
     }
 
+    /// The one-shared-child rule is a rule about a *directory*, and the books it
+    /// used to read are one parent's: the root spawns shared #1, #1 spawns
+    /// shared #2 — the same checkout by construction — and ends its own run, and
+    /// the root must not be free to spawn a third writer into that checkout
+    /// while #2 still works there. #2 is never in the root's books, because it
+    /// is #1's child (finding F13).
+    ///
+    /// #2's one reply is held, so its run is what the directory is busy with
+    /// while the root asks again; the request reaching the model is also the
+    /// proof that #2's run booked itself in the tree-wide book.
+    #[test]
+    fn the_shared_workspace_rule_counts_every_live_writer_in_that_directory() {
+        let gate = Arc::new(Gate::new());
+        let model = Arc::new(
+            Scripted::new()
+                // The root: delegate to #1, wait for it, and end its run once
+                // the report is in.
+                .when(|asked: &Asked| asked.depth().is_none() && asked.saw("#1 done"))
+                .says("heard from my child")
+                .when(|asked: &Asked| asked.depth().is_none() && asked.saw("spawned agent"))
+                .calls(vec![tool_call("c0b", "wait", json!({}))])
+                .when(|asked: &Asked| asked.depth().is_none())
+                .calls(vec![tool_call(
+                    "c0a",
+                    "spawn_agent",
+                    json!({ "brief": "delegate this to your own subagent" }),
+                )])
+                // #1: its own shared child, and then the end of its run while
+                // that child works.
+                .when(|asked: &Asked| asked.depth() == Some(1) && asked.saw("spawned agent"))
+                .says("left my own child running")
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .calls(vec![tool_call(
+                    "c1a",
+                    "spawn_agent",
+                    json!({ "brief": "work in this checkout" }),
+                )])
+                // #2: held, so the directory's one live writer is this run.
+                .when(|asked: &Asked| asked.depth() == Some(2))
+                .held(gate.clone())
+                .says("grandchild done"),
+        );
+        let (actor, events, _mailbox) = scripted_actor("shared-directory", &model);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut messages = vec![
+            Message::system("you are mush"),
+            Message::user("delegate the work"),
+        ];
+
+        let result = run_loop(&actor, &mut state, &mut messages, &cancel).unwrap();
+        assert_eq!(result.as_deref(), Some("heard from my child"));
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the grandchild never reached its own run"
+        );
+        assert_eq!(
+            state.children.keys().copied().collect::<Vec<_>>(),
+            vec![1],
+            "the parent's books name the child it spawned, and no grandchild"
+        );
+        assert!(
+            !state.running.contains(&1),
+            "the child's own run is over while its child works"
+        );
+
+        // The child's child is the writer the old count could not see: the
+        // parent's books hold neither `shared` nor `running` for it.
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "write in this checkout too" }),
+            &cancel,
+        )
+        .unwrap_err();
+        let ToolError::Failed(refused) = refused else {
+            panic!("a second writer in the directory is a failed call, not a memory error");
+        };
+        assert!(
+            refused.contains("#2"),
+            "the refusal names the grandchild's run: {refused}"
+        );
+        assert!(refused.contains("shared workspace"), "{refused}");
+        assert_eq!(
+            state.children.keys().copied().collect::<Vec<_>>(),
+            vec![1],
+            "and nothing was spawned"
+        );
+
+        // The held writer is let go, so its run ends and its thread leaves.
+        gate.release();
+        let ended = |id: AgentId| {
+            events
+                .events_for(id)
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Done))
+        };
+        let deadline = Instant::now() + WAIT;
+        while !ended(AgentId(2)) && Instant::now() < deadline {
+            let _ = events.wait(Duration::from_millis(50));
+        }
+        assert!(ended(AgentId(2)), "the released writer must end its run");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// `spawn_agent` can name its child: the name travels in the `Spawned`
     /// event, trimmed, and a blank or missing one leaves the row to derive its
     /// own handle from the brief (finding U14).
@@ -17283,6 +18296,65 @@ mod tests {
             titles,
             vec![Some("parser port".to_string()), None, None],
             "only a real name is carried, and it is trimmed"
+        );
+    }
+
+    /// A title is a row's name and a row is one line. `truncate` keeps `\n` and
+    /// `\t`, so `title: "parser\nport"` used to reach a one-line painter and
+    /// break the row's shape; the fold belongs here, in `spawn_tool`, where the
+    /// title is read off the wire (finding F14's newline half). The first line
+    /// is [`first_line`]'s: whitespace runs collapse, and a second line is not
+    /// part of the name.
+    #[test]
+    fn a_title_with_a_newline_cannot_reach_a_one_line_row() {
+        let (actor, events, _mailbox) = build_actor_about(
+            "spawn-title-fold",
+            Arc::new(
+                Scripted::new()
+                    .when(|asked: &Asked| asked.depth() == Some(1))
+                    .says("done"),
+            ),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let mut state = ActorState::default();
+        let cancel = AtomicBool::new(false);
+        let spawn = |state: &mut ActorState, args: Value| {
+            exec_tool(&actor, state, ToolName::SpawnAgent, &args, &cancel)
+        };
+
+        spawn(
+            &mut state,
+            json!({ "brief": "port the parser", "title": "parser\nport the lexer" }),
+        )
+        .unwrap();
+        note_completion(&mut state, 1, 1, Outcome::Stopped(Stop::Human));
+        spawn(
+            &mut state,
+            json!({ "brief": "port the lexer", "title": "  parser\tport  " }),
+        )
+        .unwrap();
+
+        let titles: Vec<Option<String>> = events
+            .events()
+            .into_iter()
+            .filter_map(|(_, event)| match event {
+                AgentEvent::Spawned { title, .. } => Some(title),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            titles,
+            vec![Some("parser".to_string()), Some("parser port".to_string())],
+            "a newline and a tab are folded before the row ever sees the name"
+        );
+        assert!(
+            titles
+                .iter()
+                .flatten()
+                .all(|title| !title.contains(['\n', '\t', '\r'])),
+            "nothing in a title can break a one-line row"
         );
     }
 
