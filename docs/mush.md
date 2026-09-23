@@ -473,7 +473,7 @@ elided, and the cursor is always on screen.
 | selecting | `↑`/`↓` the cursor one transcript line, `Shift` holding the selection while it moves · `PgUp`/`PgDn` ten lines at a time · `Home`/`End` the oldest / newest · `Enter` copy the selection, or the cursor's own line · `Esc` leave without copying · the pane's own scroll keys are the cursor's while this is open, and a letter is not typing |
 | picker | `j`/`k`, arrows, `g`/`G`, `Home`/`End`, `PgUp`/`PgDn` move the list, `Enter` take the row, `Esc` close |
 | agents | `j`/`k`, arrows, `g`/`G`, `Home`/`End` move the rows, `PgUp`/`PgDn` page them, `←` the row's parent, `→` its first child, `Enter` show its transcript, `c` cancel that agent, `Esc` back to the root |
-| chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `Ctrl-V` attach the image on the clipboard, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete` (at the start of the box, Backspace pops the newest attachment), `Ctrl-U` clear the words and keep the images, `Ctrl-Z` put back what the box last lost, `↑`/`↓`/`PgUp`/`PgDn` scroll (the select mode's cursor while it is open), `Esc` clear the box and its attachments · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/compact` `/notes` `/help` `/quit` |
+| chat | typing, `Enter` send, `Shift`/`Alt-Enter` a new line, `Ctrl-V` attach the image on the clipboard, `←`/`→`/`Home`/`End` the box cursor, `Backspace`/`Delete` (at the start of the box, Backspace pops the newest attachment), `Ctrl-U` clear the words and keep the images, `Ctrl-Z` put back what the box last lost, `↑`/`↓`/`PgUp`/`PgDn` scroll (the select mode's cursor while it is open), `Esc` clear the box and its attachments · a `/`-line is a command: `/provider` `/model` `/url` `/key` `/models` `/context` `/compact` `/notes` `/help` `/quit` |
 
 A paste whose every word is an image's path attaches them all — one or several,
 split on whitespace or newlines — and anything else is text and lands in the box
@@ -683,15 +683,17 @@ measured against its *parent's* branch, which is what makes the Σ in the title
 exact.
 
 The context window is resolved the same way: a window the human stated
-(`--context` / `MUSH_CONTEXT`, the home config's `context`, or this workspace's
-stored choice) › what the endpoint advertises (`max_model_len`, `context_length`,
-`context_window`, `n_ctx`, at the top level or under `meta`) › the model's
-documented window (`deepseek-flash` and `deepseek-v4-pro`: 500k) › the provider
-default. Derived windows are never persisted — they are re-read, so a stale guess
-cannot outlive its cause — and the caps a tool result may use follow the window,
-so one command's output can never fill an 8k transcript. A server that complains
-about the context length teaches mush the number it names, and the run retries
-once.
+(`--context` / `MUSH_CONTEXT`, the home config's `context`, `/context N`, or this
+workspace's stored choice) › what the endpoint advertises (`max_model_len`,
+`context_length`, `context_window`, `n_ctx`, at the top level or under `meta`) ›
+the model's documented window (`deepseek-flash` and `deepseek-v4-pro`: 500k) ›
+the provider default. `/context` with no argument reports the window in force and
+the road it came by; `/context auto` drops the statement and lets the window
+derive again. Derived windows are never persisted — they are re-read, so a stale
+guess cannot outlive its cause — and the caps a tool result may use follow the
+window, so one command's output can never fill an 8k transcript. A server that
+complains about the context length teaches mush the number it names, and the run
+retries once.
 
 Everything mush knows about a named vendor — the name a human types, its
 default endpoint, the models it documents, their windows, whether the thinking
@@ -812,7 +814,7 @@ for the alert red, because a failure has to look the same wherever it is read.
 <workspace>/
   .mush/
     .gitignore     # contains a single line: *
-    session.json   # the conversation, model, provider, endpoint, and stored failures
+    session.json   # the conversation, model, provider, endpoint, a stated window, and stored failures
     session.json.previous  # the conversation the last new chat cleared
     wt/            # isolated agents' git worktrees (when used)
 ```
@@ -1433,8 +1435,9 @@ python3 scripts/smoke.py target/debug/mush /tmp/mush-smoke --cancel
   status the endpoint chose, a body past the cap, or a cancellation is returned as
   it is, first time.
 - **A window a human states always beats a default.** `--context` / `MUSH_CONTEXT`
-  / the home config's `context` win over what an endpoint advertises, a model
-table and the provider's own fallback, and are remembered in the session.
+  / the home config's `context` / `/context N` win over what an endpoint
+  advertises, a model table and the provider's own fallback, and are remembered
+  in the session.
 - **A window says whose it is.** Each workspace hashes its canonical path to one
   of thirty hues and the chrome wears it (§4.5); the *content* colours do not
   move, because a failure has to read the same in every window. The hash is
