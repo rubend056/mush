@@ -54,7 +54,7 @@ for is gone.)
 
 Acceptance test for the whole program: **the default `cargo test` needs no
 socket, no subprocess, and no sleep longer than 50 ms; `--ignored` is only for
-live endpoints.**
+live endpoints and the idle-box frame budget.**
 
 ---
 
@@ -329,7 +329,9 @@ needs no socket, no subprocess and no sleep over 50 ms, and `--ignored` contains
 only live-endpoint tests — held: the actor scenarios it used to hold (five, not
 the four this line first claimed; more have grown beside them since) run in the
 default suite, and `--ignored` is now exactly the three live-endpoint tests in
-`http.rs` (the model list, the reply cap, and the TLS handshake).
+`http.rs` (the model list, the reply cap, and the TLS handshake) plus
+`app/mod.rs`'s idle-box test of the 16 ms frame budget
+(`a_frame_fits_in_a_60fps_budget_on_a_long_transcript`).
 
 **Stage 2.1 — `ModelClient`.** ✅ `crates/mush/src/model.rs` holds one trait
 (`chat(&ChatRequest, &AtomicBool) -> Result<ChatResponse, ModelError>`), the
@@ -507,7 +509,8 @@ was asked for, and what it now says:
   *is* the process group or the scratch file, and the local mock sockets in
   `http.rs` — with their 200–600 ms read slices — left after Stage 2.3.
 - §0's acceptance test: **held** for the default suite, whose only remaining
-  `#[ignore]`s are the three live-endpoint tests in `http.rs`.
+  `#[ignore]`s are the three live-endpoint tests in `http.rs` and `app/mod.rs`'s
+  idle-box frame-budget test.
 - §12: the decisions the wave made — one owner per fact; a trait is justified
   only by a fake a test actually uses; a delivered result has one owner; notices
   have kinds and lifetimes; a transport hiccup is retried and an answer is not; a
