@@ -4923,11 +4923,15 @@ mod tests {
         let ws = Workspace::new(root).unwrap();
         let cfg = Config::new("http://127.0.0.1:1", "test-model", None);
         let (tx, rx) = crossbeam_channel::unbounded::<Msg>();
+        // One cell for the window and the tree: the actor is handed the very
+        // handle the `App` edits, so a test that states a window has stated it
+        // for the requests too (and not only for the meter).
+        let cell = ConfigCell::own(cfg);
         let handle =
-            agent::spawn_scripted_ui(cfg.clone(), tx.clone(), root.to_path_buf(), scripted);
+            agent::spawn_scripted_ui(cell.handle(), tx.clone(), root.to_path_buf(), scripted);
         let app = App::new(
             ws,
-            ConfigCell::own(cfg),
+            cell,
             None,
             handle,
             tx,
@@ -5134,6 +5138,126 @@ mod tests {
             stored_before,
             "nothing of a ghost reaches the store"
         );
+    }
+
+    /// A5's end-to-end half: twenty children, each spawned and waited on by a
+    /// scripted root, all the way to `Done` and idle. Every report is delivered,
+    /// so the stored session holds no `result_unread: true`; the twelve outside
+    /// the warm window have their threads reclaimed by `park_history` and the
+    /// newest eight keep theirs (§8.21).
+    ///
+    /// This is the road the race used to break: the parent folded a child's
+    /// report in the gap between `ChildDone` and the child's ending event, so
+    /// the ending re-armed `✉` over a result the model had read — a lying mark,
+    /// a pinned thread and a node `CHILD_HISTORY` could no longer forget. With
+    /// the ending emitted first, the store must hold zero unread results.
+    #[test]
+    fn twenty_children_end_read_and_park() {
+        let mut script = Scripted::new();
+        for id in 1..=20u64 {
+            script = script
+                .when(|asked: &Asked| asked.depth().is_none())
+                .calls(vec![
+                    tool_call(
+                        &format!("s{id}"),
+                        "spawn_agent",
+                        serde_json::json!({ "brief": format!("child number {id}") }),
+                    ),
+                    tool_call(&format!("w{id}"), "wait", serde_json::json!({})),
+                ])
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .says(&format!("child number {id} is done"));
+        }
+        let scripted = Arc::new(
+            script
+                .when(|asked: &Asked| asked.depth().is_none())
+                .says("all twenty are in"),
+        );
+        let root = repo("twenty-children");
+        let (mut app, rx) = app_with_live_scripted_root(&root, scripted.clone());
+        // A window no twenty short turns can fill: the fold would otherwise eat
+        // a scripted reply meant for the next spawn, and this test is about the
+        // completion road, not about folding.
+        app.cell.edit(|cfg| cfg.set_context(1_000_000));
+        app.chat.insert("delegate twenty children");
+        app.send_message();
+
+        let children: Vec<AgentId> = (1..=20).map(AgentId).collect();
+        assert!(
+            pump(&mut app, &rx, &scripted, |app, _| {
+                children.iter().all(|id| {
+                    app.tree
+                        .node(*id)
+                        .is_some_and(|node| node.phase == Phase::Done)
+                }) && app
+                    .tree
+                    .node(AgentId::ROOT)
+                    .is_some_and(|node| node.phase == Phase::Done)
+            }),
+            "twenty children and their root must run to Done"
+        );
+
+        let stored = app.session_snapshot();
+        assert_eq!(stored.agents.len(), 20, "every child is in the store");
+        let unread: Vec<u64> = stored
+            .agents
+            .iter()
+            .filter(|agent| agent.result_unread)
+            .map(|agent| agent.id)
+            .collect();
+        assert!(
+            unread.is_empty(),
+            "a delivered result must not be re-armed into `✉`: {unread:?}"
+        );
+
+        // Park: the twelve oldest are outside `WARM_CHILDREN` and their threads
+        // go; the newest eight stay warm. `park_history`'s own probe is the
+        // `Shutdown` it sends — a parked actor's mailbox still exists and has no
+        // receiver behind it, so the send fails.
+        app.tick();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut parked = Vec::new();
+        while Instant::now() < deadline {
+            app.tick();
+            parked = children
+                .iter()
+                .take(12)
+                .copied()
+                .filter(|id| {
+                    app.tree
+                        .agent_tx
+                        .get(id)
+                        .map(|tx| tx.send(AgentMsg::Shutdown).is_err())
+                        .unwrap_or(true)
+                })
+                .collect();
+            if parked.len() == 12 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            parked.len(),
+            12,
+            "the twelve outside the warm window are parked: {parked:?}"
+        );
+        let warm: Vec<AgentId> = children
+            .iter()
+            .skip(12)
+            .copied()
+            .filter(|id| {
+                app.tree
+                    .agent_tx
+                    .get(id)
+                    .is_some_and(|tx| tx.send(AgentMsg::Shutdown).is_ok())
+            })
+            .collect();
+        assert_eq!(
+            warm,
+            children[12..].to_vec(),
+            "and only the newest eight keep a thread: {warm:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// The row goes and so does the name: a child the history window reaps is

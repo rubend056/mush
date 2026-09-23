@@ -760,6 +760,15 @@ pub enum AgentEvent {
     /// leaving the actor, so the child's row can stop wearing `✉` on the
     /// parent's reading rather than on a guess from the shape of the rows
     /// (finding H4).
+    ///
+    /// Its order against the child's own ending event is a contract, not an
+    /// accident: both travel this one UI channel, and the child emits its run's
+    /// ending before it tells the parent the report that produces this event
+    /// (`actor_main`), so a `ResultRead` can never be ordered before the
+    /// `Done`/`Error`/`Stopped` it answers. Reversed, the ending's arm of
+    /// `result_unread` would land after the read and nothing could clear it
+    /// again — a lying `✉`, a pinned thread and a node the history window can
+    /// never forget (§8.39).
     ResultRead {
         child: u64,
     },
@@ -1260,17 +1269,18 @@ pub(crate) fn spawn_scripted(
 /// The same actor, reporting through the UI's own channel instead of a sink a
 /// test reads: how an `App` test drives a *real* run's events into the window —
 /// [`spawn_scripted`] is for the tests that read what the model was asked,
-/// which the UI channel would not carry.
+/// which the UI channel would not carry. Takes the handle rather than a value,
+/// so the cell an `App` edits is the one this tree's actors read.
 #[cfg(test)]
 pub(crate) fn spawn_scripted_ui(
-    cfg: Config,
+    cfg: ConfigHandle,
     tx: Sender<Msg>,
     root: PathBuf,
     model: Arc<dyn ModelClient>,
 ) -> RootHandle {
     let conversation = next_conversation();
     let ui: Arc<dyn Events> = Arc::new(Ui::new(tx, conversation));
-    root_actor(ConfigHandle::own(cfg), model, ui, conversation, root)
+    root_actor(cfg, model, ui, conversation, root)
 }
 
 /// One conversation per Ctrl-N, so stale events can be told apart: an actor
@@ -1647,13 +1657,17 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
                 work: work.clone(),
             });
         }
-        actor.tell_parent(AgentMsg::ChildDone {
-            id: actor.id,
-            run: state.runs,
-            outcome: outcome.clone(),
-        });
-        match outcome {
-            Outcome::Failed(error) => actor.ctx.emit(actor.id, AgentEvent::Error(error)),
+        // The run's ending reaches the UI *before* the parent hears the
+        // report, and that order is the contract: both events travel the same
+        // UI channel (the ending by `ctx.emit`, the parent's `ResultRead` from
+        // the fold this report triggers), so emitting first is what makes the
+        // `Done`/`Error`/`Stopped` impossible to order after the `ResultRead`
+        // that answers it. Reversed, the parent's read lands first and the
+        // ending re-arms `AgentTree::finish`'s `result_unread` with nothing
+        // left to clear it — the row wears a lying `✉`, `may_park` keeps its
+        // thread and `kept` exempts it from the history window (§8.39, A5).
+        match &outcome {
+            Outcome::Failed(error) => actor.ctx.emit(actor.id, AgentEvent::Error(error.clone())),
             Outcome::Stopped(_) => actor.ctx.emit(actor.id, AgentEvent::Stopped),
             Outcome::Finished(_) => actor.ctx.emit(actor.id, AgentEvent::Done),
             // Unreachable from here, and deliberately listed rather than
@@ -1664,6 +1678,13 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
             // to have run.
             Outcome::CutOff => {}
         }
+        // Then the report, so the parent's fold can never beat the ending to
+        // the UI thread (see above).
+        actor.tell_parent(AgentMsg::ChildDone {
+            id: actor.id,
+            run: state.runs,
+            outcome: outcome.clone(),
+        });
         // A Shutdown arrived while this run was winding down: it is over, and
         // so is this actor.
         if state.shutdown {
@@ -9618,19 +9639,35 @@ mod tests {
         machine: Arc<dyn Machine>,
         clock: Arc<dyn clock::Clock>,
     ) -> (Actor, Arc<Recorder>, Sender<AgentMsg>) {
+        let recorder = Recorder::new();
+        let actor = build_actor_with_events(label, model, cfg, machine, clock, recorder.clone());
+        let mailbox = actor.my_tx.clone();
+        (actor, recorder, mailbox)
+    }
+
+    /// The same, with the sink named: how a test watches one emit *as it
+    /// happens* — the ordering probe below checks the parent's mailbox from
+    /// inside the child's own thread, which no recorder can do.
+    fn build_actor_with_events(
+        label: &str,
+        model: Arc<dyn ModelClient>,
+        cfg: ConfigHandle,
+        machine: Arc<dyn Machine>,
+        clock: Arc<dyn clock::Clock>,
+        events: Arc<dyn Events>,
+    ) -> Actor {
         let root = std::env::temp_dir().join(format!("mush-actor-{label}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
-        let recorder = Recorder::new();
         let ids = Ids::default();
         // The tree's one registry, over the same scripted machine and clock:
         // a job a test starts is watched in process, and its events land in the
         // same recording sink as the actor's.
-        let registry = jobs::Registry::new(clock.clone(), recorder.clone(), ids.clone());
+        let registry = jobs::Registry::new(clock.clone(), events.clone(), ids.clone());
         let ctx = Arc::new(AgentCtx {
             cfg,
             model,
-            events: recorder.clone(),
+            events,
             machine,
             clock,
             registry,
@@ -9639,7 +9676,7 @@ mod tests {
             live: Arc::new(AtomicU64::new(0)),
         });
         let (my_tx, rx) = crossbeam_channel::unbounded::<AgentMsg>();
-        let actor = Actor {
+        Actor {
             ctx,
             id: 7,
             depth: 0,
@@ -9648,15 +9685,99 @@ mod tests {
             fork: None,
             base: None,
             brief: String::new(),
-            my_tx: my_tx.clone(),
+            my_tx,
             // No parent: the standalone actor has nobody to report to, which is
             // the one `parent_tx` value that says nothing at all — a test that
             // wants the UI's road builds the actor with a dead mailbox of its
             // own (`Some(dead_mailbox())`, §8.39).
             parent_tx: None,
             rx,
-        };
-        (actor, recorder, my_tx)
+        }
+    }
+
+    /// A5, the ordering probe: this is the state machine the `✉` re-arm used to
+    /// lose, driven through one real run of `actor_main` and read in the child's
+    /// own thread.
+    ///
+    /// Both the run's ending event and the parent's `ChildDone` travel from this
+    /// actor, and they can be ordered two ways:
+    ///
+    /// - `Done` then `ResultRead` — the parent's fold happens after it has seen
+    ///   the ending, so `AgentTree::finish` arms `result_unread` and the read
+    ///   that follows clears it: the row is read and parkable;
+    /// - `ResultRead` then `Done` — the parent folded the report first, and the
+    ///   ending re-arms `result_unread` with nothing left to clear it
+    ///   (`record_child`'s `fresh` is spent and `delivered` names that run), so
+    ///   the child wears a lying `✉` forever: `may_park` keeps its thread and
+    ///   `kept` exempts it from the 50-node window (§8.39, A5).
+    ///
+    /// So the rule is the emit *before* the report, and the sink here is the
+    /// witness: it drains the parent's mailbox at the ending, in the same thread
+    /// that will send the report — a `ChildDone` already there means the report
+    /// went out first. The old order fails this probe every time it runs.
+    #[test]
+    fn the_runs_end_reaches_the_ui_before_the_parent_hears_the_report() {
+        struct EndBeforeReport {
+            report: Receiver<AgentMsg>,
+            verdict: Sender<Result<(), String>>,
+        }
+        impl Events for EndBeforeReport {
+            fn emit(&self, _id: AgentId, event: AgentEvent) {
+                let ending = matches!(
+                    event,
+                    AgentEvent::Done | AgentEvent::Error(_) | AgentEvent::Stopped
+                );
+                if !ending {
+                    return;
+                }
+                // In the child's thread, at the moment the UI is told: whatever
+                // the parent's mailbox holds now was sent before this emit.
+                let mut report_first = false;
+                while let Ok(message) = self.report.try_recv() {
+                    report_first |= matches!(message, AgentMsg::ChildDone { .. });
+                }
+                let _ = self.verdict.send(if report_first {
+                    Err(
+                        "the parent's report was sent before the run's ending reached the UI"
+                            .to_string(),
+                    )
+                } else {
+                    Ok(())
+                });
+            }
+        }
+
+        let scripted = Arc::new(Scripted::new().says("child done"));
+        let (report_tx, report_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        let (verdict_tx, verdict_rx) = crossbeam_channel::unbounded::<Result<(), String>>();
+        let sink = Arc::new(EndBeforeReport {
+            report: report_rx,
+            verdict: verdict_tx,
+        });
+        let mut actor = build_actor_with_events(
+            "end-before-report",
+            scripted,
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+            sink,
+        );
+        actor.parent_tx = Some(report_tx);
+        let mailbox = actor.my_tx.clone();
+        let run = std::thread::spawn(move || {
+            actor_main(
+                actor,
+                vec![Message::system("you are mush"), Message::user("do it")],
+                true,
+            );
+        });
+
+        let verdict = verdict_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("the run must end and report its ending to the UI");
+        let _ = mailbox.send(AgentMsg::Shutdown);
+        assert!(run.join().is_ok(), "the actor thread ends cleanly");
+        assert_eq!(verdict, Ok(()));
     }
 
     /// The root napping on `wait` must hear the human. Parking their
