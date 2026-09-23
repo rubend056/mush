@@ -316,6 +316,11 @@ not the mechanism.
 See [docs/mush.md](docs/mush.md) for the design: the single-owner event loop,
 the agent actor tree, the safety rules, and the roadmap.
 
+The tree has also been read cold, with no comment taken as true: six blind
+audits and four duplication passes, whose detail lives in
+[docs/findings.md](docs/findings.md) — the six audits in §8.51, the four passes
+in §8.70.
+
 ## Layout
 
 ```
