@@ -287,9 +287,10 @@ pub struct Painted {
 /// lives in `ui.rs` with every other colour, so a frame says only which rows
 /// wear it — and a test can read which rows the mode is on without a terminal.
 pub struct SelectRows {
-    /// Every painted row of the cursor's own source line.
+    /// Every painted row of the cursor's own stop — a line's rows, or the `…`
+    /// the elided tail is.
     pub cursor: Vec<usize>,
-    /// Every painted row of the source lines the selection covers.
+    /// Every painted row whose stop the selection covers.
     pub selected: Vec<usize>,
 }
 
@@ -385,16 +386,37 @@ struct Lost {
     images: Vec<Image>,
 }
 
-/// The select mode: a cursor over the transcript's *own source lines*, and the
-/// window a pane shows it through.
+/// One stop of the select cursor: a source line of the message it stands in,
+/// or the tail a tool result's cap hid — the rows a pane paints as one `…`.
+///
+/// The order is the transcript's: `Line(n)` before `Line(n+1)`, and a message's
+/// `Tail` after every one of its lines. The copy reads that order too: a
+/// selection's text is the source lines its stops cover ([`Stop::span`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Stop {
+    /// An index into `Message::text().split('\n')`.
+    Line(usize),
+    /// Every source line the pane's cap painted no row for. It names no line
+    /// because *which* line that is is the pane's measure (`wrap_text_capped`
+    /// at its width), not the transcript's: this is the one spelling of "the
+    /// hidden tail", wherever a pane's cap falls.
+    Tail,
+}
+
+/// The select mode: a cursor over the transcript's *stops*, and the window a
+/// pane shows it through.
 ///
 /// `Ctrl-Y` starts it and `Enter` copies, so this is the one road from a pane to
 /// the clipboard. What it copies is the transcript, not the rows: a painted row
 /// is a wrap of a source line at one terminal's width, and a drag over the
 /// screen is the terminal's rectangle — neither is text another program can be
 /// handed. `Message::text()` is, and every source line is one line of it, so
-/// the cursor moves over those lines and the copy is them joined with the
-/// newlines the transcript has — a soft wrap never becomes one.
+/// the copy is whole source lines joined with the newlines the transcript has —
+/// a soft wrap never becomes one. A *stop* is a painted row, though: a source
+/// line is one stop whether it wraps over one row or five, and the `…` a tool
+/// result's cap paints is one stop for every line that cap hid — so stepping
+/// through a long result steps through what the pane shows, and a selection
+/// that reaches the `…` takes the whole hidden tail.
 ///
 /// The mode is *modal*: while it is on the keys belong to it (`keys::key`
 /// routes them before the panes, the way a picker does), so a letter is not
@@ -404,13 +426,39 @@ struct Selecting {
     /// The agent whose pane this cursor is over: the mode belongs to one
     /// conversation, and a pane showing another one paints no cursor.
     agent: AgentId,
-    /// The cursor: an index into that agent's transcript, and an index into
-    /// `Message::text().split('\n')` — one *source* line, which is one or more
-    /// painted rows.
-    cursor: (usize, usize),
+    /// The cursor: an index into that agent's transcript, and the [`Stop`] it
+    /// stands on.
+    ///
+    /// The second component is a stop and not a bare line index because a stop
+    /// is a *painted row*: a tool result past the pane's cap paints one `…` row
+    /// for every source line the cap hid, and a cursor that named those lines
+    /// one at a time sat on that same row for a press each — the human's "the
+    /// selector sits there a while instead of treating the `…` as one line"
+    /// (measured: a 30-line result, `Ctrl-Y`, then 22 `↓` presses that all
+    /// landed on the `…`). With the hidden tail as one stop, a single `↓` from
+    /// the last line the pane painted is the `…`, the next is the first line
+    /// of the message after the result, and `↑` walks back the same way.
+    ///
+    /// Which lines a cap hides is the *pane's* measure, so [`Self::measure`]
+    /// is what turns a `Line` into a `Tail`: a hidden line is not a stop of its
+    /// own, it is the tail's. Until a pane has painted the mode's rows, no line
+    /// is known hidden and every source line is a stop.
+    cursor: (usize, Stop),
     /// The other end of a selection while `Shift-↑`/`Shift-↓` extends one.
-    /// `None` is a bare cursor, and `Enter` then copies its own line.
-    anchor: Option<(usize, usize)>,
+    /// `None` is a bare cursor, and `Enter` then copies the stop it stands on —
+    /// a line, or the whole tail when it is the `…`.
+    anchor: Option<(usize, Stop)>,
+    /// The width the pane last painted the mode's rows at, so the key road can
+    /// tell a line the pane painted from one its cap hid.
+    ///
+    /// A `Cell` because only the frame knows the pane's measure, exactly as
+    /// `top` is: the frame publishes it as it paints, and the keys read it. It
+    /// is the pane's width, not the terminal's (the painter caps it at
+    /// `MAX_TRANSCRIPT`), so the boundary this measures is the boundary the
+    /// painter painted. `None` is a mode no pane has painted yet: no line is
+    /// then known hidden, and every source line is a stop — the reading that
+    /// cannot lose a line the pane would have shown.
+    measure: Cell<Option<usize>>,
     /// The pane's window: which message row `top.0`'s chunk starts at, and how
     /// many rows of it the window drops (`top.1`).
     ///
@@ -433,8 +481,9 @@ pub enum SelectKey {
     /// one [`Chat::start_select`] answers; the others go through
     /// [`Chat::select_apply`].
     Start,
-    /// `↑`/`↓` and `PgUp`/`PgDn`: move the cursor `step` source lines, positive
-    /// toward the newest.
+    /// `↑`/`↓` and `PgUp`/`PgDn`: move the cursor `step` stops, positive toward
+    /// the newest — one source line the pane painted, or the one `…` a capped
+    /// result's hidden tail stands as.
     Move(i64),
     /// `Shift-↑`/`Shift-↓`: move the cursor and keep the selection reaching back
     /// to where it started.
@@ -478,17 +527,17 @@ fn cleared_line(had_words: bool, images: usize) -> Option<String> {
     Some(format!("cleared {what} · Ctrl-Z puts it back"))
 }
 
-/// The rows one message paints, and the source line each row is the reading of.
+/// The rows one message paints, and the stop each row is the reading of.
 ///
-/// The map is what lets a *source line* be found among painted rows at all: a
-/// wrapped row is not a line of the text, and a tool result's cap paints fewer
-/// rows than its text has lines. `rows` runs parallel to `lines` and is `None`
-/// for a row that is not the message's own words — the reasoning, a tool call, a
-/// picture label, the blank that closes a message.
+/// The map is what lets a *stop* be found among painted rows at all: a wrapped
+/// row is not a line of the text, and a tool result's cap paints fewer rows than
+/// its text has lines. `rows` runs parallel to `lines` and is `None` for a row
+/// that is not the message's own words — the reasoning, a tool call, a picture
+/// label, the blank that closes a message.
 #[derive(Default)]
 struct Chunk {
     lines: Vec<Line<'static>>,
-    rows: Vec<Option<(usize, usize)>>,
+    rows: Vec<Option<(usize, Stop)>>,
 }
 
 impl Chunk {
@@ -513,9 +562,9 @@ impl Chunk {
 #[derive(Default)]
 struct Body {
     lines: Vec<Line<'static>>,
-    /// Parallel to `lines`: `(message index, source line)`, the provenance a
-    /// [`Chunk`] carries once the message is known.
-    rows: Vec<Option<(usize, usize)>>,
+    /// Parallel to `lines`: `(message index, stop)`, the provenance a [`Chunk`]
+    /// carries once the message is known.
+    rows: Vec<Option<(usize, Stop)>>,
 }
 
 impl Body {
@@ -538,8 +587,9 @@ impl Body {
 /// painted (the mark is, even for a message that is only a picture), a reply
 /// with no words paints nothing, and a tool result is painted from its first
 /// row — its cap decides *which* rows, never whether the line exists, so the
-/// cursor can still walk the lines a long result hides behind its `…` and copy
-/// them whole.
+/// lines a long result hides behind its `…` are still source lines the copy can
+/// take whole. They are one stop, though, not one each: [`Stops`] is where the
+/// cap's boundary turns them into [`Stop::Tail`].
 fn lines_of(message: &Message) -> Option<Vec<&str>> {
     match message.role.as_str() {
         "user" | "tool" => Some(message.text().split('\n').collect()),
@@ -550,23 +600,109 @@ fn lines_of(message: &Message) -> Option<Vec<&str>> {
     }
 }
 
-/// The first row of a message that is the reading of source line `line`, or —
-/// for a line the pane's cap hid — the last row that is the reading of a line at
-/// or before it: the result's `…`, which stands for the rows that did not fit.
-fn first_row(rows: &[Option<(usize, usize)>], message: usize, line: usize) -> Option<usize> {
-    rows.iter()
-        .position(|row| *row == Some((message, line)))
-        .or_else(|| last_row(rows, message, line))
+/// One message's cursor stops at a pane's measure: the source lines the pane
+/// painted a row for, and whether its cap hid a tail after them.
+///
+/// Built from the painter's own wrap walk ([`capped_result`]), so the boundary
+/// the cursor steps over is the boundary the pane painted — never a second wrap
+/// with arithmetic of its own that could disagree with the rows on screen.
+#[derive(Clone, Copy)]
+struct Stops {
+    /// The message's source lines.
+    lines: usize,
+    /// How many of them have a painted row, counted from the first. The rest,
+    /// when `tail` is set, are the one [`Stop::Tail`] — and this is also the
+    /// first line that tail covers, because wrapped rows run in source order:
+    /// every line up to the last painted row's line has a row, and every line
+    /// after it has none.
+    visible: usize,
+    /// Whether the cap hid rows after the last painted one.
+    tail: bool,
 }
 
-/// The last row that is the reading of `line`: a wrapped line is several rows,
-/// and a window that ends on the cursor's line wants its end, not its start.
-fn last_row(rows: &[Option<(usize, usize)>], message: usize, line: usize) -> Option<usize> {
+impl Stops {
+    /// The stops of one message at the pane's last measure, or `None` for a
+    /// message whose text has no row of its own ([`lines_of`]).
+    ///
+    /// `measure` is `None` for a mode no pane has painted yet: no line is then
+    /// known hidden, and every source line is a stop — the reading that cannot
+    /// lose a line the pane would have shown.
+    fn of(message: &Message, measure: Option<usize>) -> Option<Stops> {
+        let lines = lines_of(message)?.len();
+        let mut stops = Stops {
+            lines,
+            visible: lines,
+            tail: false,
+        };
+        let Some(width) = measure else {
+            return Some(stops);
+        };
+        if message.role.as_str() != "tool" {
+            return Some(stops);
+        }
+        let rows = capped_result(message, width);
+        if rows.last().is_some_and(|(_, stop)| *stop == Stop::Tail) {
+            stops.visible = rows
+                .iter()
+                .filter_map(|(_, stop)| match stop {
+                    Stop::Line(line) => Some(line + 1),
+                    Stop::Tail => None,
+                })
+                .max()
+                .unwrap_or(0);
+            stops.tail = true;
+        }
+        Some(stops)
+    }
+
+    /// The stop a cursor's line names at this measure: the line itself where
+    /// the pane painted a row for it, and the one tail where the cap hid it.
+    fn clamp(self, stop: Stop) -> Stop {
+        match (stop, self.tail) {
+            (Stop::Tail, true) => Stop::Tail,
+            (Stop::Tail, false) => Stop::Line(self.visible - 1),
+            (Stop::Line(line), true) if line >= self.visible => Stop::Tail,
+            (Stop::Line(line), _) => Stop::Line(line.min(self.visible - 1)),
+        }
+    }
+
+    /// The newest stop of the message.
+    fn last(self) -> Stop {
+        if self.tail {
+            Stop::Tail
+        } else {
+            Stop::Line(self.visible - 1)
+        }
+    }
+
+    /// The source lines `stop` covers: one line for [`Stop::Line`], and every
+    /// line the cap hid for [`Stop::Tail`]. Clamp first ([`Self::clamp`]): a
+    /// `Tail` on a message the pane did not clip is not a stop at all.
+    fn span(self, stop: Stop) -> (usize, usize) {
+        match stop {
+            Stop::Line(line) => (line, line),
+            Stop::Tail => (self.visible, self.lines - 1),
+        }
+    }
+}
+
+/// The first row of a message that is the reading of `stop`, or — for a stop the
+/// pane's cap hid — the last row that is the reading of a stop at or before it:
+/// the result's `…`, which stands for the tail that did not fit.
+fn first_row(rows: &[Option<(usize, Stop)>], message: usize, stop: Stop) -> Option<usize> {
     rows.iter()
-        .rposition(|row| *row == Some((message, line)))
+        .position(|row| *row == Some((message, stop)))
+        .or_else(|| last_row(rows, message, stop))
+}
+
+/// The last row that is the reading of `stop`: a wrapped line is several rows,
+/// and a window that ends on the cursor's stop wants its end, not its start.
+fn last_row(rows: &[Option<(usize, Stop)>], message: usize, stop: Stop) -> Option<usize> {
+    rows.iter()
+        .rposition(|row| *row == Some((message, stop)))
         .or_else(|| {
             rows.iter().rposition(
-                |row| matches!(row, Some((at, row_line)) if *at == message && *row_line <= line),
+                |row| matches!(row, Some((at, row_stop)) if *at == message && *row_stop <= stop),
             )
         })
 }
@@ -583,17 +719,17 @@ fn last_text(chunk: &Chunk) -> usize {
         .map_or(0, |at| at + 1)
 }
 
-/// Which row of a window the cursor is painted on: the cursor's own line's
-/// first row, or — for a line the cap hid — the row [`first_row`]'s fallback
-/// names. `None` is "this window does not show the cursor", which is what makes
-/// the frame place the window again.
+/// Which row of a window the cursor is painted on: the cursor's own stop's
+/// first row, or — for a line the cap hid — the tail's `…`, the row the pane
+/// paints for it. `None` is "this window does not show the cursor", which is
+/// what makes the frame place the window again.
 ///
 /// `cut` is the message whose rows the window's height cut short of its text: a
-/// cut message cannot answer for a hidden line, because the cursor's line may be
+/// cut message cannot answer for a hidden line, because the cursor's stop may be
 /// under the cut rather than behind the cap.
 fn cursor_row(
-    rows: &[Option<(usize, usize)>],
-    cursor: (usize, usize),
+    rows: &[Option<(usize, Stop)>],
+    cursor: (usize, Stop),
     cut: Option<usize>,
 ) -> Option<usize> {
     if let Some(at) = rows.iter().position(|row| *row == Some(cursor)) {
@@ -603,34 +739,34 @@ fn cursor_row(
         return None;
     }
     rows.iter().rposition(
-        |row| matches!(row, Some((message, line)) if *message == cursor.0 && *line <= cursor.1),
+        |row| matches!(row, Some((message, stop)) if *message == cursor.0 && *stop <= cursor.1),
     )
 }
 
 /// Whether the cursor sits above everything a window shows. A window with no
 /// text row in it at all has nothing to be above, and reads as below — the
 /// bottom anchoring is the one that ends up showing the cursor.
-fn cursor_above(body: &Body, cursor: (usize, usize)) -> bool {
+fn cursor_above(body: &Body, cursor: (usize, Stop)) -> bool {
     match body.rows.iter().flatten().next() {
         Some(&first) => cursor < first,
         None => false,
     }
 }
 
-/// The rows a window paints the mode on: the cursor's own line, and every
-/// source line the selection covers.
+/// The rows a window paints the mode on: the cursor's own stop, and every
+/// painted row whose stop the selection covers.
 ///
 /// `cursor` is the caller's clamp of the mode's own, not `select.cursor`: the
 /// row the pane paints is the row the window was placed for.
 fn select_rows(
-    rows: &[Option<(usize, usize)>],
+    rows: &[Option<(usize, Stop)>],
     select: &Selecting,
-    cursor: (usize, usize),
+    cursor: (usize, Stop),
     cut: Option<usize>,
 ) -> Option<SelectRows> {
     let at = cursor_row(rows, cursor, cut)?;
-    // Every row of the cursor's own line, not just the one the lookup landed
-    // on: a wrapped line is one line, and every row of it is the cursor.
+    // Every row of the cursor's own stop, not just the one the lookup landed
+    // on: a wrapped line is one stop, and every row of it is the cursor.
     let tag = rows[at];
     let painted: Vec<usize> = rows
         .iter()
@@ -651,7 +787,7 @@ fn select_rows(
                 .map(|(at, _)| at)
                 .collect()
         }
-        // A bare cursor is not a selection: the one line it covers would wear
+        // A bare cursor is not a selection: the one stop it covers would wear
         // both styles and say nothing the cursor does not.
         _ => Vec::new(),
     };
@@ -1387,7 +1523,9 @@ impl Chat {
 
     /// `Ctrl-Y`: start selecting in the pane `on` shows, with the cursor on the
     /// newest source line — where the pane already is, because it follows the
-    /// bottom.
+    /// bottom. For a tool result the cap clipped, that line is a hidden one and
+    /// the frame paints it on the `…`: the tail is the newest stop there, and
+    /// the first read of the cursor clamps it onto that stop.
     ///
     /// `Some(line)` is what the bar says when there is nothing to stand on: a
     /// pane with no words yet has no source line, and a mode whose cursor has
@@ -1399,6 +1537,9 @@ impl Chat {
                     agent: on,
                     cursor,
                     anchor: None,
+                    // The first frame publishes the width it paints the mode's
+                    // rows at; until then no line is known hidden.
+                    measure: Cell::new(None),
                     // Placed by the first frame, which is what knows the
                     // pane's measure; anywhere above the cursor is the same
                     // answer here.
@@ -1410,18 +1551,22 @@ impl Chat {
         }
     }
 
-    /// The newest source line the pane paints, if it paints one.
-    fn last_line(&self, on: AgentId) -> Option<(usize, usize)> {
+    /// The newest source line of the newest message that has rows of its own,
+    /// if there is one. A cap may hide that line from the pane; the frame then
+    /// paints the cursor on the `…`, the tail's own stop.
+    fn last_line(&self, on: AgentId) -> Option<(usize, Stop)> {
         let transcript = self.transcript(on);
-        (0..transcript.len())
-            .rev()
-            .find_map(|index| lines_of(&transcript[index]).map(|lines| (index, lines.len() - 1)))
+        (0..transcript.len()).rev().find_map(|index| {
+            lines_of(&transcript[index]).map(|lines| (index, Stop::Line(lines.len() - 1)))
+        })
     }
 
-    /// The oldest source line the pane paints, if it paints one.
-    fn first_line(&self, on: AgentId) -> Option<(usize, usize)> {
+    /// The oldest source line of the first message that has rows of its own, if
+    /// there is one.
+    fn first_line(&self, on: AgentId) -> Option<(usize, Stop)> {
         let transcript = self.transcript(on);
-        (0..transcript.len()).find_map(|index| lines_of(&transcript[index]).map(|_| (index, 0)))
+        (0..transcript.len())
+            .find_map(|index| lines_of(&transcript[index]).map(|_| (index, Stop::Line(0))))
     }
 
     /// What the select mode's keys do — the one place they run.
@@ -1454,15 +1599,15 @@ impl Chat {
                 Some(copied)
             }
             SelectKey::Move(step) => {
-                let next = self.step_line(on, cursor, step);
+                let next = self.step_stop(on, cursor, step);
                 self.set_cursor(next);
                 None
             }
             SelectKey::Extend(step) => {
-                let next = self.step_line(on, cursor, step);
+                let next = self.step_stop(on, cursor, step);
                 if let Some(select) = self.select.as_mut() {
                     // The anchor is where the selection started: the first
-                    // extended step plants it on the line the cursor was on,
+                    // extended step plants it on the stop the cursor was on,
                     // and every one after keeps it. A plain move never drops
                     // it, so the selection follows the cursor's end.
                     if select.anchor.is_none() {
@@ -1487,64 +1632,89 @@ impl Chat {
         }
     }
 
-    fn set_cursor(&mut self, cursor: (usize, usize)) {
+    fn set_cursor(&mut self, cursor: (usize, Stop)) {
         if let Some(select) = self.select.as_mut() {
             select.cursor = cursor;
         }
     }
 
-    /// The cursor as the transcript is *now*: a transcript can shrink under a
-    /// state that still points into it — a reaped conversation, or a state a
-    /// caller built — and neither a key nor a frame may index past the end. The
+    /// The width the pane last painted the mode's rows at, if it has
+    /// ([`Selecting::measure`]). The one read of the published measure, so the
+    /// clamp, the step and the copy all draw the cap's boundary the same way.
+    fn measure(&self) -> Option<usize> {
+        self.select.as_ref().and_then(|select| select.measure.get())
+    }
+
+    /// The cursor as the transcript *and the pane's last paint* are now: a
+    /// transcript can shrink under a state that still points into it — a reaped
+    /// conversation, or a state a caller built — and neither a key nor a frame
+    /// may index past the end; and a line the pane's cap hid is not a stop of
+    /// its own, so it becomes the one [`Stop::Tail`] the `…` paints. The
     /// nearest line that still exists is the honest clamp — and `None` when
     /// there is no source line left at all, which drops the mode rather than
     /// leaving a cursor over nothing.
-    fn clamped_cursor(&self, on: AgentId) -> Option<(usize, usize)> {
+    fn clamped_cursor(&self, on: AgentId) -> Option<(usize, Stop)> {
         let select = self.select.as_ref().filter(|select| select.agent == on)?;
+        let measure = select.measure.get();
         let transcript = self.transcript(on);
         let mut index = select.cursor.0.min(transcript.len().checked_sub(1)?);
         loop {
-            if let Some(lines) = lines_of(&transcript[index]) {
-                return Some((index, select.cursor.1.min(lines.len() - 1)));
+            if let Some(stops) = Stops::of(&transcript[index], measure) {
+                return Some((index, stops.clamp(select.cursor.1)));
             }
             index = index.checked_sub(1)?;
         }
     }
 
-    /// The source line one step older or newer than `cursor`, or `None` at an
-    /// end of the transcript.
+    /// The stop one step older or newer than `cursor`, or `None` at an end of
+    /// the transcript.
+    ///
+    /// The transcript's own lines are not the stops: a line the pane's cap hid
+    /// is one of the lines the `…` stands for, and the whole hidden tail is the
+    /// `…`'s own stop ([`Stops`]). So forward from the last line the pane
+    /// painted is the tail, forward from the tail is the next message's first
+    /// line, and backward is the same road reversed.
     fn adjacent(
         &self,
         on: AgentId,
-        cursor: (usize, usize),
+        cursor: (usize, Stop),
         forward: bool,
-    ) -> Option<(usize, usize)> {
+        measure: Option<usize>,
+    ) -> Option<(usize, Stop)> {
         let transcript = self.transcript(on);
-        let lines = lines_of(transcript.get(cursor.0)?)?;
+        let stops = Stops::of(transcript.get(cursor.0)?, measure)?;
         if forward {
-            if cursor.1 + 1 < lines.len() {
-                return Some((cursor.0, cursor.1 + 1));
+            if let Stop::Line(line) = cursor.1 {
+                if line + 1 < stops.visible {
+                    return Some((cursor.0, Stop::Line(line + 1)));
+                }
             }
-            ((cursor.0 + 1)..transcript.len())
-                .find_map(|index| lines_of(&transcript[index]).map(|_| (index, 0)))
-        } else {
-            if cursor.1 > 0 && cursor.1 < lines.len() {
-                return Some((cursor.0, cursor.1 - 1));
+            if stops.tail && cursor.1 != Stop::Tail {
+                return Some((cursor.0, Stop::Tail));
             }
-            (0..cursor.0).rev().find_map(|index| {
-                lines_of(&transcript[index]).map(|lines| (index, lines.len() - 1))
+            ((cursor.0 + 1)..transcript.len()).find_map(|index| {
+                Stops::of(&transcript[index], measure).map(|_| (index, Stop::Line(0)))
             })
+        } else {
+            match cursor.1 {
+                Stop::Tail => Some((cursor.0, Stop::Line(stops.visible - 1))),
+                Stop::Line(0) => (0..cursor.0).rev().find_map(|index| {
+                    Stops::of(&transcript[index], measure).map(|stops| (index, stops.last()))
+                }),
+                Stop::Line(line) => Some((cursor.0, Stop::Line(line - 1))),
+            }
         }
     }
 
-    /// The cursor moved `step` source lines, positive toward the newest,
-    /// stopping at either end: the oldest and the newest lines are ends of the
-    /// transcript, not walls to crash into.
-    fn step_line(&self, on: AgentId, cursor: (usize, usize), step: i64) -> (usize, usize) {
+    /// The cursor moved `step` stops, positive toward the newest, stopping at
+    /// either end: the oldest and the newest stop are ends of the transcript,
+    /// not walls to crash into.
+    fn step_stop(&self, on: AgentId, cursor: (usize, Stop), step: i64) -> (usize, Stop) {
+        let measure = self.measure();
         let mut cursor = cursor;
         let forward = step > 0;
         for _ in 0..step.unsigned_abs() {
-            match self.adjacent(on, cursor, forward) {
+            match self.adjacent(on, cursor, forward, measure) {
                 Some(next) => cursor = next,
                 None => break,
             }
@@ -1552,17 +1722,20 @@ impl Chat {
         cursor
     }
 
-    /// `Enter`: the transcript's own text for the selection, or for the cursor's
-    /// own line when there is no selection, plus the line mush says once the
-    /// clipboard has taken it.
+    /// `Enter`: the transcript's own text for the selection, or for the stop the
+    /// cursor stands on when there is no selection, plus the line mush says once
+    /// the clipboard has taken it.
     ///
     /// The text is the *source lines* joined with `\n` — the separator the
     /// transcript has between them — so a whole message is `Message::text()`
     /// byte for byte, a soft wrap at this pane's width is not a newline, and a
-    /// tab is a tab. A tool result is copied whole even where the pane's cap
-    /// hides its tail.
-    fn copy(&self, on: AgentId, cursor: (usize, usize)) -> Copied {
+    /// tab is a tab. Every stop's own source is taken: a line is itself, and the
+    /// elided tail is every line the pane's cap hid, so a selection that reaches
+    /// the `…` gets the whole block however many presses the tail spans — the
+    /// cap bounds the frame, never the copy.
+    fn copy(&self, on: AgentId, cursor: (usize, Stop)) -> Copied {
         let select = self.select.as_ref().expect("the mode is on");
+        let measure = select.measure.get();
         let (from, to) = match select.anchor {
             Some(anchor) if anchor <= cursor => (anchor, cursor),
             Some(anchor) => (cursor, anchor),
@@ -1575,13 +1748,21 @@ impl Chat {
             let Some(lines) = transcript.get(index).and_then(lines_of) else {
                 continue;
             };
+            let Some(stops) = Stops::of(&transcript[index], measure) else {
+                continue;
+            };
+            // A stop covers a span: one line, or every line the cap hid. The
+            // endpoints are clamped at this measure first, so a line a resize
+            // has hidden since stands as the tail it now is, and the two ends'
+            // spans meet without a gap (a stop's span always continues the one
+            // before it).
             let first = if index == from.0 {
-                from.1.min(lines.len() - 1)
+                stops.span(stops.clamp(from.1)).0
             } else {
                 0
             };
             let last = if index == to.0 {
-                to.1.min(lines.len() - 1)
+                stops.span(stops.clamp(to.1)).1
             } else {
                 lines.len() - 1
             };
@@ -1669,6 +1850,11 @@ impl Chat {
     /// The trim is what keeps a one-row pane from showing that blank instead of
     /// the message it separates (finding B4); only the tail is built, so a long
     /// session costs the visible rows and not the scrollback.
+    ///
+    /// A pane painting the select mode publishes the width its rows are made at
+    /// ([`Selecting::measure`]) before it clamps the cursor: only the frame
+    /// knows the pane's measure, and the key road reads it to tell a line the
+    /// pane painted from one its cap hid.
     pub fn painted(&self, pane: &Pane<'_>, width: usize, height: usize) -> Painted {
         // The foot is a foot: at most `FOOT_ROWS`, and never the transcript's
         // last row, so a pane too short for both still has a conversation in
@@ -1694,6 +1880,11 @@ impl Chat {
             .select
             .as_ref()
             .filter(|select| select.agent == pane.agent);
+        // The width these rows are painted at, published before the clamp and
+        // the body so both read the measure the map below was built at.
+        if let Some(select) = select {
+            select.measure.set(Some(width));
+        }
         let cursor = self.clamped_cursor(pane.agent);
         let mode = select.zip(cursor);
         let (mut body, cut) = match mode {
@@ -1765,12 +1956,13 @@ impl Chat {
     /// was, not where the cursor ended.
     ///
     /// `cursor` is the caller's clamp of the mode's own ([`Chat::clamped_cursor`]),
-    /// never `select.cursor`: the window is placed for the line the transcript
-    /// still has, so every index the walk makes names a row that is there.
+    /// never `select.cursor`: the window is placed for the stop the transcript
+    /// and the pane's last paint leave, so every index the walk makes names a
+    /// row that is there.
     fn select_body(
         &self,
         select: &Selecting,
-        cursor: (usize, usize),
+        cursor: (usize, Stop),
         on: AgentId,
         width: usize,
         height: usize,
@@ -1787,8 +1979,8 @@ impl Chat {
         }
         // The window the state carries no longer shows the cursor: the terminal
         // was resized, the transcript moved under it, or the cursor's
-        // own line is behind a tool result's cap. Put it where the pane can hold
-        // it — the cursor's line at the top when it is above the window, at the
+        // own stop is behind a tool result's cap. Put it where the pane can hold
+        // it — the cursor's stop at the top when it is above the window, at the
         // bottom when it is below — and leave the placement where the next
         // frame finds it.
         let start = if cursor_above(&body, cursor) {
@@ -1838,7 +2030,7 @@ impl Chat {
         (body, cut)
     }
 
-    /// One message's rows, with the message and source line each came from.
+    /// One message's rows, with the message and stop each came from.
     fn chunk(&self, on: AgentId, index: usize, width: usize) -> Chunk {
         let message = &self.transcript(on)[index];
         let voice = self.voice_at(on, index, message);
@@ -1849,15 +2041,15 @@ impl Chat {
             lines,
             rows: rows
                 .into_iter()
-                .map(|line| line.map(|line| (index, line)))
+                .map(|stop| stop.map(|stop| (index, stop)))
                 .collect(),
         }
     }
 
-    /// The window's top with the cursor's own line as its first row: where the
-    /// line begins in its message. A line the pane's cap hid begins at the
-    /// result's `…`, which is the row that stands for it.
-    fn top_at_cursor(&self, on: AgentId, width: usize, cursor: (usize, usize)) -> (usize, usize) {
+    /// The window's top with the cursor's own stop as its first row: where the
+    /// stop begins in its message. A tool result's elided tail begins at the
+    /// `…`, which is the row that stands for it.
+    fn top_at_cursor(&self, on: AgentId, width: usize, cursor: (usize, Stop)) -> (usize, usize) {
         let chunk = self.chunk(on, cursor.0, width);
         (
             cursor.0,
@@ -1865,7 +2057,7 @@ impl Chat {
         )
     }
 
-    /// The window's top with the cursor's own line as the pane's last row: the
+    /// The window's top with the cursor's own stop as the pane's last row: the
     /// rows above it, walked back until the pane is full.
     ///
     /// When the transcript's own beginning is closer than the pane's top there
@@ -1877,11 +2069,11 @@ impl Chat {
         on: AgentId,
         width: usize,
         height: usize,
-        cursor: (usize, usize),
+        cursor: (usize, Stop),
     ) -> (usize, usize) {
         let want = height.saturating_sub(1);
         let head = self.chunk(on, cursor.0, width);
-        // The cursor's line's last row is the window's last row, so the rows
+        // The cursor's stop's last row is the window's last row, so the rows
         // above the window are everything before it.
         let mut above = last_row(&head.rows, cursor.0, cursor.1).unwrap_or(0);
         let mut blocks: Vec<(usize, Chunk)> = vec![(cursor.0, head.cut(above))];
@@ -2598,15 +2790,81 @@ fn report(text: &str) -> bool {
             .any(|tail| rest[digits..].starts_with(tail))
 }
 
-/// One message's rows: who said it, wrapped at the pane's width — and, beside
-/// them, the source line of the message's own text each row is the reading of.
+/// The two columns every row of a tool result is indented by, before the mark.
+const TOOL_INDENT: usize = 2;
+
+/// The `! ` a failed tool result wears, or nothing: mush's own spelling for a
+/// call that was refused or that failed. One spelling, because the painter and
+/// the select mode's cap both have to agree on how wide it is.
+fn tool_mark(message: &Message) -> &'static str {
+    if message.text().trim_start().starts_with(FAILED) {
+        "! "
+    } else {
+        ""
+    }
+}
+
+/// The columns one tool result's rows carry before their text: the indent plus
+/// the mark, so a flagged result is not `mark` columns wider than a successful
+/// one. It is what the painter wraps inside of, and so what the select mode's
+/// cap boundary is measured from.
+fn tool_lead(message: &Message) -> usize {
+    TOOL_INDENT + tool_mark(message).width()
+}
+
+/// The rows a pane `width` columns wide paints of one tool result, and the stop
+/// each is the reading of: the result's own rows — only as many as its cap
+/// allows — and, where the cap hid the rest, the `…` whose stop is
+/// [`Stop::Tail`].
 ///
-/// The map is *returned* rather than kept by the painter because a source line
-/// is one or more painted rows, and only the pass that paints a row knows
-/// whether the row is a soft wrap of the line above it, a markdown view of it,
-/// or the `…` that stands for the tail a tool result's cap hid. A second pass
-/// that counted them could disagree with the rows on screen, and the cursor
-/// would then sit on the wrong one. The caller adds the message's index.
+/// Shared by the painter ([`render_message`]) and the select mode's stop walk
+/// ([`Stops::of`]), so the boundary the cursor steps over is the boundary the
+/// pane paints: a second wrap with arithmetic of its own could disagree with the
+/// rows on screen, and the cursor would then sit on the wrong one.
+fn capped_result(message: &Message, width: usize) -> Vec<(String, Stop)> {
+    // Only the first eight rows are ever shown, so only those are wrapped; the
+    // ninth is what tells us to print the `…`. Wrapping the whole result was
+    // most of a frame's cost on a long session.
+    const SHOWN: usize = 8;
+    let wrap = width.saturating_sub(tool_lead(message));
+    let wrapped = wrap_text_capped(message.text(), wrap, SHOWN + 1);
+    let clipped = wrapped.len() > SHOWN;
+    // Which source line each painted row is the reading of. The wrap is per
+    // source line, so walking the lines and counting their rows is where the
+    // boundaries are — and where the cap's ninth row falls, which is the row
+    // the `…` stands for. The walk stops at the cap: it is the same arithmetic
+    // `wrap_text_capped` just did, over the rows it was allowed to do it for,
+    // never a second wrap of the whole result.
+    let mut stops: Vec<Stop> = Vec::with_capacity(wrapped.len());
+    let mut left = SHOWN + 1;
+    for (line, raw) in message.text().split('\n').enumerate() {
+        if left == 0 {
+            break;
+        }
+        let count = wrap_text_capped(raw, wrap, left).len();
+        stops.extend(std::iter::repeat(Stop::Line(line)).take(count));
+        left -= count;
+    }
+    debug_assert_eq!(stops.len(), wrapped.len(), "one source per wrapped row");
+    let mut rows: Vec<(String, Stop)> = wrapped.into_iter().zip(stops).take(SHOWN).collect();
+    if clipped {
+        // The `…` is the hidden tail's own row: one stop for every line the
+        // cap did not paint, rather than a row the cursor can only reach by
+        // walking them all.
+        rows.push(("…".to_string(), Stop::Tail));
+    }
+    rows
+}
+
+/// One message's rows: who said it, wrapped at the pane's width — and, beside
+/// them, the [`Stop`] of the message's own text each row is the reading of.
+///
+/// The map is *returned* rather than kept by the painter because a stop is one
+/// or more painted rows, and only the pass that paints a row knows whether the
+/// row is a soft wrap of the line above it, a markdown view of it, or the `…`
+/// that stands for the tail a tool result's cap hid. A second pass that counted
+/// them could disagree with the rows on screen, and the cursor would then sit on
+/// the wrong one. The caller adds the message's index.
 ///
 /// `reasoning` is the pane's `Ctrl-T` choice, threaded in rather than read off a
 /// `Chat` this free function has no handle on.
@@ -2616,9 +2874,9 @@ fn render_message(
     voice: Option<Voice>,
     width: usize,
     reasoning: bool,
-) -> Vec<Option<usize>> {
+) -> Vec<Option<Stop>> {
     let start = out.len();
-    let mut rows: Vec<Option<usize>> = Vec::new();
+    let mut rows: Vec<Option<Stop>> = Vec::new();
     match message.role.as_str() {
         "user" => {
             // Mush's own line in the conversation is marked like the other
@@ -2679,66 +2937,32 @@ fn render_message(
             rows.push(None);
         }
         "tool" => {
-            // Only the first eight lines are ever shown, so only those are
-            // wrapped; the ninth is what tells us to print the `…`. Wrapping
-            // the whole result was most of a frame's cost on a long session.
-            const SHOWN: usize = 8;
             // A result that came back `error: …` — mush's own spelling for a
             // call that was refused or that failed — is not a result, and it was
             // painted exactly like one, with only the word at the front to tell
             // them apart. The mark is the difference now, and it is red, because
             // this is the one kind of line in the transcript that reports
             // something did not happen.
-            let failed = message.text().trim_start().starts_with(FAILED);
-            let (mark, style) = if failed {
-                ("! ", Style::default().fg(Color::Red))
+            let mark = tool_mark(message);
+            let style = if mark.is_empty() {
+                dim()
             } else {
-                ("", dim())
+                Style::default().fg(Color::Red)
             };
-            // The lead is the block's indent plus the mark's own columns, and
-            // the text is wrapped inside what is left: a flagged result is not
-            // `mark` columns wider than a successful one.
-            const INDENT: usize = 2;
-            let lead = INDENT + mark.width();
-            let wrap = width.saturating_sub(lead);
-            let wrapped = wrap_text_capped(message.text(), wrap, SHOWN + 1);
-            let clipped = wrapped.len() > SHOWN;
-            // Which source line each painted row is the reading of. The wrap is
-            // per source line, so walking the lines and counting their rows is
-            // where the boundaries are — and where the cap's ninth row falls,
-            // which is the line the `…` stands for. The walk stops at the cap:
-            // it is the same arithmetic `wrap_text_capped` just did, over the
-            // rows it was allowed to do it for, never a second wrap of the
-            // whole result.
-            let mut tags: Vec<usize> = Vec::with_capacity(SHOWN + 1);
-            let mut left = SHOWN + 1;
-            for (line, raw) in message.text().split('\n').enumerate() {
-                if left == 0 {
-                    break;
-                }
-                let count = wrap_text_capped(raw, wrap, left).len();
-                tags.extend(std::iter::repeat(line).take(count));
-                left -= count;
-            }
-            debug_assert_eq!(tags.len(), wrapped.len(), "one source per wrapped row");
-            for (index, line) in wrapped.iter().take(SHOWN).enumerate() {
+            // The rows, and the stop each is the reading of: `capped_result`
+            // wraps inside the same lead this heads them with, and its `…`
+            // entry is the tail's own stop — the row that stands for every
+            // line the cap hid. That is the whole reason the cursor steps the
+            // tail in one: the map says the `…` is one stop, not a row per
+            // hidden line.
+            for (index, (line, stop)) in capped_result(message, width).into_iter().enumerate() {
                 let head = if index == 0 {
-                    format!("{}{mark}", " ".repeat(INDENT))
+                    format!("{}{mark}", " ".repeat(TOOL_INDENT))
                 } else {
-                    " ".repeat(lead)
+                    " ".repeat(tool_lead(message))
                 };
                 out.push(Line::from(Span::styled(format!("{head}{line}"), style)));
-                rows.push(tags.get(index).copied());
-            }
-            if clipped {
-                // The `…` stands for the first wrapped row the cap did not
-                // paint, so the cursor can stand on the line it hides — and,
-                // through the fallback in [`first_row`], on the lines after it.
-                out.push(Line::from(Span::styled(
-                    format!("{}…", " ".repeat(lead)),
-                    style,
-                )));
-                rows.push(tags.get(SHOWN).copied());
+                rows.push(Some(stop));
             }
             image_rows(out, message);
             rows.resize(out.len() - start, None);
@@ -2786,7 +3010,7 @@ enum View {
 /// `debug_assert` below is what keeps the two row counts from drifting.
 fn mark_rows(
     out: &mut Vec<Line<'static>>,
-    rows: &mut Vec<Option<usize>>,
+    rows: &mut Vec<Option<Stop>>,
     mark: &str,
     style: Style,
     text: &str,
@@ -2818,7 +3042,7 @@ fn mark_rows(
                 }
             }
         };
-        rows.extend(std::iter::repeat(Some(line)).take(count));
+        rows.extend(std::iter::repeat(Some(Stop::Line(line))).take(count));
     }
     // The buffers are parallel, not merely both filled: `marked` pushed the
     // rows and this pushed one entry for each of them, and it is that pairing —
@@ -3352,8 +3576,9 @@ mod tests {
     }
 
     /// A line behind a tool result's cap still has a row to stand on — the `…`
-    /// that hides it — and the copy takes the line whole: the cap is the pane's,
-    /// not the transcript's.
+    /// that hides it, which the frame clamps the cursor onto — and that row is
+    /// the whole hidden tail's one stop: the copy takes every line it stands
+    /// for, because the cap is the pane's, not the transcript's.
     #[test]
     fn a_line_behind_a_tool_results_cap_stands_on_the_ellipsis() {
         let result = (0..12)
@@ -3363,12 +3588,15 @@ mod tests {
         let mut chat = Chat::bare();
         chat.push_message(AgentId::ROOT, Message::tool("call_1", &result));
         chat.start_select(AgentId::ROOT);
+        // The pane's own measure first: that is where its cap falls, and the
+        // hidden lines are one stop only once it has painted one.
+        let pane = pane(AgentId::ROOT);
+        chat.painted(&pane, 40, 8);
         chat.select_apply(AgentId::ROOT, SelectKey::First);
         chat.select_apply(AgentId::ROOT, SelectKey::Move(11));
-        let pane = pane(AgentId::ROOT);
         let painted = chat.painted(&pane, 40, 8);
         let cursor = painted.select.as_ref().expect("painted").cursor.clone();
-        assert_eq!(cursor.len(), 1, "the hidden line has one row to stand on");
+        assert_eq!(cursor.len(), 1, "the hidden tail has one row to stand on");
         assert!(
             shown(&painted.lines[cursor[0]..=cursor[0]])[0].contains('…'),
             "and it is the ellipsis"
@@ -3376,7 +3604,115 @@ mod tests {
         let copied = chat
             .select_apply(AgentId::ROOT, SelectKey::Copy)
             .expect("Enter copies");
-        assert_eq!(copied.text, "line 11");
+        assert_eq!(
+            copied.text, "line 8\nline 9\nline 10\nline 11",
+            "the whole tail, not the one line the press landed on"
+        );
+        assert_eq!(
+            copied.line,
+            "copied 4 lines from #0's tool result — 29 bytes"
+        );
+    }
+
+    /// The `…` a tool result's cap paints is one stop, not one stop per line it
+    /// hides: from the result's last painted line, one `↓` reaches the elided
+    /// stop (the cursor's own row is the `…`), the next `↓` is the following
+    /// message's first line, and `↑` walks back the same way. Before this, a
+    /// 30-line result cost 22 `↓` presses on that same `…` row.
+    #[test]
+    fn the_cursor_steps_over_an_elided_tail_in_one() {
+        let result = (0..30)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::tool("call_1", &result));
+        chat.push_message(AgentId::ROOT, Message::assistant("after the result"));
+        chat.start_select(AgentId::ROOT);
+        let pane = pane(AgentId::ROOT);
+        // The pane's measure, published by the paint that shows the cursor on
+        // the newest line.
+        let row = |chat: &Chat| {
+            let painted = chat.painted(&pane, 40, 12);
+            let select = painted.select.as_ref().expect("the mode paints");
+            shown(&painted.lines)[select.cursor[0]].clone()
+        };
+        assert!(row(&chat).contains("after the result"), "the newest line");
+
+        // Back over the elided stop in one: the `…` row, then the result's last
+        // painted line — not another hidden line under the same `…`.
+        chat.select_apply(AgentId::ROOT, SelectKey::Move(-1));
+        assert!(
+            row(&chat).contains('…'),
+            "one step back is the elided stop: {:?}",
+            row(&chat)
+        );
+        chat.select_apply(AgentId::ROOT, SelectKey::Move(-1));
+        assert!(
+            row(&chat).contains("line 7"),
+            "and the next is line 7, the last line the pane painted: {:?}",
+            row(&chat)
+        );
+
+        // Forward the same way: one `↓` is the elided stop, the next is the
+        // message after the result.
+        chat.select_apply(AgentId::ROOT, SelectKey::Move(1));
+        assert!(row(&chat).contains('…'), "down is the elided stop again");
+        chat.select_apply(AgentId::ROOT, SelectKey::Move(1));
+        assert!(
+            row(&chat).contains("after the result"),
+            "and down again is the next message: {:?}",
+            row(&chat)
+        );
+
+        // And `↑` reverses it exactly.
+        chat.select_apply(AgentId::ROOT, SelectKey::Move(-1));
+        assert!(row(&chat).contains('…'), "up is the elided stop");
+        chat.select_apply(AgentId::ROOT, SelectKey::Move(-1));
+        assert!(row(&chat).contains("line 7"), "and up again is line 7");
+    }
+
+    /// `Shift-↓` onto the elided stop selects the whole block it stands for:
+    /// `Enter` hands the writer every source line behind the `…`, in order and
+    /// byte for byte — the message's own text, not the pane's screen — and the
+    /// line mush says counts them. Before this, the same gesture copied the one
+    /// line the first `…` press landed on.
+    #[test]
+    fn shift_over_the_ellipsis_copies_the_whole_tail() {
+        let result = (0..30)
+            .map(|n| format!("line {n}: a\tb"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let message = Message::tool("call_1", &result);
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, message.clone());
+        chat.push_message(AgentId::ROOT, Message::assistant("after the result"));
+        chat.start_select(AgentId::ROOT);
+        // The pane's measure, then the cursor onto the result's last painted
+        // line: the stop above it is the elided one.
+        let pane = pane(AgentId::ROOT);
+        chat.painted(&pane, 40, 12);
+        chat.select_apply(AgentId::ROOT, SelectKey::Move(-1)); // the elided stop
+        chat.select_apply(AgentId::ROOT, SelectKey::Move(-1)); // line 7
+        chat.select_apply(AgentId::ROOT, SelectKey::Extend(1)); // onto the `…`
+        let copied = chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        let lines: Vec<&str> = message.text().split('\n').collect();
+        let tail = lines[7..].join("\n");
+        assert_eq!(copied.text, tail, "lines 7 on, source for source");
+        assert!(
+            copied.text.ends_with(&lines[8..].join("\n")),
+            "every hidden line is in it, in order"
+        );
+        assert_eq!(
+            copied.line,
+            format!(
+                "copied {} lines from #0's tool result — {} bytes",
+                lines.len() - 7,
+                tail.len()
+            )
+        );
     }
 
     /// Ctrl-N leaves the mode behind: a cursor over a transcript that is gone is
@@ -3423,7 +3759,7 @@ mod tests {
         assert!(chat.start_select(AgentId::ROOT).is_none());
         // The state the paint road must survive, reached without a key: the
         // cursor names a message and a line the transcript does not have.
-        chat.select.as_mut().expect("the mode is on").cursor = (9, 4);
+        chat.select.as_mut().expect("the mode is on").cursor = (9, Stop::Line(4));
 
         let pane = pane(AgentId::ROOT);
         let painted = chat.painted(&pane, 40, 8);

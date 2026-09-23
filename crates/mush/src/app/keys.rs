@@ -503,7 +503,7 @@ pub fn key(focus: Focus, picker_open: bool, selecting: bool, key: KeyEvent) -> I
 /// picker.
 ///
 /// Shift is the one modifier that means something here, and it means one thing
-/// on every movement key: hold it and the line the cursor was on stays selected
+/// on every movement key: hold it and the stop the cursor was on stays selected
 /// while the cursor moves away ([`SelectKey::Extend`]); let go and the cursor
 /// moves alone, with the selection following its end when it has one
 /// ([`SelectKey::Move`]). `Home`/`End` need no second spelling for that: they
