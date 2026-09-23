@@ -25,8 +25,8 @@ mod ui;
 use std::error::Error;
 use std::io::{self, Stdout};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crossbeam_channel::{unbounded, Receiver};
@@ -1012,10 +1012,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     // start can reap the dead and never a live mush's — this one included.
     machine::reap_dead_scratch();
     // A mush that is signalled ends through the same road `Ctrl-Q` takes — the
-    // exit flush, `kill_all`, the writer's join, the socket's removal — instead
+    // exit flush, the actors' endings, the kill walk, the writer's thread — and
+    // the socket and the terminal go back last, after it (finding R3), instead
     // of dying raw with every process group it started still running (finding
-    // E1; `signals` carries the road and its reasons). The guard is held here
-    // for the whole run: dropping it would take the handlers away.
+    // E1; `signals` carries the road and its reasons, including what a second
+    // and a third signal mean). The guard is held here for the whole run, and
+    // dropped last of all: dropping it takes the handlers away and waits for
+    // the watcher thread, which reads its own EOF.
     let _signals = match signals::install() {
         Ok(signals) => Some(signals),
         // Not fatal: a mush without handlers is the mush that existed before
@@ -1139,8 +1142,13 @@ fn run() -> Result<(), Box<dyn Error>> {
         app.stored_unreadable(notice);
     }
 
-    install_panic_hook();
+    let panics = PanicRoute::new();
+    install_panic_hook(panics.clone());
     let mut guard = TerminalGuard::enter()?;
+    // The screen is mush's from here until it is handed back: a worker's panic
+    // now leaves its words in the route instead of on the alternate screen
+    // (finding PM9), and the exit road prints them below.
+    panics.raise();
     // The terminal's size is only known here; `/notes` wraps its popup to it
     // and the floor is decided from it, so record both before the first key can
     // be read. A resize reports its own.
@@ -1148,7 +1156,27 @@ fn run() -> Result<(), Box<dyn Error>> {
         app.set_term_size(size.width, size.height);
     }
     let result = event_loop(&mut guard.terminal, &mut app, &rx, &theme);
+    // The exit road runs first — the flush, the actors' endings, the quit fence
+    // and the kill walk, the writer's thread — and the terminal and the socket
+    // are handed back last (finding R3). The order is the fact: a signal that
+    // arrives while the screen still looks like mush's cannot find a hand-back
+    // already made, and a second one cannot skip a kill the road had not
+    // reached. The hurry a press asked for before this line is spent here — it
+    // asked for nothing the road can shorten — and a press after it ends the
+    // road's waits at their next poll ([`signals::forced`]). Every step of that
+    // road is bounded ([`App::shutdown`]), and a bound that expires — or a
+    // hurry that ends the wait early — comes back as a sentence, printed below
+    // on a shell that has its terminal back (findings R4, R3) — and so do the
+    // words of any worker that panicked while the screen was mush's (finding
+    // PM9).
+    let _ = signals::take_force();
+    let notes = app.shutdown();
+    drop(app);
+    drop(_attach);
     drop(guard);
+    for note in notes.into_iter().chain(panics.lower()) {
+        eprintln!("mush: {note}");
+    }
     result
 }
 
@@ -1231,36 +1259,13 @@ fn drain_actors(app: &mut App, rx: &Receiver<Msg>) {
     }
 }
 
-/// The terminal's modes, entered and left in one place.
-///
-/// Each mode is a promise to the human's shell: leaving raw mode on breaks their
-/// typing, and leaving bracketed paste on makes their own pastes arrive wrapped
-/// in escape codes. Everything that can end the program — a clean quit, a
-/// signal (`crate::signals` turns one into the quit road), a panic, an error on
-/// the way out — has to undo all of them, so they are entered here
-/// and undone by [`restore_terminal_modes`].
-fn enter_terminal_modes() -> io::Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    // Bracketed paste is what turns Ctrl-Shift-V from a stream of individual
-    // keystrokes — one event, one repaint, and a redraw per character — into a
-    // single `Event::Paste` carrying the whole paste.
-    //
-    // Mouse capture is deliberately NOT taken. It would let mush scroll by wheel
-    // notch instead of by arrow key, but it also takes away the terminal's own
-    // drag-to-select, and reading text out of the transcript is worth more than
-    // a wheel notch. The lag that made the wheel feel broken was the per-keystroke
-    // repaint, which the event loop no longer does.
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)
-}
-
-/// Undo every mode [`enter_terminal_modes`] turned on.
+/// Undo every mode [`TerminalGuard::enter`] turned on.
 fn restore_terminal_modes() {
     let _ = disable_raw_mode();
     let _ = restore_mode_sequences(&mut io::stdout());
 }
 
-/// The escape sequences that leave the modes [`enter_terminal_modes`] entered,
+/// The escape sequences that leave the modes [`TerminalGuard::enter`] entered,
 /// written through a `Write` rather than straight to `stdout`: the panic hook's
 /// one effect on the terminal, so a test can read exactly what a panic puts on
 /// the wire without a terminal (finding E10).
@@ -1279,10 +1284,75 @@ struct TerminalGuard {
 }
 
 impl TerminalGuard {
+    /// Enter the terminal: raw mode, the alternate screen, bracketed paste —
+    /// and the ratatui terminal every frame is painted through.
+    ///
+    /// Each mode is a promise to the human's shell: leaving raw mode on breaks
+    /// their typing, and leaving bracketed paste on makes their own pastes
+    /// arrive wrapped in escape codes. Everything that can end the program — a
+    /// clean quit, a signal ([`crate::signals`] turns one into the quit road),
+    /// a panic, an error on the way out — has to undo all of them, so they are
+    /// entered in one place and undone by [`restore_terminal_modes`].
+    ///
+    /// The entry is all or nothing (finding PM8): `main` exits 1 when it fails,
+    /// and it must not do that from a raw shell. A failure in any step after
+    /// raw mode has succeeded undoes every promise already made before the
+    /// error travels.
     fn enter() -> io::Result<Self> {
-        enter_terminal_modes()?;
-        let terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
-        Ok(Self { terminal })
+        Self::enter_with(
+            // Raw mode is the first promise and the first thing undone: it is
+            // what makes the human's typing stop echoing and `Ctrl-C` stop
+            // signalling.
+            enable_raw_mode,
+            // Bracketed paste is what turns Ctrl-Shift-V from a stream of
+            // individual keystrokes — one event, one repaint, and a redraw per
+            // character — into a single `Event::Paste` carrying the whole
+            // paste.
+            //
+            // Mouse capture is deliberately NOT taken. It would let mush
+            // scroll by wheel notch instead of by arrow key, but it also takes
+            // away the terminal's own drag-to-select, and reading text out of
+            // the transcript is worth more than a wheel notch. The lag that
+            // made the wheel feel broken was the per-keystroke repaint, which
+            // the event loop no longer does.
+            || execute!(io::stdout(), EnterAlternateScreen, EnableBracketedPaste),
+            || Terminal::new(CrosstermBackend::new(io::stdout())),
+            restore_terminal_modes,
+        )
+    }
+
+    /// [`Self::enter`] with the four effects as parameters.
+    ///
+    /// The seam exists because the failure road is latent by construction: it
+    /// needs a terminal whose writes stop answering, which a test cannot make
+    /// real (finding PM8). Handing each step in — entering raw mode, writing
+    /// the screen modes, building the terminal, and the undo — lets a test fail
+    /// a named step after raw mode and read the undo, exactly as
+    /// [`restore_mode_sequences`] lets a test read what a panic writes.
+    ///
+    /// The order is the fact: `raw` first, `screen` second, `build` last, and
+    /// any failure after `raw` succeeded runs `restore` before returning the
+    /// error. `restore` undoes *every* promise, not only the failed step's,
+    /// because the escapes are written in one `execute!` and a half-written
+    /// one cannot be told from a whole one.
+    fn enter_with(
+        raw: impl FnOnce() -> io::Result<()>,
+        screen: impl FnOnce() -> io::Result<()>,
+        build: impl FnOnce() -> io::Result<Terminal<CrosstermBackend<Stdout>>>,
+        restore: impl FnOnce(),
+    ) -> io::Result<Self> {
+        raw()?;
+        if let Err(error) = screen() {
+            restore();
+            return Err(error);
+        }
+        match build() {
+            Ok(terminal) => Ok(Self { terminal }),
+            Err(error) => {
+                restore();
+                Err(error)
+            }
+        }
     }
 }
 
@@ -1293,7 +1363,8 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// The signal road's one step: the flag the handler set becomes the quit.
+/// The signal road's one step: the flag the watcher thread set becomes the
+/// quit.
 ///
 /// The thread matters. A handler runs on whichever thread the kernel chose;
 /// the quit road runs on this one, where `App` lives — so the session's flush,
@@ -1308,18 +1379,100 @@ pub(crate) fn take_signal_quit(app: &mut App) -> bool {
     false
 }
 
+/// How many panic words are held for the exit road. A screen seven panics have
+/// smeared is one whose next line is the human's `reset`; the bound is there so
+/// a process panicking without end cannot grow a list forever, and what it
+/// drops is counted and said with the words.
+const KEPT_PANIC_WORDS: usize = 8;
+
+/// Where a panic's words go while the terminal is mush's.
+///
+/// A panic on a thread that is not the terminal's used to reach the default
+/// hook's stderr write immediately — with the alternate screen up and raw mode
+/// on. Raw mode keeps a newline from returning the cursor to column one, and
+/// ratatui's per-frame diff only rewrites cells that changed between *its* two
+/// buffers, so the stray words are never repaired: they persist until their
+/// cells happen to change or the screen is repainted (finding PM9). The words
+/// are therefore held here and printed by the exit road once the terminal is
+/// back, in the same `mush: ` shape every other exit sentence gets.
+///
+/// Held, not dropped: the words are usually the only account of why a thread
+/// died. The one thing the hold loses is the `RUST_BACKTRACE` note the default
+/// hook appends around them, which this hook cannot produce.
+#[derive(Clone, Default)]
+struct PanicRoute {
+    /// Whether the terminal is mush's: raised once it has been entered,
+    /// lowered when it has been handed back.
+    up: Arc<AtomicBool>,
+    /// What a non-owner panic said while `up`.
+    kept: Arc<Mutex<Vec<String>>>,
+    /// How many panics arrived after `kept` was full.
+    dropped: Arc<AtomicUsize>,
+}
+
+impl PanicRoute {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    /// The terminal has been entered: from here a worker's words are held.
+    fn raise(&self) {
+        self.up.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether the screen still belongs to mush. The hook's question.
+    fn up(&self) -> bool {
+        self.up.load(Ordering::SeqCst)
+    }
+
+    /// Hold one panic's words, or count them as dropped once the list is full.
+    fn keep(&self, words: String) {
+        let mut kept = self
+            .kept
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if kept.len() < KEPT_PANIC_WORDS {
+            kept.push(words);
+        } else {
+            self.dropped.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The terminal has been handed back: take the words that were held.
+    ///
+    /// What the bound dropped is said here rather than in silence, in the same
+    /// shape as the words it stands behind.
+    fn lower(&self) -> Vec<String> {
+        self.up.store(false, Ordering::SeqCst);
+        let mut words = std::mem::take(
+            &mut *self
+                .kept
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        );
+        let dropped = self.dropped.swap(0, Ordering::SeqCst);
+        if dropped > 0 {
+            words.push(format!(
+                "{dropped} more panics were not kept — the road keeps the first {KEPT_PANIC_WORDS}"
+            ));
+        }
+        words
+    }
+}
+
 /// The panic hook, installed where the terminal belongs: on the thread that
-/// owns it.
-fn install_panic_hook() {
+/// owns it. `route` is the half of the hook that is not about the modes: the
+/// words a worker's panic leaves while the screen is mush's (finding PM9).
+fn install_panic_hook(route: PanicRoute) {
     // The hook runs on whichever thread panicked, so it cannot ask "am I the
     // terminal's thread?" by looking around — the id is captured here, on the
     // thread that owns the terminal, and every panic is compared against it
     // (finding E10).
-    install_panic_hook_for(std::thread::current().id(), restore_terminal_modes);
+    install_panic_hook_for(std::thread::current().id(), route, restore_terminal_modes);
 }
 
 /// Install the process-wide panic hook for `owner`'s terminal, restoring its
-/// modes through `restore`.
+/// modes through `restore` and holding a non-owner's words while `route` is up.
 ///
 /// Every panic used to run [`restore_terminal_modes`], whichever thread
 /// panicked — and mush is a process with a thread per agent
@@ -1328,14 +1481,20 @@ fn install_panic_hook() {
 /// resets to the human's terminal while the UI thread kept painting frames into
 /// a screen that was no longer mush's (finding E10). A worker's panic has its
 /// own roads, and none of them needs the terminal: a job's thread ends its
-/// process group, the writer marks itself dead, and the panic message still
-/// reaches stderr through `previous`.
+/// process group, the writer marks itself dead.
+///
+/// Its *words* still have a road, and it is not stderr: printing while the
+/// alternate screen is up paints glyph garbage a frame will not repair (finding
+/// PM9). So a non-owner's panic is held in `route` while the terminal is
+/// mush's, and the exit road prints it once the screen is the shell's again.
 ///
 /// The restore is a parameter rather than a call to the real one so a test can
 /// install the hook for a thread of its own and read what each panic writes
-/// ([`restore_mode_sequences`]).
+/// ([`restore_mode_sequences`]); `route` is the parameter that lets the same
+/// test read where a worker's words went instead.
 fn install_panic_hook_for(
     owner: std::thread::ThreadId,
+    route: PanicRoute,
     restore: impl Fn() + Send + Sync + 'static,
 ) {
     let previous = std::panic::take_hook();
@@ -1345,6 +1504,18 @@ fn install_panic_hook_for(
         // UI is still running (finding E10).
         if std::thread::current().id() == owner {
             restore();
+            previous(info);
+            return;
+        }
+        // The screen is mush's: the words would be painted over by a frame
+        // ratatui believes is intact, so they are held for the exit road
+        // (finding PM9) — in the default hook's own shape, minus the note it
+        // appends around them.
+        if route.up() {
+            let thread = std::thread::current();
+            let name = thread.name().unwrap_or("<unnamed>");
+            route.keep(format!("thread '{name}' {info}"));
+            return;
         }
         previous(info);
     }));
@@ -2617,6 +2788,50 @@ mod tests {
         );
     }
 
+    /// The entry is all or nothing (finding PM8): a failure in a step after
+    /// `enable_raw_mode` has succeeded used to travel with no `TerminalGuard`
+    /// alive to undo the mode, so `main` exited 1 into a raw shell. Both
+    /// failing steps are here — the alternate-screen/paste write and the
+    /// terminal's own construction — because both happen after raw mode is on.
+    #[test]
+    fn a_failed_enter_restores_the_modes() {
+        fn enter(fail: &str, restored: Arc<AtomicBool>) -> io::Result<TerminalGuard> {
+            TerminalGuard::enter_with(
+                || Ok(()),
+                move || {
+                    if fail == "screen" {
+                        Err(io::Error::other("the screen write failed"))
+                    } else {
+                        Ok(())
+                    }
+                },
+                move || {
+                    if fail == "terminal" {
+                        Err(io::Error::other("the terminal would not build"))
+                    } else {
+                        unreachable!("nothing leaves the entry unfinished")
+                    }
+                },
+                move || restored.store(true, Ordering::SeqCst),
+            )
+        }
+
+        for failed in ["screen", "terminal"] {
+            let restored = Arc::new(AtomicBool::new(false));
+            let error = enter(failed, restored.clone())
+                .err()
+                .unwrap_or_else(|| panic!("the {failed} step must fail"));
+            assert!(
+                !error.to_string().is_empty(),
+                "the failure still travels: {error}"
+            );
+            assert!(
+                restored.load(Ordering::SeqCst),
+                "a failure in the {failed} step left the modes entered"
+            );
+        }
+    }
+
     /// The escape sequences a panic writes, captured: the `Write` seam
     /// [`restore_mode_sequences`] takes (finding E10).
     #[derive(Clone, Default)]
@@ -2633,26 +2848,38 @@ mod tests {
         }
     }
 
-    /// A worker's panic leaves the terminal alone; the panic on the thread the
-    /// hook was installed for restores it. The escape sequences are read
-    /// through the `Write` seam, so "no sequence at all" is an assertion rather
-    /// than a screen to look at (finding E10). Before the fix the hook restored
-    /// for every panic: a worker's death wrote
+    /// A worker's panic leaves the terminal alone and its words are *held* for
+    /// the exit road: with the alternate screen up, printing them paints glyph
+    /// garbage a frame ratatui believes is intact will never repair (finding
+    /// PM9). The panic on the thread the hook was installed for restores the
+    /// modes at once and still goes to the hook that was there before. The
+    /// escape sequences are read through the `Write` seam, so "no sequence at
+    /// all" is an assertion rather than a screen to look at (finding E10).
+    /// Before the fix the hook restored for every panic: a worker's death wrote
     /// `^[[?1049l^[[?2004l^[[?1006l^[[?1015l^[[?1003l^[[?1002l^[[?1000l` and
     /// the human's UI was left painting into their shell.
     #[test]
     fn a_worker_panic_leaves_the_terminal_alone() {
+        // The hook that was there before this one: it records that it ran,
+        // standing in for the default hook's stderr write.
+        let printed = Arc::new(AtomicBool::new(false));
+        {
+            let printed = printed.clone();
+            std::panic::set_hook(Box::new(move |_| printed.store(true, Ordering::SeqCst)));
+        }
         let modes = Modes::default();
         let sink = modes.clone();
+        let route = PanicRoute::new();
         let owner = std::thread::current().id();
-        install_panic_hook_for(owner, move || {
+        install_panic_hook_for(owner, route.clone(), move || {
             let mut sink = sink.clone();
             let _ = restore_mode_sequences(&mut sink);
         });
+        route.raise();
 
         // The shape of a panicking job thread, or the session writer: a named
-        // worker that dies. Its message still reaches stderr through the hook
-        // that was there before; the terminal is not its to restore.
+        // worker that dies while the UI holds the screen. The terminal is not
+        // its to restore, and the words are not its to print.
         let worker = std::thread::Builder::new()
             .name("mush-job-1".to_string())
             .spawn(|| panic!("a worker died"))
@@ -2664,9 +2891,30 @@ mod tests {
             "a worker's panic wrote to the human's terminal: {:?}",
             String::from_utf8_lossy(&written)
         );
+        assert!(
+            !printed.load(Ordering::SeqCst),
+            "a worker's panic was printed into the alternate screen"
+        );
+        let words = route.lower();
+        assert_eq!(words.len(), 1, "one panic, one account: {words:?}");
+        assert!(words[0].contains("mush-job-1"), "{words:?}");
+        assert!(words[0].contains("a worker died"), "{words:?}");
+
+        // Once the terminal is handed back, the next panic's words go where
+        // they always did: to the hook that was there before.
+        let worker = std::thread::Builder::new()
+            .name("mush-job-2".to_string())
+            .spawn(|| panic!("after the road"))
+            .expect("the worker thread starts");
+        assert!(worker.join().is_err(), "the worker panicked");
+        assert!(
+            printed.load(Ordering::SeqCst),
+            "after the hand-back the words are printed at once"
+        );
 
         // The thread the hook was installed for is the terminal's: its own
-        // panic is the one that must leave the modes behind.
+        // panic is the one that must leave the modes behind — at once, and
+        // without being held.
         let _ = std::panic::catch_unwind(|| panic!("the terminal's thread died"));
         let written = String::from_utf8_lossy(&modes.0.lock().unwrap()).into_owned();
         assert!(
@@ -2677,10 +2925,34 @@ mod tests {
             written.contains("\u{1b}[?2004l"),
             "and turns bracketed paste off: {written:?}"
         );
+        assert!(
+            route.lower().is_empty(),
+            "the owner's panic is not held: it is the terminal's own"
+        );
 
         // The hook is the process's: put the default back, so whatever panic
         // comes next is not shaped by this test.
         let _ = std::panic::take_hook();
+    }
+
+    /// The hold is bounded, and the bound is said rather than silent: a process
+    /// panicking without end must not grow the list forever, and the ninth
+    /// panic's words are accounted for with the eight that were kept.
+    #[test]
+    fn the_held_panic_words_are_bounded_and_the_bound_is_said() {
+        let route = PanicRoute::new();
+        for n in 0..KEPT_PANIC_WORDS + 3 {
+            route.keep(format!("thread 'mush-job-{n}' panicked at nowhere: boom"));
+        }
+        let words = route.lower();
+        assert_eq!(words.len(), KEPT_PANIC_WORDS + 1, "{words:?}");
+        assert!(words[0].contains("mush-job-0"), "the first is kept");
+        assert!(
+            words[KEPT_PANIC_WORDS].contains("3 more panics were not kept"),
+            "and the dropped three are counted: {:?}",
+            words[KEPT_PANIC_WORDS]
+        );
+        assert!(route.lower().is_empty(), "the take is once");
     }
 
     /// The attach CLI's refusal reaches the terminal through [`error_line`],

@@ -25,7 +25,7 @@ use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, RecvTimeoutError, Sender};
 
@@ -50,6 +50,28 @@ use crate::lock;
 /// human is a report where a freeze used to be.
 const FLUSH_DEADLINE: Duration = Duration::from_secs(10);
 
+/// How long the exit road waits for the writer's own thread after the wake
+/// channel is closed.
+///
+/// [`FLUSH_DEADLINE`] bounds the *caller's* wait for one write; this one bounds
+/// the wait for the thread itself, which has nothing left to write once the
+/// wake channel is gone and is normally already asleep. The number is shorter
+/// than the flush's on purpose: the exit road has already flushed what it
+/// could, and every moment after that is a moment the human's terminal is still
+/// held and the workspace lock is still taken. Two seconds is far past what
+/// ending a thread with an empty queue owes. When it expires the process exits
+/// anyway — the thread is left behind — and the reason is handed to the caller,
+/// which is the exit road, so the human reads it instead of meeting a mush that
+/// will not end (finding R4).
+const JOIN_DEADLINE: Duration = Duration::from_secs(2);
+
+/// How long a bounded wait sleeps between polls of the thing it waits for.
+///
+/// `std` has no wait-with-deadline for a thread or a child, so every bound in
+/// this tree is a poll loop, and this is the period this module's one uses. It
+/// is small because the thing waited for is normally already done.
+const POLL: Duration = Duration::from_millis(5);
+
 /// Where a snapshot of the session is written.
 ///
 /// The snapshot is the caller's; the serialization and the disk are the
@@ -72,6 +94,11 @@ pub trait SessionSave: Send + Sync {
     /// A write that fails is not retried behind the waiter's back: the call
     /// returns with the failure left in [`Self::take_error`], and the snapshot
     /// stays with the writer for its next wake (finding R2).
+    ///
+    /// The wait is bounded twice over. Its deadline is [`FLUSH_DEADLINE`]
+    /// (finding R4), and a signal that has already asked mush to quit and then
+    /// been pressed again ends it at the next poll (finding R3): the second
+    /// press is the human saying no wait on the exit road survives it.
     fn flush(&self);
 
     /// The last write's failure, once. A write that failed on the writer's
@@ -91,6 +118,22 @@ pub trait SessionSave: Send + Sync {
     /// still leads to the locked inode, or when there is no lock to ask (a
     /// writer built without one — a test, or a road that never took one).
     fn store_is_mine(&self) -> Result<(), String>;
+
+    /// End the writer: stop taking snapshots and wait, bounded, for the thread
+    /// that owns the disk. The reason the thread outlived the bound, for a
+    /// caller with somewhere to say it; `None` for the ordinary ending and for
+    /// an implementation with no thread of its own.
+    ///
+    /// This is the exit road's last wait before the process goes, and it is
+    /// bounded like the flush it follows (finding R4): a worker wedged inside a
+    /// write on a mount that stopped answering must not keep mush alive with
+    /// its terminal held and its workspace lock taken. A second signal ends it
+    /// at the next poll too (finding R3). The write is not lost by ending the
+    /// wait — it never landed — and the thread is left behind, which is the
+    /// price of a process that leaves when it was asked to.
+    fn close(&self) -> Option<String> {
+        None
+    }
 }
 
 /// The real seam: one writer thread, the newest snapshot, and the one a failed
@@ -105,8 +148,14 @@ pub struct Writer {
     /// Capacity one, and `None` once the worker is being stopped: a wake-up
     /// already queued is enough, because the worker empties the slot before it
     /// sleeps again, so no hand-over can be left unwritten by a lost token.
-    wake: Option<Sender<()>>,
-    worker: Option<JoinHandle<()>>,
+    ///
+    /// Behind a mutex because the exit road stops the writer through the
+    /// [`SessionSave`] seam, which takes `&self` ([`Writer::close`], finding
+    /// R4); the mutex is never held for longer than a `take`.
+    wake: Mutex<Option<Sender<()>>>,
+    /// The worker's thread: taken and joined, bounded, by [`Writer::close`], and
+    /// by [`Drop`] as the backstop for a writer nobody closed.
+    worker: Mutex<Option<JoinHandle<()>>>,
 }
 
 struct Inner {
@@ -231,8 +280,8 @@ impl Writer {
                 failed: Mutex::new(None),
                 alive: AtomicBool::new(false),
             }),
-            wake: None,
-            worker: None,
+            wake: Mutex::new(None),
+            worker: Mutex::new(None),
         }
     }
 
@@ -261,8 +310,14 @@ impl Writer {
             });
         match started {
             Ok(worker) => {
-                self.worker = Some(worker);
-                self.wake = Some(wake);
+                *self
+                    .worker
+                    .get_mut()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(worker);
+                *self
+                    .wake
+                    .get_mut()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(wake);
                 Ok(())
             }
             Err(error) => {
@@ -274,7 +329,12 @@ impl Writer {
 
     /// Nudge the worker: there is something to write (or someone to wake).
     fn poke(&self) {
-        if let Some(wake) = &self.wake {
+        if let Some(wake) = self
+            .wake
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
             let _ = wake.try_send(());
         }
     }
@@ -297,7 +357,7 @@ impl SessionSave for Writer {
     }
 
     fn flush(&self) {
-        let _ = self.flush_within(FLUSH_DEADLINE);
+        let _ = self.flush_within(FLUSH_DEADLINE, crate::signals::forced);
     }
 
     fn take_error(&self) -> Option<String> {
@@ -307,21 +367,91 @@ impl SessionSave for Writer {
     fn store_is_mine(&self) -> Result<(), String> {
         self.inner.store_is_mine()
     }
+
+    fn close(&self) -> Option<String> {
+        self.close_within(JOIN_DEADLINE, crate::signals::forced)
+    }
 }
 
 impl Writer {
+    /// [`SessionSave::close`], with the deadline a parameter so a test can hold
+    /// the clock instead of the clock holding the test.
+    ///
+    /// The wake channel is closed first — the same hand-over [`Drop`] makes:
+    /// the worker drains whatever is pending, then ends — and then the thread is
+    /// waited for, bounded, instead of for as long as the disk wants (findings
+    /// R4, R3: `deadline` is the bound, `forced` the second signal that cuts
+    /// the wait short of it).
+    fn close_within(&self, deadline: Duration, forced: impl Fn() -> bool) -> Option<String> {
+        // Dropping the sender is what tells the worker there is nothing more
+        // coming; it drains what is pending on the way out (`writer`).
+        drop(
+            self.wake
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .take(),
+        );
+        let worker = self
+            .worker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        Self::join_within(worker, deadline, forced)
+    }
+
+    /// Wait, bounded, for the worker's thread, saying so when the deadline
+    /// passes first.
+    ///
+    /// `std` has no `join` with a deadline, so this is the poll loop [`POLL`]
+    /// exists for. A thread that outlives the deadline is left behind — its
+    /// `JoinHandle` is dropped, which detaches it — because the process is
+    /// leaving either way and a waited-for thread is the one thing that can
+    /// keep it here. `forced` is the second signal (finding R3): a press that
+    /// has already asked for the quit and come back ends the wait at the next
+    /// poll, before the deadline, and says so in the same shape.
+    fn join_within(
+        worker: Option<JoinHandle<()>>,
+        deadline: Duration,
+        forced: impl Fn() -> bool,
+    ) -> Option<String> {
+        let worker = worker?;
+        let started = Instant::now();
+        while !worker.is_finished() {
+            if forced() {
+                return Some(format!(
+                    "a second signal hurried the exit — the session writer had not finished after \
+                     {:?}, so the last write may not have landed",
+                    started.elapsed()
+                ));
+            }
+            if started.elapsed() >= deadline {
+                return Some(format!(
+                    "the session writer did not finish within {deadline:?} — the last write may \
+                     still be in flight"
+                ));
+            }
+            thread::sleep(POLL);
+        }
+        let _ = worker.join();
+        None
+    }
     /// [`SessionSave::flush`], with the deadline a parameter so a test can hold
     /// the clock instead of the clock holding the test.
     ///
-    /// Three things end the wait, and none of them is "as long as it takes":
+    /// Four things end the wait, and none of them is "as long as it takes":
     /// the worker answering (the file is then current), the worker being gone
-    /// (a waiter nothing can wake is never parked), or the deadline (the write
-    /// is still in flight; the waiter is taken back out of the queue and the
-    /// failure is left in [`SessionSave::take_error`]). The deadline is not
-    /// sticky — it does not mark the worker dead — so the next flush parks a
-    /// fresh waiter and asks again, which is what makes a write that lands
-    /// late still land.
-    fn flush_within(&self, deadline: Duration) -> Result<(), String> {
+    /// (a waiter nothing can wake is never parked), the deadline (the write is
+    /// still in flight; the waiter is taken back out of the queue and the
+    /// failure is left in [`SessionSave::take_error`]), or a second signal
+    /// (finding R3: the human has said no wait survives their next press). The
+    /// deadline is not sticky — it does not mark the worker dead — so the next
+    /// flush parks a fresh waiter and asks again, which is what makes a write
+    /// that lands late still land.
+    ///
+    /// The wait is polled in [`POLL`] slices rather than handed to one
+    /// `recv_timeout` so the hurry can be read in the same slice as the press:
+    /// a thread blocked in a ten-second receive cannot hear anything.
+    fn flush_within(&self, deadline: Duration, forced: impl Fn() -> bool) -> Result<(), String> {
         if !self.inner.alive.load(Ordering::SeqCst) {
             return Err(self
                 .inner
@@ -335,37 +465,55 @@ impl Writer {
             .waiting
             .push(done.clone());
         self.poke();
+        let started = Instant::now();
         // The worker sends on the waiter after the write in front of it lands,
         // so a `recv` that returns means the file is current; a `recv` that
         // disconnects means the worker died without answering.
-        match waited.recv_timeout(deadline) {
-            Ok(()) => Ok(()),
-            Err(RecvTimeoutError::Timeout) => {
-                // The worker may still be inside the write; the answer it owes
-                // is owed to whoever waits then, not to this caller, and a
-                // waiter left in the queue would grow the queue once per
-                // timed-out flush. Take ours back out. The worker holds the
-                // queue only long enough to empty it, so this cannot become a
-                // second unbounded wait.
-                self.inner
-                    .pending
-                    .lock()
-                    .unwrap()
-                    .waiting
-                    .retain(|waiter| !waiter.same_channel(&done));
-                if !self.inner.alive.load(Ordering::SeqCst) {
-                    return Err(self
-                        .inner
-                        .fail("the session writer is gone — the session was not saved"));
-                }
-                Err(self.inner.fail(format!(
-                    "the session writer did not answer within {deadline:?} — the write is still in flight, and the next flush will ask again"
-                )))
+        loop {
+            if forced() {
+                self.give_up(&done);
+                return Err(self.inner.fail(format!(
+                    "a second signal hurried the exit — the session writer had not answered after \
+                     {:?}, so the write may not have landed",
+                    started.elapsed()
+                )));
             }
-            Err(RecvTimeoutError::Disconnected) => Err(self.inner.fail(
-                "the session writer died before the write landed — the session was not saved",
-            )),
+            match waited.recv_timeout(POLL) {
+                Ok(()) => return Ok(()),
+                Err(RecvTimeoutError::Timeout) if started.elapsed() < deadline => continue,
+                Err(RecvTimeoutError::Timeout) => {
+                    self.give_up(&done);
+                    if !self.inner.alive.load(Ordering::SeqCst) {
+                        return Err(self
+                            .inner
+                            .fail("the session writer is gone — the session was not saved"));
+                    }
+                    return Err(self.inner.fail(format!(
+                        "the session writer did not answer within {deadline:?} — the write is still in flight, and the next flush will ask again"
+                    )));
+                }
+                Err(RecvTimeoutError::Disconnected) => return Err(self.inner.fail(
+                    "the session writer died before the write landed — the session was not saved",
+                )),
+            }
         }
+    }
+
+    /// Take this caller's waiter back out of the queue, on either way a wait can
+    /// end without an answer.
+    ///
+    /// The worker may still be inside the write; the answer it owes is owed to
+    /// whoever waits then, not to this caller, and a waiter left in the queue
+    /// would grow the queue once per give-up. The worker holds the queue only
+    /// long enough to empty it, so taking ours out cannot become a second
+    /// unbounded wait.
+    fn give_up(&self, done: &Sender<()>) {
+        self.inner
+            .pending
+            .lock()
+            .unwrap()
+            .waiting
+            .retain(|waiter| !waiter.same_channel(done));
     }
 }
 
@@ -374,10 +522,25 @@ impl Drop for Writer {
         // Closing the wake channel ends the worker once it has written whatever
         // was pending. Joining it keeps a write from outliving the app that
         // asked for it — the exit flush's snapshot is on disk before this
-        // returns, which is what makes the last thing said survivable.
-        self.wake.take();
-        if let Some(worker) = self.worker.take() {
-            let _ = worker.join();
+        // returns — but bounded (finding R4): a worker wedged on a mount that
+        // stopped answering must not hold the process that is leaving. The exit
+        // road closes the writer before this ([`SessionSave::close`]), so this
+        // is the backstop for every other way a writer is dropped; the reason a
+        // thread outlived the bound has no caller left to return to, and
+        // stderr is the one door still open.
+        let wake = self
+            .wake
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        drop(wake);
+        let worker = self
+            .worker
+            .get_mut()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        if let Some(reason) = Self::join_within(worker, JOIN_DEADLINE, crate::signals::forced) {
+            eprintln!("mush: {reason}");
         }
     }
 }
@@ -809,7 +972,7 @@ mod tests {
 
         let started = Instant::now();
         let first = writer
-            .flush_within(Duration::from_millis(50))
+            .flush_within(Duration::from_millis(50), || false)
             .expect_err("a stuck worker is not an answer");
         assert!(
             started.elapsed() >= Duration::from_millis(50),
@@ -826,7 +989,7 @@ mod tests {
         );
         assert_eq!(writer.take_error().as_deref(), Some(first.as_str()));
 
-        let _ = writer.flush_within(Duration::from_millis(50));
+        let _ = writer.flush_within(Duration::from_millis(50), || false);
         assert!(
             writer.inner.pending.lock().unwrap().waiting.is_empty(),
             "and the second timeout does not grow the queue"
@@ -886,6 +1049,106 @@ mod tests {
             "before",
             "the store still holds the last write it was this mush's to make"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The exit road's bound on the writer's own thread (finding R4): a worker
+    /// stuck inside the write — here, on the queue lock the test holds, which is
+    /// the shape a wedged `write(2)` leaves — is left at the deadline, and the
+    /// reason is handed back for the exit road to say. Before the bound,
+    /// [`Drop`]'s `join` waited as long as the disk wanted, holding the terminal
+    /// hand-back and the workspace lock with it.
+    #[test]
+    fn a_stuck_writer_is_left_at_the_deadline_and_the_reason_is_said() {
+        let root = root("join-deadline");
+        let writer = Writer::new(root.to_path_buf(), None).expect("the worker starts");
+        // The worker blocks on the queue, so it is inside its work, not gone.
+        let held = writer.inner.pending.lock().unwrap();
+        let started = Instant::now();
+        let reason = writer
+            .close_within(Duration::from_millis(50), || false)
+            .expect("a stuck worker outlives the deadline");
+        assert!(
+            started.elapsed() >= Duration::from_millis(50),
+            "the deadline is the clock: {:?}",
+            started.elapsed()
+        );
+        assert!(reason.contains("did not finish"), "{reason}");
+        // The worker is left behind, not marked dead: what was handed over may
+        // still land when the lock frees, and the thread that lands it is the
+        // same one (the close is a wait, not a kill).
+        assert!(
+            writer.inner.alive.load(Ordering::SeqCst),
+            "a wait that gave up does not end the worker"
+        );
+        drop(held);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The ordinary ending: closing the writer waits for what was handed over
+    /// and says nothing — the same hand-over [`Drop`] makes, bounded (finding
+    /// R4).
+    #[test]
+    fn a_closed_writer_lands_what_was_handed_over() {
+        let root = root("close");
+        let writer = Writer::new(root.to_path_buf(), None).expect("the worker starts");
+        writer.save(saying("last words"));
+        assert_eq!(writer.close(), None, "the worker ended, nothing to say");
+        assert_eq!(last_message(&root), "last words");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A second signal ends the flush at its next poll (finding R3): the write
+    /// may still be in flight, the caller is told in the same shape the
+    /// deadline's sentence has, and the waiter is taken back out of the queue
+    /// exactly as a timed-out one is.
+    #[test]
+    fn a_hurried_flush_gives_up_at_its_next_poll() {
+        let root = root("flush-hurried");
+        let writer = Writer::parked(root.to_path_buf(), None);
+        // The same stuck worker the deadline test builds: alive, nothing parked
+        // on the queue, no answer coming.
+        writer.inner.alive.store(true, Ordering::SeqCst);
+        writer.save(saying("lost"));
+
+        let started = Instant::now();
+        let hurried = writer
+            .flush_within(Duration::from_secs(30), || true)
+            .expect_err("a hurried wait is not an answer");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the hurry is not the deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(hurried.contains("second signal"), "{hurried}");
+        assert!(
+            writer.inner.pending.lock().unwrap().waiting.is_empty(),
+            "the abandoned waiter is taken back out"
+        );
+        assert_eq!(writer.take_error().as_deref(), Some(hurried.as_str()));
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// And the writer's own thread: a second signal does not wait out
+    /// [`JOIN_DEADLINE`] either.
+    #[test]
+    fn a_hurried_close_gives_up_at_its_next_poll() {
+        let root = root("close-hurried");
+        let writer = Writer::new(root.to_path_buf(), None).expect("the worker starts");
+        // The worker blocked on the queue lock the test holds, exactly as in
+        // the deadline test.
+        let held = writer.inner.pending.lock().unwrap();
+        let started = Instant::now();
+        let reason = writer
+            .close_within(Duration::from_secs(30), || true)
+            .expect("a hurried close is not an answer");
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "the hurry is not the deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(reason.contains("second signal"), "{reason}");
+        drop(held);
         let _ = fs::remove_dir_all(&root);
     }
 }

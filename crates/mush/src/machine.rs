@@ -29,6 +29,8 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 use tempfile::{Builder, NamedTempFile};
 
@@ -226,8 +228,63 @@ struct Running {
     /// whatever group the kernel handed the number to next (finding E6).
     killed: bool,
     /// The one sentence a kill that could not end the group owes, read through
-    /// [`Job::kill_failure`] (finding E6).
+    /// [`Job::kill_failure`] (finding E6) — and the sentence a leader that
+    /// outlived [`REAP_DEADLINE`] owes beside it (finding R4).
     failure: Option<String>,
+}
+
+/// How long a kill waits for the command's leader to be reaped once its group
+/// has been signalled.
+///
+/// `SIGKILL` cannot be ignored, so the reap is normally immediate, and the day
+/// it is not is the day the leader sits in uninterruptible I/O — an NFS server
+/// that stopped answering, a device that is not returning. A `Child::wait`
+/// there blocks a kill walk that has more jobs behind it, and on the quit road
+/// it blocks the exit itself, with the workspace lock still taken (finding R4).
+/// The bound is the same kind the flush's own is: a deadline, a sentence said
+/// when it passes, and the process leaving anyway.
+const REAP_DEADLINE: Duration = Duration::from_secs(2);
+
+/// How long the reap waits between polls of the child. `std` has no
+/// wait-with-deadline, and the reap is normally the first answer of the first
+/// poll.
+const REAP_POLL: Duration = Duration::from_millis(5);
+
+/// Reap `child`, waiting at most `deadline`, and say why not when the child
+/// outlives it or the exit road is hurried.
+///
+/// `Ok(Some(_))` is the ordinary answer and returns at once: the kill has
+/// already been sent when this runs, so a child still running after the
+/// deadline is not a slow kill but a stuck one. The error road is `poll`'s, in
+/// the same words, so a child that cannot be waited for reads the same wherever
+/// the question is asked.
+///
+/// `forced` is a signal that has already asked mush to quit and come back
+/// (finding R3): the second press ends this wait at its next poll, before the
+/// deadline, and the reason says so rather than pretending the clock ran out.
+fn reap_within(child: &mut Child, deadline: Duration, forced: impl Fn() -> bool) -> Option<String> {
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return None,
+            Ok(None) => {}
+            Err(error) => return Some(format!("could not wait for command: {error}")),
+        }
+        if forced() {
+            return Some(format!(
+                "a second signal hurried the exit — the command was killed but its leader was not \
+                 reaped after {:?}",
+                started.elapsed()
+            ));
+        }
+        if started.elapsed() >= deadline {
+            return Some(format!(
+                "the command was killed but its leader did not end within {deadline:?} — it may \
+                 still be exiting"
+            ));
+        }
+        thread::sleep(REAP_POLL);
+    }
 }
 
 /// How a finished child ended.
@@ -303,7 +360,19 @@ impl Job for Running {
                 }
             }
         }
-        let _ = self.child.wait();
+        // The leader is reaped here, and only for as long as [`REAP_DEADLINE`]
+        // allows (finding R4): a `wait` with no bound would let one leader in
+        // uninterruptible I/O hold this kill — and, on the quit road, every job
+        // behind it and the process itself — for as long as the device wants.
+        if let Some(reason) = reap_within(&mut self.child, REAP_DEADLINE, crate::signals::forced) {
+            // Kept beside a group-signal failure rather than replacing it: both
+            // are things this kill could not finish, and the reader is owed the
+            // whole list.
+            self.failure = Some(match self.failure.take() {
+                Some(first) => format!("{first}; {reason}"),
+                None => reason,
+            });
+        }
     }
 
     fn kill_failure(&self) -> Option<String> {
@@ -765,7 +834,7 @@ mod tests {
     #[cfg(unix)]
     use rustix::process::{kill_process, kill_process_group, Pid, Signal};
 
-    use super::{ended, End};
+    use super::{ended, reap_within, End};
 
     /// The one reading of a real status: an exit code, or the signal that killed
     /// the process. `ExitStatusExt::from_raw` is the inverse of the `into_raw` a
@@ -937,6 +1006,79 @@ mod tests {
             "the command's PATH is the human's"
         );
         assert_eq!(end, End::Exited(0), "printenv found PATH");
+    }
+
+    /// The kill's reap is bounded (finding R4): a leader still running when the
+    /// deadline passes is not waited for past it, and the reason says so. A
+    /// live child is the shape of the day the deadline is for — a killed child
+    /// reaps instantly, and uninterruptible I/O cannot be made in a test.
+    #[cfg(unix)]
+    #[test]
+    fn a_reap_past_its_deadline_is_a_reason_not_a_wait() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep starts");
+        let deadline = std::time::Duration::from_millis(50);
+        let started = std::time::Instant::now();
+        let reason = reap_within(&mut child, deadline, || false)
+            .expect("a live child outlives the deadline");
+        assert!(
+            started.elapsed() >= deadline,
+            "the deadline is the clock: {:?}",
+            started.elapsed()
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "it is a deadline, not a wait: {:?}",
+            started.elapsed()
+        );
+        assert!(reason.contains("did not end"), "{reason}");
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    /// And the ordinary answer: a child that has ended is reaped with nothing
+    /// to say, at the first poll.
+    #[cfg(unix)]
+    #[test]
+    fn a_finished_child_is_reaped_without_a_wait() {
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("true starts");
+        let started = std::time::Instant::now();
+        assert_eq!(
+            reap_within(&mut child, std::time::Duration::from_secs(5), || false),
+            None
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the reap of a finished child is not a wait: {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// A second signal ends the reap at its next poll (finding R3): a child
+    /// that has not ended by then is left with the reason said, not waited for
+    /// to a deadline the human has already refused to wait out.
+    #[cfg(unix)]
+    #[test]
+    fn a_hurried_reap_does_not_wait() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep starts");
+        let started = std::time::Instant::now();
+        let reason = reap_within(&mut child, std::time::Duration::from_secs(30), || true)
+            .expect("a hurried reap is not an answer");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the hurry is not the deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(reason.contains("second signal"), "{reason}");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// The name is the contract a later start reaps by: the pid of the mush

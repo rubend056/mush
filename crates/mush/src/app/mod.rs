@@ -844,6 +844,10 @@ pub struct App {
     /// Work in progress does not live here — it is derived from the phases.
     pub status: Option<Status>,
     pub should_quit: bool,
+    /// Whether the exit road has run: [`Self::shutdown`] is idempotent, so the
+    /// one `main` takes on the way out cannot flush or kill a second time when
+    /// `Drop` runs it again.
+    shut_down: bool,
     pub dirty_screen: bool,
     /// The terminal's size, as of the last size `main` reported. `/notes` wraps
     /// its lines to the popup this size paints them in, and [`App::below_floor`]
@@ -1021,6 +1025,7 @@ impl App {
             worktree_facts,
             status: None,
             should_quit: false,
+            shut_down: false,
             dirty_screen: true,
             // The ubiquitous terminal, and above the floor: `main` reports the
             // real size before the first key can be read.
@@ -4184,6 +4189,11 @@ impl App {
     /// cancelled actor goes back to waiting for work (which is what Ctrl-C
     /// should do), while Ctrl-N needs the threads to be gone — and an actor
     /// holds its own mailbox open, so it never notices that the UI let go.
+    ///
+    /// The exit road sends this too ([`App`]'s `Drop`), before the job walk:
+    /// an actor mid-run is the one thing that can start a command after the
+    /// walk has read the registry, and its own ending is what closes that
+    /// window (finding R5).
     fn stop_all(&self) {
         for tx in self.tree.agent_tx.values() {
             let _ = tx.send(AgentMsg::Shutdown);
@@ -4235,15 +4245,28 @@ impl App {
     /// the worker is gone — says it the way every other failure is said
     /// (`session_save_failed`, which puts the mark back too): the write it
     /// waited for did not land, the next debounce retries, and the exit flush
-    /// is not skipped for a road that was never paid (findings R2, R6).
+    /// is not skipped for a road that was never paid (findings R2, R6). The
+    /// sentence it returns is for the one reader with no frame left to paint it
+    /// on, the exit road ([`Self::shutdown`], finding R4).
     fn flush_session(&mut self) {
+        let _ = self.flush_session_report();
+    }
+
+    /// [`Self::flush_session`]'s whole answer, for the two readers with
+    /// different places to put it: the bar (through `flush_session`) and the
+    /// exit road, which has no frame left to paint a failure on and says it to
+    /// a shell that has its terminal back ([`Self::shutdown`], finding R4).
+    ///
+    /// `None` when the session landed, and when there was nothing to write.
+    fn flush_session_report(&mut self) -> Option<String> {
         self.session_dirty_at = None;
         let session = self.session_snapshot();
         self.session_save.save(session);
         self.session_save.flush();
-        if let Some(error) = self.session_save.take_error() {
-            self.session_save_failed(error);
-        }
+        let failure = self
+            .session_save
+            .take_error()
+            .map(|error| self.session_save_failed(error));
         // A save is a moment the state is being fixed; the repository is part
         // of that picture, so refresh it here rather than leaving the bar with
         // a read older than the file on disk (finding P8). Only the human-
@@ -4251,6 +4274,7 @@ impl App {
         // debounced `save_session` — so this does not put a git process on the
         // message path.
         self.refresh_git();
+        failure
     }
 
     /// A session write that did not land, said the way every other failure is.
@@ -4261,11 +4285,13 @@ impl App {
     /// keystroke and no spinner beat marked one, so without it the line is set
     /// and never painted, and the frame that is painted is the keystroke that
     /// replaces the line. The human would read a stale workspace as saved
-    /// (finding R6).
-    fn session_save_failed(&mut self, error: String) {
+    /// (finding R6). The sentence it built is returned, for the exit road's own
+    /// reader (`App::shutdown`) — the notice and the bar line are already said.
+    fn session_save_failed(&mut self, error: String) -> String {
         let line = format!("could not save session: {error}");
-        self.fail_for(AgentId::ROOT, line.clone(), Some(line));
+        self.fail_for(AgentId::ROOT, line.clone(), Some(line.clone()));
         self.dirty_screen = true;
+        line
     }
 
     /// The conversation as it is stored: the root transcript, every subagent's,
@@ -5513,24 +5539,72 @@ impl App {
 }
 
 impl Drop for App {
-    /// The exit flush: whatever the debounce had not written yet goes out here,
-    /// so ending mush — a clean quit, and every signal that takes this road
-    /// (`main::take_signal_quit`) — costs nothing. This is what bounds a crash
-    /// to `SESSION_DEBOUNCE` of streamed chat rather than to everything since
-    /// the last boundary. A failure here is reported the usual way and then lost
-    /// with the status line: there is no screen left to read it on. The writer
-    /// does not lose the road with it — the snapshot that failed stays with the
-    /// writer, and its own final drain, as this drop releases it, is one more
-    /// attempt (finding R2).
+    /// The exit road, reached from the other side. `main` calls
+    /// [`App::shutdown`] itself, because it has a terminal to hand back and a
+    /// shell to print the sentences on; this is the backstop for every way an
+    /// `App` ends without that — a test, a panic, a future caller that forgets.
+    /// [`App::shutdown`] is idempotent, so a drop after the explicit road has
+    /// nothing left to do.
+    ///
+    /// The sentences a backstop road returns have no `main` left to print them,
+    /// and they are said here: a bound that expired is exactly the thing that
+    /// must not be swallowed, and this is the last door open.
+    ///
+    /// The exit flush is the first thing `shutdown` does, so whatever the
+    /// debounce had not written goes out on this road too, and a write that
+    /// fails is not lost with it: the snapshot stays with the writer for its own
+    /// final drain as the drop releases it (finding R2).
     fn drop(&mut self) {
-        if self.session_dirty_at.is_some() {
-            self.flush_session();
+        for note in self.shutdown() {
+            eprintln!("mush: {note}");
         }
-        // Jobs die with mush itself. Each one is a process group, and a build an
-        // agent started used to outlive a clean quit — the human's next `cargo
-        // build` then fought a ghost for the target directory. Killing here,
-        // on the way out of the process, is the last moment it can happen.
-        self.tree.handles().jobs.kill_all();
+    }
+}
+
+impl App {
+    /// The exit road: everything that must be settled before the process goes,
+    /// in one order, each step bounded, and the sentences about what could not
+    /// be settled.
+    ///
+    /// `main` calls this on the way out — *before* the terminal and the socket
+    /// go back (finding R3: the road runs first, so a second signal cannot find
+    /// a hand-back already made and skip the steps behind it), and [`Drop`]
+    /// calls it again as the backstop, which is what makes it idempotent rather
+    /// than merely ordered. The sentences it returns are printed once the
+    /// terminal is handed back, on a cooked screen.
+    ///
+    /// The order is the fact. The session goes first: it is the one thing the
+    /// human asked not to lose, and it is written only if a change is waiting
+    /// (the debounce may already have landed it). Then the actors are told to
+    /// end, and only then is the quit fence raised and every process group
+    /// walked ([`AgentTree::handles`]'s registry, `jobs::Registry::kill_all`):
+    /// an actor mid-run is the one place a group can still be born, and its own
+    /// ending — or the fence refusing its launch — is what closes that window
+    /// (finding R5). The writer's thread is waited for last, bounded like the
+    /// flush it follows, so the process does not leave while the snapshot it
+    /// just handed over is still being written (finding R4).
+    ///
+    /// Every bound here expires into a sentence, never into a hang and never
+    /// into silence: `main` prints what comes back once it has handed the
+    /// terminal back, and `Drop` does the same where there is no `main`. A
+    /// signal pressed a second time ends the waits at their next poll instead of
+    /// at their deadlines ([`crate::signals::forced`], finding R3); the sentence
+    /// it leaves says the human asked for that.
+    pub fn shutdown(&mut self) -> Vec<String> {
+        if self.shut_down {
+            return Vec::new();
+        }
+        self.shut_down = true;
+        let mut notes = Vec::new();
+        if self.session_dirty_at.is_some() {
+            notes.extend(self.flush_session_report());
+        }
+        // `Shutdown`, not `Stop`: a cancelled actor goes back to waiting for
+        // work, while the exit needs the threads to be gone.
+        self.stop_all();
+        notes.extend(self.tree.handles().jobs.kill_all());
+        notes.extend(self.session_save.close());
+        notes
     }
 }
 
@@ -11587,12 +11661,15 @@ mod tests {
     }
 
     /// A signal is not a key: it cannot be pressed twice, so it does not wait
-    /// for a second press. The handler sets the flag, the loop's step reads it
-    /// and quits — with live work, and no arm in between (finding E1).
+    /// for a second press. The handler writes its byte, the watcher thread sets
+    /// the flag, and the loop's step reads it and quits — with live work, and no
+    /// arm in between (finding E1).
     ///
     /// This is the one test in the binary that raises one of the three signals,
-    /// deliberately: once the flag is set, a second signal would take the
-    /// conditional default road and kill the test process (see `signals`).
+    /// deliberately: the press counter is the process's, and a test that raised
+    /// signals on its own would spend another test's presses. The flag is
+    /// *polled* for because the watcher is a thread of its own — `raise`
+    /// returns once the byte is in the pipe, not once the flag is set.
     #[test]
     fn a_signal_takes_the_quit_road_without_the_arming_press() {
         let _signals = crate::signals::install().expect("the handlers install");
@@ -11606,6 +11683,14 @@ mod tests {
         assert!(app.quit_armed(), "and the warning is on the line");
 
         signal_hook::low_level::raise(signal_hook::consts::SIGTERM).expect("the signal is raised");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !crate::signals::quit_requested() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the watcher thread never set the flag"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert!(
             crate::take_signal_quit(&mut app),
             "the handler set the flag, and the loop's step reads it"
@@ -12469,6 +12554,102 @@ mod tests {
             "the restart kept the failure and dropped the diff line"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The exit road tells the actors to end, not only their jobs (finding R5).
+    /// The root's own `Shutdown` is what stops its thread — a signal that
+    /// reaches the actor and ends its run, where killing its jobs alone would
+    /// leave the actor free to start another command after the walk. A mailbox
+    /// whose actor has ended refuses a send, which is how that is observable
+    /// from outside the tree.
+    #[test]
+    fn the_exit_road_ends_the_actors_not_only_their_jobs() {
+        let (app, _rx) = test_app("exit-ends-actors");
+        let mailbox = app
+            .tree
+            .agent_tx
+            .get(&AgentId::ROOT)
+            .cloned()
+            .expect("the root has a mailbox");
+        drop(app);
+        // A send into a mailbox whose actor is gone fails: the receiver went
+        // with the thread. `Stop` is the neutral word for this — an idle actor
+        // absorbs it and keeps waiting (`absorb`'s `Stop` arm) — so a refusal
+        // to send is the actor's own ending and not something the message did.
+        // Bounded, because a defect must not hang the suite.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while mailbox
+            .send(AgentMsg::Stop(crate::agent::Stop::Human))
+            .is_ok()
+        {
+            assert!(Instant::now() < deadline, "the root actor never ended");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    /// The exit road runs once (finding R4): `main` calls it before the
+    /// terminal is handed back, `Drop` calls it again as the backstop, and a
+    /// second flush or a second kill walk would be work nobody asked for. The
+    /// flush is observable — the recorder counts what the road handed over — so
+    /// the idempotence is read, not assumed.
+    #[test]
+    fn the_exit_road_is_idempotent() {
+        let (mut app, recorder) = app_recording("exit-twice");
+        streamed(&mut app, "something to write");
+        assert!(app.session_dirty_at.is_some(), "a change is waiting");
+        assert!(app.shutdown().is_empty(), "a clean road says nothing");
+        assert_eq!(recorder.len(), 1, "the flush happened once");
+        assert!(
+            app.shutdown().is_empty(),
+            "and a second call has nothing left to do"
+        );
+        assert_eq!(recorder.len(), 1, "no second flush");
+        drop(app);
+        assert_eq!(recorder.len(), 1, "and `Drop`'s backstop adds nothing");
+    }
+
+    /// A writer that answers the exit road's close with a sentence — the shape
+    /// a stuck thread leaves (finding R4) — so a test can read that the road
+    /// carries it out to the caller that can say it.
+    struct Closing(Option<String>);
+
+    impl SessionSave for Closing {
+        fn save(&self, _session: Session) {}
+
+        fn flush(&self) {}
+
+        fn take_error(&self) -> Option<String> {
+            None
+        }
+
+        /// The double holds no lock: the store it writes is its own.
+        fn store_is_mine(&self) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn close(&self) -> Option<String> {
+            self.0.clone()
+        }
+    }
+
+    /// What a bound that expired says is not swallowed (finding R4):
+    /// `App::shutdown` hands the writer's sentence to the caller, which is
+    /// `main`, which prints it to a terminal it has already handed back.
+    #[test]
+    fn the_exit_road_says_what_the_writer_could_not_finish() {
+        let root = dir("exit-says");
+        let (mut app, _rx) = app_root(
+            &root,
+            None,
+            Arc::new(Closing(Some(
+                "the session writer did not finish within 2s".to_string(),
+            ))),
+        );
+        assert_eq!(
+            app.shutdown(),
+            vec!["the session writer did not finish within 2s".to_string()],
+            "the reason a bound expired is handed to the caller that can say it"
+        );
     }
 
     /// A typo'd command answers the moment the human typed it, so it is nothing
