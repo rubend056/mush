@@ -764,11 +764,23 @@ pub enum Commit {
 /// there — the short revision, [`Commit::Nothing`] when the run changed nothing
 /// at all, or the ignored paths when those are all it changed (finding F1).
 ///
+/// It refuses to commit anywhere but the worktree it was given. `git -C <dir>`
+/// walks up to the enclosing repository, so a directory under `.mush/wt` that is
+/// no longer a worktree — a hand `git worktree remove`, then a write from a run
+/// that was already in flight — is an ordinary directory inside the human's
+/// checkout: committing there would stage and commit the human's own work, on
+/// the human's branch, under mush's subject and identity (finding F8). `dir`
+/// must be the root of its own working tree; anything else is refused as
+/// "`<dir>` is no longer a worktree" and never commits somewhere up the tree.
+///
 /// The identity and the message are supplied here (`-c user.name=…`,
 /// `--no-verify`) so a commit does not depend on the human's identity and never
 /// runs their commit hooks. The index is that worktree's own, so a commit here
 /// cannot touch the human's index either.
 pub fn commit_all(dir: &Path, subject: &str) -> Result<Commit, String> {
+    if !is_its_own_worktree(dir) {
+        return Err(format!("{} is no longer a worktree", dir.display()));
+    }
     let found =
         changes(dir).ok_or_else(|| format!("git could not read {} for a commit", dir.display()))?;
     if found.is_empty() {
@@ -794,6 +806,24 @@ pub fn commit_all(dir: &Path, subject: &str) -> Result<Commit, String> {
         ],
     )?;
     Ok(Commit::Made(run(dir, &["rev-parse", "--short", "HEAD"])?))
+}
+
+/// Whether `dir` is the root of its own working tree — the question [`commit_all`]
+/// has to ask before `git -C` goes looking upward for a repository. A linked
+/// worktree's `.git` is a file, so its presence is the first half; the second is
+/// git's own answer, because a subdirectory of a checkout has a `.git` somewhere
+/// above it and would otherwise commit into that repository (finding F8).
+fn is_its_own_worktree(dir: &Path) -> bool {
+    if !dir.join(".git").exists() {
+        return false;
+    }
+    let Some(top) = git(dir, &["rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    match (std::fs::canonicalize(dir), std::fs::canonicalize(&top)) {
+        (Ok(dir), Ok(top)) => dir == top,
+        _ => false,
+    }
 }
 
 /// A revision resolved to its commit id, or `None` when it does not exist. The
@@ -1664,6 +1694,59 @@ mod tests {
         );
         assert!(path.join("run.log").exists());
         assert!(resolve(&dir, "mush/1").is_some(), "and so is the branch");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A workspace that is no longer a worktree is not a place to commit: `git
+    /// -C` would walk up to the enclosing repository and stage and commit the
+    /// human's own modified and untracked files, on the human's branch, under
+    /// mush's subject and identity (finding F8). The refusal names the
+    /// directory, and the human's checkout is exactly as it was.
+    #[test]
+    fn a_commit_never_leaves_the_worktree() {
+        let dir = init_repo("commit-guard");
+        fs::write(dir.join("a.txt"), "the human's half-finished edit\n").unwrap();
+        fs::write(dir.join("notes.txt"), "the human's untracked file\n").unwrap();
+        let head = resolve(&dir, "HEAD").unwrap();
+        let before = git(&dir, &["status", "--porcelain"]).unwrap();
+
+        // What a missed `git worktree remove` leaves, and what a late write
+        // from a run already in flight recreates: a plain directory under
+        // `.mush/wt`, which is inside the human's checkout.
+        let plain = worktree_path(&dir, 1);
+        fs::create_dir_all(&plain).unwrap();
+        assert!(
+            !plain.join(".git").exists(),
+            "the fixture is a plain directory"
+        );
+        let error = commit_all(&plain, "mush #1: the brief").unwrap_err();
+        assert!(error.contains("is no longer a worktree"), "{error}");
+        assert!(
+            error.contains(".mush/wt/1"),
+            "and it names the directory: {error}"
+        );
+
+        // A subdirectory of a checkout is the same shape one level in.
+        let sub = dir.join("src");
+        fs::create_dir_all(&sub).unwrap();
+        let error = commit_all(&sub, "mush #1: the brief").unwrap_err();
+        assert!(error.contains("is no longer a worktree"), "{error}");
+
+        assert_eq!(
+            resolve(&dir, "HEAD").unwrap(),
+            head,
+            "the human's HEAD did not move"
+        );
+        assert_eq!(
+            git(&dir, &["status", "--porcelain"]).unwrap(),
+            before,
+            "and their index is untouched"
+        );
+        assert_ne!(
+            subject_of(&dir, "HEAD").as_deref(),
+            Some("mush #1: the brief"),
+            "no commit carries mush's subject on the human's branch"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 }
