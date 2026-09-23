@@ -285,14 +285,33 @@ pub fn parse_command(line: &str) -> Result<Command, CommandError> {
         "/compact" => Command::Compact,
         "/notes" => Command::Notes,
         "/provider" => Command::Provider(optional(argument)),
-        "/key" => Command::ApiKey(optional(argument)),
+        // A key is written into the request head raw, so a control character
+        // in one is a header line of its own (finding C7). The door is here,
+        // where the human typed it: the refusal names the command, and only
+        // the character as its escape — the key's own bytes are a secret and
+        // must not be printed.
+        "/key" => match optional(argument) {
+            Some(key) => match mush_core::config::checked_key(&key, "/key") {
+                Ok(key) => Command::ApiKey(Some(key)),
+                Err(error) => return Err(CommandError::Usage(error)),
+            },
+            None => Command::ApiKey(None),
+        },
         "/url" if argument.is_empty() => {
             return Err(CommandError::Usage(
                 "usage: /url http://host:port — base URL of an OpenAI-compatible endpoint"
                     .to_string(),
             ))
         }
-        "/url" => Command::Url(argument.to_string()),
+        // An endpoint is written into the request line raw, so a control
+        // character in one is a request the value writes for itself (finding
+        // D19). The arm routes through the same door every other road takes,
+        // so the refusal is spoken where the human typed it instead of being
+        // dropped by `set_base_url` with an ack for the endpoint in force.
+        "/url" => match mush_core::config::checked_url(argument, "/url") {
+            Ok(url) => Command::Url(url),
+            Err(error) => return Err(CommandError::Usage(error)),
+        },
         // A row with no arm here: `every_command_in_the_table_parses` fails
         // before this can happen, and the honest answer to a name that somehow
         // got here is still the error the lookup would have given.
@@ -476,6 +495,59 @@ mod tests {
             Ok(Command::Context(ContextArg::Auto)),
             "a word is read letter-blind, as /provider's and --thinking's are"
         );
+    }
+
+    /// `/key`'s secret is written into the request head raw, so a control
+    /// character in one is a header line of its own (finding C7). The door is
+    /// here, where the human typed it: the refusal names the command, and only
+    /// the character as its escape — the key's own bytes are a secret and never
+    /// reach the sentence.
+    #[test]
+    fn a_key_with_a_control_character_is_refused_by_name() {
+        assert_eq!(
+            parse_command("/key sk-a\r\nb"),
+            Err(CommandError::Usage(
+                "/key contains a control character (\\r) — check the value".to_string()
+            ))
+        );
+        // A key without one still parses, and the newline a pasted block trails
+        // is the line's own trim.
+        assert_eq!(
+            parse_command("/key sk-ok\n"),
+            Ok(Command::ApiKey(Some("sk-ok".to_string())))
+        );
+        // No argument still reports the key in use.
+        assert_eq!(parse_command("/key"), Ok(Command::ApiKey(None)));
+    }
+
+    /// The TUI's `/url` door (the residual `4f7793c` left): the endpoint is
+    /// written into the request line raw, so a control character in one is a
+    /// request the value writes for itself (finding D19). Routing the arm
+    /// through the same door every other road takes refuses it where the human
+    /// typed it, instead of `set_base_url` dropping it silently behind an ack
+    /// that names the endpoint actually in force.
+    #[test]
+    fn a_url_with_a_control_character_is_refused_by_name() {
+        let error = parse_command("/url http://h:1\r\nX: y").unwrap_err();
+        assert!(
+            matches!(
+                &error,
+                CommandError::Usage(line) if line.contains("contains a control character (\\r)")
+            ),
+            "{error:?}"
+        );
+
+        // A good URL still parses — and a trailing slash is trimmed by the same
+        // door the flag goes through.
+        assert_eq!(
+            parse_command("/url http://h:1"),
+            Ok(Command::Url("http://h:1".to_string()))
+        );
+        // No argument is still the usage line.
+        assert!(matches!(
+            parse_command("/url"),
+            Err(CommandError::Usage(line)) if line.starts_with("usage: /url http")
+        ));
     }
 
     /// `/context`'s number is read by [`mush_core::config::parse_context`] — the

@@ -5,6 +5,10 @@
 //! endpoint, provider, and model persist in the session; the API key never
 //! does — it lives in the home config or `MUSH_API_KEY`.
 //!
+//! The endpoint and the key are the two fields a request head is built from
+//! raw, so every road a human or a file states one by checks it
+//! ([`checked_url`], [`checked_key`]).
+//!
 //! [`resolve`] is the single place where the startup precedence is written
 //! down; `main.rs` only parses argv and hands the values over.
 
@@ -233,6 +237,11 @@ pub struct Config {
     /// session snapshot carry it around, not as a licence to write it.
     pub base_url: String,
     pub model: String,
+    /// The secret every request's `Authorization` header is written from raw,
+    /// so a control character here is a header line the value writes for
+    /// itself. Every road a human or a file states one by is checked
+    /// ([`checked_key`]); this field is `pub` because the settings screen and
+    /// the app's own cell carry it around, not as a licence to write it.
     pub api_key: Option<String>,
     /// The endpoint's context window in tokens. The history trimmer keeps
     /// every request under it, reserving room for the tool schemas and the
@@ -335,9 +344,9 @@ impl Overrides {
     /// The environment layer, read for startup: the same seven variables as
     /// [`Self::from_env`] and the same one read of them, but a value that does
     /// not parse is an error naming its variable rather than a silent drop.
-    /// The provider is validated first, then the endpoint, the context, the
-    /// effort and the thinking mode, so the first typo in that order is the one
-    /// reported.
+    /// The provider is validated first, then the endpoint, the key, the
+    /// context, the effort and the thinking mode, so the first typo in that
+    /// order is the one reported.
     pub fn from_env_checked() -> Result<Self, String> {
         let text = EnvText::read();
         // The provider first: a key meant for somewhere else must not be sent
@@ -353,7 +362,10 @@ impl Overrides {
             url: text.url.map(|value| parse_url_env(&value)).transpose()?,
             model: text.model,
             provider,
-            api_key: text.api_key,
+            api_key: text
+                .api_key
+                .map(|value| parse_key_env(&value))
+                .transpose()?,
             context: text
                 .context
                 .map(|value| parse_context_env(&value))
@@ -502,6 +514,42 @@ pub fn parse_url_env(value: &str) -> Result<String, String> {
     checked_url(value, "MUSH_URL")
 }
 
+/// One checked door for API keys: what a human or a file states a key by is a
+/// value written into the request head raw, so it is the one place that decides
+/// what a key may be.
+///
+/// `sk-inject\r\nX-Injected-By-Key: yes` is a header line the *value* writes
+/// for itself: the bearer line ends at the CRLF and the rest becomes a header
+/// the endpoint acts on (finding C7, proven on the wire — the second field
+/// D19 filed for the URL). So the refusal is a control character anywhere in
+/// the value, named as its escape rather than echoed as itself — the bytes of
+/// a control character must not reach the terminal that prints the refusal,
+/// and neither may the key's own bytes, because a secret must not reach a
+/// terminal or a log — and every road that states one goes through here:
+/// `MUSH_API_KEY`, the home config, and `/key`.
+///
+/// Surrounding space is trimmed *before* the check, as it is for every other
+/// stated value: a key pasted with a trailing newline is the key it looks like,
+/// and an interior one is not a key at all.
+pub fn checked_key(key: &str, road: &str) -> Result<String, String> {
+    let key = key.trim();
+    match key.chars().find(|character| character.is_control()) {
+        Some(control) => Err(format!(
+            "{road} contains a control character ({}) — check the value",
+            control.escape_debug()
+        )),
+        None => Ok(key.to_string()),
+    }
+}
+
+/// Validate `MUSH_API_KEY`, the environment's road to a checked key: a value
+/// that cannot be one is reported by name rather than dropped, because the
+/// variable is how a human states one (finding C7; the same rule `MUSH_URL`'s
+/// reader follows).
+pub fn parse_key_env(value: &str) -> Result<String, String> {
+    checked_key(value, "MUSH_API_KEY")
+}
+
 /// The host of an endpoint URL: the authority, port included; the scheme, the
 /// path and the query are not part of it.
 ///
@@ -580,7 +628,16 @@ impl Config {
             provider,
             base_url,
             model: env.model.clone().unwrap_or_default(),
-            api_key: env.api_key.clone(),
+            // A key is checked the way a URL is: a malformed one is dropped
+            // rather than kept, because this constructor has no human to
+            // report to ([`Overrides::from_env_checked`] is the reporting
+            // door), and one that trims to nothing is no key rather than the
+            // empty `Authorization: Bearer ` state D22 names.
+            api_key: env
+                .api_key
+                .as_deref()
+                .and_then(|key| parse_key_env(key).ok())
+                .filter(|key| !key.is_empty()),
             context_tokens: context.unwrap_or(DEFAULT_CONTEXT_TOKENS),
             context_source: if context.is_some() {
                 WindowSource::Stated
@@ -961,9 +1018,9 @@ pub struct Resolved {
 ///
 /// Returns an error for an unknown provider name on the command line or in the
 /// home config, and for a `MUSH_CONTEXT`, `MUSH_REASONING_EFFORT`,
-/// `MUSH_THINKING` or `MUSH_PROVIDER` that does not parse. A session's bad
-/// provider is a notice instead: that file is not hand-edited input, and a
-/// typo there must not take the TUI down (finding C2).
+/// `MUSH_THINKING`, `MUSH_PROVIDER` or `MUSH_API_KEY` that does not parse. A
+/// session's bad provider is a notice instead: that file is not hand-edited
+/// input, and a typo there must not take the TUI down (finding C2).
 pub fn resolve(
     cli: &Overrides,
     home: &UserConfig,
@@ -1043,7 +1100,18 @@ pub fn resolve_with(
         // request carried `Authorization: Bearer ` with nothing after it
         // (finding D22). `MUSH_API_KEY=""` is already dropped by
         // `env_nonempty`, so this is the file's own road to that state.
-        config.api_key = home.api_key.clone().filter(|key| !key.is_empty());
+        //
+        // A stated key is checked before it is kept, and the file's path is
+        // named with the refusal, for the reason the `base_url` arm below
+        // names it: `MUSH_CONFIG` can point anywhere, so the layer's name
+        // alone is not enough to find the line to fix (finding C7).
+        config.api_key = home
+            .api_key
+            .as_deref()
+            .map(|key| checked_key(key, "home config's api_key"))
+            .transpose()
+            .map_err(|error| format!("{error} — {}", crate::userconfig::config_path().display()))?
+            .filter(|key| !key.is_empty());
     }
     if !provider_given && !home.provider.is_empty() {
         // A typo here is an error, exactly as it is for `--provider` and
@@ -1353,6 +1421,68 @@ mod tests {
         // block gives `/url` is the URL it looks like.
         config.set_base_url("  http://next.test:8078/  \n");
         assert_eq!(config.base_url, "http://next.test:8078");
+    }
+
+    /// The other field a request head is built from (finding C7): a key with a
+    /// control character is a header line the *value* writes for itself, so
+    /// every door refuses it by name — the variable and the home config —
+    /// while the lenient read, which has no human to report to, drops it. The
+    /// character is named as its escape and the key's own bytes are never
+    /// echoed: the refusal is a line mush prints, and a secret must not reach a
+    /// terminal or a log.
+    ///
+    /// There is no session door to walk: `Session` has no `api_key` field, so
+    /// a stored file cannot carry one in. The parser's door is the same check
+    /// on the same value, pinned by
+    /// `a_key_with_a_control_character_is_refused_by_name` in `app::commands`.
+    #[test]
+    fn a_key_with_a_control_character_is_refused_by_every_door() {
+        let bad = "sk-inject-0123456789\r\nX-Injected-By-Key: yes";
+        fn said(road: &str) -> String {
+            format!("{road} contains a control character (\\r) — check the value")
+        }
+
+        // The environment, under the name the human will look for; the lenient
+        // reader drops a value like this instead — it has no human to report
+        // to — exactly as it drops a malformed window or URL.
+        let error = parse_key_env(bad).unwrap_err();
+        assert_eq!(error, said("MUSH_API_KEY"));
+        assert_eq!(
+            Config::from_env_layer(&Overrides {
+                api_key: Some(bad.into()),
+                ..Overrides::default()
+            })
+            .api_key,
+            None,
+            "the lenient layer drops it rather than storing it"
+        );
+
+        // The home config, with the file's path: the layer's name alone does
+        // not say which file to fix.
+        let mut with_key = home("custom", "http://home:4", "m");
+        with_key.api_key = Some(bad.into());
+        let error = resolve_with(
+            Config::new("http://home:4", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &with_key,
+            None,
+        )
+        .unwrap_err();
+        assert!(error.starts_with(&said("home config's api_key")), "{error}");
+        assert!(
+            error.contains(&crate::userconfig::config_path().display().to_string()),
+            "{error}"
+        );
+
+        // Neither the key's bytes nor the character itself ever reaches the
+        // sentence: what it names is the escape.
+        assert!(!error.contains("sk-inject"), "{error}");
+        assert!(!error.contains('\r'), "{error}");
+
+        // Surrounding space is still trimmed first, so the newline a pasted
+        // block trails is still the key it looks like.
+        assert_eq!(parse_key_env("  sk-ok \n"), Ok("sk-ok".to_string()));
     }
 
     #[test]

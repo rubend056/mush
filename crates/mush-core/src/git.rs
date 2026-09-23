@@ -8,8 +8,10 @@
 //! Every child is started through [`scrub`]: git does not talk to the provider,
 //! so mush's credential is not in the environment it is handed (finding C1).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use crate::secrets::scrub;
 
@@ -830,8 +832,134 @@ pub fn isolated_ids(dir: &Path) -> Option<Vec<u64>> {
     Some(ids)
 }
 
-/// The isolated worktrees that exist and are **not** landable against `HEAD`:
-/// what [`MAX_WORKTREES`] counts.
+/// One node's base and its fork revision, as [`WorktreeFacts`] stores them —
+/// named so the book's type does not spell the same pair twice.
+type NodeFacts = HashMap<u64, (String, Option<String>)>;
+
+/// The sweep's own facts about one tree's worktrees — each node's base and its
+/// fork revision — published where the spawn cap can read them.
+///
+/// The cap ([`unlandable`]) is asked inside an actor's thread
+/// (`agent::spawn_tool` in the TUI crate), which holds no tree handle, while
+/// the facts that make the cap's question the sweep's question live in the UI's
+/// tree: `App::fork_base` derives each node's base, and the node carries its
+/// fork. This is the one book between the two roads, keyed by the canonical
+/// repository root the way `agent::Writers` is keyed by the directory a run
+/// writes in: one process serves one tree per root, and a test's tree is keyed
+/// by its own directory, so two of them cannot see each other.
+///
+/// A worktree no tree names — a leftover found on disk, an agent restored from
+/// a session that stored no base — has no entry here and is asked the question
+/// [`unlandable`] has always asked: against `HEAD`, with no fork. That is the
+/// conservative side of the same asymmetry finding F7 is about (a nested child
+/// merged only into its parent's branch counts there), and it is why a refusal
+/// still says which of the two questions its number came from.
+#[derive(Default)]
+struct WorktreeFacts {
+    /// Canonical root -> each node's base and fork, replaced whole by every
+    /// walk of the tree that publishes it.
+    live: Mutex<HashMap<PathBuf, NodeFacts>>,
+}
+
+/// The process's own book of what each tree's worktrees are measured against —
+/// see [`WorktreeFacts`].
+static WORKTREE_FACTS: OnceLock<WorktreeFacts> = OnceLock::new();
+
+fn worktree_facts() -> &'static WorktreeFacts {
+    WORKTREE_FACTS.get_or_init(WorktreeFacts::default)
+}
+
+/// The book's key: one path per repository, so the same checkout named two ways
+/// is one key. A path that cannot be resolved — a directory deleted under a
+/// dying tree — is its own name, which only ever adds a book nobody reads again
+/// (`agent::writer_key`'s rule).
+fn facts_key(dir: &Path) -> PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// One tree's published facts, alive for as long as the caller holds the guard.
+///
+/// The guard is the publication's lifetime on purpose: an `App` that goes away
+/// must not leave a later tree on the same root judged by its nodes, and the
+/// book has to be process-wide because the actor that asks holds no handle to
+/// the tree that knows.
+#[must_use]
+pub struct PublishedFacts {
+    root: PathBuf,
+}
+
+impl PublishedFacts {
+    /// Replace this root's facts with one walk of the tree: every node's id,
+    /// the base its own work is measured against (`App::fork_base`) and the
+    /// fork revision it was created at, when the tree knows it.
+    ///
+    /// A whole replacement, not a merge: a node whose row is gone must not keep
+    /// answering the cap with a worktree that is gone with it.
+    pub fn set(&self, facts: impl IntoIterator<Item = (u64, String, Option<String>)>) {
+        let facts: NodeFacts = facts
+            .into_iter()
+            .map(|(id, base, fork)| (id, (base, fork)))
+            .collect();
+        worktree_facts()
+            .live
+            .lock()
+            .expect("no tree holds the book while it is poisoned")
+            .insert(self.root.clone(), facts);
+    }
+
+    /// What this guard has published, in id order: the read the UI's own tests
+    /// pin the wiring with (`App::refresh_git` → this book). Production asks
+    /// the book one id at a time through [`published_facts`].
+    pub fn published(&self) -> Option<Vec<(u64, String, Option<String>)>> {
+        worktree_facts()
+            .live
+            .lock()
+            .expect("no tree holds the book while it is poisoned")
+            .get(&self.root)
+            .map(|facts| {
+                let mut rows: Vec<(u64, String, Option<String>)> = facts
+                    .iter()
+                    .map(|(id, (base, fork))| (*id, base.clone(), fork.clone()))
+                    .collect();
+                rows.sort_by_key(|(id, ..)| *id);
+                rows
+            })
+    }
+}
+
+impl Drop for PublishedFacts {
+    fn drop(&mut self) {
+        worktree_facts()
+            .live
+            .lock()
+            .expect("no tree holds the book while it is poisoned")
+            .remove(&self.root);
+    }
+}
+
+/// Publish the facts of the tree at `root`; the returned guard owns them until
+/// it is dropped. [`PublishedFacts::set`] is the write a git read makes.
+pub fn publish_worktree_facts(root: &Path) -> PublishedFacts {
+    PublishedFacts {
+        root: facts_key(root),
+    }
+}
+
+/// The base and fork a tree published for one worktree — `key` is
+/// [`facts_key`] of the root, resolved once by [`unlandable`] — or none for a
+/// worktree no tree names.
+fn published_facts(key: &Path, id: u64) -> Option<(String, Option<String>)> {
+    worktree_facts()
+        .live
+        .lock()
+        .expect("no tree holds the book while it is poisoned")
+        .get(key)
+        .and_then(|facts| facts.get(&id))
+        .cloned()
+}
+
+/// The isolated worktrees that exist and are **not** landable: what
+/// [`MAX_WORKTREES`] counts.
 ///
 /// A landable worktree is one the next sweep takes, so it must not be what
 /// refuses a spawn — the cap exists to turn today's failure, a `git worktree add`
@@ -840,29 +968,50 @@ pub fn isolated_ids(dir: &Path) -> Option<Vec<u64>> {
 /// repository, and it answers with nothing when git cannot answer at all: a
 /// count that cannot be taken is not a hundred worktrees, it is no answer.
 ///
-/// What it asks is every worktree against `HEAD` with no fork revision, while
-/// the sweep that takes worktrees asks each node against the branch its own
-/// parent holds and with the fork it was created at (`App::reclaim_worktrees`).
-/// A nested child merged only into its parent's branch is therefore counted here
-/// although the sweep would take it, and the worktree is *reported*, not refused
-/// for it: [`MAX_WORKTREES`] and the spawn road's refusal say which question was
-/// asked rather than claiming the branch is unmerged (finding F7). The facts
-/// that would make the two questions one — each node's base and fork — live in
-/// the UI's tree, not on this side of the door.
+/// The question is the sweep's own for every worktree a tree has published
+/// ([`WorktreeFacts`]): the node's base — its parent's branch, or `HEAD` — and
+/// its fork revision, exactly the pair `App::reclaim_worktrees` hands
+/// [`reclaimable`]. A nested child merged only into its parent's branch is
+/// therefore *not* counted, which is the arithmetic finding F7 proved wrong:
+/// asking every worktree against `HEAD` with no fork counted it although the
+/// sweep would land it. A worktree no tree names — a leftover on disk, an agent
+/// restored without a base — is still asked against `HEAD` with no fork, which
+/// is the conservative side, and the refusal says which question its number
+/// came from.
 pub fn unlandable(root: &Path) -> Vec<u64> {
     let Some(worktrees) = worktrees(root) else {
         return Vec::new();
     };
-    let Some(base_sha) = resolve(root, "HEAD") else {
+    let Some(head_sha) = resolve(root, "HEAD") else {
         return Vec::new();
     };
+    let key = facts_key(root);
+    // One resolution per base, however many worktrees hang off it: a base is a
+    // parent's branch, and a hundred children can share one.
+    let mut bases: HashMap<String, Option<String>> = HashMap::new();
     let mut ids: Vec<u64> = worktrees
         .iter()
         .filter(|worktree| worktree.on_disk())
         .filter_map(|worktree| worktree.id)
         .filter(|id| {
+            let (base, base_sha, fork) = match published_facts(&key, *id) {
+                Some((base, fork)) => {
+                    let sha = bases
+                        .entry(base.clone())
+                        .or_insert_with(|| resolve(root, &base))
+                        .clone();
+                    match sha {
+                        Some(sha) => (base, sha, fork),
+                        // A base git cannot resolve is no answer, and an
+                        // unanswerable worktree is counted: the sweep would
+                        // keep it for the same reason (`reclaimable`).
+                        None => return true,
+                    }
+                }
+                None => ("HEAD".to_string(), head_sha.clone(), None),
+            };
             matches!(
-                probe(root, *id, "HEAD", &base_sha, None),
+                probe(root, *id, &base, &base_sha, fork.as_deref()),
                 Reclaimable::Kept(_)
             )
         })
@@ -1890,6 +2039,68 @@ mod tests {
         fs::write(worktree_path(&dir, 3).join("later.txt"), "later\n").unwrap(); // dirty: counted
 
         assert_eq!(unlandable(&dir), vec![1, 3]);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// The cap's arithmetic is the sweep's: a nested child merged only into its
+    /// parent's branch is landable, and counting it would refuse a spawn over a
+    /// worktree the next sweep takes (finding F7). The shape is the audit's: a
+    /// parent `mush/1` with a commit of its own, a child `mush/2` forked from
+    /// `mush/1` and merged back into it, while neither is merged into `HEAD`.
+    #[test]
+    fn a_nested_child_merged_into_its_parent_is_not_counted() {
+        let dir = init_repo("cap-nested");
+        worktree_add(&dir, 1, Some("HEAD")).unwrap();
+        let parent = worktree_path(&dir, 1);
+        fs::write(parent.join("parent.txt"), "parent\n").unwrap();
+        commit_all(&parent, "mush #1: parent work").unwrap();
+        worktree_add(&dir, 2, Some("mush/1")).unwrap();
+        let child = worktree_path(&dir, 2);
+        let fork = resolve(&child, "HEAD").unwrap();
+        fs::write(child.join("child.txt"), "child\n").unwrap();
+        commit_all(&child, "mush #2: child work").unwrap();
+        git_in(&parent, &["merge", "--no-edit", "mush/2"]);
+
+        assert_eq!(
+            reclaimable(&dir, 2, "mush/1", Some(&fork)),
+            Reclaimable::Landable(Landing::Merged),
+            "the sweep's own question lands the child"
+        );
+        // A worktree no tree names is still asked against `HEAD` with no fork,
+        // and that question counts both.
+        assert_eq!(
+            unlandable(&dir),
+            vec![1, 2],
+            "the unnamed question is the conservative one"
+        );
+
+        // With the tree's facts published, the cap asks the sweep's question.
+        let facts = publish_worktree_facts(&dir);
+        facts.set([
+            (1, "HEAD".to_string(), None),
+            (2, "mush/1".to_string(), Some(fork.clone())),
+        ]);
+        assert_eq!(
+            unlandable(&dir),
+            vec![1],
+            "a nested child merged into its parent is not what refuses a spawn"
+        );
+        assert_eq!(
+            facts.published(),
+            Some(vec![
+                (1, "HEAD".to_string(), None),
+                (2, "mush/1".to_string(), Some(fork)),
+            ])
+        );
+
+        // The guard is the publication's lifetime: a tree that goes away must
+        // not keep answering for this root.
+        drop(facts);
+        assert_eq!(
+            unlandable(&dir),
+            vec![1, 2],
+            "the facts went with the guard"
+        );
         let _ = fs::remove_dir_all(&dir);
     }
 

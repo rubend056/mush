@@ -515,6 +515,10 @@ fn write_request(
         ask.method
     );
     if let Some(key) = ask.api_key {
+        // The key as the doors handed it over: a value that may not carry a
+        // control character was refused where it entered (finding C7,
+        // `mush_core::config::checked_key`), so this writes one header line and
+        // no others. The wire is not the place a refusal is spoken.
         head.push_str(&format!("Authorization: Bearer {key}\r\n"));
     }
     if let Some(body) = ask.body {
@@ -1620,18 +1624,30 @@ mod tests {
         ok_with("", body)
     }
 
-    /// One request through a pool and an opener the test owns — no socket, and
-    /// the pool is this test's alone.
-    fn send(pool: &Pool, open: Open<'_>, url: &str, body: &str) -> io::Result<Response> {
+    /// One request through a pool and an opener the test owns, with the key the
+    /// test names — [`send`] is the shape every other test uses.
+    fn send_with_key(
+        pool: &Pool,
+        open: Open<'_>,
+        url: &str,
+        body: &str,
+        key: &str,
+    ) -> io::Result<Response> {
         let ask = Ask {
             method: "POST",
             url,
             body: Some(body),
-            api_key: Some("secret"),
+            api_key: Some(key),
             timeout: Duration::from_secs(5),
             cancel: None,
         };
         request(&ask, clock::system(), pool, open)
+    }
+
+    /// One request through a pool and an opener the test owns — no socket, and
+    /// the pool is this test's alone.
+    fn send(pool: &Pool, open: Open<'_>, url: &str, body: &str) -> io::Result<Response> {
+        send_with_key(pool, open, url, body, "secret")
     }
 
     /// Two calls to one endpoint must not cost two TCP+TLS handshakes: the kept
@@ -1675,6 +1691,51 @@ mod tests {
         assert!(!sent.contains("Connection: close"), "{sent}");
         assert!(sent.contains("Authorization: Bearer secret"), "{sent}");
         assert!(sent.contains("{\"ask\":2}"), "the second body was sent");
+    }
+
+    /// The head a *checked* key builds (finding C7): the door hands over a
+    /// value with no control character in it (`config::checked_key`), so the
+    /// bearer line ends at exactly one CRLF and the head's own next header
+    /// begins after it — no line the key writes for itself. The wire is not
+    /// where a refusal is spoken; it is where the shape a checked value
+    /// produces is pinned.
+    #[test]
+    fn a_checked_key_writes_exactly_one_crlf_after_the_bearer_token() {
+        let key = mush_core::config::checked_key("sk-ok", "/key").unwrap();
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(wire(&written, &[&ok("{}")]));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| match queue
+            .pop_front()
+        {
+            Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+            None => Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "the test scripted no more connections",
+            )),
+        };
+        send_with_key(
+            &Pool::new(),
+            &mut opener,
+            "http://models.test:8078/v1/chat/completions",
+            "{}",
+            &key,
+        )
+        .unwrap();
+
+        let sent = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        let after = sent
+            .split_once("Authorization: Bearer sk-ok")
+            .expect("the checked key reaches the head")
+            .1;
+        let up_to_next_header = after
+            .split_once("Content-Type:")
+            .expect("the key's line does not end the head")
+            .0;
+        assert_eq!(
+            up_to_next_header, "\r\n",
+            "exactly one CRLF after the bearer token: {sent}"
+        );
     }
 
     /// A kept connection the server has since closed, whose request was written

@@ -690,6 +690,13 @@ pub struct App {
     /// older tree is not one: it is dropped when it lands (finding D26), and
     /// `Ctrl-N` clears this with the tree that started it.
     git_in_flight: bool,
+    /// The facts the spawn cap asks about this tree's worktrees — each node's
+    /// base and fork — published for the actor threads that ask
+    /// (`git::unlandable`, from `agent::spawn_tool`). The guard lives as long
+    /// as the app, so a later tree on this root cannot be judged by this one's
+    /// nodes; [`Self::refresh_git`] walks them into it on every read (finding
+    /// F7).
+    worktree_facts: git::PublishedFacts,
     /// A transient line for the bar: what just happened, or what went wrong.
     /// Work in progress does not live here — it is derived from the phases.
     pub status: Option<Status>,
@@ -835,6 +842,12 @@ impl App {
         session_save: Arc<dyn SessionSave>,
     ) -> Self {
         let system = Message::system(prompt::system_prompt(&ws.root_str()));
+        // The facts the spawn cap asks about this tree's worktrees, before any
+        // actor thread can ask: published here and refreshed by every git read
+        // ([`Self::refresh_git`]). The guard lives as long as the app, so a
+        // later tree on this root cannot be judged by this one's nodes
+        // (finding F7).
+        let worktree_facts = git::publish_worktree_facts(ws.root());
         let (messages, stored_agents, stored_notices) = match stored {
             Some(session) => (session.messages, session.agents, session.notices),
             None => (Vec::new(), Vec::new(), Vec::new()),
@@ -862,6 +875,7 @@ impl App {
             ui_tx,
             git_at: None,
             git_in_flight: false,
+            worktree_facts,
             status: None,
             should_quit: false,
             dirty_screen: true,
@@ -1236,6 +1250,9 @@ impl App {
         // read must not even propose it (finding H10).
         let mut branches: Vec<(AgentId, String, String)> = Vec::new();
         let mut sweep: Vec<(AgentId, String, Option<String>)> = Vec::new();
+        // The same walk yields the spawn cap's own facts: one entry per node
+        // with a worktree, published whole (`Self::worktree_facts`).
+        let mut facts: Vec<(u64, String, Option<String>)> = Vec::new();
         // A worktree may only be swept while nothing of its agent's own is out: a
         // child that is still working, or a result the agent has not read yet,
         // wakes its actor into a fresh run *in that directory* — and a run in a
@@ -1259,8 +1276,15 @@ impl App {
             if !self.in_flight(node) && !waking.contains(&node.id) {
                 sweep.push((node.id, base.clone(), node.fork.clone()));
             }
+            facts.push((node.id.0, base.clone(), node.fork.clone()));
             branches.push((node.id, base, branch));
         }
+        // The same walk is what the spawn cap is handed: each node's base and
+        // fork, the two facts that make `git::unlandable` ask the sweep's own
+        // question instead of one against `HEAD` (finding F7). Published before
+        // the worker starts — they are UI facts, and the worker is only the git
+        // half — and the guard drops them with the app.
+        self.worktree_facts.set(facts);
         let tx = self.ui_tx.clone();
         std::thread::spawn(move || {
             let mut stats = HashMap::new();
@@ -3824,10 +3848,24 @@ impl App {
     /// to hold `mush-agent-{id}` until mush quit — a run with a hundred
     /// children held a hundred threads, of which at most the handful a human is
     /// talking to were ever going to wake again (§8.21). Parking ends the
-    /// thread and nothing else: the node, the id and the transcript stay
-    /// exactly where they fall, and the next message to that child rebuilds its
+    /// thread and the jobs that thread started — the send is
+    /// [`AgentMsg::Shutdown`], whose arm is `registry.kill_owned(actor.id)`
+    /// (`agent.rs`), and a job belongs to the agent that started it (§5.6,
+    /// [`Self::reap_history`]) — while the node, the id and the transcript stay
+    /// exactly where they fall: the next message to that child rebuilds its
     /// actor from the transcript on screen ([`Self::deliver_to_actor`]), so what
     /// the human sees does not change by one row.
+    ///
+    /// A node whose books still show a live job is not parked at all —
+    /// [`AgentTree::parkable`] asks [`AgentTree::in_flight`], which reads the
+    /// same registry the rows do — so the work a park can end is the work the
+    /// tree has not recorded yet: an actor woken by a message this tick cannot
+    /// see, which started a run before the `Shutdown` behind it in its own
+    /// mailbox was read. That is the window the kill lives in, and it is not a
+    /// reason to leave it out of the sentence above: a `Shutdown` is a kill of
+    /// whatever the actor owns, and a human has to be able to read that parking
+    /// is not free of consequences for a server, watch or benchmark a child
+    /// detached.
     ///
     /// The send is the whole probe, and it answers one question: is there a
     /// thread here? A live actor takes the `Shutdown` and ends; a mailbox with no
@@ -4262,8 +4300,9 @@ impl App {
                 // `false` side of `cut_at_the_cap` (see this method's doc).
                 ws.save_pasted_image(image.bytes, false).map_err(|e| {
                     format!(
-                        "cannot copy {from} into {}/.mush/paste: {e}",
-                        root.display()
+                        "cannot copy {from} into {}/{}: {e}",
+                        root.display(),
+                        mush_core::workspace::PASTE_REL
                     )
                 })
             })
@@ -6021,6 +6060,80 @@ mod tests {
             "the parking tick must not Shutdown the run the message started"
         );
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Parking ends the thread and the jobs that thread started: the
+    /// `Shutdown` this pass sends is `registry.kill_owned(actor.id)`'s trigger
+    /// (`agent.rs`, §5.6), so a server, watch or benchmark a child detached
+    /// does not outlive the actor a later tick reclaims. The books are the
+    /// guard in front of that — a node with a live job is not parkable at all
+    /// (`may_park`'s `in_flight_with`) — so the work a park can end is the
+    /// work the tree has not recorded: an actor woken by a message this tick
+    /// cannot see, which started a run before the `Shutdown` behind it in its
+    /// mailbox was read. The kill is staged here on exactly that second child,
+    /// by hand, because the pass refuses to send to it for the very job under
+    /// test.
+    #[test]
+    fn parking_a_child_ends_the_jobs_it_started() {
+        let (mut app, _rx) = test_app("park-kills-jobs");
+        // Ten finished children, so the warm window leaves #1 and #2 for the
+        // pass, and the test holds every mailbox a park could send to.
+        let mailboxes: Vec<Receiver<AgentMsg>> =
+            (1..=10).map(|id| finished_child(&mut app, id)).collect();
+        // #2 is the child with something to lose: a live actor of its own, and
+        // a job the tree's books see. `agent::revive` is the road a woken child
+        // takes (`App::deliver_to_actor`), over the tree's own registry.
+        let tx = agent::revive(
+            app.tree.handles(),
+            app.cell.handle(),
+            app.ui_tx.clone(),
+            app.tree.conversation().0,
+            app.ws.root().to_path_buf(),
+            agent::ReviveSpec {
+                id: 2,
+                depth: 1,
+                brief: "task 2".into(),
+                branch: None,
+                messages: Vec::new(),
+                parent: None,
+            },
+        );
+        let machine = running_job_on(&mut app, 2);
+
+        assert!(
+            app.tree.parkable().contains(&AgentId(1)),
+            "the child with nothing running is what the pass reclaims: {:?}",
+            app.tree.parkable()
+        );
+        assert!(
+            !app.tree.parkable().contains(&AgentId(2)),
+            "a live job keeps its child's thread: {:?}",
+            app.tree.parkable()
+        );
+
+        app.park_history();
+        assert!(
+            matches!(mailboxes[0].try_recv(), Ok(AgentMsg::Shutdown)),
+            "the park ended #1's thread with a Shutdown"
+        );
+        assert_eq!(
+            machine.kills(),
+            0,
+            "and left #2's job alone while the books can see it"
+        );
+
+        // The message a park sends to a child the books have not caught up
+        // with: the actor takes it, and the job it owns dies with the thread.
+        tx.send(AgentMsg::Shutdown).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while machine.kills() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            machine.kills(),
+            1,
+            "the Shutdown a park sends ends the job the actor started"
+        );
     }
 
     /// The other direction of the same road: a report finds no actor behind the
@@ -9021,6 +9134,35 @@ mod tests {
         assert!(
             path.starts_with(".mush/paste/"),
             "the FIFO was not the picture; the copy is: {path}"
+        );
+    }
+
+    /// A carry that cannot be written names the paste directory by its one
+    /// spelling ([`mush_core::workspace::PASTE_REL`]): the sentence a human
+    /// acts on says the path the writer itself uses, so the two cannot drift
+    /// apart. (The literal it replaced was the same string — which is exactly
+    /// how a second spelling starts.)
+    #[test]
+    fn a_refused_carry_names_the_paste_directory_by_its_one_spelling() {
+        let (app, _rx) = test_app("carry-refused");
+        // `.mush` is a file, so nothing can be created under it: the copy fails
+        // the way a read-only checkout or a full disk makes it fail.
+        let mush = app.ws.root().join(".mush");
+        let _ = std::fs::remove_dir_all(&mush);
+        std::fs::write(&mush, "not a directory").unwrap();
+
+        let refused = app
+            .carry_images(AgentId(1), vec![image("shot.png")])
+            .unwrap_err();
+        assert!(
+            refused.starts_with(&format!(
+                "cannot copy shot.png into {}:",
+                app.ws
+                    .root()
+                    .join(mush_core::workspace::PASTE_REL)
+                    .display()
+            )),
+            "the sentence names the paste directory the one way: {refused}"
         );
     }
 
@@ -17907,14 +18049,14 @@ mod tests {
                 0u64,
                 "parent work".to_string(),
                 "mush/1".to_string(),
-                parent_fork,
+                parent_fork.clone(),
             ),
             (
                 2,
                 1,
                 "child work".to_string(),
                 "mush/2".to_string(),
-                child_fork,
+                child_fork.clone(),
             ),
         ] {
             app.update(Msg::Agent {
@@ -17940,6 +18082,23 @@ mod tests {
         wait_git(&mut app, &rx);
 
         app.refresh_git();
+        // The spawn cap's own question, asked while both checkouts are still
+        // on disk: the walk above published each node's base and fork, so
+        // `unlandable` measures the child against its parent's branch — the
+        // one thing finding F7 proved a cap against `HEAD` got wrong — and
+        // the merged child is not what refuses a spawn.
+        assert_eq!(
+            app.worktree_facts.published(),
+            Some(vec![
+                (1, "HEAD".to_string(), Some(parent_fork)),
+                (2, "mush/1".to_string(), Some(child_fork)),
+            ])
+        );
+        assert_eq!(
+            git::unlandable(&root),
+            vec![1],
+            "the nested child merged into its parent is not counted"
+        );
         wait_git(&mut app, &rx);
 
         let child = app.tree.node(AgentId(2)).expect("the child is in the tree");
