@@ -659,8 +659,9 @@ are computed in `App`.
   agent strip on top, chat below; `h≥24` → the two-line bar; the transcript is
   capped at 110 columns however wide the terminal is.
 - **R4 — Truthful glyphs.** `[DONE]` `·` idle/never ran, `◐` running, `✓`
-  finished, `✗` failed, `⚠` a run that was cut off (the process went away with it
-  and nothing was committed), `≡` a conversation being folded, `⧗` a run parked on
+  finished, `✗` failed, `⚠` a run that was cut off (the process went away with
+  it, or the actor's thread did, and nothing was committed), `≡` a conversation
+  being folded, `⧗` a run parked on
   somebody else's result (`wait` — the icon a glance reads says the same thing
   the row's words do, `waiting on results 3s`). A running agent
   with children out wears `⏸N` — the count, beside its own phase and never
