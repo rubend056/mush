@@ -581,6 +581,11 @@ pub struct App {
     /// message box and the context meter, in one value.
     pub chat: Chat,
     pub models: Vec<http::Model>,
+    /// The endpoint a model fetch is out for, so a second ask does not stack a
+    /// second thread behind an endpoint that never answers — and so an answer
+    /// can be told from the startup discovery's own, which the human did not
+    /// ask for. `None` when no fetch is out.
+    models_in_flight: Option<String>,
     pub picker: Option<Picker>,
     /// The main worktree's branch, dirty count, and uncommitted line delta.
     pub git: Option<git::RepoStatus>,
@@ -683,6 +688,7 @@ impl App {
             // frame (finding A9), and `/model` refetches if this is still
             // empty when the human asks.
             models: Vec::new(),
+            models_in_flight: None,
             picker: None,
             git: None,
             write_clipboard: Arc::new(clipboard::write_text),
@@ -2789,16 +2795,10 @@ impl App {
                 ));
             }
             Command::Models => {
+                // The count (or the lack of one) is said when the fetch
+                // answers, not now: a road that read the list here would be
+                // reading an answer that has not arrived (finding D4).
                 self.refresh_models();
-                self.say(if self.models.is_empty() {
-                    format!("no models from {}", self.cfg().models_url())
-                } else {
-                    format!(
-                        "{} models from {}",
-                        self.models.len(),
-                        self.cfg().models_url()
-                    )
-                });
             }
         }
         // A command is a transition the human drove: whatever they asked for
@@ -2828,12 +2828,30 @@ impl App {
         }
     }
 
-    /// Re-fetch the model list from the current endpoint, falling back to the
-    /// provider's built-in list when the endpoint cannot answer. An advertised
-    /// context window is adopted here, so it lands before the next request.
+    /// Ask for a fresh model list without waiting for it.
+    ///
+    /// The fetch runs on its own thread and comes back as `Msg::Models`, the
+    /// same road the startup discovery takes: against an endpoint that accepts
+    /// and never answers, calling this on the painting thread froze the frame
+    /// for ten seconds (finding D4). The `fetching…` line says what is
+    /// happening before the answer does; a road with something more specific
+    /// to say — the endpoint or provider it just switched to — says it after,
+    /// and the answer replaces both. One fetch per endpoint at a time: a
+    /// second ask while one is out does not stack a second thread behind it,
+    /// and `adopt_models` drops a list from an endpoint the human has left.
     pub fn refresh_models(&mut self) {
-        self.models = http::list_models(self.cfg());
-        self.adopt_advertised_context();
+        self.say(format!("fetching models from {}…", self.cfg().models_url()));
+        let endpoint = self.cfg().base_url.clone();
+        if self.models_in_flight.as_deref() == Some(endpoint.as_str()) {
+            return;
+        }
+        self.models_in_flight = Some(endpoint.clone());
+        let cfg = self.cfg().clone();
+        let tx = self.ui_tx.clone();
+        std::thread::spawn(move || {
+            let models = http::list_models(&cfg);
+            let _ = tx.send(Msg::Models { endpoint, models });
+        });
     }
 
     /// Adopt a model list that finished fetching on its own thread.
@@ -2844,11 +2862,31 @@ impl App {
     /// stated, is not overwritten by whatever the endpoint lists first — and a
     /// list from an endpoint the human has since left is dropped, because the
     /// picker is about the endpoint in use.
+    ///
+    /// A fetch a command road asked for answers out loud: `no models` is the
+    /// *fetch's* word, painted when an empty list lands and never while the
+    /// list is in flight (finding D4). The startup discovery's own answer is
+    /// quiet, because nothing was asked.
     fn adopt_models(&mut self, endpoint: String, models: Vec<http::Model>) {
         if endpoint != self.cfg().base_url {
             return;
         }
+        let asked = self.models_in_flight.as_deref() == Some(endpoint.as_str());
+        if asked {
+            self.models_in_flight = None;
+        }
         self.models = models;
+        if asked {
+            self.say(if self.models.is_empty() {
+                format!("no models from {}", self.cfg().models_url())
+            } else {
+                format!(
+                    "{} models from {}",
+                    self.models.len(),
+                    self.cfg().models_url()
+                )
+            });
+        }
         if self.cfg().model.is_empty() {
             match self.models.first().map(|model| model.id.clone()) {
                 Some(id) => {
@@ -2886,10 +2924,11 @@ impl App {
 
     fn open_model_picker(&mut self) {
         if self.models.is_empty() {
+            // The list is not here yet and the fetch is on its own thread:
+            // saying `no models` now would be guessing at an answer that has
+            // not arrived (finding D4). The bar says `fetching…`, and the
+            // answer turns it into the count or the absence.
             self.refresh_models();
-        }
-        if self.models.is_empty() {
-            self.fail("no models — point at an endpoint with /url or /provider first");
             return;
         }
         let cursor = self
@@ -3016,11 +3055,17 @@ impl App {
 
     /// Point mush at another endpoint, re-deriving the window for it (finding
     /// A5). One write, so no actor sees the new endpoint with the old window.
+    ///
+    /// The model list goes with the endpoint it was fetched from: the fetch out
+    /// for the new one brings its own, and a picker opened before it lands must
+    /// say `fetching…` rather than show the models of the endpoint the human
+    /// left (finding D4).
     fn switch_endpoint(&mut self, url: &str) {
         self.cell.edit(|cfg| {
             cfg.set_base_url(url);
             cfg.rederive_context();
         });
+        self.models.clear();
     }
 
     /// Select a provider: the endpoint it owns, the model mush knows for it,
@@ -3028,6 +3073,7 @@ impl App {
     /// go out against the new provider with the old one's model or window
     /// (finding A5; a window the human stated is kept by `rederive_context`).
     fn switch_provider(&mut self, provider: Provider) {
+        let moves_endpoint = provider.spec().switches_endpoint;
         self.cell.edit(|cfg| {
             cfg.provider = provider;
             // A provider that owns an endpoint points at it; one that stands for
@@ -3044,6 +3090,12 @@ impl App {
             }
             cfg.set_model(&model);
         });
+        // A provider that brought its own endpoint brought its own model list
+        // with it; the fetch `apply_provider` starts next is what fills it
+        // (finding D4). One that keeps the human's endpoint keeps the list.
+        if moves_endpoint {
+            self.models.clear();
+        }
     }
 
     /// Apply the row `Enter` landed on. The row carries its own id, so nothing
@@ -16046,6 +16098,172 @@ mod tests {
         broken["agents"][0].as_object_mut().unwrap().remove("phase");
         let error = attach::Roster::read(&broken).expect_err("a body missing `phase` is refused");
         assert!(error.contains("phase"), "the missing key is named: {error}");
+    }
+
+    /// A loopback endpoint that accepts connections and never answers: the
+    /// shape that made the audit's frame wait 10.036 s. The accept thread keeps
+    /// every connection open, so a client waits for its answer until its own
+    /// read deadline — and the listener stays bound for the life of the test.
+    fn silent_endpoint() -> u16 {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            while let Ok((connection, _)) = listener.accept() {
+                held.push(connection);
+            }
+        });
+        port
+    }
+
+    /// A loopback endpoint that answers every request with `body`: for the
+    /// model list a command road asks for, where the answer is the test's.
+    fn models_endpoint(body: &'static str) -> u16 {
+        use std::net::{TcpListener, TcpStream};
+
+        /// Answer requests on one connection until the client stops writing.
+        fn serve(connection: TcpStream, body: &str) {
+            use std::io::{BufRead, BufReader, Read, Write};
+
+            let mut connection = BufReader::new(connection);
+            loop {
+                // The head, then exactly the body its `Content-Length`
+                // promises: the shape `http::write_request` writes.
+                let mut length = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if connection.read_line(&mut line).unwrap_or(0) == 0 {
+                        return;
+                    }
+                    let line = line.trim_end();
+                    if line.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = line.strip_prefix("Content-Length: ") {
+                        length = value.parse().unwrap_or(0);
+                    }
+                }
+                let mut request = vec![0u8; length];
+                if connection.read_exact(&mut request).is_err() {
+                    return;
+                }
+                let reply = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let out = connection.get_mut();
+                if out.write_all(reply.as_bytes()).is_err() || out.flush().is_err() {
+                    return;
+                }
+            }
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            for connection in listener.incoming().flatten() {
+                std::thread::spawn(move || serve(connection, body));
+            }
+        });
+        port
+    }
+
+    /// The next `Msg::Models` on the UI channel, skipping the answers of the
+    /// other roads a command runs (`Msg::Git`).
+    fn next_models(rx: &Receiver<Msg>) -> (String, Vec<http::Model>) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match rx.recv_timeout(left) {
+                Ok(Msg::Models { endpoint, models }) => return (endpoint, models),
+                Ok(_) => continue,
+                Err(error) => panic!("no Msg::Models arrived: {error}"),
+            }
+        }
+    }
+
+    /// D4: a command road asks for the model list and returns to the loop — the
+    /// endpoint never delays the frame.
+    ///
+    /// The audit pointed mush at a listener that accepts and never answers and
+    /// measured 10.036 s inside `update` on `/url`, `/models`, `/provider` and
+    /// Ctrl-P — the four roads that called `refresh_models` synchronously. Each
+    /// of them must come back in well under 100 ms now, the list must arrive as
+    /// the `Msg::Models` the startup fetch already uses, and `no models` is the
+    /// *fetch's* word: painted when an empty list lands, never while the list
+    /// is out.
+    #[test]
+    fn a_command_road_never_waits_on_the_endpoint() {
+        isolate_user_config();
+        let silent = format!("http://127.0.0.1:{}", silent_endpoint());
+        // The four roads, each taking the endpoint it is asked to face.
+        type Road = (&'static str, fn(&mut App, &str));
+        let roads: Vec<Road> = vec![
+            ("/url", |app, endpoint| {
+                run(app, &format!("/url {endpoint}"))
+            }),
+            ("/models", |app, _| run(app, "/models")),
+            ("/provider", |app, _| run(app, "/provider custom")),
+            ("Ctrl-P", |app, _| ctrl(app, 'p')),
+        ];
+
+        // A fresh app per road, each pointed at the silent endpoint: one road
+        // returning early must not cover for another that still waits.
+        for (road, act) in &roads {
+            let (mut app, _rx) = test_app("models-no-wait");
+            app.cell.edit(|cfg| cfg.set_base_url(&silent));
+            let started = Instant::now();
+            act(&mut app, &silent);
+            let waited = started.elapsed();
+            assert!(
+                waited < Duration::from_millis(100),
+                "{road} waited {waited:?} on an endpoint that never answers"
+            );
+            assert!(
+                !text_of(&app).contains("no models"),
+                "{road} said `no models` before the fetch did: {}",
+                text_of(&app)
+            );
+        }
+
+        // The answer to each road is the `Msg::Models` the startup fetch uses:
+        // a road that returned to the loop still hears the endpoint's list.
+        let answering =
+            models_endpoint(r#"{"object":"list","data":[{"id":"probe","context_length":32768}]}"#);
+        let url = format!("http://127.0.0.1:{answering}");
+        for (road, act) in &roads {
+            let (mut app, rx) = test_app("models-answer");
+            app.cell.edit(|cfg| cfg.set_base_url(&url));
+            act(&mut app, &url);
+            let (endpoint, models) = next_models(&rx);
+            assert_eq!(endpoint, url, "{road}: the answer names the endpoint");
+            assert_eq!(
+                models.len(),
+                1,
+                "{road}: the endpoint's list arrived as a message"
+            );
+            app.update(Msg::Models { endpoint, models });
+            assert_eq!(app.models.len(), 1, "{road}: the loop adopted it");
+        }
+
+        // An empty list from the endpoint is what `no models` means.
+        let empty = models_endpoint(r#"{"object":"list","data":[]}"#);
+        let (mut app, rx) = test_app("models-empty");
+        run(&mut app, &format!("/url http://127.0.0.1:{empty}"));
+        assert!(
+            !text_of(&app).contains("no models"),
+            "the fetch has not answered yet: {}",
+            text_of(&app)
+        );
+        let (endpoint, models) = next_models(&rx);
+        assert!(models.is_empty(), "the endpoint listed nothing");
+        app.update(Msg::Models { endpoint, models });
+        assert!(
+            text_of(&app).contains("no models from"),
+            "the fetch's own word: {}",
+            text_of(&app)
+        );
     }
 
     /// The same for a `read` answer: the transcript's lines and their indices,
