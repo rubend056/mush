@@ -61,7 +61,7 @@ use mush_core::session;
 use mush_core::text::{markdown_row_counts, truncate, wrap_text, wrap_text_capped};
 use mush_core::transcript;
 
-use crate::agent::summarize_args;
+use crate::agent::{summarize_args, Work};
 use crate::app::image_label;
 use crate::app::keys::ChatKey;
 use crate::app::short_age;
@@ -2998,9 +2998,19 @@ const LOOP_STOP: &str = "the run was stopped as a loop";
 /// conversation is marked or shaped — a child's `#1 done: …` / `#1 stopped: …` /
 /// `#1 failed: …`, a job's `#c2 done: …`, a fold's carried summary, the line
 /// that says the oldest turns were dropped (marked by `Message::note`'s flag and
-/// read by [`transcript::is_dropped_note`]) — and a child's transcript opens
-/// with the brief its parent spawned it with. What is left is the human's,
+/// read by [`transcript::is_dropped_note`]) and the line a failed commit leaves
+/// (shaped by its head, [`Work::UNCOMMITTED_HEAD`]) — and a child's transcript
+/// opens with the brief its parent spawned it with. What is left is the human's,
 /// because that is what most of a transcript is.
+///
+/// The work line is read by its *head* alone, never by its body: the head is
+/// mush's own fixed opening, spelled once beside the sentence it opens
+/// ([`Work::UNCOMMITTED_HEAD`], shared with the writer), while the body is
+/// git's error — arbitrary text a human can type too. The line reaches the pane
+/// as the `user` message the model must keep reading (its place in the request
+/// is the point of finding F17), so the shape is the only provenance there is,
+/// and the same read serves the live transcript and the one restored from the
+/// session file.
 ///
 /// The one line this cannot place is a parent's steering after a restart: the
 /// words look exactly like the human's own nudge, and nothing in the file says
@@ -3014,7 +3024,11 @@ const LOOP_STOP: &str = "the run was stopped as a loop";
 /// carries no flag stays the human's.
 fn unrecorded(agent: AgentId, index: usize, message: &Message) -> Voice {
     let text = message.text();
-    if report(text) || text.starts_with(FOLDED) || transcript::is_dropped_note(message) {
+    if report(text)
+        || text.starts_with(FOLDED)
+        || text.starts_with(Work::UNCOMMITTED_HEAD)
+        || transcript::is_dropped_note(message)
+    {
         return Voice::Mush;
     }
     if agent != AgentId::ROOT && index == 0 {
@@ -5323,6 +5337,70 @@ mod tests {
         assert!(
             rows.iter().any(|row| row == "you › delegate the parser"),
             "{rows:?}"
+        );
+    }
+
+    /// A failed commit's line is mush's own report about mush's own act, so the
+    /// pane paints it in mush's voice — never as the parent's, which is what an
+    /// unrecorded line on a *child's* transcript reads as, and never as the
+    /// human's on the root's. The line is the sentence `Work::status_line`
+    /// writes for `Uncommitted` and the sentence the model reads in the request
+    /// (finding F17); the pane knows it by the head that sentence opens with,
+    /// spelled once beside its writer ([`Work::UNCOMMITTED_HEAD`]) and shared
+    /// with this reader — the body is git's error and nobody reads it for
+    /// provenance.
+    #[test]
+    fn a_failed_commits_line_is_painted_in_mushs_voice() {
+        let line = "could not commit the worktree: /repo/.mush/wt/1 is no longer a worktree";
+        assert!(
+            line.starts_with(Work::UNCOMMITTED_HEAD),
+            "the line this test paints is the shape the actor writes"
+        );
+
+        // A child's transcript: the brief, the model's reply, then the report
+        // the run's end leaves. Before, the report read `parent ›`.
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId(1), Message::user("the brief"));
+        chat.push_message(AgentId(1), Message::assistant("reading"));
+        chat.push_message(AgentId(1), Message::user(line));
+        let rows = shown(&pane_rows(&chat, &pane(AgentId(1)), 60, 12));
+        let painted: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.contains("could not commit"))
+            .collect();
+        assert_eq!(painted.len(), 1, "the line is painted once: {rows:?}");
+        assert!(
+            painted[0].starts_with("· "),
+            "mush's voice, not the parent's: {rows:?}"
+        );
+
+        // The root's pane: no parent exists there, and the line is still mush's
+        // — not the human asking themselves what happened to the worktree.
+        let mut root = Chat::bare();
+        say(&mut root, AgentId::ROOT, "commit the work");
+        root.push_message(AgentId::ROOT, Message::user(line));
+        let rows = shown(&pane_rows(&root, &pane(AgentId::ROOT), 60, 12));
+        assert!(
+            rows.iter().any(|row| row.starts_with("· could not commit")),
+            "mush's voice on the root's road too: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row == "you › commit the work"),
+            "and the human keeps their own words: {rows:?}"
+        );
+
+        // The read is the paint-time one, so a transcript restored from the
+        // session file — which arrives without the voices a live push recorded
+        // — paints the same line the same way.
+        let mut restored = Chat::bare();
+        restored.replace_transcript(
+            AgentId(1),
+            vec![Message::user("the brief"), Message::user(line)],
+        );
+        let rows = shown(&pane_rows(&restored, &pane(AgentId(1)), 60, 12));
+        assert!(
+            rows.iter().any(|row| row.starts_with("· could not commit")),
+            "the shape is read from the stored line itself: {rows:?}"
         );
     }
 
