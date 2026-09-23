@@ -310,7 +310,7 @@ pub struct Workspace {
 /// What a search found: the matching lines, whether the cap cut the list short,
 /// how many files it never opened (binary, or past [`SEARCH_FILE_CAP`]), and
 /// how many it found whose name cannot travel on the model's road
-/// ([`Workspace::name_for_model`]: a line break in the name, bytes that are
+/// (`Workspace::name_for_model`: a line break in the name, bytes that are
 /// not UTF-8, or ends `resolve` would trim).
 ///
 /// The third field is the one that keeps "no match" honest. A model reads a
@@ -446,7 +446,7 @@ impl Workspace {
     /// `read_file` on the listed name answered "No such file or directory" —
     /// the listing handed over a path the listing could not open (finding B9).
     /// A name is bytes, not display. The roads that *hand names over* go
-    /// through [`Self::name_for_model`] instead, which refuses a name that
+    /// through `Self::name_for_model` instead, which refuses a name that
     /// cannot travel as itself; this one is infallible because its callers show
     /// a path rather than give one back, and so it may decode lossily.
     pub fn rel(&self, path: &Path) -> String {
@@ -492,17 +492,17 @@ impl Workspace {
     /// `fs::read` on a FIFO blocks until a writer appears — an actor parked
     /// forever on a name as innocent as `x.png` — and a device may never end at
     /// all. The metadata answers what the path *is* before anything is opened,
-    /// the same shape of check [`Self::image_at`] makes, so the two roads
+    /// the same shape of check `Self::image_at` makes, so the two roads
     /// cannot disagree about which paths can be read. The name is resolved for
-    /// real first ([`Self::real_path`]), because a link the root contains must
+    /// real first (`Self::real_path`), because a link the root contains must
     /// not make this read a file outside it. The read itself is bounded by
     /// [`READ_FILE_CAP`] and checked from the stat before a byte is read (see
-    /// [`Self::whole_read`]): past the cap the refusal is [`over_read_cap`]'s,
+    /// `Self::whole_read`): past the cap the refusal is `over_read_cap`'s,
     /// the one sentence [`Self::read_window`] gives too, naming `run_command`
     /// as the road that works.
     ///
     /// The decode is **strict**: bytes that are not valid UTF-8 are refused
-    /// ([`not_utf8`]), because this read's text is an edit's source *and* its
+    /// (`not_utf8`), because this read's text is an edit's source *and* its
     /// result — a lossy decode here is what rewrote a Latin-1 `caf\xe9` as
     /// U+FFFD in the lines the model never touched (finding B6). The roads
     /// that *show* a file rather than write it stay lossy on purpose, and each
@@ -602,9 +602,9 @@ impl Workspace {
     /// Past [`IMAGE_FILE_CAP`] the refusal names the downscale, because an
     /// image that big cannot be made to fit any other way — `offset`/`limit`
     /// are lines and an image has none. The name is resolved for real first
-    /// ([`Self::real_path`]) so a link inside the root cannot make the model's
+    /// (`Self::real_path`) so a link inside the root cannot make the model's
     /// read open a picture outside it; the human's paste road reaches
-    /// [`Self::image_at`] without this check, because the human already has
+    /// `Self::image_at` without this check, because the human already has
     /// the file and is the one naming it.
     pub fn read_image(&self, rel: &str) -> Result<Option<Image>, String> {
         let path = self.real_path(&self.resolve(rel)?, rel)?;
@@ -665,7 +665,7 @@ impl Workspace {
     /// promises the model that the file can be read again. The model's own
     /// tools reach nothing outside the root — the human's privilege to name any
     /// path does not extend to the model — so an image named from *outside* it
-    /// is copied into `.mush/paste/` through [`Self::write_pasted_image`], the
+    /// is copied into `.mush/paste/` through `Self::write_pasted_image`, the
     /// same writer, directory, name and cap the clipboard road uses, and the
     /// *copy* is the image's path: an image the model may have to look at again
     /// is kept where the model's own tools can reach it. That is what makes a
@@ -719,7 +719,7 @@ impl Workspace {
     ///
     /// Each image takes [`Self::pasted_image`]'s road, the copy included: a
     /// name outside the root is read where the human keeps it and written into
-    /// `.mush/paste/` through [`Self::write_pasted_image`], so every picture in
+    /// `.mush/paste/` through `Self::write_pasted_image`, so every picture in
     /// the batch carries a path the model's own tools can resolve.
     pub fn pasted_images(&self, paste: &str) -> Result<Option<Vec<Image>>, String> {
         let Some(names) = pasted_names(paste) else {
@@ -793,7 +793,7 @@ impl Workspace {
     /// screenshot cannot dirty the tree, and the file is named for the moment
     /// it was pasted rather than for the clipboard, which would let a second
     /// paste overwrite the first. The write itself is
-    /// [`Self::write_pasted_image`], shared with the copy
+    /// `Self::write_pasted_image`, shared with the copy
     /// [`Self::pasted_image`] makes of a file outside the root, so no road
     /// into that directory can drift in where the bytes land or what the image
     /// is called.
@@ -1044,8 +1044,8 @@ impl Workspace {
     /// [`edit`]: crate::tools::edit_text
     ///
     /// The cap is the same whole-read cap as everywhere else ([`READ_FILE_CAP`],
-    /// checked from the stat by [`Self::whole_read`] before a byte is read): this
-    /// road cannot get past it, and the refusal is [`over_read_cap`]'s one
+    /// checked from the stat by `Self::whole_read` before a byte is read): this
+    /// road cannot get past it, and the refusal is `over_read_cap`'s one
     /// sentence, naming `run_command` as the road to a part of the file.
     ///
     /// The decode is **lossy on purpose**: this road shows what a file holds and
@@ -1130,12 +1130,12 @@ impl Workspace {
     /// Every file under `rel` (default the workspace root), workspace-relative
     /// and sorted, with the first `limit`, whether there were more, and how
     /// many files the walk found whose name cannot travel on the model's road
-    /// ([`Self::name_for_model`]). Build and VCS directories are skipped
-    /// ([`SKIP_DIRS`]); a symlinked directory is not followed, so a listing
+    /// (`Self::name_for_model`). Build and VCS directories are skipped
+    /// (`SKIP_DIRS`); a symlinked directory is not followed, so a listing
     /// cannot leave the workspace.
     ///
     /// That claim is why the name is checked for real before the walk
-    /// ([`Self::real_path`]): `out -> /tmp/elsewhere` is a name inside the root
+    /// (`Self::real_path`): `out -> /tmp/elsewhere` is a name inside the root
     /// whose listing used to be the outside directory's. The walk itself still
     /// runs on the name the model gave, so a link to a *file* inside the root
     /// answers about that file under the name it was asked about, while a link
@@ -1183,9 +1183,9 @@ impl Workspace {
     /// runs one is the `rg` the shell already has, while this tool exists for
     /// the one case the shell cannot serve (a held machine lock). Binary files
     /// (a NUL byte) and files past [`SEARCH_FILE_CAP`] are skipped — the read
-    /// is bounded to the cap + 1 like [`Self::whole_read`]'s, so a file that
+    /// is bounded to the cap + 1 like `Self::whole_read`'s, so a file that
     /// grew behind the stat is caught by its length rather than loaded whole —
-    /// and a matching line is cut to [`MATCH_LINE_CAP`] bytes with the cut
+    /// and a matching line is cut to `MATCH_LINE_CAP` bytes with the cut
     /// said, so one minified file cannot spend the result.
     ///
     /// The match line is the *file's* line: no paint-time sanitizing, no
@@ -1207,13 +1207,13 @@ impl Workspace {
     /// What it skipped is counted and travels back with the matches
     /// ([`Matches::skipped`]): a search that says "no match" while it never
     /// opened a file is a false negative a model will act on. Files whose name
-    /// cannot travel on the model's road ([`Self::name_for_model`]) are not
+    /// cannot travel on the model's road (`Self::name_for_model`) are not
     /// opened either, and are counted the same way ([`Matches::unnamed`]) — a
     /// match line is prefixed with the path, and a path the model cannot pass
     /// back to `read_file` would be a dead end (finding B9).
     ///
     /// Like the listing, the name is checked for real before the walk
-    /// ([`Self::real_path`]): a link inside the root cannot make the search
+    /// (`Self::real_path`): a link inside the root cannot make the search
     /// read files outside it, and the files it does read are the ones under
     /// the name the model gave.
     pub fn search(
@@ -1385,11 +1385,11 @@ impl Workspace {
     /// Atomically create or replace a file, creating parent directories.
     ///
     /// The name is resolved to what it really is before anything is made (see
-    /// [`Self::real_path`]): a write through a symlink lands in the file the
+    /// `Self::real_path`): a write through a symlink lands in the file the
     /// link points at and the link stays a link, while a name whose real path
     /// leaves the root is refused rather than followed. What the name *is*
     /// decides the rest: a socket, a FIFO or a device is refused rather than
-    /// renamed over ([`entry_for_write`]), and a file with no owner-write bit
+    /// renamed over (`entry_for_write`), and a file with no owner-write bit
     /// is refused with the mode it has, so a `0444` file the human marked
     /// read-only is a sentence the model can read instead of an override it
     /// cannot see. The mode refusal lives here, at the model's door, and not in
@@ -1399,7 +1399,7 @@ impl Workspace {
     /// [`atomic_write`], because a rename over a socket destroys it whatever
     /// door it came through.
     ///
-    /// The store's own files are refused *by name* ([`Self::store_file_refusal`])
+    /// The store's own files are refused *by name* (`Self::store_file_refusal`)
     /// on top of all that. They are regular files by construction, so the
     /// shape check cannot see them, and what a rename over one costs is not
     /// bytes but the workspace's own bookkeeping: `.mush/lock` is the flock
@@ -1811,7 +1811,7 @@ fn now_millis() -> u128 {
 /// because a working day is the shortest window in which "the picture from this
 /// morning" is still being asked about; a prune never takes a paste the
 /// *current* run wrote, however old its name says it is
-/// ([`Workspace::prune_pastes`]).
+/// (`Workspace::prune_pastes`).
 pub const PASTE_MAX_AGE_MILLIS: u128 = 24 * 60 * 60 * 1000;
 
 /// The moment a paste's name carries, in unix milliseconds — the number
@@ -2009,7 +2009,7 @@ impl Fresh {
 /// Write via a same-directory temp file plus `rename`, so readers never observe
 /// a half-written file and a crash cannot corrupt the original.
 ///
-/// The name is resolved to what it really is first ([`entry_for_write`]): a
+/// The name is resolved to what it really is first (`entry_for_write`): a
 /// symlink is written through and stays a link, and a socket, a FIFO or a
 /// device is refused rather than destroyed. That guard lives here beside the
 /// rename as well as at [`Workspace::write_file`], so a caller that does not
@@ -2055,7 +2055,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8], fresh: Fresh) -> io::Result<()> {
 pub(crate) const BACKUP_TRIES: u32 = 100;
 
 /// The first free backup name beside `path` — `<path>.bak`, then `<path>.bak.2`,
-/// `<path>.bak.3`, … up to [`BACKUP_TRIES`] — for the two files mush sets aside
+/// `<path>.bak.3`, … up to `BACKUP_TRIES` — for the two files mush sets aside
 /// rather than let the next write replace them: the unreadable session
 /// ([`crate::session::keep_unreadable`]) and the unparsable home config
 /// ([`crate::userconfig`]'s save).

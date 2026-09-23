@@ -164,7 +164,7 @@ pub struct FunctionCall {
     #[serde(default)]
     pub name: String,
     /// The call's arguments as the spec's JSON text, whatever shape they
-    /// arrived in (see [`arguments_from_wire`]).
+    /// arrived in (see `arguments_from_wire`).
     #[serde(default, deserialize_with = "arguments_from_wire")]
     pub arguments: String,
 }
@@ -173,13 +173,13 @@ pub struct FunctionCall {
 /// function it asks for.
 ///
 /// Every field defaults so that a server which leaves one out — or spells the
-/// id as a number ([`id_from_wire`]) — is read rather than refused: the tool
+/// id as a number (`id_from_wire`) — is read rather than refused: the tool
 /// loop answers what it can and tells the model about what it cannot, which is
 /// the road a loose reply is supposed to keep open.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCall {
     /// The id a tool result is paired with. `serde(default)` covers a missing
-    /// one and [`id_from_wire`] a numeric one; [`assign_tool_call_ids`] then
+    /// one and `id_from_wire` a numeric one; `assign_tool_call_ids` then
     /// makes whatever arrived unique and non-empty.
     #[serde(default, deserialize_with = "id_from_wire")]
     pub id: String,
@@ -278,13 +278,13 @@ pub struct Message {
     /// The message's text. A plain JSON string on the way out — the spec's own
     /// request form, for both assistant history and tool results — unless the
     /// message carries images, when it is the content array
-    /// ([`Message::content_parts`]). On the way in, either wire shape (see
+    /// (`Message::content_parts`). On the way in, either wire shape (see
     /// `content_from_wire`).
     #[serde(default, deserialize_with = "content_from_wire")]
     pub content: Option<String>,
     /// Images carried *in* this message, in the order they were attached.
     /// They are not a wire field of their own: they become `image_url` parts
-    /// *inside* `content` on the way out ([`Message::content_parts`]), and a
+    /// *inside* `content` on the way out (`Message::content_parts`), and a
     /// part that carries no text contributes nothing on the way in
     /// (`content_from_wire`). A message that came from an endpoint or from a
     /// stored session therefore has none: a session never writes the bytes
@@ -544,7 +544,7 @@ impl Message {
         parts
     }
 
-    /// Shed this message's image payloads, leaving one [`placeholder`] line
+    /// Shed this message's image payloads, leaving one `placeholder` line
     /// where each was, so the transcript still says an image was there and
     /// which file it came from — and the model can read that file again if it
     /// needs the image.

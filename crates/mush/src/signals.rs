@@ -12,12 +12,12 @@
 //!
 //! The road is the one `Ctrl-Q` takes, reached through a flag. A handler for
 //! SIGTERM, SIGHUP and SIGINT does exactly one thing — set an [`AtomicBool`] —
-//! and the event loop reads that flag on every frame (it already wakes every
-//! 30 ms for input) and runs [`App::signal_quit`]: the loop returns, `App`'s
-//! `Drop` flushes the session and kills every job and held command, the writer
-//! is joined, and the attach guard removes the socket. Nothing in a handler
-//! touches a lock, a channel or the registry: what a handler may do is
-//! async-signal-safe and small, and this is that.
+//! and the event loop reads that flag on every frame (it already wakes every 30
+//! ms for input) and runs [`App::signal_quit`](crate::app::App::signal_quit):
+//! the loop returns, `App`'s `Drop` flushes the session and kills every job and
+//! held command, the writer is joined, and the attach guard removes the socket.
+//! Nothing in a handler touches a lock, a channel or the registry: what a
+//! handler may do is async-signal-safe and small, and this is that.
 //!
 //! **Why `signal-hook`.** The dependency is already in the tree — crossterm
 //! links it — so this is a name for code the build already compiles, not a new

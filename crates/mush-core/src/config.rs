@@ -72,7 +72,7 @@ const _: () = assert!(MAX_REPLY_TOKENS < 393_216);
 /// about what a reply costs (see `docs/findings.md` §8.30).
 const REPLY_SHARE_DIVISOR: usize = 8;
 
-/// [`REPLY_SHARE_DIVISOR`] in words, for the two strings a *human* reads (the
+/// `REPLY_SHARE_DIVISOR` in words, for the two strings a *human* reads (the
 /// `--help` line and the home config's own field help): one phrase, in the one
 /// file that owns the number, interpolated rather than retyped (finding T2 §19
 /// is the same class — a fact spelled wherever it is needed).
@@ -763,7 +763,7 @@ impl Config {
     /// its whole reply cap fits the window it is sent to. Under the cap the
     /// window is split in two instead: half for history, half for everything a
     /// request pays besides it (the cap binds below ~18.7k tokens — see
-    /// [`Self::request_reserve`]). Either way the trimmer and the cap are two
+    /// `Self::request_reserve`). Either way the trimmer and the cap are two
     /// halves of one budget, which is what keeps a long conversation from being
     /// cut off as a context-length complaint.
     pub fn history_budget(&self) -> usize {
@@ -958,7 +958,7 @@ impl Config {
     /// [`crate::provider::ProviderSpec::display_endpoint`]), the configured URL
     /// otherwise.
     ///
-    /// "Owns" is [`Self::on_the_providers_own_endpoint`], not "has a
+    /// "Owns" is `Self::on_the_providers_own_endpoint`, not "has a
     /// `display_endpoint`": asked of the provider alone, the bar painted the
     /// provider's own short name over a request whose URL was a proxy — a
     /// vendor's name on somebody else's host, while the `/url` ack printed the
