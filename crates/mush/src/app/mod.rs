@@ -165,6 +165,15 @@ pub struct Picker {
     pub kind: PickerKind,
     pub items: Vec<PickerItem>,
     pub cursor: usize,
+    /// The conversation a `/notes` report is about. Every other kind reads no
+    /// agent — its rows are labels or constants — and carries `None`.
+    ///
+    /// It is carried because the rows are *wrapped* to the terminal width the
+    /// popup opened at, and a resize has to wrap them again from the source
+    /// (finding D12): re-wrapping the wrapped rows would launder the measure
+    /// into the text, and re-deriving from the focused agent would move the
+    /// report if the focus moved under an open popup.
+    pub agent: Option<AgentId>,
 }
 
 impl Picker {
@@ -686,9 +695,75 @@ impl App {
     /// wrapped to the popup that size paints and so the floor is known. One
     /// setter, called at startup and from the resize event — the only two
     /// places the terminal's size changes.
+    ///
+    /// A *width* that changed re-wraps an open popup ([`Self::rewrap_picker`]):
+    /// its rows were laid out for the width it was opened at, and the popup a
+    /// resize paints is narrower or wider than that. Before, the rows kept the
+    /// old measure and the border cut forty columns off every one of them, so
+    /// the rest of a `/notes` report was unreachable until it was closed and
+    /// reopened (finding D12).
     pub fn set_term_size(&mut self, width: u16, height: u16) {
+        let rewrapped = self.term_width != width;
         self.term_width = width;
         self.term_height = height;
+        if rewrapped {
+            self.rewrap_picker();
+        }
+    }
+
+    /// Re-lay out the open popup for the terminal's new width.
+    ///
+    /// Only the kinds whose rows are *wrapped* to the terminal are rebuilt —
+    /// `/notes` and `/help`. A model or a provider row is one label painted
+    /// whole, and rebuilding it would be a second derivation for no width at
+    /// all: the wrapped kinds re-read the same source their opener read, so the
+    /// popup a resize paints is the popup a reopen at that size paints instead
+    /// of a second table that could drift from the first (finding D12).
+    ///
+    /// The cursor is a row index, and a re-wrap changes what row each index
+    /// names: it keeps its place, clamped to the list the new width made. That
+    /// is the most a row number can promise across a re-wrap — the alternative,
+    /// reopening on the newest note, would throw away where the human was
+    /// reading. A report that has become empty under the popup (a new chat
+    /// clears the notes) closes it: an empty list is a state the opener refuses
+    /// to create.
+    fn rewrap_picker(&mut self) {
+        let Some((kind, agent)) = self
+            .picker
+            .as_ref()
+            .map(|picker| (picker.kind, picker.agent))
+        else {
+            return;
+        };
+        let width = screen::picker_text_width(self.term_width);
+        let rows: Option<Vec<String>> = match kind {
+            PickerKind::Notes => {
+                let Some(agent) = agent else {
+                    return;
+                };
+                let notes = self.chat.notes_report(agent, session::now_secs(), width);
+                if notes.rows.is_empty() {
+                    self.picker = None;
+                    return;
+                }
+                Some(notes.rows)
+            }
+            PickerKind::Help => Some(help_notice(width).lines().map(str::to_string).collect()),
+            PickerKind::Model | PickerKind::Provider => None,
+        };
+        let Some(rows) = rows else {
+            return;
+        };
+        if let Some(picker) = self.picker.as_mut() {
+            picker.cursor = picker.cursor.min(rows.len().saturating_sub(1));
+            picker.items = rows
+                .into_iter()
+                .map(|row| PickerItem {
+                    id: None,
+                    label: row,
+                })
+                .collect();
+        }
     }
 
     /// Whether the terminal is too small for anything but the floor notice.
@@ -3157,6 +3232,7 @@ impl App {
             kind: PickerKind::Model,
             items,
             cursor,
+            agent: None,
         });
     }
 
@@ -3193,6 +3269,7 @@ impl App {
                 })
                 .collect(),
             cursor: notes.newest,
+            agent: Some(agent),
         });
     }
 
@@ -3216,6 +3293,7 @@ impl App {
             kind: PickerKind::Help,
             items,
             cursor: 0,
+            agent: None,
         });
     }
 
@@ -3235,6 +3313,7 @@ impl App {
             kind: PickerKind::Provider,
             items,
             cursor,
+            agent: None,
         });
     }
 
@@ -11754,6 +11833,92 @@ mod tests {
         assert!(wide.contains("tango"), "and at 200 columns: {wide}");
     }
 
+    /// A resize with `/notes` or `/help` open re-wraps the report: its rows were
+    /// laid out for the width it was opened at, and the popup the new size
+    /// paints is narrower. The audit's probe — a report opened at 200 and
+    /// painted at 60 — read every row clipped at the popup's edge, the tail
+    /// painted only after the popup was closed and reopened (finding D12); the
+    /// sweep's own comment claimed a resize "opens them again for each size",
+    /// and it did not.
+    #[test]
+    fn a_resized_popup_is_rewrapped_not_clipped() {
+        use unicode_width::UnicodeWidthStr;
+
+        let (mut app, _rx) = test_app("resized-popup");
+        app.chat.note(
+            "the run failed while folding the transcript: the endpoint returned 503 \
+             for the third summarisation attempt, and the fold was abandoned with the \
+             conversation left half-written, so read the tail of the transcript before \
+             trusting anything above it",
+        );
+
+        // Opened at the widest popup: the note is wrapped at 74 columns.
+        app.set_term_size(200, 50);
+        run(&mut app, "/notes");
+        let wide = screen(&mut app, 200, 50).join("\n");
+        assert!(
+            wide.contains("above it"),
+            "the tail at the size it was opened at: {wide}"
+        );
+
+        // The resize, with no reopen: the same popup, re-wrapped.
+        let resized = screen(&mut app, 60, 17).join("\n");
+        assert!(
+            resized.contains("above it"),
+            "the tail is painted after the resize, not clipped away: {resized}"
+        );
+        let room = screen::picker_text_width(60);
+        let items = app
+            .picker
+            .as_ref()
+            .expect("the popup is still open")
+            .items
+            .clone();
+        assert!(
+            items
+                .iter()
+                .all(|item| UnicodeWidthStr::width(item.label.as_str()) <= room),
+            "every row fits the {room}-column list it is painted in: {:?}",
+            labels(&items)
+        );
+
+        // And the popup a resize paints is the popup a reopen paints: the same
+        // rows, read from the same source rather than re-wrapped from the old
+        // rows.
+        let after_resize = labels(&items);
+        app.open_notes_picker();
+        assert_eq!(
+            after_resize,
+            labels(&app.picker.as_ref().expect("the reopen").items),
+            "the resize is the reopen"
+        );
+
+        // The other kind whose rows are wrapped to the terminal: `/help`.
+        app.picker = None;
+        app.set_term_size(200, 50);
+        run(&mut app, "/help");
+        let wide_rows = app.picker.as_ref().expect("the help list").items.len();
+        let _ = screen(&mut app, 60, 17);
+        let items = app
+            .picker
+            .as_ref()
+            .expect("the help list is still open")
+            .items
+            .clone();
+        assert!(
+            items
+                .iter()
+                .all(|item| UnicodeWidthStr::width(item.label.as_str()) <= room),
+            "every help row fits the narrower list: {:?}",
+            labels(&items)
+        );
+        assert!(
+            items.len() > wide_rows,
+            "and the same text wrapped narrower is more rows: {wide_rows} → {}",
+            items.len()
+        );
+    }
+
     /// The empty state is a row like any other: wrapped to the pane and windowed
     /// to its height. Returned raw it was cut mid-word on a narrow pane, so the
     /// end of the instruction never appeared at all.
@@ -14829,10 +14994,13 @@ mod tests {
     /// built for — and, per state, with both focus states, because a focused
     /// pane's border, its highlight and the chat cursor are painted differently
     /// and the rewrite had dropped that half of the old sweep (finding V3).
-    /// `reopen` is for the popups whose
-    /// item wrapping is derived from the terminal's width *when they open*
-    /// (`/notes`): the sweep opens them again for each size, which is what a
-    /// human resizing the terminal with the popup up would get.
+    ///
+    /// A popup's items are wrapped to the terminal width it was opened at, and
+    /// the sweep paints every state at every size: the resize itself re-wraps
+    /// an open popup ([`App::set_term_size`], and its pin
+    /// `a_resized_popup_is_rewrapped_not_clipped`), so a popup opened once at
+    /// 200 columns is read at 40 as the popup a human resizing with it up
+    /// would see.
     ///
     /// `absent` is the other half of `words`: facts the frame must *not* carry
     /// at any size with a floor to paint in, for a state whose point is an
@@ -14844,7 +15012,6 @@ mod tests {
         words: Vec<&'static str>,
         roomy: Vec<&'static str>,
         absent: Vec<&'static str>,
-        reopen: Option<fn(&mut App)>,
     }
 
     /// One agent, as its parent reports it to the UI.
@@ -14993,7 +15160,6 @@ mod tests {
             words: vec!["· #0", " agents ", " chat ", "Tab cycles panes"],
             roomy: vec!["you", " message ", "Ask for a change"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15017,7 +15183,6 @@ mod tests {
             ],
             roomy: vec![" agents · 1 working"],
             absent: vec!["working."],
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15034,7 +15199,6 @@ mod tests {
             words: vec!["⧗ #0", "waiting on results", "waiting on results."],
             roomy: vec![" agents · 1 waiting"],
             absent: vec!["◐ #0", "working."],
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15058,7 +15222,6 @@ mod tests {
             words: vec!["⏸1", "2 working", "waiting on 1 subagent"],
             roomy: vec!["◐ #1", "◐ #2", "lexer", " agents · 2 working · 1 waiting"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15096,7 +15259,6 @@ mod tests {
                 words: vec!["≡ #0", words, foot, "keep typing"],
                 roomy: vec!["your message is answered after the fold"],
                 absent: vec!["working."],
-                reopen: None,
             });
             keep.push(rx);
         }
@@ -15112,7 +15274,6 @@ mod tests {
             words: vec!["✗ #0", "no route to host", "agent #0 failed"],
             roomy: vec!["! no route to host"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15126,7 +15287,6 @@ mod tests {
             words: vec!["⊘ #0", "stopped"],
             roomy: vec!["re-send to resume"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15138,7 +15298,6 @@ mod tests {
             words: vec!["· #0", " agents ", " chat ", "mush › "],
             roomy: vec!["✗ #1", "mush/1", "! the endpoint returned 503"],
             absent: Vec::new(),
-            reopen: None,
         });
 
         // A pane was scrolled away from the bottom: the title says so.
@@ -15158,7 +15317,6 @@ mod tests {
             words: vec!["scrolled ↑5 rows", "PgDn"],
             roomy: vec![],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15176,7 +15334,6 @@ mod tests {
             words: vec!["more lines", "/notes"],
             roomy: vec!["note 7", "note 6", "+5 more lines"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15197,7 +15354,6 @@ mod tests {
             words: vec!["⚙1", "#c1"],
             roomy: vec![" 1 jobs · #c1"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15220,7 +15376,6 @@ mod tests {
                 "main ±3 +9−2",
             ],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(twenty_rx);
 
@@ -15254,7 +15409,6 @@ mod tests {
             ],
             roomy: vec!["deepseek-chat · 128k"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15276,7 +15430,6 @@ mod tests {
             ],
             roomy: vec![],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15296,7 +15449,6 @@ mod tests {
             words: vec!["◐ #0"],
             roomy: vec!["thinking."],
             absent: vec!["more lines"],
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15320,7 +15472,6 @@ mod tests {
             words: vec!["escaped", "␍", " chat "],
             roomy: vec!["escaped", "␍"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15399,15 +15550,8 @@ mod tests {
                 words,
                 roomy,
                 absent,
-                reopen,
             } = state;
             for &(width, height) in SWEEP_SIZES {
-                // A popup whose contents are wrapped to the terminal's width is
-                // opened again for each size, the way a resize would.
-                if let Some(reopen) = reopen {
-                    app.set_term_size(width, height);
-                    reopen(app);
-                }
                 let shot = shot(app, width, height);
                 let at = format!("{name} at {width}×{height}");
                 // The frame is the terminal: every row, every column, and not
