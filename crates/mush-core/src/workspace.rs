@@ -3,7 +3,7 @@
 
 use std::fs;
 use std::io::{self, Read, Write};
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use crate::message::Image;
@@ -989,13 +989,14 @@ impl Workspace {
     ///
     /// The name is resolved to what it really is before anything is made
     /// ([`entry_for_write`]): a write through a symlink lands in the file the
-    /// link points at and the link stays a link.
+    /// link points at and the link stays a link, and a socket, a FIFO or a
+    /// device is refused rather than renamed over.
     ///
     /// A file with no owner-write bit is refused with the mode it has, so a
     /// `0444` file the human marked read-only is a sentence the model can read
-    /// instead of an override it cannot see. That refusal lives here, at the
-    /// model's door, and not in [`atomic_write`], which `session::save` and the
-    /// human's own `config.json` writer also use: they may replace a file
+    /// instead of an override it cannot see. Those two refusals live here, at
+    /// the model's door, and not in [`atomic_write`], which `session::save` and
+    /// the human's own `config.json` writer also use: they may replace a file
     /// whatever its mode, but a model may not.
     pub fn write_file(&self, rel: &str, content: &str) -> Result<(), String> {
         let path = entry_for_write(&self.resolve(rel)?, rel)?;
@@ -1374,7 +1375,11 @@ impl Fresh {
 /// a half-written file and a crash cannot corrupt the original.
 ///
 /// The name is resolved to what it really is first ([`entry_for_write`]): a
-/// symlink is written through and stays a link.
+/// symlink is written through and stays a link, and a socket, a FIFO or a
+/// device is refused rather than destroyed. That guard lives here beside the
+/// rename as well as at [`Workspace::write_file`], so a caller that does not
+/// pass through the tool's door (`session::save`, the human's own
+/// `config.json`) cannot rename over a socket either.
 ///
 /// The mode is a fact of the file, not of this function. `tempfile` makes its
 /// scratch file `0600` and the rename would carry that onto the target, so an
@@ -1417,8 +1422,13 @@ pub fn atomic_write(path: &Path, bytes: &[u8], fresh: Fresh) -> io::Result<()> {
 /// asked what it is first. A symlink is followed one link deep, because that is
 /// where the write belongs: the model edited the file the name points at, and a
 /// rename over the link would delete the link and leave that file untouched. A
-/// symlink to nothing is refused, because following it would make a file at a
-/// path no caller checked; the reader is told to make the target first.
+/// socket, a FIFO or a device is refused, because it is not content: renaming a
+/// regular file over the workspace's own `.mush/mush.sock` unlinks the attach
+/// socket and every `mush read`/`agents`/`edit` in that directory answers "no
+/// mush is running" until mush restarts (finding B3), and a FIFO or a device
+/// is the same destruction. A symlink to nothing is refused, because following
+/// it would make a file at a path no caller checked; the reader is told to make
+/// the target first.
 ///
 /// `name` is the caller's spelling of the path — the workspace-relative `rel`
 /// at the tool's door, the path itself for a caller with no root — because the
@@ -1448,7 +1458,27 @@ fn entry_for_write(path: &Path, name: &str) -> Result<PathBuf, String> {
             )),
         };
     }
-    Ok(path.to_path_buf())
+    Err(format!(
+        "{name} is a {} — refusing to replace it",
+        what_it_is(&kind)
+    ))
+}
+
+/// The type name a refusal sentence gives for a name that is not a file: the
+/// words a model can act on, and the reason the write is refused at all.
+fn what_it_is(kind: &fs::Metadata) -> &'static str {
+    let kind = kind.file_type();
+    if kind.is_dir() {
+        "directory"
+    } else if kind.is_socket() {
+        "socket"
+    } else if kind.is_fifo() {
+        "FIFO"
+    } else if kind.is_char_device() || kind.is_block_device() {
+        "device"
+    } else {
+        "file that is not a regular file"
+    }
 }
 
 /// [`entry_for_write`]'s refusal as an IO error: the kind that says "the name
@@ -2580,6 +2610,51 @@ mod tests {
         let a = fs::metadata(&left).unwrap();
         let b = fs::metadata(&right).unwrap();
         assert_ne!(a.ino(), b.ino(), "and the two names fork");
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// A name that is not a file is not content, and a rename replaces the name
+    /// whatever it is: the workspace's own attach socket dies this way (finding
+    /// B3 — every `mush read`/`agents`/`edit` in that directory answered "no
+    /// mush is running" until mush restarted) and a FIFO goes the same way.
+    /// Both doors refuse, naming the type: the tool's `write_file` and the
+    /// `atomic_write` that `session::save` and the home config use, because a
+    /// caller that does not pass through the tool's door must not rename over
+    /// one either.
+    #[test]
+    fn a_write_will_not_replace_a_socket_or_a_fifo() {
+        use std::os::unix::net::UnixListener;
+
+        let ws = temp_workspace("write-type");
+        fs::create_dir_all(ws.root().join(".mush")).unwrap();
+        let sock = ws.root().join(".mush/mush.sock");
+        let listener = UnixListener::bind(&sock).unwrap();
+
+        let refused = ws
+            .write_file(".mush/mush.sock", "not a socket any more\n")
+            .unwrap_err();
+        assert!(refused.contains("socket"), "the type is named: {refused}");
+        assert!(fs::symlink_metadata(&sock).unwrap().file_type().is_socket());
+        assert!(
+            atomic_write(&sock, b"x", Fresh::Box).is_err(),
+            "the guard is kept beside the rename too"
+        );
+
+        let fifo = ws.root().join("pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(
+            made.is_ok_and(|status| status.success()),
+            "this test needs `mkfifo` to build the shape it pins"
+        );
+        let refused = ws.write_file("pipe", "content\n").unwrap_err();
+        assert!(refused.contains("FIFO"), "the type is named: {refused}");
+        assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+
+        // And an ordinary file and a brand-new name still write.
+        ws.write_file("plain.txt", "a\n").unwrap();
+        ws.write_file("fresh.txt", "b\n").unwrap();
+        assert_eq!(ws.read_file("fresh.txt").unwrap(), "b\n");
+        drop(listener);
         let _ = fs::remove_dir_all(ws.root());
     }
 
