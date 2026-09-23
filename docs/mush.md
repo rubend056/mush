@@ -760,7 +760,12 @@ an empty conversation clears on one press, and a copy that cannot be written
 refuses the key. The session carries every subagent's transcript too, so a
 relaunch brings the tree back with its briefs and its context; it also carries
 each agent's last **failure** (and only a failure), so a broken run is still on
-screen next time the workspace opens. A restored agent comes back **at rest**:
+screen next time the workspace opens. A row whose parent the file does not name
+comes back as the orphan it is — the same row, with its stored parent, its
+transcript and its unread mark, wearing `⚮` — and a row the restore could not
+hold is said at *that* open, in the bar and the pane's foot, and never written
+to the session: it is a reading of the file, and the next open derives it
+again. A restored agent comes back **at rest**:
 its row shows how its last run ended, its mailbox is live, and the human's next
 message is what starts it. Opening mush is not a request.
 
