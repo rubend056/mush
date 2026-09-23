@@ -873,12 +873,14 @@ default.
 
 `mush --print-config` prints what those layers resolved to — endpoint, provider,
 what the stored session was (`none`, how much of a conversation it read, or that
-the file is there and *unreadable*), model, window and whether a human stated
-it, temperature, reasoning effort and thinking mode (each with whether a human
-stated it), the reply cap's size and the name it travels under, the tool schemas
-every request reserves and the history budget those leave, the key masked, `-y`,
-and the hue the window would wear — and exits 0 without opening the terminal,
-creating `.mush/` or taking the workspace lock.
+the file is there and *unreadable*), an unreadable home config or a resolution
+notice when one is owed, model, whether that model is documented to see an image
+(`vision`), window and the road it came by, temperature, reasoning effort and
+thinking mode (each with whether a human stated it), the reply cap's size and the
+name it travels under, the tool schemas every request reserves and the history
+budget those leave, the key — always stated, masked, `(none)` when there is none
+— `-y`, and the hue the window would wear — and exits 0 without opening the
+terminal, creating `.mush/` or taking the workspace lock.
 It is the honest view of the precedence, and what makes a hand-edited file
 debuggable. The other flags a human would type are `--temperature F`,
 `--reasoning-effort LEVEL` (`low`, `high` or `max`; also
