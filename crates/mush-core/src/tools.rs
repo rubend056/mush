@@ -114,12 +114,34 @@ pub const TOOL_NAMES: [&str; 10] = names(ToolName::ALL);
 /// The names of the delegation-only tools.
 pub const ORCHESTRATION_TOOLS: [&str; 1] = names(ToolName::ORCHESTRATION);
 
-/// A required string argument.
+/// A required string argument. A value that is present but not a string is
+/// refused with the shape it should have had: "missing" is a true sentence
+/// about a field that is not there and a false one about a field the model sent
+/// as a number, and a model told its `command` is missing will add a second one
+/// before it ever changes the type.
 pub fn arg_string(args: &Value, key: &str) -> Result<String, String> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .ok_or_else(|| format!("missing `{key}`"))
+    match args.get(key) {
+        None | Some(Value::Null) => Err(format!("missing `{key}`")),
+        Some(Value::String(text)) => Ok(text.to_string()),
+        Some(other) => Err(format!("`{key}` must be a string; got {other}")),
+    }
+}
+
+/// An optional string argument, with `null` read as absent — the JSON way of
+/// saying nothing, deliberately, so `{base: null}` still means "no base" while
+/// any other non-string is refused rather than read as one.
+///
+/// A fallback here is the most expensive default in the tool set: a `base` that
+/// reads as "no base" drops the child's worktree and puts its edits in the
+/// parent's checkout (finding F12), and a `title` that reads as "no title"
+/// drops the row's name — both answer a question nobody asked, exactly the trap
+/// [`arg_usize`] documents.
+pub fn arg_string_opt(args: &Value, key: &str) -> Result<Option<String>, String> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(text)) => Ok(Some(text.to_string())),
+        Some(other) => Err(format!("`{key}` must be a string; got {other}")),
+    }
 }
 
 /// An optional whole number argument, defaulted. A value that is present but
@@ -193,21 +215,19 @@ pub fn edits_arg(args: &Value) -> Result<Vec<Edit>, String> {
     let mut edits = Vec::with_capacity(entries.len());
     for (index, entry) in entries.iter().enumerate() {
         let at = |what: String| format!("edit {}: {what}", index + 1);
-        let old = entry
-            .get("old_string")
-            .and_then(Value::as_str)
-            .ok_or_else(|| at("missing `old_string`".to_string()))?;
-        let new = entry
-            .get("new_string")
-            .and_then(Value::as_str)
-            .ok_or_else(|| at("missing `new_string`".to_string()))?;
+        // The required strings go through [`arg_string`], so a value present
+        // with the wrong type is told its shape rather than called missing; the
+        // flag is refused the same way, never defaulted — a `replace_all`
+        // someone set to `"true"` must not silently change one occurrence
+        // (finding A7's class: a wrongly-typed argument is refused, not
+        // defaulted).
+        let old = arg_string(entry, "old_string").map_err(at)?;
+        let new = arg_string(entry, "new_string").map_err(at)?;
+        let replace_all = arg_bool(entry, "replace_all", false).map_err(at)?;
         edits.push(Edit {
-            old: old.to_string(),
-            new: new.to_string(),
-            replace_all: entry
-                .get("replace_all")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            old,
+            new,
+            replace_all,
         });
     }
     Ok(edits)
@@ -289,8 +309,39 @@ mod tests {
             arg_string(&json!({"path": "a.rs"}), "path").unwrap(),
             "a.rs"
         );
-        assert!(arg_string(&json!({"path": 7}), "path").is_err());
         assert!(arg_string(&json!({}), "path").is_err());
+        // A value that is there with the wrong type is not a missing one: the
+        // sentence names the shape the model has to fix (finding A7's class).
+        assert_eq!(
+            arg_string(&json!({"path": 7}), "path").unwrap_err(),
+            "`path` must be a string; got 7"
+        );
+        assert_eq!(
+            arg_string(&json!({"path": null}), "path").unwrap_err(),
+            "missing `path`"
+        );
+    }
+
+    /// An optional string reads `null` as absent and refuses every other wrong
+    /// shape: the JSON way of saying nothing is not a licence to default a
+    /// value the model sent (finding A7/F12).
+    #[test]
+    fn arg_string_opt_reads_null_as_absent_and_refuses_the_rest() {
+        assert_eq!(arg_string_opt(&json!({}), "base").unwrap(), None);
+        assert_eq!(
+            arg_string_opt(&json!({"base": null}), "base").unwrap(),
+            None
+        );
+        assert_eq!(
+            arg_string_opt(&json!({"base": "main"}), "base").unwrap(),
+            Some("main".to_string())
+        );
+        for wrong in [json!(7), json!(["main"]), json!(true)] {
+            assert_eq!(
+                arg_string_opt(&json!({ "base": wrong.clone() }), "base").unwrap_err(),
+                format!("`base` must be a string; got {wrong}")
+            );
+        }
     }
 
     fn edit(old: &str, new: &str) -> Edit {
@@ -299,6 +350,28 @@ mod tests {
             new: new.to_string(),
             replace_all: false,
         }
+    }
+
+    /// The batch's own fields are under the same rule as every typed argument:
+    /// a value present with the wrong shape is refused, never defaulted — a
+    /// `replace_all` of `"true"` must not quietly change one occurrence when
+    /// the model asked for all of them (finding A7's class).
+    #[test]
+    fn a_wrongly_typed_edit_field_is_refused_never_defaulted() {
+        let wrong = edits_arg(&json!({
+            "edits": [{ "old_string": "a", "new_string": "b", "replace_all": "true" }]
+        }))
+        .unwrap_err();
+        assert_eq!(wrong, "edit 1: `replace_all` must be true or false");
+
+        let wrong = edits_arg(&json!({
+            "edits": [{ "old_string": 7, "new_string": "b" }]
+        }))
+        .unwrap_err();
+        assert_eq!(wrong, "edit 1: `old_string` must be a string; got 7");
+
+        let missing = edits_arg(&json!({"edits": [{"new_string": "b"}]})).unwrap_err();
+        assert_eq!(missing, "edit 1: missing `old_string`");
     }
 
     /// A batch lands whole or not at all: an edit that cannot apply leaves the

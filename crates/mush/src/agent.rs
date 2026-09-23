@@ -3856,24 +3856,26 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
     // `worktree_add` gets; the *name* is what the actor keeps, because the
     // run-end sweep asks whether the base contains the branch's work — and a
     // merge that happened while the run was going moved the base's tip, which
-    // only re-resolving the name can see.
-    let named = args.get("base").and_then(Value::as_str);
-    let base: Option<String> = match named {
+    // only re-resolving the name can see. `null` is the JSON way of saying
+    // nothing and stays absent; any other non-string is refused, never read as
+    // "no base" — a silent drop there is a shared child in the parent's checkout
+    // (finding A7, F12).
+    let named = tools::arg_string_opt(args, "base")?;
+    let base: Option<String> = match named.as_deref() {
         Some(name) => Some(git::resolve(&ctx.root, name).ok_or_else(|| {
             format!("unknown base `{name}`: no commit, branch or tag by that name")
         })?),
         None => None,
     };
-    let base_name = named.map(str::to_string);
+    let base_name = named.clone();
     let isolated = base.is_some();
     // The name the caller chose for the row, trimmed; blank means none, and the
-    // row falls back to its handle from the brief.
-    let title = args
-        .get("title")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|title| !title.is_empty())
-        .map(str::to_string);
+    // row falls back to its handle from the brief. A wrongly-typed title is
+    // refused, not silently dropped: the row is how the human finds the child
+    // (finding A7).
+    let title = tools::arg_string_opt(args, "title")?
+        .map(|title| title.trim().to_string())
+        .filter(|title| !title.is_empty());
     if !isolated {
         // Decide this *before* writing the brief: the check can only fail after
         // the brief exists, so the rule is stated in the tool schema and the
@@ -5141,15 +5143,15 @@ fn run_command(
     args: &Value,
     cancel: &AtomicBool,
 ) -> Result<String, ToolError> {
-    let command = args
-        .get("command")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "missing `command`".to_string())?;
-    let detach = args.get("detach").and_then(Value::as_bool).unwrap_or(false);
-    let exclusive = args
-        .get("exclusive")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
+    let command = tools::arg_string(args, "command")?;
+    let command = command.as_str();
+    // A wrongly-typed field is refused, never defaulted: `exclusive: "true"`
+    // used to run a benchmark beside a sibling's lock — two exclusive commands
+    // interleaved, the one thing the lock exists to prevent — and `detach:
+    // "yes"` used to become a foreground call, a 60 s block and for anything
+    // longer the 120 s kill `detach` promises not to apply (finding A7).
+    let detach = tools::arg_bool(args, "detach", false)?;
+    let exclusive = tools::arg_bool(args, "exclusive", false)?;
     let registry = actor.ctx.registry.clone();
     // Two decisions, both made *before* a process exists: whether this command
     // may use the machine at all (the lock), and whether a long one has
@@ -11889,6 +11891,122 @@ mod tests {
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
+    /// A wrongly-typed `exclusive` is refused, never read as false: with #2
+    /// holding the machine, `exclusive: "true"` used to run the benchmark
+    /// beside the lock — two exclusive commands interleaved, the one thing the
+    /// lock exists to prevent (finding A7). The refusal is the argument's own
+    /// sentence, and the command never reaches the machine.
+    #[test]
+    fn a_wrongly_typed_exclusive_is_refused_not_read_as_false() {
+        // No script on the machine: a command that ran at all spent the
+        // refusal on nothing.
+        let clock = Arc::new(Advanceable::new());
+        let machine = Arc::new(ScriptedMachine::new());
+        let (actor, _mailbox) =
+            scripted_tools_actor("exclusive-wrong-type", machine.clone(), clock);
+        let actor = Actor {
+            id: AgentId::ROOT.0,
+            ..actor
+        };
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        actor.ctx.registry.take_machine(2, "cargo bench").unwrap();
+
+        for wrong in [json!("true"), json!(1), json!([])] {
+            let refused = exec_tool(
+                &actor,
+                &mut state,
+                ToolName::RunCommand,
+                &json!({ "command": "cargo bench", "exclusive": wrong }),
+                &cancel,
+            )
+            .unwrap_err();
+            let ToolError::Failed(why) = refused else {
+                panic!("a wrongly-typed argument is a failed call, not a lock refusal");
+            };
+            assert!(
+                why.contains("`exclusive` must be true or false"),
+                "the model is told what to fix: {why}"
+            );
+        }
+        assert!(
+            machine.spawned().is_empty(),
+            "nothing ran beside the lock: {:?}",
+            machine.spawned()
+        );
+        assert!(
+            actor.ctx.registry.machine_free_for(9).is_err(),
+            "and the refusal took nothing from the holder"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A wrongly-typed `detach` is refused, never read as false: `detach:
+    /// "yes"` used to become a foreground call — a sixty-second block, and for
+    /// anything longer the 120 s kill `detach` promises not to apply (finding
+    /// A7). The refusal names the field and the shape it wants, and nothing is
+    /// started.
+    #[test]
+    fn a_wrongly_typed_detach_is_refused_not_read_as_foreground() {
+        let clock = Arc::new(Advanceable::new());
+        let machine = Arc::new(ScriptedMachine::new());
+        let (actor, _mailbox) = scripted_tools_actor("detach-wrong-type", machine.clone(), clock);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        for wrong in [json!("yes"), json!(1), json!([])] {
+            let refused = exec_tool(
+                &actor,
+                &mut state,
+                ToolName::RunCommand,
+                &json!({ "command": "serve", "detach": wrong }),
+                &cancel,
+            )
+            .unwrap_err();
+            let ToolError::Failed(why) = refused else {
+                panic!("a wrongly-typed argument is a failed call");
+            };
+            assert!(
+                why.contains("`detach` must be true or false"),
+                "the model is told what to fix: {why}"
+            );
+        }
+        assert!(
+            machine.spawned().is_empty(),
+            "no foreground call took the detach's place: {:?}",
+            machine.spawned()
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A `command` that is present but not a string is refused with its own
+    /// shape, not read as a missing field: "missing `command`" was the sentence
+    /// a model sending `{command: 7}` read, which tells it to add a field it
+    /// did send (finding A7's class, in `arg_string`).
+    #[test]
+    fn a_wrongly_typed_command_is_refused_not_read_as_missing() {
+        let clock = Arc::new(Advanceable::new());
+        let machine = Arc::new(ScriptedMachine::new());
+        let (actor, _mailbox) = scripted_tools_actor("command-wrong-type", machine.clone(), clock);
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::RunCommand,
+            &json!({ "command": 7 }),
+            &cancel,
+        )
+        .unwrap_err();
+        let ToolError::Failed(why) = refused else {
+            panic!("a wrongly-typed command is a failed call");
+        };
+        assert_eq!(why, "`command` must be a string; got 7", "{why}");
+        assert!(machine.spawned().is_empty(), "nothing ran");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
     /// A job mush *killed* is news: four hours of silence or a run past the
     /// output limit is a reason to act, and the line saying why must reach the
     /// owner's run. A *stop* is the human's doing — the line waits in the
@@ -15909,6 +16027,93 @@ mod tests {
         };
         assert!(error.contains("unknown base"), "{error}");
         assert!(state.children.is_empty(), "nothing may be spawned");
+    }
+
+    /// A wrongly-typed `base` is refused, never read as "no base":
+    /// `{base: ["main"]}` — or any non-string — used to spawn a *shared* child,
+    /// whose edits land in the parent's checkout while the parent believes they
+    /// are in a worktree (finding A7, F12). `null` is the JSON way of saying
+    /// nothing, so it still means absent: the positive twin, one shared child,
+    /// no worktree.
+    #[test]
+    fn a_wrongly_typed_base_is_refused_never_read_as_no_base() {
+        let (actor, _mailbox) = scripted_tools_actor(
+            "spawn-base-wrong-type",
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        for wrong in [json!(7), json!(["main"]), json!(true)] {
+            let refused = exec_tool(
+                &actor,
+                &mut state,
+                ToolName::SpawnAgent,
+                &json!({ "brief": "b", "title": "a wrong base", "base": wrong }),
+                &cancel,
+            )
+            .unwrap_err();
+            let ToolError::Failed(why) = refused else {
+                panic!("a wrongly-typed base is a failed call");
+            };
+            assert!(
+                why.contains("`base` must be a string"),
+                "the model is told what to fix: {why}"
+            );
+        }
+        assert!(
+            state.children.is_empty(),
+            "a refused base spawns nothing — least of all a shared child in this checkout"
+        );
+
+        // The positive twin: `null` is absent, and absent means shared.
+        let report = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "b", "title": "no base", "base": null }),
+            &cancel,
+        )
+        .unwrap();
+        assert!(report.contains("spawned agent #1"), "{report}");
+        assert!(
+            !report.contains("on mush/"),
+            "no base means the shared workspace, not a worktree: {report}"
+        );
+        assert!(state.shared.contains(&1), "the child shares this checkout");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A wrongly-typed `title` is refused, never silently dropped: the row is
+    /// what the human finds a child by, and `{title: 7}` used to read as "no
+    /// title" while the schema requires one — the same silent default as a
+    /// wrongly-typed `base`, one row's name rather than a whole worktree
+    /// (finding A7).
+    #[test]
+    fn a_wrongly_typed_title_is_refused_never_silently_dropped() {
+        let (actor, _mailbox) = scripted_tools_actor(
+            "spawn-title-wrong-type",
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(Advanceable::new()),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let refused = exec_tool(
+            &actor,
+            &mut state,
+            ToolName::SpawnAgent,
+            &json!({ "brief": "b", "title": 7 }),
+            &cancel,
+        )
+        .unwrap_err();
+        let ToolError::Failed(why) = refused else {
+            panic!("a wrongly-typed title is a failed call");
+        };
+        assert!(why.contains("`title` must be a string"), "{why}");
+        assert!(state.children.is_empty(), "nothing may be spawned");
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// A child the parent resumed with a message counts as running again: the
