@@ -1169,17 +1169,21 @@ pub(crate) mod tests {
 
     /// The rows a tree draws, painted by the row painter itself: `ui`'s side of
     /// the mark set (`agent_line`'s `▶`, `⚮` and `✉`/`✉N`) and the phase
-    /// glyph column, in the doc's `marks` block.
+    /// glyph column, in the manual's `marks` block — and on the front page,
+    /// which carries the same block.
     #[test]
     fn the_marks_block_matches_the_code() {
         let rows = marks_rows();
         let painted: Vec<String> = rows.iter().map(|row| agent_line(row, 56)).collect();
-        doc_block(
-            "docs/mush.md",
-            "marks",
-            "ui::tests::the_marks_block_matches_the_code",
-            &format!("```\n{}\n```", painted.join("\n")),
-        );
+        let rendered = format!("```\n{}\n```", painted.join("\n"));
+        for file in ["docs/mush.md", "README.md"] {
+            doc_block(
+                file,
+                "marks",
+                "ui::tests::the_marks_block_matches_the_code",
+                &rendered,
+            );
+        }
     }
 
     /// The sample frame on the manual's front page, painted by the real
