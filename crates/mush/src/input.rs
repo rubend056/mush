@@ -52,10 +52,17 @@ impl Input {
         &self.text
     }
 
+    /// Insert `text` at the cursor, as a paste or a typed character does.
+    ///
+    /// The cursor advances by the *result's* count, not the paste's: a
+    /// skin-tone modifier or a regional indicator joins the cluster before it,
+    /// so a cursor advanced by the paste's own graphemes lands one past the end
+    /// of the box — `backspace` then computes both byte positions past the end
+    /// and the first keystroke deletes nothing (finding D20).
     pub fn insert(&mut self, text: &str) {
         let at = self.byte_at(self.cursor);
         self.text.insert_str(at, text);
-        self.cursor += text.graphemes(true).count();
+        self.cursor = (self.cursor + text.graphemes(true).count()).min(self.graphemes());
     }
 
     pub fn backspace(&mut self) {
@@ -366,6 +373,28 @@ mod tests {
         assert_eq!(row, 1);
         assert_eq!(lines[1], "…hij");
         assert!(column < 5, "the cursor must fit inside the field");
+    }
+
+    /// A paste whose last cluster merges with the one before it leaves the
+    /// cursor at the end of the box, not one past it: the first Backspace
+    /// deletes the merged cluster instead of nothing (finding D20).
+    #[test]
+    fn a_paste_that_merges_with_the_grapheme_before_it_leaves_the_cursor_in_the_box() {
+        // A skin-tone modifier joins the `x` it follows into one cluster.
+        let mut typed = input("x", 1);
+        typed.insert("\u{1f3fd}");
+        assert_eq!(text_of(&typed), "x\u{1f3fd}");
+        assert_eq!(
+            typed.cursor,
+            text_of(&typed).graphemes(true).count(),
+            "the cursor names a position inside the box"
+        );
+        typed.backspace();
+        assert_eq!(
+            text_of(&typed),
+            "",
+            "the first Backspace deletes the cluster the paste merged into"
+        );
     }
 
     #[test]
