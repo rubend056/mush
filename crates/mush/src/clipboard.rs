@@ -931,9 +931,22 @@ mod tests {
     /// so "the text did not reach the clipboard" would send the human looking in
     /// the wrong place. The text here is past the pipe buffer, which is what the
     /// deadline is for: the caller's own thread never writes it, so a program
-    /// that stops reading cannot hold the human's keyboard on a full pipe. On
-    /// Linux the killed writer is checked to be really gone — a `kill` that left
-    /// a zombie would answer here and never reap anything again.
+    /// that stops reading cannot hold the human's keyboard on a full pipe.
+    ///
+    /// The writer's own pid, written before it sleeps, is the instrument the
+    /// reap is read with — and the kill races that first line: a machine slow
+    /// to start `sh` has the deadline arrive before the `echo` has run, and a
+    /// read that assumes the file is there fails on that race rather than on
+    /// anything the module did. Waiting for the file cannot mend it — the
+    /// writer is killed and reaped before the call returns, and a name it never
+    /// wrote cannot appear after it — so the naming is given room instead: a
+    /// quarter of a second, where the old 50 ms lost the race on a loaded
+    /// machine. A kill that still wins it is its own case below: the deadline's
+    /// facts (the sentence and the elapsed time) are this test's either way,
+    /// and the reap is what the pid buys when the writer had time to name
+    /// itself. On Linux the killed writer is checked to be really gone — a
+    /// `kill` that left a zombie would answer here and never reap anything
+    /// again.
     #[test]
     fn a_writer_that_never_takes_the_text_is_killed_at_the_deadline() {
         let pid_file = temp_path("hung-pid");
@@ -946,8 +959,11 @@ mod tests {
         )];
         let text = "x".repeat(1024 * 1024);
         let started = Instant::now();
+        // Room for the writer's first line: the pid it echoes is the reaping
+        // check's instrument, and 50 ms is less than a loaded machine takes to
+        // start a shell (see the doc).
         let refused =
-            run_writers(writers, &text, Instant::now() + Duration::from_millis(50)).unwrap_err();
+            run_writers(writers, &text, Instant::now() + Duration::from_millis(250)).unwrap_err();
         let waited = started.elapsed();
         assert!(
             refused.contains("`sh` did not take the text within 2s"),
@@ -968,15 +984,26 @@ mod tests {
         );
         #[cfg(target_os = "linux")]
         {
-            let pid: i32 = fs::read_to_string(&pid_file)
-                .expect("the writer names its own process before it sleeps")
-                .trim()
-                .parse()
-                .expect("sh's `$$` is a pid");
-            assert!(
-                !std::path::Path::new(&format!("/proc/{pid}")).exists(),
-                "the killed writer is reaped, not left as a zombie: /proc/{pid} is still there"
-            );
+            // The writer names its pid and then sleeps, and the kill decides
+            // which of the two this reads (see the doc): a whole pid when the
+            // naming got there first, and no file at all when the deadline won
+            // the race — which is the deadline's own fact, not a failure to
+            // read. Anything but "no such file" is the fixture failing.
+            match fs::read_to_string(&pid_file) {
+                Ok(named) => {
+                    let pid: i32 = named.trim().parse().expect("sh's `$$` is a pid");
+                    assert!(
+                        !std::path::Path::new(&format!("/proc/{pid}")).exists(),
+                        "the killed writer is reaped, not left as a zombie: /proc/{pid} is still \
+                         there"
+                    );
+                }
+                Err(error) => assert_eq!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound,
+                    "the writer names its own process before it sleeps: {error}"
+                ),
+            }
         }
     }
 
