@@ -4762,7 +4762,13 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         // writers this parent's own books name are filtered out of it, because
         // for *them* the books are the finer answer — they are written where a
         // child's run starts and ends — and the books already judged them in
-        // the two lines above.
+        // the two lines above. The refusal states that rule in the words the
+        // prompt uses, because the model reads it at the moment it matters:
+        // whose writers are counted, that it is the directory rather than this
+        // parent's books, that a grandchild counts and an ended run does not,
+        // and that the spawner's own run is exempt. The old sentence read as a
+        // parent's own books ("already runs in this shared workspace, and only
+        // one shared child may run at a time"), which is H64's third site.
         let mut running_shared: Vec<u64> = state
             .shared
             .iter()
@@ -4784,9 +4790,12 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
                 .collect::<Vec<_>>()
                 .join(", ");
             return Err(format!(
-                "cannot spawn: {names} already runs in this shared workspace, and only one shared child \
-                 may run at a time. Pass base=<branch or commit> to give a sibling its own worktree, or \
-                 wait for it to finish."
+                "cannot spawn: {names} already runs in this shared workspace, where only one \
+                 shared child may run at a time — the directory's live writers, tree-wide, not \
+                 only the children your own books name: a grandchild working here counts, a \
+                 child whose run has ended does not, and your own run is exempt. Pass \
+                 base=<branch or commit> to give a sibling its own worktree, or wait for it to \
+                 finish."
             ));
         }
     }
@@ -19043,7 +19052,10 @@ mod tests {
     ///
     /// #2's one reply is held, so its run is what the directory is busy with
     /// while the root asks again; the request reaching the model is also the
-    /// proof that #2's run booked itself in the tree-wide book.
+    /// proof that #2's run booked itself in the tree-wide book. The refusal the
+    /// root reads states that same rule — the directory's live writers,
+    /// tree-wide, a grandchild counted and an ended run not, the spawner exempt
+    /// — rather than the old per-parent narrowing (H64's third site).
     #[test]
     fn the_shared_workspace_rule_counts_every_live_writer_in_that_directory() {
         let gate = Arc::new(Gate::new());
@@ -19118,6 +19130,23 @@ mod tests {
             "the refusal names the grandchild's run: {refused}"
         );
         assert!(refused.contains("shared workspace"), "{refused}");
+        // The model reads this sentence at the moment it matters, so it owes
+        // the same six facts the prompt's sentence does — not a narrowing of
+        // them (`mush_core::prompt`'s
+        // `the_delegation_policy_states_the_directorys_live_writers`).
+        for owed in [
+            "only one shared child may run at a time",
+            "the directory's live writers, tree-wide",
+            "not only the children your own books name",
+            "a grandchild working here counts",
+            "a child whose run has ended does not",
+            "your own run is exempt",
+        ] {
+            assert!(
+                refused.contains(owed),
+                "the refusal owes `{owed}`: {refused}"
+            );
+        }
         assert_eq!(
             state.children.keys().copied().collect::<Vec<_>>(),
             vec![1],
