@@ -376,9 +376,9 @@ pub enum RunStyle {
 /// paragraph, join two lines, re-indent a list or turn `- a\n- b` into a layout
 /// the source did not have. That boundary is the point — the human called the
 /// full version a rabbit hole, and a chat reply needs a reading, not a document
-/// renderer. Tables, setext headings, reference links, HTML, task-list
-/// checkboxes, nested lists and indented code blocks are all *not* rules; a
-/// line that uses one is simply the text it is.
+/// renderer. Tables, setext headings, reference links, HTML, nested lists and
+/// indented code blocks are all *not* rules; a line that uses one is simply the
+/// text it is.
 ///
 /// It is **additive** too. The only text a rule removes is scaffolding a human
 /// does not read in a view — the `#`s of a heading, the `>` a quote's bar
@@ -447,6 +447,18 @@ pub enum RunStyle {
 ///   styled [`RunStyle::Bullet`]. A marker with no space after it is not one,
 ///   and an ordered marker is at most two digits, because `1998. It was a good
 ///   year` opens a sentence, not a list.
+/// - a `- `, `* ` or `+ ` item whose own text begins with `[ ]`, `[x]` or
+///   `[X]` and a space → the checkbox paints as `☐` or `☑` in
+///   [`RunStyle::Bullet`], the marker's own style. Two brackets and the space
+///   between them say what one box says, so the box says "checkbox" in one
+///   column where the source spelled it in three; a box is a fact about the
+///   item, and it is painted rather than dropped for the same reason the
+///   marker is. Everything that is not a checkbox is text exactly as typed:
+///   `[]` has no state, `[y]` is not a state this view knows, `[ ]` with no
+///   words after it would be a box nobody wrote, and a `[ ]` with no list
+///   marker is a line of text. `1. [ ] task` is not one either: this view's
+///   boxes belong to the unordered markers, because the ordered ones are
+///   where an item sits and the box is what it is.
 /// - a line whose first non-space text is three backticks opens a fenced block,
 ///   and the next such line closes it. The fence lines of a block with a body
 ///   are not painted and everything between them is [`RunStyle::Fence`], one
@@ -629,7 +641,23 @@ fn block(line: &str, width: usize) -> Vec<Run> {
             text: marker.to_string(),
             style: RunStyle::Bullet,
         }];
-        runs.extend(inline(text));
+        if let Some((box_char, rest)) = checkbox(marker, text) {
+            // The brackets and the space between them are scaffolding: the box
+            // is the same fact in one column. The item's own space sits between
+            // the marker and the box, and `rest` still carries the one that
+            // separates a box from the words it is about.
+            runs.push(Run {
+                text: " ".to_string(),
+                style: RunStyle::Plain,
+            });
+            runs.push(Run {
+                text: box_char.to_string(),
+                style: RunStyle::Bullet,
+            });
+            runs.extend(inline(&format!(" {rest}")));
+        } else {
+            runs.extend(inline(text));
+        }
         return runs;
     }
     inline(line)
@@ -694,6 +722,38 @@ fn list_marker(line: &str) -> Option<(&str, &str)> {
         }
     }
     None
+}
+
+/// The box a task-list item's `[ ]`/`[x]`/`[X]` names, and the item's own
+/// words after it — `None` for everything that is not a checkbox.
+///
+/// `marker` is the marker the item opened with: a box belongs to the unordered
+/// markers, because an ordered item already says where it sits and the box is
+/// what it is.
+///
+/// `text` is what [`list_marker`] left: the one space that separates the marker
+/// from the item's text, then the text. So the form read here is ` [ ] words`:
+/// `[`, one state character, `]`, one space, and at least one word after it. A
+/// box with nothing after it is not one — there is nothing for it to be about —
+/// and the state must be one a box can say, so `[]`, `[y]` and ` [ ]` are the
+/// characters they are.
+fn checkbox<'a>(marker: &str, text: &'a str) -> Option<(char, &'a str)> {
+    if !matches!(marker, "-" | "*" | "+") {
+        return None;
+    }
+    let rest = text.strip_prefix(" [")?;
+    let state = rest.chars().next()?;
+    let rest = &rest[state.len_utf8()..];
+    let box_char = match state {
+        ' ' => '☐',
+        'x' | 'X' => '☑',
+        _ => return None,
+    };
+    let rest = rest.strip_prefix("] ")?;
+    if rest.is_empty() {
+        return None;
+    }
+    Some((box_char, rest))
 }
 
 /// One source line's inline markers: plain text, spans, and links, in order.
@@ -1842,6 +1902,75 @@ mod tests {
             );
         }
         assert_eq!(markdown_row_counts("> a\n> b", 40), vec![1, 1]);
+    }
+
+    /// A task list's checkbox is a box: `[ ]` and `[x]`/`[X]` say one thing in
+    /// three columns, and `☐`/`☑` say it in one, in the bullet's own style.
+    /// The brackets and the space between them are scaffolding. Everything
+    /// that is not a checkbox is text exactly as typed, and a box is one
+    /// column wide because the pane's width arithmetic counts columns.
+    #[test]
+    fn a_task_list_is_a_box_in_the_bullets_style() {
+        for (text, box_char) in [
+            ("- [ ] todo", '☐'),
+            ("- [x] done", '☑'),
+            ("- [X] done", '☑'),
+            ("* [ ] star", '☐'),
+            ("+ [x] plus", '☑'),
+        ] {
+            let words = &text[6..];
+            assert_eq!(
+                runs(text),
+                vec![
+                    (text[..1].to_string(), RunStyle::Bullet),
+                    (" ".to_string(), RunStyle::Plain),
+                    (box_char.to_string(), RunStyle::Bullet),
+                    (format!(" {words}"), RunStyle::Plain),
+                ],
+                "{text:?} is a task item"
+            );
+        }
+        // The words after the box are read like any other item's.
+        assert_eq!(
+            runs("- [ ] **bold** word"),
+            vec![
+                ("-".to_string(), RunStyle::Bullet),
+                (" ".to_string(), RunStyle::Plain),
+                ("☐".to_string(), RunStyle::Bullet),
+                (" ".to_string(), RunStyle::Plain),
+                ("bold".to_string(), RunStyle::Strong),
+                (" word".to_string(), RunStyle::Plain),
+            ]
+        );
+        assert_eq!(rows("- [ ] todo", 40), vec!["- ☐ todo"]);
+        // A box is one column: the row it is painted in counts it as one.
+        assert_eq!(UnicodeWidthStr::width("☐"), 1);
+        assert_eq!(UnicodeWidthStr::width("☑"), 1);
+        // And what is not a checkbox is the characters it is: the brackets
+        // are the item's own text, and the item keeps the marker it had.
+        for (text, marker) in [
+            ("- []", "-"),
+            ("- [y]", "-"),
+            ("- [ ]", "-"),
+            ("- [ ] ", "-"),
+            ("- [x]", "-"),
+            ("- [ ]x", "-"),
+            ("1. [ ] ordered", "1."),
+            ("99. [x] ordered", "99."),
+        ] {
+            assert_eq!(
+                runs(text),
+                vec![
+                    (marker.to_string(), RunStyle::Bullet),
+                    (text[marker.len()..].to_string(), RunStyle::Plain),
+                ],
+                "{text:?} was read as a task item"
+            );
+        }
+        assert_eq!(
+            runs("[ ] no marker"),
+            vec![("[ ] no marker".to_string(), RunStyle::Plain)]
+        );
     }
 
     /// A fence is a block, and the fence lines are not painted: everything

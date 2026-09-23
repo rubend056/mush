@@ -6730,6 +6730,33 @@ mod tests {
             .contains(ratatui::style::Modifier::BOLD));
     }
 
+    /// A task item's box paints through the pane in the bullet's accent, and
+    /// the box is one column wide where the source's brackets were three.
+    #[test]
+    fn a_task_item_paints_as_a_box_in_the_bullets_accent() {
+        let message = Message::assistant("- [ ] todo\n- [x] done");
+        let mut rows = Vec::new();
+        render_message(&mut rows, &message, None, 40, false, Fold::DEFAULT, &[]);
+        assert_eq!(
+            shown(&rows),
+            vec![
+                "mush › - ☐ todo".to_string(),
+                "       - ☑ done".to_string(),
+                String::new(),
+            ]
+        );
+        let box_span = rows[0]
+            .spans
+            .iter()
+            .find(|span| span.content.as_ref() == "☐")
+            .expect("the box");
+        assert_eq!(box_span.style.fg, Some(Color::Green));
+        assert!(
+            !shown(&rows).iter().any(|row| row.contains('[')),
+            "the brackets are scaffolding"
+        );
+    }
+
     /// A tool result is data, not prose: its bytes are what the human copies
     /// out — a diff, a test log, a shell transcript — so the view does not
     /// touch it. A `#` in such a line is a comment, an `*` is a glob and
