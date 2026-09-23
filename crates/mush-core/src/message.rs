@@ -99,8 +99,49 @@ fn assign_tool_call_ids(calls: &mut [ToolCall]) {
     }
 }
 
+/// The `arguments` a call arrived with, as the JSON *text* the spec's own
+/// request form spells.
+///
+/// A well-behaved server sends the text (`"{\"path\":\"a\"}"`); one that
+/// already holds the object sends the object instead, and both are the same
+/// call. An object is re-spelled as its JSON text rather than refused: mush
+/// parses that text back when the call is run, and a strict endpoint is sent
+/// the string again. `null` (and an absent field, via `serde(default)`) is no
+/// arguments, which is what a call that asks for none means.
+fn arguments_from_wire<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(text)) => text,
+        Some(other) => other.to_string(),
+    })
+}
+
+/// The `id` a call arrived with, as text.
+///
+/// The spec spells a call id as a string; a server that numbered its calls
+/// sends a number, and a number is not a malformed reply. Any value that is
+/// not a string is spelled as its JSON text — `1` as `"1"` — and
+/// [`assign_tool_call_ids`] is the one place that decides what the text means
+/// for the batch (a missing or repeated id becomes `call_N`).
+fn id_from_wire<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    Ok(match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => String::new(),
+        Some(Value::String(text)) => text,
+        Some(other) => other.to_string(),
+    })
+}
+
 /// The `tool_calls` wire field, normalized on the way in: a reply is not
-/// malformed because a model left an id out or repeated one.
+/// malformed because a model left an id out, repeated one, numbered one, or
+/// left a call's `function`/`name` out (each of those shapes is read where it
+/// arrives — [`id_from_wire`], [`arguments_from_wire`] — and the batch's ids
+/// are settled here by [`assign_tool_call_ids`]).
 fn tool_calls_from_wire<'de, D>(deserializer: D) -> Result<Option<Vec<ToolCall>>, D::Error>
 where
     D: Deserializer<'de>,
@@ -112,19 +153,45 @@ where
     Ok(calls)
 }
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// One function a call names: the tool, and the arguments it is asked for.
+///
+/// Both fields default, for the module's promise: a call that names no tool —
+/// or carries no function object at all — is one the tool loop can answer
+/// (an empty name is the unknown-tool result the model can correct), where a
+/// strict parse would fail the whole reply and end the run instead.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct FunctionCall {
-    pub name: String,
     #[serde(default)]
+    pub name: String,
+    /// The call's arguments as the spec's JSON text, whatever shape they
+    /// arrived in (see [`arguments_from_wire`]).
+    #[serde(default, deserialize_with = "arguments_from_wire")]
     pub arguments: String,
 }
 
+/// One call in a reply's `tool_calls`: the id a result is paired with, and the
+/// function it asks for.
+///
+/// Every field defaults so that a server which leaves one out — or spells the
+/// id as a number ([`id_from_wire`]) — is read rather than refused: the tool
+/// loop answers what it can and tells the model about what it cannot, which is
+/// the road a loose reply is supposed to keep open.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ToolCall {
-    #[serde(default)]
+    /// The id a tool result is paired with. `serde(default)` covers a missing
+    /// one and [`id_from_wire`] a numeric one; [`assign_tool_call_ids`] then
+    /// makes whatever arrived unique and non-empty.
+    #[serde(default, deserialize_with = "id_from_wire")]
     pub id: String,
+    /// The call's `type`. Defaulted to the spec's `"function"`: that is the
+    /// only kind this tree runs, and a server that omits the field is not
+    /// malformed.
     #[serde(rename = "type", default = "function_type")]
     pub kind: String,
+    /// The function the call names. Defaulted for the same reason as the name
+    /// and arguments inside it: a missing object is an empty call, not a reply
+    /// to throw away.
+    #[serde(default)]
     pub function: FunctionCall,
 }
 
@@ -201,6 +268,12 @@ impl Image {
 
 #[derive(Clone, Debug, Default, Deserialize)]
 pub struct Message {
+    /// The speaker. `serde(default)`, because a reply that omits it is still a
+    /// reply: the reply road does not match on this field — the run pushes the
+    /// choice's message as the model's turn and answers whatever it holds — so
+    /// a missing role must not be the thing that ends a run. The empty string
+    /// is what "the server did not say" reads as.
+    #[serde(default)]
     pub role: String,
     /// The message's text. A plain JSON string on the way out — the spec's own
     /// request form, for both assistant history and tool results — unless the
@@ -648,6 +721,79 @@ pub struct ApiError {
 mod tests {
     use super::*;
     use crate::config::{BYTES_PER_TOKEN, PIXELS_PER_TOKEN};
+
+    /// The module's opening promise, as the four shapes that broke it: each
+    /// names a field a server left out or spelled its own way, and each used
+    /// to fail the *whole* reply — the `ChatResponse` parse whose `Err` becomes
+    /// "could not parse model response" and ends the run. A loose reply is
+    /// still a reply: the message parses, an object `arguments` arrives as its
+    /// JSON text, a numeric id as its text, and a choice with no `role` is the
+    /// model's own turn like any other.
+    #[test]
+    fn a_loose_reply_is_still_a_reply() {
+        // No `role`: the field defaults, and the text is the reply.
+        let roleless: Message = serde_json::from_str(r#"{"content":"hi"}"#).unwrap();
+        assert_eq!(
+            roleless.role, "",
+            "a missing role is an empty one, not a refused reply"
+        );
+        assert_eq!(roleless.text(), "hi");
+
+        // No `function` object at all: an empty function, which the tool loop
+        // answers as the unknown-tool road rather than dropping the reply.
+        let bare_call: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":[{"type":"text","text":"hi"}],"tool_calls":[{"id":"x","type":"function"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(bare_call.text(), "hi");
+        assert_eq!(bare_call.tool_calls().len(), 1);
+        assert_eq!(bare_call.tool_calls()[0].function.name, "");
+        assert_eq!(bare_call.tool_calls()[0].function.arguments, "");
+
+        // A `function` present but with no `name` is the same empty call.
+        let nameless: Message = serde_json::from_str(
+            r#"{"role":"assistant","tool_calls":[{"id":"x","type":"function","function":{}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(nameless.tool_calls()[0].function.name, "");
+
+        // `arguments` as an object: it arrives as its JSON text, which is what
+        // a strict endpoint is sent back.
+        let object_args: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":"hi","tool_calls":[{"id":"x","type":"function","function":{"name":"read_file","arguments":{"path":"a"}}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            object_args.tool_calls()[0].function.arguments,
+            r#"{"path":"a"}"#,
+            "an object arrives as the JSON text the spec calls for"
+        );
+        assert_eq!(
+            serde_json::to_string(&object_args).unwrap(),
+            r#"{"role":"assistant","content":"hi","tool_calls":[{"id":"x","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"a\"}"}}]}"#,
+            "and goes back out as the string a strict endpoint expects"
+        );
+
+        // A numeric id: it arrives as its text, and `assign_tool_call_ids`
+        // leaves a unique non-empty one alone.
+        let numeric_id: Message = serde_json::from_str(
+            r#"{"role":"assistant","content":"hi","tool_calls":[{"id":1,"type":"function","function":{"name":"read_file","arguments":"{}"}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(numeric_id.tool_calls()[0].id, "1");
+
+        // And the whole reply the run parses, choice and all: a server that
+        // sends no `role` is read here, not refused.
+        let reply: ChatResponse = serde_json::from_str(
+            r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(reply.choices[0].message.text(), "hi");
+        assert_eq!(
+            reply.choices[0].message.role, "",
+            "a role the server did not send is not an ended run"
+        );
+    }
 
     /// A spec-legal reply whose `content` is an array of parts must parse: a
     /// server that sends the newer shape is not a broken endpoint, and dying
