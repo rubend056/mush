@@ -27,10 +27,12 @@
 //! stopped — belongs to its run: a new one replaces the agent's old one, and no
 //! clock takes either away. Only the failure is the half written to the
 //! session, because that is the line a restart owes; a stop is news on the run
-//! and stays on the row, and the session's own stored status carries it across
-//! the restart (an agent that stopped comes back `Phase::Stopped`, never a red
-//! `!` for a run where nothing broke). Before this, every notice ever written
-//! stayed until Ctrl-N, a failure from twenty runs ago was painted under the
+//! and stays on the row, and what a restart reads is the *status* the run
+//! stored — a stop the human asked for comes back as the row's `Phase::Stopped`,
+//! and one the loop guard ended comes back as that run's error, the guard's own
+//! words. Neither returns as a stored `!` line: a run where nothing broke must
+//! not come back wearing a failure's red mark. Before this, every notice ever
+//! written stayed until Ctrl-N, a failure from twenty runs ago was painted under the
 //! newest message as if it were the newest thing said, none of it survived a
 //! restart, and a line about one moment spent the foot for the life of the
 //! session.

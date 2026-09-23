@@ -1970,8 +1970,12 @@ impl App {
                 // both endings.
                 let line = format!("agent {id} failed — {error}");
                 // The durable half too: the row's `✗` is derived and dies with
-                // the next run, while the notice is tagged, stamped and written
-                // to the session, so a restart still says what broke.
+                // the next run, while a *failure's* notice is tagged, stamped
+                // and written to the session, so a restart still says what
+                // broke. The loop-stop half of this arm is the exception the
+                // notice itself makes (`Chat::note_error_for` lands it as a
+                // stop): it is not stored, and the restart reads the run's
+                // stored status instead — the guard's own error.
                 self.fail_for(id, error, Some(line));
             }
             AgentEvent::Done => {
