@@ -3488,10 +3488,29 @@ fn compact_history(
         },
     );
 
-    // Fold pending nudges/completions in first; a Stop cancels the run.
-    drain_mailbox(actor, cancel, messages, state);
-    if cancel.load(Ordering::SeqCst) {
-        return Err(CANCELLED.to_string());
+    // Fold pending nudges/completions in first; a Stop cancels the run — but
+    // only a fold that belongs to a run may drain this mailbox. What a run
+    // parked is the run's own work, and the summarize request is built from
+    // the run's transcript on purpose.
+    //
+    // A fold from rest owns no run, and every command its mailbox can hold is
+    // a command for the *idle loop*: a nudge, a steering line or a completion
+    // means "start a run". Draining it here pushed the words into the
+    // transcript the fold was about to replace — the human's line travelled
+    // inside the summarize request and was then erased with the transcript it
+    // had landed in, and the `Fold::Run` the command carried was never seen,
+    // so the idle loop's next act was a blocking `recv` and the words were
+    // never answered (finding A14). The mailbox is left exactly as it is, and
+    // the idle loop folds what it holds into the run it asks for. A Stop
+    // behind a `/compact` is not lost either: the fold's own cancel flag
+    // travels to the UI with its `Compacting` event, so Ctrl-C reaches the
+    // request through the flag, and the command itself is folded (as every
+    // idle Stop is) when the loop reads it next.
+    if in_run {
+        drain_mailbox(actor, cancel, messages, state);
+        if cancel.load(Ordering::SeqCst) {
+            return Err(CANCELLED.to_string());
+        }
     }
 
     let mut folded = messages.clone();
@@ -3803,6 +3822,12 @@ fn drain_signals(actor: &Actor, cancel: &AtomicBool, state: &mut ActorState) {
 /// Fold pending mailbox commands into the current run: nudges become user
 /// messages, stops set the cancel flag, child completions update the registry.
 /// Everything parked by `drain_signals` goes in first, in order.
+///
+/// A *run's* door only: an actor at rest folds its mailbox through [`absorb`]
+/// (and what a previous run parked through [`fold_parked`]), where a command
+/// that means "start a run" can still do so. A fold from rest is the one
+/// caller that had to be told — it drained this queue into a transcript it
+/// then replaced, swallowing the run the command asked for (finding A14).
 fn drain_mailbox(
     actor: &Actor,
     cancel: &AtomicBool,
@@ -16415,6 +16440,118 @@ mod tests {
                 "carry on".to_string(),
             ],
             "the fold replaced everything but the system prompt"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The window finding A14 names: a `Compact` and the command behind it
+    /// arrive in one batch while the actor is at rest. The fold must not drain
+    /// the mailbox — what it holds is the *idle* loop's to fold, and the
+    /// transcript the fold replaces is exactly where those words would have
+    /// landed. Probed before the fix: `Nudge("carry on")` already in the
+    /// mailbox with `compact_requested` set, `compact_now` made exactly one
+    /// call — the words inside the summarize request — and the command was
+    /// gone from the transcript the fold replaced it with.
+    #[test]
+    fn an_idle_fold_leaves_a_parked_command_in_the_mailbox() {
+        let scripted = Arc::new(Scripted::new().says("the summary"));
+        let (actor, _events, mailbox) = build_actor_about(
+            "idle-fold-mailbox",
+            scripted.clone(),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState {
+            compact_requested: true,
+            ..ActorState::default()
+        };
+        let mut transcript = vec![
+            Message::system("you are mush"),
+            Message::user("say hi"),
+            Message::assistant("hi"),
+        ];
+        mailbox
+            .send(AgentMsg::Nudge(Message::user("carry on")))
+            .unwrap();
+
+        compact_now(&actor, &mut state, &mut transcript);
+
+        assert_eq!(scripted.asked().len(), 1, "the fold is one summarize call");
+        assert!(
+            matches!(actor.rx.try_recv(), Ok(AgentMsg::Nudge(_))),
+            "the words stay in the mailbox, where the idle loop folds them into \
+             the run they asked for"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The same window end to end: `Compact` and `Nudge` queued together at
+    /// rest. The fold happens (one summarize call), and the nudge is not
+    /// swallowed by it — the idle loop reads the command behind it and starts
+    /// the run the words asked for, so the model answers them. Before the fix
+    /// the only ask was the summarize one, with `carry on` inside it, and no
+    /// second run ever started.
+    #[test]
+    fn a_compact_and_a_nudge_queued_together_start_the_run_the_nudge_asked_for() {
+        let root = scratch_dir("compact-nudge-batch");
+        let summary = "the task was to say something; it was said";
+        let scripted = Arc::new(
+            Scripted::new()
+                .when(|asked: &Asked| asked.saw(COMPACT_INSTRUCTION))
+                .says(summary)
+                .says("first answer")
+                .says("carried on"),
+        );
+        let events = Recorder::new();
+        let root_tx = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        )
+        .tx;
+        root_tx
+            .send(AgentMsg::Run(vec![
+                Message::system("you are mush"),
+                Message::user("say something".to_string()),
+            ]))
+            .unwrap();
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 1),
+            "the first run must finish before the batch: {seen:?}"
+        );
+
+        // One batch, at rest: the fold first, the words the human typed behind
+        // it — the two sends are ordered in the one channel the actor reads.
+        root_tx.send(AgentMsg::Compact(Vec::new())).unwrap();
+        root_tx
+            .send(AgentMsg::Nudge(Message::user("carry on")))
+            .unwrap();
+
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 2),
+            "the nudge must be answered, not swallowed by the fold: {seen:?}"
+        );
+        assert_eq!(
+            seen.summaries,
+            vec![summary.to_string()],
+            "the fold happened"
+        );
+        let asked = scripted.asked();
+        assert!(
+            asked.iter().any(|ask| ask.saw(COMPACT_INSTRUCTION)),
+            "one ask carried the summarize instruction"
+        );
+        assert!(
+            asked
+                .last()
+                .is_some_and(|ask| ask.messages.iter().any(|m| m.text() == "carry on")),
+            "and the words reached the run they asked for: {:?}",
+            asked
+                .last()
+                .map(|ask| ask.messages.iter().map(Message::text).collect::<Vec<_>>())
         );
         let _ = fs::remove_dir_all(&root);
     }
