@@ -39,7 +39,7 @@ use crate::events::{Events, Ui};
 use crate::ids::{AgentId, Ids, JobId};
 use crate::jobs::{self, Refused};
 use crate::machine::{End, Job, Machine, Shell, ShellCommand};
-use crate::model::{retrying, HttpModel, ModelClient, ModelError};
+use crate::model::{retrying, HttpModel, ModelClient, ModelError, CHAT_DEADLINE};
 
 /// Identical consecutive tool batches before the run is called a loop.
 ///
@@ -2358,6 +2358,10 @@ fn over_window_line(cfg: &Config, carried: usize, budget: usize) -> String {
 /// looks stuck (finding B23). Everything the endpoint *answered* — a status, a
 /// refusal, a body that did not parse — is returned unchanged, first time. Both
 /// callers ask through this; only their error arms differ.
+///
+/// The deadline is the logical call's: `retrying` takes [`CHAT_DEADLINE`] once
+/// and hands every attempt only what is left of it, so one ask spends one
+/// deadline however the wire behaves (finding A2).
 fn ask(
     actor: &Actor,
     request: &ChatRequest<'_>,
@@ -2365,13 +2369,14 @@ fn ask(
 ) -> Result<ChatResponse, ModelError> {
     retrying(
         actor.ctx.clock.as_ref(),
+        CHAT_DEADLINE,
         cancel,
         |line| {
             actor
                 .ctx
                 .emit(actor.id, AgentEvent::Notice(line.to_string()))
         },
-        || actor.ctx.model.chat(request, cancel),
+        |left| actor.ctx.model.chat(request, cancel, left),
     )
 }
 

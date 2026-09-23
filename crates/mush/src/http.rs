@@ -26,9 +26,6 @@ use crate::clock::{self, Clock};
 /// Fail fast when the endpoint is unreachable, rather than inheriting the
 /// operating system's multi-minute connect timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-/// A chat completion may legitimately take minutes on a slow local model. The
-/// deadline bounds one whole request; it is no longer a per-read timeout.
-const CHAT_READ_TIMEOUT: Duration = Duration::from_secs(600);
 /// Listing models must never freeze the caller: the UI thread does this when
 /// `/model`, `/url`, or `/key` runs, and a stalled endpoint should just fall
 /// back to the provider's known list.
@@ -72,14 +69,14 @@ pub struct Response {
 trait ReadWrite: Read + Write + Send {}
 impl<T: Read + Write + Send> ReadWrite for T {}
 
-pub fn get_json(url: &str, api_key: Option<&str>, read_timeout: Duration) -> io::Result<Response> {
+pub fn get_json(url: &str, api_key: Option<&str>, timeout: Duration) -> io::Result<Response> {
     request(
         &Ask {
             method: "GET",
             url,
             body: None,
             api_key,
-            read_timeout,
+            timeout,
             cancel: None,
         },
         clock::system(),
@@ -91,11 +88,16 @@ pub fn get_json(url: &str, api_key: Option<&str>, read_timeout: Duration) -> io:
 /// POST a chat completion. `cancel` is polled while the socket waits, so a Stop
 /// reaches a model that has not answered yet — the difference between Ctrl-C
 /// working in a moment and Ctrl-C working after the reply.
+///
+/// `timeout` is what is left of the logical call's deadline — `model.rs`'s
+/// `retrying` owns the one deadline and hands each attempt its remainder — so
+/// one ask can never spend more than the one deadline it was promised.
 pub fn post_json(
     url: &str,
     body: &str,
     api_key: Option<&str>,
     cancel: &AtomicBool,
+    timeout: Duration,
 ) -> io::Result<Response> {
     request(
         &Ask {
@@ -103,7 +105,7 @@ pub fn post_json(
             url,
             body: Some(body),
             api_key,
-            read_timeout: CHAT_READ_TIMEOUT,
+            timeout,
             cancel: Some(cancel),
         },
         clock::system(),
@@ -177,7 +179,11 @@ struct Ask<'a> {
     url: &'a str,
     body: Option<&'a str>,
     api_key: Option<&'a str>,
-    read_timeout: Duration,
+    /// What is left of the logical call's deadline: the whole budget for this
+    /// ask, not a per-read timeout. `post_json` is handed the remainder
+    /// `model.rs`'s `retrying` keeps; `get_json` is one call with no retry of
+    /// its own and passes its own whole deadline.
+    timeout: Duration,
     cancel: Option<&'a AtomicBool>,
 }
 
@@ -262,7 +268,7 @@ static POOL: Pool = Pool::new();
 type Open<'a> = &'a mut dyn FnMut(&str, u16, bool, Duration) -> io::Result<Box<dyn ReadWrite>>;
 
 fn request(ask: &Ask<'_>, clock: &dyn Clock, pool: &Pool, open: Open<'_>) -> io::Result<Response> {
-    let watch = Watch::new(ask.cancel, ask.read_timeout, clock);
+    let watch = Watch::new(ask.cancel, ask.timeout, clock);
     // A Stop that arrived before the request did: do not pay for a call the
     // human already cancelled.
     watch.check()?;
@@ -281,7 +287,7 @@ fn request(ask: &Ask<'_>, clock: &dyn Clock, pool: &Pool, open: Open<'_>) -> io:
     let reused = pooled.is_some();
     let stream = match pooled {
         Some(stream) => stream,
-        None => BufReader::new(open(&host, port, tls, ask.read_timeout)?),
+        None => BufReader::new(open(&host, port, tls, ask.timeout)?),
     };
 
     match exchange(stream, ask, &host, port, &path, &watch) {
@@ -308,7 +314,7 @@ fn request(ask: &Ask<'_>, clock: &dyn Clock, pool: &Pool, open: Open<'_>) -> io:
                 return Err(error);
             }
             watch.check()?;
-            let fresh = BufReader::new(open(&host, port, tls, ask.read_timeout)?);
+            let fresh = BufReader::new(open(&host, port, tls, ask.timeout)?);
             match exchange(fresh, ask, &host, port, &path, &watch) {
                 Ok((response, stream, reusable)) => {
                     if reusable {
@@ -1102,6 +1108,7 @@ fn read_chunked<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<String>
 mod tests {
     use super::*;
     use crate::clock::fake::Advanceable;
+    use crate::model::CHAT_DEADLINE;
     use std::sync::atomic::AtomicUsize;
     use std::time::Instant;
 
@@ -1195,7 +1202,7 @@ mod tests {
 
         let url = format!("http://127.0.0.1:{}/v1/chat/completions", silent_endpoint());
         let started = Instant::now();
-        let error = post_json(&url, "{}", None, &cancel).unwrap_err();
+        let error = post_json(&url, "{}", None, &cancel, Duration::from_secs(5)).unwrap_err();
         let elapsed = started.elapsed();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
         assert!(elapsed < Duration::from_secs(3), "took {elapsed:?}");
@@ -1281,6 +1288,7 @@ mod tests {
             "{}",
             None,
             &cancel,
+            Duration::from_secs(5),
         )
         .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
@@ -1359,7 +1367,7 @@ mod tests {
             url,
             body: Some(body),
             api_key: Some("secret"),
-            read_timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(5),
             cancel: None,
         };
         request(&ask, clock::system(), pool, open)
@@ -1753,7 +1761,7 @@ mod tests {
             url: "http://models.test:8078/v1/chat/completions",
             body: Some("{}"),
             api_key: None,
-            read_timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(5),
             cancel: Some(&cancel),
         };
 
@@ -1979,7 +1987,7 @@ mod tests {
             url: "http://models.test:8078/v1/chat/completions",
             body: Some("{}"),
             api_key: None,
-            read_timeout: Duration::from_secs(5),
+            timeout: Duration::from_secs(5),
             cancel: Some(&cancel),
         };
         let pool = Pool::new();
@@ -2255,7 +2263,7 @@ mod tests {
             setter.store(true, Ordering::SeqCst);
         });
         let started = Instant::now();
-        let error = post_json(&url, "{}", None, &cancel).unwrap_err();
+        let error = post_json(&url, "{}", None, &cancel, Duration::from_secs(5)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted, "{error}");
         assert!(
             started.elapsed() < Duration::from_secs(2),
@@ -2419,7 +2427,7 @@ mod tests {
     fn live_models_endpoint() {
         let cfg = mush_core::Config::from_env();
         let response =
-            get_json(&cfg.models_url(), cfg.api_key.as_deref(), CHAT_READ_TIMEOUT).unwrap();
+            get_json(&cfg.models_url(), cfg.api_key.as_deref(), LIST_READ_TIMEOUT).unwrap();
         assert_eq!(response.status, 200);
         assert!(response.body.contains("data"));
     }
@@ -2466,7 +2474,14 @@ mod tests {
         };
         let body = serde_json::to_string(&request).unwrap();
         let cancel = AtomicBool::new(false);
-        let response = post_json(&cfg.chat_url(), &body, cfg.api_key.as_deref(), &cancel).unwrap();
+        let response = post_json(
+            &cfg.chat_url(),
+            &body,
+            cfg.api_key.as_deref(),
+            &cancel,
+            CHAT_DEADLINE,
+        )
+        .unwrap();
         assert_eq!(
             response.status,
             200,
@@ -2495,7 +2510,7 @@ mod tests {
             thinking: None,
         };
         let response =
-            get_json(&cfg.models_url(), cfg.api_key.as_deref(), CHAT_READ_TIMEOUT).unwrap();
+            get_json(&cfg.models_url(), cfg.api_key.as_deref(), LIST_READ_TIMEOUT).unwrap();
         assert_eq!(response.status, 401);
     }
 }

@@ -99,10 +99,16 @@ pub enum ModelError {
 pub trait ModelClient: Send + Sync {
     /// `cancel` is the flag the human's Stop sets; the call must notice it
     /// while it waits, not only once the endpoint has answered.
+    ///
+    /// `timeout` is what is left of the logical call's deadline: the whole
+    /// budget for this ask, not a per-attempt one. [`retrying`] owns the one
+    /// deadline and gives every attempt only its remainder, so an attempt must
+    /// bound everything it does by what it was handed.
     fn chat(
         &self,
         request: &ChatRequest<'_>,
         cancel: &AtomicBool,
+        timeout: Duration,
     ) -> Result<ChatResponse, ModelError>;
 }
 
@@ -123,6 +129,7 @@ impl ModelClient for HttpModel {
         &self,
         request: &ChatRequest<'_>,
         cancel: &AtomicBool,
+        timeout: Duration,
     ) -> Result<ChatResponse, ModelError> {
         // One snapshot per request, not a lock held across the call.
         let cfg = self.cfg.config().map_err(ModelError::Unreachable)?;
@@ -130,8 +137,13 @@ impl ModelClient for HttpModel {
         let body = serde_json::to_string(request)
             .map_err(|error| ModelError::Encode(error.to_string()))?;
 
-        let response = match http::post_json(&cfg.chat_url(), &body, cfg.api_key.as_deref(), cancel)
-        {
+        let response = match http::post_json(
+            &cfg.chat_url(),
+            &body,
+            cfg.api_key.as_deref(),
+            cancel,
+            timeout,
+        ) {
             Ok(response) => response,
             // The reader stops the moment the human cancels; that is a
             // cancellation, not a failure to reach the endpoint. The flag is
@@ -209,6 +221,14 @@ fn transport(error: &io::Error) -> bool {
 /// How many times one model call is attempted: the first try and two retries.
 /// A fourth would be a loop wearing a policy's clothes.
 pub const RETRY_ATTEMPTS: usize = 3;
+/// The whole deadline one logical model call gets. A slow local model is normal
+/// work, so the number is generous; but it belongs to the *call*, not to the
+/// attempt — [`retrying`] hands every attempt only what is left of it, so one
+/// ask can never spend two, whatever the wire does. It is a parameter of
+/// [`retrying`] and of [`ModelClient::chat`] rather than a constant read inside
+/// the transport, so a test can pass milliseconds and prove the road a human
+/// would otherwise reach in ten minutes without waiting for it.
+pub const CHAT_DEADLINE: Duration = Duration::from_secs(600);
 /// What the first backoff waits, doubling for the retry after it. Short on
 /// purpose: the hiccup this exists for clears in a moment, and a human who is
 /// being told what is happening does not need mush to wait a minute to be sure.
@@ -222,13 +242,20 @@ const BACKOFF_SLICE: Duration = Duration::from_millis(50);
 /// B23: three agents in one session died mid-work on `Connection reset by
 /// peer`, which was the network and not the endpoint).
 ///
+/// `timeout` is the deadline of the **logical call**: the whole budget for one
+/// ask, fixed here and handed to every attempt as what is left of it, so a call
+/// can never spend two. It is a parameter rather than a constant read inside the
+/// transport so that a test can pass a deadline it can afford to wait for; the
+/// backoff is spent from the same budget, never past it.
+///
 /// `attempt` is one whole try — for the real client, one `http::post_json` —
-/// and it must obey the [`ModelClient`] contract: an `Err` means the caller got
-/// nothing of the reply, which is what makes a repeat safe. This decides
-/// whether a failed try is worth another, waits the backoff on the run's own
-/// [`Clock`], and hands every retry to `announce`, so the human reads
-/// `Connection reset by peer (os error 104) — retrying (2/3)` in the transcript
-/// instead of watching a spinner that looks stuck.
+/// given what remains of the deadline, and it must obey the [`ModelClient`]
+/// contract: an `Err` means the caller got nothing of the reply, which is what
+/// makes a repeat safe. This decides whether a failed try is worth another,
+/// waits the backoff on the run's own [`Clock`], and hands every retry to
+/// `announce`, so the human reads `Connection reset by peer (os error 104) —
+/// retrying (2/3)` in the transcript instead of watching a spinner that looks
+/// stuck.
 ///
 /// Two failures are repeated: a [`ModelError::Transport`] one, and a
 /// [`ModelError::Framing`] one. Both mean the reply was never handed to the
@@ -253,20 +280,21 @@ const BACKOFF_SLICE: Duration = Duration::from_millis(50);
 /// the run loop), a refusal (a body past the cap), and a body that arrived and
 /// did not parse are all answers.
 ///
-/// Worst case: [`RETRY_ATTEMPTS`] attempts, each bounded by the transport below
-/// it (`http.rs`: 5 s to connect, 30 s to write, a 600 s read deadline — and
-/// `http.rs` may itself replace a kept connection that died unheard, once,
-/// inside one attempt), plus 1.5 s of backoff. So roughly half an hour for an
-/// endpoint that stalls three times and loses every time, and a few hundred
-/// milliseconds for the reset this is here for. The one unbounded step is the
-/// one already documented: resolving a host has no timeout (docs/mush.md §8),
-/// and that is not a retry's to fix.
+/// Worst case: [`RETRY_ATTEMPTS`] attempts, all inside the one `timeout` (each
+/// is given only what is left of it), plus a backoff spent from the same
+/// budget — so one ask against an endpoint that stalls costs its deadline, not
+/// a multiple of it, and the same ten-minute road is provable in milliseconds
+/// by a test that passed a shorter one. The one unbounded step is the one
+/// already documented: resolving a host has no timeout (docs/mush.md §8), and
+/// that is not a retry's to fix.
 pub fn retrying<T>(
     clock: &dyn Clock,
+    timeout: Duration,
     cancel: &AtomicBool,
     announce: impl Fn(&str),
-    mut attempt: impl FnMut() -> Result<T, ModelError>,
+    mut attempt: impl FnMut(Duration) -> Result<T, ModelError>,
 ) -> Result<T, ModelError> {
+    let deadline = clock.now() + timeout;
     let mut tries = 1;
     loop {
         // A Stop outranks everything: before the first attempt, and between
@@ -274,7 +302,8 @@ pub fn retrying<T>(
         if cancel.load(Ordering::SeqCst) {
             return Err(ModelError::Cancelled);
         }
-        let error = match attempt() {
+        let left = deadline.saturating_duration_since(clock.now());
+        let error = match attempt(left) {
             Ok(value) => return Ok(value),
             Err(error) => error,
         };
@@ -293,23 +322,36 @@ pub fn retrying<T>(
             // human can act on.
             return Err(error.after_attempts());
         }
+        // The one deadline is one: a retry the call cannot pay for is not
+        // made, and the backoff below spends from the same budget.
+        let left = deadline.saturating_duration_since(clock.now());
+        if left.is_zero() {
+            return Err(error);
+        }
         announce(&format!(
             "{message} — retrying ({}/{RETRY_ATTEMPTS})",
             tries + 1
         ));
-        wait(clock, cancel, tries)?;
+        wait(clock, cancel, tries, left)?;
         tries += 1;
     }
 }
 
 /// The pause before the retry after `tries` attempts, in slices the cancel flag
-/// is read between.
+/// is read between, capped by `budget` — what is left of the logical call's
+/// deadline — so the pause can never make a call outlive the deadline it was
+/// given.
 ///
 /// One long `sleep` would make Ctrl-C wait out the whole backoff, which is the
 /// one thing a cancellation may never do; and a `Cancelled` returned from here
 /// is the run stopping, not the wire failing.
-fn wait(clock: &dyn Clock, cancel: &AtomicBool, tries: usize) -> Result<(), ModelError> {
-    let mut left = RETRY_BACKOFF * 2u32.pow(tries as u32 - 1);
+fn wait(
+    clock: &dyn Clock,
+    cancel: &AtomicBool,
+    tries: usize,
+    budget: Duration,
+) -> Result<(), ModelError> {
+    let mut left = (RETRY_BACKOFF * 2u32.pow(tries as u32 - 1)).min(budget);
     while !left.is_zero() {
         if cancel.load(Ordering::SeqCst) {
             return Err(ModelError::Cancelled);
@@ -638,6 +680,7 @@ pub(crate) mod fake {
             &self,
             request: &ChatRequest<'_>,
             cancel: &AtomicBool,
+            _timeout: Duration,
         ) -> Result<ChatResponse, ModelError> {
             let asked = Asked {
                 model: request.model.to_string(),
@@ -741,8 +784,8 @@ mod tests {
 
     use super::fake::Scripted;
     use super::{
-        retrying, transport, HttpModel, ModelClient, ModelError, BACKOFF_SLICE, RETRY_ATTEMPTS,
-        RETRY_BACKOFF,
+        retrying, transport, HttpModel, ModelClient, ModelError, BACKOFF_SLICE, CHAT_DEADLINE,
+        RETRY_ATTEMPTS, RETRY_BACKOFF,
     };
     use crate::agent::AgentEvent;
     use crate::app::{AgentId, ConfigHandle};
@@ -776,9 +819,10 @@ mod tests {
         };
         retrying(
             clock,
+            CHAT_DEADLINE,
             cancel,
             |line| log.emit(AgentId(7), AgentEvent::Notice(line.to_string())),
-            || model.chat(&request, cancel),
+            |left| model.chat(&request, cancel, left),
         )
     }
 
@@ -828,6 +872,85 @@ mod tests {
                 "{kind:?} is not a hiccup"
             );
         }
+    }
+
+    /// One logical call has one deadline, not one per attempt. Nothing listens
+    /// for the first attempt (the refused dial that earns a retry); the
+    /// endpoint the retry reaches accepts and then dribbles a byte per slice
+    /// without ever framing a reply, so the deadline — not a read timeout — is
+    /// what ends it. The retry is handed only what is left of the same
+    /// deadline, so the ask ends at the one deadline it was promised, never at
+    /// the sum of two attempts' timeouts (finding A2).
+    #[test]
+    fn one_ask_spends_one_call_deadline() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Nothing listens for the first attempt...
+        drop(listener);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(200));
+            // ...and the endpoint the retry reaches never answers.
+            let listener = TcpListener::bind(("127.0.0.1", port)).unwrap();
+            if let Ok((mut connection, _)) = listener.accept() {
+                for _ in 0..40 {
+                    if connection.write_all(b"a").is_err() {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+            }
+        });
+
+        let cfg = ConfigHandle::own(mush_core::Config::new(
+            format!("http://127.0.0.1:{port}"),
+            "test",
+            None,
+        ));
+        let model = HttpModel::new(cfg);
+        let cancel = AtomicBool::new(false);
+        let messages = vec![Message::user("task")];
+        let request = ChatRequest {
+            model: "test",
+            messages: &messages,
+            tools: &[],
+            tool_choice: "auto",
+            stream: false,
+            temperature: 0.0,
+            max_tokens: 0,
+            max_completion_tokens: None,
+            thinking: None,
+            reasoning_effort: None,
+        };
+        let log = Recorder::new();
+        let deadline = Duration::from_secs(1);
+        let started = Instant::now();
+        let error = retrying(
+            crate::clock::system(),
+            deadline,
+            &cancel,
+            |line| log.emit(AgentId(7), AgentEvent::Notice(line.to_string())),
+            |left| model.chat(&request, &cancel, left),
+        )
+        .unwrap_err();
+        let elapsed = started.elapsed();
+
+        assert!(matches!(error, ModelError::Transport(_)), "{error:?}");
+        assert_eq!(
+            retry_lines(&log).len(),
+            1,
+            "the refused dial was retried, so there really were two attempts"
+        );
+        assert!(
+            elapsed >= deadline,
+            "the call waits out its one deadline: {elapsed:?}"
+        );
+        assert!(
+            elapsed < deadline + Duration::from_millis(300),
+            "one ask spends one deadline, not one per attempt: {elapsed:?}"
+        );
     }
 
     /// Two hiccups and then an answer: the call succeeds, the endpoint really
@@ -1031,9 +1154,10 @@ mod tests {
 
         let reply = retrying(
             crate::clock::system(),
+            CHAT_DEADLINE,
             &cancel,
             |line| log.emit(AgentId(7), AgentEvent::Notice(line.to_string())),
-            || model.chat(&request, &cancel),
+            |left| model.chat(&request, &cancel, left),
         )
         .unwrap();
 
