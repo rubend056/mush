@@ -52,7 +52,7 @@ use unicode_width::UnicodeWidthStr;
 
 use mush_core::message::{Image, Message};
 use mush_core::session;
-use mush_core::text::{markdown_rows, sanitize, truncate, wrap_text, wrap_text_capped};
+use mush_core::text::{markdown_row_counts, truncate, wrap_text, wrap_text_capped};
 use mush_core::transcript;
 
 use crate::agent::summarize_args;
@@ -594,13 +594,14 @@ impl Body {
 ///
 /// The predicate is the `render_message` arms' own: a user line is always
 /// painted (the mark is, even for a message that is only a picture), a reply
-/// with no words paints nothing, and a folded block — a tool result, a report,
-/// a brief — is painted from its first row: the fold decides *which* rows it
-/// paints, so the lines a long block hides behind its `…` are still source
-/// lines the copy can take whole. A kind the fold gives no rows at all is the
-/// one block whose lines are not stops ([`Stops::of`]). They are one stop,
-/// though, not one each: [`Stops`] is where the fold's boundary turns them into
-/// [`Stop::Tail`].
+/// with no words paints nothing — except a reply of fence lines, which a fence
+/// with no body paints as text ([`mush_core::text::markdown_rows`], finding
+/// D14) — and a folded block — a tool result, a report, a brief — is painted
+/// from its first row: the fold decides *which* rows it paints, so the lines a
+/// long block hides behind its `…` are still source lines the copy can take
+/// whole. A kind the fold gives no rows at all is the one block whose lines are
+/// not stops ([`Stops::of`]). They are one stop, though, not one each:
+/// [`Stops`] is where the fold's boundary turns them into [`Stop::Tail`].
 fn lines_of(message: &Message) -> Option<Vec<&str>> {
     match message.role.as_str() {
         "user" | "tool" => Some(message.text().split('\n').collect()),
@@ -767,6 +768,15 @@ fn last_text(chunk: &Chunk) -> usize {
 /// paints for it. `None` is "this window does not show the cursor", which is
 /// what makes the frame place the window again.
 ///
+/// The nearest painted row of the cursor's own message is the last answer: a
+/// source line the view paints no row for — a reply's fence line, inside a
+/// block that has a body — is still a stop the key road can stand on, and a
+/// stop with no row must paint *somewhere* or the frame reads "the cursor is
+/// here" as "there is no cursor": the mode's title promised `Enter copies`
+/// over a pane with no cursor in it (finding D14). The copy is unaffected — it
+/// reads the stop, not the row — so a cursor on a fence line copies the fence
+/// line while sitting on the message's nearest words.
+///
 /// `cut` is the message whose rows the window's height cut short of its text: a
 /// cut message cannot answer for a hidden line, because the cursor's stop may be
 /// under the cut rather than behind the fold.
@@ -781,9 +791,15 @@ fn cursor_row(
     if cut == Some(cursor.0) {
         return None;
     }
-    rows.iter().rposition(
-        |row| matches!(row, Some((message, stop)) if *message == cursor.0 && *stop <= cursor.1),
-    )
+    rows.iter()
+        .rposition(
+            |row| matches!(row, Some((message, stop)) if *message == cursor.0 && *stop <= cursor.1),
+        )
+        .or_else(|| {
+            rows.iter().position(
+                |row| matches!(row, Some((message, stop)) if *message == cursor.0 && *stop >= cursor.1),
+            )
+        })
 }
 
 /// Whether the cursor sits above everything a window shows. A window with no
@@ -3455,11 +3471,12 @@ enum View {
 /// the width the line was wrapped inside, read back off the row rather than
 /// recomputed, so the map cannot disagree with the mark the pane could afford.
 ///
-/// The markdown walk restates the view's one cross-line rule — a fence line
-/// paints no row, and the lines inside a fence are one plain block — because the
-/// parser's own `fence_line` is not public and asking it for a prefix of the
-/// reply per source line would parse the message once per line. The
-/// `debug_assert` below is what keeps the two row counts from drifting.
+/// Which source line painted how many rows is the *view's* own answer, not a
+/// second walk with the rule restated: the markdown view's count comes from
+/// [`mush_core::text::markdown_row_counts`], the map of the same walk that
+/// paints the rows, so a fence line that paints a row because its block has no
+/// body counts exactly there (finding D14). The `debug_assert` below is what
+/// keeps the two row counts from drifting.
 fn mark_rows(
     out: &mut Vec<Line<'static>>,
     rows: &mut Vec<Option<Stop>>,
@@ -3478,21 +3495,17 @@ fn mark_rows(
         .and_then(|row| row.spans.first())
         .map_or(0, |head| UnicodeWidthStr::width(head.content.as_ref()));
     let wrap = width.saturating_sub(lead);
-    let mut fence = false;
+    // The markdown view counts its rows with the view's own walk — one entry per
+    // source line, fence lines included — and the plain view with one wrap per
+    // line, which is the same arithmetic `wrap_text` does on the whole text.
+    let counts = match view {
+        View::Plain => None,
+        View::Markdown => Some(markdown_row_counts(text, wrap)),
+    };
     for (line, raw) in text.split('\n').enumerate() {
         let count = match view {
             View::Plain => wrap_text(raw, wrap).len(),
-            View::Markdown => {
-                let source = sanitize(raw);
-                if source.trim_start().starts_with("```") {
-                    fence = !fence;
-                    0
-                } else if fence {
-                    wrap_text(&source, wrap).len()
-                } else {
-                    markdown_rows(&source, wrap).len()
-                }
-            }
+            View::Markdown => counts.as_ref().expect("the map above")[line],
         };
         rows.extend(std::iter::repeat(Some(Stop::Line(line))).take(count));
     }
@@ -3861,6 +3874,89 @@ mod tests {
             "the pane wrapped the paragraphs: {}",
             shown(&painted.lines).join(" / ")
         );
+    }
+
+    /// A reply that is nothing but fence lines is a turn the human must be able
+    /// to see: a fence line paints its own row when its block has no body, so
+    /// the pane shows the three backticks the model wrote instead of a `mush › `
+    /// mark over nothing — and the select mode advertises `Enter copies` only
+    /// where there is a cursor to see (finding D14).
+    #[test]
+    fn a_reply_of_only_a_fence_is_not_an_invisible_turn() {
+        for text in ["```", "```\n```", "```\n\n```"] {
+            let mut chat = Chat::bare();
+            chat.push_message(AgentId::ROOT, Message::assistant(text));
+            let pane = pane(AgentId::ROOT);
+            let rows = shown(&pane_rows(&chat, &pane, 40, 10));
+            assert!(
+                rows.iter().any(|row| row.contains("```")),
+                "{text:?} paints its fence lines: {rows:?}"
+            );
+            assert!(chat.start_select(AgentId::ROOT).is_none(), "the mode is on");
+            let painted = chat.painted(&pane, 40, 10);
+            assert!(
+                painted
+                    .select
+                    .as_ref()
+                    .is_some_and(|select| !select.cursor.is_empty()),
+                "{text:?} paints the cursor where it says it is: {:?}",
+                painted.title
+            );
+        }
+
+        // The copy is still the source, so the fence bytes the human selects
+        // are the model's own — the view only decided how to paint them.
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::assistant("```"));
+        chat.start_select(AgentId::ROOT);
+        let copied = chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        assert_eq!(copied.text, "```");
+        assert_eq!(copied.line, "copied 1 line from #0's reply — 3 bytes");
+    }
+
+    /// The frame may never confuse "no mode" with "mode with no visible row":
+    /// every source line the pane calls selectable paints a cursor somewhere.
+    /// A reply's fence line inside a block that *does* have a body is the case
+    /// that used to paint none at all while the title promised `Enter copies`
+    /// (finding D14); a folded result's hidden tail and a wrapped paragraph are
+    /// the same invariant's other shapes.
+    #[test]
+    fn the_select_cursor_has_a_row_on_every_line_lines_of_names() {
+        let long = (0..20)
+            .map(|n| format!("line {n}: a\tb"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut chat = Chat::bare();
+        say(&mut chat, AgentId::ROOT, "a human line\nand a second");
+        chat.push_message(AgentId::ROOT, Message::assistant("```\nlet x = 1;\n```"));
+        chat.push_message(
+            AgentId::ROOT,
+            Message::assistant(
+                "a plain reply, long enough to wrap over a few rows at this width and then some",
+            ),
+        );
+        chat.push_message(AgentId::ROOT, Message::tool("call_1", &long));
+        let pane = pane(AgentId::ROOT);
+        assert!(chat.start_select(AgentId::ROOT).is_none(), "the mode is on");
+
+        let transcript = chat.transcript(AgentId::ROOT).to_vec();
+        for (index, message) in transcript.iter().enumerate() {
+            let Some(lines) = lines_of(message) else {
+                continue;
+            };
+            for (line, source) in lines.iter().enumerate() {
+                chat.select.as_mut().expect("the mode is on").cursor = (index, Stop::Line(line));
+                let painted = chat.painted(&pane, 20, 8);
+                let select = painted.select.expect("the mode paints a cursor");
+                assert!(
+                    !select.cursor.is_empty(),
+                    "message {index} line {line} ({source:?}) has no cursor row: {}",
+                    shown(&painted.lines).join(" / ")
+                );
+            }
+        }
     }
 
     /// A tool result is copied whole, byte for byte, including the lines the

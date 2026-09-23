@@ -355,11 +355,14 @@ pub enum RunStyle {
 ///   and an ordered marker is at most two digits, because `1998. It was a good
 ///   year` opens a sentence, not a list.
 /// - a line whose first non-space text is three backticks opens a fenced block,
-///   and the next such line closes it. The fence lines are not painted and
-///   everything between them is [`RunStyle::Fence`], one style with no inline
-///   parsing, so `**` in code stays code. A fence that never closes runs to the
-///   end of the message: an unterminated block is still a block, and the code
-///   in it is still code.
+///   and the next such line closes it. The fence lines of a block with a body
+///   are not painted and everything between them is [`RunStyle::Fence`], one
+///   style with no inline parsing, so `**` in code stays code. A block with no
+///   words in it is the exception — there is nothing for the fence to hide, so
+///   its fence lines are painted as text, and a reply of nothing but a fence
+///   is a turn the human can see (finding D14). A fence that never closes runs
+///   to the end of the message: an unterminated block is still a block, and the
+///   code in it is still code.
 ///
 /// An mark that never closes is **text**: `**bold` is `**bold`, a lone `*` is a
 /// lone `*`, and a `[link](` with no `)` is the characters it is. Nothing is
@@ -376,29 +379,104 @@ pub enum RunStyle {
 /// narrow. The rows this returns are the rows the plain wrapper would have
 /// made for the same text, with the styles attached.
 pub fn markdown_rows(text: &str, width: usize) -> Vec<Vec<Run>> {
+    markdown_walk(text, width).0
+}
+
+/// How many rows each source line of `text` paints under [`markdown_rows`], in
+/// source order — one entry per `text.split('\n')` line, the lines a rule
+/// paints nothing for included as zeroes.
+///
+/// The map a caller that tags painted rows with their source line needs: the
+/// pane's stop map cannot count a fence line's rows off the source, because a
+/// fence line paints a row only when its block has no body, and only the walk
+/// that paints the rows knows that. Asking the same walk for both answers is
+/// what keeps the map from drifting off the screen — a second count with a
+/// restated rule is the drift this exists to prevent (finding D14).
+///
+/// One entry per line, always: a line whose rule paints nothing is a `0`, not
+/// a missing entry, so a caller can index by source line.
+pub fn markdown_row_counts(text: &str, width: usize) -> Vec<usize> {
+    markdown_walk(text, width).1
+}
+
+/// [`markdown_rows`]' walk, with the per-source-line row count beside it: the
+/// two answers are one pass, because the count *is* the walk's per-line result.
+fn markdown_walk(text: &str, width: usize) -> (Vec<Vec<Run>>, Vec<usize>) {
     let width = width.max(1);
+    let lines: Vec<String> = text.split('\n').map(sanitize).collect();
     let mut out = Vec::new();
-    let mut fence = false;
-    for raw in text.split('\n') {
-        let line = sanitize(raw);
-        if fence_line(&line) {
-            // The fence is scaffolding, not content: it is a block boundary,
-            // and a row of backticks is not something a human reads. The code
-            // inside is untouched — see the never-closing fence above.
-            fence = !fence;
+    let mut counts = Vec::with_capacity(lines.len());
+    let mut at = 0;
+    while at < lines.len() {
+        if !fence_line(&lines[at]) {
+            let rows = wrap_runs(&block(&lines[at]), width);
+            counts.push(rows.len());
+            out.extend(rows);
+            at += 1;
             continue;
         }
-        let runs = if fence {
-            vec![Run {
-                text: line,
-                style: RunStyle::Fence,
-            }]
+        // The fence's block: the lines up to the next fence line, or the
+        // message's end — an unterminated block is still a block, and the code
+        // in it is still code.
+        let close = lines[at + 1..]
+            .iter()
+            .position(|line| fence_line(line))
+            .map(|skip| at + 1 + skip);
+        let end = close.unwrap_or(lines.len());
+        // Does anything between the fences paint a word? A block that says
+        // nothing is not scaffolding to hide: the fence lines are the whole of
+        // what the model wrote, so they are painted as text. A reply of
+        // nothing but a fence was a turn with no row at all — a `mush › ` mark
+        // over nothing, and a select mode advertising `Enter copies` with no
+        // cursor anywhere on screen (finding D14).
+        let words = lines[at + 1..end]
+            .iter()
+            .any(|line| !line.trim().is_empty());
+        for (index, line) in lines[at..end].iter().enumerate() {
+            // The opening fence of a block with words is scaffolding and paints
+            // nothing; every other line is the block's own text — the code
+            // inside it, one style with no inline parsing.
+            let style = match (words, index) {
+                (true, 0) => {
+                    counts.push(0);
+                    continue;
+                }
+                (true, _) => RunStyle::Fence,
+                (false, _) => RunStyle::Plain,
+            };
+            let rows = wrap_runs(
+                &[Run {
+                    text: line.clone(),
+                    style,
+                }],
+                width,
+            );
+            counts.push(rows.len());
+            out.extend(rows);
+        }
+        // The closing fence: scaffolding like the opening one when the block
+        // had words, and one more line of what the model wrote when it did not.
+        if let Some(close) = close {
+            if words {
+                counts.push(0);
+            } else {
+                let rows = wrap_runs(
+                    &[Run {
+                        text: lines[close].clone(),
+                        style: RunStyle::Plain,
+                    }],
+                    width,
+                );
+                counts.push(rows.len());
+                out.extend(rows);
+            }
+            at = close + 1;
         } else {
-            block(&line)
-        };
-        out.extend(wrap_runs(&runs, width));
+            at = end;
+        }
     }
-    out
+    debug_assert_eq!(counts.len(), lines.len(), "one count per source line");
+    (out, counts)
 }
 
 /// Whether a line is a fence, opening or closing one. The run of backticks is
@@ -1495,7 +1573,10 @@ mod tests {
     /// between them is code, one style, with no inline parsing — so the markers
     /// a model writes in code stay the characters they are. A fence that never
     /// closes runs to the end of the message, because an unterminated block is
-    /// still a block and the code in it is still code.
+    /// still a block and the code in it is still code. The one block whose
+    /// fence lines *are* painted is the block that says nothing: with no body
+    /// to hide there is no scaffolding, and a reply of nothing but a fence
+    /// must be a turn the human can see (finding D14).
     #[test]
     fn a_fence_hides_its_lines_and_marks_the_code_between_them() {
         let text = "before\n```rust\nlet x = **1**;\t// tab\n```\nafter";
@@ -1535,9 +1616,31 @@ mod tests {
             vec![RunStyle::Plain, RunStyle::Fence, RunStyle::Fence]
         );
 
-        // The fence line itself is not a row: a message that is only a fence
-        // paints nothing at all.
-        assert_eq!(markdown_rows("```", 40), Vec::<Vec<Run>>::new());
+        // A body that says nothing is not a body: the fence lines are the
+        // whole of what was written, so they are rows of their own. Two fences
+        // in a row are an empty block, not a fence that hides its own line.
+        assert_eq!(rows("```", 40), vec!["```"]);
+        assert_eq!(rows("```\n```", 40), vec!["```", "```"]);
+        assert_eq!(rows("```\n\n```", 40), vec!["```", "", "```"]);
+        assert_eq!(
+            rows("a\n```\n\n```\nb", 40),
+            vec!["a", "```", "", "```", "b"]
+        );
+        assert_eq!(rows("```\n \n```", 40), vec!["```", " ", "```"]);
+
+        // And the row counts are the walk's own map, one entry per source
+        // line: zeroes for the scaffolding a body hides, and the painted rows
+        // for the lines that are text.
+        assert_eq!(
+            markdown_row_counts("```\nlet x = 1;\n```", 40),
+            vec![0, 1, 0]
+        );
+        assert_eq!(markdown_row_counts("```\n```", 40), vec![1, 1]);
+        assert_eq!(markdown_row_counts("a\n```\n```\nb", 40), vec![1, 1, 1, 1]);
+        assert_eq!(
+            markdown_row_counts("a\n```\nlet x = 1;\nb", 40),
+            vec![1, 0, 1, 1]
+        );
     }
 
     /// A link renders as its text and its URL, both: this is a coding tool, and
