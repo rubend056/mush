@@ -203,6 +203,25 @@ impl Ids {
         JobId(self.jobs.fetch_add(1, Ordering::SeqCst))
     }
 
+    /// Keep the job counter above `floor`.
+    ///
+    /// The job space has no pool, but it does have a *record* beyond the
+    /// process: a job's name is written into its owner's transcript
+    /// (`#c2 done: …`), and that transcript outlives the run. Every process
+    /// starts this counter at 1, so a conversation restored over a transcript
+    /// that names `#c7` would hand the next launch's first job `#c1` — and a
+    /// `control stop #c1` the model reads out of the restored conversation
+    /// would address a command the id never named (finding A22). The floor is
+    /// read from the names the copy carries (see `agent::raise_job_floor`),
+    /// because the books are fresh after a restore: the transcript is the only
+    /// surviving record.
+    ///
+    /// `fetch_max`, so a stale floor can never lower a counter a live tree has
+    /// already moved.
+    pub fn reserve_jobs(&self, floor: u64) {
+        self.jobs.fetch_max(floor, Ordering::SeqCst);
+    }
+
     /// The agent space — the counter and the pool, one lock. A lock poisoned by
     /// a panic elsewhere is taken as it is: the house shape for a lock whose
     /// failure must not be fatal, because the records are not corrupted by
@@ -297,5 +316,21 @@ mod tests {
         ids.reserve_agents(4);
         assert_eq!(ids.agents_floor(), 6);
         assert_eq!(ids.next_agent(), AgentId(5), "the pool is still a pool");
+    }
+
+    /// The job floor is a floor too: the floor is the next number out, and a
+    /// stale (lower) one never lowers the counter a live tree has moved — the
+    /// rule a restored conversation's `#cN` names depend on (finding A22).
+    #[test]
+    fn the_job_counter_respects_a_floor_and_never_lowers_one() {
+        let ids = Ids::default();
+        ids.reserve_jobs(8);
+        assert_eq!(ids.next_job(), JobId(8), "a floor is the next number out");
+        ids.reserve_jobs(3);
+        assert_eq!(
+            ids.next_job(),
+            JobId(9),
+            "a lower floor never lowers the counter"
+        );
     }
 }

@@ -1630,6 +1630,11 @@ pub fn revive(
         .map(|_| git::worktree_path(&root, id))
         .filter(|path| path.exists());
     let ws_root = isolated.clone().unwrap_or_else(|| root.clone());
+    // The copy this revival resumes from is the one record that outlives the
+    // process, and it names the jobs its lines carry: the tree-wide job
+    // counter is fresh every launch, so it is raised before the actor can
+    // start a job of its own (finding A22).
+    raise_job_floor(&ids, &messages);
     let ws = match Workspace::new(&ws_root) {
         Ok(ws) => ws,
         Err(error) => {
@@ -1735,6 +1740,53 @@ fn revived_transcript(prompt: Message, brief: &str, messages: Vec<Message>) -> V
     carried.push(prompt);
     carried.extend(messages);
     adopted(carried)
+}
+
+/// Raise the job counter above every job id a restored conversation names.
+///
+/// A job's name is written into its owner's transcript (`#c2 done: …`), and
+/// every process starts the job counter at 1: without this, a restart over a
+/// transcript that names `#c2` hands the next launch's first job `#c1`, and a
+/// `control stop #c1` the model reads out of the restored conversation aims at
+/// a command the id never named (finding A22). The books cannot answer this —
+/// they are fresh, and there are no jobs behind them — so the transcript, the
+/// one record that survives the process, is where the floor is read.
+///
+/// Any occurrence counts, not only a line in the report grammar: a restored
+/// conversation can name a job in the model's own words too (a `status`
+/// listing quoted back, a `control` the model typed), and a number a reader
+/// can see is a number that must not be handed out again. A name that turns
+/// out to be a coincidence costs one skipped number; a missed name costs the
+/// wrong command stopped. A name at the top of the space is skipped — there is
+/// no floor above `u64::MAX`, the same refusal the agent space makes for a
+/// stored id at the ceiling (finding C9).
+fn raise_job_floor(ids: &Ids, messages: &[Message]) {
+    let highest = messages
+        .iter()
+        .map(|message| highest_job_named(message.text()))
+        .max()
+        .unwrap_or(0);
+    if let Some(floor) = highest.checked_add(1) {
+        ids.reserve_jobs(floor);
+    }
+}
+
+/// The highest `#cN` one line names, or 0.
+///
+/// Deliberately looser than the report grammar: this is a *floor*, and the
+/// directions are not symmetric (see [`raise_job_floor`]).
+fn highest_job_named(text: &str) -> u64 {
+    let mut highest = 0u64;
+    let mut rest = text;
+    while let Some(at) = rest.find("#c") {
+        rest = &rest[at + 2..];
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        if let Ok(id) = rest[..digits].parse::<u64>() {
+            highest = highest.max(id);
+        }
+        rest = &rest[digits..];
+    }
+    highest
 }
 
 /// Why an actor could not be built where it was asked to run: the directory is
@@ -2446,6 +2498,12 @@ fn absorb(
         // newer one, which is the same reason `Run` is only folded in at an idle
         // boundary (`drain_mailbox`).
         AgentMsg::Adopt(messages) => {
+            // The conversation a restart resumes from carries the job ids its
+            // lines name, and this process's job counter is fresh: the floor
+            // goes above them before a new job can be handed a name the model
+            // has already read (finding A22). Done whether or not this actor
+            // adopts the copy — the names are spent either way.
+            raise_job_floor(&actor.ctx.ids, &messages);
             if transcript.is_empty() {
                 *transcript = adopted(messages);
             }
@@ -18070,6 +18128,89 @@ mod tests {
             mailbox.send(AgentMsg::Shutdown).is_err(),
             "there is no actor behind the refused revival"
         );
+    }
+
+    /// A restored conversation keeps the `#cN …` lines of the jobs it names,
+    /// while every process starts its job counter at 1: a `control stop #c1`
+    /// the model reads out of the restored transcript would address the new
+    /// launch's first command instead (finding A22). The floor is raised from
+    /// the names the copy carries, at both hand-over doors.
+    #[test]
+    fn a_restored_transcript_raises_the_job_floor_above_the_names_it_carries() {
+        let root = scratch_dir("job-floor-revive");
+        let ids = Ids::default();
+        let events = Recorder::new();
+        let clock: Arc<dyn clock::Clock> = Arc::new(clock::System);
+        let handles = TreeHandles {
+            ids: ids.clone(),
+            live: Arc::new(AtomicU64::new(0)),
+            jobs: jobs::Registry::new(clock, events, ids.clone()),
+        };
+        let (tx, _rx) = crossbeam_channel::unbounded::<Msg>();
+
+        let _mailbox = revive(
+            handles,
+            test_cfg(),
+            tx,
+            1,
+            root.clone(),
+            ReviveSpec {
+                id: 5,
+                depth: 1,
+                brief: "the brief".to_string(),
+                branch: None,
+                messages: vec![
+                    Message::user("the brief"),
+                    Message::assistant("running it"),
+                    Message::tool("call_1", "#c7 done: exit 0 · 1s · cargo test — ok"),
+                    Message::user("and #c2 finished too"),
+                ],
+                parent: None,
+            },
+        );
+
+        assert_eq!(
+            ids.next_job(),
+            JobId(8),
+            "the highest name the revived copy carries is spent"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The root's door for the same fact: the conversation a restart resumes
+    /// from arrives as an `Adopt`, and its names are spent whether or not this
+    /// actor uses the copy (finding A22).
+    #[test]
+    fn an_adopted_root_conversation_raises_the_job_floor_too() {
+        let (actor, _events, _mailbox) = build_actor_about(
+            "job-floor-adopt",
+            Arc::new(Scripted::new()),
+            test_cfg(),
+            Arc::new(ScriptedMachine::new()),
+            Arc::new(clock::System),
+        );
+        let mut state = ActorState::default();
+        let mut transcript = Vec::new();
+
+        let fold = absorb(
+            &actor,
+            &mut state,
+            &mut transcript,
+            AgentMsg::Adopt(vec![
+                Message::system("you are mush"),
+                Message::user("start the build"),
+                Message::assistant("started"),
+                Message::tool("call_1", "#c9 done: exit 0 · 1s · sleep 60 — ok"),
+            ]),
+        );
+
+        assert_eq!(fold, Fold::Idle, "restoring is not a run");
+        assert_eq!(
+            actor.ctx.ids.next_job(),
+            JobId(10),
+            "the names the adopted copy carries are spent"
+        );
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// A named base is the history the child gets: the worktree forks from that
