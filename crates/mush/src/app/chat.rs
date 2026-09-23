@@ -3846,12 +3846,7 @@ mod tests {
     /// are what a pop and a restore move around; nothing here looks at them,
     /// and it names no pixel size, so it weighs the bytes.
     fn image(path: &str) -> Image {
-        Image {
-            path: path.to_string(),
-            mime: "image/png".to_string(),
-            bytes: vec![1, 2, 3],
-            pixels: None,
-        }
+        Image::new(path, "image/png", vec![1, 2, 3], None)
     }
 
     /// Press a key the way the app does: the pure keymap decides which pane
@@ -4963,6 +4958,31 @@ mod tests {
         assert!(
             rows.iter().any(|row| row == "  ⚙ read_file src/a.rs"),
             "{rows:?}"
+        );
+    }
+
+    /// The pane's row is made of the picture's own facts, and the size is one of
+    /// them: a payload given up must not turn `▣ shots/screen.png (png · 2.1 MB)`
+    /// into a row about an empty picture. The size is read from the stored fact
+    /// ([`Image::size`]), not measured off the buffer that held the bytes.
+    #[test]
+    fn a_pictures_row_says_the_same_size_after_its_payload_is_given_up() {
+        let mut picture = Image::new(
+            "shots/screen.png",
+            "image/png",
+            vec![0u8; 2 * 1024 * 1024],
+            None,
+        );
+        let before = image_label(&picture, usize::MAX);
+        assert_eq!(before, "shots/screen.png (png · 2.1 MB)");
+
+        picture.give_up_payload();
+
+        assert!(picture.bytes.is_empty(), "the payload is gone");
+        assert_eq!(
+            image_label(&picture, usize::MAX),
+            before,
+            "the row says the same size before and after"
         );
     }
 

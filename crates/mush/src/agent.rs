@@ -10937,11 +10937,13 @@ mod tests {
             Arc::new(clock::System),
         );
         let images: Vec<Image> = (0..7)
-            .map(|i| Image {
-                path: format!("shot{i}.png"),
-                mime: "image/png".to_string(),
-                bytes: vec![0u8; 2 * 1024 * 1024],
-                pixels: Some((100, 100)),
+            .map(|i| {
+                Image::new(
+                    format!("shot{i}.png"),
+                    "image/png",
+                    vec![0u8; 2 * 1024 * 1024],
+                    Some((100, 100)),
+                )
             })
             .collect();
         let mut messages = vec![
@@ -11552,12 +11554,7 @@ mod tests {
     /// invariant is asked about — a screenshot's file size can move by 10×
     /// without moving its cost.
     fn image_at(path: &str, width: u32, height: u32) -> Image {
-        Image {
-            path: path.to_string(),
-            mime: "image/png".to_string(),
-            bytes: vec![0; 32],
-            pixels: Some((width, height)),
-        }
+        Image::new(path, "image/png", vec![0; 32], Some((width, height)))
     }
 
     /// The same actor, keeping the sink it emits into: how a delivery test sees

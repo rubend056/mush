@@ -272,9 +272,14 @@ pub fn tokens_label(tokens: usize) -> String {
 /// label, because no rule can keep a size in columns that are not there.
 /// `usize::MAX` is a caller saying it has no row budget — the bar's sentences,
 /// which are painted as sentences and clipped, if at all, as one (PM4).
+///
+/// The size is the picture's own stored fact ([`mush_core::message::Image::size`]),
+/// never a measurement of the live buffer: a payload the byte cap has given up
+/// ([`mush_core::message::Image::give_up_payload`]) must not make the row say
+/// the picture is empty.
 pub fn image_label(image: &Image, columns: usize) -> String {
     let format = image.mime.strip_prefix("image/").unwrap_or(&image.mime);
-    let tail = format!(" ({format} · {})", size_label(image.bytes.len()));
+    let tail = format!(" ({format} · {})", size_label(image.size()));
     let name = mush_core::text::sanitize(&image.path);
     let tail_columns = unicode_width::UnicodeWidthStr::width(tail.as_str());
     if columns <= tail_columns {
@@ -9873,12 +9878,7 @@ mod tests {
     /// Its header names no size, so it weighs its bytes — the fallback the
     /// budget tests below exercise.
     fn image(path: &str) -> Image {
-        Image {
-            path: path.to_string(),
-            mime: "image/png".to_string(),
-            bytes: png(0),
-            pixels: None,
-        }
+        Image::new(path, "image/png", png(0), None)
     }
 
     /// Configure the one model the provider table documents as accepting image
@@ -10320,10 +10320,7 @@ mod tests {
         // room left for it is nothing.
         app.chat
             .push_message(AgentId::ROOT, Message::user("x".repeat(budget)));
-        let big = Image {
-            bytes: png(4),
-            ..image("shot.png")
-        };
+        let big = Image::new("shot.png", "image/png", png(4), None);
 
         assert!(app.attach_image(big), "attached anyway");
 
@@ -10353,10 +10350,7 @@ mod tests {
         // fits alone, the second makes the pair too heavy.
         let each = room / 2 + 64;
         for path in ["shots/one.png", "shots/two.png"] {
-            let pending = Image {
-                bytes: png(each),
-                ..image(path)
-            };
+            let pending = Image::new(path, "image/png", png(each), None);
             assert!(app.attach_image(pending), "{path} is attached either way");
         }
 
@@ -10394,12 +10388,7 @@ mod tests {
             std::fs::create_dir_all(root.join("shots")).unwrap();
             std::fs::write(root.join(path), &bytes).unwrap();
         }
-        let picture = Image {
-            path: path.to_string(),
-            mime: "image/png".to_string(),
-            bytes,
-            pixels: None,
-        };
+        let picture = Image::new(path, "image/png", bytes, None);
         assert_eq!(picture.weight(), room + 1, "one byte past the child's room");
 
         app.tree.focus(AgentId(1));
@@ -10429,12 +10418,7 @@ mod tests {
         let budget = app.cfg().history_budget();
         app.chat
             .push_message(AgentId::ROOT, Message::user("x".repeat(budget)));
-        let picture = Image {
-            path: path.to_string(),
-            mime: "image/png".to_string(),
-            bytes,
-            pixels: None,
-        };
+        let picture = Image::new(path, "image/png", bytes, None);
         assert_eq!(picture.weight(), room / 2, "half the child's room");
 
         app.tree.focus(AgentId(1));
@@ -10456,11 +10440,12 @@ mod tests {
         app.cell.edit(|cfg| cfg.set_context(500_000));
         app.chat
             .push_message(AgentId::ROOT, Message::user("x".repeat(900_000)));
-        let shot = Image {
-            bytes: png(741_388),
-            pixels: Some((1_920, 1_080)),
-            ..image("shots/screen.png")
-        };
+        let shot = Image::new(
+            "shots/screen.png",
+            "image/png",
+            png(741_388),
+            Some((1_920, 1_080)),
+        );
         // The picture names a file holding its own bytes, as a paste leaves it:
         // the gate keeps a path the receiving workspace reads back identically.
         std::fs::create_dir_all(app.ws.root().join("shots")).unwrap();
@@ -10496,10 +10481,7 @@ mod tests {
             // — and write the file, so the gate has the path it weighs.
             let bytes = png(room - 8 - 8 - 9 + extra);
             std::fs::write(app.ws.root().join("shot.png"), &bytes).unwrap();
-            let image = Image {
-                bytes,
-                ..image("shot.png")
-            };
+            let image = Image::new("shot.png", "image/png", bytes, None);
             assert_eq!(image.weight(), room + extra);
 
             assert!(app.attach_image(image), "the human decides");
@@ -10538,11 +10520,7 @@ mod tests {
                 .used_weight_for(AgentId::ROOT, app.cfg().history_budget());
 
         let cap = mush_core::workspace::IMAGE_FILE_CAP as usize;
-        let bytes_heavy = Image {
-            bytes: png(cap - 8),
-            pixels: Some((8, 8)),
-            ..image("huge.png")
-        };
+        let bytes_heavy = Image::new("huge.png", "image/png", png(cap - 8), Some((8, 8)));
         std::fs::write(app.ws.root().join("huge.png"), &bytes_heavy.bytes).unwrap();
         assert_eq!(bytes_heavy.bytes.len(), cap, "the transport's whole cap");
         assert!(
@@ -10555,11 +10533,7 @@ mod tests {
             Some(StatusKind::Info)
         );
 
-        let pixel_heavy = Image {
-            bytes: png(4),
-            pixels: Some((20_000, 20_000)),
-            ..image("big.png")
-        };
+        let pixel_heavy = Image::new("big.png", "image/png", png(4), Some((20_000, 20_000)));
         std::fs::write(app.ws.root().join("big.png"), &pixel_heavy.bytes).unwrap();
         assert!(
             pixel_heavy.weight() > room,
@@ -10600,11 +10574,7 @@ mod tests {
         let (mut app, _rx) = test_app("attach-overflow");
         let_the_model_see(&mut app);
         app.cell.edit(|cfg| cfg.set_context(500_000));
-        let impossible = Image {
-            bytes: png(4),
-            pixels: Some((u32::MAX, u32::MAX)),
-            ..image("huge.png")
-        };
+        let impossible = Image::new("huge.png", "image/png", png(4), Some((u32::MAX, u32::MAX)));
         std::fs::write(app.ws.root().join("huge.png"), &impossible.bytes).unwrap();
 
         assert!(!app.attach_image(impossible), "refused, not attached");
@@ -10633,10 +10603,12 @@ mod tests {
         app.cell.edit(|cfg| cfg.set_context(500_000));
         let budget = app.cfg().history_budget();
         std::fs::create_dir_all(app.ws.root().join("shots")).unwrap();
-        let first = Image {
-            bytes: png(3 * budget / 4 - 28),
-            ..image("shots/first.png")
-        };
+        let first = Image::new(
+            "shots/first.png",
+            "image/png",
+            png(3 * budget / 4 - 28),
+            None,
+        );
         std::fs::write(app.ws.root().join("shots/first.png"), &first.bytes).unwrap();
         assert!(first.weight() <= budget, "it fits the budget alone");
         assert!(app.attach_image(first), "and the box was empty");
@@ -10645,10 +10617,7 @@ mod tests {
             Some(StatusKind::Info)
         );
 
-        let second = Image {
-            bytes: png(budget / 2 - 28),
-            ..image("shots/second.png")
-        };
+        let second = Image::new("shots/second.png", "image/png", png(budget / 2 - 28), None);
         std::fs::write(app.ws.root().join("shots/second.png"), &second.bytes).unwrap();
         assert!(second.weight() <= budget, "it also fits the budget alone");
 
@@ -10733,24 +10702,14 @@ mod tests {
             let path = format!("shots/{i}.png");
             let bytes = png(cap - 8);
             std::fs::write(app.ws.root().join(&path), &bytes).unwrap();
-            let picture = Image {
-                path,
-                bytes,
-                pixels: Some((8, 8)),
-                ..image("unused")
-            };
+            let picture = Image::new(path, "image/png", bytes, Some((8, 8)));
             assert!(app.attach_image(picture), "picture {i} fits the box");
         }
         assert_eq!(app.chat.attachments().len(), 8);
         // The ninth is a file the transport allows and the box does not: its
         // pixels are as cheap as any of the eight, and its bytes are what the
         // box refuses.
-        let ninth = Image {
-            path: "shots/ninth.png".to_string(),
-            bytes: png(cap - 8),
-            pixels: Some((8, 8)),
-            ..image("unused")
-        };
+        let ninth = Image::new("shots/ninth.png", "image/png", png(cap - 8), Some((8, 8)));
         std::fs::write(app.ws.root().join("shots/ninth.png"), &ninth.bytes).unwrap();
         assert!(ninth.weight() < 64, "a few tokens of picture");
 
@@ -10786,12 +10745,12 @@ mod tests {
         // The box already holds eight cap-sized pictures; their pixels are 8×8,
         // so it is the bytes and not the window that is nearly full.
         for i in 0..8 {
-            app.chat.attach(Image {
-                path: format!("shots/held{i}.png"),
-                bytes: png(cap - 8),
-                pixels: Some((8, 8)),
-                ..image("unused")
-            });
+            app.chat.attach(Image::new(
+                format!("shots/held{i}.png"),
+                "image/png",
+                png(cap - 8),
+                Some((8, 8)),
+            ));
         }
         // Two more, each a file the transport allows.
         let mut batch = Vec::new();
@@ -10800,12 +10759,7 @@ mod tests {
             let path = format!("shots/extra{i}.png");
             let bytes = png(cap - 8);
             std::fs::write(app.ws.root().join(&path), &bytes).unwrap();
-            batch.push(Image {
-                path,
-                bytes,
-                pixels: Some((8, 8)),
-                ..image("unused")
-            });
+            batch.push(Image::new(path, "image/png", bytes, Some((8, 8))));
         }
 
         assert!(!app.attach_images(batch), "past the box's bound: refused");
@@ -20435,12 +20389,12 @@ mod tests {
             let draft = "first line\nsecond line\nthird line";
             app.chat.set_draft(AgentId::ROOT, draft);
             for i in 0..attachments {
-                app.chat.attach(Image {
-                    path: format!("shots/shot{i}.png"),
-                    mime: "image/png".to_string(),
-                    bytes: Vec::new(),
-                    pixels: None,
-                });
+                app.chat.attach(Image::new(
+                    format!("shots/shot{i}.png"),
+                    "image/png",
+                    Vec::new(),
+                    None,
+                ));
             }
             for &(width, height) in SWEEP_SIZES {
                 if is_below_floor(width, height) {
@@ -20524,12 +20478,8 @@ mod tests {
         // road reads it back to check the attachment is the file it names, and
         // a message that cannot carry its picture is refused, not painted.
         std::fs::write(app.ws.root().join(name), png(1_500_000)).unwrap();
-        app.chat.attach(Image {
-            path: name.to_string(),
-            mime: "image/png".to_string(),
-            bytes: png(1_500_000),
-            pixels: None,
-        });
+        app.chat
+            .attach(Image::new(name, "image/png", png(1_500_000), None));
 
         // The box's own row at the 40-column floor: `▣ ` leaves 36 of the
         // 38-column field, the tail takes 15, and the name gets the rest. The

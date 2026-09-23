@@ -978,21 +978,21 @@ mod tests {
         ensure_mush_dir(&root).unwrap();
 
         let mut session = saying("look at this");
-        session.messages[0].images.push(Image {
-            path: "shots/a.png".into(),
-            mime: "image/png".into(),
-            bytes: vec![0x41; 4_096],
-            pixels: Some((1_920, 1_080)),
-        });
+        session.messages[0].images.push(Image::new(
+            "shots/a.png",
+            "image/png",
+            vec![0x41; 4_096],
+            Some((1_920, 1_080)),
+        ));
         session.agents.push(AgentSession {
             id: 1,
             messages: vec![Message {
-                images: vec![Image {
-                    path: "shots/b.jpg".into(),
-                    mime: "image/jpeg".into(),
-                    bytes: vec![0x42; 4_096],
-                    pixels: Some((800, 600)),
-                }],
+                images: vec![Image::new(
+                    "shots/b.jpg",
+                    "image/jpeg",
+                    vec![0x42; 4_096],
+                    Some((800, 600)),
+                )],
                 ..Message::user("and this one")
             }],
             ..Default::default()

@@ -921,12 +921,7 @@ impl Workspace {
         drop(file);
         self.prune_pastes(&name);
         let pixels = image_dimensions(mime, &bytes);
-        Ok(Image {
-            path: paste_rel(&name),
-            mime: mime.to_string(),
-            bytes,
-            pixels,
-        })
+        Ok(Image::new(paste_rel(&name), mime, bytes, pixels))
     }
 
     /// Delete the pastes this run can no longer be reading, and answer the
@@ -1062,12 +1057,7 @@ impl Workspace {
             return Err(image_too_big(name, mime, None));
         }
         let pixels = image_dimensions(mime, &bytes);
-        Ok(Some(Image {
-            path: name.to_string(),
-            mime: mime.to_string(),
-            bytes,
-            pixels,
-        }))
+        Ok(Some(Image::new(name, mime, bytes, pixels)))
     }
 
     /// A window of a text file, as the model reads it: `limit` lines from
