@@ -683,7 +683,13 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   third site was not part of that commit: the spawn refusal at `agent.rs:4783`
   still reads “already runs in this shared workspace, and only one shared child
   may run at a time” — it names the workspace's writers rather than a parent's
-  children, and it is left as it stood.
+  children, and it is left as it stood. **✅ H64 is closed whole by `3c09beb`
+  (§8.103):** the spawn refusal now states the policy's own six facts — the
+  directory's live writers, tree-wide, a grandchild working here counts, a child
+  whose run has ended does not, the spawner's own run exempt — and
+  `the_shared_workspace_rule_counts_every_live_writer_in_that_directory` gained
+  the six-fact assertion, red before the fix (“the refusal owes `the directory's
+  live writers, tree-wide`”).
 - **H65** — ⬜ open, the doc `retrying` carries, re-read by #123 and left (§8.88):
   `crates/mush/src/model.rs:303`'s "resolving a host has no timeout (docs/mush.md
   §8)" is false since the wire phases were bounded — `http::resolve_bounded`
@@ -706,7 +712,12 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   (`live_endpoint_accepts_the_shipped_reply_cap`'s comment, “and the cap that is
   a quarter of it”), `REPLY_SHARE_DIVISOR` is 8, and `REPLY_SHARE_WORDS` spells
   “an eighth of the window”. `grep -n quarter crates/mush/src/http.rs` finds
-  only that line, and no commit in the window touched it.
+  only that line, and no commit in the window touched it. **✅ closed by
+  `f3fce8d` (§8.103)** — the comment reads `window / REPLY_SHARE_DIVISOR`
+  (`mush_core::config` owns the number, `Config::reply_cap` spends it) — **and
+  `2480468` (§8.103)**, the same sentence on `main.rs`'s
+  `the_shipped_deepseek_session_reports_the_cap_it_sends` doc; `grep -n quarter`
+  answers none in either file.
 - **H67** — ⬜ open, one spelling written twice: `crates/mush/src/app/mod.rs:4265`
   builds the copy refusal as `"cannot copy {from} into {}/.mush/paste: {e}"`
   inline, where `workspace::PASTE_REL` (`mush-core/src/workspace.rs:1844`, read by
@@ -749,7 +760,14 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   compiles (no `Scratch::new` symbol in `target/debug/mush`), so a wave's prod
   column is 146 lines larger than the code it ships. Belongs in `census.py`
   (which could read the `test-support` gate, or the feature's own entry in
-  `Cargo.toml`) or in how `mush-core/src/lib.rs` declares the module.
+  `Cargo.toml`) or in how `mush-core/src/lib.rs` declares the module. **✅
+  closed by `9009f4c` (§8.103):** the classifier reads a module file's gate at
+  its declaration (`#[cfg(<text>)]` above `mod <name>;`) or at its own top
+  (`#![cfg(<text>)]`) and counts the whole file's code as tests when the gate's
+  text names the word `test`; `scratch.rs` is tests 279, prod 0 at `260ff11`
+  (its in-file `mod tests` stays inside the gate) and is the only file in the
+  tree classified that way. TOTAL reads 92,747 · 5,252 · 26,162 · 41,039 ·
+  20,294. Its one latent hole is H76.
 - **H71** — ⬜ open, a number the tree outgrew, named by `7dadf47` (§8.100): ten
   fixtures in `agent.rs` spell the real system prompt as
   `Message::system("s".repeat(3_247))` — lines 9427, 9625, 9714, 9760, 9827,
@@ -757,7 +775,12 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   measured is **3,725** bytes; the audit's 3,247 is two growths old. The floor
   test now measures instead of spelling, and these ten are the other readers of
   the old count. The fix belongs there: build the fixture's system message from
-  the length `prompt::system_prompt` answers, or from one shared constant.
+  the length `prompt::system_prompt` answers, or from one shared constant. **✅
+  closed by `a6e4ad9` (§8.103):** the ten fixtures call `measured_prompt(&actor)`
+  — `Message::system(prompt::system_prompt(&actor.ws.root_str()))`, 3,748 bytes
+  of prompt at the probe's fixture root — and `grep -rn 3_247 crates/` answers
+  0. No expectation moved, the tightest fixture's 1920×1080 picture measuring
+  12,074 bytes against its 12,288-byte budget.
 - **H72** — ⬜ open, the last shape-read provenance, named by `10e2fc7`
   (§8.100): `app/chat.rs`'s `unrecorded` still reads two writers' provenance off
   their sentence's shape — `report`/`report_tail` (a child's `#1 done: …`, a
@@ -768,7 +791,16 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   sentence deciding its own provenance, the rule finding F3 removed. Those
   writers can take `Message::mush` too and the two shape reads retire; the
   restarted-steering line is the one case that cannot (`unrecorded`'s doc says
-  so: nothing in the file says the words were a parent's).
+  so: nothing in the file says the words were a parent's). **✅ closed by
+  `94120bb` (§8.103):** `unrecorded` is `message.mush ||
+  transcript::is_dropped_note(message)`, `report`, `FOLDED` and their docs are
+  gone, and every writer of a report or a fold line marks what it writes — the
+  actor's folds, its carried summary, the UI's mirror of it and its restore-time
+  cut-off line; `push_line` stays for a parent's steering alone. The `tool`
+  half's own residue — a `read_file`/`grep` output that quotes the line counting
+  as a read — was named by `aafcec9` and closed by `bd9c0c5` (§8.103), which
+  matches the result's `tool_call_id` against the call above it and reads the
+  name through `ToolName::parse`.
 - **H73** — ⬜ open, the product's legacies, named by `2202f7f` (§8.99): the
   `mush-cmd-*` files whose pid is not in the field the scratch sweep reads are
   skipped by name (“the product reaps its own scratch”), and the product's
@@ -776,19 +808,37 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   legacy name such as `mush-cmd-out-legacy-<pid>` has no readable pid and is in
   neither sweep's reach. Belongs in `machine.rs`'s reaper, which owns the
   prefix; a name to reap is `mush-cmd-<pid>-…`, and the legacy shapes are known.
+  **⬜ re-read at `260ff11` (§8.103):** no commit in the four waves touched
+  `machine.rs`'s reaper (`git log 9e13986..260ff11 --
+  crates/mush/src/machine.rs` is empty), so the legacies stand where they were.
 - **H74** — ⬜ open, the sweep's one blind direction, recorded by `2202f7f`
   (§8.99): a dead test's pid held by an unrelated process reads as alive, so
   that root is left where it is — the harmless direction, and the one the
   product's own reaper takes, but an entry that survives forever if the pid is
   reused each time. No cheap reading can tell a reused pid from a live suite,
-  which is why it is recorded rather than fixed.
+  which is why it is recorded rather than fixed. **⬜ re-read at `260ff11`
+  (§8.103):** no commit in the four waves touched the sweep (`git log
+  9e13986..260ff11 -- crates/mush-core/src/scratch.rs` is empty); the direction
+  stands as recorded.
 - **H75** — ⬜ open, the one entry a lone run leaves, recorded by `2202f7f`
   (§8.99): `cargo test -p mush` alone ends with one `mush-user-config-<pid>`
   config store, because a `static` holds that root for the binary's life and its
   guard cannot drop before the process ends. It is named for the dead pid a
   later run's sweep reaps (the full workspace run's second binary does it); what
   is owed is a `static` whose value can outlive the root, or a sweep at exit
-  that this workspace has no hook for.
+  that this workspace has no hook for. **⬜ re-read at `260ff11` (§8.103):** left
+  open — no commit in the four waves closed it, and `isolate_user_config` is
+  untouched by their diff of `app/mod.rs`.
+- **H76** — ⬜ open, a latent limit in the census's new gate rule, named by
+  `9009f4c` (§8.103): the classifier decides by the word `test` in the gate's
+  text, so a module gated `#[cfg(not(test))]` would read as test support and its
+  code lines would leave the prod column — a gate whose meaning is the opposite
+  of its word. No such declaration exists at `260ff11` (`grep -rn
+  "cfg(not(test))" crates/` answers 0), so the misreading is latent. The fix
+  belongs in `scripts/census.py`'s `names_test`, which could read the
+  attribute's polarity or refuse a `not(...)` wrapper; the script's own
+  docstring already says “when in doubt, a file stays in prod” — this is the one
+  doubt it does not read.
 
 `docs/refactor.md` §11 is the ledger: its older queue is closed except `R6`
 (judged and left on purpose), and the four blind duplication passes of §8.70
@@ -9366,4 +9416,345 @@ append is the only change), every pipeline under `set -o pipefail`:
 
 The record changes no line under `crates/`: every number above is a command's
 output, and the sections are the commits' own bodies re-read at this base.
+
+---
+
+## 8.103 The tail: the last shape reads retire, the fractions name their constants, the census learns test support (#143–#147)
+
+Four waves landed on master since §8.102 — `332fe21` (#143), `f15be23` (#144),
+`96ab55e` (#146) and `260ff11` (#147), the tip this pass reads at. Their
+through-line is the queue's own rows: a sentence must not decide its own
+provenance (H72), a written number must not stand where a function or a constant
+can be read (H66, H71), and a column of the census must count the code a product
+ships (H70). What follows is the commits' own bodies, re-read against the tree
+at `260ff11`; a number this pass measured says so.
+
+**The last two shape reads retire, and every report carries the mark
+(`94120bb`, merged `332fe21`; H72).** #141 gave mush's own out-of-band lines one
+mark on the shape the actor hands over (`Message::mush`) and named the two
+writers it did not reach, both in `app/chat.rs`: the `report` shape read — `#1
+done: …`, `#c2 stopped: …` — and the `FOLDED` prefix (`Context compacted`). Both
+still read provenance off the sentence's words, which is the hole finding F3
+closed for the four lines #141 took — so a restored human line word for word
+`#1 done: …`, or beginning with the fold's words, painted as mush's own voice.
+`unrecorded` is now one rule — `message.mush ||
+transcript::is_dropped_note(message)` — and `report`, `FOLDED` and their docs
+are gone. `report_tail` and `report_failed` stay, because the fold's failure
+exemption reads a block's *kind*, not its writer. Measured, on a child's pane
+and on a restored copy, a real report and a real fold beside human lookalikes of
+each sentence (the probe was deleted; the after is pinned):
+
+```
+before  child-live       ·  #1 done: created iso.txt   ·  Context compacted — …
+        child-restored   ·  #1 done: created iso.txt   ·  Context compacted — …
+        root-restored    ·  #1 done: created iso.txt   ·  Context compacted — …
+after   marked real      ·  #1 done: created iso.txt   ·  Context compacted — …
+        human lookalike, restored          you ›  #1 done: created iso.txt
+        human lookalike, unmarked mid-run  parent ›  (the pane's fallback)
+```
+
+Every writer of a report or a fold line now sets the mark: the actor's folds —
+a child's completion and a job's report, at both fold boundaries (`absorb` and
+`fold_completions`) and on the mailbox's `CommandDone` — the actor's carried
+summary (`compact_history`), the UI's mirror of it (`AgentEvent::Compact`), and
+the UI's restore-time cut-off line for a child no actor survived to report. The
+one writer left unmarked is a parent's steering, another agent's words: it stays
+on `push_line`, and §8.100's boundary holds — the one line the pane cannot place
+after a restart reads as the human's until the process is new, exactly as
+before. The wire is byte-identical
+(`Message::mush` is not a wire field; `message.rs` pins a marked line against
+`Message::user`), and the session file stores the flag, so a restored marked
+line paints as mush's for the same reason a live one does. Pinned by
+`a_report_and_a_fold_read_their_mark_and_never_their_words`.
+
+**The fixtures measure the prompt instead of spelling 3,247 bytes (`a6e4ad9`,
+H71).** Ten fixtures in `agent.rs` built the “real system prompt” as
+`Message::system("s".repeat(3_247))`, and two doc comments called the audit's
+3,247 the real prompt. It is not: the prompt `bfbf681` measured is 3,725 bytes
+at `/tmp/ws`, two growths past the audit, and several of those fixtures exist to
+put a transcript over the context budget — a test must not spell a number a
+function can return. The fixtures now call `measured_prompt(&actor)`, which is
+`Message::system(prompt::system_prompt(&actor.ws.root_str()))`: the actor's own
+root, because the prompt names the workspace it runs in and a stand-in root
+would be a size nobody's request has. Measured: the system message weighed
+3,253 bytes (6 for the role plus the spelled 3,247) and weighs 3,754 at the
+probe's fixture root (`/tmp/mush-probe-prompt-2795217`), where the prompt itself
+is 3,748 bytes. `grep -rn 3_247 crates/` answers 0 at this base. No expectation
+moved: all seven tests pass with their assertions unchanged, and the tightest
+fixture — the 1920×1080 picture that goes out at the 8k default — carries
+12,074 bytes against the 12,288-byte budget, 214 to spare at the probe's root
+(~195 at the longest fixture root), where it had 715 with the spelled prompt.
+That slack is the fixture's point: if the prompt grows past it, the test says
+the picture no longer fits an 8k window rather than the number being papered
+over. The doc arithmetic was rewritten where it spelled the prompt; the
+share-the-room test keeps the audit's historical 13,768-byte measurement and
+says the audit counted the prompt while the fixture measures it.
+
+**The reply cap's comment names the divisor (`f3fce8d`; H66's first site).**
+`http.rs`'s `live_endpoint_accepts_the_shipped_reply_cap` comment said the cap is
+“a quarter” of the window, where `REPLY_SHARE_DIVISOR` is 8 and
+`REPLY_SHARE_WORDS` spells “an eighth of the window”: the sentence was one
+number and the code another. It now reads `window / REPLY_SHARE_DIVISOR`
+(`mush_core::config` owns the number, `Config::reply_cap` spends it) — the
+constant's business, the rule `REPLY_SHARE_WORDS` already keeps for the two
+strings a human reads. No test reads the comment; the cap's value is pinned by
+`config.rs`'s own `reply_cap` tests. The same sentence in `main.rs` is `2480468`
+below, and the two together close H66.
+
+**The spawn refusal states the directory's writers, not a parent's child
+(`3c09beb`; H64's third site).** `bfbf681` (§8.98) fixed the delegation policy's
+sentence and `agent::Writers`'s doc; the refusal a spawner reads when the shared
+workspace is busy still named only the children of one parent. It now carries
+the policy's own six facts in the prompt's own words:
+
+```
+before  cannot spawn: #2 already runs in this shared workspace, and only one
+        shared child may run at a time. Pass base=<branch or commit> to give a
+        sibling its own worktree, or wait for it to finish.
+after   cannot spawn: #2 already runs in this shared workspace, where only one
+        shared child may run at a time — the directory's live writers,
+        tree-wide, not only the children your own books name: a grandchild
+        working here counts, a child whose run has ended does not, and your
+        own run is exempt. Pass base=<branch or commit> to give a sibling its
+        own worktree, or wait for it to finish.
+```
+
+The model reads this sentence at the moment it matters, and the doc above the
+guard says why the rule is stated there. No rule changed — only the sentence the
+guard says it with.
+`the_shared_workspace_rule_counts_every_live_writer_in_that_directory` gained
+the six-fact assertion, red before the fix (“the refusal owes `the directory's
+live writers, tree-wide`”), and its older assertions (`#2`, “shared workspace”)
+are kept, not loosened. H64 is closed whole: its two sentences by §8.98, this
+third site here.
+
+**§11's census anchor moves to `332fe21` (`7d08ef1`).** `docs/refactor.md`'s
+ledger still anchored to `7338d81` (86,623 lines — prod 19,092, tests 38,164,
+comments 24,395, blank 4,972), several waves old. Run at the current master, the
+census read 92,505 (prod 20,428, tests 40,741, comments 26,093, blank 5,243), so
+the anchor is now `332fe21` and its deltas over `7338d81` are prod +1,336,
+tests +2,577, comments +1,698, blank +271. The older anchors are left as they
+stood — the `38d0438` and `b8d8baa` sentences keep their own “not a number to be
+overwritten” notes — and no row was re-audited: no row is made false by a change
+in the wave.
+
+**An adopted report is read by its mark, not by a human's lookalike
+(`aafcec9`; H72's delivery half).** `absorb`'s idle `Run` asks which reports the
+incoming transcript already carries, and both sites answered with
+`text().contains(&line)`: any message holding the words counted as a read. A
+human who types `#1 done: wrote the parser` — quoting a report, asking about it
+— then marked that completion delivered, and the fold never handed it over: the
+result was silenced, not read. The read is now provenance-first, one helper for
+both:
+
+```rust
+fn reads_report(transcript: &[Message], line: &str) -> bool {
+    transcript.iter().any(|message| {
+        (message.mush && message.text() == line)
+            || (message.role == "tool" && message.text().contains(line))
+    })
+}
+```
+
+Two hands write a report into a transcript, and neither is the human's: the fold
+pushes mush's own marked line, and a `wait` hands the line over as its call's
+answer — a `tool` message. The mark, or the tool result, decides, with the text
+as the second half: the line names the id, the outcome and the summary, so
+matching it is matching the id. The mark-only reading of the previous child's
+sentence would have made the restored/`wait` road unread again —
+`adoption_reads_a_failed_or_stopped_line_as_delivered` pins that shape, where
+one `wait` result carries several lines at once, which is why the tool half asks
+`contains` and not equality — so the tool half stays. The helper's own doc names
+a narrowing the commit did not take: the `tool` half does not check that the
+result's call was a `wait`, so a file whose contents quote the line — read back
+by `read_file` or `grep` — still counted as a read.
+`a_report_is_read_by_its_mark_not_by_its_words` pins both directions; with the
+old scan it fails at “the human's words are not a read”.
+
+**A report is read from a `wait`'s result, not from a file quoting it (#146:
+`2480468`, `dfd9069`, `bd9c0c5`, merged `96ab55e`).** `bd9c0c5` closes the
+residue `aafcec9` named rather than guessed at. A report only comes home in a
+`wait` result, and the call above a result names its tool: `Message` pairs the
+result with its call by `tool_call_id`, so `answers_a_wait` matches the id and
+reads the name through `ToolName::parse` — the code's own spelling of `wait`,
+never a retyped string. Measured over the three shapes (the probe is deleted):
+
+```
+                                 before  after
+marked report (Message::mush):     true    true
+a wait result:                     true    true
+read_file result quoting the line: true   false   ← the residue
+```
+
+`a_report_is_read_from_a_wait_result_not_from_a_file_quoting_it` pins both
+directions: a `read_file` result quoting the line leaves the completion unread
+and the fold hands it over, while a `wait` result carrying the line — several
+lines at once, hence `contains` — marks it delivered and it is not handed over
+again. The honest deviation:
+`adoption_reads_a_failed_or_stopped_line_as_delivered` was built by
+`assistant_calling`, whose calls are named `edit_file`, so under the narrowing
+the fixture pinned the too-wide match while the test was read as the wait road.
+Its batch is now built by `calling(ToolName::Wait, &[…])`, a helper that names
+the tool; every assertion and the test's own doc are unchanged, and it stays
+green. `adopting_a_transcript_that_announces_a_completion_keeps_it_delivered`
+gets the same batch, which makes its “(as a `wait` result, say)” true. The two
+fraction sites the wave also names are `main.rs`'s
+`the_shipped_deepseek_session_reports_the_cap_it_sends` doc (`2480468`: the
+shipped DeepSeek window of 120,000 tokens gives 15,000, an eighth, not “a
+quarter”) and `agent.rs`'s `a_full_history_folds_once_and_says_the_window_asked`
+doc (`dfd9069`: the fixture is past the trigger — `compaction_trigger(budget) +
+1_000` — so it is past `mush_core::transcript::compaction_trigger`, nine tenths,
+not “three quarters”). Neither file has a second occurrence of the fraction.
+
+**The nearly-full fold's doc names the trigger, and the census learns what test
+support is (#147: `37f04cc`, `9009f4c`, merged `260ff11`).** `37f04cc` is the
+same sentence one file over: `Compacting::NearlyFull`'s doc said the history is
+“three quarters of the window” and now names
+[`mush_core::transcript::compaction_trigger`], keeping the reason it states —
+nobody asked, and the history is why the fold is running. A grep over
+`app/tree.rs` for the fraction shape finds this one occurrence and two phrases
+that are not: the cursor's “a third” *row* (D2) and a test's “a minute and a
+half ago” (the 90 s its own fixture sets). No test pins the doc's words; the
+phase's own is `context nearly full — compacting…`, unchanged. `9009f4c` closes
+H70, the census's blind shape: a module *file* is test support when the gate
+that brings it in — `#[cfg(<text>)]` immediately above `mod <name>;` in the
+parent, or the file's own `#![cfg(<text>)]` — names the word `test` (`test`, and
+the feature spelled `test-support`). `crates/mush-core/src/scratch.rs`, declared
+`#[cfg(any(test, feature = "test-support"))]`, moved its whole file's code from
+prod to tests:
+
+```
+file                              total  blank   cmt  tests   prod
+crates/mush-core/src/scratch.rs     485     42   164    133    146   before
+crates/mush-core/src/scratch.rs     485     42   164    279      0   after
+TOTAL                             92747   5252 26162  40893  20440   before
+TOTAL                             92747   5252 26162  41039  20294   after
+```
+
+The in-file `#[cfg(test)] mod tests` stays inside the whole-file gate, so the
+file's tests column is 133 + 146 = 279. A `diff` of the two per-file tables is
+that row and the two totals lines: no other file changes column. The
+classification resolves the declaration's name through the module layout —
+`lib.rs`/`main.rs`/`mod.rs` and a crate root under `bin/`, `tests/`, `examples/`
+or `benches/` look beside themselves, any other module file looks in the
+directory named after it — and anything unresolved stays in prod: “when in
+doubt, a file stays in prod”. A probe (built under `/tmp` and deleted) checked
+the edges: a `feature = "prod-only"` gate stays prod; a name resolving to both
+`<name>.rs` and `<name>/mod.rs` leaves both in prod; a declaration naming no
+file changes nothing. `scratch.rs` is the only file in the tree classified this
+way, and the summary's span line is unchanged at 53,425 (the `#[cfg(test)] mod`
+blocks' physical span, kept for comparison — a test-support file's whole length
+does not join it). The reading's one latent hole is H76 below: the word scan
+would read `#[cfg(not(test))]` as naming test, and no such declaration exists in
+the tree today.
+
+**The rows this pass moves.** H66 (`f3fce8d` + `2480468`), H64's third site
+(`3c09beb`), H70 (`9009f4c`), H71 (`a6e4ad9`) and H72 (`94120bb`, with the
+delivery half's residue by `bd9c0c5`) are closed on their own rows, each with
+the commit and the sentence that closed it. H73–H75 were re-read and left open:
+none of the four waves touched the `mush-cmd-*` legacy names, the sweep's
+pid-reuse direction, or the one config store a lone run leaves — the first two
+files appear in no commit of `9e13986..260ff11`, and the third's
+`isolate_user_config` is untouched by `app/mod.rs`'s diff — and the limits stand
+as §8.99 recorded them. One row is new: **H76**, the census's `not(test)`
+reading, latent today.
+
+**The census and this pass's gates.** `python3 scripts/census.py` at `260ff11`
+prints **TOTAL 92,747 · blank 5,252 · comment 26,162 · tests 41,039 · prod
+20,294**, span 53,425 (this pass's reading, on the tree this section is written
+in). Over §11's anchor `332fe21` (92,505, that commit's reading) that is +242:
+blank +9, comment +69, tests +298, prod −134 — and 146 of the prod fall is
+`9009f4c`'s classifier moving `scratch.rs`, read before and after on one tree,
+so #144's and #146's production lines are 12 net. Over §8.52's addendum at
+`e73ed85` (92,391) it is +356: blank +11, comment +108, tests +380, prod −143 —
+3 production lines net across the whole span, #143's own prod delta being −9.
+This is what a tail of sentence-and-classifier waves looks like on the census.
+
+On a clean tree (`docs/findings.md`'s append is the only change), every
+pipeline under `set -o pipefail`:
+
+- `cargo fmt --all -- --check` — pass.
+- `cargo clippy --all-targets -- -D warnings` — pass.
+- `cargo build --workspace` — pass.
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` —
+  pass, exit 0.
+- `cargo test --workspace` — red once (891 passed, 1 failed, 4 ignored) on
+  `lock::tests::a_refusal_does_not_name_a_dead_holder`: its last assertion, “a
+  dead pid in the file cannot refuse a workspace”, fired under the loaded run
+  while the test alone passes in 0.00 s — the H58 residual's shape, a lock road
+  that fails before the flock mis-blamed by a bool assertion, carried as that
+  gate carried it and not chased. `cargo test --workspace --no-fail-fast` —
+  892 passed + 282 passed, 4 ignored, 0 failed, exit 0.
+- `python3 scripts/census.py` — the totals above.
+- The three endpoint-free pty scenarios, one at a time, each in its own fixture
+  directory under `/tmp` — `python3 scripts/smoke.py target/debug/mush
+  /tmp/mush-148-resize --resize`, `… --cancel`, `… --sigterm` — pass: the
+  resize redrew 4,803 bytes with no keypress, the cancel landed in 0.93 s over
+  exactly two chats, and the sigterm's job process group was gone.
+
+This pass changes no line under `crates/` or `scripts/`: every number above is
+a command's output or a commit's own body, and the sections are the commits'
+own bodies re-read at this base.
+
+---
+
+## 8.104 M5 spawn mode, as the reconnaissance found it (proposed, not decided)
+
+The roadmap's next milestone is one sentence: *“M5 spawn mode: `mush` launches a
+configured agent in a pty pane with the attach socket's path and the workspace
+root injected into its environment, so 'works with any agent' covers binaries
+that know nothing about mush”* (`docs/mush.md` §9). A read-only reconnaissance
+child (`#145`, report only, no commits) read the tree for the milestone's shape
+and its costs. Nothing here is decided: the record enters the verdicts as the
+proposal they are, and the decisions the human holds are listed last.
+
+**The guest is a pane beside the model, and nothing in the tree can allocate
+it.** The recon's verdicts, each a reason rather than a preference:
+
+- The guest cannot be a **tree row**: a node is a `Spawn` value, its phases mean
+  model work, and a restore would restart arbitrary binaries on open.
+- It cannot be a **job**: a job's output is a file read with a budget
+  (`jobs::CMD_OUTPUT_LIMIT`, the capped read), which is the wrong shape for a
+  live terminal.
+- So it is a pane beside the model, and the pty is the milestone's real cost:
+  nothing in the tree can allocate one today — `libc` reaches the tree only
+  transitively, `nix`/`portable-pty`/`vt100` are absent from the lock, and the
+  workspace's lints say `unsafe_code = "forbid"`. `rustix` is already a direct
+  dependency of `mush` (`fs`, `process`) and is the shortest road if its `pty`
+  feature carries a safe `openpty`; that is one of the human's decisions below,
+  and one of the recon's own uncertainties.
+- `Screen` has exactly two shapes (`Floor`, `Panes`) and every pane is lines, so
+  a terminal pane is a new `Screen` value, a painter that fills the frame's
+  buffer rather than composing lines, and a new modal fact in `key()`.
+- `Ctrl-Q`'s two-step warning counts tree agents and registry jobs today
+  (`App::what_a_quit_kills`); a pty child must be counted, or the warning the
+  human makes the decision by would not name it.
+- The pane's `Rect` must become the guest's winsize **before its first read** —
+  a guest that reads 24×80 before the first paint cannot be resized into
+  correctness afterwards.
+
+**The recommended first slice,** as the recon drew it: `--agent CMD` /
+`MUSH_AGENT`, one guest; a `pty.rs` seam with a fake, mirroring `machine.rs`'s
+`Machine` + `Scripted` shape; the guest's bytes coalesced into capped messages;
+a terminal pane as a *view* — zen's sibling, so §4.5's R3 size tiers stay true
+and no third panes tier is invented; keys forwarded with `Ctrl-Q` still mush's;
+winsize set before the first read and on every change; the guest's process group
+killed on drop; the guest counted in the quit warning; and one real-pty scenario
+in `scripts/smoke.py` (`stty size` inside the guest, an outer resize reaching
+it, the pid gone after quit).
+
+**The decisions the human holds.** The **dependency** — `portable-pty`; `nix`;
+`rustix`'s `pty` feature; a documented `unsafe` exception; or no controlling
+terminal at all. The **terminal emulator** — hand-rolled, a small crate, or a
+large one. How an agent is **configured** — flag, env, home config; a shell
+string or argv. **Where the pane lives** — a view, the chat column, or a third
+tier against R3 — and how keys reach it: a new `Focus` variant or a modal fact
+in `key()`. The **lifecycle corners**: one guest or one per agent; always-on or
+on demand; what an exit paints; whether it survives `Ctrl-N`.
+
+**The recon's uncertainties, named as such:** whether `rustix` exposes `openpty`
+rather than the `openpt` family; whether current `nix` deprecates `forkpty`;
+`portable-pty`'s controlling-terminal behaviour on Linux; `Frame::buffer_mut`'s
+availability in this ratatui (0.29); and whether a pty child with no controlling
+terminal still receives an ISIG-generated SIGINT.
 
