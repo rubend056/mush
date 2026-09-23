@@ -1644,17 +1644,16 @@ pub fn revive(
     // The system prompt is regenerated, and an agent with no transcript but a
     // known brief is seeded with the task — so a worktree found on disk resumes
     // knowing what it was for, even though it has no memory of the run.
-    let mut transcript = vec![Message::system(prompt::subagent_prompt(
-        &ws_root_str,
-        depth,
-        isolated.is_some(),
-        depth < MAX_DEPTH,
-    ))];
-    if messages.is_empty() && !brief.is_empty() {
-        transcript.push(Message::user(brief));
-    } else {
-        transcript.extend(adopted(messages));
-    }
+    let transcript = revived_transcript(
+        Message::system(prompt::subagent_prompt(
+            &ws_root_str,
+            depth,
+            isolated.is_some(),
+            depth < MAX_DEPTH,
+        )),
+        &brief,
+        messages,
+    );
     // It comes back at rest, not running: a restart is not a request. Starting
     // a run here replayed every restored agent's task against the endpoint the
     // moment mush opened — thirteen agents, thirteen requests nobody asked for,
@@ -1664,6 +1663,31 @@ pub fn revive(
     // resumes, and the human's next message is what starts it.
     start(actor, transcript, false);
     cmd_tx
+}
+
+/// The transcript a revived agent starts from: a freshly built system prompt,
+/// then the copy it had, repaired — with the dropped-turns note back in the
+/// place the *request* gives it, after the system prompt and the opening task.
+///
+/// The copy arrives in the UI's shape: the same conversation without a system
+/// prompt, and with the note where the UI appends what it is told — the end.
+/// [`place_dropped_note`] (through [`adopted`]) puts a carried note back at
+/// index 2 *of the list it is given*, and index 2 is the note's place only when
+/// the prompt heads that list. For the root it always does, because the UI's
+/// own copy of the root's conversation carries the prompt ([`AgentMsg::Run`]'s
+/// hand-over); a child's prompt is the one message a revival cannot bring back
+/// (it names a workspace that may have moved), so a note in a child's copy
+/// used to be placed one line into the conversation instead of after its brief
+/// (finding A18). One door for both roads: the whole request-shaped list —
+/// prompt included — goes through [`adopted`].
+fn revived_transcript(prompt: Message, brief: &str, messages: Vec<Message>) -> Vec<Message> {
+    if messages.is_empty() && !brief.is_empty() {
+        return vec![prompt, Message::user(brief)];
+    }
+    let mut carried = Vec::with_capacity(messages.len() + 1);
+    carried.push(prompt);
+    carried.extend(messages);
+    adopted(carried)
 }
 
 /// A mailbox nobody is listening on: what a child is given when its caller
@@ -9163,6 +9187,51 @@ mod tests {
             "the actor's own list too"
         );
         let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The dropped-turns note's place is a fact about the *request*: after the
+    /// system prompt and the opening task. A child's history is rebuilt
+    /// without its prompt — the prompt names a workspace that may have moved —
+    /// while the UI's copy appends the note where it appends every line it is
+    /// told, at the end. Putting the note back at index 2 of *that* copy landed
+    /// it one line into the conversation; the root's copy carries its prompt,
+    /// which is why the placement was right only there (finding A18). Probed
+    /// before the fix: the revived child's list opened
+    /// `[system, brief, reading, note, …]`; after, the note is where the model
+    /// expects a statement about the transcript's front.
+    #[test]
+    fn a_revived_childs_note_comes_back_after_its_brief() {
+        let note = Message::user(mush_core::transcript::DROPPED_TURNS_NOTE);
+        let carried = vec![
+            Message::user("the brief"),
+            Message::assistant("reading"),
+            Message::user("more"),
+            Message::assistant("done"),
+            note.clone(),
+            Message::user("carry on"),
+        ];
+        let transcript = revived_transcript(Message::system("the child's prompt"), "", carried);
+        assert_eq!(transcript[0].role, "system", "the prompt heads the request");
+        assert_eq!(transcript[1].text(), "the brief", "then the opening task");
+        assert_eq!(
+            transcript[2].text(),
+            mush_core::transcript::DROPPED_TURNS_NOTE,
+            "and the note where the dropped turns were, as on the root's road"
+        );
+        assert_eq!(
+            transcript[3].text(),
+            "reading",
+            "the turns after it keep their order"
+        );
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|message| mush_core::transcript::is_dropped_note(message))
+                .count(),
+            1,
+            "a carried note is moved, not stacked"
+        );
+        assert_eq!(transcript.len(), 7, "nothing else was added or lost");
     }
 
     /// The window's last resort before a refusal: the newest turn's own tool
