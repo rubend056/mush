@@ -996,4 +996,170 @@ pub(crate) mod tests {
             "{file}'s `{id}` block is stale — regenerate it with:\n  MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush {check}"
         );
     }
+
+    /// One row of the mark sweep: `agent_line`'s own fields, with every mark
+    /// the row can wear set by the flag that produces it.
+    #[allow(clippy::too_many_arguments)]
+    fn mark_row(
+        glyph: &'static str,
+        title: &str,
+        place: &str,
+        activity: &str,
+        focused: bool,
+        result_unread: bool,
+        unread_children: usize,
+        parent_gone: bool,
+    ) -> AgentRow {
+        AgentRow {
+            id: AgentId(0),
+            depth: 0,
+            parent_gone,
+            glyph,
+            focused,
+            result_unread,
+            unread_children,
+            title: title.to_string(),
+            place: place.to_string(),
+            activity: activity.to_string(),
+        }
+    }
+
+    /// Every phase glyph and every mark `agent_line` adds, as rows. The glyphs
+    /// are inputs here — `phase_glyph` is private to `app::screen`, and that
+    /// module's own sweep pins each phase to its glyph — while every mark this
+    /// file paints is read back through the function that paints it, so a mark
+    /// added, moved or removed changes this block and fails its check.
+    fn marks_rows() -> Vec<AgentRow> {
+        vec![
+            mark_row("·", "idle", "", "", false, false, 0, false),
+            mark_row("◐", "thinking", "", "thinking 3s", false, false, 0, false),
+            mark_row(
+                "◐",
+                "working",
+                "",
+                "edit_file src/lib.rs 12s",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "≡",
+                "compacting",
+                "",
+                "compacting 2s",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "⧗",
+                "waiting",
+                "",
+                "waiting on results 3s",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "⊘",
+                "cancelling",
+                "",
+                "cancelling 0s",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "⊘",
+                "stopped",
+                "",
+                "stopped · re-send to resume",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "⚠",
+                "cut off",
+                "",
+                "cut off · nothing committed",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row("✓", "done", "", "wrote README.md", false, false, 0, false),
+            mark_row(
+                "✗",
+                "failed",
+                "",
+                "no route to host",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "◐",
+                "the focused row",
+                "",
+                "thinking 3s",
+                true,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "◐",
+                "lexer",
+                "mush/1 +12−3 ⚙1",
+                "edit_file src/lex.rs 3s",
+                false,
+                false,
+                0,
+                false,
+            ),
+            mark_row(
+                "✓",
+                "result unread",
+                "",
+                "wrote README.md",
+                false,
+                true,
+                0,
+                false,
+            ),
+            mark_row("·", "two reads owed", "", "", false, false, 2, false),
+            mark_row(
+                "✓",
+                "parent gone",
+                "",
+                "wrote src/lex.rs",
+                false,
+                false,
+                0,
+                true,
+            ),
+        ]
+    }
+
+    /// The rows a tree draws, painted by the row painter itself: `ui`'s side of
+    /// the mark set (`agent_line`'s `▶`, `⚮` and `✉`/`✉N`) and the phase
+    /// glyph column, in the doc's `marks` block.
+    #[test]
+    fn the_marks_block_matches_the_code() {
+        let rows = marks_rows();
+        let painted: Vec<String> = rows.iter().map(|row| agent_line(row, 56)).collect();
+        doc_block(
+            "docs/mush.md",
+            "marks",
+            "ui::tests::the_marks_block_matches_the_code",
+            &format!("```\n{}\n```", painted.join("\n")),
+        );
+    }
 }
