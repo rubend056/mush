@@ -511,10 +511,14 @@ pub enum RunStyle {
 ///   under it can be explained no other way.
 ///
 ///   The columns' widths are a fact about the whole block, so the walk buffers
-///   a table and paints it at the pane's own width: **the columns fill the
-///   pane exactly** — the cells' widths plus the ` │ ` between them sum to
-///   `width` — and a cell wraps inside its own column with the module's own
-///   wrap, so no row of a table is wider than the pane it is read on. No
+///   a table and paints it at the pane's own width: **a column is sized to its
+///   content** — no wider than its widest cell (the header counts as a row),
+///   no narrower than its longest unbroken word where the pane's room can
+///   afford it, and the room no column can use goes to the columns that can —
+///   and **the columns fill the pane exactly**: the cells' widths plus the
+///   ` │ ` between them sum to `width`, and a cell wraps inside its own column
+///   with the module's own wrap, so no row of a table is wider than the pane it
+///   is read on. No
 ///   cell's text is dropped or truncated: a row with fewer cells than the
 ///   header pads with empty ones, a row with more folds its extra cells into
 ///   the last column, joined by the `|` the source separated them with —
@@ -1204,6 +1208,37 @@ fn runs_width(runs: &[Run]) -> usize {
         .sum()
 }
 
+/// The width of a cell's longest stretch that [`wrap_runs`] cannot break: a
+/// word, a path, a token — the narrowest column that holds the cell without
+/// splitting one of them.
+///
+/// The wrapper breaks at a space and nowhere else, so a unit is what is left
+/// between spaces: a tab is four columns of layout and a no-break space is a
+/// character, and the wrapper treats neither as a break, so both keep the units
+/// around them one. A run boundary is not a break either — `**bold**word` is
+/// one word — which is why the units are walked over the cell's characters
+/// rather than per run. The arithmetic is [`runs_width`]'s, one unit at a time.
+fn longest_unit(runs: &[Run]) -> usize {
+    let mut longest = 0;
+    let mut unit = 0;
+    for run in runs {
+        for ch in run.text.chars() {
+            let width = if ch == '\t' {
+                4
+            } else {
+                UnicodeWidthChar::width(ch).unwrap_or(1).max(1)
+            };
+            if ch == ' ' {
+                unit = 0;
+            } else {
+                unit += width;
+                longest = longest.max(unit);
+            }
+        }
+    }
+    longest
+}
+
 /// One column's alignment, as its delimiter row spells it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Align {
@@ -1331,6 +1366,81 @@ fn fit_cells(mut cells: Vec<String>, columns: usize) -> Vec<String> {
     cells
 }
 
+/// The room each of a table's painted columns gets: the content rule.
+///
+/// `want` is each column's widest cell and `need` its longest unbroken unit
+/// ([`longest_unit`]), both in the columns [`wrap_runs`] paints. The room is
+/// spent so that:
+///
+/// - a column's floor is `need`: the room goes first to the words that cannot
+///   be broken, so every column gets what its longest word holds whenever the
+///   pane's width can afford all of them. A pane that cannot afford them all
+///   spends what it has as evenly as it can, and the words that do not fit
+///   break — [`wrap_runs`]' own road, which drops nothing. Every column keeps
+///   at least one column of content either way: the fold rule that chose the
+///   painted columns leaves the room that many columns at least, and this
+///   arithmetic starts each column there;
+/// - a column's ceiling is `want`: the room is shared evenly among the columns
+///   still below their widest cell, each stopping there, so no column grows
+///   past its content while another column whose words need the room is still
+///   short;
+/// - the room left when every column already holds its widest cell can be used
+///   by none of them: preferring one column's blanks over another's would be
+///   the even share with a thumb on the scale, so the shares stay even, and
+///   the odd columns the division leaves — fewer than the columns there are —
+///   go to the widest wants, ties to the leftmost, where the table's own
+///   weight sits. So the widths sum to exactly the room, and the pane is
+///   filled by the cells rather than by one column's blanks.
+fn column_widths(want: &[usize], need: &[usize], room: usize) -> Vec<usize> {
+    let mut widths = vec![1; want.len()];
+    let mut left = room - want.len();
+    water_fill(&mut widths, &mut left, need);
+    water_fill(&mut widths, &mut left, want);
+    if left > 0 {
+        let share = left / widths.len();
+        let mut order: Vec<usize> = (0..widths.len()).collect();
+        order.sort_by_key(|column| (std::cmp::Reverse(want[*column]), *column));
+        for (at, &column) in order.iter().enumerate() {
+            widths[column] += share + usize::from(at < left % widths.len());
+        }
+    }
+    debug_assert_eq!(
+        widths.iter().sum::<usize>(),
+        room,
+        "a table's columns fill the pane exactly"
+    );
+    widths
+}
+
+/// Hands `left` out to the columns under `caps`, a share at a time: every
+/// round gives the columns still under their cap the same share of what is
+/// left, and the columns whose cap is nearer than that share stop there — so
+/// the room goes to the columns that can still use it, and no column passes its
+/// cap while another is short of its own. A round that leaves less than one
+/// column per open column leaves the rest where it is, for the rule after this
+/// one, which is where the odd columns go.
+fn water_fill(widths: &mut [usize], left: &mut usize, caps: &[usize]) {
+    loop {
+        let open: Vec<usize> = (0..widths.len())
+            .filter(|column| widths[*column] < caps[*column])
+            .collect();
+        let share = *left / open.len().max(1);
+        if open.is_empty() || share == 0 {
+            return;
+        }
+        let mut capped = false;
+        for &column in &open {
+            let take = (caps[column] - widths[column]).min(share);
+            widths[column] += take;
+            *left -= take;
+            capped |= take < share;
+        }
+        if !capped {
+            return;
+        }
+    }
+}
+
 /// One table's block: the painted rows and the row count of every source line
 /// in it.
 ///
@@ -1339,13 +1449,15 @@ fn fit_cells(mut cells: Vec<String>, columns: usize) -> Vec<String> {
 /// delimiter row says how they lean, and a delimiter that names fewer columns
 /// leaves the rest left-aligned, as a bare `---` does.
 ///
-/// Every row of the table is one of these, painted to the pane: the cells share
-/// the width fairly, each cell wraps inside its own column with the module's
-/// own wrap ([`wrap_runs`]) and is padded to the column's width with the spaces
-/// its alignment asks for, and the `│` between two columns is layout, painted
-/// plain. A cell that wrapped gets one physical row per row of its own text —
-/// the row is as tall as its tallest cell — so nothing a cell holds is dropped
-/// and no row outgrows the width.
+/// Every row of the table is one of these, painted to the pane: a column is
+/// sized to its content ([`column_widths`]) so a short column stops at what it
+/// holds while the width its words need goes to the columns that need it, each
+/// cell wraps inside its own column with the module's own wrap ([`wrap_runs`])
+/// and is padded to the column's width with the spaces its alignment asks for,
+/// and the `│` between two columns is layout, painted plain. A cell that
+/// wrapped gets one physical row per row of its own text — the row is as tall
+/// as its tallest cell — so nothing a cell holds is dropped and no row
+/// outgrows the width.
 fn table(source: &[String], width: usize) -> (Vec<Vec<Run>>, Vec<usize>) {
     let header = cells(&source[0]);
     let columns = header.len().max(1);
@@ -1357,17 +1469,43 @@ fn table(source: &[String], width: usize) -> (Vec<Vec<Run>>, Vec<usize>) {
     // cells take, for the same reason.
     let painted = columns.min(width.div_ceil(4)).max(1);
     align.truncate(painted);
-    let room = width - 3 * (painted - 1);
-    let (base, extra) = (room / painted, room % painted);
-    let widths: Vec<usize> = (0..painted)
-        .map(|column| base + usize::from(column < extra))
-        .collect();
-
-    let row = |cells: Vec<String>| -> Vec<Vec<Run>> {
-        let columns: Vec<Vec<Run>> = fit_cells(cells, painted)
+    // Every painted row's cells, folded to the columns the pane paints and read
+    // as inline runs once: a width is measured on the runs the row will paint —
+    // the header is a row like any other — and the same runs are what is
+    // painted, so a cell is parsed exactly once.
+    let read = |line: &String| -> Vec<Vec<Run>> {
+        fit_cells(cells(line), painted)
             .iter()
             .map(|cell| inline(cell))
-            .collect();
+            .collect()
+    };
+    let mut block: Vec<Vec<Vec<Run>>> = Vec::with_capacity(source.len() - 1);
+    block.push(read(&source[0]));
+    block.extend(source[2..].iter().map(read));
+    // What each column holds and what it cannot lose: the widest cell in it, and
+    // the longest stretch of a cell the wrapper cannot break.
+    let want: Vec<usize> = (0..painted)
+        .map(|column| {
+            block
+                .iter()
+                .map(|row| runs_width(&row[column]))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let need: Vec<usize> = (0..painted)
+        .map(|column| {
+            block
+                .iter()
+                .map(|row| longest_unit(&row[column]))
+                .max()
+                .unwrap_or(0)
+        })
+        .collect();
+    let room = width - 3 * (painted - 1);
+    let widths = column_widths(&want, &need, room);
+
+    let paint = |columns: &[Vec<Run>]| -> Vec<Vec<Run>> {
         let wrapped: Vec<Vec<Vec<Run>>> = columns
             .iter()
             .zip(&widths)
@@ -1412,7 +1550,7 @@ fn table(source: &[String], width: usize) -> (Vec<Vec<Run>>, Vec<usize>) {
 
     let mut rows = Vec::new();
     let mut counts = Vec::with_capacity(source.len());
-    let header_rows = row(header);
+    let header_rows = paint(&block[0]);
     // The separator is the header's own underline: it is painted under the
     // header's rows and counted with the header's source line, so the delimiter
     // line paints no row of its own — the map is still one entry per source
@@ -1431,8 +1569,8 @@ fn table(source: &[String], width: usize) -> (Vec<Vec<Run>>, Vec<usize>) {
         style: RunStyle::Rule,
     }]);
     counts.push(0);
-    for source in &source[2..] {
-        let painted = row(cells(source));
+    for row in &block[1..] {
+        let painted = paint(row);
         counts.push(painted.len());
         rows.extend(painted);
     }
@@ -2091,6 +2229,43 @@ mod tests {
         );
     }
 
+    /// The column widths a painted table's separator row spells: each part is
+    /// one column's width plus the one dash `─┼─` carries on each side (the
+    /// first and last parts carry one), so the arithmetic reads the widths back
+    /// off the paint instead of trusting a second copy of the rule.
+    fn table_widths(painted: &[String]) -> Vec<usize> {
+        let separator = painted
+            .iter()
+            .find(|row| row.contains('─'))
+            .expect("a table paints a separator");
+        if !separator.contains('┼') {
+            return vec![separator.chars().count()];
+        }
+        let parts: Vec<usize> = separator
+            .split('┼')
+            .map(|part| part.chars().count())
+            .collect();
+        let last = parts.len() - 1;
+        parts
+            .iter()
+            .enumerate()
+            .map(|(at, part)| part - if at == 0 || at == last { 1 } else { 2 })
+            .collect()
+    }
+
+    /// The characters one column paints, in order, read back off the painted
+    /// rows: each row's part for that column with its padding trimmed. This is
+    /// how a test proves a cell was not dropped for fitting — the text the
+    /// column holds has to come back whole, even where a word was split.
+    fn column_text(painted: &[String], column: usize) -> String {
+        painted
+            .iter()
+            .filter(|row| !row.contains('─'))
+            .map(|row| row.split(" │ ").nth(column).unwrap_or("").trim_end())
+            .collect::<Vec<_>>()
+            .join("")
+    }
+
     /// Every string of length 1..=`max_len` over `alphabet`, in order. The
     /// equality test's fuzz is generated rather than typed out, so its
     /// alphabet is readable and its reach is exact (finding B14).
@@ -2610,12 +2785,13 @@ mod tests {
     /// the whole block. The delimiter row names the alignment, the header says
     /// how many columns there are, and the `│` between two columns is layout.
     ///
-    /// A table is painted at the pane's own width: the cells share it fairly and
-    /// a cell wraps inside its own column, so a table is exactly as wide as the
-    /// pane and never wider. The delimiter row paints no row of its own — the
-    /// `─┼─` line is the header's underline and counts with the header — and
-    /// the map is still one entry per source line whose total is the number of
-    /// painted rows (finding D14).
+    /// A table is painted at the pane's own width: a column is sized to its
+    /// content ([`column_widths`]' rule) — its widest cell, floored by its
+    /// longest unbroken word — and the room every column can use is spent, so a
+    /// table is exactly as wide as the pane and never wider. The delimiter row
+    /// paints no row of its own — the `─┼─` line is the header's underline and
+    /// counts with the header — and the map is still one entry per source line
+    /// whose total is the number of painted rows (finding D14).
     #[test]
     fn a_table_is_painted_at_the_panes_own_width() {
         let text = "| name | age |\n| :--- | ---: |\n| ana | 3 |\n| bob | 41 |";
@@ -2662,9 +2838,9 @@ mod tests {
     fn a_tables_alignment_is_the_delimiter_rows() {
         let text = "| left | center | right |\n| :--- | :----: | ----: |\n| a | b | c |";
         let painted = rows(text, 39);
-        assert_eq!(painted[0], "left        │   center    │       right");
-        assert_eq!(painted[1], "────────────┼─────────────┼────────────");
-        assert_eq!(painted[2], "a           │      b      │           c");
+        assert_eq!(painted[0], "left       │    center    │       right");
+        assert_eq!(painted[1], "───────────┼──────────────┼────────────");
+        assert_eq!(painted[2], "a          │      b       │           c");
         // A delimiter row without a colon is left-aligned, and a column the
         // delimiter row does not name is left-aligned too.
         let text = "| a | b |\n| --- | --- |\n| x | y |";
@@ -2680,22 +2856,21 @@ mod tests {
 
     /// A cell wraps inside its own column, and the row is as tall as its
     /// tallest cell: the cells beside a wrapped one are padded with blanks, and
-    /// a body row that wrapped into six paints six rows in the map.
+    /// a header row whose long cell wrapped into two paints two rows in the
+    /// map.
     #[test]
     fn a_wrapped_cell_stays_inside_its_column() {
         let text = "| a | a cell that must wrap |\n| --- | --- |\n| b | it does |";
         assert_eq!(
             rows(text, 20),
             vec![
-                "a         │ a cell  ",
-                "          │ that    ",
-                "          │ must    ",
-                "          │ wrap    ",
-                "──────────┼─────────",
-                "b         │ it does ",
+                "a │ a cell that     ",
+                "  │ must wrap       ",
+                "──┼─────────────────",
+                "b │ it does         ",
             ]
         );
-        assert_eq!(markdown_row_counts(text, 20), vec![5, 0, 1]);
+        assert_eq!(markdown_row_counts(text, 20), vec![3, 0, 1]);
     }
 
     /// A `|` is a cell boundary only where the text says so: inside a code span
@@ -2708,9 +2883,9 @@ mod tests {
         assert_eq!(
             rows(text, 21),
             vec![
-                "a|b       │ c        ",
-                "──────────┼──────────",
-                "d | e     │ f        ",
+                "a|b         │ c      ",
+                "────────────┼────────",
+                "d | e       │ f      ",
             ]
         );
         assert_eq!(
@@ -2721,7 +2896,7 @@ mod tests {
                     style: RunStyle::Code,
                 },
                 Run {
-                    text: "      ".to_string(),
+                    text: "        ".to_string(),
                     style: RunStyle::Plain,
                 },
                 Run {
@@ -2733,7 +2908,7 @@ mod tests {
                     style: RunStyle::Plain,
                 },
                 Run {
-                    text: "        ".to_string(),
+                    text: "      ".to_string(),
                     style: RunStyle::Plain,
                 },
             ]
@@ -2752,10 +2927,10 @@ mod tests {
         assert_eq!(
             rows(text, 21),
             vec![
-                "a         │ b        ",
-                "──────────┼──────────",
-                "only      │          ",
-                "x         │ y | z    ",
+                "a        │ b         ",
+                "─────────┼───────────",
+                "only     │           ",
+                "x        │ y | z     ",
             ]
         );
     }
@@ -2839,6 +3014,160 @@ mod tests {
             "a", "b", "c", "d", "e", "f", "g", "h", "1", "2", "3", "4", "5", "6", "7", "8",
         ] {
             assert!(flat.contains(cell), "{cell:?} is gone: {flat:?}");
+        }
+    }
+
+    /// A column is sized to its content: the room goes to the columns whose
+    /// words need it, and a short column stops at the widest thing it holds.
+    /// The table this was read off — `lane | agent | report | hunting for`,
+    /// with a token in one column and a path in another — paints its four
+    /// columns as `[4, 5, 28, 80]` at 126 pane columns: every short column
+    /// exactly its own widest cell (`lane`; the header `agent`, one wider than
+    /// `#156`; the path), the path's column wide enough that the path is never
+    /// broken mid-word, and the sentence — which needs more than the pane can
+    /// give it — all of the rest.
+    #[test]
+    fn a_tables_columns_are_sized_by_their_content() {
+        let text = "| lane | agent | report | hunting for |\n| --- | --- | --- | --- |\n| 3 | #156 | docs/audits/runtime-risks.md | whether the table's cells share the pane's width fairly at every width the pane can have |";
+        // The pane the table was read in: `agent` holds its header and `#156`
+        // instead of thirty columns of blank, and the path is whole.
+        let painted = rows(text, 126);
+        assert_eq!(
+            painted,
+            vec![
+                "lane │ agent │ report                       │ hunting for                                                                     ",
+                "─────┼───────┼──────────────────────────────┼─────────────────────────────────────────────────────────────────────────────────",
+                "3    │ #156  │ docs/audits/runtime-risks.md │ whether the table's cells share the pane's width fairly at every width the pane ",
+                "     │       │                              │ can have                                                                        ",
+            ]
+        );
+        // The room, exactly: 4 + 5 + 28 + 80 and the three ` │ ` separators.
+        assert_eq!(table_widths(&painted), vec![4, 5, 28, 80]);
+        // Narrower panes spend the room on the words that cannot break first,
+        // and the sentence takes what is left: the path keeps its 28 columns.
+        for width in [115usize, 60] {
+            let painted = rows(text, width);
+            assert_eq!(
+                table_widths(&painted)[..3],
+                [4, 5, 28][..],
+                "the short columns at {width}"
+            );
+            assert!(
+                painted
+                    .iter()
+                    .any(|row| row.contains("docs/audits/runtime-risks.md")),
+                "the path is broken mid-word at {width}: {painted:?}"
+            );
+            assert_eq!(
+                table_widths(&painted).iter().sum::<usize>() + 3 * 3,
+                width,
+                "the room at {width}"
+            );
+            for row in markdown_rows(text, width) {
+                assert_row_fits(&row, width, "the report's table");
+            }
+        }
+        // Where the pane cannot afford the path its 28 columns the room is
+        // shared as far as it goes and the path breaks — at 40 the pane gives
+        // it 15 — but nothing is dropped: the column's text comes back whole.
+        let painted = rows(text, 40);
+        assert_eq!(table_widths(&painted), vec![4, 5, 15, 7]);
+        assert_eq!(
+            column_text(&painted, 2),
+            "reportdocs/audits/runtime-risks.md"
+        );
+    }
+
+    /// The water-filling shape: a column never grows past its widest cell while
+    /// another column is still short of its own — the room the short columns
+    /// cannot use is the long column's before a single column is spent on
+    /// blanks, which is what sizing a table's columns to their content means.
+    /// A pane wider than the table itself is the one place a column passes its
+    /// own widest cell, and there every column already holds its widest cell
+    /// (the rest is shared evenly, its odd column going to the widest content).
+    #[test]
+    fn a_table_column_is_not_wider_than_its_content_while_another_is_short() {
+        let text = "| a | b | c | d |\n| --- | --- | --- | --- |\n| 12345 | 123 | 1234567 | a much longer cell than any of them |";
+        // Each column holds one word a row, the header included, so its widest
+        // cell is the longest thing in that column.
+        let want = [5, 3, 7, 35];
+        for width in 4 * want.len()..=120 {
+            let painted = rows(text, width);
+            let widths = table_widths(&painted);
+            assert_eq!(widths.len(), want.len());
+            assert_eq!(
+                widths.iter().sum::<usize>() + 3 * (want.len() - 1),
+                width,
+                "the room at {width}: {widths:?}"
+            );
+            for (column, &width_of) in widths.iter().enumerate() {
+                if width_of <= want[column] {
+                    continue;
+                }
+                for (other, &other_width) in widths.iter().enumerate() {
+                    assert!(
+                        other_width >= want[other],
+                        "column {column} is past its widest cell ({width_of} > {}) \
+                         while column {other} is short ({other_width} < {}) at {width}",
+                        want[column],
+                        want[other]
+                    );
+                }
+            }
+            for row in markdown_rows(text, width) {
+                assert_row_fits(&row, width, "a table being sized");
+            }
+        }
+        // The long column takes the room the short ones cannot: at 45 the three
+        // short columns hold exactly their cells and the sentence has the rest
+        // — 21 of its 35 columns — so it wraps, with no word broken.
+        let painted = rows(text, 45);
+        assert_eq!(table_widths(&painted), vec![5, 3, 7, 21]);
+        let long = column_text(&painted, 3);
+        assert!(long.starts_with("da much longer cell"), "{long:?}");
+        assert!(long.ends_with("than any of them"), "{long:?}");
+    }
+
+    /// A pane too narrow for every column's need still paints every cell: the
+    /// room is shared as far as it goes, a word that does not fit breaks — the
+    /// wrapper's own road, which drops nothing — and no row outgrows the pane.
+    #[test]
+    fn a_narrow_table_pane_still_paints_every_cell() {
+        let text = "| aaaaaaaaaa | bbbbbbbbbb |\n| --- | --- |\n| cccccccccc | dddddddddd |";
+        // Neither column can have its ten-column word (two columns and the
+        // separator leave nine columns of room): the nine are shared evenly.
+        let painted = rows(text, 12);
+        assert_eq!(table_widths(&painted), vec![5, 4]);
+        assert_eq!(
+            painted,
+            vec![
+                "aaaaa │ bbbb",
+                "aaaaa │ bbbb",
+                "      │ bb  ",
+                "──────┼─────",
+                "ccccc │ dddd",
+                "ccccc │ dddd",
+                "      │ dd  ",
+            ]
+        );
+        assert_eq!(markdown_row_counts(text, 12), vec![4, 0, 3]);
+        // Nothing is dropped: every character of both rows' cells is painted,
+        // in order, over the rows each cell wrapped into.
+        assert_eq!(column_text(&painted, 0), "aaaaaaaaaacccccccccc");
+        assert_eq!(column_text(&painted, 1), "bbbbbbbbbbdddddddddd");
+        // And the room the one-column `a`/`c` column cannot use is the long
+        // word's, even here: it keeps its single column, the word takes eight
+        // and still breaks — eleven characters do not fit eight columns.
+        let text = "| a | bbbbbbbbbb |\n| --- | --- |\n| c | dddddddddd |";
+        let painted = rows(text, 12);
+        assert_eq!(table_widths(&painted), vec![1, 8]);
+        assert_eq!(column_text(&painted, 0), "ac");
+        assert_eq!(column_text(&painted, 1), "bbbbbbbbbbdddddddddd");
+        // And the table is inside the pane at every width down to one column.
+        for width in 1..=12usize {
+            for row in markdown_rows(text, width) {
+                assert_row_fits(&row, width, "a table at a narrow pane");
+            }
         }
     }
 
