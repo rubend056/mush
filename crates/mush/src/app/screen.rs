@@ -272,8 +272,6 @@ pub struct AgentRow {
     pub glyph: &'static str,
     /// The tree's focused agent: the row wearing `▶`.
     pub focused: bool,
-    /// Children whose own run is in flight, drawn as `⏸N`.
-    pub waiting: usize,
     /// This agent's own is in the list and its parent has not read its result
     /// yet, drawn as `✉` (finding H4).
     pub result_unread: bool,
@@ -587,32 +585,22 @@ impl App {
         }
     }
 
-    /// The rows for `nodes`, in their order, with the parent's busy-child count
-    /// derived in one [`super::tree::AgentTree::busy_counts`] walk for the whole
-    /// call rather than once per row, which was quadratic in the tree the pane
-    /// paints (finding R29).
+    /// The rows for `nodes`, in their order.
     ///
     /// `pub(super)` so the attach roster serializes the very rows the pane
     /// paints instead of deriving them a second time (finding R21).
     pub(super) fn rows(&self, nodes: &[&AgentNode]) -> Vec<AgentRow> {
-        let busy = self.tree.busy_counts();
-        nodes
-            .iter()
-            .map(|node| self.row(node, busy.get(&node.id).copied().unwrap_or(0)))
-            .collect()
+        nodes.iter().map(|node| self.row(node)).collect()
     }
 
-    /// One row, with the parent's busy-child count supplied: [`Self::rows`] has
-    /// already built them all in one walk, so this does not ask the tree for
-    /// them (finding R29).
+    /// One row.
     ///
     /// The indent is the tree's *painted* depth, not [`AgentNode::depth`]: a
     /// node whose parent is not in the tree is a top-level row in `rows()`'s
     /// order, and its indent has to be the same nesting the order paints
     /// (finding D9).
-    fn row(&self, node: &AgentNode, waiting: usize) -> AgentRow {
-        // Two facts, two marks: `glyph · id` is this agent's own phase, and
-        // `⏸N` counts the children that are working. The old row derived the
+    fn row(&self, node: &AgentNode) -> AgentRow {
+        // `glyph · id` is this agent's own phase alone: the old row derived the
         // glyph from "has live children", so a busy agent wore `⏸` and its own
         // work vanished from the screen (finding U1).
         let mut place = node.branch.clone().unwrap_or_default();
@@ -650,7 +638,6 @@ impl App {
             parent_gone: self.tree.parent_gone(node),
             glyph: phase_glyph(&node.phase),
             focused: self.tree.focused == node.id,
-            waiting,
             result_unread: node.result_unread,
             unread_children: self.tree.unread_children(node.id).len(),
             title: node.title(),
@@ -1004,9 +991,9 @@ fn git_cell(git: &git::RepoStatus, age: Option<Duration>) -> String {
 ///
 /// Every clause is a count of the phases, named for what it counts, and no
 /// agent is in two of them: `N working` is the agents whose own run is in
-/// flight, `M waiting` the ones at rest with children working — a subset of the
-/// rows wearing `⏸N`, which a working parent wears too (finding R10) — and the
-/// totals are the branches'. It used to say `N running` over a number that
+/// flight, `M waiting` the ones at rest with children working — a working
+/// parent with children out is in `N working`, never here (finding R10) — and
+/// the totals are the branches'. It used to say `N running` over a number that
 /// included the napping ones, which is how the title came to contradict the
 /// rows under it (finding U2).
 ///
@@ -1054,8 +1041,9 @@ fn title_cells(app: &App, above: usize, below: usize) -> Vec<String> {
 /// load, the same fact every row wears as `⚙N`, summed over the tree — one
 /// agent's share is a row, this is the whole (finding H8). It is jobs and only
 /// jobs: a command still under its tool call is not one, so it is on neither.
-/// Ranked before `waiting` because a napping agent is already visible on its
-/// own row as `⏸N`, while the machine's load exists nowhere else.
+/// Ranked before `waiting` because a napping agent's own row already wears the
+/// resting glyph above the working child's row — the tree's shape says it —
+/// while the machine's load exists nowhere else.
 fn agent_count_cells(app: &App) -> Vec<String> {
     let roster = app.tree.roster();
     let mut cells = Vec::new();
@@ -1246,12 +1234,12 @@ fn agent_detail(node: &AgentNode) -> Vec<String> {
 /// the model or the endpoint did failed, and the agent's work is still on disk,
 /// untouched and unlanded.
 ///
-/// Waiting on children is a *different fact* from working and is drawn as a
-/// different mark (`agent_line`'s `⏸N`), because a parent that is mid-turn with
-/// children running is working, not paused — the row that said `⏸` about it was
-/// claiming a park that never happened (finding U1). Folding is a different fact
-/// again: it is a request of its own, and `◐` for it is what made a compaction
-/// look like the run's own model call (finding U11).
+/// A parent that is mid-turn with children running is working, not paused: the
+/// row that said `⏸` about it was claiming a park that never happened — the
+/// children's own `◐` rows are what say they are running, and the title's
+/// `M waiting` counts the agents at rest (finding U1). Folding is a different
+/// fact again: it is a request of its own, and `◐` for it is what made a
+/// compaction look like the run's own model call (finding U11).
 ///
 /// A run parked in a `wait` is the third: `⧗`, because the agent is not
 /// computing anything and `◐` for it said *working* about the one thing on
@@ -1618,9 +1606,9 @@ mod tests {
             phase_glyph(&Phase::Failed("boom".into())),
         ];
         // The marks `ui::agent_line` adds beside the glyph, in the same head:
-        // the pane cursor, the counts, and the severed-link `⚮` a row whose
-        // parent the tree forgot wears (`AgentRow::parent_gone`).
-        for mark in glyphs.into_iter().chain(["▶", "⏸", "✉", "⚙", "⚠", "⚮"]) {
+        // the pane cursor, the unread counts, and the severed-link `⚮` a row
+        // whose parent the tree forgot wears (`AgentRow::parent_gone`).
+        for mark in glyphs.into_iter().chain(["▶", "✉", "⚙", "⚠", "⚮"]) {
             assert_eq!(
                 UnicodeWidthStr::width(mark),
                 1,
@@ -1988,7 +1976,7 @@ mod tests {
     ///
     /// #2..#5 hang under #1 and are orphaned together by one reap, each with a
     /// different own state — a finished probe, a stopped run (`⊘`), a landed
-    /// worktree, and a napping parent with a child in flight (`⏸1`); #6 is that
+    /// worktree, and a napping parent whose child is in flight; #6 is that
     /// child and #7 a root child, both with a parent in the tree; #8 is a
     /// leftover worktree, top-level by construction rather than by a lost link;
     /// the root is never marked. Read at the 80×24 floor and on a roomy pane, in
@@ -2004,7 +1992,7 @@ mod tests {
         insert(&mut app, 3, 1, 2, "port the parser");
         insert(&mut app, 4, 1, 2, "land the lexer");
         insert(&mut app, 5, 1, 2, "hold the line");
-        // A child in flight under #5: the `⏸1` a marked row also wears.
+        // A child in flight under #5: the running row a marked row sits over.
         insert(&mut app, 6, 5, 3, "probe the tokens");
         insert(&mut app, 7, 0, 1, "task seven");
         // A leftover worktree: no parent in this tree, and nothing lost.
@@ -2032,7 +2020,7 @@ mod tests {
         app.tree.idle(AgentId(5));
         app.tree.finish(AgentId(7), Some("done".to_string()));
         app.tree.result_read(AgentId(7));
-        // #6 stays thinking: that is the `⏸1` on #5's row.
+        // #6 stays thinking: the child in flight under #5's resting row.
 
         app.tree.reap(&[AgentId(1)]);
 
@@ -2074,17 +2062,22 @@ mod tests {
                         );
                     }
                     // The marks the row already carried are not displaced: the
-                    // stop is the agent's own phase and the `⏸1` is about the
-                    // child it holds, and both sit with the severed link.
+                    // stop is the agent's own phase, and #5 napping on #6 is
+                    // said by #5's own resting row over #6's running one.
                     assert!(
                         row_for(&frame, 3).contains("⊘ #3 ⚮"),
                         "a stopped orphan wears both: {:#?}",
                         row_for(&frame, 3)
                     );
                     assert!(
-                        row_for(&frame, 5).contains("⏸1"),
-                        "a napping orphan keeps its count: {:#?}",
+                        row_for(&frame, 5).contains("· #5 ⚮"),
+                        "a napping orphan wears its own resting glyph: {:#?}",
                         row_for(&frame, 5)
+                    );
+                    assert!(
+                        row_for(&frame, 6).contains("◐ #6"),
+                        "and the child it naps on says it is running: {:#?}",
+                        row_for(&frame, 6)
                     );
                 }
             }
@@ -2175,6 +2168,50 @@ mod tests {
             marked[0].contains("test-model"),
             "and it is the current model: {marked:?}"
         );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The row's `⏸N` count is gone (the human's ask): the human read the glyph
+    /// as *paused*, and mush has no pause — a stop is `⊘`, a parked run `⧗`, a
+    /// run in flight `◐` — while the number counted the parent's own children
+    /// with a run in flight. The fact has two homes already, and they are two
+    /// different facts: the children's own rows say they are running (`#6`'s
+    /// `◐`), and the title's `N waiting` counts the agents at rest with work
+    /// out (`#5`'s `✓` under the title's `1 waiting`) — per-parent children
+    /// against tree-wide napping agents, which under one glyph taught the
+    /// reader to conflate them. The rows are read at 200×50 so the title has
+    /// the columns for both clauses and the child's brief survives elision.
+    #[test]
+    fn a_parents_row_no_longer_counts_the_children_in_flight() {
+        let (mut app, _rx, root) = frame_app("no-pause-mark");
+        insert(&mut app, 5, 0, 1, "watch the probes");
+        insert(&mut app, 6, 5, 2, "probe the tokens");
+        app.tree.finish(AgentId(5), Some("done".to_string()));
+        app.tree.result_read(AgentId(5));
+        // #6 stays thinking: #5 is Done with a child in flight, which its row
+        // used to say as `✓ #5 ⏸1 watch  done`.
+
+        let frame = pane_frame(&mut app, 200, 50, &crate::theme::Theme::default());
+        assert!(
+            !frame.join("\n").contains('⏸'),
+            "no row wears the count that is gone: {frame:#?}"
+        );
+        assert_eq!(
+            row_for(&frame, 5),
+            "   ✓ #5 watch  done",
+            "the parent's own state is the whole of what its row says"
+        );
+        assert_eq!(
+            row_for(&frame, 6),
+            "     ◐ #6 probe  thinking 0s",
+            "and the child in flight says so on its own row"
+        );
+        assert!(
+            frame[0].contains(" agents · 1 working · 1 waiting"),
+            "the title still counts the agents at rest with work out: {:#?}",
+            frame[0]
+        );
+
         let _ = std::fs::remove_dir_all(&root);
     }
 }

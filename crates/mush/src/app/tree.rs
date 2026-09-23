@@ -538,10 +538,10 @@ pub struct Roster {
     /// agent at rest whose children are working.
     ///
     /// The two are one fact — this agent computes nothing until a result
-    /// arrives — and the row says which of the two it is (`⧗ waiting on
-    /// results 3s` for the parked run, `⏸N` for the napping parent). "Children"
-    /// are its own, the same unit its row's `⏸N` mark counts: a grandchild's
-    /// work is its own parent's to wait for.
+    /// arrives — and the tree says which of the two it is: the parked run's row
+    /// wears `⧗ waiting on results 3s`, and the napping parent's row wears its
+    /// own resting glyph above the rows of the children that run. "Children"
+    /// are its own: a grandchild's work is its own parent's to wait for.
     pub waiting: usize,
 }
 
@@ -1745,8 +1745,9 @@ impl AgentTree {
             } else if node.phase.is_busy() {
                 roster.working += 1;
             } else if self.napping_with(node.id, &busy) {
-                // At rest with work out: §5.5's napping orchestrator, which the
-                // row draws as `⏸`. Counted here and *nowhere else* — counting
+                // At rest with work out: §5.5's napping orchestrator, whose own
+                // row wears its resting glyph over its children's running
+                // rows. Counted here and *nowhere else* — counting
                 // it as working as well is exactly what the title did wrong
                 // (U2), and a stop or a failure is not a reason to say it waits
                 // for nothing (U12: the mailbox is just as alive).
@@ -1757,8 +1758,8 @@ impl AgentTree {
     }
 
     /// The per-parent count of children whose run is in flight, derived in one
-    /// walk. [`crate::app::App::rows`] builds this map once per pane or roster
-    /// and looks every row up in it, and the title's `M waiting` and [`Self::napping`]
+    /// walk. [`crate::app::App::attach_agents`] builds this map once and looks
+    /// every node up in it, and the title's `M waiting` and [`Self::napping`]
     /// read the same entries. A derivation, not a stored fact, dropped with the
     /// frame (finding R29).
     pub fn busy_counts(&self) -> HashMap<AgentId, usize> {
@@ -2383,8 +2384,8 @@ mod tests {
         );
 
         // The child's run ends with a grandchild of its own working: the child
-        // naps on it (its own children are the unit, the same one its row's
-        // `⏸N` counts), and the root — whose own child is done — is in no
+        // naps on it (a node waits for its own children, never its
+        // grandchildren's), and the root — whose own child is done — is in no
         // bucket at all.
         tree.finish(opened.id, Some("spawned #2".to_string()));
         let (tx, _rx2) = crossbeam_channel::unbounded::<AgentMsg>();
