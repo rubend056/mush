@@ -107,10 +107,10 @@ either tests or nothing at all.
 19. **The `"git worktree failed"` string compare** (`git.rs:88-93,323-331`) —
     the file's own `GIT_UNAVAILABLE` documents why comparing a copy of a message
     is wrong; a reworded `run` silently retires this rewrite. [#35]
-20. **The plain-HTTP read timeout set and overwritten two statements later**
-    (`http.rs:687-695`) — no syscall happens in between, so for `http://` the
-    value is never consulted; inside the TLS arm it is the handshake budget.
-    [#35]
+20. **The TLS arm's read timeout set twice around the handshake**
+    (`http.rs:960-966`) — the handshake's slicing and the reads that follow
+    both want `READ_SLICE`, so the second `set_read_timeout` sets the value the
+    first one already did; it marks the phase boundary, not a change. [#35]
 21. **`!matches!(kind, Interrupted)` in `dead_kept`** (`http.rs:282-288`) — the
     `!watch.cancelled()` on the line above already excludes the only producer.
     [#35]

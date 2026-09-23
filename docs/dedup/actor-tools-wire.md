@@ -467,7 +467,7 @@ of them can drift into a false sentence.
    truncation note and reads as complete.
 4. **The body cap, three times.** `http.rs:653` (`read_exact`'s
    `len > MAX_BODY_BYTES`), `675` (`read_to_end`'s running check), `1108`
-   (`read_chunked`'s `out.len() + size`). Owner:
+   (`read_chunked`'s `size > MAX_BODY_BYTES - out.len()`). Owner:
    `fn body_room(written: usize, more: usize) -> io::Result<()>` — **net ~4**;
    drift is one road that can be made to allocate past the cap.
 5. **The wait's poll slice.** `agent.rs:4334` and `4456`, both

@@ -154,8 +154,9 @@ an agent event — becomes a `Msg`, and one thread applies it to `App` (§6).
   `write_file`'s `content` and `edit_file`'s replacement are bytes the model
   already sent, so a cap there would save the conversation nothing and cost a
   turn and the work. A write large enough to push the request past the window
-  ends that turn at the request's own refusal (`cannot send this request: …`),
-  with the bytes already on disk. The caps' sizes follow the window:
+  ends that turn at the request's own refusal (`cannot send this request: …`) —
+  the window line or the byte ceiling's — with the bytes already on disk. The
+  caps' sizes follow the window:
   `Config::cmd_cap()` (`crates/mush-core/src/config.rs`), the `CMD_CAP`
   (`crates/mush-core/src/lib.rs`) and the `READ_FILE_CAP` / `SEARCH_FILE_CAP` /
   `IMAGE_FILE_CAP` constants (`crates/mush-core/src/workspace.rs`).

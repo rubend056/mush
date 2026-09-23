@@ -633,9 +633,10 @@ step further: it *under*-reports.
 
 **Blast radius.** The attach gate's window bound (`mod.rs:3683`, `:3893`)
 accepts a picture on a room short by the prompt; the next request is then
-refused before the wire by H43's `over_window_line` — a turn and the human's
-money for a message the gate had accepted. The window is one frame of event
-draining; the arithmetic is wrong.
+refused before the wire by H43's `over_window_line` (or the request's
+`MAX_REQUEST_BYTES` ceiling) — a turn and the human's money for a message the
+gate had accepted. The window is one frame of event draining; the arithmetic is
+wrong.
 
 **Fix.** Weigh the prompt first and return it alone when there is no transcript,
 or make `learn_system` create the empty transcript entry it knows exists.
