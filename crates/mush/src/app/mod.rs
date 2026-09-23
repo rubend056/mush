@@ -347,7 +347,11 @@ const BOX_IMAGE_BYTES: usize = (mush_core::workspace::IMAGE_FILE_CAP * 8) as usi
 /// A byte count the way a glance wants it: `900 B`, `340 KB`, `1.2 MB`. One
 /// decimal for the unit that needs one — a megabyte is where the rounding is
 /// visible, and `1.2` says more than `1258` or than a bare `1`.
-fn size_label(bytes: usize) -> String {
+///
+/// `pub(crate)` because the agent's own digest reads it: a read's result is
+/// weighed in the compact log with the same spelling the box weighs an
+/// attachment in ([`crate::agent::digest`]), not a second one.
+pub(crate) fn size_label(bytes: usize) -> String {
     const KB: usize = 1_000;
     const MB: usize = 1_000_000;
     if bytes < KB {
@@ -1141,6 +1145,9 @@ impl App {
         // later tree on this root cannot be judged by this one's nodes
         // (finding F7).
         let worktree_facts = git::publish_worktree_facts(ws.root());
+        // The chat's own copy of the root, for paths and commands in the
+        // compact log: the workspace itself moves into the app below.
+        let workspace = ws.root().to_path_buf();
         let (messages, stored_agents, stored_notices) = match stored {
             Some(session) => (session.messages, session.agents, session.notices),
             None => (Vec::new(), Vec::new(), Vec::new()),
@@ -1152,7 +1159,7 @@ impl App {
             home_config: userconfig::config_path(),
             focus: Focus::Chat,
             zen: false,
-            chat: Chat::new(system, messages),
+            chat: Chat::new(system, messages, workspace),
             // Empty until a fetch says otherwise: the model list is discovered
             // on its own thread so nothing about an endpoint delays the first
             // frame (finding A9), and `/model` refetches if this is still

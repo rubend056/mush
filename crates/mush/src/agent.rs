@@ -33,7 +33,10 @@ use mush_core::transcript::{
 use mush_core::workspace::{truncate_for_model, LineCount, READ_FILE_CAP, SEARCH_FILE_CAP};
 use mush_core::{prompt, tools, Config, Image, Message, Workspace, CMD_TIMEOUT_SECS};
 
-use crate::app::{tokens_label, Compacting, ConfigHandle, ConversationId, Msg, WindowSource};
+use crate::app::{
+    short_age, size_label, tokens_label, Compacting, ConfigHandle, ConversationId, Msg,
+    WindowSource,
+};
 use crate::clock;
 use crate::events::{Events, Ui};
 use crate::ids::{AgentId, Ids, JobId};
@@ -6631,6 +6634,7 @@ fn run_shell(
     actor: &Actor,
     state: &mut ActorState,
 ) -> Result<String, ToolError> {
+    let started = actor.ctx.clock.now();
     let spawned = actor.ctx.machine.spawn(&ShellCommand { command, root })?;
     // From here to the end of the call the command is the registry's as much as
     // this actor's: quitting mush, a `Stop` and Ctrl-N all reach it (finding
@@ -6698,11 +6702,17 @@ fn run_shell(
     let cap = result_cap(actor, state);
     let (stdout, stderr) = running.output(cap);
     let mut report = command_report(&stdout, &stderr);
+    // How long the foreground call took, on the clock the wait itself ran on:
+    // `end_note` turns it into the one fact of a command a stored transcript
+    // could not otherwise carry (there is no wall clock in a message), and the
+    // digest reads it back out of the note.
+    let elapsed = actor.ctx.clock.now().saturating_duration_since(started);
     report.push_str(&end_note(
         &ended,
         timeout,
         matches!(detach, Detach::Job { .. }),
         cap,
+        elapsed,
     ));
     // A command that ended with its group still standing: its own end was the
     // only end — nothing in mush asked it to stop — and what stayed behind was
@@ -6719,26 +6729,46 @@ fn run_shell(
 }
 
 /// The model's sentence for how its command ended: `[exit 0]`, `[cancelled]`,
-/// the timeout, the output cap, the signal that killed it.
+/// the timeout, the output cap, the signal that killed it — and how long the
+/// call ran, where that is a fact of its own.
 ///
 /// One home for the whole translation table, so every reason mush stops a
 /// command has exactly one sentence and a new one cannot be added to one
 /// translator and missed by another (refactor R15). Pure: the one arm no run
 /// reaches — a command handed to the job registry builds no report at all — is
 /// read by the unit test beside the others rather than left to chance.
-fn end_note(ended: &Ended, timeout: Duration, detachable: bool, cap: usize) -> String {
+///
+/// `elapsed` is the call's own time, and it becomes an ` after 5s` clause in
+/// the arms that have no duration of their own: the spellings are the pane's
+/// ([`short_age`] — the same rendering the tree's `waiting on results 3s`
+/// wears), and a run under one second says nothing, because `after 0s` on a
+/// command that just started is noise rather than a fact.
+fn end_note(
+    ended: &Ended,
+    timeout: Duration,
+    detachable: bool,
+    cap: usize,
+    elapsed: Duration,
+) -> String {
+    let after = if elapsed.as_secs() == 0 {
+        String::new()
+    } else {
+        format!(" after {}", short_age(elapsed))
+    };
     match ended {
-        Ended::Exited(code) => format!("[exit {code}]"),
+        Ended::Exited(code) => format!("[exit {code}{after}]"),
         // A signal death is not an exit code, and the sentence says what it is:
         // `[exit -1]` was this arm's spelling for a `SIGSEGV` and for an OOM
         // kill alike, and it read as the command's own doing (finding B6).
-        Ended::Signalled(signal) => format!("[killed by signal {signal}]"),
+        Ended::Signalled(signal) => format!("[killed by signal {signal}{after}]"),
         // Neither a code nor a signal: the state names what is unknown rather
         // than the `-1` sentinel, which read as a code a command can return
         // (finding H26). No child mush starts ends this way — `machine::ended`
         // reads an exit or a death by signal from the statuses `wait` produces —
         // and the arm is honest anyway.
-        Ended::Unknown => "[no exit status: neither an exit code nor a signal]".to_string(),
+        Ended::Unknown => {
+            format!("[no exit status: neither an exit code nor a signal{after}]")
+        }
         Ended::Stopped(jobs::Stopped::TimedOut) => {
             let mut note = format!("[timed out after {}s", timeout.as_secs());
             // The one case where "a long command detaches by itself" cannot
@@ -6754,7 +6784,7 @@ fn end_note(ended: &Ended, timeout: Duration, detachable: bool, cap: usize) -> S
             note.push(']');
             note
         }
-        Ended::Stopped(jobs::Stopped::Cancelled) => "[cancelled]".to_string(),
+        Ended::Stopped(jobs::Stopped::Cancelled) => format!("[cancelled{after}]"),
         Ended::Stopped(jobs::Stopped::TooMuchOutput) => {
             format!("[killed: output passed {CMD_OUTPUT_LIMIT} bytes; the first {cap} are above]")
         }
@@ -6887,45 +6917,1209 @@ pub fn summarize_args(raw: &str) -> String {
 /// transcript (`docs/mush.md` §4.5 R4), one activity line in the tree — so a
 /// `path` of `…\u{1b}]0;PWNED` would otherwise repaint the terminal it is drawn
 /// on. The one reading both callers share is the one place to do it.
+///
+/// The compact log's ask ([`digest`]) is defanged the same way, through the very
+/// same [`sanitize`]: its text is the model's arguments too.
 fn summarize(args: &Value) -> String {
     sanitize(&read_args(args))
 }
 
-/// What the arguments say, before the text is made safe to paint.
-fn read_args(args: &Value) -> String {
-    if let Some(path) = args.get("path").and_then(Value::as_str) {
-        return path.to_string();
+/// The `path` argument as the model wrote it: one reader for the label
+/// ([`read_args`]) and the compact log's ask ([`digest`]), so the two cannot
+/// disagree about which file a call named.
+fn path_arg(args: &Value) -> Option<String> {
+    args.get("path").and_then(Value::as_str).map(str::to_string)
+}
+
+/// The `command` argument as the model wrote it.
+fn command_arg(args: &Value) -> Option<String> {
+    args.get("command")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// The `brief` argument as the model wrote it.
+fn brief_arg(args: &Value) -> Option<String> {
+    args.get("brief")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// `control {id, action, text?}` as `#4 stop "the words"` — the one shape the
+/// label and the compact ask share, with the quoted text cut to `text_columns`
+/// where a one-row label asks for a cut and shown whole where the compact log's
+/// own columns are the only budget (`None`).
+fn control_arg(args: &Value, text_columns: Option<usize>) -> Option<String> {
+    let id = args.get("id").and_then(Value::as_str)?;
+    let action = args.get("action").and_then(Value::as_str).unwrap_or("");
+    let mut label = format!("#{id}");
+    if !action.is_empty() {
+        label.push(' ');
+        label.push_str(action);
     }
-    if let Some(command) = args.get("command").and_then(Value::as_str) {
+    if let Some(text) = args.get("text").and_then(Value::as_str) {
+        let text = first_line(text);
+        let text = match text_columns {
+            Some(columns) => truncate(&text, columns),
+            None => text,
+        };
+        label.push_str(&format!(" \"{text}\""));
+    }
+    Some(label)
+}
+
+/// What the arguments say, before the text is made safe to paint.
+///
+/// The label's own reading: one row, so a long command or brief is cut to the
+/// columns a row can spare. The compact log reads the same arguments through the
+/// same field readers ([`path_arg`], [`command_arg`], [`brief_arg`],
+/// [`control_arg`]) but keeps the facts this reading cuts away — a read's
+/// window, a search's pattern — in [`digest`].
+fn read_args(args: &Value) -> String {
+    if let Some(path) = path_arg(args) {
+        return path;
+    }
+    if let Some(command) = command_arg(args) {
         // The *first line*, with whitespace collapsed. Truncating the raw string
         // at 60 characters kept its newlines, so a heredoc turned a one-line
         // label into several — `⚙ run_command cd …` followed by `import io`,
         // `p = 'crates/…`, and so on. A label is one line by definition.
-        return truncate(&first_line(command), 50);
+        return truncate(&first_line(&command), 50);
     }
-    if let Some(brief) = args.get("brief").and_then(Value::as_str) {
-        return truncate(&first_line(brief), 40);
+    if let Some(brief) = brief_arg(args) {
+        return truncate(&first_line(&brief), 40);
     }
     // `control {id, action, text?}`, which names none of the three above: the
     // tools a human watching a tree most needs to read are exactly the calls
     // that steer the run, and they rendered as a bare `⚙ control` otherwise
     // (R4's "`⚙ name summarized-args`" vacuous for them). The id is the target
     // and the action is what is being done to it.
-    if let Some(id) = args.get("id").and_then(Value::as_str) {
-        let action = args.get("action").and_then(Value::as_str).unwrap_or("");
-        let mut label = format!("#{id}");
-        if !action.is_empty() {
-            label.push(' ');
-            label.push_str(action);
-        }
-        if let Some(text) = args.get("text").and_then(Value::as_str) {
-            label.push_str(&format!(" \"{}\"", truncate(&first_line(text), 30)));
-        }
+    if let Some(label) = control_arg(args, Some(30)) {
         return label;
     }
     // `status` and `wait` take no arguments: there is nothing to summarize, and
     // the label is the tool's own name alone.
     String::new()
+}
+
+/// How a tool result that never happened is spelled. Every refused or failed
+/// call's result is prefixed with exactly this (`format!("error: {error}")`),
+/// so a result either is one or merely starts like one — the transcript's fold
+/// and the digest below both read it.
+pub(crate) const FAILED: &str = "error:";
+
+// ---------------------------------------------------------------------------
+// The call digest: what the compact log paints
+// ---------------------------------------------------------------------------
+
+/// One tool call as the pane reads it: the ask the call made, once its result
+/// has landed what came back, and the result's own facts that are neither.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallFacts {
+    /// What the call asked for, in the tool's own shape — a read's window, a
+    /// search's pattern, the `cd` a shell line never needs, and the output
+    /// shaping a human adds to a shell line to read it ([`strip_shaping`]).
+    /// Never cut: the painter owns the pane's columns (the call grid).
+    pub ask: String,
+    /// What the result's own sentences say. `None` while no result has landed:
+    /// a call still in flight paints no arrow, because the transcript cannot
+    /// know the phase the tree owns.
+    pub outcome: Option<CallOutcome>,
+    /// The result's facts that are not its one outcome sentence — one row each,
+    /// dim, painted *under* the call's header in the unfolded view only (the
+    /// compact log is one row per call). A fact the result does not carry is
+    /// left out rather than guessed: `read_file` has a total line count only
+    /// where the read was a window, `spawn_agent` a worktree only where the
+    /// child is isolated, and `edit_file` says nothing here because the ask
+    /// already names the file and the outcome already counts the hunks. The
+    /// painter cuts each row to the pane's gutter ([`crate::app`]'s call
+    /// grid); nothing here is cut.
+    pub details: Vec<String>,
+}
+
+/// The one sentence of a call's result the compact log paints, and how it reads
+/// at a glance.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CallOutcome {
+    pub text: String,
+    pub tone: Tone,
+}
+
+/// An outcome's verdict, named for the reading and not the colour: the painter
+/// owns the palette (clean green, warning yellow, failure red, in-flight or
+/// unknown dim).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Tone {
+    /// It worked.
+    Ok,
+    /// It worked, with something the human should know: mush cancelled it, a
+    /// stop was handed over, a wait ran out.
+    Warn,
+    /// It failed: a nonzero exit, a signal, a refusal.
+    Alert,
+    /// Still going: a spawned child, a wait that timed out on live work.
+    Running,
+    /// No verdict either way: a listing, a miss, "nothing to wait for".
+    None,
+}
+
+/// The one reading of a tool call and its result, built in one place.
+///
+/// `match name` has **no wildcard arm**: a new [`ToolName`] cannot compile
+/// until it is given a digest here. `args` is the call's own JSON object
+/// (`ToolCall::function.arguments`), `result` is the text of the `tool` message
+/// carrying the call's id (`None` until it lands), and `root` is the workspace
+/// the agent runs in — a path is shown relative to it and a leading
+/// `cd <root> &&` is redundant beside it, so the digest needs the fact the
+/// arguments carry only as a string.
+///
+/// The outcome is read from the result's **own sentences** — the executor's end
+/// note, a read's trailer, a listing's rows — never from the model's prose and
+/// never guessed: this file is where those sentences are written, so a sentence
+/// that changes shape is caught by the tests beside each one. A call with no
+/// result yet has no outcome at all; a failed call's outcome is one sentence for
+/// every tool ([`failure`]).
+///
+/// **The duration.** A [`run_command`]'s report ends with the command's own end
+/// note, and an end note carries how long the command ran when that is worth a
+/// clause ([`end_note`]) — `[exit 0 after 5s]`. It is the one fact of a command
+/// the transcript could not otherwise carry: there is no wall clock in a stored
+/// message. A command handed to the job registry builds no report, so a
+/// detached call's digest has no exit clause at all.
+///
+/// **The details.** Each arm also fills [`CallFacts::details`] from the result's
+/// other own sentences — the files a search hit, the lines a command's stderr
+/// section holds, the total a read's trailer names. The readers live beside the
+/// outcome readers and read the same result, and an arm with nothing to say
+/// says nothing (see the field's doc for what each tool leaves out).
+pub fn digest(name: ToolName, args: &Value, result: Option<&str>, root: &Path) -> CallFacts {
+    // A failed call is one sentence for every tool, and it is mush's sentence
+    // and not the tool's own: read it before the per-tool grammar below, which
+    // is written for the results each tool really produces.
+    let refused = result.and_then(failure);
+    let ok = result.filter(|_| refused.is_none());
+    let (ask, outcome, details) = match name {
+        ToolName::EditFile => (path_ask(args, root), edit_outcome(ok), Vec::new()),
+        ToolName::ReadFile => (read_ask(args, root), read_outcome(ok), read_details(ok)),
+        ToolName::WriteFile => (path_ask(args, root), write_outcome(ok), Vec::new()),
+        ToolName::ListFiles => (path_ask(args, root), list_outcome(ok), list_details(ok)),
+        ToolName::Search => (
+            search_ask(args, root),
+            search_outcome(ok),
+            search_details(ok),
+        ),
+        ToolName::RunCommand => (
+            command_ask(args, root),
+            command_outcome(ok),
+            command_details(ok),
+        ),
+        ToolName::SpawnAgent => (brief_ask(args), spawn_outcome(ok), spawn_details(ok)),
+        ToolName::Status => (String::new(), status_outcome(ok), status_details(ok)),
+        ToolName::Control => (control_ask(args), control_outcome(ok), control_details(ok)),
+        ToolName::Wait => (String::new(), wait_outcome(ok), wait_details(ok)),
+    };
+    CallFacts {
+        // The ask is the model's own arguments, so it is defanged exactly as the
+        // label is ([`summarize`]): one `sanitize`, two readings. The details
+        // come off a result the actor sanitized on its way in, and are read the
+        // same way a painted row is — the painter truncates, which sanitizes.
+        ask: sanitize(&ask),
+        outcome: refused.or(outcome),
+        details: details.iter().map(|row| sanitize(row)).collect(),
+    }
+}
+
+/// [`digest`] from the raw text a transcript stores: the name the model called
+/// and the argument JSON it sent.
+///
+/// A name no tool answers to — the model can invent one — has no [`ToolName`] to
+/// match on, and it is still read the one way a transcript can read it: the
+/// label's own summarised arguments as the ask, and the result's failure
+/// sentence as the outcome, because such a call is refused before it runs.
+pub(crate) fn call_digest(
+    name: &str,
+    arguments: &str,
+    result: Option<&str>,
+    root: &Path,
+) -> CallFacts {
+    let Some(name) = ToolName::parse(name) else {
+        return CallFacts {
+            ask: summarize_args(arguments),
+            outcome: result.and_then(failure),
+            details: Vec::new(),
+        };
+    };
+    let args: Value = serde_json::from_str(arguments).unwrap_or(Value::Null);
+    digest(name, &args, result, root)
+}
+
+/// A failed call's own sentence: `error: …`, its first line, in the alert red —
+/// except a cancellation, which is mush's doing and not the tool's failure, and
+/// wears the warning yellow ([`CANCELLED`]).
+///
+/// Every failed result opens with [`FAILED`]; a result that merely starts like
+/// one is not read here at all, because this is only called on results the
+/// executor itself refused.
+fn failure(result: &str) -> Option<CallOutcome> {
+    let why = first_line(result.trim_start().strip_prefix(FAILED)?.trim());
+    Some(if why == CANCELLED {
+        CallOutcome {
+            text: CANCELLED.to_string(),
+            tone: Tone::Warn,
+        }
+    } else {
+        CallOutcome {
+            text: format!("{FAILED} {why}").trim_end().to_string(),
+            tone: Tone::Alert,
+        }
+    })
+}
+
+/// The workspace-relative spelling of a path the model named: inside the root
+/// the root is dropped, outside it the path is shown as it was written, and a
+/// relative path stays exactly what the model said (a leading `./` is the one
+/// exception — it names the same file and no column of an ask should say so).
+fn workspace_path(raw: &str, root: &Path) -> String {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return String::new();
+    }
+    if let Ok(rest) = Path::new(raw).strip_prefix(root) {
+        let shown = rest.to_string_lossy();
+        return if shown.is_empty() {
+            ".".to_string()
+        } else {
+            shown.into_owned()
+        };
+    }
+    raw.strip_prefix("./").unwrap_or(raw).to_string()
+}
+
+/// A path-shaped call's ask: the file the call named, workspace-relative inside
+/// the root ([`workspace_path`]) and nothing at all when the call named none — the
+/// workspace root is every file tool's own default.
+fn path_ask(args: &Value, root: &Path) -> String {
+    path_arg(args)
+        .map(|path| workspace_path(&path, root))
+        .unwrap_or_default()
+}
+
+/// A read's ask: the file and the window the call asked for where it asked for
+/// one — `text.rs 1408→1530`.
+///
+/// The end is arithmetic on the call's own two arguments, because the file has
+/// not been read here: a limit past the file's end still names the line the call
+/// asked up to, and only the result knows how far the file really goes. A call
+/// that named no window (the defaults) is the path alone; a limit the call left
+/// open names where the read starts and no end — `text.rs 1408→`.
+fn read_ask(args: &Value, root: &Path) -> String {
+    let path = path_ask(args, root);
+    let offset = tools::arg_usize(args, "offset", 1).unwrap_or(1).max(1);
+    let limit = tools::arg_usize(args, "limit", usize::MAX).unwrap_or(usize::MAX);
+    let range = match (offset, limit) {
+        (_, 0) => String::new(),
+        (1, usize::MAX) => String::new(),
+        (offset, usize::MAX) => format!(" {offset}→"),
+        (offset, limit) => format!(
+            " {offset}→{}",
+            offset.saturating_add(limit).saturating_sub(1)
+        ),
+    };
+    format!("{path}{range}").trim_start().to_string()
+}
+
+/// A search's ask: the pattern and where it looked — `"column_widths" in
+/// crates`. The pattern is quoted because it is a pattern and not a word of the
+/// ask; the path is dropped when the call named none, which is the root.
+fn search_ask(args: &Value, root: &Path) -> String {
+    let pattern = args
+        .get("pattern")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let path = workspace_path(&tools::arg_path(args, "path").unwrap_or_default(), root);
+    match (pattern.is_empty(), path.is_empty()) {
+        (true, _) => String::new(),
+        (false, true) => format!("\"{pattern}\""),
+        (false, false) => format!("\"{pattern}\" in {path}"),
+    }
+}
+
+/// A command's ask: the first line, whitespace collapsed, with the one `cd` a
+/// shell line never needs taken out and the output-shaping tail dropped.
+///
+/// Every command already runs with the workspace root as its cwd
+/// ([`run_shell`]), so `cd <root> && cargo test` asks for exactly what
+/// `cargo test` does and the `cd` is a lie about the line the human reads. A
+/// `cd` anywhere else stays: it is a real change of directory.
+fn command_ask(args: &Value, root: &Path) -> String {
+    let command = command_arg(args)
+        .map(|c| first_line(&c))
+        .unwrap_or_default();
+    strip_shaping(&strip_cd(&command, root))
+}
+
+/// [`command_ask`]'s second rule: the output-shaping tail of a shell line is
+/// not what the line ran, and the pane's ask column is for what ran.
+///
+/// A human writes `cargo test 2>&1 | tail -40` to *read* a command, and the
+/// transcript already says what the shaping cost: the outcome's `· 41 lines` is
+/// the payload that survived it. So a trailing `2>&1`, `2>/dev/null`, `| cat`,
+/// `| head -N` or `| tail -N` (and any run of them) comes off the ask. Nothing
+/// that changes *what ran* does: a pipe into a real program, a redirect into a
+/// file, an `&&`/`||` chain, `head -n 5` spelled the long way, and a `head` a
+/// quoted string hides are all left alone, because dropping them would make the
+/// ask a lie about the command the transcript holds.
+///
+/// **This is a deliberate reading, and a vetoable one.** The model's arguments
+/// are the record of what it asked for, and this is the one place the digest
+/// edits them down to the part a human needs to read; the case against is that
+/// the ask then names a command the model did not literally write. What the
+/// command *did* is unaffected — the result is the result — and the shaping has
+/// its own witness in the outcome's line count.
+fn strip_shaping(command: &str) -> String {
+    let mut text = command.trim_end();
+    loop {
+        if let Some(rest) = text.strip_suffix("2>&1") {
+            text = rest.trim_end();
+            continue;
+        }
+        if let Some(rest) = text.strip_suffix("2>/dev/null") {
+            text = rest.trim_end();
+            continue;
+        }
+        // The last stage of a pipeline is the shaping one only when it is one of
+        // the readers that changes nothing about what ran. The `|` is looked for
+        // from the right, so `a | head -3 | cat` loses both stages in the loop.
+        let Some((head, stage)) = text.rsplit_once('|') else {
+            break;
+        };
+        if !shaping_stage(stage) {
+            break;
+        }
+        text = head.trim_end();
+    }
+    text.to_string()
+}
+
+/// Whether one `|` stage only shapes what a command's reader sees: `cat`,
+/// `head -N`, `tail -N`, spelled exactly so. Anything else — a program, a
+/// `wc`, a `head -n 5`, an empty stage — is a real change and stays.
+fn shaping_stage(stage: &str) -> bool {
+    let stage = stage.trim();
+    if stage == "cat" {
+        return true;
+    }
+    let Some(rest) = stage
+        .strip_prefix("head")
+        .or_else(|| stage.strip_prefix("tail"))
+    else {
+        return false;
+    };
+    let Some(count) = rest.trim_start().strip_prefix('-') else {
+        return false;
+    };
+    !count.is_empty() && count.bytes().all(|byte| byte.is_ascii_digit())
+}
+
+/// [`command_ask`]'s `cd` rule, on its own so both halves can be pinned: the
+/// root's own leading `cd <root> &&` goes, and any other `cd` stays — a second
+/// `cd`, one behind another command, one whose directory is not the root, and
+/// one with no `&&` after it.
+fn strip_cd(command: &str, root: &Path) -> String {
+    let Some(rest) = command.trim_start().strip_prefix("cd ") else {
+        return command.to_string();
+    };
+    let Some((dir, tail)) = rest.split_once("&&") else {
+        return command.to_string();
+    };
+    // `Path` comparison is component-wise, so a trailing slash on the root is
+    // the same directory, and a model's own spelling of a *different* path is
+    // left alone with the whole line.
+    if Path::new(dir.trim()) != root {
+        return command.to_string();
+    }
+    let tail = tail.trim();
+    if tail.is_empty() {
+        return command.to_string();
+    }
+    tail.to_string()
+}
+
+/// A spawn's ask: the brief's first line — the task, one row, the same reading
+/// the tree's row title derives from. The title a caller chose is not the ask:
+/// it names the row, and the row already wears it.
+fn brief_ask(args: &Value) -> String {
+    brief_arg(args)
+        .map(|brief| first_line(&brief))
+        .unwrap_or_default()
+}
+
+/// `control`'s ask: `#4 stop "the words"`, the same reading the label paints
+/// with the quoted text shown whole (the painter owns the columns).
+fn control_ask(args: &Value) -> String {
+    control_arg(args, None).unwrap_or_default()
+}
+
+/// `edited {path}` / `edited {path} — {3} edits`: the outcome is the count
+/// alone — the path is already in the ask — and one edit is spelled `1 hunk`,
+/// not `1 hunks`.
+fn edit_outcome(ok: Option<&str>) -> Option<CallOutcome> {
+    let text = ok?.trim_end();
+    let count = text
+        .split_once(" — ")
+        .and_then(|(_, tail)| tail.strip_suffix(" edits"))
+        .and_then(|count| count.parse::<usize>().ok())
+        .unwrap_or(1);
+    Some(CallOutcome {
+        text: if count == 1 {
+            "1 hunk".to_string()
+        } else {
+            format!("{count} hunks")
+        },
+        tone: Tone::Ok,
+    })
+}
+
+/// A read's details: the file's own size, where the result names it — the total
+/// line count a window's trailer carries ([`read_total`]). A whole read has no
+/// row: its outcome already counts every line the file has, and mush's
+/// transcript carries no byte count of a file it read only a window of, so the
+/// size the outcome gives is the window's and not the file's. The file's own
+/// total is the fact the reader cannot otherwise see.
+fn read_details(ok: Option<&str>) -> Vec<String> {
+    match ok.map(read_total) {
+        Some(Some(total)) => vec![format!("of {}", count_label(total, "line"))],
+        _ => Vec::new(),
+    }
+}
+
+/// The file's own line count where a read's trailer names it: `[mush: lines
+/// 4–5 of 9 — read on with offset=6]` for a window, and `[mush: line 1 of 20 is
+/// longer than the cap …]` for a line the cap cut. The window's own count is
+/// the outcome's, so only the `of N` clause is read here.
+fn read_total(text: &str) -> Option<usize> {
+    for line in text.lines() {
+        let Some(rest) = line.trim_end().strip_prefix("[mush: ") else {
+            continue;
+        };
+        let Some((_, tail)) = rest.split_once(" of ") else {
+            continue;
+        };
+        let digits: String = tail.chars().take_while(char::is_ascii_digit).collect();
+        if !digits.is_empty() {
+            return digits.parse().ok();
+        }
+    }
+    None
+}
+
+/// A read's outcome: `{n} lines · {size}` over the window's own payload, the
+/// picture a read can hand back instead named as what it is, and the empty file
+/// as `empty`.
+fn read_outcome(ok: Option<&str>) -> Option<CallOutcome> {
+    let text = ok?.trim_end();
+    // An image: `read shots/x.png — a png image, 4198 bytes`.
+    if let Some(rest) = text.strip_prefix("read ") {
+        if let Some((_, facts)) = rest.split_once(" — a ") {
+            if let Some((format, size)) = facts.split_once(" image, ") {
+                let bytes = size
+                    .trim_end_matches(" bytes")
+                    .parse::<usize>()
+                    .unwrap_or_default();
+                return Some(CallOutcome {
+                    text: format!("a {format} image · {}", size_label(bytes)),
+                    tone: Tone::Ok,
+                });
+            }
+        }
+    }
+    // `{path} is empty`: nothing was read because there is nothing there.
+    if text.ends_with(" is empty") {
+        return Some(CallOutcome {
+            text: "empty".to_string(),
+            tone: Tone::Ok,
+        });
+    }
+    let payload = payload(text);
+    Some(CallOutcome {
+        text: format!(
+            "{} · {}",
+            count_label(payload.lines().count(), "line"),
+            size_label(payload.len())
+        ),
+        tone: Tone::Ok,
+    })
+}
+
+/// A write's outcome: what the file was and became — `new · 3 lines`, `41 lines
+/// → 3 lines` — read off the one sentence [`write_tool`] writes for each case.
+fn write_outcome(ok: Option<&str>) -> Option<CallOutcome> {
+    let text = ok?.trim_end();
+    let (_, tail) = text.split_once(" — ")?;
+    let text = if let Some(after) = tail.strip_suffix(" (new)") {
+        format!("new · {after}")
+    } else if tail.contains(" → ") {
+        tail.to_string()
+    } else if let Some((after, _)) = tail.split_once(" (replaced a text file past") {
+        format!("{after} · replaced past the read cap")
+    } else if let Some((after, _)) = tail.split_once(" (replaced a file that is not text)") {
+        format!("{after} · replaced a file that is not text")
+    } else {
+        first_line(tail)
+    };
+    Some(CallOutcome {
+        text,
+        tone: Tone::Ok,
+    })
+}
+
+/// A listing's details: `more than 400 files — list a narrower path` where the
+/// walk stopped at its own cap. The outcome already says `· more`; this names
+/// the number the cap was and the road around it, both of which the result's
+/// own note carries.
+fn list_details(ok: Option<&str>) -> Vec<String> {
+    let Some(text) = ok.map(str::trim_end) else {
+        return Vec::new();
+    };
+    match capped_note(text, "files") {
+        Some(cap) => vec![format!("more than {cap} files — list a narrower path")],
+        None => Vec::new(),
+    }
+}
+
+/// The count a result's own cap note names: `[mush: the first 400 files — …]`
+/// is `400`, and a note about anything else is `None`. One reader for the two
+/// tools whose walk stops at a cap, so the number and the noun cannot drift
+/// apart.
+fn capped_note(text: &str, what: &str) -> Option<usize> {
+    for line in text.lines() {
+        let Some(rest) = line.trim_end().strip_prefix("[mush: the first ") else {
+            continue;
+        };
+        let digits: String = rest.chars().take_while(char::is_ascii_digit).collect();
+        if digits.is_empty() || !rest[digits.len()..].trim_start().starts_with(what) {
+            continue;
+        }
+        return digits.parse().ok();
+    }
+    None
+}
+
+/// A listing's outcome: how many names came back — `12 files`, `1 file` — with
+/// `· more` where the walk stopped at its own cap, and the empty listing's own
+/// sentence when there was nothing to name.
+fn list_outcome(ok: Option<&str>) -> Option<CallOutcome> {
+    let text = ok?.trim_end();
+    if text.ends_with(": no files") {
+        return Some(CallOutcome {
+            text: "no files".to_string(),
+            tone: Tone::Ok,
+        });
+    }
+    let payload = payload(text);
+    let files = payload.lines().filter(|line| !line.is_empty()).count();
+    Some(CallOutcome {
+        text: if files == 0 {
+            "no files".to_string()
+        } else {
+            let mut named = count_label(files, "file");
+            if text.contains("[mush: the first ") {
+                named.push_str(" · more");
+            }
+            named
+        },
+        tone: Tone::Ok,
+    })
+}
+
+/// A search's outcome: `7 hits · 3 files` over the match lines — a hit is one
+/// match line and a file is one distinct path among them — with `· more` where
+/// the walk stopped at its cap, and a miss as `no match` rather than the whole
+/// sentence (the pattern and the path are already in the ask).
+fn search_outcome(ok: Option<&str>) -> Option<CallOutcome> {
+    let text = ok?.trim_end();
+    if text.starts_with("no match for `") {
+        return Some(CallOutcome {
+            text: "no match".to_string(),
+            tone: Tone::None,
+        });
+    }
+    let (hits, files) = search_hits(text);
+    let mut outcome = format!(
+        "{} · {}",
+        count_label(hits, "hit"),
+        count_label(files.len(), "file")
+    );
+    if text.contains("[mush: the first ") {
+        outcome.push_str(" · more");
+    }
+    Some(CallOutcome {
+        text: outcome,
+        tone: Tone::Ok,
+    })
+}
+
+/// A search's details: which files the hits landed in — the fact a counted
+/// outcome cannot carry, and the first thing a reader wants before opening one.
+/// A miss has no names to give, and a hit line the reader cannot name a file
+/// from (a line the cap cut mid-match) is not a file to invent.
+fn search_details(ok: Option<&str>) -> Vec<String> {
+    let Some(text) = ok.map(str::trim_end) else {
+        return Vec::new();
+    };
+    if text.starts_with("no match for `") {
+        return Vec::new();
+    }
+    let (hits, files) = search_hits(text);
+    if hits == 0 || files.is_empty() {
+        return Vec::new();
+    }
+    vec![format!(
+        "{} in {}",
+        count_label(hits, "hit"),
+        files.join(", ")
+    )]
+}
+
+/// The hits and the distinct files of a search's payload, in one walk: a hit is
+/// one non-empty match line, and a file is one distinct path among them, in
+/// sorted order so two readings of the same result read the same.
+fn search_hits(text: &str) -> (usize, Vec<String>) {
+    let payload = payload(text);
+    let hits = payload.lines().filter(|line| !line.is_empty()).count();
+    let mut files: Vec<String> = payload
+        .lines()
+        .filter_map(match_file)
+        .map(str::to_string)
+        .collect();
+    files.sort_unstable();
+    files.dedup();
+    (hits, files)
+}
+
+/// The file a search match line names: `path:line: text`. The separator is the
+/// first `:` a line number follows — not the last one — because a path may hold
+/// a colon and a match line's own text may hold many.
+fn match_file(line: &str) -> Option<&str> {
+    for (at, byte) in line.bytes().enumerate() {
+        if byte != b':' {
+            continue;
+        }
+        let rest = &line[at + 1..];
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && rest.as_bytes().get(digits) == Some(&b':') {
+            return Some(&line[..at]);
+        }
+    }
+    None
+}
+
+/// A command's outcome, read off the report's closing note: `exit 0 · 41 lines
+/// · 5s`, `killed by signal 9`, `cancelled`, `timed out after 120s`. The line
+/// count is the payload's own — the command's output, with the end note and
+/// every `[mush: …]` trailer left out — and a command that printed nothing has
+/// no line clause, because `0 lines` is a number that says nothing.
+///
+/// A command handed to the job registry builds no report at all
+/// ([`detached_line`]), so its outcome is that handover and there is no exit
+/// clause to read: the job is where the end will be said.
+fn command_outcome(ok: Option<&str>) -> Option<CallOutcome> {
+    let text = ok?.trim_end();
+    let note = text
+        .lines()
+        .rev()
+        .find_map(|line| end_note_of(line.trim_end()))?;
+    // The notes and the time they carry. The timeout's sentence already names
+    // how long the command was *given*, so it is read whole and never grows the
+    // call's own time; the arms that carry no duration of their own read the
+    // ` after 5s` clause `end_note` appends.
+    let (mut outcome, tone, duration) = if note.starts_with("timed out after ") {
+        (note.to_string(), Tone::Alert, None)
+    } else if let Some(job) = note.strip_prefix("still running — detached as ") {
+        let job = job.split(';').next().unwrap_or("").trim();
+        (format!("detached as {job}"), Tone::Running, None)
+    } else if note.starts_with("killed: ") || note.starts_with("no exit status") {
+        (note.to_string(), Tone::Alert, None)
+    } else if note.starts_with("ran ") && note.contains("could not become a job") {
+        ("could not become a job".to_string(), Tone::Alert, None)
+    } else {
+        let (head, duration) = match note.split_once(" after ") {
+            Some((head, tail)) => (head, Some(tail)),
+            None => (note, None),
+        };
+        let (outcome, tone) = match head {
+            // `[exit 0]`: the code is the command's own, and only `0` is a clean
+            // end.
+            head if head.starts_with("exit ") => (
+                head.to_string(),
+                if head == "exit 0" {
+                    Tone::Ok
+                } else {
+                    Tone::Alert
+                },
+            ),
+            "cancelled" => ("cancelled".to_string(), Tone::Warn),
+            // A signal death is not an exit code ([`end_note`]'s own rule).
+            head if head.starts_with("killed by signal ") => (head.to_string(), Tone::Alert),
+            head => (head.to_string(), Tone::None),
+        };
+        (outcome, tone, duration)
+    };
+    let payload = payload(text);
+    let lines = payload.lines().count();
+    if lines > 0 {
+        outcome.push_str(&format!(" · {}", count_label(lines, "line")));
+    }
+    if let Some(duration) = duration {
+        outcome.push_str(&format!(" · {duration}"));
+    }
+    Some(CallOutcome {
+        text: outcome,
+        tone,
+    })
+}
+
+/// A command's details: the stderr a report carries, counted — `stderr 12
+/// lines`. The report's stdout is the outcome's own line count; stderr is the
+/// half those lines do not count, and a command that wrote none gets no row.
+fn command_details(ok: Option<&str>) -> Vec<String> {
+    match ok.map(stderr_lines) {
+        Some(Some(lines)) => vec![format!("stderr {}", count_label(lines, "line"))],
+        _ => Vec::new(),
+    }
+}
+
+/// How many lines a command report's stderr section holds: the lines between
+/// the `--- stderr ---` marker [`command_report`] writes and the report's own
+/// end note, which is mush's sentence and not the command's output. `None`
+/// where there is no section at all, and a section mush never writes empty.
+fn stderr_lines(text: &str) -> Option<usize> {
+    let lines: Vec<&str> = text.trim_end().lines().collect();
+    let at = lines
+        .iter()
+        .position(|line| line.trim_end() == "--- stderr ---")?;
+    // The end note — and the group clause appended to it — closes the report;
+    // anything before it is the section's own text.
+    let mut end = lines.len();
+    while end > at + 1 && note_line(lines[end - 1].trim_end()) {
+        end -= 1;
+    }
+    (end > at + 1).then(|| end - at - 1)
+}
+
+/// A spawn's details: where the child's checkout is. The result names the
+/// branch; the worktree is the harness's own convention for the same id
+/// ([`git::worktree_rel`]), and it is a fact the parent needs the moment it
+/// wants to look at the child's files. A child that shares this workspace is
+/// `#185 spawned` — no branch, no worktree — and gets no row rather than an
+/// invented path.
+fn spawn_details(ok: Option<&str>) -> Vec<String> {
+    let Some(text) = ok.map(str::trim_end) else {
+        return Vec::new();
+    };
+    let Some(rest) = text.strip_prefix("spawned agent ") else {
+        return Vec::new();
+    };
+    let Some(id) = rest.split_whitespace().next() else {
+        return Vec::new();
+    };
+    if !rest[id.len()..].trim_start().starts_with("on ") {
+        return Vec::new();
+    }
+    let Ok(id) = id.trim_start_matches('#').parse::<u64>() else {
+        return Vec::new();
+    };
+    vec![format!(
+        "{} · {}",
+        git::branch_name(id),
+        git::worktree_rel(id)
+    )]
+}
+
+/// A spawn's outcome: where the child was put. `#185 on mush/185` is the
+/// branch the spawn result names, and `#185 spawned` is a child in this
+/// workspace, which has no branch of its own.
+///
+/// The child's live phase is deliberately **not** invented here: the tree owns
+/// it, a result cannot carry it, and a digest that said `working` from a
+/// transcript would be a lie the moment the child stopped. A pane that ever
+/// threads the tree's phases in could read them; the transcript alone reads the
+/// branch.
+fn spawn_outcome(ok: Option<&str>) -> Option<CallOutcome> {
+    let text = ok?.trim_end();
+    let rest = text.strip_prefix("spawned agent ")?;
+    let id = rest.split_whitespace().next()?;
+    let after = rest[id.len()..].trim_start();
+    let text = match after.strip_prefix("on ") {
+        Some(rest) => {
+            let branch = rest.split_whitespace().next().unwrap_or("");
+            format!("{id} on {branch}")
+        }
+        None => format!("{id} spawned"),
+    };
+    Some(CallOutcome {
+        text,
+        tone: Tone::Running,
+    })
+}
+
+/// A listing of what an agent owns, counted by section: `2 agents · 1 job`,
+/// plus `· 1 unread` for each `✉` row — a result nobody has read yet. A
+/// section with no rows is left out, and a listing with no sections at all is
+/// its own sentence.
+///
+/// The `✉` is the listing's own mark and the count is its own rows; nothing
+/// here guesses a *phase*, which lives in the tree and not in the listing.
+fn status_outcome(ok: Option<&str>) -> Option<CallOutcome> {
+    let text = ok?.trim_end();
+    if text.starts_with("no children and no jobs") {
+        return Some(CallOutcome {
+            text: "no children and no jobs".to_string(),
+            tone: Tone::None,
+        });
+    }
+    #[derive(PartialEq)]
+    enum Section {
+        None,
+        Agents,
+        Jobs,
+    }
+    let mut section = Section::None;
+    let (mut agents, mut jobs, mut unread) = (0usize, 0usize, 0usize);
+    let mut live = false;
+    for line in text.lines() {
+        match line.trim_end() {
+            "agents:" => {
+                section = Section::Agents;
+                continue;
+            }
+            "jobs:" => {
+                section = Section::Jobs;
+                continue;
+            }
+            _ => {}
+        }
+        // A job's window is indented under its headline; it is part of the row
+        // above and not a row of its own.
+        if line.starts_with(' ') {
+            continue;
+        }
+        let running = line.contains(" running");
+        match section {
+            Section::Agents => {
+                agents += 1;
+                unread += usize::from(line.contains('✉'));
+                live |= running;
+            }
+            Section::Jobs => {
+                jobs += 1;
+                live |= running;
+            }
+            Section::None => {}
+        }
+    }
+    let mut outcome = Vec::new();
+    if agents > 0 {
+        outcome.push(count_label(agents, "agent"));
+    }
+    if jobs > 0 {
+        outcome.push(count_label(jobs, "job"));
+    }
+    if unread > 0 {
+        outcome.push(format!("{unread} unread"));
+    }
+    Some(CallOutcome {
+        text: outcome.join(" · "),
+        tone: if live { Tone::Running } else { Tone::None },
+    })
+}
+
+/// A listing's details: one row per child and per job, `#1 running`,
+/// `#2 done`, `#c1 running` — the ids and their state words, which a counted
+/// outcome cannot carry and a parent steering a tree needs. The rows are read
+/// exactly as [`status_outcome`] reads them: each section's head is not a row,
+/// and a job's indented window is part of the headline above it. An ending
+/// whose state word is not one the listing's own vocabulary names is skipped
+/// rather than guessed.
+fn status_details(ok: Option<&str>) -> Vec<String> {
+    let Some(text) = ok.map(str::trim_end) else {
+        return Vec::new();
+    };
+    let mut rows = Vec::new();
+    let mut listing = false;
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.starts_with(' ') {
+            continue;
+        }
+        if line == "agents:" || line == "jobs:" {
+            listing = true;
+            continue;
+        }
+        if !listing {
+            continue;
+        }
+        let Some((id, rest)) = line.split_once(' ') else {
+            continue;
+        };
+        if !id.starts_with('#') {
+            continue;
+        }
+        // The `✉` is the listing's own unread mark, not part of the state word.
+        let rest = rest.trim_start().trim_start_matches('✉').trim_start();
+        if let Some(state) = state_word(rest) {
+            rows.push(format!("{id} {state}"));
+        }
+    }
+    rows
+}
+
+/// The state word a listing row's own words open with: the glyph the fold and
+/// the tree print (`◐`, `✓`, `✗`, `⊘`, `⚠`) or the word itself. This is the
+/// listing's vocabulary and no other's — a row that opens with neither is
+/// nobody's state, and reads as no row at all.
+fn state_word(rest: &str) -> Option<&'static str> {
+    for (mark, word) in [
+        ('◐', "running"),
+        ('✓', "done"),
+        ('✗', "failed"),
+        ('⊘', "stopped"),
+        ('⚠', "cut off"),
+    ] {
+        if rest.starts_with(mark) {
+            return Some(word);
+        }
+    }
+    [
+        "running", "done", "failed", "stopped", "cut off", "killed", "ended",
+    ]
+    .into_iter()
+    .find(|word| rest.starts_with(*word))
+}
+
+/// A `control`'s details: the aside behind the first sentence, where the result
+/// carries one — a child that was parked, an actor that is gone. It is the
+/// qualification the outcome's tone alone cannot spell, and a delivery with no
+/// aside gets no row.
+fn control_details(ok: Option<&str>) -> Vec<String> {
+    let Some(text) = ok.map(str::trim_end) else {
+        return Vec::new();
+    };
+    let Some((_, aside)) = text.split_once(" — ") else {
+        return Vec::new();
+    };
+    let aside = first_line(aside);
+    if aside.is_empty() {
+        Vec::new()
+    } else {
+        vec![aside]
+    }
+}
+
+/// A `control`'s outcome: `#1 stopping`, `#1 messaged`, and the job that had
+/// already ended answering with its own line. An aside after the first sentence
+/// — a parked actor, one whose actor is gone — is not the ordinary delivery, so
+/// it wears the warning yellow; the ordinary asides (a mid-run child that will
+/// read the words at its next step) do not.
+fn control_outcome(ok: Option<&str>) -> Option<CallOutcome> {
+    let text = ok?.trim_end();
+    let (head, aside) = match text.split_once(" — ") {
+        Some((head, aside)) => (head, Some(aside)),
+        None => (text, None),
+    };
+    let (text, tone) = if let Some(id) = head.strip_prefix("stopping agent ") {
+        (format!("{id} stopping"), Tone::Ok)
+    } else if let Some(id) = head.strip_prefix("messaged agent ") {
+        (format!("{id} messaged"), Tone::Ok)
+    } else if let Some(id) = head.strip_prefix("stopping job ") {
+        (format!("{id} stopping"), Tone::Ok)
+    } else if let Some(ending) = line_ending(head) {
+        (ending.text, ending.tone)
+    } else {
+        (first_line(head), Tone::Ok)
+    };
+    let unsettled =
+        aside.is_some_and(|aside| aside.contains("actor is gone") || aside.contains("was parked"));
+    Some(CallOutcome {
+        text,
+        tone: if unsettled { Tone::Warn } else { tone },
+    })
+}
+
+/// A `wait`'s outcome, read off the sentence that ended it: a delivered child's
+/// report (`#185 done`), a delivered job's line (`#c2 done`), the words that
+/// outranked the wait (`user spoke`, `parent spoke`), the machine's hold, or
+/// A `wait`'s details: which of the agent's own things the delivered line came
+/// from — `from #185`. Only a result the wait handed over names a source: the
+/// machine's sentences, the words that outranked the wait and mush's own
+/// `nothing to wait for` are nobody's line, and get no row.
+fn wait_details(ok: Option<&str>) -> Vec<String> {
+    let Some(text) = ok.map(str::trim_end) else {
+        return Vec::new();
+    };
+    let line = text.lines().next().unwrap_or("").trim_end();
+    if line_ending(line).is_none() {
+        return Vec::new();
+    }
+    let Some((id, _)) = line.split_once(' ') else {
+        return Vec::new();
+    };
+    vec![format!("from {id}")]
+}
+
+/// `nothing to wait for`, which is mush's own sentence and stays word for word.
+///
+/// The answer's *first line* is what is read: a wait that times out hands over
+/// what it has and then names what it is still waiting on, and the result is
+/// what the wait was for.
+fn wait_outcome(ok: Option<&str>) -> Option<CallOutcome> {
+    let text = ok?.trim_end();
+    let line = text.lines().next().unwrap_or("").trim_end();
+    if line.starts_with("interrupted — the human wrote to you") {
+        return Some(CallOutcome {
+            text: "user spoke".to_string(),
+            tone: Tone::Ok,
+        });
+    }
+    if line.starts_with("interrupted — your parent sent you a message") {
+        return Some(CallOutcome {
+            text: "parent spoke".to_string(),
+            tone: Tone::Ok,
+        });
+    }
+    if line.starts_with("nothing to wait for") {
+        return Some(CallOutcome {
+            text: "nothing to wait for".to_string(),
+            tone: Tone::None,
+        });
+    }
+    if let Some(rest) = line.strip_prefix("wait timed out — ") {
+        let rest = rest.split(';').next().unwrap_or(rest).trim();
+        let text = if rest.contains("still holds the machine") {
+            "the machine is held".to_string()
+        } else {
+            rest.to_string()
+        };
+        return Some(CallOutcome {
+            text,
+            tone: Tone::Running,
+        });
+    }
+    if line.starts_with("the machine is free now") {
+        return Some(CallOutcome {
+            text: "the machine is free".to_string(),
+            tone: Tone::Ok,
+        });
+    }
+    if line.starts_with("the machine is still held by") {
+        return Some(CallOutcome {
+            text: "the machine is held".to_string(),
+            tone: Tone::Running,
+        });
+    }
+    // Everything else a wait hands over is a result's own line: `#185 done: …`,
+    // `#c2 done: exit 0 · 3m12s · …`.
+    if let Some(ending) = line_ending(line) {
+        return Some(ending);
+    }
+    Some(CallOutcome {
+        text: first_line(line),
+        tone: Tone::None,
+    })
+}
+
+/// The id and the verb a delivered result's line opens with: `#185 done`,
+/// `#c2 done`, `#3 stopped`, `#c1 killed`, `#2 cut off`, `#1 failed`. The glyph
+/// a repeat `wait` answers with ([`Outcome::digest`]'s `✓ ✗ ⊘ ⚠`) is the same
+/// verb and reads the same way.
+fn line_ending(line: &str) -> Option<CallOutcome> {
+    let (id, rest) = line.split_once(' ')?;
+    if !id.starts_with('#') {
+        return None;
+    }
+    // A glyph outranks the words it replaced: `#1 ✓ wrote the lexer` is a
+    // finish, and `wrote` is the summary's first word, not the verb.
+    let (verb, tone) = match rest.chars().next() {
+        Some('✓') => ("done", Tone::Ok),
+        Some('✗') => ("failed", Tone::Alert),
+        Some('⊘') => ("stopped", Tone::Warn),
+        Some('⚠') => ("cut off", Tone::Warn),
+        _ if rest.starts_with("done") => ("done", Tone::Ok),
+        _ if rest.starts_with("failed") => ("failed", Tone::Alert),
+        _ if rest.starts_with("stopped") => ("stopped", Tone::Warn),
+        _ if rest.starts_with("cut off") => ("cut off", Tone::Warn),
+        _ if rest.starts_with("killed") => ("killed", Tone::Alert),
+        _ if rest.starts_with("ended") => ("ended", Tone::None),
+        _ => (rest.split_whitespace().next().unwrap_or(""), Tone::None),
+    };
+    Some(CallOutcome {
+        text: format!("{id} {verb}").trim_end().to_string(),
+        tone,
+    })
+}
+
+/// The payload of a result: its lines minus mush's own trailing notes. A
+/// `[mush: …]` line is a sentence about the result and not content of it, and
+/// the same goes for a command report's end note (`[exit 0]`, `[cancelled]`, the
+/// group clause behind it) — a line count that counted them would say a silent
+/// command printed one line.
+fn payload(result: &str) -> String {
+    let result = result.trim_end();
+    let mut lines: Vec<&str> = result.split('\n').collect();
+    while lines.last().is_some_and(|line| note_line(line.trim_end())) {
+        lines.pop();
+    }
+    lines.join("\n")
+}
+
+/// Whether a whole line of a result is mush's own note rather than the tool's
+/// content: a `[mush: …]` trailer, one of the bracketed end notes a command's
+/// report closes with ([`end_note`], the handover line), or the group clause
+/// [`run_shell`] appends behind one. The test is on the *start* of the line
+/// because a group clause is appended to the end note without a newline between
+/// them.
+fn note_line(line: &str) -> bool {
+    if line.starts_with("[mush: ") {
+        return true;
+    }
+    if end_note_of(line).is_some() {
+        return true;
+    }
+    line.starts_with('[')
+        && (line.contains("in its group") || line.contains("could not end its process group"))
+}
+
+/// The first bracketed note of a line — `[exit 0 after 5s]` is `exit 0 after
+/// 5s` — where the line opens with one. A group clause follows the end note on
+/// the same line, so only the first bracket is ever a note.
+fn note_of(line: &str) -> Option<&str> {
+    line.strip_prefix('[')?.split(']').next()
+}
+
+/// [`command_outcome`]'s half that finds the end note: the closing note of a
+/// report, if this line is one. Its grammar is [`end_note`]'s own vocabulary
+/// plus the handover line, and a `[mush: …]` trailer is deliberately *not* one —
+/// it is a sentence about the payload, and it can follow the end note.
+fn end_note_of(line: &str) -> Option<&str> {
+    let inner = note_of(line)?;
+    (inner.starts_with("exit ")
+        || inner == "cancelled"
+        || inner.starts_with("timed out after ")
+        || inner.starts_with("killed")
+        || inner.starts_with("no exit status")
+        || inner.starts_with("still running — detached as ")
+        || inner.starts_with("ran ") && inner.contains("could not become a job"))
+    .then_some(inner)
+}
+
+/// `1 line` / `3 lines`, `1 hit` / `7 hits`, `1 file` / `400 files`, `1 agent` /
+/// `2 agents`: one count, spelled so a single one never reads `1 lines`.
+fn count_label(count: usize, noun: &str) -> String {
+    if count == 1 {
+        format!("1 {noun}")
+    } else {
+        format!("{count} {noun}s")
+    }
 }
 
 #[cfg(test)]
@@ -6955,6 +8149,622 @@ mod tests {
             "fix the parser"
         );
         assert_eq!(summarize(&json!({})), "");
+    }
+
+    /// One row of [`a_digest_for_every_tool`]'s table: the tool and its
+    /// arguments, the result it read, and what the digest reads off the pair.
+    type DigestCase = (
+        ToolName,
+        Value,
+        &'static str,
+        &'static str,
+        &'static str,
+        Tone,
+        &'static [&'static str],
+    );
+
+    /// A sample call and its result for every tool, read as the pane reads
+    /// them: the ask the call made, the outcome the result's own sentences
+    /// give, and the detail rows the unfolded view paints under it.
+    ///
+    /// The table is [`ToolName::ALL`]'s own list, so a tool that falls out of
+    /// it is caught here — and the digest itself has no wildcard arm, so a tool
+    /// *added* cannot build until it has a reading of its own.
+    #[test]
+    fn a_digest_for_every_tool() {
+        let root = Path::new("/w");
+        let cases: Vec<DigestCase> = vec![
+            (
+                ToolName::EditFile,
+                json!({"path": "src/lex.rs", "edits": [{}, {}, {}]}),
+                "edited src/lex.rs — 3 edits",
+                "src/lex.rs",
+                "3 hunks",
+                Tone::Ok,
+                // The ask names the file and the outcome counts the hunks:
+                // there is no third fact here to carry.
+                &[],
+            ),
+            (
+                ToolName::ReadFile,
+                json!({"path": "src/text.rs", "offset": 5, "limit": 3}),
+                "one\ntwo\nthree\n[mush: lines 5–7 of 20 — read on with offset=8]",
+                "src/text.rs 5→7",
+                "3 lines · 13 B",
+                Tone::Ok,
+                &["of 20 lines"],
+            ),
+            (
+                ToolName::WriteFile,
+                json!({"path": "src/lex.rs"}),
+                "wrote src/lex.rs — 3 lines (new)",
+                "src/lex.rs",
+                "new · 3 lines",
+                Tone::Ok,
+                &[],
+            ),
+            (
+                ToolName::ListFiles,
+                json!({"path": "src"}),
+                "src/a.rs\nsrc/b.rs\n[mush: the first 400 files — list a narrower path to see \
+                 the rest]",
+                "src",
+                "2 files · more",
+                Tone::Ok,
+                &["more than 400 files — list a narrower path"],
+            ),
+            (
+                ToolName::Search,
+                json!({"pattern": "column_widths", "path": "crates"}),
+                "crates/a.rs:1: let column_widths = 1;\ncrates/a.rs:2: let it be 2;\n\
+                 crates/b.rs:9: let column_widths = 3;",
+                "\"column_widths\" in crates",
+                "3 hits · 2 files",
+                Tone::Ok,
+                &["3 hits in crates/a.rs, crates/b.rs"],
+            ),
+            (
+                ToolName::RunCommand,
+                json!({"command": "cargo test"}),
+                "ok\nstill ok\n[exit 0 after 5s]",
+                "cargo test",
+                "exit 0 · 2 lines · 5s",
+                Tone::Ok,
+                &[],
+            ),
+            (
+                ToolName::SpawnAgent,
+                json!({"brief": "table layout fixes"}),
+                "spawned agent #185 on mush/185 at 1a2b3c4 · runs until it stops calling tools · \
+                 wait returns its summary",
+                "table layout fixes",
+                "#185 on mush/185",
+                Tone::Running,
+                &["mush/185 · .mush/wt/185"],
+            ),
+            (
+                ToolName::Status,
+                json!({}),
+                "agents:\n#1 ◐ running on mush/1\n#2 ✉ ✓ wrote the lexer\njobs:\n#c1 running 3s \
+                 · cargo test",
+                "",
+                "2 agents · 1 job · 1 unread",
+                Tone::Running,
+                &["#1 running", "#2 done", "#c1 running"],
+            ),
+            (
+                ToolName::Control,
+                json!({"id": "4", "action": "message", "text": "more"}),
+                "messaged agent #4 — it is mid-run, so it reads this at its next step",
+                "#4 message \"more\"",
+                "#4 messaged",
+                Tone::Ok,
+                &["it is mid-run, so it reads this at its next step"],
+            ),
+            (
+                ToolName::Wait,
+                json!({}),
+                "#185 done: the table is laid out",
+                "",
+                "#185 done",
+                Tone::Ok,
+                &["from #185"],
+            ),
+        ];
+        assert_eq!(cases.len(), ToolName::ALL.len(), "a row per tool");
+        for (name, args, result, ask, text, tone, details) in cases {
+            let facts = digest(name, &args, Some(result), root);
+            assert_eq!(facts.ask, ask, "{name:?}'s ask");
+            assert_eq!(
+                facts.outcome,
+                Some(CallOutcome {
+                    text: text.to_string(),
+                    tone,
+                }),
+                "{name:?}'s outcome"
+            );
+            assert_eq!(facts.details, details, "{name:?}'s details");
+        }
+    }
+
+    /// A call whose result has not landed has no outcome — and therefore no
+    /// arrow — while its ask is read the same as ever: the transcript cannot
+    /// know whether the call is still running, and inventing `working` from it
+    /// would be a lie the tree's phase already tells the truth about.
+    #[test]
+    fn a_call_with_no_result_yet_has_no_outcome() {
+        let facts = digest(
+            ToolName::RunCommand,
+            &json!({"command": "cargo test"}),
+            None,
+            Path::new("/w"),
+        );
+        assert_eq!(facts.ask, "cargo test");
+        assert_eq!(facts.outcome, None);
+        assert!(
+            facts.details.is_empty(),
+            "a call with no result has no facts either"
+        );
+    }
+
+    /// A shell line's output-shaping tail is not what the line ran: `2>&1`,
+    /// `2>/dev/null`, `| cat`, `| head -N` and `| tail -N` come off the ask —
+    /// any run of them — and the outcome's line count is the witness of what
+    /// they cost. Anything that changes *what ran* stays, because the ask would
+    /// otherwise be a lie about the command the transcript holds.
+    #[test]
+    fn the_ask_drops_the_output_shaping_tail() {
+        let root = Path::new("/w");
+        let command = |command: &str| {
+            digest(
+                ToolName::RunCommand,
+                &json!({"command": command}),
+                None,
+                root,
+            )
+            .ask
+        };
+        assert_eq!(command("cargo test 2>&1"), "cargo test");
+        assert_eq!(command("cargo test 2>/dev/null"), "cargo test");
+        assert_eq!(command("ls -la | head -5"), "ls -la");
+        assert_eq!(command("ls -la | tail -3"), "ls -la");
+        assert_eq!(command("cat log | cat"), "cat log");
+        assert_eq!(
+            command("cargo test 2>&1 | tail -40"),
+            "cargo test",
+            "the whole shaping tail goes, not one stage"
+        );
+        assert_eq!(
+            command("cargo test | head -5 | tail -2 | cat"),
+            "cargo test",
+            "a run of shaping stages goes"
+        );
+        assert_eq!(
+            command("cd /w && cargo test 2>&1 | tail -5"),
+            "cargo test",
+            "the `cd` and the shaping are one reading"
+        );
+        // What ran is not what shapes it: every one of these stays whole.
+        assert_eq!(command("ls | wc -l"), "ls | wc -l");
+        assert_eq!(command("ls > out.txt"), "ls > out.txt");
+        assert_eq!(command("ls | head -n 5"), "ls | head -n 5");
+        assert_eq!(command("ls | head"), "ls | head");
+        assert_eq!(command("ls | grep head"), "ls | grep head");
+        assert_eq!(
+            command("echo 'a | cat' && ls"),
+            "echo 'a | cat' && ls",
+            "a stage behind `&&` is not a trailing one"
+        );
+        assert_eq!(
+            command("cargo test && echo done"),
+            "cargo test && echo done"
+        );
+    }
+
+    /// A failed call is one sentence for every tool — the result's own first
+    /// line, red — and a cancellation, which is mush's doing and not a failure,
+    /// wears the warning yellow instead.
+    #[test]
+    fn a_failed_call_is_one_sentence_for_every_tool() {
+        let root = Path::new("/w");
+        let args = json!({"path": "src/a.rs"});
+        for name in ToolName::ALL {
+            let facts = digest(
+                name,
+                &args,
+                Some("error: the call was refused\nthe long explanation"),
+                root,
+            );
+            assert_eq!(
+                facts.outcome,
+                Some(CallOutcome {
+                    text: "error: the call was refused".to_string(),
+                    tone: Tone::Alert,
+                }),
+                "{name:?}'s failure"
+            );
+            assert!(
+                facts.details.is_empty(),
+                "{name:?}: a refused call has no facts to show"
+            );
+            let cancelled = digest(name, &args, Some("error: cancelled"), root);
+            assert_eq!(
+                cancelled.outcome,
+                Some(CallOutcome {
+                    text: "cancelled".to_string(),
+                    tone: Tone::Warn,
+                }),
+                "{name:?}'s cancellation"
+            );
+        }
+    }
+
+    /// The details are read off the result and never invented: a tool whose
+    /// result holds no second fact leaves the list empty, and every reader has
+    /// a road where there is nothing to say.
+    #[test]
+    fn the_details_only_say_what_the_result_holds() {
+        let root = Path::new("/w");
+        let details = |name: ToolName, args: Value, result: &str| {
+            digest(name, &args, Some(result), root).details
+        };
+        // A whole read names no total: its outcome already counts every line it
+        // read, and no sentence in the transcript weighs the whole file.
+        assert!(details(ToolName::ReadFile, json!({}), "one\ntwo").is_empty());
+        assert!(details(
+            ToolName::ReadFile,
+            json!({}),
+            "read shots/a.png — a png image, 4198 bytes"
+        )
+        .is_empty());
+        // A command that wrote no stderr: there is no section to count.
+        assert!(details(ToolName::RunCommand, json!({}), "ok\n[exit 0]").is_empty());
+        // A search that missed names no file to hit.
+        assert!(details(
+            ToolName::Search,
+            json!({}),
+            "no match for `x` under the workspace root"
+        )
+        .is_empty());
+        // A child that shares this workspace has no branch and no worktree.
+        assert!(details(
+            ToolName::SpawnAgent,
+            json!({}),
+            "spawned agent #185 · runs until it stops calling tools · wait returns its summary"
+        )
+        .is_empty());
+        // A wait the machine freed is nobody's result.
+        assert!(details(
+            ToolName::Wait,
+            json!({}),
+            "the machine is free now — #1's exclusive command ended"
+        )
+        .is_empty());
+        assert!(details(
+            ToolName::Wait,
+            json!({}),
+            "wait timed out — #185 still running"
+        )
+        .is_empty());
+        // An empty listing has no row to name.
+        assert!(details(ToolName::Status, json!({}), "no children and no jobs").is_empty());
+        // A delivery that carried no aside has nothing behind it.
+        assert!(details(ToolName::Control, json!({}), "stopping agent #4").is_empty());
+        // Edit and write carry no third fact, whatever their result says: the
+        // ask has the path and the outcome the change.
+        assert!(details(ToolName::EditFile, json!({}), "edited x — 1 edit").is_empty());
+        assert!(details(ToolName::WriteFile, json!({}), "wrote x — 3 lines (new)").is_empty());
+        // The stderr a report really carries: the section's own lines, with the
+        // report's end note left out of the count.
+        assert_eq!(
+            details(
+                ToolName::RunCommand,
+                json!({}),
+                "ok\n--- stderr ---\nwarning one\nwarning two\n[exit 0]"
+            ),
+            vec!["stderr 2 lines"]
+        );
+    }
+
+    /// A path is shown workspace-relative inside the root and as written
+    /// outside it, and a command's one redundant `cd <root> &&` goes — the
+    /// command already runs with the root as its cwd. Every other `cd` stays:
+    /// a second one, one behind another command, one naming a different
+    /// directory, and one with no `&&` after it.
+    #[test]
+    fn the_ask_shows_a_path_beside_the_root_and_a_command_without_its_cd() {
+        let root = Path::new("/w");
+        let ask = |args: Value| digest(ToolName::ReadFile, &args, None, root).ask;
+        assert_eq!(ask(json!({"path": "/w/src/a.rs"})), "src/a.rs");
+        assert_eq!(ask(json!({"path": "/w"})), ".");
+        assert_eq!(ask(json!({"path": "./src/a.rs"})), "src/a.rs");
+        assert_eq!(ask(json!({"path": "src/a.rs"})), "src/a.rs");
+        assert_eq!(ask(json!({"path": "/elsewhere/a.rs"})), "/elsewhere/a.rs");
+        // The window is arithmetic on the call's own arguments.
+        assert_eq!(
+            digest(
+                ToolName::ReadFile,
+                &json!({"path": "src/a.rs", "offset": 12}),
+                None,
+                root
+            )
+            .ask,
+            "src/a.rs 12→"
+        );
+        assert_eq!(
+            digest(
+                ToolName::ReadFile,
+                &json!({"path": "src/a.rs", "limit": 40}),
+                None,
+                root
+            )
+            .ask,
+            "src/a.rs 1→40"
+        );
+
+        let command = |command: &str| {
+            digest(
+                ToolName::RunCommand,
+                &json!({"command": command}),
+                None,
+                root,
+            )
+            .ask
+        };
+        assert_eq!(command("cd /w && cargo test -p mush"), "cargo test -p mush");
+        assert_eq!(command("cd /w/ && cargo test"), "cargo test");
+        assert_eq!(command("cd /tmp && ls"), "cd /tmp && ls");
+        assert_eq!(
+            command("mkdir -p x && cd /w && ls"),
+            "mkdir -p x && cd /w && ls"
+        );
+        assert_eq!(command("cd /w"), "cd /w");
+        assert_eq!(command("cd /w && "), "cd /w &&");
+        assert_eq!(command("ls -la"), "ls -la");
+        // A heredoc is one line in a label and one row in the log.
+        assert_eq!(command("cat > x <<EOF\nbody\nEOF"), "cat > x <<EOF");
+    }
+
+    /// A `wait`'s outcome is the sentence that ended it, and every ending the
+    /// tool can write is read: a delivered child's report and job's line, the
+    /// words that outranked the wait, the machine's hold, and mush's own
+    /// `nothing to wait for` word for word.
+    #[test]
+    fn a_wait_outcome_reads_the_sentence_that_ended_it() {
+        let root = Path::new("/w");
+        let wait = |result: &str| digest(ToolName::Wait, &json!({}), Some(result), root).outcome;
+        let expect = |text: &str, tone: Tone| {
+            Some(CallOutcome {
+                text: text.to_string(),
+                tone,
+            })
+        };
+        assert_eq!(wait("#185 done: wrote it"), expect("#185 done", Tone::Ok));
+        assert_eq!(
+            wait("#185 ✓ wrote it (123 chars total) (already read — no new run since)"),
+            expect("#185 done", Tone::Ok),
+            "a repeat wait answers with the child's digest, which is the same ending"
+        );
+        assert_eq!(
+            wait("#185 failed: no route"),
+            expect("#185 failed", Tone::Alert)
+        );
+        assert_eq!(
+            wait("#185 ⊘ stopped — idle and resumable (control message resumes it)"),
+            expect("#185 stopped", Tone::Warn)
+        );
+        assert_eq!(
+            wait("#185 ⚠ cut off — the run never ended; nothing was committed"),
+            expect("#185 cut off", Tone::Warn)
+        );
+        assert_eq!(
+            wait("#c2 done: exit 0 · 3m12s · cargo test — test result: ok"),
+            expect("#c2 done", Tone::Ok),
+            "a job's line is its own ending"
+        );
+        assert_eq!(
+            wait("#c1 killed by signal 9 · 2s · sleep 60"),
+            expect("#c1 killed", Tone::Alert)
+        );
+        assert_eq!(
+            wait(
+                "interrupted — the human wrote to you while you waited; it is in your \
+                 transcript. Answer it; use wait again when you need it."
+            ),
+            expect("user spoke", Tone::Ok)
+        );
+        assert_eq!(
+            wait(
+                "interrupted — your parent sent you a message while you waited; it is in your \
+                  transcript."
+            ),
+            expect("parent spoke", Tone::Ok)
+        );
+        assert_eq!(
+            wait(NOTHING_TO_WAIT_FOR),
+            expect("nothing to wait for", Tone::None)
+        );
+        assert_eq!(
+            wait("nothing to wait for: #185 is not running and has no result"),
+            expect("nothing to wait for", Tone::None),
+            "the targeted road says the same words"
+        );
+        assert_eq!(
+            wait("wait timed out — #185 still running"),
+            expect("#185 still running", Tone::Running)
+        );
+        assert_eq!(
+            wait(
+                "wait timed out — #1's exclusive command (cargo bench) still holds the machine; \
+                  nothing you can call ends it"
+            ),
+            expect("the machine is held", Tone::Running)
+        );
+        assert_eq!(
+            wait("the machine is still held by #1's exclusive command (cargo bench) — wait again"),
+            expect("the machine is held", Tone::Running)
+        );
+        assert_eq!(
+            wait(
+                "the machine is free now — #1's exclusive command (cargo bench) ended; the lock \
+                  is free for your next command"
+            ),
+            expect("the machine is free", Tone::Ok)
+        );
+        // A wait that times out hands over what it has and *then* names what it
+        // is still waiting on: the answer's first line is what the wait was for.
+        assert_eq!(
+            wait("#1 done: first\n#2 still running"),
+            expect("#1 done", Tone::Ok)
+        );
+    }
+
+    /// A command's outcome is its report's closing note: the exit code and the
+    /// duration the note carries, the signal, the cancel, the timeout — and the
+    /// payload's own line count, which counts the command's output and not
+    /// mush's notes. A command that printed nothing has no line clause at all.
+    #[test]
+    fn a_command_outcome_reads_its_end_note() {
+        let root = Path::new("/w");
+        let command =
+            |result: &str| digest(ToolName::RunCommand, &json!({}), Some(result), root).outcome;
+        let expect = |text: &str, tone: Tone| {
+            Some(CallOutcome {
+                text: text.to_string(),
+                tone,
+            })
+        };
+        assert_eq!(
+            command("out\n[exit 0]"),
+            expect("exit 0 · 1 line", Tone::Ok)
+        );
+        assert_eq!(command("[exit 101]"), expect("exit 101", Tone::Alert));
+        assert_eq!(
+            command("out\n[exit 0 after 5s]"),
+            expect("exit 0 · 1 line · 5s", Tone::Ok),
+            "the command's own time travels in the note and is read back out of it"
+        );
+        assert_eq!(
+            command("out\n[killed by signal 9]"),
+            expect("killed by signal 9 · 1 line", Tone::Alert)
+        );
+        assert_eq!(
+            command("out\n[cancelled]"),
+            expect("cancelled · 1 line", Tone::Warn)
+        );
+        assert_eq!(
+            command("out\n[timed out after 120s]"),
+            expect("timed out after 120s · 1 line", Tone::Alert)
+        );
+        assert_eq!(
+            command("out\n[no exit status: neither an exit code nor a signal]"),
+            expect(
+                "no exit status: neither an exit code nor a signal · 1 line",
+                Tone::Alert
+            )
+        );
+        // A command that ended with its group still standing: the clause is
+        // mush's own note too, and it is not a line of the command's output.
+        assert_eq!(
+            command("out\n[exit 0][2 processes in its group were stopped]"),
+            expect("exit 0 · 1 line", Tone::Ok)
+        );
+        // The handover: a command the registry took builds no report, so there
+        // is no exit clause — the job is where the end will be said.
+        assert_eq!(
+            command("[still running — detached as #c1; you will be told when it finishes]"),
+            expect("detached as #c1", Tone::Running)
+        );
+        // A `[mush: …]` line is never content either — and it can follow the
+        // end note, so the note is found by its own grammar and not by being
+        // the last line.
+        assert_eq!(
+            command("out\n[exit 0]\n[mush: the first 4096 bytes; the rest is in the file]"),
+            expect("exit 0 · 1 line", Tone::Ok)
+        );
+    }
+
+    /// The two results a read can hand back that have no line count: a picture
+    /// is named as what it is, and an empty file is `empty` — not `0 lines`.
+    #[test]
+    fn a_read_names_a_picture_and_an_empty_file() {
+        let root = Path::new("/w");
+        let read = |result: &str| {
+            digest(
+                ToolName::ReadFile,
+                &json!({"path": "x"}),
+                Some(result),
+                root,
+            )
+            .outcome
+        };
+        assert_eq!(
+            read("read shots/a.png — a png image, 4198 bytes"),
+            Some(CallOutcome {
+                text: "a png image · 4 KB".to_string(),
+                tone: Tone::Ok,
+            })
+        );
+        assert_eq!(
+            read("src/empty.rs is empty"),
+            Some(CallOutcome {
+                text: "empty".to_string(),
+                tone: Tone::Ok,
+            })
+        );
+    }
+
+    /// The digest's text is the model's own arguments, so it is defanged
+    /// exactly as the label is: an escape sequence in a path must not reach the
+    /// pane that paints the ask.
+    #[test]
+    fn an_ask_carries_no_escape_from_an_argument() {
+        let facts = digest(
+            ToolName::ReadFile,
+            &json!({"path": "src/\u{1b}]0;PWNED\u{7}main.rs"}),
+            None,
+            Path::new("/w"),
+        );
+        assert_eq!(facts.ask, "src/main.rs", "the escape sequence goes whole");
+        let facts = digest(
+            ToolName::Search,
+            &json!({"pattern": "a\u{1b}[2Jb", "path": "x\u{7}y"}),
+            None,
+            Path::new("/w"),
+        );
+        assert_eq!(facts.ask, "\"ab\" in xy");
+    }
+
+    /// [`call_digest`] is the raw-text road a transcript takes: the name and the
+    /// argument JSON as the model sent them. A name no tool answers to is still
+    /// read — the refusal's own sentence is its outcome — while a call whose
+    /// arguments are not JSON reads as the empty arguments every reader of a
+    /// broken call sees.
+    #[test]
+    fn a_call_digest_reads_the_raw_transcript_road() {
+        let root = Path::new("/w");
+        let facts = call_digest(
+            "read_file",
+            r#"{"path":"src/a.rs","offset":4,"limit":2}"#,
+            Some("x\n[mush: lines 4–5 of 9 — read on with offset=6]"),
+            root,
+        );
+        assert_eq!(facts.ask, "src/a.rs 4→5");
+        assert_eq!(facts.outcome.unwrap().text, "1 line · 1 B");
+        let unknown = call_digest(
+            "teleport",
+            r#"{"where":"home"}"#,
+            Some("error: unknown tool `teleport`"),
+            root,
+        );
+        assert_eq!(unknown.ask, "");
+        assert_eq!(
+            unknown.outcome,
+            Some(CallOutcome {
+                text: "error: unknown tool `teleport`".to_string(),
+                tone: Tone::Alert,
+            })
+        );
     }
 
     /// The label is painted raw — one span in the transcript, one activity line
@@ -9599,6 +11409,56 @@ mod tests {
             Duration::ZERO,
             "and nothing was waited for"
         );
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The command's own time reaches the model's result — and so the compact
+    /// log, which reads it back out of the note — through the end note. A
+    /// command that ran past a second says how long it ran, in the pane's own
+    /// spelling, on the clock the wait itself ran on; one that ended at once
+    /// says nothing, because `after 0s` on a command that just started is noise.
+    ///
+    /// This is the one fact of a command a transcript could not otherwise carry:
+    /// a message has no wall clock of its own.
+    #[test]
+    fn a_command_that_took_a_while_says_so_in_its_report() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script {
+            exits_after: Some(200),
+            ..Script::exits(0)
+        }));
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) =
+            scripted_tools_actor("took-a-while", machine.clone(), clock.clone());
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let scratch = Scratch::new("command-took-a-while");
+        let report = run_shell(
+            "true",
+            scratch.path(),
+            Duration::from_secs(5),
+            Detach::No,
+            &cancel,
+            &actor,
+            &mut state,
+        )
+        .unwrap();
+        assert_eq!(
+            report, "[exit 0 after 2s]",
+            "the note carries the command's own time"
+        );
+        assert_eq!(
+            clock.elapsed(),
+            Duration::from_secs(2),
+            "the clock the note was read off"
+        );
+        // And the compact log reads `exit 0 · 2s` back out of that note.
+        let facts = digest(
+            ToolName::RunCommand,
+            &json!({"command": "true"}),
+            Some(&report),
+            Path::new("/w"),
+        );
+        assert_eq!(facts.outcome.unwrap().text, "exit 0 · 2s");
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
@@ -15023,6 +16883,7 @@ mod tests {
     #[test]
     fn the_three_ways_a_foreground_command_ends_are_not_confusable() {
         let minute = Duration::from_secs(60);
+        let zero = Duration::ZERO;
         // A kill from outside the watcher: the process died of a signal, and
         // that is a cancel — not `[killed by signal 9]`, which is the kill's
         // own death and reads as somebody else's doing. This is the arm finding
@@ -15064,34 +16925,38 @@ mod tests {
         // — and the nameless end a platform with no exit status produces, which
         // no unix child can (refactor R15, finding H26).
         let notes = vec![
-            end_note(&Ended::Exited(0), minute, true, mush_core::CMD_CAP),
-            end_note(&Ended::Signalled(9), minute, true, mush_core::CMD_CAP),
+            end_note(&Ended::Exited(0), minute, true, mush_core::CMD_CAP, zero),
+            end_note(&Ended::Signalled(9), minute, true, mush_core::CMD_CAP, zero),
             end_note(
                 &Ended::Stopped(jobs::Stopped::TimedOut),
                 minute,
                 true,
                 mush_core::CMD_CAP,
+                zero,
             ),
             end_note(
                 &Ended::Stopped(jobs::Stopped::Cancelled),
                 minute,
                 true,
                 mush_core::CMD_CAP,
+                zero,
             ),
             end_note(
                 &Ended::Stopped(jobs::Stopped::TooMuchOutput),
                 minute,
                 true,
                 4_096,
+                zero,
             ),
             end_note(
                 &Ended::Stopped(jobs::Stopped::RanTooLong),
                 minute,
                 true,
                 mush_core::CMD_CAP,
+                zero,
             ),
-            end_note(&Ended::Detached, minute, true, mush_core::CMD_CAP),
-            end_note(&Ended::Unknown, minute, true, mush_core::CMD_CAP),
+            end_note(&Ended::Detached, minute, true, mush_core::CMD_CAP, zero),
+            end_note(&Ended::Unknown, minute, true, mush_core::CMD_CAP, zero),
         ];
         let mut unique = notes.clone();
         unique.sort();
@@ -15130,9 +16995,59 @@ mod tests {
             minute,
             false,
             mush_core::CMD_CAP,
+            zero,
         );
         assert!(full.contains("budget is full"), "{full}");
         assert!(!notes[2].contains("budget"), "{}", notes[2]);
+
+        // The command's own time is a clause of its end note where it is worth
+        // one: a run past a second says how long it ran, in the pane's own
+        // spelling, and a run under one stays word for word what it was — an
+        // `after 0s` on a command that just started would be noise.
+        assert_eq!(
+            end_note(
+                &Ended::Exited(0),
+                minute,
+                true,
+                mush_core::CMD_CAP,
+                Duration::from_millis(5_600),
+            ),
+            "[exit 0 after 5s]"
+        );
+        assert_eq!(
+            end_note(
+                &Ended::Signalled(9),
+                minute,
+                true,
+                mush_core::CMD_CAP,
+                Duration::from_secs(125),
+            ),
+            "[killed by signal 9 after 2m05s]"
+        );
+        assert_eq!(
+            end_note(
+                &Ended::Stopped(jobs::Stopped::Cancelled),
+                minute,
+                true,
+                mush_core::CMD_CAP,
+                Duration::from_millis(999),
+            ),
+            "[cancelled]",
+            "a sub-second run says nothing about its time"
+        );
+        // The arms that carry a duration of their own do not grow a second: a
+        // timeout already names how long the command was given.
+        assert!(
+            !end_note(
+                &Ended::Stopped(jobs::Stopped::TimedOut),
+                minute,
+                true,
+                mush_core::CMD_CAP,
+                Duration::from_secs(90),
+            )
+            .contains("after 1m30s"),
+            "the timeout names its own duration"
+        );
     }
 
     /// The quit half of finding S4, at the seam: a command killed from *outside*

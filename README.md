@@ -247,7 +247,7 @@ stale:
     Ctrl-N               start a new chat (a second press stops every agent, drops every transcript)
     Ctrl-P               model picker
     Ctrl-T               show or hide the model's reasoning
-    Ctrl-O               show or hide tool output, reports and briefs (a failure always shows)
+    Ctrl-O               the compact log: one line per tool call (a failure always shows)
     Ctrl-F               the focused pane takes the whole screen, and back
     Ctrl-Y               select the transcript: Enter copies, Esc leaves
     Tab / Shift-Tab      cycle panes (agents, chat)

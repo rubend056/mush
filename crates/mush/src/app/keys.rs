@@ -128,7 +128,7 @@ pub const KEYS: &[Binding] = &[
     Binding {
         context: Context::Anywhere,
         keys: "Ctrl-O",
-        help: "show or hide tool output, reports and briefs (a failure always shows)",
+        help: "the compact log: one line per tool call (a failure always shows)",
     },
     Binding {
         context: Context::Anywhere,
@@ -387,13 +387,15 @@ pub enum Intent {
     /// A view: the reasoning is already stored with the turn, so this changes
     /// what the pane paints and nothing else.
     ToggleReasoning,
-    /// Show or hide the *output* (`Ctrl-O`): a tool's result, mush's own report
-    /// about a child or a job, and the brief a child's pane opens with. A view
-    /// in [`Intent::ToggleReasoning`]'s sense: it is not said into the
-    /// transcript and not stored, the rows are still there and come back on the
-    /// next press, and a restart paints them again. The failure exemption is
-    /// the fold's, not this key's: a failed result's own row and a
-    /// `#1 failed: …` report stay in both states.
+    /// Show the compact log (`Ctrl-O`): one row per tool call — what it asked
+    /// and, on the pane's own grid, what came back ([`crate::app::call_grid`])
+    /// — with mush's own report about a child
+    /// or a job and another agent's words at one row each, so only what was
+    /// actually spoken keeps whole words. A view in [`Intent::ToggleReasoning`]'s
+    /// sense: it is not said into the transcript and not stored, the rows are
+    /// still there and come back on the next press, and a restart paints them
+    /// again. The failure exemption is the fold's, not this key's: a failed
+    /// result's own row and a `#1 failed: …` report stay in both states.
     ToggleOutput,
     /// Show or hide the zen view: the focused pane takes the whole screen
     /// (`Ctrl-F`). A view in the same sense as `Ctrl-T`'s: it changes what the

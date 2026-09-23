@@ -42,14 +42,20 @@
 //! terminal: width and height are arguments, the blank separator that closes a
 //! message is trimmed before the window is cut, every block that is not the
 //! human's own words or the model's reply is folded to its kind's number of rows
-//! ([`Fold`], with the `…` row that says what is hidden — or to none at all,
-//! while `Ctrl-O` hides the output), and the foot is capped and counted. `ui.rs` keeps the frame around it — the border, the prompt and the
-//! cursor — and paints what this returns, title included, because a pane one row
-//! tall has no row to spend on saying what it is hiding, or that the human has
-//! scrolled away from the bottom.
+//! ([`Fold`], with the `…` row that says what is hidden), and the `Ctrl-O` view is
+//! the compact log: a tool's result at no rows at all — the call's own line,
+//! `▤ read_file src/a.rs → 3 lines`, is the event ([`crate::agent::digest`]) —
+//! and mush's reports and another agent's words at one row each, with a blank
+//! closing only
+//! the messages that painted words of their own. The foot is capped and counted.
+//! `ui.rs` keeps the frame around it — the border, the prompt and the cursor — and
+//! paints what this returns, title included, because a pane one row tall has no
+//! row to spend on saying what it is hiding, or that the human has scrolled away
+//! from the bottom.
 
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use ratatui::style::{Color, Style};
@@ -61,7 +67,7 @@ use mush_core::session;
 use mush_core::text::{markdown_row_counts, truncate, wrap_text, wrap_text_capped};
 use mush_core::transcript;
 
-use crate::agent::summarize_args;
+use crate::agent::{call_digest, CallFacts, FAILED};
 use crate::app::image_label;
 use crate::app::keys::ChatKey;
 use crate::app::short_age;
@@ -797,7 +803,9 @@ fn last_row(rows: &[Option<(usize, Stop)>], message: usize, stop: Stop) -> Optio
 /// One past the last row of a chunk that is the reading of the message's own
 /// text. A window the pane's height cut *before* this row is hiding text; one
 /// cut at or after it has all the words on screen, whatever else it left below
-/// (the picture labels, the blank that closes a message).
+/// (the picture labels, and the blank that closes a message — where the message
+/// painted one: a block the fold hid, and a compact turn whose only rows are its
+/// call lines, paint no blank to close).
 fn last_text(chunk: &Chunk) -> usize {
     chunk
         .rows
@@ -935,22 +943,32 @@ pub struct Chat {
     /// voices, and the pane then reads the flags the lines carry
     /// ([`unrecorded`]).
     spoken: HashMap<AgentId, HashMap<usize, Voice>>,
-    /// Each painted tool call's one-word reading, keyed like [`Self::spoken`]:
-    /// the agent, then the index of the line it sits in, then the call's place
-    /// in that line's batch.
+    /// Each painted tool call's digest — the ask, the paired result's outcome,
+    /// and that result's detail rows ([`crate::agent::digest`]) — keyed like
+    /// [`Self::spoken`]: the agent, then the index of the line it sits in, then
+    /// the call's place in that line's batch. **Both views paint through this
+    /// one entry**: the digest row is the call's header in the unfolded view
+    /// too, and the compact log differs only in hiding the details and the
+    /// payload ([`call_grid`]).
     ///
-    /// A label shows at most [`LABEL_ARGS`] columns, but reading it is a full
-    /// parse of the model's argument JSON (`agent::summarize_args`), and that
-    /// JSON is unbounded — H45/H46 removed the caps on a `write_file`'s
-    /// `content` — so one 2 MB call cost 104.9 ms *per frame*, in a debug
-    /// build (finding A13). The argument text cannot change once the call is
-    /// recorded, so the reading is stored where the transcript it belongs to
-    /// lives, and dropped on the three roads [`Self::spoken`] is: a
-    /// replacement, a forget, a clear. An append moves no index and keeps it.
-    /// The value is already cut to [`LABEL_ARGS`] columns, the most any pane
-    /// can show, because a second cut to the pane's own budget is the same cut
-    /// the whole value would have taken.
-    summaries: RefCell<HashMap<AgentId, HashMap<usize, Vec<String>>>>,
+    /// The arguments are parsed once per call, on the first frame that paints
+    /// the call, because that parse is unbounded — H45/H46 removed the caps on
+    /// a `write_file`'s `content` — and one 2 MB call cost 104.9 ms *per frame*
+    /// in a debug build (finding A13). The *outcome* is the half whose answer
+    /// can change after that first frame — the result lands in a later message
+    /// — so an entry remembers how long the transcript was when it was read
+    /// ([`CachedCalls::at`]), and a call with no outcome yet is read again once
+    /// the transcript has grown. A message whose every call already has its
+    /// outcome is final and never re-parsed.
+    facts: RefCell<HashMap<AgentId, HashMap<usize, CachedCalls>>>,
+    /// The workspace root: what a digested path is shown relative to, and the
+    /// directory a command's redundant leading `cd` names
+    /// ([`crate::agent::digest`]). It is the agent *root's* workspace, which is
+    /// the application's — a subagent's pane paints its own transcript, whose
+    /// calls resolved in the child's worktree, but the transcript does not
+    /// store which workspace a call ran in, and the root's is the one path this
+    /// UI holds.
+    workspace: PathBuf,
     /// Each agent's transcript revision: a monotone counter of the changes the
     /// UI's copy of that agent has taken — one per appended line, one per
     /// wholesale replacement, and one per draft an attach client set. `read`
@@ -979,15 +997,16 @@ pub struct Chat {
     /// rather than in `App`, because every pane paints through this one
     /// transcript and the choice is about the reading, not about the frame.
     reasoning: bool,
-    /// Whether a pane paints the *output* kinds — a tool's result, mush's own
-    /// report about a child or a job, the brief a child's pane opens with.
+    /// Whether a pane paints the *shown* view — every block at its fold's
+    /// number — rather than the compact log (`Ctrl-O`): one line per tool call,
+    /// a report and another agent's words at one row each, and a result at none.
     ///
     /// A *view*, in the family of [`Self::reasoning`] and `App`'s zen
     /// (`Ctrl-F`), and shown by default: `Ctrl-O` changes only what the panes
     /// paint, so it is not said into the conversation and not stored — the rows
     /// are still in the transcript and come back on the next press, and a
     /// restart paints them again. It lives here, beside the transcript it
-    /// hides, for the same reason the reasoning view does: every pane paints
+    /// folds, for the same reason the reasoning view does: every pane paints
     /// through this one `Chat`, so one flip is every pane's. The fold's own
     /// rule — a failure is never what the fold gives up ([`Fold`]) — is what
     /// keeps a hidden failure visible; this flag knows nothing about it.
@@ -998,8 +1017,21 @@ pub struct Chat {
     fold: Fold,
 }
 
+/// Every tool call's digest in one message, and the length the agent's
+/// transcript had when the reading was taken.
+///
+/// The length is the staleness rule and nothing else: a result lands in a
+/// *later* message, so a reading taken while a call was still in flight has no
+/// outcome, and the entry is read again on the first frame after the transcript
+/// grew. An entry whose calls all have their outcomes cannot change — a recorded
+/// result is as immutable as the call — so it is never re-parsed.
+struct CachedCalls {
+    at: usize,
+    calls: Vec<CallFacts>,
+}
+
 impl Chat {
-    pub fn new(system: Message, root: Vec<Message>) -> Self {
+    pub fn new(system: Message, root: Vec<Message>, workspace: PathBuf) -> Self {
         Self {
             system,
             systems: HashMap::new(),
@@ -1012,7 +1044,8 @@ impl Chat {
             reading: HashMap::new(),
             select: None,
             spoken: HashMap::new(),
-            summaries: RefCell::new(HashMap::new()),
+            facts: RefCell::new(HashMap::new()),
+            workspace,
             revisions: HashMap::new(),
             pending: None,
             reasoning: true,
@@ -1038,10 +1071,11 @@ impl Chat {
         self.output
     }
 
-    /// `Ctrl-O`: show or hide the output kinds — a tool's result, mush's own
-    /// report about a child or a job, the brief a child's pane opens with. The
-    /// two states are the folded numbers and none, so the same key brings the
-    /// rows back exactly as they were.
+    /// `Ctrl-O`: show the compact log — a tool's result at no rows at all (the
+    /// call's own line is the event, and its outcome is read from the result's
+    /// own sentence), mush's own report about a child or a job and another
+    /// agent's words at one row each. The two states are two [`Fold`] values, so
+    /// the same key brings the rows back exactly as they were.
     ///
     /// A view, like [`Self::set_reasoning`]: not a change to the conversation
     /// and not a thing to say, and `clear` deliberately leaves it alone — the
@@ -1053,8 +1087,8 @@ impl Chat {
     }
 
     /// The fold this conversation's panes paint through: the conversation's own
-    /// numbers, with the output kinds at none while the human has hidden them
-    /// ([`Self::set_output`]).
+    /// numbers, or the compact log's ([`Fold::compact`]) while the human has
+    /// asked for it ([`Self::set_output`]).
     ///
     /// The one read for both roads that measure a block — the painter
     /// ([`Self::chunk`]) and the select mode's stop walk ([`Self::stops_at`]) —
@@ -1063,7 +1097,7 @@ impl Chat {
         if self.output {
             self.fold
         } else {
-            self.fold.without_output()
+            self.fold.compact()
         }
     }
 
@@ -1088,7 +1122,11 @@ impl Chat {
     /// An empty chat, for this module's own tests.
     #[cfg(test)]
     pub fn bare() -> Self {
-        Self::new(Message::system("you are mush"), Vec::new())
+        Self::new(
+            Message::system("you are mush"),
+            Vec::new(),
+            PathBuf::from("."),
+        )
     }
 
     /// The system prompt this conversation opens with. Every run is sent it
@@ -1249,7 +1287,7 @@ impl Chat {
                 voices.insert(index + 1, voice);
             }
         }
-        self.summaries.borrow_mut().remove(&agent);
+        self.drop_facts(agent);
         if let Some(Reading::Holding { up_to, .. }) = self.reading.get_mut(&agent) {
             if *up_to > from {
                 *up_to += 1;
@@ -1305,7 +1343,7 @@ impl Chat {
         // The readings are keyed by the indices of the transcript that just
         // went, exactly as the voices are: a stale one would label a message
         // with another call's arguments (see the field).
-        self.summaries.borrow_mut().remove(&agent);
+        self.drop_facts(agent);
         // A hold is a position in the transcript that just went, and a fold is
         // a new transcript: the pane reads it from the bottom (finding D15).
         self.reading.remove(&agent);
@@ -1463,7 +1501,7 @@ impl Chat {
         // mode that survives Ctrl-N would be a cursor over nothing.
         self.select = None;
         self.spoken.clear();
-        self.summaries.borrow_mut().clear();
+        self.facts.borrow_mut().clear();
         self.pending = None;
         // The road back goes with the conversation the loss was in: a Ctrl-N
         // that handed a keystroke a draft from the chat that just went would be
@@ -1521,7 +1559,7 @@ impl Chat {
         self.agents.remove(&agent);
         self.systems.remove(&agent);
         self.spoken.remove(&agent);
-        self.summaries.borrow_mut().remove(&agent);
+        self.drop_facts(agent);
         self.revisions.remove(&agent);
         self.reading.remove(&agent);
         self.notices.retain(|notice| notice.agent != agent);
@@ -2484,35 +2522,72 @@ impl Chat {
         (body, cut)
     }
 
-    /// The one-word reading of every tool call in one message, computed once
-    /// per call and kept for the life of the transcript entry.
+    /// Both views' reading of every tool call in one message: the ask, the
+    /// outcome of the result the transcript pairs with the call, and that
+    /// result's detail rows — computed once per call and kept.
     ///
-    /// This is the reading [`tool_label`] paints, and it is a full parse of the
-    /// argument JSON: the parse and the cut to the pane's columns are what cost
-    /// a frame, and the parse is by far the larger half (finding A13). The
-    /// argument text cannot change once the call is recorded, so the reading is
-    /// taken here, on the first frame that paints the call, and never again —
-    /// the field's own doc has the invalidation rules.
-    fn call_summaries(&self, on: AgentId, index: usize, message: &Message) -> Vec<String> {
-        let mut cached = self.summaries.borrow_mut();
+    /// The pairing is the transcript's own ([`Message::tool_call_id`]): the
+    /// result of a call is the `tool` line after it that carries the call's id,
+    /// never a neighbouring line's. The two are painted in *different*
+    /// messages, which is why the outcome cannot be read off the call's own
+    /// message: a call whose result has not landed reads as `None` and paints
+    /// no arrow — and that is the one entry not kept for good, because the
+    /// result lands in a message appended later ([`CachedCalls`]).
+    ///
+    /// The value is the whole reading, never cut to a budget: the pane that
+    /// paints it owns the columns ([`call_grid`]), and the reading is the same
+    /// at every width, which is what lets it be cached in the first place.
+    fn call_facts(&self, on: AgentId, index: usize, message: &Message) -> Vec<CallFacts> {
+        let transcript = self.transcript(on);
+        let mut cached = self.facts.borrow_mut();
         let by_index = cached.entry(on).or_default();
-        if let Some(read) = by_index.get(&index) {
-            return read.clone();
+        if let Some(entry) = by_index.get(&index) {
+            let settled = !entry.calls.iter().any(|call| call.outcome.is_none());
+            if settled || entry.at == transcript.len() {
+                return entry.calls.clone();
+            }
         }
-        let read: Vec<String> = message
+        let calls: Vec<CallFacts> = message
             .tool_calls()
             .iter()
-            .map(|call| truncate(&summarize_args(&call.function.arguments), LABEL_ARGS))
+            .map(|call| {
+                let result = result_for(transcript, index, &call.id);
+                call_digest(
+                    &call.function.name,
+                    &call.function.arguments,
+                    result,
+                    &self.workspace,
+                )
+            })
             .collect();
-        by_index.insert(index, read.clone());
-        read
+        by_index.insert(
+            index,
+            CachedCalls {
+                at: transcript.len(),
+                calls: calls.clone(),
+            },
+        );
+        calls
+    }
+
+    /// Drop an agent's digested tool calls: what they are keyed by — the
+    /// transcript's indices — or the calls behind them belong to a transcript
+    /// that has gone. The same four roads [`Self::spoken`] takes, taken beside
+    /// it, because the two are keyed by the same indices and one of them
+    /// labels the indices the other voices.
+    fn drop_facts(&self, agent: AgentId) {
+        self.facts.borrow_mut().remove(&agent);
     }
 
     /// One message's rows, with the message and stop each came from.
     fn chunk(&self, on: AgentId, index: usize, width: usize) -> Chunk {
         let message = &self.transcript(on)[index];
         let voice = self.voice_at(on, index, message);
-        let summaries = self.call_summaries(on, index, message);
+        let fold = self.painted_fold();
+        // The calls' own reading: one digest per call, which is the header row
+        // of both views — the unfolded one paints each result's details and
+        // payload under it, and the compact log hides both ([`call_grid`]).
+        let facts = self.call_facts(on, index, message);
         let mut lines = Vec::new();
         let rows = render_message(
             &mut lines,
@@ -2520,8 +2595,8 @@ impl Chat {
             voice,
             width,
             self.reasoning,
-            self.painted_fold(),
-            &summaries,
+            fold,
+            &facts,
         );
         debug_assert_eq!(lines.len(), rows.len(), "one map entry per painted row");
         Chunk {
@@ -2990,11 +3065,6 @@ const MIN_BODY: usize = 4;
 /// not forty lines of JSON (`docs/mush.md` §4.5 R4).
 const LABEL_ARGS: usize = 60;
 
-/// How a tool result that never happened is spelled. `agent.rs` prefixes every
-/// refused or failed call's result with exactly this (`format!("error: {error}")`),
-/// so a result either is one or merely starts like one.
-const FAILED: &str = "error:";
-
 /// One tool call's row: `  ⚙ name summarized-args`, budgeted to the pane.
 ///
 /// The arguments are what a path or a command is read from, so the columns they
@@ -3003,7 +3073,18 @@ const FAILED: &str = "error:";
 /// path was cut mid-word with the `…` that says so falling outside the border.
 /// The name is never the part that goes: a row too narrow for both keeps the
 /// name.
+/// The result a call is paired with: the first `tool` message after it that
+/// carries the call's id.
 ///
+/// The transcript stores the pairing ([`Message::tool_call_id`]), which is the
+/// only thing that can tell two calls' results apart: a turn may have several
+/// calls in flight at once, and their results come back in whatever order they
+/// finish. `None` is a call whose result has not landed yet.
+fn result_for<'a>(messages: &'a [Message], index: usize, id: &str) -> Option<&'a str> {
+    messages[index + 1..]
+        .iter()
+        .find(|message| message.tool_call_id.as_deref() == Some(id))
+        .map(Message::text)
 /// `summary` is the reading [`Chat::call_summaries`] remembers, and `None` — a
 /// caller painting a message without a `Chat` in hand — takes the same reading
 /// itself. Either way the reading is what `agent::summarize_args` gives, cut to
@@ -3371,11 +3452,11 @@ impl Kind {
 /// decision lives: how many rows, per [`Kind`] of block, a pane paints before
 /// the `…` row that stands for the rest.
 ///
-/// It is a *value* and not a `const` per arm. The `Ctrl-O` view holds one and
-/// sets it ([`Fold::without_output`]) — the output kinds go to no rows at all,
-/// and the same numbers come back on the next press — and a setting will later
-/// read the numbers from configuration, which is why they are here and not
-/// spelled at a paint site. `Chat` holds the one a conversation paints through
+/// It is a *value* and not a `const` per arm. The compact log holds one and
+/// sets it ([`Fold::compact`]) — the result kind goes to no rows at all, because
+/// the call's own line is the event — and a setting will later read the numbers
+/// from configuration, which is why they are here and not spelled at a paint
+/// site. `Chat` holds the one a conversation paints through
 /// ([`Chat::painted_fold`]).
 ///
 /// The numbers are **per kind** because the kinds are read differently. A tool
@@ -3423,15 +3504,22 @@ impl Fold {
         }
     }
 
-    /// The same fold with the output kinds at no rows at all — what a pane
-    /// paints through while the human has asked for the main model's words
-    /// alone (`Ctrl-O`): a tool's result, mush's own report about a child or a
-    /// job, and the brief a child's pane opens with. The reasoning is
-    /// deliberately untouched: it is not output, and `Ctrl-T` owns that block.
-    pub fn without_output(self) -> Self {
+    /// The compact log's numbers (`Ctrl-O`): a tool's result at **no rows at
+    /// all** — the call's own line is the event, and a result's `! error: …`
+    /// row is the one exception [`Fold::shown`] keeps — mush's own report about
+    /// a child or a job at one row, and another agent's words at one row, so a
+    /// command-only turn reads as one dense list and only what was spoken keeps
+    /// whole words (the human's lines and the model's reply, which the fold
+    /// never touches). The reasoning is deliberately untouched: it is not
+    /// output, and `Ctrl-T` owns that block.
+    ///
+    /// The same key brings the rows back because this is a value: the shown
+    /// state is [`Fold::DEFAULT`] and the compact one is this, and the view is
+    /// which of the two a pane paints ([`Chat::set_output`]).
+    pub fn compact(self) -> Self {
         self.with(Kind::Result, 0)
-            .with(Kind::Mush, 0)
-            .with(Kind::Brief, 0)
+            .with(Kind::Mush, 1)
+            .with(Kind::Brief, 1)
     }
 
     /// This fold's own number for `kind`, before [`Fold::shown`] adds the one
@@ -3441,16 +3529,16 @@ impl Fold {
     }
 
     /// Whether this fold gives `kind` no rows at all — the hidden half of the
-    /// `Ctrl-O` view ([`Fold::without_output`]). A block of such a kind paints
-    /// no `…` row either ([`folded_rows`]); its one exception is the failure
-    /// row [`Fold::shown`] never gives up.
+    /// compact log ([`Fold::compact`]). A block of such a kind paints no `…` row
+    /// either ([`folded_rows`]); its one exception is the failure row
+    /// [`Fold::shown`] never gives up.
     fn hides(self, kind: Kind) -> bool {
         self.number(kind) == 0
     }
 
     /// The same fold with one kind's number changed — how a view sets one: the
-    /// `Ctrl-O` key zeroes the output kinds through it at runtime
-    /// ([`Fold::without_output`]), and a setting will later read a number from
+    /// `Ctrl-O` key turns the result kind to none through it at runtime
+    /// ([`Fold::compact`]), and a setting will later read a number from
     /// configuration. The door is not test-only any more: the key is its first
     /// runtime caller, which is why the gate came off.
     pub fn with(mut self, kind: Kind, rows: usize) -> Self {
@@ -3715,10 +3803,14 @@ fn render_message(
     width: usize,
     reasoning: bool,
     fold: Fold,
-    summaries: &[String],
+    facts: &[CallFacts],
 ) -> Vec<Option<Stop>> {
     let start = out.len();
     let mut rows: Vec<Option<Stop>> = Vec::new();
+    // The compact log is the fold that gives the result kind no rows; it is also
+    // the view whose tool-call rows are the events, and the two facts are one
+    // (`Ctrl-O` is the whole of both).
+    let compact = fold.hides(Kind::Result);
     match message.role.as_str() {
         "user" => {
             // The mark is painted even for a message that is only an
@@ -3750,9 +3842,7 @@ fn render_message(
                 }
             }
             image_rows(out, message, width);
-            rows.resize(out.len() - start, None);
-            out.push(Line::from(""));
-            rows.push(None);
+            closing_blank(out, &mut rows, start);
         }
         "assistant" => {
             // The reasoning comes first because that is the order it decided
@@ -3762,6 +3852,7 @@ fn render_message(
             // fold, whose number for it is `usize::MAX`: what the human pressed
             // `Ctrl-T` to read is shown whole, and only a setting that lowers
             // the number makes it fold like any other block.
+            let words = out.len();
             if reasoning {
                 reasoning_rows(out, message, width, fold);
                 rows.resize(out.len() - start, None);
@@ -3781,17 +3872,42 @@ fn render_message(
                     View::Markdown,
                 );
             }
+            image_rows(out, message, width);
+            // Rule 2 of the closing blank: in the compact log a turn whose only
+            // painted rows are its call lines paints no blank, so consecutive
+            // command-only turns read as one dense list — the calls are the log.
+            // Every other compact turn (a reply, a thought, a picture) keeps its
+            // blank, and the shown view keeps the blank either way.
+            let spoke = out.len() > words;
             for (at, call) in message.tool_calls().iter().enumerate() {
+                let fallback;
+                let facts = match facts.get(at) {
+                    Some(facts) => facts,
+                    // A caller with no cache — the tests, and any future read of
+                    // a message on its own — reads the call the one way it can:
+                    // its own arguments, no result, and no workspace to trim a
+                    // path against.
+                    None => {
+                        fallback = call_digest(
+                            &call.function.name,
+                            &call.function.arguments,
+                            None,
+                            std::path::Path::new(""),
+                        );
+                        &fallback
+                    }
+                };
                 out.push(Line::from(Span::styled(
                     tool_label(call, width, summaries.get(at).map(String::as_str)),
                     Style::default().fg(Color::Yellow),
                 )));
                 rows.push(None);
             }
-            image_rows(out, message, width);
-            rows.resize(out.len() - start, None);
-            out.push(Line::from(""));
-            rows.push(None);
+            if spoke || !compact {
+                closing_blank(out, &mut rows, start);
+            } else {
+                rows.resize(out.len() - start, None);
+            }
         }
         "tool" => {
             // A result is a file dump, so [`folded_block`] paints it through
@@ -3801,9 +3917,7 @@ fn render_message(
                 folded_marked(out, &mut rows, head, message.text(), width, kind, fold);
             }
             image_rows(out, message, width);
-            rows.resize(out.len() - start, None);
-            out.push(Line::from(""));
-            rows.push(None);
+            closing_blank(out, &mut rows, start);
         }
         _ => {}
     }
@@ -3813,6 +3927,21 @@ fn render_message(
         "one map entry per painted row"
     );
     rows
+}
+
+/// Close a message with the blank that separates it from the next one — where
+/// the message painted a row of its own to close.
+///
+/// Rule 1 of the closing blank: a message the fold gave no rows paints no blank
+/// either, because a blank over a block nothing painted is exactly the clutter
+/// the compact log exists to remove. Everything else keeps its blank as it
+/// always had it, the failure rows included.
+fn closing_blank(out: &mut Vec<Line<'static>>, rows: &mut Vec<Option<Stop>>, start: usize) {
+    rows.resize(out.len() - start, None);
+    if out.len() > start {
+        out.push(Line::from(""));
+        rows.push(None);
+    }
 }
 
 /// Which view makes a text's rows: the reply's markdown, or the wrapper every
@@ -7494,8 +7623,8 @@ mod tests {
     fn a_failure_is_never_what_the_fold_gives_up() {
         let zero = Fold::DEFAULT.with(Kind::Result, 0).with(Kind::Mush, 0);
 
-        // A failed result: the failure row stays, and the log it came with is
-        // what the fold gives up.
+        // A failed result: the failure row stays with the blank that closes it,
+        // and the log it came with is what the fold gives up.
         let failed = "error: the call was refused\nthe log line one\nthe log line two";
         let rows = shown(&message_rows_under(
             &Message::tool("call_1", failed),
@@ -7509,8 +7638,9 @@ mod tests {
             vec!["  ! error: the call was refused".to_string(), String::new(),]
         );
 
-        // The same text as a *success* paints nothing at all at 0: the
-        // exemption is the block's, not the setting's.
+        // The same text as a *success* paints nothing at all at 0 — not even
+        // the blank, because a message with no rows of its own has nothing to
+        // close (rule 1 of the closing blank).
         let ok = "wrote three lines\nthe log line one\nthe log line two";
         let rows = shown(&message_rows_under(
             &Message::tool("call_1", ok),
@@ -7519,7 +7649,10 @@ mod tests {
             true,
             zero,
         ));
-        assert_eq!(rows, vec![String::new()]);
+        assert!(
+            rows.is_empty(),
+            "nothing painted, not even a blank: {rows:?}"
+        );
 
         // And a child's failed report, painted through the pane the human
         // reads: the fold rides on `Chat`, so this is the whole road.
@@ -7596,7 +7729,7 @@ mod tests {
             AgentId::ROOT,
             Message::tool(
                 "call_1",
-                "test result: ok. 3 passed\nthe log line one\nthe log line two",
+                "test result: ok. 3 passed\nthe log line one\nthe log line two\n[exit 0]",
             ),
         );
         chat.push_message(
@@ -7612,7 +7745,7 @@ mod tests {
             "the result is shown by default: {before:?}"
         );
         assert!(
-            before.iter().any(|row| row.contains("#1 done:")),
+            before.iter().any(|row| row.contains("· #1 done:")),
             "and so is the child's report: {before:?}"
         );
 
@@ -7623,15 +7756,16 @@ mod tests {
             vec![
                 "mush › running the tests".to_string(),
                 "  ⚙ run_command cargo test".to_string(),
+                String::new(),
+                "· #1 done: the parser is written".to_string(),
             ],
-            "the call's own label and the reply, and nothing of the output"
+            "the call's line carries its outcome, the report keeps its whole one \
+             line, and the result is not painted"
         );
-        for row in &hidden {
-            assert!(
-                before.contains(row),
-                "every row that stayed was left as it was: {row:?}"
-            );
-        }
+        assert!(
+            !hidden.iter().any(|row| row.contains("test result: ok")),
+            "the output rows are gone: {hidden:?}"
+        );
         assert!(
             !hidden.iter().any(|row| row.contains('…')),
             "nothing counts the rows the human asked not to see: {hidden:?}"
@@ -7647,6 +7781,72 @@ mod tests {
             shown(&pane_rows(&chat, &pane, 60, 20)),
             before,
             "the second press restores exactly the rows that were there"
+        );
+    }
+
+    /// The compact log's own numbers: a tool's result at **none** (the call's
+    /// line is the event), mush's report and another agent's words at **one**
+    /// row each, and the reasoning exactly where it was — `Ctrl-T` owns that
+    /// block and the compact view must not fold a thought.
+    #[test]
+    fn the_compact_fold_is_one_row_per_report() {
+        let fold = Fold::DEFAULT.compact();
+        let many = "line 0\nline 1\nline 2";
+        assert_eq!(
+            fold.shown(Kind::Result, many),
+            0,
+            "a result is not the event"
+        );
+        assert_eq!(fold.shown(Kind::Mush, many), 1, "a report is one row");
+        assert_eq!(
+            fold.shown(Kind::Brief, many),
+            1,
+            "so are another agent's words"
+        );
+        assert_eq!(
+            fold.shown(Kind::Reasoning, many),
+            usize::MAX,
+            "a thought is not output: `Ctrl-T` owns it"
+        );
+        // The failure row survives the result kind's zero, unchanged.
+        assert_eq!(
+            fold.shown(Kind::Result, "error: the call was refused"),
+            1,
+            "the failure is never what the fold gives up"
+        );
+    }
+
+    /// A block the compact log keeps at **one** row still says how much of it
+    /// that row is: a report longer than its line, and another agent's words
+    /// arriving the same way, each keep the `…` row the fold's own elision
+    /// paints, indented under the mark the block was folded under. The `…` is
+    /// part of *showing* a block, and the compact log shows one row of one —
+    /// only the *result* kind goes to no rows at all, and its hidden half has
+    /// no head for a `…` to stand behind (the call's own line is the event).
+    #[test]
+    fn a_clipped_one_row_block_keeps_its_elision() {
+        let mut chat = Chat::bare();
+        chat.push_message(
+            AgentId::ROOT,
+            Message::mush("#1 done: wrote it\nand the log line"),
+        );
+        chat.push_message(
+            AgentId::ROOT,
+            Message::user("do the thing\nand then the other"),
+        );
+        toggle_output(&mut chat);
+        let pane = pane(AgentId::ROOT);
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane, 60, 20)),
+            vec![
+                "· #1 done: wrote it".to_string(),
+                "  … +1 more lines".to_string(),
+                String::new(),
+                "parent › do the thing".to_string(),
+                "         … +1 more lines".to_string(),
+            ],
+            "one row each, and the `…` that says what lies behind it (the pane\
+             trims the trailing blank)"
         );
     }
 
@@ -7698,8 +7898,10 @@ mod tests {
                 "  ! error: the call was refused".to_string(),
                 String::new(),
                 "· #1 failed: no route to the endpoint".to_string(),
+                "  … +1 more lines".to_string(),
             ],
-            "the failures stay and nothing else does"
+            "the failures stay — with their closing blanks, because they said \
+             words of their own — and nothing else does"
         );
     }
 

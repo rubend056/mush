@@ -372,7 +372,7 @@ the blocks below (a test fails while either is stale):
     Ctrl-N               start a new chat (a second press stops every agent, drops every transcript)
     Ctrl-P               model picker
     Ctrl-T               show or hide the model's reasoning
-    Ctrl-O               show or hide tool output, reports and briefs (a failure always shows)
+    Ctrl-O               the compact log: one line per tool call (a failure always shows)
     Ctrl-F               the focused pane takes the whole screen, and back
     Ctrl-Y               select the transcript: Enter copies, Esc leaves
     Tab / Shift-Tab      cycle panes (agents, chat)
@@ -521,9 +521,22 @@ of what the request already carries. `Ctrl-T` shows or hides it in every pane;
 the toggle writes nothing, sends nothing and is not stored, and a new chat keeps
 whatever the human chose. A reasoning that trims to nothing paints no row at all.
 
-`Ctrl-O` is the same kind of view over the output: a tool's result, mush's own
-report about a child or a job, and the brief a child's pane opens with. Like
-`Ctrl-T` the key writes nothing and is not stored. Two rows stay in both states,
+`Ctrl-O` is the compact log: the conversation folded to one row per tool call.
+The call's row is the *same row in both views* — the pane's call grid — and the
+compact log differs only in what follows it: a header, no details, no payload.
+
+In the unfolded view the facts the outcome does not carry are painted under the
+call's header, dim, at the header's own gutter — a read's `of 812 lines`, the
+files a search hit, a command's `stderr 12 lines`, a spawn's `mush/188 ·
+.mush/wt/188` — and the result's payload is painted at that same gutter, so a
+call reads as one block. mush's own report about a child or a job and another
+agent's words are one row each, with the usual `… +N more lines` where they run
+on, so only what was actually spoken keeps whole words: the human's lines and
+the model's reply, which the fold never touches. A message paints its closing
+blank only where it painted rows of its own, and in the compact log a turn whose
+only rows are its call lines paints no blank either, so consecutive command-only
+turns read as one dense list. Like `Ctrl-T` the key writes nothing and is not
+stored, and the same press brings every row back. Two rows stay in both states,
 because a hidden failure would be a lie about what happened: a failed result's
 own `! error: …` row and a `#1 failed: …` report.
 
@@ -662,8 +675,13 @@ owner's row. A running agent with children out wears *no* count of them: the
 children's own rows say they run, and the title's `N waiting` counts the agents
 at rest with work out. Tool calls are
 `⚙ name summarized-args` (never raw JSON, the tools that steer a run included:
-`⚙ control #4 message "…"`), and notices are neutral `·` unless something
-actually failed (`!`).
+`⚙ control #4 message "…"`). The transcript paints a call as its digest row —
+the ask the call really made (a read's window, a search's pattern, a command
+without its redundant `cd` or its output-shaping tail) and, at the pane's own
+outcome column, what came back: `⚙ read_file text.rs 1408→1530    → 123 lines ·
+4 KB` — the same row in `Ctrl-O`'s compact log, which hides the details and the
+payload under it. Notices are neutral `·`
+unless something actually failed (`!`).
 
 The cursor row is the one wearing the pane's selection colour (the workspace's
 own hue, below); there is no separate marker glyph, because the row's own `▶`
