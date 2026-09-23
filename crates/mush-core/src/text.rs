@@ -327,7 +327,16 @@ fn wrap_capped(text: &str, width: usize, max_lines: Option<usize>) -> Vec<String
                 if max_lines.is_some_and(|max| out.len() >= max) {
                     return out;
                 }
-                current_width = UnicodeWidthStr::width(current.as_str());
+                // The tail is measured by the rule the break just used, not by
+                // the string API: `UnicodeWidthStr::width` knows ZWJ sequences
+                // (a family is two columns) where this wrapper charges every
+                // glyph its own width, so a tail holding a sequence measured
+                // one way and grew the other — and `wrap_runs` measures its own
+                // tail the per-glyph way, so the same text wrapped into a
+                // different number of rows in the plain and styled views
+                // (finding PM7). One rule for both wrappers: the sum this
+                // wrapper breaks by.
+                current_width = current.chars().map(glyph_width).sum();
                 last_space = None;
             }
 
@@ -1594,9 +1603,10 @@ fn table(source: &[String], width: usize) -> (Vec<Vec<Run>>, Vec<usize>) {
 }
 
 /// [`wrap_text`] over styled runs: the same rows, each row split into runs of
-/// one style. The arithmetic is [`glyph_width`]'s, tab expansion included, and a
-/// test pins the two against each other — one rule, two wrappers, and no drift
-/// between the view and the text beside it.
+/// one style. The arithmetic is [`glyph_width`]'s — tab expansion, the breaks,
+/// and the width a tail left by a break is measured by — and a test pins the
+/// two against each other: one rule, two wrappers, and no drift between the
+/// view and the text beside it.
 fn wrap_runs(runs: &[Run], width: usize) -> Vec<Vec<Run>> {
     let width = width.max(1);
     let chars: Vec<(char, RunStyle)> = runs
@@ -3398,13 +3408,20 @@ mod tests {
 
     /// The view's wrap is `wrap_text`'s wrap: for text that is not markdown the
     /// two make the same rows, character for character, at every width — one
-    /// rule with two spellings, and this is the test that says they cannot
+    /// rule with two wrappers, and this is the test that says they cannot
     /// drift.
     ///
-    /// The second half is the fuzz that found the last divergence (finding
-    /// B14): a no-break space is not a space, so a break that lands before one
-    /// must leave it in the row on both roads. Every string up to length 5 over
-    /// that alphabet, at widths 1..=12, is that fuzz kept as the pin.
+    /// The second half is the fuzz that found the last divergences (findings
+    /// B14 and PM7): a no-break space is not a space, so a break that lands
+    /// before one must leave it in the row on both roads; and a broken tail is
+    /// measured by the rule the wrapper breaks by — the per-glyph sum
+    /// [`glyph_width`] spells — so the combining mark, the ZWJ and the emoji
+    /// presentation in the alphabet are the characters that once made the plain
+    /// wrapper charge a tail the string API's *sequence* width where
+    /// `wrap_runs` summed its parts, wrapping the same text into a different
+    /// number of rows. Every string up to length 5 over that alphabet, at
+    /// widths 1..=12, is that fuzz kept as the pin; the two family-emoji texts
+    /// the finding named are checked the same way at widths 1..=24.
     #[test]
     fn a_plain_message_wraps_exactly_like_wrap_text() {
         let texts = [
@@ -3417,6 +3434,8 @@ mod tests {
             "  leading and trailing  ",
             "spaces  between  words",
             "bcd日 after a full row",
+            "a \u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467} b",
+            " a\u{301}\u{1f468}",
             "",
         ];
         for text in texts {
@@ -3428,7 +3447,18 @@ mod tests {
                 );
             }
         }
-        let alphabet = ['a', 'b', ' ', '\u{a0}', '\u{3000}', '\u{2028}', '\t'];
+        let alphabet = [
+            'a',
+            'b',
+            ' ',
+            '\u{a0}',    // no-break space: not a break
+            '\u{3000}',  // ideographic space: not a space to break at
+            '\u{2028}',  // line separator: a character, not a newline
+            '\t',        // four columns of layout
+            '\u{301}',   // combining mark: a known zero
+            '\u{200d}',  // ZWJ: a known zero, and a sequence's joiner
+            '\u{1f468}', // emoji presentation: two columns, and a sequence's head
+        ];
         for text in strings_over(&alphabet, 5) {
             for width in 1..=12usize {
                 assert_eq!(
