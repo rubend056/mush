@@ -3954,7 +3954,7 @@ mod tests {
             .unwrap()
             .expect("an outside image is attached");
 
-        let session = session::Session {
+        let mut session = session::Session {
             model: "a-model".to_string(),
             messages: vec![Message::user_with_images("look at this", vec![image])],
             ..Default::default()

@@ -11,8 +11,11 @@
 //! Now the UI thread hands a snapshot over and keeps painting. One thread
 //! writes: the newest snapshot wins, because one still waiting is *replaced*
 //! rather than queued behind — so a burst costs a single write carrying the
-//! latest state, and an older snapshot can never land after a newer one.
-//! [`SessionSave::flush`] is the other half: the transitions that mean "this
+//! latest state, and an older snapshot can never land after a newer one. A
+//! write that fails does not consume its snapshot: the writer keeps it and
+//! tries again on the next wake, and on its own final drain when the app is
+//! dropped, so a full disk costs the human a delay and never the conversation
+//! tail behind it (finding R2). [`SessionSave::flush`] is the other half: the transitions that mean "this
 //! must be on disk" wait for their own write, a cost paid once per human
 //! action instead of once per response.
 
@@ -56,13 +59,19 @@ const FLUSH_DEADLINE: Duration = Duration::from_secs(10);
 pub trait SessionSave: Send + Sync {
     /// Hand a snapshot over, without waiting for it. Cheap enough for the
     /// message path: the newest snapshot wins, so a burst of messages costs one
-    /// write that carries the latest state.
+    /// write that carries the latest state. A write that fails does not consume
+    /// the snapshot — the writer keeps it and tries again on its next wake, and
+    /// on its own final drain, so the road back is never lost (finding R2).
     fn save(&self, session: Session);
 
     /// Wait until everything handed over so far is on disk. For the call sites
     /// that mean "this must not be lost" — the human's own message, a command
     /// that changed what is stored, quitting — rather than for a streamed
     /// response, which is covered by the debounce and the exit flush.
+    ///
+    /// A write that fails is not retried behind the waiter's back: the call
+    /// returns with the failure left in [`Self::take_error`], and the snapshot
+    /// stays with the writer for its next wake (finding R2).
     fn flush(&self);
 
     /// The last write's failure, once. A write that failed on the writer's
@@ -71,7 +80,8 @@ pub trait SessionSave: Send + Sync {
     fn take_error(&self) -> Option<String>;
 }
 
-/// The real seam: one writer thread, and the newest snapshot.
+/// The real seam: one writer thread, the newest snapshot, and the one a failed
+/// attempt could not write.
 ///
 /// The write itself is `Session::save`, unchanged — same path, same fields,
 /// same format, still read by `Session::load`. Pretty, not compact: this file is
@@ -345,11 +355,18 @@ impl Drop for Writer {
 
 /// Write snapshots until nothing is waiting, then sleep until poked again.
 fn writer(inner: Arc<Inner>, woken: Receiver<()>) {
+    // The snapshot an attempt could not write, kept here on the thread that
+    // tried: the failed attempt did not consume it (`Session::save` borrows),
+    // so the next wake — a hand-over, a flush, or this thread's final drain
+    // when the writer is dropped — writes the same conversation instead of one
+    // that was lost with the attempt (finding R2). One is kept, and a newer
+    // hand-over replaces it: the newest state is the only one worth writing.
+    let mut retry: Option<Session> = None;
     loop {
         // The sender going away is the writer being dropped; the drain below
         // still runs, so a hand-over that raced the drop is not lost.
         let woke = woken.recv().is_ok();
-        drain(&inner);
+        retry = drain(&inner, retry);
         if !woke {
             return;
         }
@@ -360,41 +377,72 @@ fn writer(inner: Arc<Inner>, woken: Receiver<()>) {
 ///
 /// One thread, so one write at a time: at most one snapshot is in flight, and
 /// the only one that can follow it is the newest state.
-fn drain(inner: &Inner) {
+///
+/// `retry` is what a previous attempt could not write. This call is a wake, so
+/// it is tried once at the top — unless a newer snapshot is already waiting,
+/// which makes it pointless — and a failure is handed back instead of looped
+/// on: a full disk does not refill in the next microsecond, and spinning
+/// `Session::save` on the worker would only burn the box that is already out
+/// of room. The next wake tries again.
+fn drain(inner: &Inner, mut retry: Option<Session>) -> Option<Session> {
+    if inner.pending.lock().unwrap().snapshot.is_none() {
+        if let Some(session) = retry.take() {
+            retry = attempt(inner, session);
+        }
+    }
     loop {
         let (snapshot, waiting) = inner.pending.lock().unwrap().take();
         if snapshot.is_none() && waiting.is_empty() {
-            return;
+            return retry;
         }
         if let Some(session) = snapshot {
-            // The store is one writer's only while the lock's name still leads
-            // to the inode this process locked. The model's write road refuses
-            // the store's own names, but the name is on the human's own disk:
-            // a whole-file write or an `mv` over it replaces it in one step,
-            // and from then on a second mush owns the store. Writing the
-            // conversation into somebody else's store is exactly the damage the
-            // lock exists to prevent, so a save that cannot prove the store is
-            // still this mush's writes nothing and leaves the refusal where the
-            // UI's tick reads it.
-            if let Some(Err(why)) = inner.lock.as_ref().map(lock::Identity::still_mine) {
-                *inner.failed.lock().unwrap() = Some(why);
-            } else {
-                let attempt = session.save(&inner.root);
-                #[cfg(test)]
-                inner.writes.fetch_add(1, Ordering::SeqCst);
-                // Nobody is waiting on a background write, so the failure is left
-                // where the UI's next tick will find it. A later success does not
-                // clear it: the tick polls every frame, and a failure that arrives
-                // and is overwritten unseen is a failure that was swallowed.
-                if let Err(error) = attempt {
-                    *inner.failed.lock().unwrap() = Some(error.to_string());
-                }
-            }
+            // A hand-over makes whatever a failed attempt was holding
+            // pointless: the newest state is the only one worth writing.
+            retry = attempt(inner, session);
         }
         // After the write, never before it: a waiter is asking for a file it can
         // read, not for a promise.
         for waiter in waiting {
             let _ = waiter.send(());
+        }
+    }
+}
+
+/// Write `session`, or say why it did not land.
+///
+/// `Some(session)` is a write that failed with the snapshot intact: the caller
+/// keeps it and tries again on the next wake (finding R2). `None` means there is
+/// nothing left to write — the file is current, or the store is not this mush's
+/// any more, which no retry can change.
+fn attempt(inner: &Inner, mut session: Session) -> Option<Session> {
+    // The store is one writer's only while the lock's name still leads to the
+    // inode this process locked. The model's write road refuses the store's own
+    // names, but the name is on the human's own disk: a whole-file write or an
+    // `mv` over it replaces it in one step, and from then on a second mush owns
+    // the store. Writing the conversation into somebody else's store is exactly
+    // the damage the lock exists to prevent, so a save that cannot prove the
+    // store is still this mush's writes nothing and leaves the refusal where the
+    // UI's tick reads it.
+    if let Some(Err(why)) = inner.lock.as_ref().map(lock::Identity::still_mine) {
+        *inner.failed.lock().unwrap() = Some(why);
+        // The refusal is not a bad moment on a disk that may recover: the name
+        // has a different inode behind it for good, so a retry would be an
+        // attempt to write into another mush's store. The conversation is
+        // dropped rather than kept.
+        return None;
+    }
+    let wrote = session.save(&inner.root);
+    #[cfg(test)]
+    inner.writes.fetch_add(1, Ordering::SeqCst);
+    // Nobody is waiting on a background write, so the failure is left where the
+    // UI's next tick will find it. A later success does not clear it: the tick
+    // polls every frame, and a failure that arrives and is overwritten unseen is
+    // a failure that was swallowed.
+    match wrote {
+        Ok(()) => None,
+        Err(error) => {
+            *inner.failed.lock().unwrap() = Some(error.to_string());
+            Some(session)
         }
     }
 }
@@ -564,6 +612,61 @@ mod tests {
         writer.save(saying("after"));
         writer.flush();
         assert_eq!(last_message(&root), "after");
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A write that failed is not the end of the road: the attempt did not
+    /// consume the snapshot, so the next wake — a flush that hands nothing new
+    /// over, and the writer's own final drain when the app is dropped — writes
+    /// the same conversation instead of one that was lost with the attempt
+    /// (finding R2).
+    #[test]
+    fn a_failed_write_is_kept_and_lands_on_the_next_wake() {
+        let root = root("retained");
+        // `.mush` as a *file* is a workspace the session cannot be written to,
+        // exactly as a full disk or a read-only checkout would be.
+        fs::write(root.join(".mush"), "not a directory").unwrap();
+        let writer = Writer::new(root.to_path_buf(), None).expect("the worker starts");
+        writer.save(saying("kept"));
+        writer.flush();
+        assert!(writer.take_error().is_some(), "the attempt is reported");
+        assert!(!session_path(&root).exists(), "and nothing landed");
+
+        // The disk comes back: the next wake is this flush, which hands
+        // nothing over — the retry is the point.
+        fs::remove_file(root.join(".mush")).unwrap();
+        writer.flush();
+        assert_eq!(last_message(&root), "kept", "the retained snapshot landed");
+        assert_eq!(
+            writer.writes(),
+            2,
+            "two attempts: the failed one and the retry"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// The writer's own final drain is one more attempt: a snapshot a failed
+    /// write left behind is written when the writer is dropped — the road that
+    /// still goes out when the UI never saw the failure, or quit before its
+    /// next tick could (finding R2).
+    #[test]
+    fn a_retained_snapshot_lands_when_the_writer_is_dropped() {
+        let root = root("drop-retry");
+        fs::write(root.join(".mush"), "not a directory").unwrap();
+        {
+            let writer = Writer::new(root.to_path_buf(), None).expect("the worker starts");
+            writer.save(saying("kept"));
+            writer.flush();
+            assert!(writer.take_error().is_some(), "the attempt is reported");
+            // The disk comes back, and nothing else will poke the worker: the
+            // drop is the last wake, and its drain carries the snapshot.
+            fs::remove_file(root.join(".mush")).unwrap();
+        }
+        assert_eq!(
+            last_message(&root),
+            "kept",
+            "the writer's final drain wrote the retained snapshot"
+        );
         let _ = fs::remove_dir_all(&root);
     }
 

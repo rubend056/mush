@@ -488,11 +488,13 @@ impl Session {
 
     /// Write the conversation to `<root>/.mush/session.json`.
     ///
-    /// Takes `self` by value because the caller is the writer thread's
-    /// snapshot: it handed over a conversation it will not read again (see
-    /// `session_save`), so the save can consume it instead of borrowing it
-    /// back. Same path, same fields, same format, still read by
-    /// [`Self::load`].
+    /// Borrows the value rather than consuming it: the caller is the writer
+    /// thread's snapshot, and a write that fails has to be retryable — the
+    /// conversation must still be there for the next attempt instead of being
+    /// freed with the failed one (finding R2). The borrow is mutable because
+    /// shedding image payloads is part of the save; the replacement is
+    /// idempotent, so a retry writes the same bytes the first attempt would
+    /// have. Same path, same fields, same format, still read by [`Self::load`].
     ///
     /// Image bytes are not written. Every message carrying one has its payload
     /// replaced, before serialization, by the placeholder that names its path
@@ -503,7 +505,7 @@ impl Session {
     /// the file again. [`Self::load`] therefore returns the placeholder and no
     /// images, and because the drop is idempotent a loaded session saved again
     /// cannot stack a second placeholder on the first one's text.
-    pub fn save(mut self, root: &Path) -> std::io::Result<()> {
+    pub fn save(&mut self, root: &Path) -> std::io::Result<()> {
         self.shed_images();
         let path = session_path(root);
         // The directory comes back through `ensure_mush_dir`, the same door
@@ -881,7 +883,7 @@ mod tests {
         let root = Scratch::new("session2");
         ensure_mush_dir(&root).unwrap();
 
-        let session = Session {
+        let mut session = Session {
             model: "test".into(),
             provider: "custom".into(),
             base_url: "http://localhost:9".into(),
@@ -1015,7 +1017,7 @@ mod tests {
             raw.len()
         );
 
-        let loaded = Session::load(&root).unwrap();
+        let mut loaded = Session::load(&root).unwrap();
         assert!(
             loaded.messages[0].images.is_empty(),
             "loading brings no bytes back"

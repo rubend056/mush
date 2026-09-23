@@ -2050,8 +2050,14 @@ impl App {
             self.save_session();
         }
         // A write that failed on the writer's thread has no caller to return
-        // to, so it is picked up here — the next tick after it happened.
+        // to, so it is picked up here — the next tick after it happened — and
+        // the mark goes back on: the write did not put the conversation on
+        // disk, and `App::drop` flushes only while the session is dirty. The
+        // debounce pays the retry, so a full disk costs one snapshot rebuild
+        // per minute instead of the whole tail since the last write that
+        // landed (finding R2).
         if let Some(error) = self.session_save.take_error() {
+            self.mark_session_dirty();
             self.fail(format!("could not save session: {error}"));
         }
     }
@@ -4146,7 +4152,9 @@ impl App {
     /// streamed response must not rebuild a session, let alone write one. The
     /// mark is deliberately *not* moved by later changes — a stream that never
     /// pauses still reaches the file once per `SESSION_DEBOUNCE` instead of
-    /// being deferred until it stops.
+    /// being deferred until it stops — and a write that failed puts it back
+    /// where the failure is observed (`save_session`, `flush_session`), because
+    /// that is exactly the state the mark exists to describe (finding R2).
     fn mark_session_dirty(&mut self) {
         if self.session_dirty_at.is_none() {
             self.session_dirty_at = Some(Instant::now());
@@ -4160,6 +4168,11 @@ impl App {
     /// that cannot leave this thread — the conversation lives here — so it is
     /// paid once per `SESSION_DEBOUNCE` rather than once per streamed message,
     /// and never while a burst of them is being drained.
+    ///
+    /// The mark is cleared before the disk is known to have taken the snapshot,
+    /// because the write is on another thread; a failure re-sets it where the
+    /// tick reads the error, and the writer keeps the snapshot for a retry —
+    /// so the cleared mark is never the loss of the road (finding R2).
     fn save_session(&mut self) {
         self.session_dirty_at = None;
         let session = self.session_snapshot();
@@ -4173,12 +4186,18 @@ impl App {
     /// Nothing else waits, which is what keeps the wait off the message path: a
     /// streamed response is covered by the debounce and by the flush on the way
     /// out, so the most a crash can cost is the last `SESSION_DEBOUNCE` of chat.
+    ///
+    /// A flush that reports a failure — the deadline passed, the write failed,
+    /// the worker is gone — re-sets the mark instead of leaving it cleared: the
+    /// write it waited for did not land, the next debounce retries, and the exit
+    /// flush is not skipped for a road that was never paid (finding R2).
     fn flush_session(&mut self) {
         self.session_dirty_at = None;
         let session = self.session_snapshot();
         self.session_save.save(session);
         self.session_save.flush();
         if let Some(error) = self.session_save.take_error() {
+            self.mark_session_dirty();
             self.fail(format!("could not save session: {error}"));
         }
         // A save is a moment the state is being fixed; the repository is part
@@ -5437,7 +5456,10 @@ impl Drop for App {
     /// (`main::take_signal_quit`) — costs nothing. This is what bounds a crash
     /// to `SESSION_DEBOUNCE` of streamed chat rather than to everything since
     /// the last boundary. A failure here is reported the usual way and then lost
-    /// with the status line: there is no screen left to read it on.
+    /// with the status line: there is no screen left to read it on. The writer
+    /// does not lose the road with it — the snapshot that failed stays with the
+    /// writer, and its own final drain, as this drop releases it, is one more
+    /// attempt (finding R2).
     fn drop(&mut self) {
         if self.session_dirty_at.is_some() {
             self.flush_session();
@@ -8028,7 +8050,7 @@ mod tests {
     #[test]
     fn a_restore_report_is_not_carried_into_the_next_session() {
         let root = repo("restore-report");
-        let stored = stored_with_rows(vec![
+        let mut stored = stored_with_rows(vec![
             (2, Some(0), "first", "the first row's line"),
             (2, Some(0), "second", "the second row's line"),
         ]);
@@ -12111,6 +12133,60 @@ mod tests {
             text_of(&app).contains("could not save session"),
             "it says what failed: {}",
             text_of(&app)
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The failure must not consume the road it was on: a write that failed
+    /// did not put the conversation on disk, so the mark goes back on when the
+    /// tick reports it — and `App::drop`, which flushes only while the session
+    /// is dirty, still sends what the failed write owed (finding R2).
+    #[test]
+    fn a_failed_background_write_leaves_the_mark_for_the_exit_flush() {
+        use session_save::fake::Recorder;
+
+        let recorder = Recorder::new().fails("no space left on device");
+        let root = dir("failed-exit-flush");
+        let (mut app, _rx) = app_root(&root, None, recorder.clone());
+        streamed(&mut app, "lost");
+
+        age_session(&mut app, SESSION_DEBOUNCE);
+        app.tick(); // hands the snapshot over and clears the mark
+        app.tick(); // takes the failure
+        assert!(
+            app.session_dirty_at.is_some(),
+            "the failed write re-armed the mark, not just the bar line"
+        );
+
+        drop(app);
+        assert_eq!(
+            recorder.len(),
+            2,
+            "the exit flush went out: the debounce's hand-over and the drop's"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same for a flush, the road whose whole promise is "this must not be
+    /// lost": a flush that reports a failure leaves the mark on, so the
+    /// debounce and the exit flush both still owe the write (finding R2). The
+    /// bar is not asserted here: this arm's own ack is said after the flush and
+    /// is what the human reads (IN12's road, not this one) — the *mark* is the
+    /// fact a failed flush owns.
+    #[test]
+    fn a_failed_flush_leaves_the_mark_for_the_next_road() {
+        use session_save::fake::Recorder;
+
+        let recorder = Recorder::new().fails("no space left on device");
+        let root = dir("failed-flush");
+        let (mut app, _rx) = app_root(&root, None, recorder);
+        // `/context` is one of the commands that must not be lost: its arm
+        // writes the workspace and flushes.
+        run(&mut app, "/context 32768");
+
+        assert!(
+            app.session_dirty_at.is_some(),
+            "the flush did not get the write, and the mark is still owed"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
