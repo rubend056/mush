@@ -899,12 +899,12 @@ built-in defaults.
 needs to be added to the project's own `.gitignore`.
 
 `session.json` is written on its own thread. A streamed message only marks the
-conversation dirty, and the file is rewritten at most once a second — so a tool
+conversation dirty, and the file is rewritten at most once a minute — so a tool
 result costs the screen nothing — while a sent message, a command that changed
 what is stored, a compaction and a new chat (Ctrl-N's confirming press) are
 written before they return, and quitting writes whatever is still only in
 memory. Quitting therefore
-loses nothing, and a crash can cost at most the last second of a streamed reply.
+loses nothing, and a crash can cost at most the last minute of a streamed reply.
 On startup the conversation resumes where it left off. Over a conversation with
 something in it, `Ctrl-N` clears in two steps: the first press says what would
 go and where it is kept (`.mush/session.json.previous`), and the second writes
