@@ -16,6 +16,7 @@ pub mod text;
 pub mod tools;
 pub mod transcript;
 pub mod userconfig;
+pub mod whole_disk;
 pub mod workspace;
 
 pub use config::{Config, Overrides};
