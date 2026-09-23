@@ -322,7 +322,9 @@ pub struct InputPane {
     /// cannot be read off them (`▣ +2 more` counts what is left, not the whole);
     /// the number lives once, beside the rows it is already arithmetic over.
     pub attachment_count: usize,
-    /// The lines the box shows, already windowed around the cursor.
+    /// The lines the box shows, already windowed around the cursor and
+    /// [`mush_core::text::sanitize`]d — the box itself keeps the human's own
+    /// bytes, because a send must send exactly what was typed (PM1/IN5).
     pub lines: Vec<String>,
     /// The line the cursor is on, in `lines`.
     pub cursor_row: usize,
@@ -892,7 +894,13 @@ fn facts_line(app: &App, width: usize) -> String {
     } else {
         root
     };
-    let mut cells = vec![format!(" ⌂ {shown}")];
+    // The workspace path is the one part of this line an outside hand wrote —
+    // `mkdir $'\e[2J'` is legal — and the painter paints the facts whole, so
+    // the cell is defanged here, where the frame's word is built, exactly as
+    // `App::set_status` defangs the bar's own word (PM1/IN5). The rest of the
+    // line is mush's: the git cell is a ref name git itself forbids controls
+    // in, the label is sanitized where it is built and the meter is numbers.
+    let mut cells = vec![format!(" ⌂ {}", sanitize(&shown))];
     if let Some(git) = &app.git {
         cells.push(git_cell(git, app.git_age()));
     }

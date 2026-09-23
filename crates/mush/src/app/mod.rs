@@ -9534,6 +9534,79 @@ mod tests {
         );
     }
 
+    /// PM1/IN5's first site: the message box stores the human's own bytes — a
+    /// send must send exactly what was typed, and the select-mode copy reads
+    /// its source — but the terminal acts on what it is shown. A paste that
+    /// kept a terminal's colours, and an attach client's `edit`, both carry
+    /// escape sequences into the draft; the painted row is the safe copy. The
+    /// measurement that makes this a leak and not a cosmetic gap is
+    /// `ui::tests`'s raw-span probe: `Buffer::set_stringn` paints an ESC
+    /// verbatim.
+    #[test]
+    fn the_message_box_paints_a_hostile_draft_defanged() {
+        // The paste road: line endings normalised, and nothing else.
+        let (mut app, _rx) = test_app("hostile-paste");
+        app.update(Msg::Paste(HOSTILE.into()));
+        assert_eq!(
+            app.chat.input().text(),
+            HOSTILE.replace('\r', "\n"),
+            "the box stores the human's own bytes; the painter defangs its copy"
+        );
+        let pasted = shot(&mut app, 120, 32);
+        assert_no_command("a hostile paste in the message box", &pasted);
+        assert!(
+            pasted.text().contains("escaped"),
+            "the words still read: {}",
+            pasted.text()
+        );
+
+        // The attach client's road: `mush edit` reaches the same box through
+        // `App::handle_attach`, and the draft is exactly the bytes the client
+        // sent.
+        let base = app.chat.revision(AgentId::ROOT);
+        attach_ok(app.handle_attach(
+            "a client",
+            &attach_request(
+                2,
+                attach::Op::Edit {
+                    agent: 0,
+                    base,
+                    text: HOSTILE.to_string(),
+                    send: false,
+                },
+            ),
+        ));
+        assert_eq!(
+            app.chat.input().text(),
+            HOSTILE,
+            "the box stores the client's bytes too"
+        );
+        let edited = shot(&mut app, 120, 32);
+        assert_no_command("an attach client's edit in the message box", &edited);
+        assert!(
+            edited.text().contains("escaped"),
+            "the words still read: {}",
+            edited.text()
+        );
+    }
+
+    /// PM1/IN5's second site: the bar's `⌂ <root>` cell is built from the
+    /// workspace path, which an outside hand wrote (`mkdir $'\e[2J'` is legal),
+    /// and the bar paints the facts whole. The cell is defanged at the same
+    /// boundary the bar's own word is (`App::set_status`), and the path still
+    /// reads: the escape goes, the words around it stay.
+    #[test]
+    fn the_bar_paints_a_hostile_workspace_path_defanged() {
+        let (mut app, _rx) = test_app(&format!("hostile-root-{HOSTILE}"));
+        let shot = shot(&mut app, 120, 32);
+        assert_no_command("a workspace path holding an escape", &shot);
+        assert!(
+            shot.text().contains("escaped"),
+            "the path still reads: {}",
+            shot.text()
+        );
+    }
+
     /// The bytes of a png, as far as `image_mime` is concerned: the magic
     /// number is the whole of what it reads, and the padding lets a test size a
     /// picture to whatever a budget needs.

@@ -11,6 +11,8 @@ use unicode_segmentation::UnicodeSegmentation;
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::UnicodeWidthStr;
 
+use mush_core::text::sanitize;
+
 #[derive(Debug, Default, Clone)]
 pub struct Input {
     text: String,
@@ -109,11 +111,20 @@ impl Input {
     }
 
     /// The line the cursor is on (0-based) and its column within that line.
+    ///
+    /// The column is measured over the line [`sanitize`]d — the same text
+    /// [`Self::view`] paints — so the cursor and the renderer cannot disagree
+    /// about where the cursor is, which is this module's one contract. The
+    /// stored draft keeps the human's own bytes; the column a terminal is
+    /// told is the painted line's.
     pub fn cursor_line(&self) -> (usize, usize) {
         let before = &self.text[..self.byte_at(self.cursor)];
         let line = before.matches('\n').count();
         let start = before.rfind('\n').map(|at| at + 1).unwrap_or(0);
-        (line, UnicodeWidthStr::width(&before[start..]))
+        (
+            line,
+            UnicodeWidthStr::width(sanitize(&before[start..]).as_str()),
+        )
     }
 
     /// The text of one line, without its newline.
@@ -125,6 +136,14 @@ impl Input {
     /// the cursor's row and column inside them. The box scrolls vertically so
     /// the cursor's line is always one of them — a long message must not push
     /// the line being typed off the top.
+    ///
+    /// Every line is [`sanitize`]d here, at the one road a frame's copy of the
+    /// draft takes: the box holds the human's own bytes — a send must send
+    /// exactly what was typed, and the select-mode copy reads its source — but
+    /// a terminal acts on the text it is shown, and a paste or an attach
+    /// client can carry an escape into the draft. This is the box's half of the
+    /// rule `App::set_status` keeps for the bar's word: the strings mush sends
+    /// are untouched, the strings it paints are defanged.
     pub fn view(&self, rows: usize, width: usize) -> (Vec<String>, usize, usize) {
         let rows = rows.max(1);
         let (cursor_line, cursor_col) = self.cursor_line();
@@ -132,7 +151,7 @@ impl Input {
         let first = cursor_line.saturating_sub(rows.saturating_sub(1));
         let mut lines = Vec::with_capacity(rows);
         for index in first..(first + rows).min(self.line_count()) {
-            let (text, _) = window_line(self.line(index), 0, width);
+            let (text, _) = window_line(&sanitize(self.line(index)), 0, width);
             lines.push(text);
         }
         // The window is re-run around the cursor's own column so the cursor
@@ -140,7 +159,7 @@ impl Input {
         // the painted ones: `first` is the cursor's line or above it, and there
         // is a row for every line from `first` up to the box's height.
         let cursor_row = cursor_line - first;
-        let (windowed, column) = window_line(self.line(cursor_line), cursor_col, width);
+        let (windowed, column) = window_line(&sanitize(self.line(cursor_line)), cursor_col, width);
         lines[cursor_row] = windowed;
         (lines, cursor_row, column)
     }

@@ -523,6 +523,38 @@ pub(crate) mod tests {
         buffer[(x, y)].style()
     }
 
+    /// The record disagreed with itself about this: `docs/audits/tui.md:898`
+    /// read ratatui 0.29's `Buffer::set_stringn` as filtering graphemes
+    /// holding controls, while `33409d4` had measured an escape reaching the
+    /// terminal. The one-line experiment settles it, and the answer is that
+    /// the crate does **not** filter: painting `Span::raw("\u{1b}[2J")` at
+    /// 10×1 leaves the ESC, the `[`, the `2` and the `J` in four cells of the
+    /// buffer (`crossterm`'s backend writes `cell.symbol()` verbatim, so these
+    /// bytes reach the terminal as a frame wipe). That is why every surface
+    /// that paints a string mush did not write defangs it at the paint
+    /// boundary (PM1/IN5).
+    #[test]
+    fn a_raw_span_paints_a_control_byte_verbatim() {
+        let mut terminal = Terminal::new(TestBackend::new(10, 1)).unwrap();
+        terminal
+            .draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(Line::from(Span::raw("\u{1b}[2Jx"))),
+                    frame.area(),
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let symbols: Vec<String> = (0..4u16)
+            .map(|x| buffer[(x, 0)].symbol().to_string())
+            .collect();
+        assert_eq!(
+            symbols,
+            vec!["\u{1b}", "[", "2", "J"],
+            "ratatui 0.29's `Buffer::set_stringn` paints a control byte into its cell"
+        );
+    }
+
     /// A popup with no inner room — a terminal too narrow or too short for a
     /// list — paints `Clear`, its border, and nothing else: the list and the
     /// hint need the row and the column `Block::inner` does not leave, which is
