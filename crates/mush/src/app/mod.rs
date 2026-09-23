@@ -165,6 +165,15 @@ pub struct Picker {
     pub kind: PickerKind,
     pub items: Vec<PickerItem>,
     pub cursor: usize,
+    /// The conversation a `/notes` report is about. Every other kind reads no
+    /// agent — its rows are labels or constants — and carries `None`.
+    ///
+    /// It is carried because the rows are *wrapped* to the terminal width the
+    /// popup opened at, and a resize has to wrap them again from the source
+    /// (finding D12): re-wrapping the wrapped rows would launder the measure
+    /// into the text, and re-deriving from the focused agent would move the
+    /// report if the focus moved under an open popup.
+    pub agent: Option<AgentId>,
 }
 
 impl Picker {
@@ -686,9 +695,75 @@ impl App {
     /// wrapped to the popup that size paints and so the floor is known. One
     /// setter, called at startup and from the resize event — the only two
     /// places the terminal's size changes.
+    ///
+    /// A *width* that changed re-wraps an open popup ([`Self::rewrap_picker`]):
+    /// its rows were laid out for the width it was opened at, and the popup a
+    /// resize paints is narrower or wider than that. Before, the rows kept the
+    /// old measure and the border cut forty columns off every one of them, so
+    /// the rest of a `/notes` report was unreachable until it was closed and
+    /// reopened (finding D12).
     pub fn set_term_size(&mut self, width: u16, height: u16) {
+        let rewrapped = self.term_width != width;
         self.term_width = width;
         self.term_height = height;
+        if rewrapped {
+            self.rewrap_picker();
+        }
+    }
+
+    /// Re-lay out the open popup for the terminal's new width.
+    ///
+    /// Only the kinds whose rows are *wrapped* to the terminal are rebuilt —
+    /// `/notes` and `/help`. A model or a provider row is one label painted
+    /// whole, and rebuilding it would be a second derivation for no width at
+    /// all: the wrapped kinds re-read the same source their opener read, so the
+    /// popup a resize paints is the popup a reopen at that size paints instead
+    /// of a second table that could drift from the first (finding D12).
+    ///
+    /// The cursor is a row index, and a re-wrap changes what row each index
+    /// names: it keeps its place, clamped to the list the new width made. That
+    /// is the most a row number can promise across a re-wrap — the alternative,
+    /// reopening on the newest note, would throw away where the human was
+    /// reading. A report that has become empty under the popup (a new chat
+    /// clears the notes) closes it: an empty list is a state the opener refuses
+    /// to create.
+    fn rewrap_picker(&mut self) {
+        let Some((kind, agent)) = self
+            .picker
+            .as_ref()
+            .map(|picker| (picker.kind, picker.agent))
+        else {
+            return;
+        };
+        let width = screen::picker_text_width(self.term_width);
+        let rows: Option<Vec<String>> = match kind {
+            PickerKind::Notes => {
+                let Some(agent) = agent else {
+                    return;
+                };
+                let notes = self.chat.notes_report(agent, session::now_secs(), width);
+                if notes.rows.is_empty() {
+                    self.picker = None;
+                    return;
+                }
+                Some(notes.rows)
+            }
+            PickerKind::Help => Some(help_notice(width).lines().map(str::to_string).collect()),
+            PickerKind::Model | PickerKind::Provider => None,
+        };
+        let Some(rows) = rows else {
+            return;
+        };
+        if let Some(picker) = self.picker.as_mut() {
+            picker.cursor = picker.cursor.min(rows.len().saturating_sub(1));
+            picker.items = rows
+                .into_iter()
+                .map(|row| PickerItem {
+                    id: None,
+                    label: row,
+                })
+                .collect();
+        }
     }
 
     /// Whether the terminal is too small for anything but the floor notice.
@@ -3157,6 +3232,7 @@ impl App {
             kind: PickerKind::Model,
             items,
             cursor,
+            agent: None,
         });
     }
 
@@ -3193,6 +3269,7 @@ impl App {
                 })
                 .collect(),
             cursor: notes.newest,
+            agent: Some(agent),
         });
     }
 
@@ -3216,6 +3293,7 @@ impl App {
             kind: PickerKind::Help,
             items,
             cursor: 0,
+            agent: None,
         });
     }
 
@@ -3235,6 +3313,7 @@ impl App {
             kind: PickerKind::Provider,
             items,
             cursor,
+            agent: None,
         });
     }
 
@@ -3859,6 +3938,14 @@ impl App {
     /// here is [`Tree::focused`] — the same agent every other chat key is about.
     /// A pane with nothing to stand on says so in the bar rather than opening a
     /// cursor over nothing.
+    ///
+    /// `Ctrl-Y` is app-wide, so one state has to be refused *before* the chat
+    /// is asked: the zen view with the tree full-screen, where the chat pane is
+    /// the message box alone and paints no transcript at all. The mode is
+    /// modal, and one opened over a pane the frame cannot paint would swallow
+    /// every letter with no cursor and nothing on screen saying why; the
+    /// refusal names the key that shows the pane, and is the same shape as the
+    /// empty-pane answer [`Chat::start_select`] gives (finding D24).
     fn select_key(&mut self, key: SelectKey) {
         let on = self.tree.focused;
         match key {
@@ -3867,7 +3954,9 @@ impl App {
             // silently throw away a selection the human was building.
             SelectKey::Start => {
                 if !self.chat.selecting() {
-                    if let Some(line) = self.chat.start_select(on) {
+                    if self.zen && self.focus == Focus::Agents {
+                        self.say("the chat pane is hidden — Tab shows it, then Ctrl-Y");
+                    } else if let Some(line) = self.chat.start_select(on) {
                         self.say(line);
                     }
                 }
@@ -9582,6 +9671,54 @@ mod tests {
         assert_eq!(app.focus, Focus::Agents, "and cycles the pane it names");
     }
 
+    /// `Ctrl-Y` is app-wide, but the pane it selects from is the chat pane's:
+    /// in the zen view with the tree full-screen the chat is the message box
+    /// alone, and the mode it would open is one no frame can paint — no cursor,
+    /// and every letter swallowed with nothing on screen saying why. The key
+    /// refuses with a line naming the way to the pane, and the pane it does
+    /// paint the mode in still opens it (finding D24).
+    #[test]
+    fn ctrl_y_with_the_chat_hidden_says_so() {
+        let (mut app, _rx) = test_app("select-hidden");
+        crowd(&mut app, 3);
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("a reply to select from"));
+
+        // `Tab` to the tree, `Ctrl-F`: the chat pane is a zero rect.
+        tab(&mut app);
+        ctrl(&mut app, 'f');
+        assert!(
+            app.zen && app.focus == Focus::Agents,
+            "the tree takes the screen"
+        );
+        assert!(
+            !screen(&mut app, 80, 24)
+                .iter()
+                .any(|row| row.contains("a reply to select from")),
+            "and the chat's rows are not painted"
+        );
+
+        ctrl(&mut app, 'y');
+
+        assert!(!app.chat.selecting(), "no mode is taken");
+        assert!(
+            text_of(&app).contains("hidden"),
+            "and the bar says why: {}",
+            text_of(&app)
+        );
+        // The keyboard is still the tree's: a letter is a tree binding, not a
+        // swallowed mode key.
+        app.tree.cursor_top();
+        app.on_key(KeyEvent::new(KeyCode::Char('j'), KeyModifiers::NONE));
+        assert_ne!(app.tree.cursor(), 0, "`j` still moves the tree's cursor");
+
+        // The pane that does paint the transcript takes the mode as before.
+        tab(&mut app);
+        assert_eq!(app.focus, Focus::Chat);
+        ctrl(&mut app, 'y');
+        assert!(app.chat.selecting(), "the chat pane opens the mode");
+    }
+
     /// A fold replaces the transcript under the select mode, and the mode must
     /// not be left pointing at rows that are gone: the automatic fold fires at
     /// nine tenths of the budget, so this is an ordinary long session's road,
@@ -11258,6 +11395,100 @@ mod tests {
         }
     }
 
+    /// Every title is elided to the pane it names: the conversation pane's
+    /// clauses — a select mode, hidden lines, a held reading — and the agents
+    /// pane's counts are dropped whole rather than cut by the border, at every
+    /// size, in both focuses and in the zen view. The chat's title was the one
+    /// title painted as it stood: with `Ctrl-Y` open over a 38-column pane its
+    /// sentence ran 64 columns and the border cut `+6 more lines · /notes` —
+    /// the pane's own way of saying what it hides — mid-word (finding D11).
+    #[test]
+    fn no_pane_title_paints_past_its_pane() {
+        use unicode_width::UnicodeWidthStr;
+
+        let (mut app, _rx) = test_app("title-elision");
+        crowd(&mut app, 12);
+        // The focused pane is the one whose title is painted, and a child's
+        // name is longer than the root's: give it a mode, a held reading and
+        // more notes than the foot shows.
+        app.tree.focus(AgentId(1));
+        for i in 0..12 {
+            app.chat
+                .push_message(AgentId(1), Message::assistant(format!("line {i}")));
+        }
+        for i in 0..6 {
+            app.chat
+                .note_for(AgentId(1), format!("a note the foot may not show {i}"));
+        }
+        app.chat.scroll_by(AgentId(1), 3);
+
+        let title_room = |area: Rect| area.width.saturating_sub(2) as usize;
+        let check = |at: &str, title: &str, room: usize| {
+            assert!(
+                UnicodeWidthStr::width(title) <= room,
+                "{at}: the title {title:?} is {} columns in a {room}-column pane",
+                UnicodeWidthStr::width(title)
+            );
+        };
+
+        for (width, height) in [
+            (40u16, 10u16),
+            (40, 12),
+            (60, 17),
+            (79, 24),
+            (80, 24),
+            (120, 32),
+        ] {
+            for selecting in [false, true] {
+                if selecting {
+                    assert!(
+                        app.chat.start_select(AgentId(1)).is_none(),
+                        "the mode is on at {width}×{height}"
+                    );
+                } else {
+                    app.chat.cancel_select();
+                }
+                for (zen, focus) in [
+                    (false, Focus::Chat),
+                    (false, Focus::Agents),
+                    (true, Focus::Chat),
+                    (true, Focus::Agents),
+                ] {
+                    app.zen = zen;
+                    app.focus = focus;
+                    let at = format!("{width}×{height} selecting={selecting} zen={zen} {focus:?}");
+                    let screen = app.screen(Rect::new(0, 0, width, height));
+                    let Screen::Panes(panes) = screen else {
+                        panic!("{at} is below the floor")
+                    };
+                    check(&at, &panes.agents.title, title_room(panes.agents.area));
+                    if let Some(painted) = &panes.chat.transcript {
+                        check(&at, &painted.title, title_room(panes.chat.transcript_area));
+                    }
+                }
+            }
+        }
+
+        // The state the frame cannot reach on a legal terminal — a transcript
+        // pane two rows tall, where the foot spends its count row on the notes
+        // themselves — is the shape the audit's probe read: there the title
+        // carries the count and the `/notes` hint as well as the mode's line,
+        // and all three clauses are dropped whole rather than clipped.
+        let pane = Pane {
+            agent: AgentId(1),
+            words: None,
+            spin: 0,
+            label: "test-model · ctx ~500k",
+        };
+        for height in [2usize, 3, 4] {
+            for width in [38usize, 20, 12] {
+                let painted = app.chat.painted(&pane, width, height);
+                let at = format!("a {width}×{height} transcript pane");
+                check(&at, &painted.title, width);
+            }
+        }
+    }
+
     /// The bar keeps a row whatever else is on screen. In compact mode it was
     /// the trailing constraint behind a `Min(6)` chat, and at 40×10 the panes
     /// above it took the row it was owed: the frame painted the tree, the
@@ -11477,6 +11708,61 @@ mod tests {
         assert!(rows[0].contains("1 working"), "{}", rows[0]);
     }
 
+    /// The `/help` popup at the 40-column floor: the command table's
+    /// descriptions wrapped to one character per row — the usage column never
+    /// gave a column back, and `4 + 27 + 2` leaves one column of a 34-column
+    /// surface. When the description column would fall under
+    /// `mush_core::text::MIN_DESCRIPTION_COLUMNS`, the description hangs under
+    /// its own left cell instead, wrapped at the popup's whole width — for the
+    /// commands *and* the keys, since the popup shows both and the keys table
+    /// had the same arithmetic and the same collapse (finding D23; the audit's
+    /// "as the key table already does" is not true of the code it read).
+    ///
+    /// Measured at this width: 563 lines before the rule, 136 after; the
+    /// audit's own probe read the command table as `s` / `w` one row at a
+    /// time.
+    #[test]
+    fn the_help_picker_keeps_a_readable_description_column() {
+        use unicode_width::UnicodeWidthStr;
+
+        let width = screen::picker_text_width(40);
+        assert_eq!(width, 34, "the popup's text width at the floor");
+
+        let commands = commands::table_at("deepseek|custom", width);
+        assert!(
+            commands.contains(
+                "    /provider [deepseek|custom]\n    switch provider, or pick one\n    from a list\n"
+            ),
+            "the description hangs under its usage, wrapped at the popup's width:\n{commands}"
+        );
+        assert!(
+            !commands
+                .lines()
+                .any(|line| line.trim().chars().count() == 1),
+            "no description is shredded to one character per row:\n{commands}"
+        );
+
+        // The keys table, which the popup paints under the commands. Its *keys*
+        // column can be one character (`c` cancels the selected row), so the
+        // shape is pinned by a description that could not fit a nine-column
+        // column: the one the audit's probe read shredded.
+        let keys = keys::help_table_at(width);
+        assert!(
+            keys.contains("    Ctrl-Q\n    quit (a second press confirms\n"),
+            "a key's description hangs under the key:\n{keys}"
+        );
+
+        // The whole popup, at the floor: every row fits the surface it is
+        // painted in.
+        let notice = help_notice(width);
+        for line in notice.lines() {
+            assert!(
+                UnicodeWidthStr::width(line) <= width,
+                "a {width}-column popup row: {line:?}"
+            );
+        }
+    }
+
     /// `/notes` is the other half of the cap: the lines the foot ceded are read
     /// in full, oldest first, with the cursor on the newest.
     #[test]
@@ -11600,6 +11886,92 @@ mod tests {
         run(&mut app, "/notes");
         let wide = screen(&mut app, 200, 50).join("\n");
         assert!(wide.contains("tango"), "and at 200 columns: {wide}");
+    }
+
+    /// A resize with `/notes` or `/help` open re-wraps the report: its rows were
+    /// laid out for the width it was opened at, and the popup the new size
+    /// paints is narrower. The audit's probe — a report opened at 200 and
+    /// painted at 60 — read every row clipped at the popup's edge, the tail
+    /// painted only after the popup was closed and reopened (finding D12); the
+    /// sweep's own comment claimed a resize "opens them again for each size",
+    /// and it did not.
+    #[test]
+    fn a_resized_popup_is_rewrapped_not_clipped() {
+        use unicode_width::UnicodeWidthStr;
+
+        let (mut app, _rx) = test_app("resized-popup");
+        app.chat.note(
+            "the run failed while folding the transcript: the endpoint returned 503 \
+             for the third summarisation attempt, and the fold was abandoned with the \
+             conversation left half-written, so read the tail of the transcript before \
+             trusting anything above it",
+        );
+
+        // Opened at the widest popup: the note is wrapped at 74 columns.
+        app.set_term_size(200, 50);
+        run(&mut app, "/notes");
+        let wide = screen(&mut app, 200, 50).join("\n");
+        assert!(
+            wide.contains("above it"),
+            "the tail at the size it was opened at: {wide}"
+        );
+
+        // The resize, with no reopen: the same popup, re-wrapped.
+        let resized = screen(&mut app, 60, 17).join("\n");
+        assert!(
+            resized.contains("above it"),
+            "the tail is painted after the resize, not clipped away: {resized}"
+        );
+        let room = screen::picker_text_width(60);
+        let items = app
+            .picker
+            .as_ref()
+            .expect("the popup is still open")
+            .items
+            .clone();
+        assert!(
+            items
+                .iter()
+                .all(|item| UnicodeWidthStr::width(item.label.as_str()) <= room),
+            "every row fits the {room}-column list it is painted in: {:?}",
+            labels(&items)
+        );
+
+        // And the popup a resize paints is the popup a reopen paints: the same
+        // rows, read from the same source rather than re-wrapped from the old
+        // rows.
+        let after_resize = labels(&items);
+        app.open_notes_picker();
+        assert_eq!(
+            after_resize,
+            labels(&app.picker.as_ref().expect("the reopen").items),
+            "the resize is the reopen"
+        );
+
+        // The other kind whose rows are wrapped to the terminal: `/help`.
+        app.picker = None;
+        app.set_term_size(200, 50);
+        run(&mut app, "/help");
+        let wide_rows = app.picker.as_ref().expect("the help list").items.len();
+        let _ = screen(&mut app, 60, 17);
+        let items = app
+            .picker
+            .as_ref()
+            .expect("the help list is still open")
+            .items
+            .clone();
+        assert!(
+            items
+                .iter()
+                .all(|item| UnicodeWidthStr::width(item.label.as_str()) <= room),
+            "every help row fits the narrower list: {:?}",
+            labels(&items)
+        );
+        assert!(
+            items.len() > wide_rows,
+            "and the same text wrapped narrower is more rows: {wide_rows} → {}",
+            items.len()
+        );
     }
 
     /// The empty state is a row like any other: wrapped to the pane and windowed
@@ -12264,6 +12636,108 @@ mod tests {
             assert_eq!(tree.input.width, width, "{at}: and takes the width");
             assert_eq!(tree.bar, two.bar, "{at}: and the bar keeps its rows");
             shot(&mut app, width, height).assert_shape("zen tree", width, height);
+            ctrl(&mut app, 'f');
+            tab(&mut app);
+            assert_eq!(app.focus, Focus::Chat, "{at}: back where the size began");
+        }
+    }
+
+    /// D13: the two-pane chat split is one derivation, so zen hands the message
+    /// box the very rows the two-pane layout gave it — even at the compact
+    /// sizes, where the agents strip sits above the chat and the old zen Chat
+    /// arm re-split the taller frame. A four-line draft asks the split for six
+    /// rows: at 40×12 the two-pane column is eight rows high and lends the box
+    /// five of them (the transcript keeps its three), while a fresh split over
+    /// the eleven-row zen frame handed the box six — one row down and one row
+    /// taller. At 40×10 the column cannot hold the box's ask and the
+    /// transcript's floor, so the box is the three rows left over; the zen arm
+    /// handed it six.
+    #[test]
+    fn zen_keeps_the_boxes_rows_at_every_size() {
+        let (mut app, _rx) = test_app("zen-box-rows");
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("hello"));
+        // Four draft lines: the box asks for six rows, so the split's answer
+        // is not the arithmetic a box would derive alone.
+        app.update(Msg::Paste("one\ntwo\nthree\nfour".into()));
+        assert_eq!(
+            app.chat.input().line_count(),
+            4,
+            "the draft the split reads"
+        );
+        for (width, height) in [(40u16, 12u16), (40, 10), (60, 17), (79, 24)] {
+            let at = format!("{width}×{height}");
+            let two = pane_rects(&mut app, width, height);
+            assert!(two.agents.width > 0, "{at}: the two-pane frame to measure");
+            assert!(two.input.height > 0, "{at}: the two-pane box to measure");
+
+            // Chat focused: the box keeps the two-pane rows, widened to the
+            // frame, and the transcript takes what is above it.
+            ctrl(&mut app, 'f');
+            let zen = pane_rects(&mut app, width, height);
+            assert_eq!(
+                zen.agents,
+                Rect::new(0, 0, 0, 0),
+                "{at}: the agents pane is a zero rect"
+            );
+            assert_eq!(
+                (zen.input.y, zen.input.height),
+                (two.input.y, two.input.height),
+                "{at}: the box keeps the two-pane rows"
+            );
+            assert_eq!(zen.input.x, 0, "{at}: the box takes the frame's width");
+            assert_eq!(
+                zen.input.width, width,
+                "{at}: the box takes the frame's width"
+            );
+            assert_eq!(
+                zen.transcript.x, 0,
+                "{at}: the transcript starts at the left"
+            );
+            assert_eq!(zen.transcript.width, width, "{at}: and spans the frame");
+            assert_eq!(zen.transcript.y, 0, "{at}: and starts at the top");
+            assert_eq!(
+                zen.transcript.bottom(),
+                zen.input.y,
+                "{at}: the transcript sits on its box"
+            );
+            assert_eq!(
+                zen.transcript.height + zen.input.height,
+                zen.bar.y,
+                "{at}: the transcript and the box tile the frame above the bar"
+            );
+            assert!(zen.transcript_painted, "{at}: the transcript still paints");
+            ctrl(&mut app, 'f');
+
+            // Agents focused: the tree takes everything above the box, and the
+            // box is the very box the two-pane layout had.
+            tab(&mut app);
+            assert_eq!(app.focus, Focus::Agents, "{at}: Tab moves the keyboard");
+            ctrl(&mut app, 'f');
+            let tree = pane_rects(&mut app, width, height);
+            assert_eq!(
+                (tree.input.y, tree.input.height),
+                (two.input.y, two.input.height),
+                "{at}: the box keeps the two-pane rows"
+            );
+            assert_eq!(tree.input.x, 0, "{at}: the box takes the frame's width");
+            assert_eq!(
+                tree.input.width, width,
+                "{at}: the box takes the frame's width"
+            );
+            assert_eq!(tree.agents.y, 0, "{at}: the tree starts at the top");
+            assert_eq!(
+                tree.agents.bottom(),
+                tree.input.y,
+                "{at}: the tree sits on the box"
+            );
+            assert_eq!(
+                tree.agents.height + tree.input.height,
+                tree.bar.y,
+                "{at}: the tree and the box tile the frame above the bar"
+            );
+            assert_eq!(tree.transcript.height, 0, "{at}: no transcript is painted");
+            assert!(!tree.transcript_painted, "{at}: so `transcript` is `None`");
             ctrl(&mut app, 'f');
             tab(&mut app);
             assert_eq!(app.focus, Focus::Chat, "{at}: back where the size began");
@@ -14575,10 +15049,13 @@ mod tests {
     /// built for — and, per state, with both focus states, because a focused
     /// pane's border, its highlight and the chat cursor are painted differently
     /// and the rewrite had dropped that half of the old sweep (finding V3).
-    /// `reopen` is for the popups whose
-    /// item wrapping is derived from the terminal's width *when they open*
-    /// (`/notes`): the sweep opens them again for each size, which is what a
-    /// human resizing the terminal with the popup up would get.
+    ///
+    /// A popup's items are wrapped to the terminal width it was opened at, and
+    /// the sweep paints every state at every size: the resize itself re-wraps
+    /// an open popup ([`App::set_term_size`], and its pin
+    /// `a_resized_popup_is_rewrapped_not_clipped`), so a popup opened once at
+    /// 200 columns is read at 40 as the popup a human resizing with it up
+    /// would see.
     ///
     /// `absent` is the other half of `words`: facts the frame must *not* carry
     /// at any size with a floor to paint in, for a state whose point is an
@@ -14590,7 +15067,6 @@ mod tests {
         words: Vec<&'static str>,
         roomy: Vec<&'static str>,
         absent: Vec<&'static str>,
-        reopen: Option<fn(&mut App)>,
     }
 
     /// One agent, as its parent reports it to the UI.
@@ -14739,7 +15215,6 @@ mod tests {
             words: vec!["· #0", " agents ", " chat ", "Tab cycles panes"],
             roomy: vec!["you", " message ", "Ask for a change"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -14763,7 +15238,6 @@ mod tests {
             ],
             roomy: vec![" agents · 1 working"],
             absent: vec!["working."],
-            reopen: None,
         });
         keep.push(rx);
 
@@ -14780,7 +15254,6 @@ mod tests {
             words: vec!["⧗ #0", "waiting on results", "waiting on results."],
             roomy: vec![" agents · 1 waiting"],
             absent: vec!["◐ #0", "working."],
-            reopen: None,
         });
         keep.push(rx);
 
@@ -14804,7 +15277,6 @@ mod tests {
             words: vec!["⏸1", "2 working", "waiting on 1 subagent"],
             roomy: vec!["◐ #1", "◐ #2", "lexer", " agents · 2 working · 1 waiting"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -14842,7 +15314,6 @@ mod tests {
                 words: vec!["≡ #0", words, foot, "keep typing"],
                 roomy: vec!["your message is answered after the fold"],
                 absent: vec!["working."],
-                reopen: None,
             });
             keep.push(rx);
         }
@@ -14858,7 +15329,6 @@ mod tests {
             words: vec!["✗ #0", "no route to host", "agent #0 failed"],
             roomy: vec!["! no route to host"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -14872,7 +15342,6 @@ mod tests {
             words: vec!["⊘ #0", "stopped"],
             roomy: vec!["re-send to resume"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -14884,7 +15353,6 @@ mod tests {
             words: vec!["· #0", " agents ", " chat ", "mush › "],
             roomy: vec!["✗ #1", "mush/1", "! the endpoint returned 503"],
             absent: Vec::new(),
-            reopen: None,
         });
 
         // A pane was scrolled away from the bottom: the title says so.
@@ -14904,7 +15372,6 @@ mod tests {
             words: vec!["scrolled ↑5 rows", "PgDn"],
             roomy: vec![],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -14922,7 +15389,6 @@ mod tests {
             words: vec!["more lines", "/notes"],
             roomy: vec!["note 7", "note 6", "+5 more lines"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -14943,7 +15409,6 @@ mod tests {
             words: vec!["⚙1", "#c1"],
             roomy: vec![" 1 jobs · #c1"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -14966,7 +15431,6 @@ mod tests {
                 "main ±3 +9−2",
             ],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(twenty_rx);
 
@@ -15000,7 +15464,6 @@ mod tests {
             ],
             roomy: vec!["deepseek-chat · 128k"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15022,7 +15485,6 @@ mod tests {
             ],
             roomy: vec![],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15042,7 +15504,6 @@ mod tests {
             words: vec!["◐ #0"],
             roomy: vec!["thinking."],
             absent: vec!["more lines"],
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15066,7 +15527,6 @@ mod tests {
             words: vec!["escaped", "␍", " chat "],
             roomy: vec!["escaped", "␍"],
             absent: Vec::new(),
-            reopen: None,
         });
         keep.push(rx);
 
@@ -15145,15 +15605,8 @@ mod tests {
                 words,
                 roomy,
                 absent,
-                reopen,
             } = state;
             for &(width, height) in SWEEP_SIZES {
-                // A popup whose contents are wrapped to the terminal's width is
-                // opened again for each size, the way a resize would.
-                if let Some(reopen) = reopen {
-                    app.set_term_size(width, height);
-                    reopen(app);
-                }
                 let shot = shot(app, width, height);
                 let at = format!("{name} at {width}×{height}");
                 // The frame is the terminal: every row, every column, and not

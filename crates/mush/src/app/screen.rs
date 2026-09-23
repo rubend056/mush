@@ -74,8 +74,18 @@ const MAX_ATTACHMENT_ROWS: usize = 3;
 const PICKER_MIN_WIDTH: u16 = 40;
 const PICKER_MAX_WIDTH: u16 = 80;
 
+/// A share of `whole`, clamped between `min` and `max`.
+///
+/// One integer type, wide enough to hold the multiply: `whole * percent`
+/// overflows a `u16` above a few hundred columns — at the picker's 60% it
+/// panics in a debug build above 1092 columns, while a release build wraps and
+/// the clamp quietly turns the wrap into the floor (finding R72).
+fn share(whole: u16, percent: u32, min: u16, max: u16) -> u16 {
+    ((whole as u32 * percent / 100) as u16).clamp(min, max)
+}
+
 fn picker_width(terminal_width: u16) -> u16 {
-    (terminal_width * 60 / 100).clamp(PICKER_MIN_WIDTH, PICKER_MAX_WIDTH)
+    share(terminal_width, 60, PICKER_MIN_WIDTH, PICKER_MAX_WIDTH)
 }
 
 /// The columns the picker's list gives one item's text. The term carries the
@@ -92,9 +102,7 @@ pub(crate) fn picker_text_width(terminal_width: u16) -> usize {
 /// this is a length: a row's four ranked fields need about forty of them, the
 /// chat keeps its own floor, and past the cap the extra columns are empty.
 fn agents_columns(terminal_width: u16) -> u16 {
-    let share = (terminal_width as u32 * 34 / 100) as u16;
-    share
-        .clamp(AGENTS_MIN_COLUMNS, AGENTS_MAX_COLUMNS)
+    share(terminal_width, 34, AGENTS_MIN_COLUMNS, AGENTS_MAX_COLUMNS)
         .min(terminal_width.saturating_sub(CHAT_MIN_COLUMNS))
 }
 
@@ -398,45 +406,63 @@ impl App {
             (columns[0], columns[1], rows[1])
         };
 
+        // The chat column's split, once: the transcript above the message box.
+        // Both zen arms read these same rows, so the box cannot move when the
+        // tree gives up its rows (finding D13).
+        let chat_split =
+            Layout::vertical([Constraint::Min(3), Constraint::Length(self.input_rows())])
+                .split(chat_area);
+
         // The zen view ([`App::zen`]): the focused pane takes what the two
         // panes shared, because the terminal's own drag — mush deliberately
         // does not capture the mouse (finding K3) — takes a rectangle of cells,
         // and at 80 columns that rectangle starts in the agents pane. The
-        // two-pane layout above is the source of every row this hands over, so
-        // the pane that keeps its place keeps exactly the rows it had.
+        // two-pane layout above is the source of every row this hands over —
+        // the chat column's split and the message box's rows included, so the
+        // box keeps exactly the rows it had (finding D13).
         let (agents_area, chat) = match (self.zen, self.focus) {
-            (false, _) => (agents_area, self.chat_pane(chat_area)),
+            (false, _) => (
+                agents_area,
+                self.chat_pane_with(chat_split[0], chat_split[1]),
+            ),
             // The chat takes the rows above the bar whole — what the agents
             // pane and the chat had between them — and the agents pane becomes
-            // a zero rect, so nothing can paint in it.
-            (true, Focus::Chat) => (
-                Rect::new(area.x, area.y, 0, 0),
-                self.chat_pane(Rect::new(
-                    area.x,
-                    area.y,
-                    area.width,
-                    bar_area.y.saturating_sub(area.y),
-                )),
-            ),
-            // The message box keeps the rows the two-pane layout gave it — its
-            // own split, not a re-derivation — and takes the width; the tree
-            // gets everything above it.
-            (true, Focus::Agents) => {
-                let split =
-                    Layout::vertical([Constraint::Min(3), Constraint::Length(self.input_rows())])
-                        .split(chat_area);
+            // a zero rect, so nothing can paint in it. The box keeps the rows
+            // the two-pane split gave it, widened to the frame, and the
+            // transcript is what remains above it.
+            (true, Focus::Chat) => {
                 let box_area = Rect {
                     x: area.x,
                     width: area.width,
-                    ..split[1]
+                    ..chat_split[1]
                 };
                 (
-                    Rect::new(
-                        area.x,
-                        area.y,
-                        area.width,
-                        box_area.y.saturating_sub(area.y),
+                    Rect::new(area.x, area.y, 0, 0),
+                    self.chat_pane_with(
+                        Rect {
+                            y: area.y,
+                            height: box_area.y.saturating_sub(area.y),
+                            ..box_area
+                        },
+                        box_area,
                     ),
+                )
+            }
+            // The message box keeps the rows the two-pane layout gave it — the
+            // split above, not a re-derivation — and takes the width; the tree
+            // gets everything above it.
+            (true, Focus::Agents) => {
+                let box_area = Rect {
+                    x: area.x,
+                    width: area.width,
+                    ..chat_split[1]
+                };
+                (
+                    Rect {
+                        y: area.y,
+                        height: box_area.y.saturating_sub(area.y),
+                        ..box_area
+                    },
                     self.chat_box(box_area),
                 )
             }
@@ -619,13 +645,6 @@ impl App {
         }
     }
 
-    /// The chat column: the transcript `Chat` renders and the message box.
-    fn chat_pane(&self, area: Rect) -> ChatPane {
-        let rows = Layout::vertical([Constraint::Min(3), Constraint::Length(self.input_rows())])
-            .split(area);
-        self.chat_pane_with(rows[0], rows[1])
-    }
-
     /// The rows the message box asks the layout for: the draft's lines, capped
     /// so the pane keeps the screen, plus the attachment rows and the box's two
     /// border rows. The box grows with the message — a multi-line draft has to
@@ -640,9 +659,9 @@ impl App {
     /// never the part that is left out (finding D5). The two derivations agree
     /// whenever the ask is granted.
     ///
-    /// One derivation, because two layouts read it: the split above, and the
-    /// zen view, which has to hand the box exactly the rows this gives it so
-    /// the box does not move when the tree takes the screen.
+    /// One derivation, because the split is the one place the box's rows come
+    /// from: the zen views hand the box exactly the rows this gives it, so the
+    /// box does not move when the tree takes the screen.
     pub(super) fn input_rows(&self) -> u16 {
         let input_lines = (self.chat.input().line_count() as u16).clamp(1, MAX_INPUT_LINES);
         let attachment_count = self.chat.attachments().len().min(MAX_ATTACHMENT_ROWS) as u16;
@@ -665,7 +684,7 @@ impl App {
     }
 
     /// What the chat column paints, from the two rects it is made of: the
-    /// transcript at `transcript_area` and the box at `input_area`. [`Self::chat_pane`]
+    /// transcript at `transcript_area` and the box at `input_area`. `App::screen`
     /// splits a column into the two; [`Self::chat_box`] hands over the box
     /// alone.
     fn chat_pane_with(&self, transcript_area: Rect, input_area: Rect) -> ChatPane {
@@ -875,8 +894,8 @@ fn facts_line(app: &App, width: usize) -> String {
     elide(&cells, " │ ", "", &cells[0], width)
 }
 
-/// Drop cells from the right until the line fits: one rule for the two lines
-/// that are built this way — the pane's title and the facts under it — and the
+/// Drop cells from the right until the line fits: one rule for every line that
+/// is built this way — the two panes' titles and the facts under them — and the
 /// one home of it (finding D9).
 ///
 /// A cell goes whole, because a clause cut mid-number (`Σ +324 −`, `2 waitin`)
@@ -885,7 +904,18 @@ fn facts_line(app: &App, width: usize) -> String {
 /// name, and the facts line keeps the `⌂` cell that says which tree the screen
 /// is about. `prefix` opens every kept line, so the separator *inside* the line
 /// (` · `, ` │ `) and the one joining it to what precedes are each said once.
-fn elide(cells: &[String], separator: &str, prefix: &str, floor: &str, width: usize) -> String {
+///
+/// The conversation pane's title is built by the same rule rather than painted
+/// as it stands: `Chat::painted` hands its clauses here, so the chat's title
+/// cannot be the one title on screen a painter cuts mid-word at the border
+/// (finding D11).
+pub(super) fn elide(
+    cells: &[String],
+    separator: &str,
+    prefix: &str,
+    floor: &str,
+    width: usize,
+) -> String {
     for kept in (1..=cells.len()).rev() {
         let line = format!("{prefix}{}", cells[..kept].join(separator));
         if UnicodeWidthStr::width(line.as_str()) <= width {
@@ -1365,6 +1395,32 @@ mod tests {
             assert!(
                 picker_text_width(terminal) <= picker_width(terminal) as usize,
                 "a report wider than its popup at {terminal}"
+            );
+        }
+    }
+
+    /// A share of the terminal is arithmetic about a `u16`, so it is computed
+    /// in one integer type wide enough to hold the product: `terminal_width *
+    /// 60` in `u16` overflows above 1092 columns — a debug build panics on the
+    /// multiply and a release build wraps, which the clamp then quietly turns
+    /// into the popup's floor (finding R72). The sweep crosses that width, and
+    /// both shares are asserted to be the natural one, clamped, at every size a
+    /// terminal can name.
+    #[test]
+    fn no_share_of_a_terminal_overflows_its_integer() {
+        let natural = |whole: u16, percent: u32| (whole as u32 * percent / 100) as u16;
+        for terminal in 40..=2000u16 {
+            assert_eq!(
+                picker_width(terminal),
+                natural(terminal, 60).clamp(PICKER_MIN_WIDTH, PICKER_MAX_WIDTH),
+                "the picker's share at {terminal}"
+            );
+            assert_eq!(
+                agents_columns(terminal),
+                natural(terminal, 34)
+                    .clamp(AGENTS_MIN_COLUMNS, AGENTS_MAX_COLUMNS)
+                    .min(terminal.saturating_sub(CHAT_MIN_COLUMNS)),
+                "the agents pane's share at {terminal}"
             );
         }
     }

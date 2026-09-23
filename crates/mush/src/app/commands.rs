@@ -181,7 +181,10 @@ pub fn table(providers: &str) -> String {
 
 /// The same table, rendered for a surface `width` columns wide: the usage stays
 /// in its column and a description that does not fit hangs under its own
-/// column (finding U15). `usize::MAX` is the unwrapped form `--help` prints.
+/// column — or, when that column would be narrower than
+/// [`mush_core::text::MIN_DESCRIPTION_COLUMNS`], under its own usage row,
+/// wrapped at the surface's whole width (finding D23). `usize::MAX` is the
+/// unwrapped form `--help` prints.
 pub fn table_at(providers: &str, width: usize) -> String {
     let rows: Vec<(String, &str)> = COMMANDS
         .iter()
@@ -197,20 +200,9 @@ pub fn table_at(providers: &str, width: usize) -> String {
         .map(|(usage, _)| usage.chars().count())
         .max()
         .unwrap_or(0);
-    let description_column = 4 + usage_width + 2;
-    let room = width.saturating_sub(description_column).max(1);
     let mut out = String::new();
     for (usage, help) in &rows {
-        let lead = format!("    {usage:<usage_width$}  ");
-        let mut wrapped = mush_core::text::wrap_text(help, room).into_iter();
-        if let Some(first) = wrapped.next() {
-            out.push_str(&lead);
-            out.push_str(&first);
-            out.push('\n');
-        }
-        for continuation in wrapped {
-            out.push_str(&format!("{:description_column$}{continuation}\n", ""));
-        }
+        out.push_str(&mush_core::text::columns(usage, usage_width, help, width));
     }
     out.trim_end().to_string()
 }

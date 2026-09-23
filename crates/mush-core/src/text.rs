@@ -192,6 +192,57 @@ pub fn wrap_text_capped(text: &str, width: usize, max_lines: usize) -> Vec<Strin
     wrap_capped(text, width, Some(max_lines))
 }
 
+/// The least a description column may be and still be read: below this the
+/// two-column shape stops paying for itself, and a description hangs under the
+/// cell it describes instead of into a column of fragments.
+///
+/// At the `/help` popup's 40-column floor the command table's descriptions
+/// wrapped to one character per row — and to nine columns at 80 — because the
+/// usage column was never allowed to give a column back (finding D23). Sixteen
+/// is about a word and a half of prose: a readability judgement, not an
+/// arithmetic one, and one number because both help tables read it.
+pub const MIN_DESCRIPTION_COLUMNS: usize = 16;
+
+/// One row of a two-column help table, rendered for a surface `width` columns
+/// wide: `left` (its column sized by the caller's `left_width`, the longest
+/// left cell's) starts at the table's four-space indent and `description`
+/// starts in the column `4 + left_width + 2` reserves it, with every wrapped
+/// continuation hanging under the description rather than under the left cell.
+///
+/// When that description column would be narrower than
+/// [`MIN_DESCRIPTION_COLUMNS`], the two-column shape is abandoned: the left
+/// cell gets its own row and the description hangs *under* it, wrapped to the
+/// same four-space indent and the rest of `width`. A column of one- and
+/// two-word fragments costs more rows than it saves and reads as broken text,
+/// and the row it describes is what the human came for (finding D23).
+///
+/// Both help surfaces render through this one function — `mush --help`'s keys
+/// and commands blocks and the `/help` popup's — so the popup and the CLI
+/// cannot disagree about the shape, and the continuation indent is spelled
+/// once (the column arithmetic refactor R60 names).
+pub fn columns(left: &str, left_width: usize, description: &str, width: usize) -> String {
+    let description_column = 4 + left_width + 2;
+    let mut out = String::new();
+    if width.saturating_sub(description_column) < MIN_DESCRIPTION_COLUMNS {
+        out.push_str(&format!("    {left}\n"));
+        for line in wrap_text(description, width.saturating_sub(4).max(1)) {
+            out.push_str(&format!("    {line}\n"));
+        }
+        return out;
+    }
+    let lead = format!("    {left:<left_width$}  ");
+    let mut wrapped = wrap_text(description, width - description_column).into_iter();
+    if let Some(first) = wrapped.next() {
+        out.push_str(&lead);
+        out.push_str(&first);
+        out.push('\n');
+    }
+    for continuation in wrapped {
+        out.push_str(&format!("{:description_column$}{continuation}\n", ""));
+    }
+    out
+}
+
 fn wrap_capped(text: &str, width: usize, max_lines: Option<usize>) -> Vec<String> {
     let width = width.max(1);
     let mut out: Vec<String> = Vec::new();
@@ -225,6 +276,17 @@ fn wrap_capped(text: &str, width: usize, max_lines: Option<usize>) -> Vec<String
             // painted `bcd日`, five columns, and the terminal cut the glyph the
             // pane had no column for. So the break is a loop: while the tail
             // does not fit either, the tail is a row of its own.
+            //
+            // A break trims the **spaces it broke at**, and only those: `rest`
+            // begins at the space the row ended on, so every other character of
+            // the tail is the text's own. A no-break space, an ideographic space
+            // or a line separator is not a space to break at, so it is not one
+            // to delete either — `trim_start` ate the whole whitespace class
+            // and dropped characters the plain wrapper kept, which put the
+            // view's rows and the wrapper's rows on two different rules
+            // (finding B14). The tail rule is one rule now, spelled here and in
+            // `wrap_runs`: no character is dropped, and the two wrappers cannot
+            // disagree about where a row ends or what it holds.
             loop {
                 if current_width + char_width <= width || current.is_empty() {
                     break;
@@ -232,7 +294,7 @@ fn wrap_capped(text: &str, width: usize, max_lines: Option<usize>) -> Vec<String
                 if let Some(space) = last_space {
                     let rest = current.split_off(space);
                     out.push(std::mem::take(&mut current));
-                    current = rest.trim_start().to_string();
+                    current = rest.trim_start_matches(' ').to_string();
                 } else {
                     out.push(std::mem::take(&mut current));
                 }
@@ -355,11 +417,14 @@ pub enum RunStyle {
 ///   and an ordered marker is at most two digits, because `1998. It was a good
 ///   year` opens a sentence, not a list.
 /// - a line whose first non-space text is three backticks opens a fenced block,
-///   and the next such line closes it. The fence lines are not painted and
-///   everything between them is [`RunStyle::Fence`], one style with no inline
-///   parsing, so `**` in code stays code. A fence that never closes runs to the
-///   end of the message: an unterminated block is still a block, and the code
-///   in it is still code.
+///   and the next such line closes it. The fence lines of a block with a body
+///   are not painted and everything between them is [`RunStyle::Fence`], one
+///   style with no inline parsing, so `**` in code stays code. A block with no
+///   words in it is the exception — there is nothing for the fence to hide, so
+///   its fence lines are painted as text, and a reply of nothing but a fence
+///   is a turn the human can see (finding D14). A fence that never closes runs
+///   to the end of the message: an unterminated block is still a block, and the
+///   code in it is still code.
 ///
 /// An mark that never closes is **text**: `**bold` is `**bold`, a lone `*` is a
 /// lone `*`, and a `[link](` with no `)` is the characters it is. Nothing is
@@ -373,32 +438,110 @@ pub enum RunStyle {
 /// cannot fit a row by itself. A rendered row therefore does not outgrow
 /// `width` — one glyph (or one tab, four columns at once) wider than the whole
 /// width is the only thing a row cannot honour, and a pane's body is never that
-/// narrow. The rows this returns are the rows the plain wrapper would have
-/// made for the same text, with the styles attached.
+/// narrow. The wrap is the plain wrapper's wrap, exactly: the same break
+/// points, the same tab stop, and the same tail on every break — the spaces
+/// the break happened at, and no other character, a no-break space included
+/// (finding B14) — with the styles attached, so a row is the row the plain
+/// wrapper would have made of the text the rules above left.
 pub fn markdown_rows(text: &str, width: usize) -> Vec<Vec<Run>> {
+    markdown_walk(text, width).0
+}
+
+/// How many rows each source line of `text` paints under [`markdown_rows`], in
+/// source order — one entry per `text.split('\n')` line, the lines a rule
+/// paints nothing for included as zeroes.
+///
+/// The map a caller that tags painted rows with their source line needs: the
+/// pane's stop map cannot count a fence line's rows off the source, because a
+/// fence line paints a row only when its block has no body, and only the walk
+/// that paints the rows knows that. Asking the same walk for both answers is
+/// what keeps the map from drifting off the screen — a second count with a
+/// restated rule is the drift this exists to prevent (finding D14).
+///
+/// One entry per line, always: a line whose rule paints nothing is a `0`, not
+/// a missing entry, so a caller can index by source line.
+pub fn markdown_row_counts(text: &str, width: usize) -> Vec<usize> {
+    markdown_walk(text, width).1
+}
+
+/// [`markdown_rows`]' walk, with the per-source-line row count beside it: the
+/// two answers are one pass, because the count *is* the walk's per-line result.
+fn markdown_walk(text: &str, width: usize) -> (Vec<Vec<Run>>, Vec<usize>) {
     let width = width.max(1);
+    let lines: Vec<String> = text.split('\n').map(sanitize).collect();
     let mut out = Vec::new();
-    let mut fence = false;
-    for raw in text.split('\n') {
-        let line = sanitize(raw);
-        if fence_line(&line) {
-            // The fence is scaffolding, not content: it is a block boundary,
-            // and a row of backticks is not something a human reads. The code
-            // inside is untouched — see the never-closing fence above.
-            fence = !fence;
+    let mut counts = Vec::with_capacity(lines.len());
+    let mut at = 0;
+    while at < lines.len() {
+        if !fence_line(&lines[at]) {
+            let rows = wrap_runs(&block(&lines[at]), width);
+            counts.push(rows.len());
+            out.extend(rows);
+            at += 1;
             continue;
         }
-        let runs = if fence {
-            vec![Run {
-                text: line,
-                style: RunStyle::Fence,
-            }]
+        // The fence's block: the lines up to the next fence line, or the
+        // message's end — an unterminated block is still a block, and the code
+        // in it is still code.
+        let close = lines[at + 1..]
+            .iter()
+            .position(|line| fence_line(line))
+            .map(|skip| at + 1 + skip);
+        let end = close.unwrap_or(lines.len());
+        // Does anything between the fences paint a word? A block that says
+        // nothing is not scaffolding to hide: the fence lines are the whole of
+        // what the model wrote, so they are painted as text. A reply of
+        // nothing but a fence was a turn with no row at all — a `mush › ` mark
+        // over nothing, and a select mode advertising `Enter copies` with no
+        // cursor anywhere on screen (finding D14).
+        let words = lines[at + 1..end]
+            .iter()
+            .any(|line| !line.trim().is_empty());
+        for (index, line) in lines[at..end].iter().enumerate() {
+            // The opening fence of a block with words is scaffolding and paints
+            // nothing; every other line is the block's own text — the code
+            // inside it, one style with no inline parsing.
+            let style = match (words, index) {
+                (true, 0) => {
+                    counts.push(0);
+                    continue;
+                }
+                (true, _) => RunStyle::Fence,
+                (false, _) => RunStyle::Plain,
+            };
+            let rows = wrap_runs(
+                &[Run {
+                    text: line.clone(),
+                    style,
+                }],
+                width,
+            );
+            counts.push(rows.len());
+            out.extend(rows);
+        }
+        // The closing fence: scaffolding like the opening one when the block
+        // had words, and one more line of what the model wrote when it did not.
+        if let Some(close) = close {
+            if words {
+                counts.push(0);
+            } else {
+                let rows = wrap_runs(
+                    &[Run {
+                        text: lines[close].clone(),
+                        style: RunStyle::Plain,
+                    }],
+                    width,
+                );
+                counts.push(rows.len());
+                out.extend(rows);
+            }
+            at = close + 1;
         } else {
-            block(&line)
-        };
-        out.extend(wrap_runs(&runs, width));
+            at = end;
+        }
     }
-    out
+    debug_assert_eq!(counts.len(), lines.len(), "one count per source line");
+    (out, counts)
 }
 
 /// Whether a line is a fence, opening or closing one. The run of backticks is
@@ -1330,6 +1473,26 @@ mod tests {
             .collect()
     }
 
+    /// Every string of length 1..=`max_len` over `alphabet`, in order. The
+    /// equality test's fuzz is generated rather than typed out, so its
+    /// alphabet is readable and its reach is exact (finding B14).
+    fn strings_over(alphabet: &[char], max_len: usize) -> Vec<String> {
+        fn walk(alphabet: &[char], remaining: usize, current: &mut String, out: &mut Vec<String>) {
+            if remaining == 0 {
+                return;
+            }
+            for ch in alphabet {
+                current.push(*ch);
+                out.push(current.clone());
+                walk(alphabet, remaining - 1, current, out);
+                current.pop();
+            }
+        }
+        let mut out = Vec::new();
+        walk(alphabet, max_len, &mut String::new(), &mut out);
+        out
+    }
+
     /// A marker marks, and a marker that never closes is text — the characters
     /// as they were written, not half a span and not a dropped character. The
     /// same guard keeps a `*` used for arithmetic and a span of spaces as the
@@ -1495,7 +1658,10 @@ mod tests {
     /// between them is code, one style, with no inline parsing — so the markers
     /// a model writes in code stay the characters they are. A fence that never
     /// closes runs to the end of the message, because an unterminated block is
-    /// still a block and the code in it is still code.
+    /// still a block and the code in it is still code. The one block whose
+    /// fence lines *are* painted is the block that says nothing: with no body
+    /// to hide there is no scaffolding, and a reply of nothing but a fence
+    /// must be a turn the human can see (finding D14).
     #[test]
     fn a_fence_hides_its_lines_and_marks_the_code_between_them() {
         let text = "before\n```rust\nlet x = **1**;\t// tab\n```\nafter";
@@ -1535,9 +1701,31 @@ mod tests {
             vec![RunStyle::Plain, RunStyle::Fence, RunStyle::Fence]
         );
 
-        // The fence line itself is not a row: a message that is only a fence
-        // paints nothing at all.
-        assert_eq!(markdown_rows("```", 40), Vec::<Vec<Run>>::new());
+        // A body that says nothing is not a body: the fence lines are the
+        // whole of what was written, so they are rows of their own. Two fences
+        // in a row are an empty block, not a fence that hides its own line.
+        assert_eq!(rows("```", 40), vec!["```"]);
+        assert_eq!(rows("```\n```", 40), vec!["```", "```"]);
+        assert_eq!(rows("```\n\n```", 40), vec!["```", "", "```"]);
+        assert_eq!(
+            rows("a\n```\n\n```\nb", 40),
+            vec!["a", "```", "", "```", "b"]
+        );
+        assert_eq!(rows("```\n \n```", 40), vec!["```", " ", "```"]);
+
+        // And the row counts are the walk's own map, one entry per source
+        // line: zeroes for the scaffolding a body hides, and the painted rows
+        // for the lines that are text.
+        assert_eq!(
+            markdown_row_counts("```\nlet x = 1;\n```", 40),
+            vec![0, 1, 0]
+        );
+        assert_eq!(markdown_row_counts("```\n```", 40), vec![1, 1]);
+        assert_eq!(markdown_row_counts("a\n```\n```\nb", 40), vec![1, 1, 1, 1]);
+        assert_eq!(
+            markdown_row_counts("a\n```\nlet x = 1;\nb", 40),
+            vec![1, 0, 1, 1]
+        );
     }
 
     /// A link renders as its text and its URL, both: this is a coding tool, and
@@ -1620,6 +1808,11 @@ mod tests {
     /// two make the same rows, character for character, at every width — one
     /// rule with two spellings, and this is the test that says they cannot
     /// drift.
+    ///
+    /// The second half is the fuzz that found the last divergence (finding
+    /// B14): a no-break space is not a space, so a break that lands before one
+    /// must leave it in the row on both roads. Every string up to length 5 over
+    /// that alphabet, at widths 1..=12, is that fuzz kept as the pin.
     #[test]
     fn a_plain_message_wraps_exactly_like_wrap_text() {
         let texts = [
@@ -1639,6 +1832,16 @@ mod tests {
                 assert_eq!(
                     rows(text, width),
                     wrap_text(text, width),
+                    "{text:?} @ {width}"
+                );
+            }
+        }
+        let alphabet = ['a', 'b', ' ', '\u{a0}', '\u{3000}', '\u{2028}', '\t'];
+        for text in strings_over(&alphabet, 5) {
+            for width in 1..=12usize {
+                assert_eq!(
+                    rows(&text, width),
+                    wrap_text(&text, width),
                     "{text:?} @ {width}"
                 );
             }

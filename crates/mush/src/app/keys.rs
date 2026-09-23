@@ -35,7 +35,7 @@
 
 use ratatui::crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
-use mush_core::text::wrap_text;
+use mush_core::text::columns;
 
 use super::chat::SelectKey;
 use super::Focus;
@@ -306,20 +306,17 @@ pub fn help_table() -> String {
 
 /// The same table, rendered for a surface `width` columns wide: the keys stay
 /// in their column and a description that does not fit hangs under its own
-/// column rather than under the keys, so a popup no wider than a phone does
-/// not read as a broken two-column page (finding U15). `width` is a byte/column
-/// budget of the longest row; `usize::MAX` is the unwrapped form `--help`
-/// prints.
+/// column — or, when that column would be narrower than
+/// [`mush_core::text::MIN_DESCRIPTION_COLUMNS`], under its own keys row, wrapped at the
+/// surface's whole width, which is what the `/help` popup does at the 40-column
+/// floor (finding D23). `width` is a byte/column budget of the longest row;
+/// `usize::MAX` is the unwrapped form `--help` prints.
 pub fn help_table_at(width: usize) -> String {
     let key_width = KEYS
         .iter()
         .map(|binding| binding.keys.chars().count())
         .max()
         .unwrap_or(0);
-    // Four spaces of indent, the keys column, its two-space gutter: where a
-    // wrapped description starts.
-    let description_column = 4 + key_width + 2;
-    let room = width.saturating_sub(description_column).max(1);
     let mut out = String::new();
     let mut shown: Option<Context> = None;
     for binding in KEYS {
@@ -330,16 +327,7 @@ pub fn help_table_at(width: usize) -> String {
             out.push_str(&format!("  {}:\n", binding.context.label()));
             shown = Some(binding.context);
         }
-        let lead = format!("    {:<key_width$}  ", binding.keys);
-        let mut wrapped = wrap_text(binding.help, room).into_iter();
-        if let Some(first) = wrapped.next() {
-            out.push_str(&lead);
-            out.push_str(&first);
-            out.push('\n');
-        }
-        for continuation in wrapped {
-            out.push_str(&format!("{:description_column$}{continuation}\n", ""));
-        }
+        out.push_str(&columns(binding.keys, key_width, binding.help, width));
     }
     out.trim_end().to_string()
 }
