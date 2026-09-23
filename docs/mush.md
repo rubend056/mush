@@ -529,10 +529,13 @@ lingering `thinking…` impossible rather than merely fixed.
 state (`glyph · id`), then the marks, then `branch +add −del`, then the activity
 with its age, then the title — facts that exist nowhere else survive longest, and
 the title yields first because the footer and the transcript carry the brief in
-full. The title is derived from the brief (`deep.txt`, `lexer`), so two children
-never read the same. The selected row's full facts get a footer under the list,
-up to three lines when the pane is tall and one when it is compact, isolated
-agents included (`.mush/wt/2 · git diff HEAD...mush/2` — git's own spellings).
+full. The title is derived from the brief (a given `title` first, else the
+brief's first line's first path-like word, else its first non-filler word —
+`deep.txt`, `lexer`), so two briefs that share that word paint the same title;
+give a child a `title` where the rows must read apart. The selected row's full
+facts get a footer under the list, up to three lines when the pane is tall and
+one when it is compact, isolated agents included (`.mush/wt/2 · git diff
+HEAD...mush/2` — git's own spellings).
 The pane's title totals the tree (`agents · 2 working · 1 waiting · Σ +324 −40`
 — each count named, each agent in exactly one). `fit_row` is
 `crates/mush-core/src/text.rs`; the derivation is `App::rows` in
