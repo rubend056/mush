@@ -646,8 +646,11 @@ are computed in `App`.
   age appended once it is past ten seconds, so a cached fact cannot read as a
   live one. The meter is the run's own numbers: what the conversation weighs
   against the history budget (`full` at it, `over` one byte past it), the fold's
-  trigger inside that budget, and the window last with the `~` that says it was
-  assumed rather than stated. The window's size is never a mystery again, and
+  trigger inside that budget, and the window last with the mark of the road it
+  came by: `~` assumed from mush's model table, `≈` advertised by the endpoint's
+  model list, `≤` named by the endpoint in a refusal, and none when the human
+  stated it — `--print-config` and `/context` say that road in words. The
+  window's size is never a mystery again, and
   the repository survives the narrowest of them.
 - **R3 — Size tiers with a floor.** `[DONE]` `w<40 || h<10` → a single notice,
   centred on both axes, that falls back to a shorter spelling and always names
