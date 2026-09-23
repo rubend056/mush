@@ -895,10 +895,14 @@ Each line is what was checked and against what, not what a doc says.
   picker, the select mode at both ends) through `App::screen` + `ui::draw` — all
   survived; the compact tiers' three `Length`s add up exactly; `▲N`/`▼N` match
   ratatui's real window; every frame starts from a blank buffer.
-- **The painter cannot emit a terminal command**: `Buffer::set_stringn` filters
-  graphemes containing controls, so even the unsanitized `⌂ {root}` cell and
-  `Config::label()`'s endpoint are cosmetic gaps, not escapes (B15's *marks*
-  never reach a cell either).
+- **The painter can emit a terminal command**: `Buffer::set_stringn` does
+  **not** filter control graphemes — the *Unsolved* experiment in
+  `paint-and-measure.md` was run: paint `Line::from(Span::raw("\u{1b}[2J"))`
+  into a `TestBackend` and read the cell, and the escape is in the cell, because
+  crossterm's backend writes `cell.symbol()` verbatim — so the unsanitized
+  `⌂ {root}` cell and `Config::label()`'s endpoint are real escapes, not
+  cosmetic gaps, which is why the box and the bar defang what they paint
+  (`a3274b3`; B15's *marks* never reach a cell).
 - **`rows()` order and completeness for unique ids, and cursor arithmetic**
   (child blind on `tree.rs`): pre-order over parent links, orphans top-level,
   `grow`'s visited check makes a cycle a non-loop, `cursor_id` is the one
