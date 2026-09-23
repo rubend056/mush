@@ -412,6 +412,25 @@ pub enum RunStyle {
 ///   [`RunStyle::Url`]. The URL's own parentheses are counted, so a wiki link's
 ///   tail is not cut off.
 ///
+/// A span **nests**: its content is read by the same rules, so a strong run may
+/// hold an emphasis run and an emphasis run a strong one. `**a *b* c**` is
+/// strong `a `, emphasis `b`, strong ` c`; `~~old *new*~~` is strike `old `,
+/// emphasis `new`; a code span inside a strong one is still a code span; and a
+/// marker that does not close inside a span is the text it is, so `**a *b**` is
+/// one strong `a *b`. The runs stay a flat [`Vec<Run>`] and a run wears one
+/// style, so nesting on a terminal is *adjacent* runs with the inner style
+/// attached: the outer style is what the content left plain, and an inner
+/// span's own runs keep theirs. One character cannot wear two styles, and the
+/// inner one is the one the writer meant.
+///
+/// A run of three or more asterisks is still **one** strong span: the run is
+/// spent whole by the rule that opens it, so `***bold***` is the strong `bold`
+/// it always was. CommonMark reads that run as an emphasis *around* a strong,
+/// and this view does not read a span it cannot paint — such an emphasis would
+/// cover no character the strong does not, and a character wears one style, so
+/// the nested reading and this one are the same row. The nesting this view
+/// reads is the content's own.
+///
 /// A **run** of a marker is all-or-nothing: a rule spends every marker in the
 /// run it opens or closes with, and a run no rule can spend as a pair is text
 /// exactly as it was typed. So no row ever paints a marker left over from a run
@@ -804,10 +823,13 @@ fn checkbox<'a>(marker: &str, text: &'a str) -> Option<(char, &'a str)> {
 
 /// One source line's inline markers: plain text, spans, and links, in order.
 ///
-/// No nesting and no escapes: inside a span the text is the text, so
-/// `**a *b**` is strong text that happens to hold a star. That is the small
-/// version on purpose — a recursive parser is where a chat reply stops being a
-/// reading.
+/// A span's content is read by this same scanner — that is what nesting is —
+/// so `**a *b* c**` is three runs and `**a *b**` is one: the content's own
+/// markers are read where they stand, and a marker that does not close inside
+/// the span is the text it is. Two spans do not nest into their own content:
+/// a code span's text is code, so its backticks and asterisks are the
+/// characters they are, and a link's text is one link, because the URL beside
+/// it is the fact the pair exists to carry.
 fn inline(line: &str) -> Vec<Run> {
     let chars: Vec<char> = line.chars().collect();
     let mut runs: Vec<Run> = Vec::new();
@@ -836,6 +858,24 @@ fn inline(line: &str) -> Vec<Run> {
             text: plain,
             style: RunStyle::Plain,
         });
+    }
+    runs
+}
+
+/// The runs a span's content made, with the span's own style worn by every run
+/// the content left plain.
+///
+/// This is all "nesting" can mean on a terminal: a [`Run`] wears one style, so
+/// an outer span is the style of the content's plain runs and an inner span
+/// keeps its own — the two are *adjacent* runs, not two styles on one
+/// character. The inner style is the one the writer meant, so it is the one
+/// that survives where the two would overlap.
+fn nested(content: &str, style: RunStyle) -> Vec<Run> {
+    let mut runs = inline(content);
+    for run in &mut runs {
+        if run.style == RunStyle::Plain {
+            run.style = style;
+        }
     }
     runs
 }
@@ -881,13 +921,8 @@ fn span(chars: &[char], i: usize) -> Option<(usize, Vec<Run>)> {
                 (RunStyle::Strong, Closer::Run)
             };
             close(chars, i + open, '*', closer).map(|(end, len)| {
-                (
-                    end + len,
-                    vec![Run {
-                        text: chars[i + open..end].iter().collect(),
-                        style,
-                    }],
-                )
+                let text: String = chars[i + open..end].iter().collect();
+                (end + len, nested(&text, style))
             })
         }
         '~' => {
@@ -896,13 +931,8 @@ fn span(chars: &[char], i: usize) -> Option<(usize, Vec<Run>)> {
                 return None;
             }
             close(chars, i + open, '~', Closer::Run).map(|(end, len)| {
-                (
-                    end + len,
-                    vec![Run {
-                        text: chars[i + open..end].iter().collect(),
-                        style: RunStyle::Strike,
-                    }],
-                )
+                let text: String = chars[i + open..end].iter().collect();
+                (end + len, nested(&text, RunStyle::Strike))
             })
         }
         '_' if underscore_opens(chars, i) => {
@@ -912,13 +942,8 @@ fn span(chars: &[char], i: usize) -> Option<(usize, Vec<Run>)> {
                 if matches!(chars.get(end + len), Some(ch) if *ch == '_' || ch.is_alphanumeric()) {
                     return None;
                 }
-                Some((
-                    end + len,
-                    vec![Run {
-                        text: chars[i + 1..end].iter().collect(),
-                        style: RunStyle::Emphasis,
-                    }],
-                ))
+                let text: String = chars[i + 1..end].iter().collect();
+                Some((end + len, nested(&text, RunStyle::Emphasis)))
             })
         }
         '[' => link(chars, i).map(|(end, text, url)| {
@@ -2202,6 +2227,88 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A span's content is read by the same scanner, so emphasis nests: a
+    /// strong run may hold an emphasis run and the other way round. The runs
+    /// stay flat and a run wears one style, so nesting shows as *adjacent* runs
+    /// with the inner style attached — the outer style is what the content left
+    /// plain, and an inner span keeps its own.
+    #[test]
+    fn emphasis_nests_and_shows_as_adjacent_runs() {
+        assert_eq!(
+            runs("**a *b* c**"),
+            vec![
+                ("a ".to_string(), RunStyle::Strong),
+                ("b".to_string(), RunStyle::Emphasis),
+                (" c".to_string(), RunStyle::Strong),
+            ]
+        );
+        assert_eq!(
+            runs("*a **b** c*"),
+            vec![
+                ("a ".to_string(), RunStyle::Emphasis),
+                ("b".to_string(), RunStyle::Strong),
+                (" c".to_string(), RunStyle::Emphasis),
+            ]
+        );
+        assert_eq!(
+            runs("_a **b** c_"),
+            vec![
+                ("a ".to_string(), RunStyle::Emphasis),
+                ("b".to_string(), RunStyle::Strong),
+                (" c".to_string(), RunStyle::Emphasis),
+            ]
+        );
+        // Strike nests the same way: the words outside the inner span wear the
+        // strike, and the inner span wears its own style.
+        assert_eq!(
+            runs("~~old *new*~~"),
+            vec![
+                ("old ".to_string(), RunStyle::Strike),
+                ("new".to_string(), RunStyle::Emphasis),
+            ]
+        );
+        // A code span inside a strong one is a code span: its backticks are
+        // read, not painted, and its own text is not parsed.
+        assert_eq!(
+            runs("**read `main.rs` now**"),
+            vec![
+                ("read ".to_string(), RunStyle::Strong),
+                ("main.rs".to_string(), RunStyle::Code),
+                (" now".to_string(), RunStyle::Strong),
+            ]
+        );
+        assert_eq!(
+            runs("**a `*b*` c**"),
+            vec![
+                ("a ".to_string(), RunStyle::Strong),
+                ("*b*".to_string(), RunStyle::Code),
+                (" c".to_string(), RunStyle::Strong),
+            ]
+        );
+        // A link inside a span stays a link and its URL.
+        assert_eq!(
+            runs("**see [docs](https://x.dev/a) now**"),
+            vec![
+                ("see ".to_string(), RunStyle::Strong),
+                ("docs".to_string(), RunStyle::Link),
+                (" (https://x.dev/a)".to_string(), RunStyle::Url),
+                (" now".to_string(), RunStyle::Strong),
+            ]
+        );
+        // What the view promised before nesting still holds: a run of three or
+        // more is one strong span spent whole, and a marker that does not close
+        // inside a span is the text it is.
+        assert_eq!(
+            runs("***bold***"),
+            vec![("bold".to_string(), RunStyle::Strong)]
+        );
+        assert_eq!(
+            runs("**a *b**"),
+            vec![("a *b".to_string(), RunStyle::Strong)]
+        );
+        assert_eq!(runs("*a**"), vec![("*a**".to_string(), RunStyle::Plain)]);
     }
 
     /// A fence is a block, and the fence lines are not painted: everything

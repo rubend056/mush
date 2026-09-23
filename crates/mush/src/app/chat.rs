@@ -6757,6 +6757,39 @@ mod tests {
         );
     }
 
+    /// Nested emphasis reaches the frame as adjacent spans: the outer style on
+    /// the words it holds, the inner style on the run it marks, and the outer
+    /// style again after it — one style per span, which is what nesting is on
+    /// a terminal.
+    #[test]
+    fn nested_emphasis_paints_as_adjacent_spans() {
+        let message = Message::assistant("**a *b* c**");
+        let mut rows = Vec::new();
+        render_message(&mut rows, &message, None, 40, false, Fold::DEFAULT, &[]);
+        assert_eq!(shown(&rows)[0], "mush › a b c");
+        let spans: Vec<(&str, bool, bool)> = rows[0]
+            .spans
+            .iter()
+            .map(|span| {
+                let modifier = span.style.add_modifier;
+                (
+                    span.content.as_ref(),
+                    modifier.contains(ratatui::style::Modifier::BOLD),
+                    modifier.contains(ratatui::style::Modifier::ITALIC),
+                )
+            })
+            .collect();
+        assert_eq!(
+            spans,
+            vec![
+                ("mush › ", false, false),
+                ("a ", true, false),
+                ("b", false, true),
+                (" c", true, false),
+            ]
+        );
+    }
+
     /// A tool result is data, not prose: its bytes are what the human copies
     /// out — a diff, a test log, a shell transcript — so the view does not
     /// touch it. A `#` in such a line is a comment, an `*` is a glob and
