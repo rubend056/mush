@@ -5013,15 +5013,25 @@ fn write_tool(actor: &Actor, args: &Value) -> Result<String, String> {
 /// `list_files`: the workspace's files under a path, one per line.
 fn list_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String, String> {
     let rel = tools::arg_path(args, "path")?;
-    let (files, truncated) = actor.ws.list_files(&rel, LIST_LIMIT)?;
-    if files.is_empty() {
+    let (files, truncated, unnamed) = actor.ws.list_files(&rel, LIST_LIMIT)?;
+    if files.is_empty() && unnamed == 0 {
         return Ok(format!("{}: no files", shown_path(&rel)));
     }
-    let mut out = files.join("\n");
+    let mut notes = Vec::new();
     if truncated {
-        out.push_str(&format!(
-            "\n[mush: the first {LIST_LIMIT} files — list a narrower path to see the rest]"
+        notes.push(format!(
+            "the first {LIST_LIMIT} files — list a narrower path to see the rest"
         ));
+    }
+    if unnamed > 0 {
+        notes.push(unnamed_note(unnamed));
+    }
+    let mut out = files.join("\n");
+    if !notes.is_empty() {
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&format!("[mush: {}]", notes.join("; ")));
     }
     Ok(truncate_for_model(out, result_cap(actor, state)))
 }
@@ -5032,17 +5042,24 @@ fn search_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String
     let rel = tools::arg_path(args, "path")?;
     let ignore_case = tools::arg_bool(args, "ignore_case", false)?;
     let found = actor.ws.search(&pattern, &rel, ignore_case, SEARCH_LIMIT)?;
+    let mut skipped = Vec::new();
+    if found.skipped > 0 {
+        skipped.push(skipped_note(found.skipped));
+    }
+    if found.unnamed > 0 {
+        skipped.push(unnamed_note(found.unnamed));
+    }
     if found.matches.is_empty() {
         // A miss that never opened every file is not a miss. "No match" is
         // what a model reads as "it is not there", so the files the walk
         // skipped are named along with the road to them.
         let under = shown_path(&rel);
-        return Ok(if found.skipped == 0 {
+        return Ok(if skipped.is_empty() {
             format!("no match for `{pattern}` under {under}")
         } else {
             format!(
                 "no match for `{pattern}` under {under} — {}",
-                skipped_note(found.skipped)
+                skipped.join("; ")
             )
         });
     }
@@ -5055,6 +5072,9 @@ fn search_tool(actor: &Actor, state: &ActorState, args: &Value) -> Result<String
     }
     if found.skipped > 0 {
         notes.push(skipped_note(found.skipped));
+    }
+    if found.unnamed > 0 {
+        notes.push(unnamed_note(found.unnamed));
     }
     if !notes.is_empty() {
         out.push_str(&format!("\n[mush: {}]", notes.join("; ")));
@@ -5073,6 +5093,21 @@ fn skipped_note(skipped: usize) -> String {
         format!(
             "{skipped} files were skipped (binary or over {cap} MB); run_command (`rg`) reads them"
         )
+    }
+}
+
+/// The files neither a listing nor a search could name, as a sentence. A name
+/// the model cannot pass back to `read_file` is worse than absent when it is
+/// carried: it reads as a file and opens as nothing, and a match under it would
+/// be a dead end. So the name is not shown; the count is, and the shell is the
+/// road that reaches it, names and all.
+fn unnamed_note(unnamed: usize) -> String {
+    let why = "a line break in the name, bytes that are not UTF-8, or leading/trailing whitespace \
+               the tools' own trim would drop";
+    if unnamed == 1 {
+        format!("1 file was not named ({why}); run_command (`ls -b`, `rg`) reads it")
+    } else {
+        format!("{unnamed} files were not named ({why}); run_command (`ls -b`, `rg`) reads them")
     }
 }
 

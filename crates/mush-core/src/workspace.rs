@@ -58,8 +58,10 @@ pub const IMAGE_FILE_CAP: u64 = 2 * 1024 * 1024;
 /// is the road to that file.
 pub const SEARCH_FILE_CAP: u64 = 2 * 1024 * 1024;
 
-/// How much of one matching line `search` shows, so one minified line cannot
-/// spend the whole result.
+/// How much of one matching line `search` shows, in *bytes*, so one minified
+/// line cannot spend the whole result. A line past the cap is cut on a
+/// character boundary and the cut is marked ([`match_line`]): a partial line a
+/// model mistakes for the whole is a wrong fact, not a short one.
 const MATCH_LINE_CAP: usize = 240;
 
 /// The mime an image's own first bytes name, or `None` when they are not an
@@ -297,15 +299,23 @@ pub struct Workspace {
 }
 
 /// What a search found: the matching lines, whether the cap cut the list short,
-/// and how many files it never opened (binary, or past [`SEARCH_FILE_CAP`]).
+/// how many files it never opened (binary, or past [`SEARCH_FILE_CAP`]), and
+/// how many it found whose name cannot travel on the model's road
+/// ([`Workspace::name_for_model`]: a line break in the name, bytes that are
+/// not UTF-8, or ends `resolve` would trim).
 ///
 /// The third field is the one that keeps "no match" honest. A model reads a
 /// miss as "the symbol does not exist", so a search that skipped a file must
 /// say so — the count is what the tool tells it instead of a false negative.
+/// The fourth is the same honesty for the *name*: a match line is prefixed
+/// with the path, and a path the model cannot pass back to `read_file` is a
+/// dead end, so such files are not searched and are counted instead — the same
+/// reason [`Workspace::list_files`] leaves them out (finding B9).
 pub struct Matches {
     pub matches: Vec<String>,
     pub more: bool,
     pub skipped: usize,
+    pub unnamed: usize,
 }
 
 /// What a bounded line count of a whole file can say, from
@@ -416,12 +426,54 @@ impl Workspace {
         }
     }
 
-    /// Workspace-relative display path for an absolute path.
+    /// Workspace-relative display path for an absolute path: the name the
+    /// filesystem holds, with a path outside the root left whole (a real path
+    /// must not be rewritten into a relative one that means something else).
+    ///
+    /// Nothing here folds a `\` into `/`. On this box `\` is an ordinary
+    /// byte of a file's name, and the fold made a name that no road can open
+    /// again: a file named `a\b.txt` listed as `a/b.txt`, and a model's
+    /// `read_file` on the listed name answered "No such file or directory" —
+    /// the listing handed over a path the listing could not open (finding B9).
+    /// A name is bytes, not display. The roads that *hand names over* go
+    /// through [`Self::name_for_model`] instead, which refuses a name that
+    /// cannot travel as itself; this one is infallible because its callers show
+    /// a path rather than give one back, and so it may decode lossily.
     pub fn rel(&self, path: &Path) -> String {
         path.strip_prefix(&self.root)
             .unwrap_or(path)
             .to_string_lossy()
-            .replace('\\', "/")
+            .into_owned()
+    }
+
+    /// The name a *model road* hands back for a real path, or `None` when the
+    /// name cannot travel as itself.
+    ///
+    /// The listing and the search are data roads: what they report is what the
+    /// model passes back to `read_file`, so a reported name must be one the
+    /// tools open again — [`Self::resolve`] has to return the same path. Three
+    /// shapes cannot:
+    ///
+    /// - a name that is not valid UTF-8: [`Self::rel`]'s lossy decode would
+    ///   hand over U+FFFD where the file holds a byte, and the name would name
+    ///   nothing;
+    /// - a name holding `\n` or `\r`: a listing is one name per line, so it
+    ///   would read as two entries, neither of them the file (B9's second
+    ///   half);
+    /// - a name whose ends [`str::trim`] would change: `resolve` trims the path
+    ///   it is given, so a leading or trailing space (or NBSP, or any other
+    ///   whitespace) is a byte the model's own road cannot carry — handing it
+    ///   over would name a different file, or none.
+    ///
+    /// `None` is not a silent loss: the road counts what it could not name and
+    /// the tool layer says how many and which road reaches them
+    /// (`run_command`: `ls -b`, `rg`).
+    fn name_for_model(&self, path: &Path) -> Option<String> {
+        let name = path.strip_prefix(&self.root).unwrap_or(path).to_str()?;
+        if name.trim() != name || name.contains(['\n', '\r']) {
+            return None;
+        }
+        Some(name.to_string())
     }
 
     /// Read a text file whole, for the one road that writes back what it reads:
@@ -899,6 +951,19 @@ impl Workspace {
     /// string that cannot match. The range is named once, in the trailing
     /// sentence.
     ///
+    /// The window's lines are a *reader's* lines: [`str::lines`] drops the
+    /// `\r` of a CRLF ending, so what is copied out of a CRLF file's window is
+    /// a line's text, never its bytes. That is said rather than hidden — a file
+    /// whose lines all end with CRLF gets a sentence saying so, and [`edit`]
+    /// refuses an edit whose strings hold a line break or a `\r` in such a
+    /// file: a single-line edit lands byte for byte, and the road for anything
+    /// across lines is `run_command` (`sed -i`, `perl -pi`) or `write_file`
+    /// (finding B7). The two used to be silent and disagreed — a copied
+    /// multi-line `old_string` could never match, and a one-line edit that did
+    /// match inserted LF lines into the CRLF file.
+    ///
+    /// [`edit`]: crate::tools::edit_text
+    ///
     /// The cap is the same whole-read cap as everywhere else ([`READ_FILE_CAP`],
     /// checked from the stat by [`Self::whole_read`] before a byte is read): this
     /// road cannot get past it, and the refusal is [`over_read_cap`]'s one
@@ -957,6 +1022,14 @@ impl Workspace {
         }
         let last = offset + shown.len() - 1;
         let mut out = shown.join("\n");
+        if text::is_crlf(&text) {
+            out.push_str(
+                "\n[mush: the file's lines end with CRLF — the \\r is not shown in a line; an \
+                 edit whose old_string or new_string holds a line break or a \\r is refused, a \
+                 line's own text still edits exactly, and run_command (`sed -i`, `perl -pi`) or \
+                 write_file is the road for anything across lines]",
+            );
+        }
         if part {
             out.push_str(&format!(
                 "\n[mush: line {offset} of {total} is longer than the {cap}-byte cap — shown in \
@@ -976,9 +1049,11 @@ impl Workspace {
     }
 
     /// Every file under `rel` (default the workspace root), workspace-relative
-    /// and sorted, with the first `limit` and whether there were more. Build and
-    /// VCS directories are skipped ([`SKIP_DIRS`]); a symlinked directory is not
-    /// followed, so a listing cannot leave the workspace.
+    /// and sorted, with the first `limit`, whether there were more, and how
+    /// many files the walk found whose name cannot travel on the model's road
+    /// ([`Self::name_for_model`]). Build and VCS directories are skipped
+    /// ([`SKIP_DIRS`]); a symlinked directory is not followed, so a listing
+    /// cannot leave the workspace.
     ///
     /// That claim is why the name is checked for real before the walk
     /// ([`Self::real_path`]): `out -> /tmp/elsewhere` is a name inside the root
@@ -986,7 +1061,18 @@ impl Workspace {
     /// runs on the name the model gave, so a link to a *file* inside the root
     /// answers about that file under the name it was asked about, while a link
     /// to a directory is left alone like every other symlinked directory.
-    pub fn list_files(&self, rel: &str, limit: usize) -> Result<(Vec<String>, bool), String> {
+    ///
+    /// The third value is why the listing does not hand over a name it cannot
+    /// open again: a name holding a line break reads as two entries, and a name
+    /// `resolve` would trim names a different file — both are counted instead
+    /// of reported, and the tool layer says how many and where they can be
+    /// reached (finding B9). The listing's own shape must not make a file
+    /// unreachable, or hand one over that is not there.
+    pub fn list_files(
+        &self,
+        rel: &str,
+        limit: usize,
+    ) -> Result<(Vec<String>, bool, usize), String> {
         let start = self.resolve(rel)?;
         self.real_path(&start, rel)?;
         // "Empty" and "not there" are different facts, and a listing that
@@ -996,14 +1082,18 @@ impl Workspace {
             return Err(format!("no such path: `{rel}`"));
         }
         let mut found = Vec::new();
+        let mut unnamed = 0usize;
         self.walk(&start, &mut |path: &Path| {
-            found.push(self.rel(path));
+            match self.name_for_model(path) {
+                Some(name) => found.push(name),
+                None => unnamed += 1,
+            }
             true
         });
         found.sort();
         let truncated = found.len() > limit;
         found.truncate(limit);
-        Ok((found, truncated))
+        Ok((found, truncated, unnamed))
     }
 
     /// Every line under `rel` containing `pattern` — a literal string, not a
@@ -1014,8 +1104,16 @@ impl Workspace {
     /// runs one is the `rg` the shell already has, while this tool exists for
     /// the one case the shell cannot serve (a held machine lock). Binary files
     /// (a NUL byte) and files past [`SEARCH_FILE_CAP`] are skipped, and a
-    /// matching line is cut to [`MATCH_LINE_CAP`] so one minified file cannot
-    /// spend the result.
+    /// matching line is cut to [`MATCH_LINE_CAP`] bytes with the cut said, so
+    /// one minified file cannot spend the result.
+    ///
+    /// The match line is the *file's* line: no paint-time sanitizing, no
+    /// `trim_end`, and a CRLF ending's `\r` stays ([`text::file_lines`]). This
+    /// is a model road, and the model's roads are data — a line a search shows
+    /// that the file does not hold is a line the model copies into an
+    /// `old_string` and reads "not found" (finding B8). The pane that paints
+    /// the result sanitizes its own copy ([`text::sanitize`]), which is where
+    /// the escape sequences go.
     ///
     /// The decode is **lossy on purpose**, like [`Self::read_window`]'s and for
     /// the same reason: a search only shows what it found, so a file in another
@@ -1027,7 +1125,11 @@ impl Workspace {
     ///
     /// What it skipped is counted and travels back with the matches
     /// ([`Matches::skipped`]): a search that says "no match" while it never
-    /// opened a file is a false negative a model will act on.
+    /// opened a file is a false negative a model will act on. Files whose name
+    /// cannot travel on the model's road ([`Self::name_for_model`]) are not
+    /// opened either, and are counted the same way ([`Matches::unnamed`]) — a
+    /// match line is prefixed with the path, and a path the model cannot pass
+    /// back to `read_file` would be a dead end (finding B9).
     ///
     /// Like the listing, the name is checked for real before the walk
     /// ([`Self::real_path`]): a link inside the root cannot make the search
@@ -1056,7 +1158,14 @@ impl Workspace {
         let mut matches = Vec::new();
         let mut more = false;
         let mut skipped = 0usize;
+        let mut unnamed = 0usize;
         self.walk(&start, &mut |path: &Path| {
+            // The name is needed before the file is opened: it is the match
+            // line's prefix, and a name that cannot travel is not searched.
+            let Some(name) = self.name_for_model(path) else {
+                unnamed += 1;
+                return true;
+            };
             let Ok(meta) = fs::metadata(path) else {
                 skipped += 1;
                 return true;
@@ -1074,7 +1183,7 @@ impl Workspace {
                 return true;
             }
             let text = String::from_utf8_lossy(&bytes);
-            for (number, line) in text.lines().enumerate() {
+            for (number, line) in text::file_lines(&text).enumerate() {
                 let haystack = if ignore_case {
                     line.to_lowercase()
                 } else {
@@ -1087,12 +1196,7 @@ impl Workspace {
                     more = true;
                     return false;
                 }
-                matches.push(format!(
-                    "{}:{}: {}",
-                    self.rel(path),
-                    number + 1,
-                    text::truncate(line.trim_end(), MATCH_LINE_CAP)
-                ));
+                matches.push(format!("{}:{}: {}", name, number + 1, match_line(line)));
             }
             true
         });
@@ -1100,6 +1204,7 @@ impl Workspace {
             matches,
             more,
             skipped,
+            unnamed,
         })
     }
 
@@ -1638,6 +1743,28 @@ fn create_paste_file(dir: &Path, millis: u128, mime: &str) -> Result<(String, fs
     }
 }
 
+/// One matched line, as `search` hands it to a model: the file's own bytes,
+/// cut only past [`MATCH_LINE_CAP`] and with the cut said.
+///
+/// It is deliberately not [`text::truncate`]: that sanitizes for a pane, and it
+/// would delete the line's escape sequences and control bytes, turn a bare `\r`
+/// into `␍` and trim the line's own trailing whitespace — a line the file does
+/// not hold (finding B8). Nor is it `trim_end`ed: a search result is a
+/// location, and the model may ask about the spaces. The cut uses
+/// [`text::boundary_at_or_before`] and the marker names the road that prints
+/// the whole line, the same shape [`truncate_for_model`] uses for output; a
+/// line the cap did not touch comes back exactly.
+fn match_line(line: &str) -> String {
+    if line.len() <= MATCH_LINE_CAP {
+        return line.to_string();
+    }
+    let cut = text::boundary_at_or_before(line, MATCH_LINE_CAP);
+    format!(
+        "{}… [mush: line cut at {MATCH_LINE_CAP} bytes — run_command (`rg -n`) prints it whole]",
+        &line[..cut]
+    )
+}
+
 /// Cap text handed to a model, cutting on a char boundary and marking the
 /// cut, so a partial result can never be mistaken for the whole output. The
 /// marker says how much was kept and what to do next — the command result is
@@ -1883,10 +2010,72 @@ mod tests {
             ws.rel(&ws.root().join(".mush/session.json.bak.2")),
             ".mush/session.json.bak.2"
         );
-        // And the rule folds `\` to `/`: a path built on Windows, or a name a
-        // model wrote, reads with the one separator — which the second rule
-        // did not do.
-        assert_eq!(ws.rel(&ws.root().join("a\\b")), "a/b");
+        // And a name's `\` stays the name's: on this box it is an ordinary
+        // byte, and folding it into `/` named a path that does not exist
+        // (finding B9).
+        assert_eq!(ws.rel(&ws.root().join("a\\b")), "a\\b");
+    }
+
+    /// A path a tool hands the model is a path the tool opens again: a name is
+    /// bytes, not display. A file named `a\b.txt` lists as `a\b.txt` — the old
+    /// fold into `a/b.txt` named a file that does not exist — and a name that
+    /// cannot travel *as itself* (a line break, bytes that are not UTF-8, ends
+    /// `resolve` would trim) is not handed over as a path at all, because the
+    /// listing's own shape would read it as two entries or as a different file:
+    /// it is counted instead, for the tool layer to say so. A search names the
+    /// same file the same way (finding B9).
+    #[test]
+    fn a_listed_path_can_be_opened_again() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let ws = temp_workspace("listed-name");
+        fs::write(ws.root().join(r"a\b.txt"), "the real file\n").unwrap();
+        fs::write(ws.root().join("a\nb.txt"), "the newline file\n").unwrap();
+        fs::write(
+            ws.root().join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt")),
+            "latin name\n",
+        )
+        .unwrap();
+        fs::write(ws.root().join("trailing "), "trailing space\n").unwrap();
+
+        let (listed, truncated, unnamed) = ws.list_files("", 100).unwrap();
+        assert_eq!(
+            listed,
+            vec![r"a\b.txt".to_string()],
+            "the backslash is a name byte, not a separator"
+        );
+        assert!(!truncated);
+        assert_eq!(unnamed, 3, "the names that cannot travel are counted");
+        for name in &listed {
+            assert_eq!(
+                ws.read_file(name).unwrap(),
+                fs::read_to_string(ws.root().join(name)).unwrap(),
+                "every listed path opens the file it named"
+            );
+        }
+
+        // The search names the file the same way, and its path opens too. The
+        // three unnameable files are counted, not reported under a name that
+        // opens something else (or nothing).
+        let found = ws.search("the real file", "", false, 10).unwrap();
+        assert_eq!(found.matches, vec![r"a\b.txt:1: the real file".to_string()]);
+        assert_eq!(found.unnamed, 3);
+        let named = found.matches[0].split(':').next().unwrap();
+        assert_eq!(ws.read_file(named).unwrap(), "the real file\n");
+
+        // A search that never looked into the newline-named file is not a
+        // silent miss, and a directory of only such names is not "no files".
+        let found = ws.search("the newline file", "", false, 10).unwrap();
+        assert!(found.matches.is_empty());
+        assert_eq!(found.unnamed, 3);
+        let dir = ws.root().join("only");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("x\ny"), "no pattern\n").unwrap();
+        let (files, _, unnamed) = ws.list_files("only", 100).unwrap();
+        assert!(files.is_empty());
+        assert_eq!(unnamed, 1, "the listing says it left one name out");
+
+        let _ = fs::remove_dir_all(ws.root());
     }
 
     #[test]
@@ -3481,6 +3670,116 @@ mod tests {
         let long = "x".repeat(64 * 1024);
         ws.write_file("long.txt", &long).unwrap();
         assert_eq!(ws.read_file("long.txt").unwrap(), long);
+    }
+
+    /// A CRLF file's window and its edit road tell one story: the window says
+    /// the file's lines end with CRLF, because a line's *text* is not the
+    /// file's bytes when an ending is there; an edit inside one line lands and
+    /// leaves every ending alone; and an edit that spells a line break — the
+    /// copy that could never match, or the `new_string` that would insert LF
+    /// lines — is refused in words, naming the endings and the road that
+    /// changes them (finding B7).
+    #[test]
+    fn a_crlf_file_is_read_and_edited_consistently() {
+        let ws = temp_workspace("crlf-edit");
+        fs::write(ws.root().join("win.txt"), "alpha\r\nbeta\r\ngamma\r\n").unwrap();
+
+        let window = ws.read_window("win.txt", 1, 10, 4_000).unwrap();
+        assert!(
+            window.contains("CRLF"),
+            "the read says the file's line endings: {window:?}"
+        );
+
+        // A line's own text — what the window shows — is exactly what the edit
+        // road matches, and the file's other endings are untouched.
+        let edited = crate::tools::edit_text(
+            &ws.read_file("win.txt").unwrap(),
+            "gamma",
+            "delta",
+            false,
+            "win.txt",
+        )
+        .unwrap();
+        assert_eq!(edited, "alpha\r\nbeta\r\ndelta\r\n");
+        ws.write_file("win.txt", &edited).unwrap();
+        assert_eq!(
+            fs::read(ws.root().join("win.txt")).unwrap(),
+            b"alpha\r\nbeta\r\ndelta\r\n",
+            "the one-line edit left every CRLF standing"
+        );
+
+        // The copy the window used to invite: two of its lines, which is an
+        // `old_string` the file's bytes can never hold. The refusal names the
+        // line endings and the road that still does the work.
+        let refused = crate::tools::edit_text(&edited, "alpha\nbeta", "one\ntwo", false, "win.txt")
+            .unwrap_err();
+        assert!(refused.contains("CRLF"), "{refused}");
+        assert!(refused.contains("run_command"), "{refused}");
+
+        // And the one-line edit whose `new_string` would insert LF lines into
+        // the CRLF file is refused for the same reason, as is an edit that
+        // spells the ending itself.
+        for (old, new) in [("alpha", "A\nB"), ("alpha\r", "x"), ("alpha", "x\r")] {
+            let refused = crate::tools::edit_text(&edited, old, new, false, "win.txt").unwrap_err();
+            assert!(refused.contains("CRLF"), "{old:?} -> {new:?}: {refused}");
+        }
+
+        // The read still says so after the edit, and the window of a *mixed*
+        // file says nothing: its bytes can be edited exactly, and are.
+        assert!(ws
+            .read_window("win.txt", 1, 10, 4_000)
+            .unwrap()
+            .contains("CRLF"));
+        fs::write(ws.root().join("mixed.txt"), "a\nb\r\nc\n").unwrap();
+        let mixed = ws.read_window("mixed.txt", 1, 10, 4_000).unwrap();
+        assert!(!mixed.contains("CRLF"), "{mixed}");
+        assert_eq!(
+            crate::tools::edit_text("a\nb\r\nc\n", "a\nb", "A\nB", false, "mixed.txt").unwrap(),
+            "A\nB\r\nc\n"
+        );
+        let _ = fs::remove_dir_all(ws.root());
+    }
+
+    /// A search result is the file's line, not a display's: the trailing
+    /// spaces, the control byte and the escape sequence all come back, and so
+    /// does the `\r` of a CRLF ending — the bytes the file holds at that line
+    /// number. A line past the cap is cut on a character boundary and the cut
+    /// is said, never silently shortened (finding B8).
+    #[test]
+    fn a_searched_line_is_the_files_own_bytes() {
+        let ws = temp_workspace("search-bytes");
+        let line = "before\rneedle \x1b[31m \x07  ";
+        fs::write(ws.root().join("raw.txt"), format!("{line}\n")).unwrap();
+        assert_eq!(
+            ws.read_file("raw.txt").unwrap(),
+            format!("{line}\n"),
+            "the strict read and the search line are the same bytes"
+        );
+        let found = ws.search("needle", ".", false, 10).unwrap();
+        assert_eq!(
+            found.matches,
+            vec![format!("raw.txt:1: {line}")],
+            "no sanitizing, no trim_end: the line comes back byte for byte"
+        );
+
+        // The `\r` of a CRLF ending is the file's byte too.
+        fs::write(ws.root().join("crlf.txt"), "needle\r\nnext\r\n").unwrap();
+        let found = ws.search("needle", "crlf.txt", false, 10).unwrap();
+        assert_eq!(found.matches, vec!["crlf.txt:1: needle\r".to_string()]);
+
+        // A line past the cap is cut on a character boundary and marked, never
+        // silently shortened.
+        let long = format!("needle{}", "x".repeat(2 * MATCH_LINE_CAP));
+        ws.write_file("long.txt", &format!("{long}\n")).unwrap();
+        let found = ws.search("needle", "long.txt", false, 10).unwrap();
+        let reported = &found.matches[0];
+        assert!(
+            reported.starts_with(&format!("long.txt:1: {}", &long[..MATCH_LINE_CAP])),
+            "{reported}"
+        );
+        assert!(reported.contains("line cut at"), "{reported}");
+        assert!(reported.len() < long.len(), "the cut is real");
+        let _ = fs::remove_dir_all(ws.root());
     }
 
     /// The edit road's decode is strict: a non-UTF-8 file is refused with the

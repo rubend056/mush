@@ -3,6 +3,11 @@
 //! Wrapping, truncation, row budgets and secret masks all count *display
 //! columns*, so they live together and cannot drift (finding B9). Nothing here
 //! touches a terminal: this is string arithmetic over `unicode-width`.
+//!
+//! The line arithmetic is here for the other side of the same question: what a
+//! *file's* line is, as bytes, versus what a display makes of it
+//! ([`file_lines`]). The model's roads read a file and must hand back its own
+//! bytes; the pane's painter is the one road that rewrites them ([`sanitize`]).
 
 use unicode_truncate::UnicodeTruncateStr;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -23,9 +28,18 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 ///   meant to be overwritten) that no row can honour, and it is rare enough that
 ///   marking it is honest where dropping it would silently join two words. The
 ///   `\r` of a `\r\n` is a line ending, so it goes with nothing shown.
-/// - every other **C0/C1 control** and `DEL` is dropped, along with the bidi
-///   embedding and isolate characters: they exist to command a display rather
-///   than to be read, and the one U+200D a ZWJ emoji needs is not among them.
+/// - every other **C0/C1 control** and `DEL` is dropped, along with the
+///   characters that command the order a line is painted in: the bidi
+///   embeddings and isolates (U+202A–202E, U+2066–2069) and the bidi *marks*
+///   (U+200E LRM, U+200F RLM, U+061C ALM). A mark is the same command spelled
+///   invisibly — inside `src/main.rs` it can make the painted name read as a
+///   different path — and the whole family goes (finding B15).
+/// - the zero-width characters that command no order **stay**, and are named
+///   so the rule above cannot be read as wider than it is: ZWJ (U+200D) and
+///   ZWNJ (U+200C) are orthography — an emoji sequence, a Persian word — and
+///   ZWSP (U+200B), BOM (U+FEFF) and SHY (U+00AD) are invisible but reorder
+///   nothing and take no column. Dropping them would be this function editing
+///   the text it was asked to make safe.
 /// - a **tab** is kept. It is layout, not a command, and [`wrap_text`] renders
 ///   it as four columns — the pane's tab stop, never the terminal's.
 ///
@@ -52,8 +66,55 @@ pub fn sanitize(text: &str) -> String {
 }
 
 /// A character that commands a display instead of appearing on it.
+///
+/// The bidi *marks* are here beside the embeddings and isolates: LRM, RLM and
+/// ALM do not paint, but they pick the order a neutral run is laid out in, so a
+/// line that holds one can be painted as a different line than it is — the
+/// same command the embeddings spell, in one invisible character (finding
+/// B15). The zero-width characters that command no order are not here, and
+/// [`sanitize`]'s doc names them so this rule cannot be read as wider than it
+/// is.
 fn invisible(ch: char) -> bool {
-    ch.is_control() || matches!(ch, '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}')
+    ch.is_control()
+        || matches!(
+            ch,
+            '\u{061c}' | '\u{200e}' | '\u{200f}' | '\u{202a}'..='\u{202e}' | '\u{2066}'..='\u{2069}'
+        )
+}
+
+/// Whether `text` holds a `\n` that is not the second byte of a `\r\n`.
+fn has_bare_lf(text: &str) -> bool {
+    let bytes = text.as_bytes();
+    bytes
+        .iter()
+        .enumerate()
+        .any(|(index, &byte)| byte == b'\n' && (index == 0 || bytes[index - 1] != b'\r'))
+}
+
+/// Whether `text`'s lines all end with CRLF and there is at least one: a CRLF
+/// file.
+///
+/// A *mixed* file (one bare LF anywhere) is not one: an edit into it can be
+/// byte-exact, and calling it a CRLF file would refuse work the bytes allow.
+/// The two roads that must not guess are the window, which says a CRLF file's
+/// ending out loud, and the edit, which refuses an edit that would insert an
+/// ending the file does not use (finding B7).
+pub fn is_crlf(text: &str) -> bool {
+    text.contains("\r\n") && !has_bare_lf(text)
+}
+
+/// The lines `text` holds as the file's own bytes: split at every `\n`, with
+/// the `\r` of a `\r\n` kept at the end of the line it ends.
+///
+/// [`str::lines`] is a *reader's* split — it drops the `\r` of a CRLF ending —
+/// and this is the splitter a *model's* road reads a file through: a searched
+/// line must be the line the file holds, so its trailing spaces, its escape
+/// sequences and the `\r` of its ending all come back (finding B8). What the
+/// pane paints is the painter's own copy, [`sanitize`]d; what a read window
+/// shows is a line's text and says so when an ending is missing (finding B7).
+pub fn file_lines(text: &str) -> impl Iterator<Item = &str> {
+    text.split_inclusive('\n')
+        .map(|line| line.strip_suffix('\n').unwrap_or(line))
 }
 
 /// Consume one escape sequence, whole.
@@ -1115,6 +1176,55 @@ mod tests {
         assert_eq!(sanitize("safe\u{202e}drowssap"), "safedrowssap");
         // And the ordinary text a transcript is made of is untouched.
         assert_eq!(sanitize("w00 w01 · #1 done: ✓"), "w00 w01 · #1 done: ✓");
+    }
+
+    /// The doc says what goes and what stays, and this pins both halves. Every
+    /// character that can command the *order* a line is painted in leaves no
+    /// trace — the bidi marks beside the embeddings and isolates — while the
+    /// zero-width characters that command no order stay, because removing them
+    /// would be the sanitizer editing the text it was asked to make safe: a ZWJ
+    /// emoji and a ZWNJ word are the proof (finding B15).
+    #[test]
+    fn sanitize_strips_what_its_doc_says() {
+        for ch in [
+            '\u{061c}', // ALM
+            '\u{200e}', // LRM
+            '\u{200f}', // RLM
+            '\u{202a}', // LRE
+            '\u{202e}', // RLO
+            '\u{2066}', // LRI
+            '\u{2069}', // PDI
+        ] {
+            assert_eq!(
+                sanitize(&format!("safe{ch}drowssap")),
+                "safedrowssap",
+                "{ch:?} commands the display"
+            );
+            // The one-line cut is a painter too, and must not put it back.
+            assert_eq!(
+                truncate(&format!("src{ch}/main.rs"), 40),
+                "src/main.rs",
+                "the cut sanitizes as it truncates"
+            );
+        }
+
+        // Kept, and named in the doc: orthography, and zero-width characters
+        // with no order to command.
+        for ch in [
+            '\u{200b}', // ZWSP
+            '\u{200c}', // ZWNJ
+            '\u{200d}', // ZWJ
+            '\u{feff}', // BOM
+            '\u{00ad}', // SHY
+        ] {
+            assert_eq!(
+                sanitize(&format!("a{ch}b")),
+                format!("a{ch}b"),
+                "{ch:?} is not a command and stays"
+            );
+        }
+        let family = "\u{1f468}\u{200d}\u{1f469}\u{200d}\u{1f467}";
+        assert_eq!(sanitize(family), family, "a ZWJ emoji survives whole");
     }
 
     /// A wrapped row is what the terminal will paint: no escape survives the
