@@ -850,9 +850,9 @@ process groups are killed on exit — and with a `Stop` aimed at their owner,
 because Ctrl-C means “stop the work in flight”, and a job is work in flight. A
 job also has an age ceiling, `JOB_MAX_AGE` (4 h of wall time, hardcoded): without
 it a hung `detach` held its slot, its process group and its scratch files until
-mush quit, and the kill says so — `#c3 killed: it ran past the 4h ceiling · 4h0m
-· cargo run`. There is no knob, on purpose: a ceiling a config can raise is not a
-ceiling on the disk every agent shares.
+mush quit, and the kill says so — `#c3 killed: it ran past the 4h ceiling ·
+4h00m · cargo run`. There is no knob, on purpose: a ceiling a config can raise
+is not a ceiling on the disk every agent shares.
 
 **3. One command at a time may own the machine.**
 `run_command({command, exclusive: true})` takes a workspace-wide lock.
