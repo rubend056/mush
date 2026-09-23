@@ -136,23 +136,103 @@ pub fn branch(dir: &Path) -> Option<String> {
 pub fn status(dir: &Path) -> Option<RepoStatus> {
     Some(RepoStatus {
         branch: branch(dir).unwrap_or_default(),
-        dirty: dirty_paths(dir)?,
+        // The human's own checkout is not dirty because it built: `target/` and
+        // every other path an ignore rule covers is deliberately not theirs to
+        // commit. The reclaim probe reads those paths for itself — for a
+        // worktree they are work no commit can keep (finding F1).
+        dirty: changes(dir)?
+            .iter()
+            .filter(|change| !change.ignored)
+            .count(),
         stat: diff_stat(dir, &["diff", "--shortstat", "HEAD"]).unwrap_or_default(),
     })
 }
 
-/// How many paths in `dir` are uncommitted — the `dirty` half of [`status`],
-/// without the line delta a caller asking "is this checkout clean" does not
-/// need. One process instead of two, which matters on the path that asks about
-/// every worktree in the repository ([`unlandable`]).
-fn dirty_paths(dir: &Path) -> Option<usize> {
-    let porcelain = git(dir, &["status", "--porcelain"])?;
+/// One path `git status --porcelain --ignored=matching` reports in `dir`: its
+/// name, and whether it is there only because an ignore rule covers it (an `!!`
+/// line).
+///
+/// Telling the ignored half apart is what lets one reading answer both
+/// questions the tree asks of a checkout: whether a commit would take anything
+/// from it, and whether it holds paths a commit *cannot* keep. `git status
+/// --porcelain` alone answers only the first — a run whose whole deliverable
+/// matched the repository's own `.gitignore` read as "clean — nothing changed"
+/// and was swept, taking the only copy (finding F1). `--ignored=matching` names
+/// an ignored directory once instead of every file inside it, which is the
+/// reading a `target/`-sized tree needs.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Change {
+    path: String,
+    ignored: bool,
+}
+
+/// The paths git reports in `dir`, in its own order: tracked edits and untracked
+/// files first, the ignored ones after them. One process and one parse, so the
+/// reclaim probe and [`commit_all`] cannot disagree about whether a run changed
+/// anything (finding F1).
+fn changes(dir: &Path) -> Option<Vec<Change>> {
+    let porcelain = git(dir, &["status", "--porcelain", "--ignored=matching"])?;
     Some(
         porcelain
             .lines()
             .filter(|line| !line.trim().is_empty())
-            .count(),
+            .map(|line| {
+                let code = line.get(..2).unwrap_or("");
+                // A rename is `R  old -> new`: the path that exists is the new
+                // one. Everything else is `XY path`, the path from the third
+                // byte on (a quoted path keeps its quoting — it is a name in a
+                // sentence here, not something mush hands back to git).
+                let path = line.get(3..).unwrap_or("");
+                let path = path.rsplit_once(" -> ").map(|(_, to)| to).unwrap_or(path);
+                Change {
+                    path: path.to_string(),
+                    ignored: code == "!!",
+                }
+            })
+            .collect(),
     )
+}
+
+/// The first one or two of `paths`, and a count for the rest: `a.txt`,
+/// `a.txt, b.txt`, `a.txt, b.txt and 3 more`. A row's sentence has to say what
+/// the work is without listing a whole `target/` (H10's habit).
+pub fn named_paths(paths: &[String]) -> String {
+    match paths {
+        [] => String::new(),
+        [one] => one.clone(),
+        [one, two] => format!("{one}, {two}"),
+        [one, two, rest @ ..] => format!("{one}, {two} and {} more", rest.len()),
+    }
+}
+
+/// Why a checkout [`probe`] cannot remove must stay, in words a human can act
+/// on: what is in it and, when the paths are ones no commit can keep, which
+/// ones — the ignored half is the part a `git add -A` would silently drop, so
+/// it is the part a deletion would destroy (finding F1).
+fn kept_checkout(rel: &str, found: &[Change]) -> String {
+    let ignored: Vec<String> = found
+        .iter()
+        .filter(|change| change.ignored)
+        .map(|change| change.path.clone())
+        .collect();
+    let uncommitted = found.len() - ignored.len();
+    match (uncommitted, ignored.len()) {
+        (0, count) => format!(
+            "{rel} holds {}, which a commit cannot keep: {} — land or discard it by hand",
+            counted(count as u64, "ignored path", "ignored paths"),
+            named_paths(&ignored)
+        ),
+        (count, 0) => format!(
+            "{rel} has {} in it",
+            counted(count as u64, "uncommitted path", "uncommitted paths")
+        ),
+        (count, ignored_count) => format!(
+            "{rel} has {} and {} in it: {}",
+            counted(count as u64, "uncommitted path", "uncommitted paths"),
+            counted(ignored_count as u64, "ignored path", "ignored paths"),
+            named_paths(&ignored)
+        ),
+    }
 }
 
 /// The work a branch adds on top of its base: exactly that branch's own commits,
@@ -209,8 +289,14 @@ pub fn branch_name(id: u64) -> String {
 /// keeps: the cap bounds what a run leaves on disk, and it must never be the
 /// thing that refuses a delegation the history could still hold. It counts
 /// checkouts that are **not landable** — the ones no sweep will take — so a
-/// worktree whose work is already merged, or one whose run never committed,
-/// never spends a slot on its way out.
+/// worktree whose work is already merged, or one whose run committed nothing
+/// and left no path a commit cannot keep, never spends a slot on its way out.
+///
+/// Ignored work does spend one, and that is the price of finding F1's rule: a
+/// child that merely compiled has a `target/` no commit can keep, so its
+/// checkout is kept until the human discards it — one of these slots, visible
+/// on the row, against a silent deletion of a deliverable only that directory
+/// holds.
 pub const MAX_WORKTREES: usize = 70;
 
 /// The agent id in a `mush/<id>` branch name, `None` for any other name.
@@ -330,14 +416,29 @@ fn head_answer(probe: Result<String, String>) -> Option<bool> {
 /// Returns the path and the branch, both from the formatters above, so no caller
 /// ever spells `.mush/wt/<id>` or `mush/<id>` itself.
 ///
-/// The three ways this can refuse each carry a reason a human has to read: no
-/// repository, no commit to start from, and git's own message when the add
-/// itself fails (an id whose branch or directory is still taken). The spawn
-/// tool treats every one of them as a refused delegation: a base is a promise
-/// about history, and a child running on the wrong one is worse than no child.
+/// `dir` is the caller's workspace, and may be any directory *inside* a
+/// repository: git's own questions are answered from there and the checkout is
+/// made under it, so `mush crates/mush` gets `.mush/wt/<id>` below its own
+/// workspace like any root does (finding F11).
+///
+/// Every way this can refuse carries a reason a human has to read: not a
+/// repository, no commit to start from, a path git cannot be handed, and git's
+/// own message when the add itself fails (an id whose branch or directory is
+/// still taken). The spawn tool treats each of them as a refused delegation: a
+/// base is a promise about history, and a child running on the wrong one is
+/// worse than no child.
 pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf, String), String> {
-    if !dir.join(".git").exists() {
-        return Err("not a git repository".to_string());
+    // The `.git` test that used to stand here asked a question git does not: a
+    // linked worktree's `.git` is a file, and a workspace that is a
+    // subdirectory of a repository has none at all while `rev-parse` answers
+    // every question inside it — so the whole isolated road was refused, with
+    // "not a git repository" about a directory the human had opened mush in
+    // (finding F11). The refusal is kept for a directory git really cannot
+    // answer for; the question is git's own.
+    match run(dir, &["rev-parse", "--git-dir"]) {
+        Ok(_) => {}
+        Err(error) if error == GIT_UNAVAILABLE => return Err(error),
+        Err(_) => return Err("not a git repository".to_string()),
     }
     match (base, has_commits(dir)) {
         (None, Some(false)) => {
@@ -350,6 +451,17 @@ pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf,
     }
     let path = worktree_path(dir, id);
     let branch = branch_name(id);
+    // A path git cannot be given is refused *before* anything is created: the
+    // empty string this used to fall through to (`to_str().unwrap_or("")`) made
+    // `git worktree add -b mush/<id> "" HEAD` create the branch and then die on
+    // git's own assertion — a partial add whose id the caller has to keep
+    // either way (finding F10).
+    let Some(path_arg) = path.to_str() else {
+        return Err(format!(
+            "cannot create a worktree at `{}`: the path is not valid UTF-8, and git cannot be given it",
+            path.display()
+        ));
+    };
     // The name is `worktree add`, not `run`'s `worktree`: a silent failure has
     // to name the subcommand that failed, and this is the call that knows it.
     run_named(
@@ -360,7 +472,7 @@ pub fn worktree_add(dir: &Path, id: u64, base: Option<&str>) -> Result<(PathBuf,
             "add",
             "-b",
             &branch,
-            path.to_str().unwrap_or(""),
+            path_arg,
             base.unwrap_or("HEAD"),
         ],
     )
@@ -508,14 +620,16 @@ fn probe(root: &Path, id: u64, base: &str, base_sha: &str, fork: Option<&str>) -
         }
     }
     if on_disk {
-        match dirty_paths(&worktree_path(root, id)) {
-            Some(0) => {}
-            Some(count) => {
-                return Reclaimable::Kept(format!(
-                    "{rel} has {} in it",
-                    counted(count as u64, "uncommitted path", "uncommitted paths")
-                ))
-            }
+        // A checkout git still has something in is kept, whatever the branch
+        // says: the branch may be merged and the paths may be the only copy of
+        // the run's work. The cost is real — a child that merely compiled into
+        // `target/` keeps its checkout until the human discards it, spending one
+        // of the `MAX_WORKTREES` slots that bound the disk — and it is the trade
+        // H10 already makes everywhere else: a bounded, visible cost against a
+        // silent deletion of work nothing can account for (finding F1).
+        match changes(&worktree_path(root, id)) {
+            Some(found) if found.is_empty() => {}
+            Some(found) => return Reclaimable::Kept(kept_checkout(&rel, &found)),
             None => {
                 return Reclaimable::Kept(format!("{rel} — git could not say whether it is clean"))
             }
@@ -675,17 +789,57 @@ fn counted(count: u64, one: &str, many: &str) -> String {
     format!("{count} {}", if count == 1 { one } else { many })
 }
 
-/// Commit everything in the worktree `dir` under `subject`, and answer the short
-/// revision — or `None` when the run changed nothing, so a clean worktree costs
-/// no empty commit.
+/// What [`commit_all`] found in the worktree it was given: the two answers a
+/// put-away commit can have, plus the third one that used to be silent.
+///
+/// The `None` this replaces said "the run changed nothing" about a checkout
+/// whose only new files matched the repository's own `.gitignore`, and the sweep
+/// then deleted them with the checkout (finding F1). "Nothing changed" must
+/// never be said about a run that changed the filesystem, so paths a commit
+/// cannot keep are their own answer and a caller has to name them.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Commit {
+    /// The work is committed. The short revision, for the row.
+    Made(String),
+    /// Nothing changed at all: no tracked edit, no untracked file, no ignored
+    /// path.
+    Nothing,
+    /// The only paths git saw are ones it ignores, so there was nothing to
+    /// commit and nothing a commit could keep. Named, so a row can say where the
+    /// deliverable is.
+    Ignored(Vec<String>),
+}
+
+/// Commit everything in the worktree `dir` under `subject`, and answer what was
+/// there — the short revision, [`Commit::Nothing`] when the run changed nothing
+/// at all, or the ignored paths when those are all it changed (finding F1).
+///
+/// It refuses to commit anywhere but the worktree it was given. `git -C <dir>`
+/// walks up to the enclosing repository, so a directory under `.mush/wt` that is
+/// no longer a worktree — a hand `git worktree remove`, then a write from a run
+/// that was already in flight — is an ordinary directory inside the human's
+/// checkout: committing there would stage and commit the human's own work, on
+/// the human's branch, under mush's subject and identity (finding F8). `dir`
+/// must be the root of its own working tree; anything else is refused as
+/// "`<dir>` is no longer a worktree" and never commits somewhere up the tree.
 ///
 /// The identity and the message are supplied here (`-c user.name=…`,
-/// `--no-verify`) so a commit never depends on the human's git configuration and
-/// never runs their hooks. The index belongs to this worktree, so committing
-/// here cannot contend with the human's own git commands in the main checkout.
-pub fn commit_all(dir: &Path, subject: &str) -> Result<Option<String>, String> {
-    if run(dir, &["status", "--porcelain"])?.is_empty() {
-        return Ok(None);
+/// `--no-verify`) so a commit does not depend on the human's identity and never
+/// runs their commit hooks. The index is that worktree's own, so a commit here
+/// cannot touch the human's index either.
+pub fn commit_all(dir: &Path, subject: &str) -> Result<Commit, String> {
+    if !is_its_own_worktree(dir) {
+        return Err(format!("{} is no longer a worktree", dir.display()));
+    }
+    let found =
+        changes(dir).ok_or_else(|| format!("git could not read {} for a commit", dir.display()))?;
+    if found.is_empty() {
+        return Ok(Commit::Nothing);
+    }
+    if found.iter().all(|change| change.ignored) {
+        return Ok(Commit::Ignored(
+            found.iter().map(|change| change.path.clone()).collect(),
+        ));
     }
     run(dir, &["add", "-A"])?;
     run(
@@ -701,7 +855,25 @@ pub fn commit_all(dir: &Path, subject: &str) -> Result<Option<String>, String> {
             subject,
         ],
     )?;
-    Ok(Some(run(dir, &["rev-parse", "--short", "HEAD"])?))
+    Ok(Commit::Made(run(dir, &["rev-parse", "--short", "HEAD"])?))
+}
+
+/// Whether `dir` is the root of its own working tree — the question [`commit_all`]
+/// has to ask before `git -C` goes looking upward for a repository. A linked
+/// worktree's `.git` is a file, so its presence is the first half; the second is
+/// git's own answer, because a subdirectory of a checkout has a `.git` somewhere
+/// above it and would otherwise commit into that repository (finding F8).
+fn is_its_own_worktree(dir: &Path) -> bool {
+    if !dir.join(".git").exists() {
+        return false;
+    }
+    let Some(top) = git(dir, &["rev-parse", "--show-toplevel"]) else {
+        return false;
+    };
+    match (std::fs::canonicalize(dir), std::fs::canonicalize(&top)) {
+        (Ok(dir), Ok(top)) => dir == top,
+        _ => false,
+    }
 }
 
 /// A revision resolved to its commit id, or `None` when it does not exist. The
@@ -988,15 +1160,18 @@ mod tests {
         assert!(path.join(".git").exists(), "the worktree is a checkout");
 
         fs::write(path.join("work.txt"), "the work\n").unwrap();
-        let revision = commit_all(&path, "mush #5: do the thing").unwrap();
-        assert!(revision.is_some(), "the worktree had work to commit");
+        let made = commit_all(&path, "mush #5: do the thing").unwrap();
+        assert!(
+            matches!(made, Commit::Made(_)),
+            "the worktree had work to commit: {made:?}"
+        );
         assert_eq!(
             subject_of(&path, "HEAD").as_deref(),
             Some("mush #5: do the thing")
         );
         assert_eq!(
             commit_all(&path, "mush #5: do the thing").unwrap(),
-            None,
+            Commit::Nothing,
             "a clean worktree must not be committed again"
         );
 
@@ -1177,12 +1352,14 @@ mod tests {
         let fork = resolve(&path, "HEAD").expect("a fresh checkout has a HEAD");
         // The content is the id's: a worktree forked from a base that already
         // merged an earlier test's `work.txt` would otherwise be clean, and
-        // `commit_all` would answer `None` — which is the *other* test's case.
+        // `commit_all` would answer `Commit::Nothing` — which is the
+        // *other* test's case.
         fs::write(path.join("work.txt"), format!("work {id}\n")).unwrap();
         assert!(
-            commit_all(&path, &format!("mush #{id}: work"))
-                .unwrap()
-                .is_some(),
+            matches!(
+                commit_all(&path, &format!("mush #{id}: work")).unwrap(),
+                Commit::Made(_)
+            ),
             "the run's work must really be committed"
         );
         fork
@@ -1261,7 +1438,10 @@ mod tests {
         // The base moves on the way HEAD does under a session: a commit of the
         // human's own, nothing the run ever did.
         fs::write(dir.join("later.txt"), "the human's own work\n").unwrap();
-        assert!(commit_all(&dir, "the human's own work").unwrap().is_some());
+        assert!(matches!(
+            commit_all(&dir, "the human's own work").unwrap(),
+            Commit::Made(_)
+        ));
         assert_ne!(resolve(&dir, "HEAD").unwrap(), fork, "the base moved on");
 
         assert_eq!(
@@ -1497,5 +1677,178 @@ mod tests {
         assert_eq!(counted(1, "commit", "commits"), "1 commit");
         assert_eq!(counted(2, "commit", "commits"), "2 commits");
         assert_eq!(counted(0, "commit", "commits"), "0 commits");
+    }
+
+    /// A name list for a row's sentence: the first two, and a count for the
+    /// rest — a `target/` with a hundred thousand files under it must not become
+    /// a paragraph (finding F1).
+    #[test]
+    fn a_name_list_stays_a_sentence() {
+        assert_eq!(named_paths(&[]), "");
+        assert_eq!(named_paths(&["a.txt".into()]), "a.txt");
+        assert_eq!(
+            named_paths(&["a.txt".into(), "b.txt".into()]),
+            "a.txt, b.txt"
+        );
+        assert_eq!(
+            named_paths(&["a".into(), "b".into(), "c".into(), "d".into()]),
+            "a, b and 2 more"
+        );
+    }
+
+    /// A run whose only work is in an ignored path: `git status --porcelain`
+    /// calls the worktree clean, the sweep removes it, and the run's only copy
+    /// goes with it. The reading is `--ignored=matching`; `commit_all` says the
+    /// paths instead of "nothing changed"; the sweep keeps what it cannot
+    /// account for and names it (finding F1).
+    #[test]
+    fn an_ignored_only_worktree_is_kept_and_named() {
+        let dir = init_repo("ignored-only");
+        // `/ignored/*` ignores the directory's *contents*, so the porcelain
+        // names the file a human would go looking for. (`/ignored/` names the
+        // directory instead: one line for a `target/`-sized tree, and the
+        // paths a commit cannot keep are the ignored boundary either way.)
+        fs::write(dir.join(".gitignore"), "/ignored/*\n*.log\n").unwrap();
+        git_in(&dir, &["add", ".gitignore"]);
+        git_in(&dir, &["commit", "-qm", "ignore the run's output"]);
+        worktree_add(&dir, 1, Some("HEAD")).unwrap();
+        let path = worktree_path(&dir, 1);
+        let fork = resolve(&path, "HEAD").unwrap();
+        fs::create_dir_all(path.join("ignored")).unwrap();
+        fs::write(path.join("ignored/report.txt"), "the only copy\n").unwrap();
+        fs::write(path.join("run.log"), "log\n").unwrap();
+
+        // The run changed the filesystem, so the answer is not "nothing".
+        match commit_all(&path, "mush #1: the task").unwrap() {
+            Commit::Ignored(paths) => {
+                assert!(
+                    paths.contains(&"ignored/report.txt".to_string()),
+                    "the answer names the deliverable: {paths:?}"
+                );
+                assert!(paths.contains(&"run.log".to_string()), "{paths:?}");
+            }
+            other => panic!("the only work is ignored, so nothing was committed: {other:?}"),
+        }
+        assert_eq!(
+            resolve(&path, "HEAD").unwrap(),
+            fork,
+            "and no commit was made"
+        );
+
+        // Kept, with a sentence that names where the work is.
+        match reclaimable(&dir, 1, "HEAD", Some(&fork)) {
+            Reclaimable::Kept(why) => {
+                assert!(
+                    why.contains("ignored/report.txt"),
+                    "the sentence names it: {why}"
+                );
+                assert!(why.contains("run.log"), "{why}");
+            }
+            other => panic!("ignored-only work must be kept, got {other:?}"),
+        }
+        match reclaim(&dir, 1, "HEAD", Some(&fork)) {
+            Reclaimed::Kept(why) => assert!(why.contains("ignored/report.txt"), "{why}"),
+            other => panic!("ignored-only work must be kept, got {other:?}"),
+        }
+        assert!(
+            path.join("ignored/report.txt").exists(),
+            "the only copy is still there"
+        );
+        assert!(path.join("run.log").exists());
+        assert!(resolve(&dir, "mush/1").is_some(), "and so is the branch");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// A workspace that is no longer a worktree is not a place to commit: `git
+    /// -C` would walk up to the enclosing repository and stage and commit the
+    /// human's own modified and untracked files, on the human's branch, under
+    /// mush's subject and identity (finding F8). The refusal names the
+    /// directory, and the human's checkout is exactly as it was.
+    #[test]
+    fn a_commit_never_leaves_the_worktree() {
+        let dir = init_repo("commit-guard");
+        fs::write(dir.join("a.txt"), "the human's half-finished edit\n").unwrap();
+        fs::write(dir.join("notes.txt"), "the human's untracked file\n").unwrap();
+        let head = resolve(&dir, "HEAD").unwrap();
+        let before = git(&dir, &["status", "--porcelain"]).unwrap();
+
+        // What a missed `git worktree remove` leaves, and what a late write
+        // from a run already in flight recreates: a plain directory under
+        // `.mush/wt`, which is inside the human's checkout.
+        let plain = worktree_path(&dir, 1);
+        fs::create_dir_all(&plain).unwrap();
+        assert!(
+            !plain.join(".git").exists(),
+            "the fixture is a plain directory"
+        );
+        let error = commit_all(&plain, "mush #1: the brief").unwrap_err();
+        assert!(error.contains("is no longer a worktree"), "{error}");
+        assert!(
+            error.contains(".mush/wt/1"),
+            "and it names the directory: {error}"
+        );
+
+        // A subdirectory of a checkout is the same shape one level in.
+        let sub = dir.join("src");
+        fs::create_dir_all(&sub).unwrap();
+        let error = commit_all(&sub, "mush #1: the brief").unwrap_err();
+        assert!(error.contains("is no longer a worktree"), "{error}");
+
+        assert_eq!(
+            resolve(&dir, "HEAD").unwrap(),
+            head,
+            "the human's HEAD did not move"
+        );
+        assert_eq!(
+            git(&dir, &["status", "--porcelain"]).unwrap(),
+            before,
+            "and their index is untouched"
+        );
+        assert_ne!(
+            subject_of(&dir, "HEAD").as_deref(),
+            Some("mush #1: the brief"),
+            "no commit carries mush's subject on the human's branch"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// An isolated spawn below the repository root: the workspace is `repo/sub`,
+    /// and the same call `spawn_tool` makes creates `repo/sub/.mush/wt/<id>` on
+    /// `mush/<id>`, forked from the base. The `.git` test this replaces refused
+    /// it with "not a git repository" about a directory git answers every
+    /// question inside (finding F11).
+    #[test]
+    fn an_isolated_spawn_works_below_the_repository_root() {
+        let repo = init_repo("spawn-below-root");
+        let sub = repo.join("crates").join("mush");
+        fs::create_dir_all(&sub).unwrap();
+        let base = resolve(&sub, "HEAD").unwrap();
+
+        let (path, name) = worktree_add(&sub, 1, Some("HEAD")).unwrap();
+        assert_eq!(
+            path,
+            sub.join(".mush/wt/1"),
+            "the checkout is under the workspace, not the repository root"
+        );
+        assert_eq!(name, "mush/1");
+        assert!(path.join(".git").exists(), "it is a real checkout");
+        assert_eq!(
+            resolve(&path, "HEAD").unwrap(),
+            base,
+            "forked from the base git resolved in the workspace"
+        );
+        assert_eq!(branch(&path).as_deref(), Some("mush/1"));
+
+        // A directory that is not in any repository keeps its own sentence.
+        let plain =
+            std::env::temp_dir().join(format!("mush-git-below-plain-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&plain);
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(
+            worktree_add(&plain, 2, None).unwrap_err(),
+            "not a git repository"
+        );
+        let _ = fs::remove_dir_all(&plain);
+        let _ = fs::remove_dir_all(&repo);
     }
 }

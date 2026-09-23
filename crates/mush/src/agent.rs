@@ -245,8 +245,14 @@ pub enum Outcome {
 pub enum Work {
     /// The run committed its work on `branch`.
     Committed { branch: String, revision: String },
-    /// The run changed nothing: the branch stands clean where it was.
+    /// The run changed nothing at all: the branch stands clean where it was.
     Clean { branch: String },
+    /// The run changed only paths the repository ignores, so there was nothing
+    /// to commit and nothing a commit could keep. Its own answer because
+    /// "nothing changed" is false about a run that changed the filesystem —
+    /// and because the sweep now keeps the checkout those paths live in
+    /// (finding F1).
+    Ignored { branch: String, paths: Vec<String> },
     /// The commit itself failed; the worktree may be dirty and unlanded.
     Uncommitted { branch: String, error: String },
 }
@@ -261,6 +267,10 @@ impl Work {
                 Some(format!("committed {revision} on {branch}"))
             }
             Work::Clean { .. } => None,
+            Work::Ignored { branch, paths } => Some(format!(
+                "{branch} holds ignored work only: {} — a commit cannot keep it",
+                git::named_paths(paths)
+            )),
             Work::Uncommitted { error, .. } => {
                 Some(format!("could not commit the worktree: {error}"))
             }
@@ -273,6 +283,10 @@ impl Work {
         match self {
             Work::Committed { branch, revision } => format!(" · committed {revision} on {branch}"),
             Work::Clean { branch } => format!(" · {branch} clean — nothing changed"),
+            Work::Ignored { branch, paths } => format!(
+                " · {branch} holds ignored work only: {}",
+                truncate(&git::named_paths(paths), 60)
+            ),
             Work::Uncommitted { branch, error } => {
                 format!(" · {branch} uncommitted ({})", truncate(error, 60))
             }
@@ -1599,11 +1613,10 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         // of being left as untracked files in the worktree. Before the parent is
         // told, so a diff or merge it triggers already sees the work.
         let work = actor.branch.clone().map(|branch| {
-            match commit_worktree(actor.ws.root(), actor.id, &actor.brief, &outcome) {
-                Ok(Some(revision)) => Work::Committed { branch, revision },
-                Ok(None) => Work::Clean { branch },
-                Err(error) => Work::Uncommitted { branch, error },
-            }
+            work_from_commit(
+                branch,
+                commit_worktree(actor.ws.root(), actor.id, &actor.brief, &outcome),
+            )
         });
         if let Some(line) = work.as_ref().and_then(Work::status_line) {
             actor.ctx.emit(actor.id, AgentEvent::Status(line));
@@ -3791,12 +3804,34 @@ fn too_many_worktrees(held: &[u64]) -> String {
     };
     format!(
         "cannot spawn: {} isolated worktrees already exist and none of them is landable \
-         (the limit is {}) — each holds an unmerged branch or uncommitted work: {named}{more}. \
+         (the limit is {}) — each holds an unmerged branch, uncommitted work, or ignored \
+         paths a commit cannot keep: {named}{more}. \
          Land or drop one first: merge or delete its branch, then \
          `git worktree remove --force .mush/wt/<id>` and `git branch -d mush/<id>`.",
         held.len(),
         git::MAX_WORKTREES
     )
+}
+
+/// Give the number back after a failed `worktree add`, or keep it spent —
+/// decided by what git actually made, never by the error text (finding F10).
+///
+/// [`Ids::lose_agent`]'s licence to reuse a number is "nothing was created",
+/// and a `git worktree add` that returns nonzero may still have created both a
+/// `mush/<id>` branch and a `.mush/wt/<id>` checkout: a failing
+/// `post-checkout` hook is one way, an interrupted checkout another. Asking git
+/// is the only way to tell, and when either exists the numbers above it are
+/// reserved — exactly as a leftover worktree does — so the next isolated spawn
+/// draws a fresh id instead of dying on `a branch named 'mush/<id>' already
+/// exists` for the rest of the conversation.
+fn release_or_reserve(ids: &Ids, root: &Path, id: AgentId) {
+    let branch = git::resolve(root, &git::branch_name(id.0)).is_some();
+    let checkout = git::worktree_path(root, id.0).exists();
+    if branch || checkout {
+        ids.reserve_agents(id.0 + 1);
+    } else {
+        ids.lose_agent(id);
+    }
 }
 
 fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<String, String> {
@@ -3890,19 +3925,20 @@ fn spawn_tool(actor: &Actor, state: &mut ActorState, args: &Value) -> Result<Str
         // about history: if git cannot make the worktree, the delegation fails
         // rather than running the brief in the wrong tree (finding H7).
         //
-        // git is the line `lose_agent` stops at: its refusal means no worktree
-        // and no branch was made, so the number is handed back and the retry
-        // after a bad `base` is consecutive. A failure *after* this arm —
-        // `Workspace::new` — leaves the worktree git just made, so the number
-        // stays spent: the invariant is "reusable only if nothing was created",
-        // and a `mush/<id>` branch is something.
+        // git's refusal does not say what git made: a failing `post-checkout`
+        // hook (or any failure after the branch exists) leaves a `mush/<id>`
+        // branch and a `.mush/wt/<id>` checkout behind, and the `lose_agent`
+        // licence to reuse the number is only "nothing was created". So the
+        // error is asked about before the number goes back (finding F10); a
+        // worktree left by a failure *after* this arm — `Workspace::new` — stays
+        // spent the same way, because a `mush/<id>` branch is something.
         Some(name) => match git::worktree_add(&ctx.root, id.0, base.as_deref()) {
             Ok((path, branch)) => match Workspace::new(&path) {
                 Ok(child_ws) => (child_ws, Some(branch)),
                 Err(error) => return Err(format!("cannot start from `{name}`: {error}")),
             },
             Err(reason) => {
-                ctx.ids.lose_agent(id);
+                release_or_reserve(&ctx.ids, &ctx.root, id);
                 return Err(format!("cannot start from `{name}`: {reason}"));
             }
         },
@@ -4777,17 +4813,30 @@ fn message_agent(
 }
 
 /// Commit whatever an isolated agent left in its worktree, so the branch the
-/// row names actually carries the work. Returns the
-/// short revision when something was committed, `None` when the run changed
-/// nothing. The subject is built above, next to the id, brief and outcome it is
-/// made of.
+/// row names actually carries the work. Returns what was there — a revision,
+/// or [`git::Commit::Nothing`] / [`git::Commit::Ignored`], the two answers that
+/// mean no commit (finding F1). The subject is built above, next to the id,
+/// brief and outcome it is made of.
 fn commit_worktree(
     root: &Path,
     id: u64,
     brief: &str,
     outcome: &Outcome,
-) -> Result<Option<String>, String> {
+) -> Result<git::Commit, String> {
     git::commit_all(root, &commit_subject(id, brief, outcome))
+}
+
+/// What the run's end makes of the worktree commit: the fact the parent reads.
+/// Its own function so the third answer — ignored paths, which are emphatically
+/// not "nothing changed" — is decided in one place a test can call (finding
+/// F1).
+fn work_from_commit(branch: String, found: Result<git::Commit, String>) -> Work {
+    match found {
+        Ok(git::Commit::Made(revision)) => Work::Committed { branch, revision },
+        Ok(git::Commit::Nothing) => Work::Clean { branch },
+        Ok(git::Commit::Ignored(paths)) => Work::Ignored { branch, paths },
+        Err(error) => Work::Uncommitted { branch, error },
+    }
 }
 
 /// `read_file`: a window of a text file, or an image.
@@ -5867,6 +5916,56 @@ mod tests {
         );
         assert!(!lines.contains("mush/2"), "{lines}");
         let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// A run whose only changes are ignored paths changed the filesystem: the
+    /// row must never read "clean — nothing changed", and the parent has to be
+    /// able to see where the deliverable is (finding F1).
+    #[test]
+    fn an_ignored_run_is_never_nothing_changed() {
+        let work = work_from_commit(
+            "mush/1".into(),
+            Ok(git::Commit::Ignored(vec![
+                "ignored/report.txt".into(),
+                "run.log".into(),
+            ])),
+        );
+        let digest = work.digest();
+        assert!(!digest.contains("nothing changed"), "{digest}");
+        assert!(digest.contains("ignored/report.txt"), "{digest}");
+        let line = work
+            .status_line()
+            .expect("a kept deliverable is news the human hears");
+        assert!(line.contains("ignored/report.txt"), "{line}");
+        assert!(
+            line.contains("a commit cannot keep"),
+            "and why it was not committed: {line}"
+        );
+
+        // The other two answers still mean what they always did.
+        assert_eq!(
+            work_from_commit("mush/1".into(), Ok(git::Commit::Nothing)),
+            Work::Clean {
+                branch: "mush/1".into()
+            }
+        );
+        assert_eq!(
+            work_from_commit("mush/1".into(), Ok(git::Commit::Made("abc1234".into()))),
+            Work::Committed {
+                branch: "mush/1".into(),
+                revision: "abc1234".into()
+            }
+        );
+        // A refusal is the failure it says: the sentence names the directory a
+        // commit would have left (finding F8).
+        assert_eq!(
+            work_from_commit(
+                "mush/1".into(),
+                Err("/repo/.mush/wt/1 is no longer a worktree".into())
+            )
+            .digest(),
+            " · mush/1 uncommitted (/repo/.mush/wt/1 is no longer a worktree)"
+        );
     }
 
     /// The work fact is a listing, not a signal: it starts no run and changes
@@ -13340,6 +13439,122 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    /// A failed `worktree add` is not evidence that git made nothing: with a
+    /// failing `post-checkout` hook, git has already created the branch and the
+    /// checkout when the verb returns 1. The number is asked about instead of
+    /// inferred from the error, so the next isolated spawn draws a *fresh* id
+    /// and succeeds — instead of dying on `a branch named 'mush/1' already
+    /// exists` for the rest of the conversation (finding F10).
+    #[cfg(unix)]
+    #[test]
+    fn an_id_comes_back_only_when_git_created_nothing() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = init_git_repo("ids-partial");
+        // A hooks directory the test owns, because a machine-wide
+        // `core.hooksPath` would otherwise decide what runs.
+        let hooks = root.join("hooks");
+        fs::create_dir_all(&hooks).unwrap();
+        git_in(
+            &root,
+            &["config", "core.hooksPath", hooks.to_str().unwrap()],
+        );
+        let hook = hooks.join("post-checkout");
+        fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
+        fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // The child of the *second* spawn: one tracked file, so its branch has
+        // a commit of its own and the run's own sweep leaves it standing.
+        let gate = Arc::new(Gate::new());
+        let scripted = Arc::new(
+            Scripted::new()
+                // The two turns of the child the second spawn makes.
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .calls(vec![tool_call(
+                    "c1",
+                    "run_command",
+                    json!({ "command": "printf 'kept' > kept.txt" }),
+                )])
+                .when(|asked: &Asked| asked.depth() == Some(1))
+                .says("wrote kept.txt")
+                // The root's retry, held while the test repairs the hook: the
+                // request is only made with the refusal behind it.
+                .when(|asked: &Asked| asked.saw("cannot start from"))
+                .held(gate.clone())
+                .calls(vec![tool_call(
+                    "c2",
+                    "spawn_agent",
+                    json!({ "brief": "write kept.txt in your worktree", "base": "main" }),
+                )])
+                .when(|asked: &Asked| asked.saw("spawned agent #2"))
+                .says("the fresh spawn worked")
+                .when(|asked: &Asked| asked.saw("#2 done"))
+                .says("all done")
+                // The root's first turn.
+                .calls(vec![tool_call(
+                    "c0",
+                    "spawn_agent",
+                    json!({ "brief": "write kept.txt in your worktree", "base": "main" }),
+                )]),
+        );
+        let events = Recorder::new();
+        let handle = spawn_scripted(
+            Config::new("http://127.0.0.1:1", "scripted", None),
+            events.clone(),
+            root.clone(),
+            scripted.clone(),
+        );
+        handle
+            .tx
+            .send(AgentMsg::Run(vec![
+                Message::system(prompt::system_prompt(root.to_str().unwrap())),
+                Message::user("delegate a file".to_string()),
+            ]))
+            .unwrap();
+
+        // The first spawn was refused by the hook; git made the branch and the
+        // checkout all the same. The test repairs the hook while the retry is
+        // held, then lets it through.
+        assert!(
+            gate.wait_until_asked(WAIT),
+            "the root's retry never asked — the first spawn was not refused"
+        );
+        assert!(
+            git_rev_parse(&root, "mush/1").is_some(),
+            "git did create the branch before the verb failed"
+        );
+        assert!(git::worktree_path(&root, 1).exists());
+        fs::remove_file(&hook).unwrap();
+        gate.release();
+
+        let mut seen = Watched::default();
+        assert!(
+            seen.wait(&events, WAIT, |seen| seen.done >= 2),
+            "the root, and the child the fresh id made, must each finish: {seen:?}"
+        );
+        assert_eq!(seen.errors, Vec::<String>::new());
+        assert!(
+            git_rev_parse(&root, "mush/2").is_some(),
+            "the fresh id got its own branch instead of colliding with the leftover"
+        );
+
+        // The leftover is the sweep's to take — its branch stands on HEAD and
+        // its checkout is clean — and after the ordinary sweep exactly one mush
+        // branch is left: the one the fresh id made. Without the reservation the
+        // second spawn would have drawn 1 and this would be mush/1, or nothing.
+        assert!(
+            matches!(
+                git::reclaim(&root, 1, "HEAD", None),
+                git::Reclaimed::Removed { .. }
+            ),
+            "the partial add's residue is landable"
+        );
+        let branches = git::run(&root, &["branch", "-l", "mush/*"]).unwrap_or_default();
+        assert_eq!(branches.lines().count(), 1, "{branches:?}");
+        assert!(branches.contains("mush/2"), "{branches:?}");
+        let _ = fs::remove_dir_all(&root);
+    }
+
     /// A tree whose isolated child has finished its first run, left `iso.txt` on
     /// `mush/1`, and is now idle — the state a hand-run merge or discard starts
     /// from.
@@ -13557,12 +13772,15 @@ mod tests {
     }
 
     /// A spawn refused *before* git could create anything gives its number back,
-    /// so the next child is consecutive rather than one past a hole. The invariant
-    /// (`crate::ids`) draws the line at the worktree: here `git worktree add`
-    /// failed, so no branch and no directory exist and #1 is free; a failure
-    /// after that line — `Workspace::new` over a worktree git did make — must
-    /// *not* hand the number back, or the next `add -b mush/1` would meet the
-    /// branch the refused spawn left.
+    /// so the next child is consecutive rather than one past a hole. The
+    /// invariant (`crate::ids`) draws the line at the worktree, and the line is
+    /// asked about rather than inferred from the error (finding F10): here `git
+    /// worktree add` could not even lock the branch — a file sits where
+    /// `refs/heads/mush` would be a directory — so no branch and no directory
+    /// exist, which is what the spawn checks before handing #1 back. A failure
+    /// that left either behind (a failing `post-checkout` hook, a path taken by
+    /// something) reserves above it instead: see
+    /// [`an_id_comes_back_only_when_git_created_nothing`].
     #[test]
     fn a_failed_isolated_spawn_leaves_the_next_childs_id_consecutive() {
         let (actor, _mailbox) = scripted_tools_actor(
@@ -13577,9 +13795,11 @@ mod tests {
         fs::write(root.join("base.txt"), "base\n").unwrap();
         git_in(&root, &["add", "-A"]);
         git_in(&root, &["commit", "-qm", "init"]);
-        // The one thing `git worktree add` refuses: the path is taken.
-        fs::create_dir_all(root.join(".mush/wt/1")).unwrap();
-        fs::write(root.join(".mush/wt/1/in the way.txt"), "mine\n").unwrap();
+        // The one failure `git worktree add` meets before it creates anything:
+        // the branch's ref cannot be locked, so no branch and no checkout are
+        // made — nothing the refused spawn would have to keep its number for.
+        fs::create_dir_all(root.join(".git/refs/heads")).unwrap();
+        fs::write(root.join(".git/refs/heads/mush"), "not a directory\n").unwrap();
         let mut state = ActorState::default();
         let cancel = AtomicBool::new(false);
 
