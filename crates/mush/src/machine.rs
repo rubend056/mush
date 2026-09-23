@@ -251,20 +251,31 @@ const REAP_DEADLINE: Duration = Duration::from_secs(2);
 const REAP_POLL: Duration = Duration::from_millis(5);
 
 /// Reap `child`, waiting at most `deadline`, and say why not when the child
-/// outlives it.
+/// outlives it or the exit road is hurried.
 ///
 /// `Ok(Some(_))` is the ordinary answer and returns at once: the kill has
 /// already been sent when this runs, so a child still running after the
 /// deadline is not a slow kill but a stuck one. The error road is `poll`'s, in
 /// the same words, so a child that cannot be waited for reads the same wherever
 /// the question is asked.
-fn reap_within(child: &mut Child, deadline: Duration) -> Option<String> {
+///
+/// `forced` is a signal that has already asked mush to quit and come back
+/// (finding R3): the second press ends this wait at its next poll, before the
+/// deadline, and the reason says so rather than pretending the clock ran out.
+fn reap_within(child: &mut Child, deadline: Duration, forced: impl Fn() -> bool) -> Option<String> {
     let started = Instant::now();
     loop {
         match child.try_wait() {
             Ok(Some(_)) => return None,
             Ok(None) => {}
             Err(error) => return Some(format!("could not wait for command: {error}")),
+        }
+        if forced() {
+            return Some(format!(
+                "a second signal hurried the exit — the command was killed but its leader was not \
+                 reaped after {:?}",
+                started.elapsed()
+            ));
         }
         if started.elapsed() >= deadline {
             return Some(format!(
@@ -353,7 +364,7 @@ impl Job for Running {
         // allows (finding R4): a `wait` with no bound would let one leader in
         // uninterruptible I/O hold this kill — and, on the quit road, every job
         // behind it and the process itself — for as long as the device wants.
-        if let Some(reason) = reap_within(&mut self.child, REAP_DEADLINE) {
+        if let Some(reason) = reap_within(&mut self.child, REAP_DEADLINE, crate::signals::forced) {
             // Kept beside a group-signal failure rather than replacing it: both
             // are things this kill could not finish, and the reader is owed the
             // whole list.
@@ -1010,7 +1021,8 @@ mod tests {
             .expect("sleep starts");
         let deadline = std::time::Duration::from_millis(50);
         let started = std::time::Instant::now();
-        let reason = reap_within(&mut child, deadline).expect("a live child outlives the deadline");
+        let reason = reap_within(&mut child, deadline, || false)
+            .expect("a live child outlives the deadline");
         assert!(
             started.elapsed() >= deadline,
             "the deadline is the clock: {:?}",
@@ -1036,7 +1048,7 @@ mod tests {
             .expect("true starts");
         let started = std::time::Instant::now();
         assert_eq!(
-            reap_within(&mut child, std::time::Duration::from_secs(5)),
+            reap_within(&mut child, std::time::Duration::from_secs(5), || false),
             None
         );
         assert!(
@@ -1044,6 +1056,29 @@ mod tests {
             "the reap of a finished child is not a wait: {:?}",
             started.elapsed()
         );
+    }
+
+    /// A second signal ends the reap at its next poll (finding R3): a child
+    /// that has not ended by then is left with the reason said, not waited for
+    /// to a deadline the human has already refused to wait out.
+    #[cfg(unix)]
+    #[test]
+    fn a_hurried_reap_does_not_wait() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("sleep starts");
+        let started = std::time::Instant::now();
+        let reason = reap_within(&mut child, std::time::Duration::from_secs(30), || true)
+            .expect("a hurried reap is not an answer");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "the hurry is not the deadline: {:?}",
+            started.elapsed()
+        );
+        assert!(reason.contains("second signal"), "{reason}");
+        let _ = child.kill();
+        let _ = child.wait();
     }
 
     /// The name is the contract a later start reaps by: the pid of the mush

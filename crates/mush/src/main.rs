@@ -1012,10 +1012,13 @@ fn run() -> Result<(), Box<dyn Error>> {
     // start can reap the dead and never a live mush's — this one included.
     machine::reap_dead_scratch();
     // A mush that is signalled ends through the same road `Ctrl-Q` takes — the
-    // exit flush, `kill_all`, the writer's join, the socket's removal — instead
+    // exit flush, the actors' endings, the kill walk, the writer's thread — and
+    // the socket and the terminal go back last, after it (finding R3), instead
     // of dying raw with every process group it started still running (finding
-    // E1; `signals` carries the road and its reasons). The guard is held here
-    // for the whole run: dropping it would take the handlers away.
+    // E1; `signals` carries the road and its reasons, including what a second
+    // and a third signal mean). The guard is held here for the whole run, and
+    // dropped last of all: dropping it takes the handlers away and waits for
+    // the watcher thread, which reads its own EOF.
     let _signals = match signals::install() {
         Ok(signals) => Some(signals),
         // Not fatal: a mush without handlers is the mush that existed before
@@ -1148,15 +1151,23 @@ fn run() -> Result<(), Box<dyn Error>> {
         app.set_term_size(size.width, size.height);
     }
     let result = event_loop(&mut guard.terminal, &mut app, &rx, &theme);
-    // The terminal and the socket go back where they always did; the exit road
-    // — the flush, the actors' endings, the quit fence and the kill walk, the
-    // writer's thread — runs here, with the human's own shell able to read what
-    // it says. Every step of that road is bounded ([`App::shutdown`]), and a
-    // bound that expires comes back as a sentence, printed to stderr here
-    // (finding R4): mush leaves, and it leaves saying what it could not finish.
-    drop(guard);
+    // The exit road runs first — the flush, the actors' endings, the quit fence
+    // and the kill walk, the writer's thread — and the terminal and the socket
+    // are handed back last (finding R3). The order is the fact: a signal that
+    // arrives while the screen still looks like mush's cannot find a hand-back
+    // already made, and a second one cannot skip a kill the road had not
+    // reached. The hurry a press asked for before this line is spent here — it
+    // asked for nothing the road can shorten — and a press after it ends the
+    // road's waits at their next poll ([`signals::forced`]). Every step of that
+    // road is bounded ([`App::shutdown`]), and a bound that expires — or a
+    // hurry that ends the wait early — comes back as a sentence, printed below
+    // on a shell that has its terminal back (findings R4, R3).
+    let _ = signals::take_force();
+    let notes = app.shutdown();
+    drop(app);
     drop(_attach);
-    for note in app.shutdown() {
+    drop(guard);
+    for note in notes {
         eprintln!("mush: {note}");
     }
     result
@@ -1345,7 +1356,8 @@ impl Drop for TerminalGuard {
     }
 }
 
-/// The signal road's one step: the flag the handler set becomes the quit.
+/// The signal road's one step: the flag the watcher thread set becomes the
+/// quit.
 ///
 /// The thread matters. A handler runs on whichever thread the kernel chose;
 /// the quit road runs on this one, where `App` lives — so the session's flush,

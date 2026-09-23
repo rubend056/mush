@@ -5462,10 +5462,12 @@ impl App {
     /// in one order, each step bounded, and the sentences about what could not
     /// be settled.
     ///
-    /// `main` calls this on the way out — after the terminal and the socket are
-    /// handed back, so the sentences it returns are read on a cooked screen —
-    /// and [`Drop`] calls it again as the backstop, which is what makes it
-    /// idempotent rather than merely ordered.
+    /// `main` calls this on the way out — *before* the terminal and the socket
+    /// go back (finding R3: the road runs first, so a second signal cannot find
+    /// a hand-back already made and skip the steps behind it), and [`Drop`]
+    /// calls it again as the backstop, which is what makes it idempotent rather
+    /// than merely ordered. The sentences it returns are printed once the
+    /// terminal is handed back, on a cooked screen.
     ///
     /// The order is the fact. The session goes first: it is the one thing the
     /// human asked not to lose, and it is written only if a change is waiting
@@ -5479,8 +5481,11 @@ impl App {
     /// just handed over is still being written (finding R4).
     ///
     /// Every bound here expires into a sentence, never into a hang and never
-    /// into silence: `main` prints what comes back on a terminal it has already
-    /// handed back, and `Drop` does the same where there is no `main`.
+    /// into silence: `main` prints what comes back once it has handed the
+    /// terminal back, and `Drop` does the same where there is no `main`. A
+    /// signal pressed a second time ends the waits at their next poll instead of
+    /// at their deadlines ([`crate::signals::forced`], finding R3); the sentence
+    /// it leaves says the human asked for that.
     pub fn shutdown(&mut self) -> Vec<String> {
         if self.shut_down {
             return Vec::new();
@@ -11469,12 +11474,15 @@ mod tests {
     }
 
     /// A signal is not a key: it cannot be pressed twice, so it does not wait
-    /// for a second press. The handler sets the flag, the loop's step reads it
-    /// and quits — with live work, and no arm in between (finding E1).
+    /// for a second press. The handler writes its byte, the watcher thread sets
+    /// the flag, and the loop's step reads it and quits — with live work, and no
+    /// arm in between (finding E1).
     ///
     /// This is the one test in the binary that raises one of the three signals,
-    /// deliberately: once the flag is set, a second signal would take the
-    /// conditional default road and kill the test process (see `signals`).
+    /// deliberately: the press counter is the process's, and a test that raised
+    /// signals on its own would spend another test's presses. The flag is
+    /// *polled* for because the watcher is a thread of its own — `raise`
+    /// returns once the byte is in the pipe, not once the flag is set.
     #[test]
     fn a_signal_takes_the_quit_road_without_the_arming_press() {
         let _signals = crate::signals::install().expect("the handlers install");
@@ -11488,6 +11496,14 @@ mod tests {
         assert!(app.quit_armed(), "and the warning is on the line");
 
         signal_hook::low_level::raise(signal_hook::consts::SIGTERM).expect("the signal is raised");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !crate::signals::quit_requested() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the watcher thread never set the flag"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
         assert!(
             crate::take_signal_quit(&mut app),
             "the handler set the flag, and the loop's step reads it"
