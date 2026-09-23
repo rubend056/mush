@@ -423,8 +423,10 @@ impl Outcome {
     /// mistaken for either.
     ///
     /// `pub(crate)` because a cut-off run has no actor left to write this line:
-    /// the UI, which is the only observer that can tell an actor vanished, files
-    /// it through the very same sentence (`App::report_cut_off`).
+    /// the ending is filed by whichever hand is left, and both read this one
+    /// sentence — the thread that died reports it to its parent on the way out
+    /// ([`file_death`]), and an actor already gone leaves the UI to file it
+    /// (`App::report_cut_off`). The parent's fold is what writes the words.
     pub(crate) fn line(&self, id: u64) -> String {
         match self {
             Outcome::Finished(summary) => format!("#{id} done: {summary}"),
@@ -511,7 +513,10 @@ impl Outcome {
 /// parent has read (so the line folds, and wakes a napping parent) and the same
 /// value twice is the same report (so it folds once — `docs/findings.md` B24).
 /// Nothing can ever claim it afterwards either: the actor that would is the
-/// thing that vanished. The UI is the only hand left that can file the report
+/// thing that vanished. Two hands are left to file the report, and they are the
+/// two halves of one question — was there an actor to file it? A thread that dies
+/// files its own ending as its last act ([`file_death`]), and one that was already
+/// gone when someone looked for it leaves the UI as the only observer
 /// (`App::report_cut_off`).
 pub(crate) const CUT_OFF_RUN: u64 = u64::MAX;
 
@@ -736,6 +741,26 @@ pub enum AgentEvent {
     /// The run was stopped by a request (a Stop, Ctrl-C, Ctrl-N). The actor is
     /// still alive, so the row goes quiet instead of claiming a failure.
     Stopped,
+    /// This agent's actor thread died with its work in flight: the run it was in
+    /// never ended, so no `Done`, `Error` or `Stopped` is coming — and the phase
+    /// the row is wearing is the last thing it was *told*, which is why the
+    /// thread that dies says this as its last act (`agent::file_death`).
+    ///
+    /// The dead thread's own news, and only it can carry it: a phase is
+    /// something the UI was told, so a death that says nothing leaves a row
+    /// spinning for as long as the session lasts (finding F6). `reason` is the
+    /// panic payload — the message of the `panic!` that broke the thread, which
+    /// nothing else records.
+    ///
+    /// The parent is deliberately *not* told from here: the dying thread files
+    /// its own ending on the road every other ending takes
+    /// ([`Outcome::CutOff`] through [`AgentMsg::ChildDone`]), and a second
+    /// filing from this arm would report one run's ending twice. The UI's own
+    /// cut-off road (`App::report_cut_off`) is the other case — an actor that
+    /// was already gone and left nobody to file anything.
+    CutOff {
+        reason: String,
+    },
     /// Mush's own sweep took this agent's worktree: its branch adds nothing to
     /// the base the run was forked from — its work was merged, or the run never
     /// committed anything — so the checkout and the branch are gone. `landing`
@@ -779,11 +804,13 @@ pub enum AgentEvent {
     /// the thread and nothing else, so the node, the id and the transcript stay
     /// exactly where they were — and it is also what a child the history window
     /// has since forgotten leaves, which the parent's books outlive as well
-    /// (finding H19). The parent cannot tell the two apart, and cannot wake
-    /// either one: only the UI holds the transcript an actor is rebuilt from.
-    /// So the command travels here and the UI hands it over through the door a
-    /// human's own message uses (`App::deliver_to_actor`), which revives a
-    /// parked child and drops a command for an id that really is gone.
+    /// (finding H19), and what a thread that *died* leaves
+    /// ([`AgentEvent::CutOff`], finding F6). The parent cannot tell the three
+    /// apart, and cannot wake any of them: only the UI holds the transcript an
+    /// actor is rebuilt from. So the command travels here and the UI hands it
+    /// over through the door a human's own message uses
+    /// (`App::deliver_to_actor`), which revives a parked child and drops a
+    /// command for an id that really is gone.
     ///
     /// The parent has already answered its model by then — an empty mailbox is
     /// not proof that the child is gone, which is the whole of finding H18 — so
@@ -1570,7 +1597,122 @@ fn start(actor: Actor, initial: Vec<Message>, start_immediately: bool) {
     }
 }
 
-fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: bool) {
+/// One run's slot in the tree's count of running agents ([`AgentCtx::live`]),
+/// released when the run ends — however it ends.
+///
+/// A guard rather than the two calls the count used to be (`fetch_add` where the
+/// run begins, `fetch_sub` where its ending is filed): everything between those
+/// two lines can panic — the model call, the parse, the commit at the run's own
+/// end — and the decrement is the one line an unwinding thread never reaches.
+/// A slot that leaks does not sit idle: it is [`MAX_AGENTS`] refusing a spawn
+/// with a sentence that is false ("{MAX_AGENTS} agents are already running
+/// tree-wide") and that no `wait` can clear, because the run holding it will
+/// never report that it is over. `Drop` runs on the way out of a panic and on
+/// the way out of a thread that exits early, which is the whole point: the count
+/// is right even when the road that would have written it down is never reached
+/// (finding F6).
+struct LiveGuard {
+    live: Arc<AtomicU64>,
+}
+
+impl LiveGuard {
+    /// Count this run, for as long as the guard lives.
+    fn take(live: &Arc<AtomicU64>) -> Self {
+        live.fetch_add(1, Ordering::SeqCst);
+        Self { live: live.clone() }
+    }
+}
+
+impl Drop for LiveGuard {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// Run one actor's body, and file what is left when it dies.
+///
+/// A panic inside a run — a tool, a parse, a model reply — unwinds the thread it
+/// happened on, and unwinding skips exactly the two things an actor's ending is
+/// made of: the UI is told nothing, so it keeps painting the phase the agent was
+/// *last* told (a row that spins forever), and the parent is sent nothing, so a
+/// `wait` burns its whole cap and a book that says the child is running stays
+/// that way for the rest of the session. The process-wide panic hook restores
+/// the terminal and nothing else, and a death that says nothing is the one thing
+/// a run's two readers cannot survive — so the death is caught where it happened
+/// and filed as the ending it is (finding F6).
+fn actor_main(actor: Actor, initial: Vec<Message>, start_immediately: bool) {
+    // What a death needs, taken before the body owns the actor: the thread that
+    // dies has no books and no state left, and these two are its readers.
+    let id = actor.id;
+    let ctx = actor.ctx.clone();
+    let parent_tx = actor.parent_tx.clone();
+    let body = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        actor_body(actor, initial, start_immediately)
+    }));
+    if let Err(payload) = body {
+        file_death(&ctx, id, parent_tx.as_ref(), &panic_words(payload));
+    }
+}
+
+/// The last act of an actor whose thread died: file the ending the unwinding
+/// skipped, with the two readers a run's ending has.
+///
+/// A panic is an ending like any other, and the run's own [`Outcome::CutOff`] is
+/// its shape: that variant exists for a run that never ended — "the process went
+/// away with it in flight" — and a thread that dies mid-run is the same sentence
+/// happening to one run instead of to the whole process. Not `Failed`: nothing
+/// the model or the endpoint did broke, and a failure is a result a `wait` may
+/// hand over. Not `Stopped`: there is no actor left for a nudge to resume. So the
+/// parent reads it through the road a stopped or reaped run's ending takes
+/// ([`tell_parent`]), under [`CUT_OFF_RUN`] — the number no actor can report, so
+/// the line folds once and wakes a parent that is napping on it.
+///
+/// The UI is told *first*, and for the reason every other ending is
+/// (`actor_main`): the row's ending and the `ResultRead` the parent's fold sends
+/// back travel one channel, and the ending has to be the one that arrives first
+/// (§8.39). Nothing is committed by a run that never ended, so there is no
+/// [`AgentMsg::Work`] fact to send: the same answer the UI's own cut-off road
+/// gives (`App::report_cut_off`).
+fn file_death(ctx: &AgentCtx, id: u64, parent_tx: Option<&Sender<AgentMsg>>, reason: &str) {
+    ctx.emit(
+        id,
+        AgentEvent::CutOff {
+            reason: reason.to_string(),
+        },
+    );
+    tell_parent(
+        ctx,
+        id,
+        parent_tx,
+        AgentMsg::ChildDone {
+            id,
+            run: CUT_OFF_RUN,
+            outcome: Outcome::CutOff,
+        },
+    );
+}
+
+/// What a panic payload says, as a line a human can read.
+///
+/// A `panic!` with a literal or a `format!` is every panic this tree has, and the
+/// payload is the only record of it that outlives the thread: the process-wide
+/// hook restores the terminal and prints to a stderr the screen is painting over.
+/// Anything else — a `panic_any` of a struct, a payload from another library's
+/// convention — is named as unreadable rather than dropped, because "the actor
+/// died" must not read as if nothing had been said.
+fn panic_words(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(words) = payload.downcast_ref::<&str>() {
+        return (*words).to_string();
+    }
+    if let Some(words) = payload.downcast_ref::<String>() {
+        return words.clone();
+    }
+    "a payload this build cannot read".to_string()
+}
+
+/// One actor's loop, unchanged: wait for work, run it, and tell everybody how
+/// the run ended. [`actor_main`] is the wrapper that catches a death in it.
+fn actor_body(actor: Actor, mut transcript: Vec<Message>, start_immediately: bool) {
     let mut state = ActorState::default();
     // Children are handed a task and start at once; the root waits to be asked.
     let mut ready = start_immediately;
@@ -1602,9 +1744,12 @@ fn actor_main(actor: Actor, mut transcript: Vec<Message>, start_immediately: boo
         // this, and the books end where the child really is. The root has no
         // parent, so it says none of this (`tell_parent`).
         actor.tell_parent(AgentMsg::ChildRunning { id: actor.id });
-        actor.ctx.live.fetch_add(1, Ordering::SeqCst);
+        // The slot this run holds in the tree's count of running agents. It is
+        // held for the whole ending — the commit and both reports — and released
+        // by `Drop`, so a run that dies anywhere along that road does not leave
+        // the count claiming it is still running (see [`LiveGuard`]).
+        let _live = LiveGuard::take(&actor.ctx.live);
         let result = run_loop(&actor, &mut state, &mut transcript, &cancel);
-        actor.ctx.live.fetch_sub(1, Ordering::SeqCst);
         // How the run ended decides both the commit subject and what the parent
         // is told. A stopped run still has work worth keeping, but its commit
         // must not read like a finished one.
@@ -9842,6 +9987,265 @@ mod tests {
         let _ = mailbox.send(AgentMsg::Shutdown);
         assert!(run.join().is_ok(), "the actor thread ends cleanly");
         assert_eq!(verdict, Ok(()));
+    }
+
+    /// F6's trigger: a model client whose reply *is* the panic.
+    ///
+    /// No reachable input produces one on demand — the audit that found F6
+    /// could reach no panic from model or repo input
+    /// (`docs/audits/contract-and-git.md`, F6) — so the death is driven from
+    /// here: the answer never comes, the request stays in flight, and the
+    /// thread that owns it is the one that dies. `held` is what the tree's
+    /// count of running runs said at that moment, which is how a test knows the
+    /// slot under test was really taken.
+    struct Panics {
+        live: std::sync::Mutex<Option<Arc<AtomicU64>>>,
+        held: std::sync::Mutex<Vec<u64>>,
+    }
+
+    impl Panics {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                live: std::sync::Mutex::new(None),
+                held: std::sync::Mutex::new(Vec::new()),
+            })
+        }
+
+        /// The counter this client reads when it is asked: the actor is built
+        /// after its client, so the two are wired up here.
+        fn watch(&self, live: Arc<AtomicU64>) {
+            *self.live.lock().unwrap() = Some(live);
+        }
+    }
+
+    impl ModelClient for Panics {
+        fn chat(
+            &self,
+            _request: &ChatRequest<'_>,
+            _cancel: &AtomicBool,
+            _timeout: Duration,
+        ) -> Result<ChatResponse, ModelError> {
+            let live = self
+                .live
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("the client is wired to the tree's count before the run starts");
+            self.held.lock().unwrap().push(live.load(Ordering::SeqCst));
+            panic!("the model call died mid-reply");
+        }
+    }
+
+    /// What one actor's death left behind, as the hands that can hear it saw
+    /// it: the parent's mailbox (`None` for an actor with no parent, whose
+    /// reporting road has no reader at all), the UI's events, the tree's count
+    /// while the request was in flight, and whether the thread itself unwound —
+    /// a death caught where it happened leaves the join clean, and one that is
+    /// not unwinds the thread, which is F6's whole silence.
+    struct Died {
+        parent: Option<Receiver<AgentMsg>>,
+        told: Vec<AgentEvent>,
+        mailbox: Sender<AgentMsg>,
+        live: Arc<AtomicU64>,
+        held: Vec<u64>,
+        panicked: bool,
+    }
+
+    /// Drive one run of an actor whose model client dies mid-reply, and wait for
+    /// its thread to end: the recipe the F6 audit used, as the one driver the two
+    /// tests below are built from.
+    fn a_run_that_dies(label: &str, with_parent: bool) -> Died {
+        let client = Panics::new();
+        let (mut actor, events, mailbox) = build_actor(label, client.clone(), test_cfg());
+        let live = actor.ctx.live.clone();
+        client.watch(live.clone());
+        let parent = with_parent.then(|| {
+            let (tx, rx) = crossbeam_channel::unbounded::<AgentMsg>();
+            actor.parent_tx = Some(tx);
+            rx
+        });
+        let run = std::thread::spawn(move || {
+            actor_main(
+                actor,
+                vec![Message::system("you are mush"), Message::user("do it")],
+                true,
+            );
+        });
+        let panicked = run.join().is_err();
+        let held = client.held.lock().unwrap().clone();
+        Died {
+            parent,
+            told: events.events_for(AgentId(7)),
+            mailbox,
+            live,
+            held,
+            panicked,
+        }
+    }
+
+    /// An actor's thread is one of the two readers of its own run ending, and a
+    /// panic takes both the thread and the ending away: the parent's books keep a
+    /// child that can never report — a `wait` that burns its whole 600 s cap and
+    /// answers "still running", a listing that says `◐ running` for the rest of
+    /// the session — and the UI keeps painting the phase it was *last told*, which
+    /// is a row that spins forever (finding F6).
+    ///
+    /// The thread that dies files what happened instead, as the ending it is: one
+    /// `Outcome::CutOff` on the road every other ending takes, under the run
+    /// number no actor can report, and one event to the UI so the row can stop
+    /// wearing a phase nothing will ever clear.
+    #[test]
+    fn an_actor_thread_that_dies_mid_run_is_reported_cut_off() {
+        // `build_actor`'s actor is #7, and it is a child here: the parent is the
+        // mailbox the test holds.
+        let child = 7;
+        let died = a_run_that_dies("died-mid-run", true);
+        let heard: Vec<AgentMsg> = died
+            .parent
+            .as_ref()
+            .expect("this actor was given a parent")
+            .try_iter()
+            .collect();
+
+        // The run announced itself, then died. What the parent must have is the
+        // *ending*, exactly once, and of the shape a run that never ended has:
+        // `Finished`, `Failed` and `Stopped` would each be a fact about a run that
+        // ended, and two endings would be one run reported twice.
+        assert!(
+            matches!(heard.first(), Some(AgentMsg::ChildRunning { id }) if *id == child),
+            "the run says it started before it dies: {heard:?}"
+        );
+        let endings: Vec<&AgentMsg> = heard
+            .iter()
+            .filter(|message| matches!(message, AgentMsg::ChildDone { .. }))
+            .collect();
+        assert_eq!(
+            endings.len(),
+            1,
+            "one ending, not none and not two: {heard:?}"
+        );
+        match endings[0] {
+            AgentMsg::ChildDone { id, run, outcome } => {
+                assert_eq!(*id, child, "the child that died");
+                assert_eq!(
+                    *outcome,
+                    Outcome::CutOff,
+                    "a run that never ended is not a result, not a failure and not a stop"
+                );
+                assert_eq!(
+                    *run, CUT_OFF_RUN,
+                    "the number no actor can report: the books fold this line once"
+                );
+            }
+            other => panic!("the only ending here is a completion: {other:?}"),
+        }
+
+        // The UI was told the same fact, once, with the payload — the only record
+        // of what broke. No `Done`/`Error`/`Stopped` follows, which is what makes
+        // the row stop: its phase is the last event it was handed, and this is the
+        // last one there is.
+        let told: Vec<&AgentEvent> = died
+            .told
+            .iter()
+            .filter(|event| matches!(event, AgentEvent::CutOff { .. }))
+            .collect();
+        assert_eq!(told.len(), 1, "one death, one telling: {:?}", died.told);
+        match told[0] {
+            AgentEvent::CutOff { reason } => assert!(
+                reason.contains("the model call died mid-reply"),
+                "the payload travels: it is what says which panic this was: {reason}"
+            ),
+            other => panic!("the event is the death: {other:?}"),
+        }
+        assert!(
+            matches!(died.told.last(), Some(AgentEvent::CutOff { .. })),
+            "nothing is emitted after the death, so the row cannot be left spinning: {:?}",
+            died.told
+        );
+
+        // The slot the run held is given back, and the death was caught in the
+        // thread that had it rather than left to unwind it.
+        assert_eq!(died.held, vec![1], "the run was in flight when it died");
+        assert_eq!(
+            died.live.load(Ordering::SeqCst),
+            0,
+            "a leaked slot is `MAX_AGENTS` refusing a spawn for the rest of the session"
+        );
+        assert!(!died.panicked, "the death is caught where it happened");
+
+        // The parent's books, built from what it heard through the two functions
+        // its own drain uses. The listing is the line a parent reads: never
+        // `◐ running` about a thread that is gone, and always which ending this
+        // was.
+        let mut state = ActorState::default();
+        state.children.insert(child, died.mailbox.clone());
+        for message in &heard {
+            match message {
+                AgentMsg::ChildRunning { id } => note_running(&mut state, *id),
+                AgentMsg::ChildDone { id, run, outcome } => {
+                    note_completion(&mut state, *id, *run, outcome.clone());
+                }
+                _ => {}
+            }
+        }
+        let listing = child_listing(&state);
+        assert!(
+            listing.contains("cut off"),
+            "the parent is told which ending this was: {listing}"
+        );
+        assert!(
+            !listing.contains("running"),
+            "and never that a child whose thread is gone is still running: {listing}"
+        );
+
+        // The wait those books answer. Before the fix this was the cap: the run
+        // never reported, so nothing was left to wait for but the clock — 600 s
+        // of it, and the answer "still running" (finding F6).
+        let clock = Arc::new(Advanceable::new());
+        let (parent, _mailbox) =
+            scripted_tools_actor("died-mid-run-wait", Arc::new(Shell), clock.clone());
+        let cancel = Arc::new(AtomicBool::new(false));
+        let answer = wait_tool(&parent, &mut state, &cancel).unwrap();
+        assert!(
+            answer.contains("cut off"),
+            "the ending the wait hands over is the cut-off: {answer}"
+        );
+        assert!(
+            clock.elapsed() < Duration::from_secs(600),
+            "and it costs no part of the cap: {:?}",
+            clock.elapsed()
+        );
+        let _ = fs::remove_dir_all(parent.ws.root());
+    }
+
+    /// The count `MAX_AGENTS` reads is a slot per run in flight, and the road that
+    /// gives a slot back is the run's own ending — the road a thread that dies
+    /// never reaches. So the slot is held in a guard: `Drop` decrements on the way
+    /// out of a panic and on the way out of a thread that exits early, and the
+    /// count cannot be left saying that a run which will never report is still
+    /// going.
+    ///
+    /// The root's shape is the case with no reporting road at all: `parent_tx` is
+    /// `None`, so `tell_parent` has no reader and nothing but the guard can restore
+    /// the count (finding F6).
+    #[test]
+    fn a_thread_that_dies_without_a_reporting_road_leaves_the_count_where_it_found_it() {
+        let died = a_run_that_dies("died-unreported", false);
+        assert!(
+            died.parent.is_none(),
+            "the root has nobody to file an ending to"
+        );
+        assert_eq!(
+            died.held,
+            vec![1],
+            "the run took its slot, and the model call is where it died"
+        );
+        assert_eq!(
+            died.live.load(Ordering::SeqCst),
+            0,
+            "a slot a dead run cannot return is a spawn refused with a false sentence"
+        );
+        assert!(!died.panicked, "the death is caught where it happened");
     }
 
     /// The root napping on `wait` must hear the human. Parking their

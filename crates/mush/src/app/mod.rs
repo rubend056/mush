@@ -328,12 +328,17 @@ fn seeded_outcome(phase: &Phase, summary: Option<&str>) -> Option<agent::Outcome
 /// The row is the mark; this is the sentence a human needs to act on it — that
 /// the run did not produce a result, and that whatever it wrote is *uncommitted*,
 /// which is what makes the difference between "recoverable" and "lost"
-/// (finding H2). One wording, shared by the two paths that can prove a run was
-/// cut off: a restored status that still said `running`, and an actor whose
-/// mailbox is dead with work in flight.
-fn cut_off_notice() -> String {
-    "cut off — its run never ended, so nothing was committed; its work is where it left it"
-        .to_string()
+/// (finding H2). One wording, shared by the roads that can prove a run was cut
+/// off: a restored status that still said `running`, an actor whose mailbox is
+/// dead with work in flight, and a thread that died and filed its own ending on
+/// the way out (finding F6) — which is the one that can name what broke, so its
+/// payload is carried rather than dropped.
+fn cut_off_notice(reason: Option<&str>) -> String {
+    let ending = match reason {
+        Some(reason) => format!("the actor's thread died ({reason})"),
+        None => "its run never ended".to_string(),
+    };
+    format!("cut off — {ending}, so nothing was committed; its work is where it left it")
 }
 
 /// `/help`: the key table, then the command table.
@@ -906,8 +911,11 @@ impl App {
             // would say *that* a run never ended without saying what follows
             // from it, which is the whole of what the human needs (finding H2).
             if phase == Phase::CutOff {
+                // No reason to name: a stored status says a run never ended, not
+                // what ended it — the payload of a death is a fact about the
+                // session that died, and the file does not carry it.
                 self.chat
-                    .note_cut_off_for(AgentId(agent.id), cut_off_notice());
+                    .note_cut_off_for(AgentId(agent.id), cut_off_notice(None));
                 cut_off.push((AgentId(agent.id), parent));
             }
             let tx = agent::revive(
@@ -1876,6 +1884,21 @@ impl App {
                 if id == self.tree.focused {
                     self.say(format!("agent {id} stopped — send a message to resume it"));
                 }
+            }
+            AgentEvent::CutOff { reason } => {
+                // The dying thread's own last act: it filed its own ending to its
+                // parent on the way out (`agent::file_death`), so the parent is
+                // deliberately *not* told from here — a second filing would
+                // report one run's ending twice. What is left is the half only
+                // the UI owns: the row that was left wearing the last phase it
+                // was ever told, the pane's sentence (with the payload, the only
+                // record of what broke), the jobs nothing else will stop, and
+                // the bar.
+                self.note_cut_off(
+                    id,
+                    cut_off_notice(Some(&reason)),
+                    format!("agent {id} died — its run was cut off, nothing committed"),
+                );
             }
             AgentEvent::Error(error) => {
                 self.tree.fail(id, error.clone());
@@ -4588,9 +4611,8 @@ impl App {
         }
     }
 
-    /// An agent's actor is gone with its run in flight: the one ending no actor
-    /// can report, because the actor that would have reported it is the thing
-    /// that vanished.
+    /// An agent's actor is gone with its run in flight and left nobody to file the
+    /// ending: the actor that would have reported it is the thing that vanished.
     ///
     /// So the UI — the only observer left, and the one that just proved it by
     /// finding the mailbox dead — says it in both places the fact has a reader.
@@ -4604,23 +4626,18 @@ impl App {
     /// A parent whose node is gone too, and the root — which is nobody's child
     /// and never revived — have nobody to tell; the row and the pane still say
     /// it.
+    ///
+    /// The *other* road that can learn an actor is gone is the actor itself:
+    /// a thread that dies files its own cut-off on the way out
+    /// (`agent::file_death`, `AgentEvent::CutOff`), and there the parent is
+    /// already told — which is the one thing the two roads do differently, and
+    /// the reason `note_cut_off` below holds everything else they share.
     fn report_cut_off(&mut self, id: AgentId) {
-        self.chat.note_cut_off_for(id, cut_off_notice());
-        self.mark_session_dirty();
-        // The actor that owned this agent's jobs is the thing that vanished, so
-        // nothing else will ever stop them: `Registry::stop` refuses any caller
-        // but the owner, and `kill_owned` is otherwise reached only from inside
-        // the owning actor's own `Stop`/`Shutdown` handlers (`agent.rs`). Left
-        // alone, a build the agent started would run until mush quits, owned by
-        // a row that says the work was cut off. The UI is the only observer
-        // left, so the kill is the UI's to make — and it is what the row, the
-        // notice and the parent's message are describing.
-        self.tree.handles().jobs.kill_owned(id.0);
-        if id == self.tree.focused {
-            self.say(format!(
-                "agent {id} was already gone — its run was cut off, nothing committed"
-            ));
-        }
+        self.note_cut_off(
+            id,
+            cut_off_notice(None),
+            format!("agent {id} was already gone — its run was cut off, nothing committed"),
+        );
         let Some(parent) = self.tree.node(id).and_then(|node| node.parent) else {
             return;
         };
@@ -4639,6 +4656,40 @@ impl App {
                 outcome: agent::Outcome::CutOff,
             },
         );
+    }
+
+    /// Everything the UI itself owns about an agent whose actor is gone: the row,
+    /// the pane's sentence, the jobs it owned, and the bar's line — and nothing
+    /// about the parent, which belongs to whichever road knows whether it has a
+    /// report to send.
+    ///
+    /// Two roads can learn that an actor is gone, and they differ in exactly that
+    /// one thing: a thread that died files its own cut-off as its last act
+    /// (`agent::file_death`), while an actor that was already gone when a Stop
+    /// looked for it leaves the UI as the only hand that can file anything
+    /// ([`Self::report_cut_off`]). Everything else is the same fact about the same
+    /// agent, so it is written once: a second spelling is a second chance for the
+    /// row, the pane and the jobs to disagree about one death (finding F6).
+    fn note_cut_off(&mut self, id: AgentId, notice: String, line: String) {
+        // The row first. A phase is a fact the UI was *told*, which is what makes
+        // a silent death a row that spins forever: this is the telling.
+        self.tree.cut_off(id);
+        self.chat.note_cut_off_for(id, notice);
+        self.mark_session_dirty();
+        // The actor that owned this agent's jobs is the thing that vanished, so
+        // nothing else will ever stop them: `Registry::stop` refuses any caller
+        // but the owner, and `kill_owned` is otherwise reached only from inside
+        // the owning actor's own `Stop`/`Shutdown` handlers (`agent.rs`). Left
+        // alone, a build the agent started would run until mush quits, owned by
+        // a row that says the work was cut off. The UI is the only observer
+        // left, so the kill is the UI's to make — and it is what the row, the
+        // notice and the parent's message are describing.
+        self.tree.handles().jobs.kill_owned(id.0);
+        // Only the agent the human is looking at needs the bar; the row and the
+        // pane say the same thing to everyone else.
+        if id == self.tree.focused {
+            self.say(line);
+        }
     }
 
     fn cycle_focus(&mut self, direction: i64) {
@@ -15718,6 +15769,80 @@ mod tests {
         app.tick();
         assert_eq!(app.tree.agents[0].phase, Phase::Idle);
         assert!(!app.busy(), "the bar must stop claiming work");
+    }
+
+    /// The *other* road that can learn a run was cut off: the thread that died says
+    /// so itself, as its last act (`agent::file_death`). What the UI adds is the
+    /// half only the UI owns — the row stops wearing the phase it was last told
+    /// (a phase is a fact the UI was handed, so a silent death leaves a row
+    /// spinning for as long as the session lasts), the pane gets the sentence with
+    /// the payload in it, and the jobs the vanished actor owned are stopped.
+    ///
+    /// The parent is deliberately *not* told from here: the dying thread filed its
+    /// own ending before it went, and a second filing would report one run's ending
+    /// twice (finding F6).
+    #[test]
+    fn a_dead_actors_row_says_cut_off_and_the_ui_files_no_second_ending() {
+        let (mut app, _rx) = test_app("died-row");
+        let conversation = app.tree.conversation();
+        // A live parent (#1) whose mailbox this test holds, and a child (#2) that
+        // is mid-run: the row is wearing `thinking…` when the thread dies.
+        let (parent_tx, parent_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        for (child, parent, depth, cmd) in [
+            (1, 0, 1, parent_tx),
+            (2, 1, 2, crossbeam_channel::unbounded().0),
+        ] {
+            app.update(Msg::Agent {
+                conversation,
+                id: AgentId::ROOT,
+                event: AgentEvent::Spawned {
+                    child,
+                    parent,
+                    brief: format!("task {child}"),
+                    depth,
+                    branch: None,
+                    fork: None,
+                    title: None,
+                    cmd,
+                },
+            });
+        }
+        app.tree.begin(AgentId(2), None);
+
+        app.on_agent(
+            AgentId(2),
+            AgentEvent::CutOff {
+                reason: "the model call died mid-reply".into(),
+            },
+        );
+
+        assert_eq!(
+            app.tree.node(AgentId(2)).map(|node| node.phase.clone()),
+            Some(Phase::CutOff),
+            "the row stops painting the last phase it was told"
+        );
+        let notice = app
+            .chat
+            .notices_for(AgentId(2))
+            .map(|notice| notice.text.clone())
+            .collect::<Vec<_>>()
+            .join(" · ");
+        assert!(
+            notice.contains("the model call died mid-reply"),
+            "the payload is the only record of which death this was: {notice}"
+        );
+        assert!(notice.contains("nothing was committed"), "{notice}");
+        let rows = screen(&mut app, 120, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("⚠ #2")),
+            "the row says which ending this was: {rows:?}"
+        );
+        assert!(
+            parent_rx
+                .try_iter()
+                .all(|message| !matches!(message, AgentMsg::ChildDone { .. })),
+            "the parent hears the ending from the actor that died, once: the UI adds no second filing"
+        );
     }
 
     /// The one ending no actor can report, because the actor that would have

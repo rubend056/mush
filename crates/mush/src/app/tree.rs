@@ -1138,6 +1138,24 @@ impl AgentTree {
         self.agent_cancel.remove(&id);
     }
 
+    /// The actor behind this row is gone with its run in flight: the run never
+    /// ended, so no result is coming and no phase the row could paint from its
+    /// own last event is the truth.
+    ///
+    /// Its own phase, not `Failed` and not `Stopped`. A failure is a result the
+    /// row's `✗` says was produced, and a stop is a promise — "the actor is alive
+    /// and a message resumes it" — which is the one thing an actor that died
+    /// cannot keep: the thread is what vanished, and the copy of the
+    /// conversation left on screen is where it would have to resume from
+    /// (`docs/findings.md` H2, F6).
+    pub fn cut_off(&mut self, id: AgentId) {
+        if let Some(node) = self.node_mut(id) {
+            node.phase = Phase::CutOff;
+            node.since = Instant::now();
+        }
+        self.agent_cancel.remove(&id);
+    }
+
     /// The parent has read this agent's result: the line is in its transcript
     /// now, wherever it came from — a fold at the next message boundary, the
     /// wake-up a napping parent got, or a `wait` that asked for it.
