@@ -231,18 +231,28 @@ the run being replaced.
 
 ## When the network hiccups
 
-A failure of the transport — a connection reset or refused, an unexpected end
-of stream, a connect or read timeout — is the wire, not the endpoint refusing
-the request, so mush asks again: **three attempts in total**, with a short
-backoff between them. Each retry is a line in the agent's own transcript
-(`· Connection reset by peer (os error 104) — retrying (2/3)`) instead of a
-spinner that looks stuck, and Ctrl-C abandons the request at once, backoff
-included. What the endpoint *answered* — a 4xx or 5xx status, a reply past the
-body cap, a body that did not parse — is returned as it is, first time: an
-answer is not a hiccup. Every attempt is bounded by the client's own budget
-(5 s to connect, 30 s to write, a 10-minute read deadline), so three attempts
-plus the backoff is the worst case: seconds for the hiccup this is for, about
-half an hour for an endpoint that stalls and loses every time.
+A failure that happened *before the request was handed over* — a dial that
+never connected (refused, timed out, a name that did not resolve, a TLS
+handshake that failed), or a write that did not hand the whole request to the
+endpoint — is the wire, not the endpoint refusing the request, and no whole
+request reached it, so mush asks again: **three attempts in total** (the first
+try and two retries), with a short backoff between them. Each retry is a line in
+the agent's own transcript
+(`· Connection refused (os error 111) — retrying (2/3)`) instead of a spinner
+that looks stuck, and Ctrl-C abandons the request at once, backoff included.
+Everything after the write is final, first time, because the endpoint may
+already have read, run and charged for the request: a connection reset, an
+unexpected end of stream, a read timeout, a 4xx or 5xx status, a reply past the
+body cap, a body that did not parse. An answer is not a hiccup (the one
+learned-window retry of a context-length 400 is *Context window*'s backstop,
+not this section's). One ask spends one budget of ten minutes (600 s): the whole
+deadline is fixed once, and every attempt — and the backoff between them — gets
+only what is left of it, so a retry the call cannot afford is not made. Each
+phase of an attempt takes the smaller of its own ceiling — 5 s to connect to
+one address, 30 s to write one chunk, 10 s to resolve a name — and what is left
+of the call, so the worst case is that one ask's ten minutes, not a multiple of
+it: about a second and a half for a dial that is refused every time, ten minutes
+for an endpoint that accepts the connection and then stalls.
 
 ## Context window
 
