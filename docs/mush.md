@@ -1111,9 +1111,11 @@ mush/
     mush-core/   # pure domain: config, messages, prompt, session, tools, workspace. No UI.
       config.rs      endpoint/model/api-key/window resolution (the startup precedence)
       git.rs         branch, dirty count and per-branch diffstat, from `git` shell-outs
+      lib.rs         the crate root: the module list, the re-exports, and the command caps
       message.rs     OpenAI-compatible message + request/response types
       prompt.rs      the system prompt and the tool schemas
       provider.rs    the provider table: a vendor's endpoint, models and defaults
+      secrets.rs     the secrets mush holds, and why a process it starts never inherits one
       session.rs     `.mush/` creation and conversation persistence
       text.rs        display-column arithmetic: wrap, truncate, fit_row, mask, sanitize
                      and the line-local markdown view: markdown_rows, Run/RunStyle
@@ -1140,6 +1142,10 @@ mush/
       session_save.rs  the writer thread behind `.mush/session.json`
       input.rs       the message box's grapheme cursor and horizontal window
       http.rs        a few hundred lines of blocking HTTP/1.1 client
+      ids.rs         the two id spaces (`#1` agents, `#c2` jobs) and the one place either is drawn
+      lock.rs        one mush per workspace: the `flock` that keeps two off one store
+      signals.rs     the signals that mean end mush, all taking the clean-quit road
+      theme.rs       the per-workspace hue and the form the terminal can paint it in
       ui.rs          the painter: reads a `Screen` a value at a time and paints it
       app/screen.rs  every painted value, derived by `App` (layout, rows, words)
       attach.rs      the M3 socket: `.mush/mush.sock`, one JSON request per line
