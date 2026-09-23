@@ -14645,6 +14645,48 @@ mod tests {
         );
     }
 
+    /// The other half of what a vanished actor leaves: the machine it claimed.
+    /// A panic skips the call's release ([`crate::jobs::Foreground::drop`]), and
+    /// the road that kills the orphaned job is the only one that can free the
+    /// claim — a sibling queued on a lock held by a row that is gone never gets
+    /// in (finding E4).
+    #[test]
+    fn a_cut_off_owner_frees_the_machine_it_held() {
+        use crate::jobs::Launch;
+        use crate::machine::fake::{Script, Scripted};
+        use crate::machine::{Machine, ShellCommand};
+
+        let (mut app, _rx) = test_app("cut-off-holder");
+        let jobs = app.tree.handles().jobs.clone();
+        let machine = Arc::new(Scripted::new().runs(Script::hangs()));
+        let job = machine
+            .spawn(&ShellCommand {
+                command: "cargo bench",
+                root: std::path::Path::new("/tmp"),
+            })
+            .unwrap();
+        let (mailbox, _rx) = crossbeam_channel::unbounded();
+        jobs.launch(Launch::started(
+            1,
+            "cargo bench".to_string(),
+            true,
+            mailbox,
+            job,
+        ))
+        .unwrap();
+        spawn_agent(&mut app, 1, 0, 1, "a task", None);
+        begin_run(&mut app, AgentId(1));
+        assert!(jobs.held().is_some(), "the exclusive job holds the machine");
+
+        app.stop_one(AgentId(1));
+
+        assert_eq!(jobs.held(), None, "the cut-off road frees the machine");
+        assert!(
+            jobs.take_machine(9, "cargo bench").is_ok(),
+            "and a sibling can take it"
+        );
+    }
+
     /// A child's result is unread until its *parent's actor* has read it, and
     /// the screen says so from both ends of the relationship: the child's row
     /// wears `✉`, and the parent's row counts what it owes a read (finding H4).
