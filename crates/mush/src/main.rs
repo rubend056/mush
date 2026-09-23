@@ -1185,12 +1185,20 @@ fn enter_terminal_modes() -> io::Result<()> {
 /// Undo every mode [`enter_terminal_modes`] turned on.
 fn restore_terminal_modes() {
     let _ = disable_raw_mode();
-    let _ = execute!(
-        io::stdout(),
+    let _ = restore_mode_sequences(&mut io::stdout());
+}
+
+/// The escape sequences that leave the modes [`enter_terminal_modes`] entered,
+/// written through a `Write` rather than straight to `stdout`: the panic hook's
+/// one effect on the terminal, so a test can read exactly what a panic puts on
+/// the wire without a terminal (finding E10).
+fn restore_mode_sequences(writer: &mut impl io::Write) -> io::Result<()> {
+    execute!(
+        writer,
         LeaveAlternateScreen,
         DisableBracketedPaste,
         DisableMouseCapture
-    );
+    )
 }
 
 /// Restores the terminal on both clean exit (Drop) and panic.
@@ -1228,12 +1236,44 @@ pub(crate) fn take_signal_quit(app: &mut App) -> bool {
     false
 }
 
+/// The panic hook, installed where the terminal belongs: on the thread that
+/// owns it.
 fn install_panic_hook() {
+    // The hook runs on whichever thread panicked, so it cannot ask "am I the
+    // terminal's thread?" by looking around — the id is captured here, on the
+    // thread that owns the terminal, and every panic is compared against it
+    // (finding E10).
+    install_panic_hook_for(std::thread::current().id(), restore_terminal_modes);
+}
+
+/// Install the process-wide panic hook for `owner`'s terminal, restoring its
+/// modes through `restore`.
+///
+/// Every panic used to run [`restore_terminal_modes`], whichever thread
+/// panicked — and mush is a process with a thread per agent
+/// (`mush-agent-{id}`), per job (`mush-job-{id}`) and one for the session
+/// writer. A worker's death therefore wrote `LeaveAlternateScreen` and the mode
+/// resets to the human's terminal while the UI thread kept painting frames into
+/// a screen that was no longer mush's (finding E10). A worker's panic has its
+/// own roads, and none of them needs the terminal: a job's thread ends its
+/// process group, the writer marks itself dead, and the panic message still
+/// reaches stderr through `previous`.
+///
+/// The restore is a parameter rather than a call to the real one so a test can
+/// install the hook for a thread of its own and read what each panic writes
+/// ([`restore_mode_sequences`]).
+fn install_panic_hook_for(
+    owner: std::thread::ThreadId,
+    restore: impl Fn() + Send + Sync + 'static,
+) {
     let previous = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        // Every mode, or a panic leaves the human's shell in raw mode, or
-        // swallowing its own pastes.
-        restore_terminal_modes();
+        // Only the thread whose terminal this is restores it: a panic on any
+        // other thread must leave the human's screen alone, whether or not the
+        // UI is still running (finding E10).
+        if std::thread::current().id() == owner {
+            restore();
+        }
         previous(info);
     }));
 }
@@ -2335,5 +2375,71 @@ mod tests {
                 send: false,
             }
         );
+    }
+
+    /// The escape sequences a panic writes, captured: the `Write` seam
+    /// [`restore_mode_sequences`] takes (finding E10).
+    #[derive(Clone, Default)]
+    struct Modes(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl io::Write for Modes {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// A worker's panic leaves the terminal alone; the panic on the thread the
+    /// hook was installed for restores it. The escape sequences are read
+    /// through the `Write` seam, so "no sequence at all" is an assertion rather
+    /// than a screen to look at (finding E10). Before the fix the hook restored
+    /// for every panic: a worker's death wrote
+    /// `^[[?1049l^[[?2004l^[[?1006l^[[?1015l^[[?1003l^[[?1002l^[[?1000l` and
+    /// the human's UI was left painting into their shell.
+    #[test]
+    fn a_worker_panic_leaves_the_terminal_alone() {
+        let modes = Modes::default();
+        let sink = modes.clone();
+        let owner = std::thread::current().id();
+        install_panic_hook_for(owner, move || {
+            let mut sink = sink.clone();
+            let _ = restore_mode_sequences(&mut sink);
+        });
+
+        // The shape of a panicking job thread, or the session writer: a named
+        // worker that dies. Its message still reaches stderr through the hook
+        // that was there before; the terminal is not its to restore.
+        let worker = std::thread::Builder::new()
+            .name("mush-job-1".to_string())
+            .spawn(|| panic!("a worker died"))
+            .expect("the worker thread starts");
+        assert!(worker.join().is_err(), "the worker panicked");
+        let written = modes.0.lock().unwrap().clone();
+        assert!(
+            written.is_empty(),
+            "a worker's panic wrote to the human's terminal: {:?}",
+            String::from_utf8_lossy(&written)
+        );
+
+        // The thread the hook was installed for is the terminal's: its own
+        // panic is the one that must leave the modes behind.
+        let _ = std::panic::catch_unwind(|| panic!("the terminal's thread died"));
+        let written = String::from_utf8_lossy(&modes.0.lock().unwrap()).into_owned();
+        assert!(
+            written.contains("\u{1b}[?1049l"),
+            "leaves the alternate screen: {written:?}"
+        );
+        assert!(
+            written.contains("\u{1b}[?2004l"),
+            "and turns bracketed paste off: {written:?}"
+        );
+
+        // The hook is the process's: put the default back, so whatever panic
+        // comes next is not shaped by this test.
+        let _ = std::panic::take_hook();
     }
 }
