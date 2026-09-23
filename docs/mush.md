@@ -460,17 +460,18 @@ content is read again, so emphasis nests), `` `code` ``, `~~strike~~`, one to
 three `#` headings, list markers kept with a wrapped row hung under the item's
 own text, `> ` painted as a `│ ` bar, `[ ]`/`[x]` as `☐`/`☑`, three or more
 `-`/`*`/`_` as a rule across the pane, fenced code, links as `text (url)`, and
-tables — the delimiter row names each column's alignment and the cells share the
-pane's width exactly, wrapping inside their columns — and painted in the reply's
-styles, with only the scaffolding a view does not read (a heading's `#`s, a
-quote's `>`, a checkbox's brackets, a table's pipes and delimiter row, a fence's
-two lines) left unpainted. It is deliberately not a document renderer — no
-paragraph reflow, no nested lists, no HTML — and it changes no bytes: tool
-results and `run_command` output, the human's own lines, briefs, notices and the
-model's reasoning rows are painted raw, so a `#` there is a comment and an `*` a
-glob. What the copy road hands another program is the *source* lines of a reply,
-never the painted screen. Both rules live in `crates/mush-core/src/text.rs`
-(`sanitize`, `markdown_rows`).
+tables — the delimiter row names each column's alignment and each column is
+sized to its content: a short column stops at its widest cell while the pane's
+width goes to the columns whose words still need it, each wrapping inside its
+own column — and painted in the reply's styles, with only the scaffolding a view
+does not read (a heading's `#`s, a quote's `>`, a checkbox's brackets, a table's
+pipes and delimiter row, a fence's two lines) left unpainted. It is
+deliberately not a document renderer — no paragraph reflow, no nested lists, no
+HTML — and it changes no bytes: tool results and `run_command` output, the
+human's own lines, briefs, notices and the model's reasoning rows are painted
+raw, so a `#` there is a comment and an `*` a glob. What the copy road hands
+another program is the *source* lines of a reply, never the painted screen. Both
+rules live in `crates/mush-core/src/text.rs` (`sanitize`, `markdown_rows`).
 
 `Ctrl-Y` is that copy road. mush never captures the mouse, so the terminal owns
 selection and a drag is a rectangle of screen cells; the mode is a cursor over
