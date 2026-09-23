@@ -17374,9 +17374,10 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
-    /// A fold the window triggered — nobody asked, the history is three quarters
-    /// of the budget — reaches the same visible state, and says *why* it is
-    /// happening: the human did not ask for this one. It folds once.
+    /// A fold the window triggered — nobody asked, the history is past
+    /// [`mush_core::transcript::compaction_trigger`] — reaches the same visible
+    /// state, and says *why* it is happening: the human did not ask for this
+    /// one. It folds once.
     #[test]
     fn a_full_history_folds_once_and_says_the_window_asked() {
         let root = scratch_dir("compact-auto-visible");
