@@ -478,8 +478,9 @@ elided, and the cursor is always on screen.
 A paste whose every word is an image's path attaches them all — one or several,
 split on whitespace or newlines — and anything else is text and lands in the box
 as it always did (§3). The attachments are painted as dim `▣ path (format ·
-size)` rows above the text — one per image, at most three, the third counting the
-rest when there are more, with the title saying how many — and they travel with
+size)` rows above the text — one per image, at most three, fewer when the box has
+less room, the last of them counting the rest when there are more, with the
+title saying how many — and they travel with
 the send: `Enter` on an empty box with an image attached is still a send, because
 the picture *is* the message. A send that does not land puts the words and the
 images back in the box, and `Esc` clears both.
