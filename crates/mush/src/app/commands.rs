@@ -327,7 +327,7 @@ fn optional(argument: &str) -> Option<String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::ui::HINT;
 
@@ -618,6 +618,23 @@ mod tests {
             assert!(
                 parse_command(word).is_ok(),
                 "the bar advertises `{word}`, which is not a command"
+            );
+        }
+    }
+
+    /// The `/help` table, exactly as `mush --help` prints it, in the manual's
+    /// `commands` block — and on the front page, which carries the same block.
+    /// One table behind both surfaces, and a failing test while a block
+    /// disagrees with it.
+    #[test]
+    fn the_commands_block_matches_the_code() {
+        let rendered = format!("```\n{}\n```", table(&mush_core::provider::names_piped()));
+        for file in ["docs/mush.md", "README.md"] {
+            crate::ui::tests::doc_block(
+                file,
+                "commands",
+                "app::commands::tests::the_commands_block_matches_the_code",
+                &rendered,
             );
         }
     }

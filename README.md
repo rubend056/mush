@@ -242,6 +242,18 @@ fails while either block is stale:
 <!-- /generated: keys -->
 
 <!-- generated: commands (blessed by MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush app::commands::tests::the_commands_block_matches_the_code) -->
+```
+    /provider [deepseek|custom]  switch provider, or pick one from a list
+    /model                       pick a model from the endpoint's list
+    /url <url>                   point at another OpenAI-compatible endpoint
+    /key [SECRET]                show the API key in use, or set one (saved to the home config)
+    /models                      refresh the model list from the endpoint
+    /context [N|auto]            say the window's size and road, state one, or auto for the table
+    /compact                     fold the focused agent's conversation into a summary
+    /notes                       read every note about the focused agent, in full
+    /help                        list the keys and these commands
+    /quit                        leave mush
+```
 <!-- /generated: commands -->
 
 ## The screen
