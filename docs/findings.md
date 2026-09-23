@@ -641,6 +641,57 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   375 pids, ≈4.3 GiB) could not be reproduced at this base. The fix belongs in
   the tests' scratch-root helpers — one `Scratch` type whose `Drop` removes the
   root, or one helper they all call — and a child is being sent for it.
+- **H64** — ⬜ open, the code half of H55, re-read and left by #123's pass (§8.88):
+  `crates/mush-core/src/prompt.rs:58` still says "without one the child works in
+  this workspace, and only one such child may run at a time", while the rule
+  `spawn_tool` enforces is the *directory's* live writers, tree-wide — the
+  `writers()` static keyed by the canonical workspace root, booked for a shared
+  run through `WriterGuard`, minus the spawner's own children (its books are the
+  finer answer for them) and never the spawner itself (`d7f12a2`, §8.83). The
+  manual's two halves were repaired (`20c30a7` README, `e5f67a1` docs/mush.md),
+  so what H55 owes now is the code alone: the prompt's sentence, the doc at
+  `agent.rs:1806`, and the refusal at `agent.rs:4507` ("already runs in this
+  shared workspace, and only one shared child may run at a time") all quote the
+  per-parent claim as the rule. `prompt.rs` is the human's file.
+- **H65** — ⬜ open, the doc `retrying` carries, re-read by #123 and left (§8.88):
+  `crates/mush/src/model.rs:303`'s "resolving a host has no timeout (docs/mush.md
+  §8)" is false since the wire phases were bounded — `http::resolve_bounded`
+  (`http.rs:970`) ends its wait at the smaller of `RESOLVE_TIMEOUT` (10 s,
+  `http.rs:954`) and `Watch::left`, and a spent wait answers through
+  `Watch::spend` — and the same doc's "costs milliseconds" (`model.rs:301`) is
+  false of the case it names: a refused dial pays `RETRY_BACKOFF` 500 ms and then
+  1 000 ms (`model.rs:260`), the 1.5 s sum `model.rs`'s own test asserts
+  (`RETRY_BACKOFF + RETRY_BACKOFF * 2`, `:1170`).
+- **H66** — ⬜ open, one sentence in code: `crates/mush/src/http.rs:3005`'s "the
+  cap that is a quarter of it" (in `live_endpoint_accepts_the_shipped_reply_cap`'s
+  comment) where `Config::reply_cap` divides by `REPLY_SHARE_DIVISOR = 8`
+  (`mush-core/src/config.rs:69`) and `REPLY_SHARE_WORDS` spells "an eighth of the
+  window" (`:75`). §123 corrected the two documents that said a quarter
+  (`fc31aff`, §8.88); the code's own comment still says it.
+- **H67** — ⬜ open, one spelling written twice: `crates/mush/src/app/mod.rs:4265`
+  builds the copy refusal as `"cannot copy {from} into {}/.mush/paste: {e}"`
+  inline, where `workspace::PASTE_REL` (`mush-core/src/workspace.rs:1844`, read by
+  `paste_dir`/`paste_rel` and by every message about a paste) is the one spelling
+  (R44, §8.72).
+- **H68** — ⬜ open, two sentences in `crates/mush/src/jobs.rs`, re-read by #123
+  and left (§8.88): `STATUS_WINDOW`'s doc (`:104`) says "Spent on the windows
+  rather than on the list, so no job is ever dropped from a status for being
+  old", while the registry keeps at most `MAX_JOBS` live plus `JOB_HISTORY = 8`
+  finished (`:86`; the eviction at `:1461`, the listing's own doc at `:933`) — an
+  old finished job *is* dropped and no status can list it; and `Live::kill`'s doc
+  (`:483`, "Killing is idempotent and goes through the handle rather than the
+  flag") reads as an either/or over a body (`:487`) that stores `stop` first and
+  then takes the handle. The same line is §8.86's A23 residual — "Stop it and
+  everything it started" is the process group mush gave the command, and a
+  command that left it is outside cleanup's reach (`d4c596c`, §8.83).
+- **H69** — ⬜ open, the module doc's own list: `crates/mush/src/theme.rs:7`
+  names the accent sites as "the focused border, the picker's frame and selection,
+  the message prompt, the bar's badge, the selected agent row and an activity
+  line" — seven — where `ui::select_painted` (`ui.rs:263`) paints two more with
+  `theme.accent()` (the cursor's row as the hue's characters on `Black`, the
+  selection's rows as `Black` on the hue), so the count is nine, as the manual's
+  decision log now says (`bff3e2a`, §8.88). The list is the last surface that
+  stops at seven.
 
 `docs/refactor.md` §11 is the ledger: its older queue is closed except `R6`
 (judged and left on purpose), and the four blind duplication passes of §8.70
@@ -666,7 +717,8 @@ cursor. Their closure sheet is
 audits owed are on H12, H16, H21, H27, H28, H30, H34 and H35 (H28 is closed by
 `926a12a`, H58), the narrowed B23/B27 retry class is on those rows in §2.75,
 H49–H53 are the rows the campaign opened, and H54–H63 are the rows this wave
-opened or settled.
+opened or settled. H64–H69 are the sentences the three documents' pass found
+still drifting in code (§8.88), and §8.87 is the human's `#58` report answered.
 
 ---
 
