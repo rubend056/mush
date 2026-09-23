@@ -8551,6 +8551,45 @@ mod tests {
         assert_eq!(app.focus, Focus::Agents, "and cycles the pane it names");
     }
 
+    /// A fold replaces the transcript under the select mode, and the mode must
+    /// not be left pointing at rows that are gone: the automatic fold fires at
+    /// nine tenths of the budget, so this is an ordinary long session's road,
+    /// and the frame it panicked was the process's last — the UI thread's draw
+    /// path takes every actor, every child's worktree and the unsent draft with
+    /// it (D1, `chat.rs:1768`). The fold reaches the chat exactly as the actor
+    /// sends it, `AgentEvent::Compact`, and either the cursor lands on a line
+    /// that exists or the pane paints no cursor and no `Enter copies` clause.
+    #[test]
+    fn a_fold_while_selecting_does_not_panic_the_frame() {
+        let (mut app, _rx) = test_app("probe-fold");
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("first\nsecond"));
+        app.chat.push_message(AgentId::ROOT, Message::user("third"));
+        ctrl(&mut app, 'y');
+        assert!(app.chat.selecting(), "the mode is on");
+        app.update(Msg::Agent {
+            conversation: app.tree.conversation(),
+            id: AgentId::ROOT,
+            event: AgentEvent::Compact {
+                in_run: false,
+                summary: "the summary".to_string(),
+            },
+        });
+        assert!(
+            !app.chat.selecting(),
+            "the fold takes the mode with the rows"
+        );
+        let grid = frame_grid(&mut app, 80, 24);
+        assert!(
+            !grid.iter().any(|row| row.contains("Enter copies")),
+            "no clause promises a cursor the pane is not painting"
+        );
+        assert!(
+            grid.iter().any(|row| row.contains("the summary")),
+            "the fold's own line is what the pane paints now"
+        );
+    }
+
     /// `Enter` in the select mode is the copy: the app hands the text to the
     /// writer it holds (never to a program the machine may not have, and never
     /// to the human's real clipboard), queues the line the copy built for the
