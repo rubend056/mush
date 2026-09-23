@@ -290,18 +290,21 @@ pub fn branch_name(id: u64) -> String {
 /// The number is deliberately above the window of children a reaped session
 /// keeps: the cap bounds what a run leaves on disk, and it must never be the
 /// thing that refuses a delegation the history could still hold. It counts
-/// checkouts that are **not landable against `HEAD`** — the question
-/// [`unlandable`] can ask from here — so a worktree whose work is already
-/// merged, or one whose run committed nothing and left no path a commit cannot
-/// keep, never spends a slot on its way out.
+/// checkouts that are **not landable** by the sweep's own question: every
+/// worktree a tree has published against that node's own base and fork, and one
+/// no tree names against `HEAD` with no fork ([`unlandable`], finding F7) — so
+/// work already merged, and a nested child merged into the branch its node
+/// names, never spends a slot.
 ///
-/// That question is the repo-wide half of the sweep's, not the sweep's own:
-/// the sweep measures a nested child against the branch its parent holds, so a
-/// child merged only into its parent's branch is counted here although the
-/// sweep would take it. The facts that would close the gap — each node's base
-/// and fork — live in the UI's tree, which the spawn road cannot reach; until
-/// it can, the refusal says which question was asked rather than claiming the
-/// worktrees are unmerged (finding F7).
+/// The tree publishes its nodes' answers because the spawn road holds no tree
+/// handle: `WorktreeFacts` is that book — filled by one walk of the tree on
+/// every git read ([`PublishedFacts::set`]): each node's base (`App::fork_base`)
+/// and the fork revision it was created at. It is replaced whole, and cleared
+/// when the guard drops, so a later tree on the same root is never judged by
+/// this one's nodes. A worktree the book does not name — a leftover found on
+/// disk, an agent restored without a base — is asked against `HEAD` with no
+/// fork, the conservative side of the same question, and a refusal says which
+/// of the two its number came from.
 ///
 /// Ignored work does spend one, and that is the price of finding F1's rule: a
 /// child that merely compiled has a `target/` no commit can keep, so its

@@ -13412,6 +13412,13 @@ mod tests {
     /// meter and the file. Before, the sentence lived in the actor's list
     /// alone, so the stored session and the number the human read were a note
     /// short of what the model was told.
+    ///
+    /// Its place is the transcript's *front*, not its end: the note lands after
+    /// the front ([`mush_core::transcript::place_dropped_note`] reads it off the
+    /// list — the system prompt if one heads it, then the opening task; the
+    /// pane's copy has no prompt, so its note sits at index 1). The `.last()`
+    /// this test used to assert read right only because nothing else was in
+    /// that copy — a copy with a task in it wants the index the note lands at.
     #[test]
     fn the_dropped_turns_note_reaches_the_pane_and_the_session() {
         let (mut app, _rx) = test_app("dropped-note");
@@ -13427,17 +13434,47 @@ mod tests {
             mush_core::transcript::trim_history(&mut messages, 300).expect("a trim that had to cut")
         };
 
+        // A copy with a life of its own: the opening task, a turn, and a newest
+        // line the note must not displace.
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("do the task"));
+        app.chat
+            .push_message(AgentId::ROOT, Message::assistant("working"));
+        app.chat
+            .push_message(AgentId::ROOT, Message::user("and carry on"));
+
         app.on_agent(AgentId::ROOT, AgentEvent::Message(note.clone()));
 
+        let pane = app.chat.transcript(AgentId::ROOT);
         assert_eq!(
-            app.chat.transcript(AgentId::ROOT).last().map(Message::text),
-            Some(note.text()),
-            "the pane holds the sentence the model was given"
+            pane.iter().position(mush_core::transcript::is_dropped_note),
+            Some(1),
+            "the note lands after the front — the opening task is index 0 — and \
+             not at the end: {pane:?}"
         );
         assert_eq!(
-            app.session_snapshot().messages.last().map(Message::text),
+            pane.get(1).map(Message::text),
             Some(note.text()),
-            "and a restart resumes with it"
+            "the pane holds the sentence the model was given: {pane:?}"
+        );
+        assert!(
+            mush_core::transcript::is_dropped_note(&pane[1]),
+            "and reads it as mush's line — the note's flag, which the pane's \
+             `unrecorded` paints `· ` from, not its words: {pane:?}"
+        );
+        assert_eq!(
+            pane.last().map(Message::text),
+            Some("and carry on"),
+            "the newest line the copy already held is still the newest: {pane:?}"
+        );
+
+        let stored = app.session_snapshot().messages;
+        assert_eq!(
+            stored
+                .iter()
+                .position(mush_core::transcript::is_dropped_note),
+            Some(1),
+            "and a restart resumes with the note, flag and place alike: {stored:?}"
         );
     }
 

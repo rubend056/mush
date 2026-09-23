@@ -2605,8 +2605,9 @@ mod tests {
     ///
     /// The 512-byte floor is the one exception, and only under windows nothing
     /// fits in anyway: at a 1,024-token window the fifth is 307 bytes while the
-    /// floor is 512, and the system prompt alone (3,247 bytes) outweighs the
-    /// whole 1,536-byte budget.
+    /// floor is 512, and the system prompt alone outweighs the whole 1,536-byte
+    /// budget — the test below measures it against that window, because a byte
+    /// count written here is a sentence that rots the moment the prompt grows.
     #[test]
     fn a_full_result_after_a_cut_lands_on_the_ceiling() {
         for context in [2_000, 8_192, 24_000, 40_000, 120_000] {
@@ -2636,6 +2637,23 @@ mod tests {
             eight_k.cmd_cap(),
             2_458,
             "the fifth above the stopping point"
+        );
+
+        // The doc's last sentence, measured rather than spelled: at the
+        // 1,024-token window the floor's exception is about — `reply_cap`'s
+        // floor binds there and the reserve is half the window — the budget is
+        // smaller than the system prompt itself, so a window that small has
+        // nothing for history to fit in whatever the floor does.
+        let floor_window = Config {
+            context_tokens: 1_024,
+            ..Config::new("http://x:1", "m", None)
+        };
+        let floor_budget = floor_window.history_budget();
+        let prompt = crate::prompt::system_prompt("/tmp/ws");
+        assert!(
+            prompt.len() > floor_budget,
+            "the system prompt ({} bytes) outweighs the whole {floor_budget}-byte budget",
+            prompt.len()
         );
     }
 

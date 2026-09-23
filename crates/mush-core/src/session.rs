@@ -222,9 +222,10 @@ pub struct AgentSession {
     #[serde(default)]
     pub result_unread: bool,
     /// The child's transcript, stored the way the root's is: each message in
-    /// its wire form plus the note's flag
+    /// its wire form plus the flags a message's provenance needs
     /// ([`crate::message::serialize_stored_messages`]), so a note read back
-    /// is read as the note rather than as the human's own line.
+    /// is read as the note rather than as the human's own line, and a line
+    /// mush wrote is read as mush's.
     #[serde(default, serialize_with = "crate::message::serialize_stored_messages")]
     pub messages: Vec<Message>,
 }
@@ -275,10 +276,10 @@ pub struct Session {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub context: Option<usize>,
     /// The root conversation, stored in the shape that keeps each message's
-    /// own facts: the wire form plus the note's flag
+    /// own facts: the wire form plus the flags a message's provenance needs
     /// ([`crate::message::serialize_stored_messages`]), because a transcript
-    /// read back from here has to know which line is the note instead of
-    /// reading it as the human's.
+    /// read back from here has to know which line is the note, and which lines
+    /// mush itself wrote, instead of reading them as the human's.
     #[serde(serialize_with = "crate::message::serialize_stored_messages")]
     pub messages: Vec<Message>,
     /// The subagents this conversation had, so their context outlives the

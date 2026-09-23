@@ -330,6 +330,30 @@ pub struct Message {
     /// word `DROPPED_TURNS_NOTE` is still the human's own.
     #[serde(default)]
     pub note: bool,
+    /// Whether mush itself wrote this line, rather than the human, a parent or
+    /// the model: the provenance a pane paints its own voice from (finding
+    /// F3), and the one thing about a line that is never read off its words.
+    ///
+    /// The lines that carry it are mush's words *to* a run — the loop guard's
+    /// warning before a resumed run, the instructions a cut-off or unreadable
+    /// reply is answered with, and the report a failed commit leaves — every
+    /// one of them a `user` message, which is the shape a request reads them
+    /// in, and every one of them a line nobody said. The pane used to place
+    /// the failed commit's line by its opening words alone and had nothing at
+    /// all to place the other three, so a child's pane painted mush's own
+    /// instructions as its parent's; the flag decides instead, exactly as
+    /// [`Message::note`](Message::note) does for the note.
+    ///
+    /// Not a wire field: the model reads the sentence alone, so an endpoint
+    /// cannot tell a marked line from a human's identical one. It *is* written
+    /// to `.mush/session.json` and read back ([`serialize_stored_messages`]),
+    /// because a restart has no other road to the fact — without it a restored
+    /// line the actor marked would paint as whoever the pane falls back to.
+    /// `false` is what every other message reads as, the wire and an older
+    /// file included (`serde(default)`), so the flag stays a fact about the
+    /// lines that carry it.
+    #[serde(default)]
+    pub mush: bool,
 }
 
 /// `Message` is serialized by hand, and only because of `images`.
@@ -345,9 +369,9 @@ pub struct Message {
 /// learns there are images.
 ///
 /// This is the **wire** form: it is what the request path sends, so it names
-/// nothing the spec does not. The one field that is not the spec's — `note` —
-/// is written only by [`serialize_stored_messages`], the shape the session
-/// file stores.
+/// nothing the spec does not. The two fields that are not the spec's — `note`
+/// and `mush` — are written only by [`serialize_stored_messages`], the shape
+/// the session file stores.
 impl Serialize for Message {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
@@ -358,18 +382,19 @@ impl Serialize for Message {
 }
 
 /// One message in the shape `.mush/session.json` stores it: [`Message`]'s wire
-/// form, plus `note` when the flag is set.
+/// form, plus `note` and `mush` when those flags are set.
 ///
-/// Why the file must have it and the wire must not is
-/// [`Message::note`](Message::note)'s doc. Why not a session-level fact: the
-/// flag belongs to one message, and a boolean on the file would have to be
-/// matched back to a line — by prose, the one thing finding F3 forbids — while
-/// the message is where the flag already lives.
+/// Why the file must have them and the wire must not is
+/// [`Message::note`](Message::note)'s doc; `mush`'s is
+/// [`Message::mush`](Message::mush)'s. Why not a session-level fact: each flag
+/// belongs to one message, and a boolean on the file would have to be matched
+/// back to a line — by prose, the one thing finding F3 forbids — while the
+/// message is where the flag already lives.
 ///
-/// Only the `true` is written. A message without the flag is byte for byte what
-/// the wire form writes, so a session file stays readable by a mush that
-/// predates the field, and `#[serde(default)]` is what a file that predates it
-/// reads back as (`false`).
+/// Only the `true` is written, for either flag. A message with neither is byte
+/// for byte what the wire form writes, so a session file stays readable by a
+/// mush that predates the field, and `#[serde(default)]` is what a file that
+/// predates it reads back as (`false`).
 pub fn serialize_stored_messages<S>(messages: &[Message], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: Serializer,
@@ -403,12 +428,14 @@ impl Message {
         S: Serializer,
     {
         let note = stored && self.note;
+        let mush = stored && self.mush;
         let fields = 1
             + usize::from(self.content.is_some() || !self.images.is_empty())
             + usize::from(self.reasoning_content.is_some())
             + usize::from(self.tool_calls.is_some())
             + usize::from(self.tool_call_id.is_some())
-            + usize::from(note);
+            + usize::from(note)
+            + usize::from(mush);
         let mut message = serializer.serialize_struct("Message", fields)?;
         message.serialize_field("role", &self.role)?;
         if self.images.is_empty() {
@@ -429,6 +456,9 @@ impl Message {
         }
         if note {
             message.serialize_field("note", &true)?;
+        }
+        if mush {
+            message.serialize_field("mush", &true)?;
         }
         message.end()
     }
@@ -511,6 +541,23 @@ impl Message {
     pub fn note(text: impl Into<String>) -> Self {
         Self {
             note: true,
+            ..Self::user(text)
+        }
+    }
+
+    /// A line mush itself wrote into the conversation: the one constructor
+    /// that sets [`Message::mush`], so the mark is a fact about the hand that
+    /// wrote a line and never about what the line says (finding F3) — a human
+    /// whose message is word for word one of these lines keeps their own voice.
+    ///
+    /// The text stays the caller's, because the sentence is what the model
+    /// reads and this constructor holds no second copy of it. The role is the
+    /// user's, the shape a request reads an out-of-band line in and the one
+    /// [`Message::note`](Message::note) and the compact instruction already
+    /// use; the flag is what tells the pane whose line it is.
+    pub fn mush(text: impl Into<String>) -> Self {
+        Self {
+            mush: true,
             ..Self::user(text)
         }
     }
@@ -925,6 +972,35 @@ mod tests {
         );
         assert!(
             !stored.starts_with(r#"{"note""#),
+            "and stays a message: {stored}"
+        );
+    }
+
+    /// The `mush` flag is the same kind of provenance as the note's, for the
+    /// lines mush writes *to* a run: off the wire, so the model reads the
+    /// sentence alone, and on the session file, so a pane repaints the line as
+    /// mush's after a restart instead of falling back to whoever the transcript
+    /// cannot place (finding F3).
+    #[test]
+    fn a_mush_lines_provenance_stays_off_the_wire_and_travels_in_the_file() {
+        let sentence = "Your previous run was stopped as a loop: the same tool call repeated";
+        let marked = Message::mush(sentence);
+        assert_eq!(
+            serde_json::to_string(&marked).unwrap(),
+            serde_json::to_string(&Message::user(sentence)).unwrap(),
+            "a request cannot tell mush's line from a human's identical one"
+        );
+
+        let mut bytes = Vec::new();
+        let mut serializer = serde_json::Serializer::new(&mut bytes);
+        serialize_stored_messages(&[marked], &mut serializer).unwrap();
+        let stored = String::from_utf8(bytes).unwrap();
+        assert!(
+            stored.contains(r#""mush":true"#),
+            "the file says which line is mush's: {stored}"
+        );
+        assert!(
+            !stored.starts_with(r#"{"mush""#),
             "and stays a message: {stored}"
         );
     }
