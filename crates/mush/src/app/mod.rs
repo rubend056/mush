@@ -12299,6 +12299,17 @@ mod tests {
     /// painted only after the popup was closed and reopened (finding D12); the
     /// sweep's own comment claimed a resize "opens them again for each size",
     /// and it did not.
+    ///
+    /// The comparison below strips the `0s · ` lead each note is painted under:
+    /// that lead's age is a reading of the wall clock
+    /// (`short_age(Duration::from_secs(now.saturating_sub(notice.at)))`,
+    /// `chat.rs`), taken when a popup's rows are built — and the two paints this
+    /// test compares, the resize's re-wrap and the reopen, read that clock at
+    /// two instants. A second boundary falling between them turns `0s · …` into
+    /// `1s · …` while every wrapped row agrees: a clock race, not a layout
+    /// difference, and the age is not a fact this frame is about. Measured
+    /// before the strip: 1 failure in 300 runs of this test alone, the same
+    /// rows with `0s` against `1s`.
     #[test]
     fn a_resized_popup_is_rewrapped_not_clipped() {
         use unicode_width::UnicodeWidthStr;
@@ -12343,12 +12354,29 @@ mod tests {
 
         // And the popup a resize paints is the popup a reopen paints: the same
         // rows, read from the same source rather than re-wrapped from the old
-        // rows.
-        let after_resize = labels(&items);
+        // rows. The age lead is stripped first — `0s · the run failed …` and
+        // `1s · the run failed …` are the same row, and which of the two a
+        // paint writes is a clock reading, not the layout this assertion pins
+        // (see the test's doc). What is left — every head row's mark and text,
+        // every continuation row's indent — is what a resize must re-wrap
+        // rather than clip.
+        let without_age = |rows: &[&str]| -> Vec<String> {
+            rows.iter()
+                .map(|row| match row.split_once(' ') {
+                    // A note's first row leads with its age; a continuation row
+                    // is indented and carries none.
+                    Some((age, rest)) if age.chars().next().is_some_and(|c| c.is_ascii_digit()) => {
+                        rest.to_string()
+                    }
+                    _ => row.to_string(),
+                })
+                .collect()
+        };
+        let after_resize = without_age(&labels(&items));
         app.open_notes_picker();
         assert_eq!(
             after_resize,
-            labels(&app.picker.as_ref().expect("the reopen").items),
+            without_age(&labels(&app.picker.as_ref().expect("the reopen").items)),
             "the resize is the reopen"
         );
 
