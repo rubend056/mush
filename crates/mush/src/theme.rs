@@ -4,10 +4,15 @@
 //! Two mush windows on two workspaces were indistinguishable — same borders,
 //! same focus badge, same selected row. Every workspace now hashes its
 //! absolute path to one of thirty named hues, and the chrome that used to be
-//! `Color::Cyan` is painted in it: the focused border, the picker's frame and
-//! selection, the message prompt, the bar's badge, the selected agent row and
-//! an activity line. The rest of the palette is *content* and stays fixed — a
-//! failure is red in every workspace, the floor notice is yellow, dimmed text
+//! `Color::Cyan` is painted in it by one rule: the hue *points* — at whose
+//! window this is, or at where the keyboard is — and never *reports* what
+//! happened. That rule yields every site, and this is the whole list: the
+//! focused pane's border, the bar's badge, the message prompt, the selected
+//! row of the list the keyboard is in (the agent tree's, a band while it has
+//! the keyboard and the hue as ink while the chat does; the picker's), the
+//! picker's frame, the transcript's select-mode cursor band and its selection,
+//! and an activity line. The rest of the palette is *content* and stays fixed —
+//! a failure is red in every workspace, the floor notice is yellow, dimmed text
 //! is gray — because what happened reads the same wherever it is read; only
 //! *whose window* this is wears the hue.
 //!

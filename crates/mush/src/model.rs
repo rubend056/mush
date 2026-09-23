@@ -297,11 +297,14 @@ const BACKOFF_SLICE: Duration = Duration::from_millis(50);
 ///
 /// Worst case: [`RETRY_ATTEMPTS`] attempts, all inside the one `timeout` (each
 /// is given only what is left of it), plus a backoff spent from the same
-/// budget — so one ask against an endpoint that refuses to connect costs
-/// milliseconds, and one against an endpoint that accepts and stalls costs its
-/// deadline, not a multiple of it. The one unbounded step is the one already
-/// documented: resolving a host has no timeout (docs/mush.md §8), and that is
-/// not a retry's to fix.
+/// budget — so one ask against an endpoint that refuses to connect costs, at
+/// worst, three dials plus the two backoffs `RETRY_BACKOFF` and twice that
+/// (500 ms then 1 s), while one against an endpoint that accepts and stalls
+/// costs its deadline, not a multiple of it. Nothing in the call is unbounded,
+/// the name lookup included: it is a phase of the attempt like the connect and
+/// the write, and `http.rs`'s `resolve_bounded` ends its wait at the smaller of
+/// its own `RESOLVE_TIMEOUT` (10 s) and what is left of the call's deadline — a
+/// ceiling, not a schedule (finding A19).
 pub fn retrying<T>(
     clock: &dyn Clock,
     timeout: Duration,
