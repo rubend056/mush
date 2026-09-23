@@ -11258,6 +11258,100 @@ mod tests {
         }
     }
 
+    /// Every title is elided to the pane it names: the conversation pane's
+    /// clauses — a select mode, hidden lines, a held reading — and the agents
+    /// pane's counts are dropped whole rather than cut by the border, at every
+    /// size, in both focuses and in the zen view. The chat's title was the one
+    /// title painted as it stood: with `Ctrl-Y` open over a 38-column pane its
+    /// sentence ran 64 columns and the border cut `+6 more lines · /notes` —
+    /// the pane's own way of saying what it hides — mid-word (finding D11).
+    #[test]
+    fn no_pane_title_paints_past_its_pane() {
+        use unicode_width::UnicodeWidthStr;
+
+        let (mut app, _rx) = test_app("title-elision");
+        crowd(&mut app, 12);
+        // The focused pane is the one whose title is painted, and a child's
+        // name is longer than the root's: give it a mode, a held reading and
+        // more notes than the foot shows.
+        app.tree.focus(AgentId(1));
+        for i in 0..12 {
+            app.chat
+                .push_message(AgentId(1), Message::assistant(format!("line {i}")));
+        }
+        for i in 0..6 {
+            app.chat
+                .note_for(AgentId(1), format!("a note the foot may not show {i}"));
+        }
+        app.chat.scroll_by(AgentId(1), 3);
+
+        let title_room = |area: Rect| area.width.saturating_sub(2) as usize;
+        let check = |at: &str, title: &str, room: usize| {
+            assert!(
+                UnicodeWidthStr::width(title) <= room,
+                "{at}: the title {title:?} is {} columns in a {room}-column pane",
+                UnicodeWidthStr::width(title)
+            );
+        };
+
+        for (width, height) in [
+            (40u16, 10u16),
+            (40, 12),
+            (60, 17),
+            (79, 24),
+            (80, 24),
+            (120, 32),
+        ] {
+            for selecting in [false, true] {
+                if selecting {
+                    assert!(
+                        app.chat.start_select(AgentId(1)).is_none(),
+                        "the mode is on at {width}×{height}"
+                    );
+                } else {
+                    app.chat.cancel_select();
+                }
+                for (zen, focus) in [
+                    (false, Focus::Chat),
+                    (false, Focus::Agents),
+                    (true, Focus::Chat),
+                    (true, Focus::Agents),
+                ] {
+                    app.zen = zen;
+                    app.focus = focus;
+                    let at = format!("{width}×{height} selecting={selecting} zen={zen} {focus:?}");
+                    let screen = app.screen(Rect::new(0, 0, width, height));
+                    let Screen::Panes(panes) = screen else {
+                        panic!("{at} is below the floor")
+                    };
+                    check(&at, &panes.agents.title, title_room(panes.agents.area));
+                    if let Some(painted) = &panes.chat.transcript {
+                        check(&at, &painted.title, title_room(panes.chat.transcript_area));
+                    }
+                }
+            }
+        }
+
+        // The state the frame cannot reach on a legal terminal — a transcript
+        // pane two rows tall, where the foot spends its count row on the notes
+        // themselves — is the shape the audit's probe read: there the title
+        // carries the count and the `/notes` hint as well as the mode's line,
+        // and all three clauses are dropped whole rather than clipped.
+        let pane = Pane {
+            agent: AgentId(1),
+            words: None,
+            spin: 0,
+            label: "test-model · ctx ~500k",
+        };
+        for height in [2usize, 3, 4] {
+            for width in [38usize, 20, 12] {
+                let painted = app.chat.painted(&pane, width, height);
+                let at = format!("a {width}×{height} transcript pane");
+                check(&at, &painted.title, width);
+            }
+        }
+    }
+
     /// The bar keeps a row whatever else is on screen. In compact mode it was
     /// the trailing constraint behind a `Min(6)` chat, and at 40×10 the panes
     /// above it took the row it was owed: the frame painted the tree, the

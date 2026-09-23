@@ -875,8 +875,8 @@ fn facts_line(app: &App, width: usize) -> String {
     elide(&cells, " │ ", "", &cells[0], width)
 }
 
-/// Drop cells from the right until the line fits: one rule for the two lines
-/// that are built this way — the pane's title and the facts under it — and the
+/// Drop cells from the right until the line fits: one rule for every line that
+/// is built this way — the two panes' titles and the facts under them — and the
 /// one home of it (finding D9).
 ///
 /// A cell goes whole, because a clause cut mid-number (`Σ +324 −`, `2 waitin`)
@@ -885,7 +885,18 @@ fn facts_line(app: &App, width: usize) -> String {
 /// name, and the facts line keeps the `⌂` cell that says which tree the screen
 /// is about. `prefix` opens every kept line, so the separator *inside* the line
 /// (` · `, ` │ `) and the one joining it to what precedes are each said once.
-fn elide(cells: &[String], separator: &str, prefix: &str, floor: &str, width: usize) -> String {
+///
+/// The conversation pane's title is built by the same rule rather than painted
+/// as it stands: `Chat::painted` hands its clauses here, so the chat's title
+/// cannot be the one title on screen a painter cuts mid-word at the border
+/// (finding D11).
+pub(super) fn elide(
+    cells: &[String],
+    separator: &str,
+    prefix: &str,
+    floor: &str,
+    width: usize,
+) -> String {
     for kept in (1..=cells.len()).rev() {
         let line = format!("{prefix}{}", cells[..kept].join(separator));
         if UnicodeWidthStr::width(line.as_str()) <= width {

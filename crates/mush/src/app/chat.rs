@@ -276,6 +276,10 @@ impl Notice {
 /// instead would need a row the pane does not have.
 pub struct Painted {
     pub lines: Vec<Line<'static>>,
+    /// The pane's title, already elided to the pane's own measure — its
+    /// clauses whole or not at all, taken by the same rule the agents pane's
+    /// title and the facts line are (finding D11). The painter paints it; it
+    /// does not choose its words.
     pub title: String,
     /// Where the select mode is painted, when it is on this pane's
     /// conversation. `None` is the ordinary reading.
@@ -2050,18 +2054,14 @@ impl Chat {
         body.lines.extend(foot.lines);
         let lines = body.lines;
 
-        let mut title = if pane.agent == AgentId::ROOT {
-            " mush ".to_string()
-        } else {
-            format!(" agent {} ", pane.agent)
-        };
+        let mut clauses: Vec<String> = Vec::new();
         // The mode's own line, first because it is the newest thing about the
         // pane: `Ctrl-Y` put the cursor here and the keys that finish the job
         // are not the ones the hint under the pane advertises. The pair named
         // is the one that leaves the mode — nothing else on this screen says
         // which of the two copies.
         if mode.is_some() {
-            title.push_str("· Enter copies · Esc leaves ");
+            clauses.push("Enter copies · Esc leaves ".to_string());
         }
         // A pane with no row to spare for the foot's own count line is the case
         // the title exists for: wherever the human looks, the pane says how
@@ -2069,7 +2069,7 @@ impl Chat {
         // count row that carries `· /notes` is exactly the row this pane has no
         // room for.
         if foot.hidden > 0 && !foot.counted {
-            title.push_str(&format!("· {} · /notes ", more_label(foot.hidden)));
+            clauses.push(format!("{} · /notes ", more_label(foot.hidden)));
         }
         // A pane that is not at the bottom says so. The foot staying put is
         // what makes it a foot, but a window holding rows above the newest line
@@ -2081,9 +2081,29 @@ impl Chat {
         // would be a lie about the rows on screen.
         if mode.is_none() {
             if let Some((offset, _)) = self.reading(pane.agent).held(transcript.len()) {
-                title.push_str(&format!("· scrolled ↑{offset} rows · PgDn "));
+                clauses.push(format!("scrolled ↑{offset} rows · PgDn "));
             }
         }
+        // The clauses are ranked, and a pane that runs out of columns drops
+        // them whole from the right — the same rule, and the same function, the
+        // agents pane's title and the bar's facts line already use. A title cut
+        // mid-word by the border is a count that is not the count: with `Ctrl-Y`
+        // open at 40 columns the chat's title ran 64 columns wide and the pane
+        // painted ` agent #12 · Enter copies · Esc leaves` — the `+6 more lines`
+        // and `/notes` clauses, the pane's own way of saying what it hides, were
+        // simply gone (finding D11). Each clause ends in the space that joins it
+        // to the next, so the joined line reads as one sentence of clauses.
+        //
+        // The floor is the pane's own name: a terminal too narrow for one clause
+        // still says which conversation the pane is showing. The budget is the
+        // measure the rows were laid out at, so a title never outgrows the pane
+        // it names.
+        let name = if pane.agent == AgentId::ROOT {
+            " mush ".to_string()
+        } else {
+            format!(" agent {} ", pane.agent)
+        };
+        let title = super::screen::elide(&clauses, "· ", &format!("{name}· "), &name, width);
         Painted {
             lines,
             title,
