@@ -429,6 +429,10 @@ struct Record {
     id: JobId,
     owner: u64,
     command: String,
+    /// The instant the command's age is measured from — the moment it was held
+    /// as a tool call, or the moment it was handed to the registry when it
+    /// started as a job: `Launch` carries the one and stamps the other (finding
+    /// E9). What the row, a `status` headline and the completion line all read.
     started: Instant,
     /// What it is: running, or what it left behind. One field, because it is one
     /// fact — a record that has ended has the line its owner reads and the window
@@ -580,6 +584,11 @@ pub struct Foreground {
     /// agent that did not start it (refactor R20).
     owner: u64,
     live: Live,
+    /// The instant the command was held as a tool call — its real start, the
+    /// moment the registry first had it. It travels to the job the command
+    /// becomes, so a handed-over job's age is the command's and not the
+    /// handover's (finding E9).
+    started: Instant,
     /// Whether the registry has taken this command over as a job: `launch`
     /// sets it once the record exists, and the `Drop` that follows the handover
     /// must not kill the job the command just became.
@@ -868,6 +877,10 @@ impl Launch {
     /// neither the foreground map nor the job list, so a kill that lands in
     /// this window still reaches it.
     ///
+    /// The command's start travels with the handle (`Foreground::started`): the
+    /// hold stamped it when the command was first in the registry, so the job's
+    /// age is the command's rather than this handover's (finding E9).
+    ///
     /// The owner is the held command's own ([`Foreground::owner`]), not a
     /// parameter: the registry already recorded who started it, and a second
     /// statement of the same fact is one that can disagree (refactor R20).
@@ -1005,6 +1018,12 @@ impl Registry {
     /// release always belongs to the command it finds. Slots — a second
     /// identity beside the key, never reused — existed to police a stale
     /// release, which needs two overlapping commands from one agent.
+    ///
+    /// The clock is read here because this is the moment the command starts as
+    /// far as the registry is concerned, and it is the age a job the command
+    /// hands over to is measured from: reading `self.clock` at the handover
+    /// instead would report a command that ran for most of `CMD_DETACH_AFTER`
+    /// as new (finding E9).
     pub fn hold(self: &Arc<Self>, owner: u64, job: Box<dyn Job>) -> Foreground {
         let live = Live::new(job);
         self.inner().foregrounds.insert(owner, live.clone());
@@ -1012,6 +1031,7 @@ impl Registry {
             registry: Arc::clone(self),
             owner,
             live,
+            started: self.clock.now(),
             handed_over: false,
             left: None,
         }
@@ -1153,6 +1173,17 @@ impl Registry {
             source,
         } = launch;
         let (live, held) = source.into_live();
+        // The instant the job's age is measured from, one value for the record
+        // and the watch thread both: a command that was *held* as a tool call
+        // has been running since the hold — `Foreground::started`, stamped at
+        // `hold` — while a command started as a job is stamped here, at its one
+        // door into the registry (finding E9). Reading the clock again at the
+        // thread spawn would be a second, slightly later answer to the same
+        // question.
+        let started = match &held {
+            Some(holding) => holding.started,
+            None => self.clock.now(),
+        };
         let admitted = {
             let mut inner = self.inner();
             let refusal = if exclusive {
@@ -1204,7 +1235,7 @@ impl Registry {
                             id,
                             owner,
                             command: command.clone(),
-                            started: self.clock.now(),
+                            started,
                             state: State::Running(live.clone()),
                         },
                     );
@@ -1235,7 +1266,6 @@ impl Registry {
         }
         let registry = Arc::clone(self);
         let watching = live.clone();
-        let started = self.clock.now();
         let spawned = thread::Builder::new()
             .name(format!("mush-job-{id}"))
             .spawn(move || watch(registry, watching, id, owner, command, started, mailbox));
@@ -1586,9 +1616,11 @@ fn watch(
         };
     }
     // The line is built here, by the thread that watched the job end, from the
-    // command and the moment it was handed: nothing has to come back out of the
-    // record it ends, so `finish` has no case where there is no record to report
-    // — the old fallback for one of those spelled the age as `0s`.
+    // command and the moment it was held or handed over — the record's own
+    // `started`, so the age is the command's and not this thread's (finding
+    // E9): nothing has to come back out of the record it ends, so `finish` has
+    // no case where there is no record to report — the old fallback for one of
+    // those spelled the age as `0s`.
     let age = registry.clock.now().saturating_duration_since(started);
     let line = outcome.line(id, &command, age, &tail, &group);
     registry.finish(id, line.clone(), tail);
@@ -2560,6 +2592,65 @@ mod tests {
             "the job's record names it from here on, so the hold is gone"
         );
         registry.kill_all();
+    }
+
+    /// A command handed over from a tool call keeps the age of the call: the
+    /// row the screen paints and the completion line the owner reads both
+    /// measure from the instant the command was *held*, not from the handover
+    /// that made it a job (finding E9). The probe read
+    /// `#c1 age after a 59 s tool call: 0ns` and a `· 0s ·` completion, because
+    /// `launch` stamped the record and the watch thread at its own clock; the
+    /// hold's instant now travels through `Launch::held`.
+    #[test]
+    fn a_handed_over_job_keeps_the_age_of_its_tool_call() {
+        let machine = Arc::new(ScriptedMachine::new().runs(Script::exits(0)));
+        let (registry, _events, clock) = registry();
+        let held = registry.hold(
+            7,
+            machine
+                .spawn(&ShellCommand {
+                    command: "cargo build",
+                    root: Path::new("/tmp"),
+                })
+                .unwrap(),
+        );
+        // The job's own thread cannot poll while this guard lives — the hold's
+        // `Drop` skips the kill because the handover is marked first — so the
+        // clock moves only where the test moves it and both ages are exact.
+        let grip = held.live.clone();
+        let guard = grip.job.lock().unwrap();
+        clock.advance(Duration::from_secs(59));
+        let (tx, mailbox) = crossbeam_channel::unbounded();
+        let id = registry
+            .launch(Launch::held("cargo build".to_string(), false, tx, held))
+            .unwrap();
+
+        let jobs = registry.live_for(7);
+        assert_eq!(jobs.len(), 1);
+        assert_eq!(jobs[0].id, id);
+        assert_eq!(
+            jobs[0].age,
+            Duration::from_secs(59),
+            "the row says how long the command has run"
+        );
+        drop(guard);
+
+        let line = match mailbox.recv_timeout(Duration::from_secs(5)) {
+            Ok(AgentMsg::CommandDone { id: done, line, .. }) => {
+                assert_eq!(done, id);
+                line
+            }
+            other => panic!("no completion for {id}: {other:?}"),
+        };
+        assert!(line.contains("done: exit 0"), "{line}");
+        assert!(
+            line.contains("· 59s ·"),
+            "the completion line's age is the command's: {line}"
+        );
+        assert!(
+            !line.contains("· 0s ·"),
+            "not the handover's instant: {line}"
+        );
     }
 
     /// The budget is the machine's, not one agent's: `MAX_JOBS` live jobs are
