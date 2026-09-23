@@ -483,10 +483,16 @@ impl Live {
         }
     }
 
-    /// Stop it and everything it started, now. Killing is idempotent and goes
-    /// through the handle rather than the flag: on Ctrl-N and on quit the
-    /// process groups must be gone before this returns, not ten milliseconds
-    /// later.
+    /// Stop it and everything it started, now. Killing is idempotent, and this
+    /// body does both acts in one order: the flag, then the kill through the
+    /// gripped handle ([`Job::kill`], where the process group is actually
+    /// signalled). The flag is set first because it is what an end's readers —
+    /// the job's own watcher, a foreground waiter — read to report mush's
+    /// `stopped` rather than the signal the kill sent; the kill is what makes
+    /// that end visible, so the reason has to be readable before it. The kill
+    /// is called here rather than left to the watcher's next poll because on
+    /// Ctrl-N and on quit the process groups must be gone before this returns,
+    /// not ten milliseconds later.
     fn kill(&self) {
         self.stop.store(true, Ordering::SeqCst);
         if let Ok(mut job) = self.job.lock() {
