@@ -4791,6 +4791,14 @@ fn wait_digest(actor: &Actor, state: &mut ActorState, fresh_only: bool) -> Vec<S
 /// flight?" — and made it poll both. A listing is not a delivery: each child's
 /// outcome is a digest, each job's is its current line, `✉` marks the results
 /// nobody has read, and `wait` is what hands them over.
+///
+/// It is a big-text road and answers to [`result_cap`] like every other one: the
+/// registry bounds its own windows by [`jobs::STATUS_WINDOW`], but a status that
+/// spent that whole window would carry three times the room this turn has, and
+/// the *next* request would cross the context window — where H43's
+/// `shed_newest_results` drops the newest results, the very listing the model
+/// asked for (finding A11). The cut is `truncate_for_model`'s, so a cut listing
+/// says what it kept and how to ask narrower.
 fn status_tool(actor: &Actor, state: &ActorState) -> Result<String, String> {
     let jobs = actor.ctx.registry.status_for(actor.id);
     let mut sections = Vec::new();
@@ -4805,7 +4813,10 @@ fn status_tool(actor: &Actor, state: &ActorState) -> Result<String, String> {
     if sections.is_empty() {
         return Ok("no children and no jobs".to_string());
     }
-    Ok(sections.join("\n"))
+    Ok(truncate_for_model(
+        sections.join("\n"),
+        result_cap(actor, state),
+    ))
 }
 
 /// The child half of `status`: one line per child, in id order.
@@ -7895,6 +7906,72 @@ mod tests {
             );
             let _ = fs::remove_dir_all(actor.ws.root());
         }
+    }
+
+    /// `status` is a big-text road like the ones [`result_cap`] names — a jobs
+    /// listing carries each job's output window — so it is bounded by the room
+    /// this turn has, not only by the registry's own [`jobs::STATUS_WINDOW`].
+    /// A result that spends three times the turn's whole room is what
+    /// `turn_room` exists to prevent: the *next* request crosses the window and
+    /// H43's `shed_newest_results` drops the newest results — the listing the
+    /// model just asked for — instead (finding A11).
+    #[test]
+    fn a_status_listing_is_bounded_by_the_turns_result_cap() {
+        use crate::machine::ShellCommand;
+
+        let mut cfg = Config::new("http://127.0.0.1:1", "test", None);
+        // The audit's window: 8 K tokens → budget 12,288 bytes, `cmd_cap`
+        // (and so `result_cap`) 2,458 — under which the probe measured **8,197
+        // bytes** of status with four ended jobs.
+        cfg.set_context(8 * 1024);
+        let mut machine = ScriptedMachine::new();
+        for _ in 0..4 {
+            machine = machine.runs(Script::hangs().says(&"x".repeat(jobs::JOB_TAIL)));
+        }
+        let machine = Arc::new(machine);
+        let (actor, _events, _mailbox) = build_actor_about(
+            "status-cap",
+            Arc::new(Scripted::new()),
+            ConfigHandle::own(cfg),
+            machine.clone(),
+            Arc::new(Advanceable::new()),
+        );
+        for index in 0..4 {
+            let command = format!("cargo build --release {index}");
+            let job = machine
+                .spawn(&ShellCommand {
+                    command: &command,
+                    root: std::path::Path::new("/tmp"),
+                })
+                .unwrap();
+            let (mailbox, _rx) = crossbeam_channel::unbounded();
+            actor
+                .ctx
+                .registry
+                .launch(jobs::Launch::started(
+                    actor.id, command, false, mailbox, job,
+                ))
+                .unwrap();
+        }
+
+        let state = ActorState::default();
+        let listing = status_tool(&actor, &state).unwrap();
+        let cap = result_cap(&actor, &state);
+        assert_eq!(cap, 2_458, "the 8 K window's cap, the audit's own number");
+        // Before the fix this was the whole jobs window — four 1,500-byte
+        // tails, 6,000 bytes plus headlines — some three times the turn's room.
+        assert!(
+            listing.len() <= cap + 128,
+            "a status is bounded by the turn's result cap, not only by the jobs window: \
+             {} bytes of a {cap}-byte cap",
+            listing.len()
+        );
+        assert!(
+            listing.ends_with("to see the rest]"),
+            "and a cut says so: {listing:?}"
+        );
+        assert!(listing.contains("jobs:"), "{listing}");
+        let _ = fs::remove_dir_all(actor.ws.root());
     }
 
     /// The digest names the size of what it hides exactly when it hides
