@@ -120,12 +120,11 @@ fn parse_from<I: Iterator<Item = String>>(mut args: I) -> Result<Args, String> {
             }
             "--context" => {
                 let value = args.next().ok_or("--context needs a value")?;
-                let tokens = value
-                    .parse::<usize>()
-                    .ok()
-                    .filter(|n| *n > 0)
-                    .ok_or_else(|| format!("--context needs a token count, got `{value}`"))?;
-                overrides.context = Some(tokens);
+                // The flag and `MUSH_CONTEXT` are two doors to one number, so
+                // they read it through one function ([`config::parse_context`]):
+                // the same spelling — surrounding space and all — is accepted by
+                // both, and a refusal names the door it came in by.
+                overrides.context = Some(config::parse_context(&value, "--context")?);
             }
             "--temperature" => {
                 let value = args.next().ok_or("--temperature needs a value")?;
@@ -1274,6 +1273,39 @@ mod tests {
         // recorded for the features that will ask, and nothing else.
         assert_eq!(overrides.api_key, None);
         assert!(args.yes, "`-y` is not copied into the config layer");
+    }
+
+    /// `--context` and `MUSH_CONTEXT` are two doors to one number, so the same
+    /// spelling — leading or trailing space included — is read the same way by
+    /// both. Before they shared [`config::parse_context`], `--context " 8192"`
+    /// was a refusal while `MUSH_CONTEXT=" 8192"` was accepted: one number, two
+    /// answers, one of them the wrong one.
+    #[test]
+    fn the_context_flag_and_the_variable_read_one_number_one_way() {
+        for stated in ["8192", " 8192", "8192 ", " 8192 "] {
+            let args = parse_from(["--context", stated].into_iter().map(str::to_string)).unwrap();
+            assert_eq!(
+                args.overrides.context,
+                Some(8_192),
+                "{stated:?} from the flag"
+            );
+            assert_eq!(
+                config::parse_context_env(stated),
+                Ok(8_192),
+                "{stated:?} from the environment"
+            );
+        }
+        // And they agree on the refusal too: one rule, each sentence naming the
+        // road that carried the value.
+        let refused = match parse_from(["--context", "8k"].into_iter().map(str::to_string)) {
+            Err(error) => error,
+            Ok(_) => panic!("`--context 8k` was accepted"),
+        };
+        assert_eq!(refused, "--context needs a token count, got `8k`");
+        assert_eq!(
+            config::parse_context_env("8k").unwrap_err(),
+            "MUSH_CONTEXT needs a token count, got `8k`"
+        );
     }
 
     /// The flags a human types reach the config layer, the session flag is
