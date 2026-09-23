@@ -808,4 +808,55 @@ pub(crate) mod tests {
             " ⌂ ~/p/demo │ master ±3 +12−3 │ deepseek-flash @ deepseek.com · ctx 12k/430.5k ~500k",
         )
     }
+
+    /// §4.5's sample: one row per phase and one per row mark, so the picture
+    /// says the same thing about the marks the `marks` block names.
+    pub(crate) fn manual_sample_screen() -> Screen {
+        let mut root = row(0, 0, "◐", "root", "", "thinking 4s");
+        root.focused = true;
+        root.unread_children = 2;
+        let mut orphan = row(8, 1, "✓", "orphan", "", "wrote src/lex.rs");
+        orphan.parent_gone = true;
+        let mut unread = row(7, 1, "✓", "docs", "", "wrote README.md");
+        unread.result_unread = true;
+        sample_screen(
+            &["3 working", "1 waiting", "Σ +324 −40"],
+            vec![
+                root,
+                row(1, 1, "⧗", "lexer", "", "waiting on results 3s"),
+                row(
+                    2,
+                    2,
+                    "◐",
+                    "tests",
+                    "mush/2 +324−40 ⚙1",
+                    "edit_file tests/lex.rs 3s",
+                ),
+                row(3, 1, "✗", "probe", "", "no route to host"),
+                row(4, 1, "⊘", "run", "", "stopped · re-send to resume"),
+                row(5, 1, "⚠", "build", "", "cut off · nothing committed"),
+                row(6, 1, "≡", "fold", "", "compacting 2s"),
+                unread,
+                orphan,
+            ],
+            0,
+            Vec::new(),
+            vec![
+                Line::from("you › make the tree show every state"),
+                Line::from("mush › Spawning the children."),
+                Line::from("      ⚙ spawn_agent tests probe"),
+                Line::from("      · spawned #2 (tests)"),
+                Line::from("      ⚙ wait"),
+                Line::from("      · #2 done: 3 tests pass"),
+                Line::from("      ✗ #3 failed: no route to host"),
+                Line::from("      ⚠ #5 cut off · nothing committed"),
+                Line::from("mush › Every mark is on a row above."),
+            ],
+            Some((
+                Rank::Said,
+                "spawned #8 (orphan) — its parent was reaped".to_string(),
+            )),
+            " ⌂ ~/p/demo │ master ±3 +324−40 │ deepseek-flash @ deepseek.com · ctx 12k/430.5k ~500k",
+        )
+    }
 }

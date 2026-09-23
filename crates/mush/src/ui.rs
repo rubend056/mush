@@ -1198,4 +1198,17 @@ pub(crate) mod tests {
             &format!("```\n{}\n```", frame_text(100, 28, &screen)),
         );
     }
+
+    /// The frame §4.5 photographs: one row per phase and per mark, painted the
+    /// way a real terminal paints them.
+    #[test]
+    fn the_manual_frame_matches_the_code() {
+        let screen = crate::app::commands::tests::manual_sample_screen();
+        doc_block(
+            "docs/mush.md",
+            "frame",
+            "ui::tests::the_manual_frame_matches_the_code",
+            &format!("```\n{}\n```", frame_text(100, 28, &screen)),
+        );
+    }
 }

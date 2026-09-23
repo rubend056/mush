@@ -765,6 +765,36 @@ painters, so neither can outlive them:
 <!-- /generated: marks -->
 
 <!-- generated: frame (blessed by MUSH_BLESS_DOCS=1 cargo test -p mush --bin mush ui::tests::the_manual_frame_matches_the_code) -->
+```
+┌ agents · 3 working · 1 waiting─┐┌ mush ──────────────────────────────────────────────────────────┐
+│▶◐ #0 ✉2 root  thinking 4s      ││you › make the tree show every state                            │
+│   ⧗ #1  waiting on results 3s  ││mush › Spawning the children.                                   │
+│     ◐ #2 tests                 ││      ⚙ spawn_agent tests probe                                 │
+│   ✗ #3 probe  no route to host ││      · spawned #2 (tests)                                      │
+│   ⊘ #4 run                     ││      ⚙ wait                                                    │
+│   ⚠ #5 build                   ││      · #2 done: 3 tests pass                                   │
+│   ≡ #6 fold  compacting 2s     ││      ✗ #3 failed: no route to host                             │
+│   ✓ #7 ✉ docs  wrote README.md ││      ⚠ #5 cut off · nothing committed                          │
+│   ✓ #8 ⚮  wrote src/lex.rs     ││mush › Every mark is on a row above.                            │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                ││                                                                │
+│                                │└────────────────────────────────────────────────────────────────┘
+│                                │┌ message ───────────────────────────────────────────────────────┐
+│                                ││›                                                               │
+└────────────────────────────────┘└────────────────────────────────────────────────────────────────┘
+ chat  spawned #8 (orphan) — its parent was reaped
+ ⌂ ~/p/demo │ master ±3 +324−40 │ deepseek-flash @ deepseek.com · ctx 12k/430.5k ~500k
+```
 <!-- /generated: frame -->
 
 The cursor row is the one wearing the pane's selection colour — which is now the
