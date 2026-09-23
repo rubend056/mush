@@ -39,10 +39,25 @@ const LIST_READ_TIMEOUT: Duration = Duration::from_secs(10);
 const READ_SLICE: Duration = Duration::from_millis(200);
 /// A request body is small; a write that blocks this long is a dead endpoint.
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
-/// A response body larger than this is refused while it is being read, so a
-/// server cannot make mush allocate without bound (docs §8). Generous on
-/// purpose: a big diff or a long model reply is normal work.
+/// A response body larger than this is refused while it is being read. With
+/// [`MAX_HEAD_BYTES`] this is the whole of what one reply may make mush
+/// allocate, so a server cannot make mush allocate without bound (docs §8).
+/// Generous on purpose: a big diff or a long model reply is normal work.
 const MAX_BODY_BYTES: usize = 80 * 1024 * 1024;
+/// The most bytes of a response *head* — the status line, every header line,
+/// the head as a whole, and the chunk-size lines that frame a body — mush will
+/// read. One named number for all of them, because the thing being bounded is
+/// one: the memory a reply that has not framed itself may take from mush. A
+/// head is small by every protocol on earth (a status line and a handful of
+/// headers), so 64 KiB is generous; an endpoint that writes a line or a head
+/// past it is one that will never send the newline, and the read that used to
+/// grow a `Vec` there is the one the OOM killer took the whole process for,
+/// every agent's transcript with it (finding A1). A head past the bound is a
+/// refusal, not a framing error: the endpoint is the one that sent it, and the
+/// human is owed its name and the size. [`MAX_BODY_BYTES`] is the same decision
+/// one layer down; the two together are what makes "a server cannot make mush
+/// allocate without bound" true.
+const MAX_HEAD_BYTES: usize = 64 * 1024;
 
 #[derive(Debug)]
 pub struct Response {
@@ -340,10 +355,25 @@ fn exchange(
     // reported as `malformed status line: ""`, refusing a reply that had not
     // even started. Skipping it keeps `heard` false, so a connection that dies
     // after the blank line is still "nothing heard" and gets its one retry.
+    // What the head has cost so far: each line is bounded by [`MAX_HEAD_BYTES`],
+    // and this is the head's own share of the same number, so an endpoint that
+    // sends short lines forever cannot sit in mush's memory either. Each line
+    // is counted with its terminator (two bytes), so the guard can only close
+    // early, never late.
+    let mut head_bytes = 0usize;
     let status_line = loop {
         match read_line(&mut stream, watch) {
             Ok(Some(line)) if line.is_empty() => continue,
-            Ok(Some(line)) => break line,
+            Err(error) if is_overlong(&error) => {
+                return Err((head_too_large(ask.url), heard));
+            }
+            Ok(Some(line)) => {
+                head_bytes += line.len() + 2;
+                if head_bytes > MAX_HEAD_BYTES {
+                    return Err((head_too_large(ask.url), heard));
+                }
+                break line;
+            }
             // Nothing at all came back: the peer closed the connection before it
             // answered (a kept connection the server has since dropped), which is
             // not the same thing as a malformed status line, and must not be
@@ -375,8 +405,15 @@ fn exchange(
             // The headers ended at the stream's end: the framing they would
             // have given is simply absent, exactly as it was before.
             Ok(None) => break,
+            Err(error) if is_overlong(&error) => {
+                return Err((head_too_large(ask.url), heard));
+            }
             Err(error) => return Err((error, heard)),
         };
+        head_bytes += line.len() + 2;
+        if head_bytes > MAX_HEAD_BYTES {
+            return Err((head_too_large(ask.url), heard));
+        }
         if line.is_empty() {
             break;
         }
@@ -587,7 +624,17 @@ fn fill<'b, R: BufRead>(reader: &'b mut R, watch: &Watch) -> io::Result<Option<&
     }
 }
 
-/// A line without its terminator, or `None` at end of stream.
+/// Read one line, refusing one longer than [`MAX_HEAD_BYTES`].
+///
+/// Every line mush reads off a reply is a line of the head or of the framing
+/// that ends one — a status line, a header line, a chunk-size line, a trailer
+/// field — and before the body there is nothing to bound one: an endpoint that
+/// never writes the newline used to make this `Vec` grow until the process was
+/// OOM-killed (finding A1). The bound is the head's own number; a chunk-size
+/// line is read by the same reader for the same reason, and the caller that
+/// knows which line it was refuses it as what it is ([`OverlongLine`]).
+///
+/// Returns the line without its terminator, or `None` at end of stream.
 fn read_line<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<Option<String>> {
     let mut line = Vec::new();
     loop {
@@ -602,6 +649,9 @@ fn read_line<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<Option<Str
             .position(|byte| *byte == b'\n')
             .map(|index| index + 1)
             .unwrap_or(chunk.len());
+        if line.len() + take > MAX_HEAD_BYTES {
+            return Err(overlong_line());
+        }
         line.extend_from_slice(&chunk[..take]);
         reader.consume(take);
         if line.ends_with(b"\n") {
@@ -914,6 +964,55 @@ fn body_cut_off() -> io::Error {
     )
 }
 
+/// A line that reached [`MAX_HEAD_BYTES`] without its terminator: the read that
+/// has no end to stop at, and the shape an endpoint with no newline to send
+/// leaves behind. Its own marker rather than a message because the two roads
+/// that read lines refuse it as different things — a response head past the
+/// bound is an answer mush refuses, while a chunk-size line past it is framing
+/// that never parsed — and only the caller that read the line knows which.
+#[derive(Debug)]
+struct OverlongLine;
+
+impl fmt::Display for OverlongLine {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("a reply line that never ended")
+    }
+}
+
+impl std::error::Error for OverlongLine {}
+
+fn overlong_line() -> io::Error {
+    io::Error::new(io::ErrorKind::InvalidData, OverlongLine)
+}
+
+fn is_overlong(error: &io::Error) -> bool {
+    error
+        .get_ref()
+        .is_some_and(|inner| inner.downcast_ref::<OverlongLine>().is_some())
+}
+
+/// The refusal a response head past [`MAX_HEAD_BYTES`] gets: the endpoint and
+/// the bound in one sentence, because the head is the endpoint's to send and
+/// the human is the one who can act on it. A plain `InvalidData` — the class of
+/// a body past [`MAX_BODY_BYTES`], never [`Framing`]: the endpoint answered, and
+/// mush is the one saying no. The connection is dropped with the error, so
+/// nothing of the oversized head waits in the pool.
+fn head_too_large(endpoint: &str) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("{endpoint} sent a response head larger than {MAX_HEAD_BYTES} bytes"),
+    )
+}
+
+/// The same line on the body road: a chunk-size or trailer line that never
+/// ended is framing that never parsed, and says so in [`Framing`]'s own words
+/// rather than as an answer mush refuses.
+fn overlong_framing() -> io::Error {
+    framing(format!(
+        "a chunked-framing line larger than {MAX_HEAD_BYTES} bytes"
+    ))
+}
+
 /// Exactly `len` bytes of a chunked body, where the stream ending early is the
 /// body being cut off rather than `read_exact`'s `Content-Length` complaint.
 fn read_chunk_bytes<R: BufRead>(reader: &mut R, len: usize, watch: &Watch) -> io::Result<Vec<u8>> {
@@ -960,10 +1059,12 @@ fn read_chunked<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<String>
         // A reply that then reaches the stream's end is a *cut-off* body, said
         // as one below.
         let size_line = loop {
-            match read_line(reader, watch)? {
-                Some(line) if line.trim().is_empty() => continue,
-                Some(line) => break line,
-                None => return Err(body_cut_off()),
+            match read_line(reader, watch) {
+                Ok(Some(line)) if line.trim().is_empty() => continue,
+                Ok(Some(line)) => break line,
+                Ok(None) => return Err(body_cut_off()),
+                Err(error) if is_overlong(&error) => return Err(overlong_framing()),
+                Err(error) => return Err(error),
             }
         };
         let size_field = size_line.trim().split(';').next().unwrap_or("").trim();
@@ -976,12 +1077,14 @@ fn read_chunked<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<String>
             // *next* request's status line on a kept connection, which refused
             // a healthy reply as `malformed status line: ""`.
             loop {
-                match read_line(reader, watch)? {
-                    Some(line) if line.is_empty() => break,
+                match read_line(reader, watch) {
+                    Ok(Some(line)) if line.is_empty() => break,
                     // A trailer field: part of this body, not the next reply.
-                    Some(_) => continue,
+                    Ok(Some(_)) => continue,
                     // The stream ended at the zero chunk; the body is complete.
-                    None => break,
+                    Ok(None) => break,
+                    Err(error) if is_overlong(&error) => return Err(overlong_framing()),
+                    Err(error) => return Err(error),
                 }
             }
             break;
@@ -1555,7 +1658,11 @@ mod tests {
             "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
             MAX_BODY_BYTES + 1
         );
-        let cases: [(&str, bool); 4] = [
+        let head_over = format!(
+            "HTTP/1.1 200 OK\r\nX-Big: {}\r\n",
+            "a".repeat(MAX_HEAD_BYTES)
+        );
+        let cases: [(&str, bool); 5] = [
             // A chunk size that is not hex, a Content-Length that is not a
             // number, a chunk terminator the framing did not promise, and the
             // one answer mush refuses.
@@ -1569,6 +1676,9 @@ mod tests {
                 true,
             ),
             (&huge, false),
+            // A response head past its bound, too: the endpoint really sent it,
+            // so it is an answer mush refuses rather than a frame that broke.
+            (&head_over, false),
         ];
         for (answer, framed) in cases {
             let written = Arc::new(Mutex::new(Vec::new()));
@@ -2239,6 +2349,68 @@ mod tests {
         let error = get_json(&url, None, Duration::from_secs(5)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
         assert!(started.elapsed() < Duration::from_secs(2));
+    }
+
+    /// A response *head* is bounded, not only a body: an endpoint that writes a
+    /// header line with no newline in it used to make `read_line` grow a `Vec`
+    /// until the OOM killer took the process — a probe's 85 MiB head cost
+    /// 178 MB of peak RSS and the call still returned `200` (finding A1). The
+    /// refusal names the endpoint and the size, and the connection is dropped
+    /// at once: the endpoint's own writes stop at the bound instead of an
+    /// 85 MiB line.
+    #[test]
+    fn a_header_line_past_the_bound_is_a_refusal() {
+        use std::io::Write as _;
+        use std::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let written = Arc::new(AtomicUsize::new(0));
+        let counter = written.clone();
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut scratch = [0u8; 1024];
+            let _ = connection.read(&mut scratch);
+            // A status line, and then a header line with no newline in it: the
+            // shape that used to grow until the process died.
+            let _ = connection.write_all(b"HTTP/1.1 200 OK\r\nX-Big: ");
+            let block = vec![b'a'; 64 * 1024];
+            while counter.load(Ordering::SeqCst) < 256 * MAX_HEAD_BYTES {
+                match connection.write(&block) {
+                    Ok(0) | Err(_) => return true,
+                    Ok(n) => {
+                        counter.fetch_add(n, Ordering::SeqCst);
+                    }
+                }
+            }
+            // Not one write failed: is the connection at least gone?
+            let _ = connection.set_read_timeout(Some(Duration::from_secs(2)));
+            matches!(connection.read(&mut [0u8; 1]), Ok(0) | Err(_))
+        });
+
+        let url = format!("http://127.0.0.1:{port}/v1/models");
+        let error = get_json(&url, None, Duration::from_secs(5)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(
+            !is_framing(&error),
+            "a head past the bound is an answer mush refuses, not framing that broke: {error}"
+        );
+        let message = error.to_string();
+        assert!(message.contains(&url), "the endpoint is named: {message}");
+        assert!(
+            message.contains(&MAX_HEAD_BYTES.to_string()),
+            "the bound is named: {message}"
+        );
+        assert!(
+            server.join().unwrap(),
+            "the connection was not dropped after the refusal"
+        );
+        let bytes = written.load(Ordering::SeqCst);
+        assert!(
+            bytes < 64 * MAX_HEAD_BYTES,
+            "the endpoint wrote {bytes} bytes before the close: an unbounded head let it\
+             write the whole line"
+        );
     }
 
     /// Talks to the configured endpoint; run with `--ignored`.
