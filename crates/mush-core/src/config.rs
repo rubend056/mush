@@ -895,7 +895,14 @@ pub fn resolve_with(
 
     // 2. Home config: machine-global defaults, and where the API key lives.
     if config.api_key.is_none() {
-        config.api_key = home.api_key.clone();
+        // An empty string in the file is no key, not a key. Hand-edited, it
+        // used to become `Some("")`, and three surfaces then disagreed about
+        // one state: `/key`'s ack read `api key set (••••…)`, `--print-config`
+        // read `(none)` (it filters the empty string itself), and every
+        // request carried `Authorization: Bearer ` with nothing after it
+        // (finding D22). `MUSH_API_KEY=""` is already dropped by
+        // `env_nonempty`, so this is the file's own road to that state.
+        config.api_key = home.api_key.clone().filter(|key| !key.is_empty());
     }
     if !provider_given && !home.provider.is_empty() {
         // A typo here is an error, exactly as it is for `--provider` and
@@ -1324,6 +1331,39 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved.config.api_key.as_deref(), Some("sk-home"));
+    }
+
+    /// An empty string in the home config is no key: a hand-edited
+    /// `api_key: ""` used to resolve to `Some("")`, which `/key`'s ack read as
+    /// a set key, `--print-config` printed as `(none)`, and every request sent
+    /// as `Authorization: Bearer ` (finding D22).
+    #[test]
+    fn an_empty_config_key_is_no_key() {
+        let mut empty = home("custom", "http://home:4", "m");
+        empty.api_key = Some(String::new());
+        let config = resolve_with(
+            Config::new("http://home:4", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &empty,
+            None,
+        )
+        .unwrap()
+        .config;
+        assert_eq!(config.api_key, None, "an empty string is no key");
+
+        // A non-empty home key still travels: the host matches, so this is
+        // not D6's rule dropping it, and the layer is unchanged.
+        let config = resolve_with(
+            Config::new("http://home:4", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home("custom", "http://home:4", "m"),
+            None,
+        )
+        .unwrap()
+        .config;
+        assert_eq!(config.api_key.as_deref(), Some("sk-home"));
     }
 
     /// The host is the part of an endpoint a key is minted for: the authority,
