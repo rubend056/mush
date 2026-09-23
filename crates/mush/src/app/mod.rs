@@ -814,13 +814,14 @@ pub struct App {
     /// The write road as a value the app holds: what the select mode's `Enter`
     /// hands the text to, and the one place that road can be stood in for.
     ///
-    /// The default is [`clipboard::write_text`] — the real `wl-copy`/`xclip`/
-    /// `pbcopy` sequence. The seam exists because `Enter` is a *key*, and a key
-    /// mush can press must be a key a test can press: without it, a test that
-    /// copied would either clobber the human's real clipboard (the key is the
-    /// one the whole mode exists for, and a test run has no business writing
-    /// to the clipboard the human is using) or depend on which of the three
-    /// programs the machine happens to have on `PATH`. The read road needs no
+    /// The default is [`clipboard::write_text`] — the real
+    /// `wl-copy`/`xclip`/`pbcopy`/`clip` sequence. The seam exists because
+    /// `Enter` is a *key*, and a key mush can press must be a key a test can
+    /// press: without it, a test that copied would either clobber the human's
+    /// real clipboard (the key is the one the whole mode exists for, and a test
+    /// run has no business writing to the clipboard the human is using) or
+    /// depend on which of the four programs the machine happens to have on
+    /// `PATH`. The read road needs no
     /// such seam: its answer is a message a test hands in directly
     /// (`Msg::Clipboard`), and pressing `Ctrl-V` where the machine has no
     /// reader costs a status line and nothing else.
