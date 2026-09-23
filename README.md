@@ -173,9 +173,10 @@ wear — painted by the code's own row painter:
 <!-- /generated: marks -->
 
 `✉`/`✉N` are unread results (the parent's, and an agent's own children's), `⚮`
-is a row whose parent the history window has reaped (it is drawn at the top
-level like a root child, and the mark is what says it is not one), and `⚙N`
-counts the jobs on their owner's row. A running agent with children out wears
+is a row whose parent the history window has reaped (it is drawn under its
+nearest surviving ancestor — the root when none of its own survive — at that
+ancestor's depth plus one, dim, and the mark is what says its own parent is not
+the row it sits under), and `⚙N` counts the jobs on their owner's row. A running agent with children out wears
 **no** count of them: the children's own rows say they run, and the pane title's
 `N waiting` counts the agents at rest with work out. A row spends its columns on
 state, then the branch and line delta (`mush/2 +8−0`), then the activity with its

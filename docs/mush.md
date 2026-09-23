@@ -630,12 +630,14 @@ parked on somebody else's result (`wait` — the icon a glance reads says the sa
 thing the row's words do, `waiting on results 3s`), `⊘` a cancel in flight or a
 run that landed stopped, so a guard-stop is not dressed as a failure, `✉` a
 result a parent has not read, `✉N` the ones from an agent's own children, `⚮` a
-row whose parent the history window has reaped (it is drawn at the top level like
-a root child, and the mark is what says it is not one; how many children a parent
-keeps is `CHILD_HISTORY` in `crates/mush/src/app/tree.rs`), `▶` the focused
-agent, and `⚙N` jobs on their owner's row. A running agent with children out wears *no*
-count of them: the children's own rows say they run, and the title's
-`N waiting` counts the agents at rest with work out. Tool calls are
+row whose parent the history window has reaped (it is drawn under its nearest
+surviving ancestor — the root when none of its own survive — at that ancestor's
+depth plus one, dim, and the mark is what says its own parent is not the row it
+sits under; how many children a parent keeps is `CHILD_HISTORY` in
+`crates/mush/src/app/tree.rs`), `▶` the focused agent, and `⚙N` jobs on their
+owner's row. A running agent with children out wears *no* count of them: the
+children's own rows say they run, and the title's `N waiting` counts the agents
+at rest with work out. Tool calls are
 `⚙ name summarized-args` (never raw JSON, the tools that steer a run included:
 `⚙ control #4 message "…"`), and notices are neutral `·` unless something
 actually failed (`!`).
