@@ -146,7 +146,9 @@ and never share state with the painter.
   no window: past 2 MB it is refused with a downscale as the road, and an image
   the run's model is not documented to see is refused *before* it is sent, so a
   request that cannot be read never costs a turn. Edit operations always work on
-  the complete file, and no *input* is capped: `write_file`'s `content` and
+  the complete file — a file whose bytes are not valid UTF-8 is refused rather
+  than read lossily, because the text this read hands back is what an edit
+  writes back — and no *input* is capped: `write_file`'s `content` and
   `edit_file`'s replacement are bytes the model already sent, in its own tool
   call and in the request that carries it, so a cap there would save the
   conversation nothing and cost a turn and the work. A write large enough to
