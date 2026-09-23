@@ -4375,11 +4375,25 @@ fn machine_held(held: &jobs::Held) -> String {
 }
 
 /// Whether a `wait` has a result nobody has read to hand over: a child whose
-/// body the model has not been given yet. A job's line is not here — it was
-/// folded into the transcript when the job ended (`note_job`), so handing it
-/// over again is a recap, not news.
+/// body the model has not been given yet, or a job's line no boundary has folded
+/// in yet.
+///
+/// A job's report is folded into the transcript at a *message boundary*
+/// (`fold_completions`), not when the job ends: `note_job` only records it, so a
+/// `wait` standing inside the tool call that started the job — exactly
+/// `[run_command{detach:true}, wait]` — is before every boundary that has not
+/// happened yet and the line is unread *here*. Asking only about children is
+/// what parked a finished job's line behind a sibling's exclusive hold for the
+/// whole timeout, the blindness H13 is about, one id space over (finding A3).
+/// What is *not* a reason to wait is a line already delivered: a job ends once,
+/// its line is handed over once, and reading it again is the recap
+/// [`wait_digest`] refuses to make.
 fn unread_result(state: &ActorState) -> bool {
     state.children.keys().any(|id| state.unread(*id))
+        || state
+            .done_jobs
+            .keys()
+            .any(|job| !state.delivered_jobs.contains(job))
 }
 
 fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Result<String, String> {
@@ -4433,8 +4447,8 @@ fn wait_tool(actor: &Actor, state: &mut ActorState, cancel: &AtomicBool) -> Resu
             // A result nobody has read comes first, whatever the machine is
             // doing: waiting is what a model does when it wants a result, and
             // parking one behind a sibling's benchmark is the blindness H13 is
-            // about. Everything else a digest would carry — an already-read
-            // body, a job's line — is a recap of something the transcript
+            // about. Everything else a digest would carry — a body the model
+            // has already been given — is a recap of something the transcript
             // already holds, so it is not a reason to refuse to wait.
             if unread_result(state) {
                 let answers = wait_digest(actor, state, false).join("\n");
@@ -12600,6 +12614,54 @@ mod tests {
             "the lock rides along with the result, so the next move is informed: {answer}"
         );
         assert_eq!(clock.elapsed(), Duration::ZERO, "no wait was spent");
+        let _ = fs::remove_dir_all(actor.ws.root());
+    }
+
+    /// The job twin of the child road above, and the shape a model actually
+    /// writes: `[run_command{detach:true}, wait]`. A job that ends while the
+    /// wait is in flight has its line *recorded* by the mid-call poll
+    /// (`drain_signals` → `note_job`) and folded only at the next message
+    /// boundary, so it is a result nobody has read — and the machine gate must
+    /// hand it over at once, whatever a sibling holds. Asking only about
+    /// children parked that line behind the hold for the whole 600 s timeout:
+    /// a result the wait already had, ten minutes of the human's wall clock
+    /// late and only usable once the run was out of time (finding A3).
+    #[test]
+    fn a_finished_job_is_handed_over_before_the_machine_is_waited_out() {
+        let clock = Arc::new(Advanceable::new());
+        let (actor, _mailbox) = scripted_tools_actor(
+            "wait-machine-job-result",
+            Arc::new(ScriptedMachine::new()),
+            clock.clone(),
+        );
+        let mut state = ActorState::default();
+        let cancel = Arc::new(AtomicBool::new(false));
+        // A finished job whose report nobody has read: `note_job` records the
+        // line and clears the running book, and no boundary has folded it in.
+        state.running_jobs.insert(JobId(1));
+        note_job(
+            &mut state,
+            JobId(1),
+            "#c1 done: exit 0 · 2s · cargo test — running 12 tests · test result: ok".to_string(),
+            true,
+        );
+        actor.ctx.registry.take_machine(2, "cargo bench").unwrap();
+
+        let answer = exec_tool(&actor, &mut state, ToolName::Wait, &json!({}), &cancel).unwrap();
+        assert!(
+            answer.contains("#c1 done: exit 0 · 2s · cargo test"),
+            "the job's own line is the answer: {answer}"
+        );
+        assert!(
+            answer.contains("the machine is still held by #2's exclusive command")
+                && answer.contains("cargo bench"),
+            "the lock rides along with the result, so the next move is informed: {answer}"
+        );
+        assert_eq!(clock.elapsed(), Duration::ZERO, "no wait was spent");
+        assert!(
+            state.delivered_jobs.contains(&JobId(1)),
+            "and the handover marked it read, so the line is not handed over twice"
+        );
         let _ = fs::remove_dir_all(actor.ws.root());
     }
 
