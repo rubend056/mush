@@ -730,8 +730,7 @@ impl Config {
     /// The one cap on the text a tool result may carry — a command's output, a
     /// file read, a listing, a search. It scales with the window like a read
     /// did: the room a cut leaves between its stopping point and the ceiling
-    /// ([`Self::history_budget`] minus
-    /// [`trim_target`](crate::transcript::trim_target)), floored at 512 bytes so
+    /// ([`Self::history_budget`] minus [`trim_target`]), floored at 512 bytes so
     /// a tiny window still gets an answer, and capped by [`CMD_CAP`] so a huge
     /// one does not hand the model a transcript's worth in a single turn. A
     /// result that hits the cap says so (see `truncate_for_model`; a file read
