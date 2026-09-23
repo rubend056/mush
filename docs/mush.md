@@ -146,8 +146,9 @@ an agent event — becomes a `Msg`, and one thread applies it to `App` (§6).
   turn and the work. A write large enough to push the request past the window
   ends that turn at the request's own refusal (`cannot send this request: …`),
   with the bytes already on disk. The caps' sizes follow the window:
-  `Config::cmd_cap()` and the `CMD_CAP` / `READ_FILE_CAP` / `SEARCH_FILE_CAP` /
-  `IMAGE_FILE_CAP` constants in `crates/mush-core/src/{config,workspace}.rs`.
+  `Config::cmd_cap()` (`crates/mush-core/src/config.rs`), the `CMD_CAP`
+  (`crates/mush-core/src/lib.rs`) and the `READ_FILE_CAP` / `SEARCH_FILE_CAP` /
+  `IMAGE_FILE_CAP` constants (`crates/mush-core/src/workspace.rs`).
 - **Bounded loops.** A run ends when the model stops calling tools; a *loop* —
   the same tool batch five rounds over with nothing changed in between — ends it
   early. Nothing counts turns, so a model that keeps making *different* calls
@@ -291,9 +292,10 @@ and how a stored transcript sheds the bytes in place:
 
 ### History budget
 
-Small local models have small contexts (the default endpoint reports 8 K). Every
-request reserves room for the tool schemas, the reply and a margin, and the rest
-is the history budget the run trims and folds at. Before each request the agent
+Small local models have small contexts (a custom provider's default window is
+8 K, `provider::PROVIDERS`). Every request reserves room for the tool schemas,
+the reply and a margin, and the rest is the history budget the run trims and
+folds at. Before each request the agent
 folds or trims, in that order, and always cuts at a **user** message boundary so
 assistant/tool pairs stay valid.
 
