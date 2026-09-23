@@ -179,6 +179,12 @@ impl ThinkingMode {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub provider: Provider,
+    /// What every request is built from: [`Self::chat_url`] and
+    /// [`Self::models_url`] append to it and the result is written into the
+    /// request line raw, so a control character here is a request the value
+    /// writes for itself. Every road a human or a file states one by is checked
+    /// ([`checked_url`]); this field is `pub` because the settings screen and a
+    /// session snapshot carry it around, not as a licence to write it.
     pub base_url: String,
     pub model: String,
     pub api_key: Option<String>,
@@ -282,8 +288,9 @@ impl Overrides {
     /// The environment layer, read for startup: the same seven variables as
     /// [`Self::from_env`] and the same one read of them, but a value that does
     /// not parse is an error naming its variable rather than a silent drop.
-    /// The provider is validated first, then the context, the effort and the
-    /// thinking mode, so the first typo in that order is the one reported.
+    /// The provider is validated first, then the endpoint, the context, the
+    /// effort and the thinking mode, so the first typo in that order is the one
+    /// reported.
     pub fn from_env_checked() -> Result<Self, String> {
         let text = EnvText::read();
         // The provider first: a key meant for somewhere else must not be sent
@@ -296,7 +303,7 @@ impl Overrides {
             None => None,
         };
         Ok(Self {
-            url: text.url,
+            url: text.url.map(|value| parse_url_env(&value)).transpose()?,
             model: text.model,
             provider,
             api_key: text.api_key,
@@ -412,6 +419,42 @@ fn normalize_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
+/// One checked door for endpoint URLs: what a human or a file states an endpoint
+/// by is a value written into the request line raw, so it is the one place that
+/// decides what an endpoint may be.
+///
+/// `http://host.test:8078/v1\r\nX-Injected-By-Url: yes` is a request the *value*
+/// writes for itself: the request line ends at the CRLF and the rest becomes
+/// header lines the endpoint acts on (finding D19, proven on the wire — the
+/// second field C7 filed for the key). So the refusal is a control character
+/// anywhere in the value, named as its escape rather than echoed as itself —
+/// the bytes of a control character must not reach the terminal that prints the
+/// refusal, and `(\r)` says which one it was — and every road that states one
+/// goes through here: `--url`, `MUSH_URL`, the home config, a session, and the
+/// writer `/url` reaches ([`Config::set_base_url`]).
+///
+/// Surrounding space is trimmed *before* the check, as it is for every other
+/// stated value: a URL pasted with a trailing newline is the URL it looks like,
+/// and an interior one is not a URL at all.
+pub fn checked_url(url: &str, road: &str) -> Result<String, String> {
+    let url = url.trim();
+    match url.chars().find(|character| character.is_control()) {
+        Some(control) => Err(format!(
+            "{road} contains a control character ({}) — check the value",
+            control.escape_debug()
+        )),
+        None => Ok(normalize_url(url)),
+    }
+}
+
+/// Validate `MUSH_URL`, the environment's road to a checked endpoint: a value
+/// that cannot be a URL is reported by name rather than dropped, because the
+/// variable is how a human states one (finding D19; the same rule
+/// `MUSH_CONTEXT`'s reader follows).
+pub fn parse_url_env(value: &str) -> Result<String, String> {
+    checked_url(value, "MUSH_URL")
+}
+
 /// The host of an endpoint URL: the authority, port included; the scheme, the
 /// path and the query are not part of it.
 ///
@@ -483,7 +526,7 @@ impl Config {
         let base_url = env
             .url
             .as_deref()
-            .map(normalize_url)
+            .and_then(|url| parse_url_env(url).ok())
             .unwrap_or_else(|| provider.default_base_url().to_string());
         let context = env.context.filter(|n| *n > 0).map(clamp_context);
         Self {
@@ -503,6 +546,10 @@ impl Config {
         }
     }
 
+    /// Built by code rather than stated by a human or a file — the tests, and
+    /// the fallback an unreadable config cell leaves — so the value is only
+    /// normalized here: the doors a *stated* URL comes in by are [`checked_url`]'s
+    /// ([`Self::set_base_url`], and the layers [`resolve`] applies).
     pub fn new(
         base_url: impl Into<String>,
         model: impl Into<String>,
@@ -716,9 +763,17 @@ impl Config {
     }
 
     /// Point at a different endpoint, normalizing the URL the same way every
-    /// other entry point does.
+    /// other entry point does ([`checked_url`]).
+    ///
+    /// A value with a control character is refused and the endpoint stays where
+    /// it was: this writer has no error to hand back — the TUI's `/url` arm is
+    /// the one caller that reaches it without one, and the ack it prints names
+    /// the endpoint actually in force — and a value like that must never be the
+    /// one a request line is built from (finding D19).
     pub fn set_base_url(&mut self, url: &str) {
-        self.base_url = normalize_url(url);
+        if let Ok(url) = checked_url(url, "/url") {
+            self.base_url = url;
+        }
     }
 
     /// Forget the API key when the endpoint now set is on another host, and say
@@ -845,7 +900,7 @@ pub fn resolve_with(
     let mut notices: Vec<String> = Vec::new();
     // 1. Command-line flags beat everything else.
     if let Some(url) = cli.url.as_deref() {
-        config.set_base_url(url);
+        config.base_url = checked_url(url, "--url")?;
     }
     if let Some(provider) = cli.provider.as_deref() {
         config.provider = Provider::parse(provider).ok_or_else(|| {
@@ -920,7 +975,11 @@ pub fn resolve_with(
         }
     }
     if !url_given && !home.base_url.is_empty() {
-        config.set_base_url(&home.base_url);
+        // The file's own path is named with the refusal, for the reason the
+        // provider arm above names it: `MUSH_CONFIG` can point anywhere, so the
+        // layer's name alone is not enough to find the line to fix.
+        config.base_url = checked_url(&home.base_url, "home config's base_url")
+            .map_err(|error| format!("{error} — {}", crate::userconfig::config_path().display()))?;
     }
     if !model_given && config.model.is_empty() && !home.model.is_empty() {
         config.model = home.model.clone();
@@ -967,7 +1026,18 @@ pub fn resolve_with(
             // and the notice names the road back, as the `/url` and `/provider`
             // acks do.
             let was = config.base_url.clone();
-            config.set_base_url(&session.base_url);
+            match checked_url(&session.base_url, "session's base_url") {
+                Ok(url) => config.base_url = url,
+                // A session is a file a workspace carries, not hand-edited input
+                // the way the home config is — a build that stored a value this
+                // one cannot use wrote it — so this is a notice rather than a
+                // start-up failure (finding C2). The value is *not* used: a
+                // request line is written from `base_url` raw, so a control
+                // character there is a request of the session's own making
+                // (finding D19), and the endpoint left in force is named so a
+                // human can see that the stored one never arrived.
+                Err(error) => notices.push(format!("{error} — keeping the endpoint {was}")),
+            }
             if config.forget_key_if_host_changed(&was) {
                 notices.push(format!(
                     "session: endpoint {} is another host — no api key for this endpoint; \
@@ -1093,6 +1163,101 @@ mod tests {
             agents: Vec::new(),
             notices: Vec::new(),
         }
+    }
+
+    /// The other field a request line is built from (finding D19): an endpoint
+    /// with a control character in it is a request the *value* writes for
+    /// itself, so every door refuses it by name — the flag, the variable, the
+    /// home config, and the writer `/url` reaches — and a session (a file, so a
+    /// notice rather than a start-up failure) keeps the endpoint that was in
+    /// force instead of using it. The character is named as its escape, never
+    /// echoed as itself: the refusal is a line mush prints.
+    #[test]
+    fn a_url_with_a_control_character_is_refused_by_every_door() {
+        let bad = "http://host.test:8078/v1\r\nX-Injected-By-Url: yes";
+        fn said(road: &str) -> String {
+            format!("{road} contains a control character (\\r) — check the value")
+        }
+
+        // The environment, under the name the human will look for; the lenient
+        // reader drops a value like this instead, exactly as it drops a
+        // malformed window, because it has no human to report to.
+        assert_eq!(parse_url_env(bad), Err(said("MUSH_URL")));
+        assert_eq!(
+            Config::from_env_layer(&Overrides {
+                url: Some(bad.into()),
+                ..Overrides::default()
+            })
+            .base_url,
+            Provider::Custom.default_base_url(),
+            "the lenient layer falls back rather than storing it"
+        );
+
+        // The flag.
+        let cli = Overrides {
+            url: Some(bad.into()),
+            ..Overrides::default()
+        };
+        assert_eq!(
+            resolve_with(
+                Config::new("http://base:0", "m", None),
+                &cli,
+                &Overrides::default(),
+                &UserConfig::default(),
+                None,
+            )
+            .unwrap_err(),
+            said("--url")
+        );
+
+        // The home config, with the file's path: the layer's name alone does
+        // not say which file to fix.
+        let error = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &home("custom", bad, "m"),
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with(&said("home config's base_url")),
+            "{error}"
+        );
+        assert!(
+            error.contains(&crate::userconfig::config_path().display().to_string()),
+            "{error}"
+        );
+
+        // A session: said out loud, and the endpoint that was in force stays.
+        let resolved = resolve_with(
+            Config::new("http://base:0", "m", None),
+            &Overrides::default(),
+            &Overrides::default(),
+            &UserConfig::default(),
+            Some(&stored("custom", bad, "m")),
+        )
+        .unwrap();
+        assert_eq!(resolved.config.base_url, "http://base:0");
+        assert_eq!(resolved.notices.len(), 1, "{:?}", resolved.notices);
+        assert!(
+            resolved.notices[0].starts_with(&said("session's base_url"))
+                && resolved.notices[0].contains("http://base:0"),
+            "{:?}",
+            resolved.notices
+        );
+
+        // And the writer the TUI's `/url` reaches: refused, so the endpoint a
+        // request line is built from is unchanged.
+        let mut config = Config::new("http://base:0", "m", None);
+        config.set_base_url(bad);
+        assert_eq!(config.base_url, "http://base:0");
+        assert!(!config.chat_url().chars().any(char::is_control));
+
+        // Surrounding space is still trimmed first, so the shape a pasted
+        // block gives `/url` is the URL it looks like.
+        config.set_base_url("  http://next.test:8078/  \n");
+        assert_eq!(config.base_url, "http://next.test:8078");
     }
 
     #[test]

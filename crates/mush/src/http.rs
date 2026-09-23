@@ -50,7 +50,11 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// A response body larger than this is refused while it is being read. With
 /// [`MAX_HEAD_BYTES`] this is the whole of what one reply may make mush
 /// allocate, so a server cannot make mush allocate without bound (docs §8).
-/// Generous on purpose: a big diff or a long model reply is normal work.
+/// Generous on purpose: a big diff or a long model reply is normal work. How
+/// an over-cap reply is *said* depends on which framing carried the size: a
+/// `Content-Length`, or a body that ended with the stream, is the answer's own
+/// size and a plain refusal, while a chunk-size line past the cap is the
+/// framing itself ([`Framing`], finding A10).
 const MAX_BODY_BYTES: usize = 80 * 1024 * 1024;
 /// The most bytes of a response *head* — the status line, every header line,
 /// the head as a whole, and the chunk-size lines that frame a body — mush will
@@ -852,6 +856,13 @@ fn read_to_end<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<Vec<u8>>
     Ok(out)
 }
 
+/// The refusal a body past [`MAX_BODY_BYTES`] gets when the size is the
+/// *answer's own*: the number in a `Content-Length`, or the bytes that arrived
+/// before the stream ended. Plain `InvalidData` — a refusal, never [`Framing`]
+/// — because the endpoint framed a body that size and mush is the one saying
+/// no. A chunk-size line past the cap is the framing's own claim, not the
+/// answer's size, and [`read_chunked`] raises [`framing`] for it before this is
+/// reached (finding A10).
 fn body_too_large() -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -1132,17 +1143,22 @@ pub fn is_unsent(error: &io::Error) -> bool {
 }
 
 /// A reply whose framing broke before its body could be read: a status line or
-/// `Content-Length` that is not one, a chunk size that is not hex, a chunk
-/// terminator that is not the terminator the framing promised.
+/// `Content-Length` that is not one, a chunk size that is not hex or that
+/// claims past [`MAX_BODY_BYTES`], a chunk terminator that is not the
+/// terminator the framing promised.
 ///
 /// Its own type rather than a bare `InvalidData`, because the kind alone cannot
 /// say whether the endpoint *answered* or its reply *broke on the way in* — and
-/// the two want opposite treatment. A body past [`MAX_BODY_BYTES`] is an answer
-/// mush refuses (a `Refused`, never retried); a frame that never parsed was
-/// never handed to the caller, so it is reported as what it is — bytes that
-/// failed to frame themselves, not the endpoint's opinion of the request — and
-/// the connection that carried it is dropped rather than kept (finding B27,
-/// `model.rs`).
+/// the two want opposite treatment. A body whose `Content-Length`, or whose
+/// stream's end, put it past [`MAX_BODY_BYTES`] is an answer mush refuses (a
+/// `Refused`, never retried). A chunk-size line that claims past the cap is
+/// framing instead, because that line *is* the framing of a body mush has not
+/// read — a garbled `FFFFFFFF` and an honest 4 GiB chunk are the same bytes to
+/// mush, so it reports the claim, not the endpoint's answer (finding A10).
+/// Either way the frame was never handed to the caller,
+/// so it is reported as what it is — bytes that failed to frame themselves,
+/// not the endpoint's opinion of the request — and the connection that carried
+/// it is dropped rather than kept (finding B27, `model.rs`).
 #[derive(Debug)]
 struct Framing(String);
 
@@ -1219,10 +1235,11 @@ fn is_overlong(error: &io::Error) -> bool {
 
 /// The refusal a response head past [`MAX_HEAD_BYTES`] gets: the endpoint and
 /// the bound in one sentence, because the head is the endpoint's to send and
-/// the human is the one who can act on it. A plain `InvalidData` — the class of
-/// a body past [`MAX_BODY_BYTES`], never [`Framing`]: the endpoint answered, and
-/// mush is the one saying no. The connection is dropped with the error, so
-/// nothing of the oversized head waits in the pool.
+/// the human is the one who can act on it. A plain `InvalidData` — a refusal,
+/// the class of a body past [`MAX_BODY_BYTES`] on the `Content-Length` and
+/// end-of-stream roads, never [`Framing`]: the endpoint answered, and mush is
+/// the one saying no. The connection is dropped with the error, so nothing of
+/// the oversized head waits in the pool.
 fn head_too_large(endpoint: &str) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidData,
@@ -1241,6 +1258,8 @@ fn overlong_framing() -> io::Error {
 
 /// Exactly `len` bytes of a chunked body, where the stream ending early is the
 /// body being cut off rather than `read_exact`'s `Content-Length` complaint.
+/// `len` has already been held to [`MAX_BODY_BYTES`] by [`read_chunked`], so
+/// the cap `read_exact` would raise is not this road's answer.
 fn read_chunk_bytes<R: BufRead>(reader: &mut R, len: usize, watch: &Watch) -> io::Result<Vec<u8>> {
     read_exact(reader, len, watch).map_err(|error| match error.kind() {
         io::ErrorKind::UnexpectedEof => body_cut_off(),
@@ -1315,8 +1334,17 @@ fn read_chunked<R: BufRead>(reader: &mut R, watch: &Watch) -> io::Result<String>
             }
             break;
         }
+        // A chunk-size line *is* the framing, so a size past the cap is a reply
+        // that broke where mush reads it — never an answer mush refuses.
+        // `FFFFFFFF` is what a garbled line parses to, and it is
+        // indistinguishable from an honest 4 GiB chunk: mush only ever has the
+        // claim, so it reports the claim (with the size and the cap in the
+        // words) rather than `body_too_large()`'s sentence about a body the
+        // endpoint never handed over (finding A10).
         if out.len() + size > MAX_BODY_BYTES {
-            return Err(body_too_large());
+            return Err(framing(format!(
+                "a chunk size of {size} bytes would put the body past the {MAX_BODY_BYTES}-byte body cap"
+            )));
         }
         out.extend_from_slice(&read_chunk_bytes(reader, size, watch)?);
         read_chunk_terminator(reader, watch)?;
@@ -1963,6 +1991,50 @@ mod tests {
         }
     }
 
+    /// A chunk-size line *is* the framing, so a size that claims past
+    /// [`MAX_BODY_BYTES`] is a reply breaking where mush reads it — never the
+    /// endpoint's refusal. A garbled line that still parses as hex
+    /// (`FFFFFFFF`, just under 4 GiB) is indistinguishable from an honest
+    /// chunk that size, and mush only ever has the claim: `body_too_large()`
+    /// said the endpoint had sent a body of 83886080 bytes, blaming a healthy
+    /// endpoint for a flaky proxy's line (finding A10). The `Content-Length`
+    /// half stays a refusal, pinned by `an_oversized_body_is_refused`.
+    #[test]
+    fn a_chunk_size_claim_past_the_cap_is_framing_not_the_endpoints_refusal() {
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(wire(
+            &written,
+            &["HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nFFFFFFFF\r\nhello\r\n0\r\n\r\n"],
+        ));
+        let mut opener = move |_host: &str, _port: u16, _tls: bool, _watch: &Watch<'_>| match queue
+            .pop_front()
+        {
+            Some(wire) => Ok(Box::new(wire) as Box<dyn ReadWrite>),
+            None => Err(io::Error::new(
+                io::ErrorKind::ConnectionRefused,
+                "the test scripted no more connections",
+            )),
+        };
+        let pool = Pool::new();
+        let error = send(
+            &pool,
+            &mut opener,
+            "http://models.test:8078/v1/chat/completions",
+            "{}",
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(is_framing(&error), "a chunk-size claim is framing: {error}");
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "a chunk size of 4294967295 bytes would put the body past the {MAX_BODY_BYTES}-byte body cap"
+            ),
+            "the claim names the size it read and the cap it passed"
+        );
+    }
+
     /// A Stop that lands while a chunked body is arriving abandons the reply
     /// where it stands, and the abandoned body is **not** what waits in the
     /// pool for the next request: the connection is dropped, and the next call
@@ -2585,7 +2657,13 @@ mod tests {
     }
 
     /// A body past the cap is refused while it is being read, however honest
-    /// the framing is.
+    /// the framing is — and this is the half that stays a refusal: the size is
+    /// the answer's own, written in the endpoint's `Content-Length`, so the
+    /// endpoint is the one that framed a body that large and mush is the one
+    /// saying no. The chunked half is *not* a refusal — a chunk-size line is
+    /// the framing — and is pinned by
+    /// `a_chunk_size_claim_past_the_cap_is_framing_not_the_endpoints_refusal`
+    /// (finding A10).
     #[test]
     fn an_oversized_body_is_refused() {
         use std::io::Write as _;
@@ -2597,7 +2675,9 @@ mod tests {
             if let Ok((mut connection, _)) = listener.accept() {
                 let mut scratch = [0u8; 1024];
                 let _ = connection.read(&mut scratch);
-                // Announced length, and a chunked variant; neither body is sent.
+                // An announced length past the cap, with no body behind it:
+                // the refusal is the number's, so the read stops before a byte
+                // of the body has to arrive.
                 let _ = connection.write_all(
                     format!(
                         "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
@@ -2614,6 +2694,14 @@ mod tests {
         let started = Instant::now();
         let error = get_json(&url, None, Duration::from_secs(5)).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData, "{error}");
+        assert!(
+            !is_framing(&error),
+            "the endpoint's own size is a refusal, not framing: {error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            format!("the response body is larger than {MAX_BODY_BYTES} bytes"),
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
     }
 

@@ -68,20 +68,23 @@ pub enum ModelError {
     /// again deliberately.
     Transport(String),
     /// The reply's framing broke before its body could be read: a status line
-    /// or `Content-Length` that is not one, a chunk size that is not hex, a
-    /// chunk terminator the framing did not promise. [`http`] raises these, and
-    /// they are *not* an answer the endpoint chose — nothing of the reply was
-    /// handed over. Final like [`ModelError::Transport`] and for the same
-    /// reason: the request went out whole, so the endpoint may already have
+    /// or `Content-Length` that is not one, a chunk size that is not hex or
+    /// that claims past `http`'s cap, a chunk terminator the framing did not
+    /// promise. [`http`] raises these, and they are *not* an answer the
+    /// endpoint chose — nothing of the reply was handed over. Final like
+    /// [`ModelError::Transport`] and for the same reason: the request went out
+    /// whole, so the endpoint may already have
     /// read it and answered it (finding A2). The connection that carried the
     /// broken frame is dropped rather than kept, so a later ask never reads the
     /// same leftover framing (finding B27).
     Framing(String),
     /// The endpoint answered, but its reply was refused before it could be
-    /// read: a body past `http`'s cap, or a response head past it. A malformed
-    /// status line or chunk line is *not* here — those are
+    /// read: a body whose `Content-Length` — or whose whole length, when it
+    /// ends with the stream — is past `http`'s cap, or a response head past it.
+    /// A malformed status line or chunk line is *not* here — those are
     /// [`ModelError::Framing`], a reply that broke on the way in rather than an
-    /// answer.
+    /// answer; neither is a chunk-size line claiming past the cap, which is the
+    /// framing itself and never the body (finding A10).
     Refused(String),
     /// The endpoint answered with a status other than 200. `body` is what it
     /// said, verbatim: the caller reads the endpoint's own complaint out of it
