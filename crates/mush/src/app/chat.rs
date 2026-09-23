@@ -48,7 +48,7 @@
 //! tall has no row to spend on saying what it is hiding, or that the human has
 //! scrolled away from the bottom.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -936,6 +936,22 @@ pub struct Chat {
     /// provenance, and the pane then reads what it can from the lines themselves
     /// ([`unrecorded`]).
     spoken: HashMap<AgentId, HashMap<usize, Voice>>,
+    /// Each painted tool call's one-word reading, keyed like [`Self::spoken`]:
+    /// the agent, then the index of the line it sits in, then the call's place
+    /// in that line's batch.
+    ///
+    /// A label shows at most [`LABEL_ARGS`] columns, but reading it is a full
+    /// parse of the model's argument JSON (`agent::summarize_args`), and that
+    /// JSON is unbounded — H45/H46 removed the caps on a `write_file`'s
+    /// `content` — so one 2 MB call cost 104.9 ms *per frame*, in a debug
+    /// build (finding A13). The argument text cannot change once the call is
+    /// recorded, so the reading is stored where the transcript it belongs to
+    /// lives, and dropped on the three roads [`Self::spoken`] is: a
+    /// replacement, a forget, a clear. An append moves no index and keeps it.
+    /// The value is already cut to [`LABEL_ARGS`] columns, the most any pane
+    /// can show, because a second cut to the pane's own budget is the same cut
+    /// the whole value would have taken.
+    summaries: RefCell<HashMap<AgentId, HashMap<usize, Vec<String>>>>,
     /// Each agent's transcript revision: a monotone counter of the changes the
     /// UI's copy of that agent has taken — one per appended line, one per
     /// wholesale replacement, and one per draft an attach client set. `read`
@@ -997,6 +1013,7 @@ impl Chat {
             reading: HashMap::new(),
             select: None,
             spoken: HashMap::new(),
+            summaries: RefCell::new(HashMap::new()),
             revisions: HashMap::new(),
             pending: None,
             reasoning: true,
@@ -1182,6 +1199,10 @@ impl Chat {
     pub fn replace_transcript(&mut self, agent: AgentId, messages: Vec<Message>) {
         let prior = self.revision(agent);
         self.spoken.remove(&agent);
+        // The readings are keyed by the indices of the transcript that just
+        // went, exactly as the voices are: a stale one would label a message
+        // with another call's arguments (see the field).
+        self.summaries.borrow_mut().remove(&agent);
         // A hold is a position in the transcript that just went, and a fold is
         // a new transcript: the pane reads it from the bottom (finding D15).
         self.reading.remove(&agent);
@@ -1321,6 +1342,7 @@ impl Chat {
         // mode that survives Ctrl-N would be a cursor over nothing.
         self.select = None;
         self.spoken.clear();
+        self.summaries.borrow_mut().clear();
         self.pending = None;
         // The road back goes with the conversation the loss was in: a Ctrl-N
         // that handed a keystroke a draft from the chat that just went would be
@@ -1378,6 +1400,7 @@ impl Chat {
         self.agents.remove(&agent);
         self.systems.remove(&agent);
         self.spoken.remove(&agent);
+        self.summaries.borrow_mut().remove(&agent);
         self.revisions.remove(&agent);
         self.reading.remove(&agent);
         self.notices.retain(|notice| notice.agent != agent);
@@ -2212,10 +2235,35 @@ impl Chat {
         (body, cut)
     }
 
+    /// The one-word reading of every tool call in one message, computed once
+    /// per call and kept for the life of the transcript entry.
+    ///
+    /// This is the reading [`tool_label`] paints, and it is a full parse of the
+    /// argument JSON: the parse and the cut to the pane's columns are what cost
+    /// a frame, and the parse is by far the larger half (finding A13). The
+    /// argument text cannot change once the call is recorded, so the reading is
+    /// taken here, on the first frame that paints the call, and never again —
+    /// the field's own doc has the invalidation rules.
+    fn call_summaries(&self, on: AgentId, index: usize, message: &Message) -> Vec<String> {
+        let mut cached = self.summaries.borrow_mut();
+        let by_index = cached.entry(on).or_default();
+        if let Some(read) = by_index.get(&index) {
+            return read.clone();
+        }
+        let read: Vec<String> = message
+            .tool_calls()
+            .iter()
+            .map(|call| truncate(&summarize_args(&call.function.arguments), LABEL_ARGS))
+            .collect();
+        by_index.insert(index, read.clone());
+        read
+    }
+
     /// One message's rows, with the message and stop each came from.
     fn chunk(&self, on: AgentId, index: usize, width: usize) -> Chunk {
         let message = &self.transcript(on)[index];
         let voice = self.voice_at(on, index, message);
+        let summaries = self.call_summaries(on, index, message);
         let mut lines = Vec::new();
         let rows = render_message(
             &mut lines,
@@ -2224,6 +2272,7 @@ impl Chat {
             width,
             self.reasoning,
             self.painted_fold(),
+            &summaries,
         );
         debug_assert_eq!(lines.len(), rows.len(), "one map entry per painted row");
         Chunk {
@@ -2705,19 +2754,26 @@ const FAILED: &str = "error:";
 /// path was cut mid-word with the `…` that says so falling outside the border.
 /// The name is never the part that goes: a row too narrow for both keeps the
 /// name.
-fn tool_label(call: &mush_core::ToolCall, width: usize) -> String {
+///
+/// `summary` is the reading [`Chat::call_summaries`] remembers, and `None` — a
+/// caller painting a message without a `Chat` in hand — takes the same reading
+/// itself. Either way the reading is what `agent::summarize_args` gives, cut to
+/// [`LABEL_ARGS`] first, because the cached copy is stored at that width and a
+/// second cut to the pane's budget is the same cut (finding A13).
+fn tool_label(call: &mush_core::ToolCall, width: usize, summary: Option<&str>) -> String {
     // `agent::summarize_args` is the same reading the tree shows.
     let head = format!("  ⚙ {} ", call.function.name);
     let budget = LABEL_ARGS.min(width.saturating_sub(head.width()));
     if budget < MIN_BODY {
         return head.trim_end().to_string();
     }
-    format!(
-        "{head}{}",
-        truncate(&summarize_args(&call.function.arguments), budget)
-    )
-    .trim_end()
-    .to_string()
+    let summary = match summary {
+        Some(summary) => summary.to_string(),
+        None => truncate(&summarize_args(&call.function.arguments), LABEL_ARGS),
+    };
+    format!("{head}{}", truncate(&summary, budget))
+        .trim_end()
+        .to_string()
 }
 
 /// The rows of one turn's `reasoning_content`, or none at all.
@@ -3379,7 +3435,11 @@ fn folded_marked(
 ///
 /// `reasoning` is the pane's `Ctrl-T` choice and `fold` the pane's [`Fold`] —
 /// how much of each kind of block it paints. Both are threaded in rather than
-/// read off a `Chat` this free function has no handle on.
+/// read off a `Chat` this free function has no handle on. `summaries` is the
+/// same kind of threading for the tool-call labels: one entry per entry of
+/// `message.tool_calls()`, the reading [`Chat::call_summaries`] cached, and
+/// empty for a caller that has no cache — the label path then takes the
+/// reading itself, which is what the cache would have stored.
 fn render_message(
     out: &mut Vec<Line<'static>>,
     message: &Message,
@@ -3387,6 +3447,7 @@ fn render_message(
     width: usize,
     reasoning: bool,
     fold: Fold,
+    summaries: &[String],
 ) -> Vec<Option<Stop>> {
     let start = out.len();
     let mut rows: Vec<Option<Stop>> = Vec::new();
@@ -3452,9 +3513,9 @@ fn render_message(
                     View::Markdown,
                 );
             }
-            for call in message.tool_calls() {
+            for (at, call) in message.tool_calls().iter().enumerate() {
                 out.push(Line::from(Span::styled(
-                    tool_label(call, width),
+                    tool_label(call, width, summaries.get(at).map(String::as_str)),
                     Style::default().fg(Color::Yellow),
                 )));
                 rows.push(None);
@@ -3675,7 +3736,7 @@ mod tests {
         fold: Fold,
     ) -> Vec<Line<'static>> {
         let mut lines = Vec::new();
-        render_message(&mut lines, message, voice, width, reasoning, fold);
+        render_message(&mut lines, message, voice, width, reasoning, fold, &[]);
         lines
     }
 
@@ -4563,6 +4624,67 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A tool call's arguments are read once, not once per frame: the label a
+    /// frame paints is the reading the call was recorded with, and a call whose
+    /// argument JSON is unbounded — H45/H46 left `write_file`'s `content` at
+    /// whatever the model sends — costs the pane the frame that first shows it
+    /// and no other (finding A13).
+    #[test]
+    fn a_tool_calls_arguments_are_read_once_not_once_per_frame() {
+        let mut chat = Chat::bare();
+        let call = |arguments: &str| mush_core::ToolCall {
+            id: "call_1".into(),
+            kind: "function".into(),
+            function: mush_core::FunctionCall {
+                name: "write_file".into(),
+                arguments: arguments.into(),
+            },
+        };
+        let big = format!(r#"{{"path":"a.txt","content":"{}"}}"#, "x".repeat(1 << 20));
+        chat.push_message(
+            AgentId::ROOT,
+            Message {
+                role: "assistant".into(),
+                tool_calls: Some(vec![call(&big)]),
+                ..Default::default()
+            },
+        );
+        let first = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 120, 4)).join("\n");
+        assert!(first.contains("a.txt"), "the label is the path: {first:?}");
+
+        // The arguments behind the pane change — a state no transcript road
+        // writes, and the only way to tell a re-read from a stored reading.
+        if let Some(calls) = chat
+            .root
+            .last_mut()
+            .and_then(|message| message.tool_calls.as_mut())
+        {
+            calls[0].function.arguments = r#"{"path":"somewhere/else.rs"}"#.into();
+        }
+        let second = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 120, 4)).join("\n");
+        assert_eq!(
+            first, second,
+            "the frame paints the reading the call was recorded with"
+        );
+
+        // A replacement is a new transcript, and the readings keyed by the old
+        // one's indices go with it: the same index in the new transcript must
+        // not answer with the call that used to sit there.
+        chat.replace_transcript(
+            AgentId::ROOT,
+            vec![Message {
+                role: "assistant".into(),
+                tool_calls: Some(vec![call(r#"{"path":"new.rs"}"#)]),
+                ..Default::default()
+            }],
+        );
+        let replaced = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 120, 4)).join("\n");
+        assert!(
+            replaced.contains("new.rs") && !replaced.contains("a.txt"),
+            "a replaced transcript is read on its own: {replaced:?}"
+        );
     }
 
     /// A truncated label says it was truncated. The arguments are budgeted the
@@ -6029,7 +6151,7 @@ mod tests {
         let source = "# Steps\n\n- **run** `cargo test`\n\nsee [the docs](https://example.com/a)";
         let message = Message::assistant(source);
         let mut rows = Vec::new();
-        render_message(&mut rows, &message, None, 60, false, Fold::DEFAULT);
+        render_message(&mut rows, &message, None, 60, false, Fold::DEFAULT, &[]);
         assert_eq!(
             shown(&rows),
             vec![
@@ -6089,6 +6211,7 @@ mod tests {
             60,
             false,
             Fold::DEFAULT,
+            &[],
         );
         assert_eq!(
             shown(&rows),
@@ -6119,6 +6242,7 @@ mod tests {
             80,
             false,
             Fold::DEFAULT,
+            &[],
         );
         assert_eq!(shown(&rows)[0], format!("you › {source}"));
 
@@ -6150,7 +6274,7 @@ mod tests {
         let message = Message::assistant(text);
         for width in [10usize, 12, 14, 20, 33, 40, 80] {
             let mut rows = Vec::new();
-            render_message(&mut rows, &message, None, width, false, Fold::DEFAULT);
+            render_message(&mut rows, &message, None, width, false, Fold::DEFAULT, &[]);
             let painted = shown(&rows);
             for row in &painted {
                 assert!(
