@@ -3962,6 +3962,24 @@ impl App {
         true
     }
 
+    /// A signal — the terminal closing, a session manager's stop, an IDE's stop
+    /// button — takes the quit road, at once and without the arming press.
+    ///
+    /// `Ctrl-Q` warns first when work is live because the human is at the
+    /// keyboard and a second press is still theirs to make ([`Self::request_quit`]).
+    /// A signal has no second press to offer: the process is the thing being
+    /// signalled, and the road it must not take is the kernel's default, which
+    /// kills mush before any `Drop` runs and leaves every process group and the
+    /// attach socket behind (finding E1). What this costs is exactly what a
+    /// *confirmed* `Ctrl-Q` costs — the in-flight turn dies, and the exit flush
+    /// writes what the debounce had not — so the flag becomes `should_quit`
+    /// directly. This is not `request_quit`: nothing here can be an accident of
+    /// a stray keystroke, and a signal that is refused for want of a second
+    /// press would not be a signal at all.
+    pub fn signal_quit(&mut self) {
+        self.should_quit = true;
+    }
+
     /// `Ctrl-Q` (and `/quit`): leave — but never silently over live work.
     ///
     /// The exit kills the agents' process groups (finding H9): a model call in
@@ -4394,11 +4412,11 @@ impl App {
 
 impl Drop for App {
     /// The exit flush: whatever the debounce had not written yet goes out here,
-    /// so quitting — the one way out of the event loop — costs nothing. This is
-    /// what bounds a crash to `SESSION_DEBOUNCE` of streamed chat rather than to
-    /// everything since the last boundary. A failure here is reported the usual
-    /// way and then lost with the status line: there is no screen left to read
-    /// it on.
+    /// so ending mush — a clean quit, and every signal that takes this road
+    /// (`main::take_signal_quit`) — costs nothing. This is what bounds a crash
+    /// to `SESSION_DEBOUNCE` of streamed chat rather than to everything since
+    /// the last boundary. A failure here is reported the usual way and then lost
+    /// with the status line: there is no screen left to read it on.
     fn drop(&mut self) {
         if self.session_dirty_at.is_some() {
             self.flush_session();
@@ -9172,6 +9190,33 @@ mod tests {
         ctrl(&mut app, 'q');
 
         assert!(app.should_quit, "the second one is the quit");
+    }
+
+    /// A signal is not a key: it cannot be pressed twice, so it does not wait
+    /// for a second press. The handler sets the flag, the loop's step reads it
+    /// and quits — with live work, and no arm in between (finding E1).
+    ///
+    /// This is the one test in the binary that raises one of the three signals,
+    /// deliberately: once the flag is set, a second signal would take the
+    /// conditional default road and kill the test process (see `signals`).
+    #[test]
+    fn a_signal_takes_the_quit_road_without_the_arming_press() {
+        let _signals = crate::signals::install().expect("the handlers install");
+        let (mut app, _rx) = test_app("quit-signal");
+        app.chat.insert("do the thing");
+        app.send_message();
+        assert!(app.busy(), "there is work a quit would kill");
+
+        ctrl(&mut app, 'q');
+        assert!(!app.should_quit, "Ctrl-Q warns first");
+        assert!(app.quit_armed(), "and the warning is on the line");
+
+        signal_hook::low_level::raise(signal_hook::consts::SIGTERM).expect("the signal is raised");
+        assert!(
+            crate::take_signal_quit(&mut app),
+            "the handler set the flag, and the loop's step reads it"
+        );
+        assert!(app.should_quit, "and the signal quits at once");
     }
 
     /// A detached job is work in flight too, and it is a process group the old

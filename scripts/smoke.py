@@ -7,9 +7,9 @@ makes them the only test that covers the whole path — keys, agent loop, tool
 execution, atomic writes, and session persistence.
 
 Usage:
-    python3 scripts/smoke.py [BINARY] [WORKDIR] [--agent|--resize|--cancel|--lock]
+    python3 scripts/smoke.py [BINARY] [WORKDIR] [--agent|--resize|--cancel|--sigterm|--lock]
 
-The resize and cancel scenarios need no model endpoint; the others do.
+The resize, cancel and sigterm scenarios need no model endpoint; the others do.
 
 Defaults to ./target/debug/mush and a fresh directory under /tmp.
 Requires a reachable model endpoint (see the MUSH_URL / MUSH_MODEL variables).
@@ -17,6 +17,7 @@ Requires a reachable model endpoint (see the MUSH_URL / MUSH_MODEL variables).
 
 import argparse
 import fcntl
+import json
 import os
 import pathlib
 import pty
@@ -359,6 +360,192 @@ def scenario_cancel(binary: str, root: pathlib.Path) -> bool:
     return all(results)
 
 
+def scenario_sigterm(binary: str, root: pathlib.Path) -> bool:
+    """SIGTERM must take the same road as a confirmed Ctrl-Q.
+
+    A killed mush used to run no destructor at all: the last messages of the
+    session were lost with the debounce, every process group it started stayed
+    alive — the build holding `target/`, the server holding a port — and
+    `.mush/mush.sock`, which is removed by exactly one `Drop`, survived as the
+    proof that *nothing* was cleaned up (finding E1).
+
+    The job is a real detached `sleep 600; touch marker`; the model is a fake
+    endpoint that asks for it and then answers with a sentence the debounce (a
+    minute) has not written yet. `kill -TERM` on the mush pid, and all four
+    facts are asserted: the job's group is gone within a bounded wait, the
+    marker was never created, the sentence is in `session.json`, and the socket
+    is gone.
+    """
+    print(f"\n== sigterm == {root}")
+    marker = root / "marker"
+    message = "the answer the debounce had not written"
+    command = f"sleep 600; touch {marker}"
+
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    port = listener.getsockname()[1]
+    state = {"chats": 0}
+
+    env = {
+        "MUSH_URL": f"http://127.0.0.1:{port}",
+        "MUSH_PROVIDER": "custom",
+        "MUSH_MODEL": "probe",
+    }
+    # Fork the TUI before any thread exists, as the cancel scenario explains.
+    tui = Tui(binary, root, rows=30, cols=110, env_extra=env)
+
+    def reply(connection, payload: bytes):
+        connection.sendall(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+            b"Content-Length: " + str(len(payload)).encode() + b"\r\n\r\n" + payload
+        )
+        connection.close()
+
+    def handle(connection):
+        request = connection.recv(65536)
+        if b"/models" in request:
+            reply(connection, b'{"object":"list","data":[{"id":"probe"}]}')
+            return
+        state["chats"] += 1
+        if state["chats"] == 1:
+            arguments = json.dumps({"command": command, "detach": True})
+            reply(
+                connection,
+                b'{"choices":[{"message":{"role":"assistant","content":null,'
+                b'"tool_calls":[{"id":"call_1","type":"function","function":'
+                b'{"name":"run_command","arguments":'
+                + json.dumps(arguments).encode()
+                + b"}}]},\"finish_reason\":\"tool_calls\"}]}",
+            )
+        else:
+            reply(
+                connection,
+                b'{"choices":[{"message":{"role":"assistant","content":'
+                + json.dumps(message).encode()
+                + b'},"finish_reason":"stop"}]}',
+            )
+
+    def endpoint():
+        while True:
+            try:
+                connection, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=handle, args=(connection,), daemon=True).start()
+
+    threading.Thread(target=endpoint, daemon=True).start()
+    tui.pump(1.5)
+    tui.send("start the long job\r", settle=0.5)
+
+    # The job exists once `sh -c <command>` is running; it is the group leader,
+    # so its pid is the pgid whose end the signal must bring.
+    job_pgid = None
+    deadline = time.time() + 20
+    while time.time() < deadline and job_pgid is None:
+        tui.pump(0.3)
+        job_pgid = find_job_group(command)
+
+    # The second chat means the tool result is in the transcript and the fake
+    # model is answering; the sentence on screen means it is in the conversation.
+    deadline = time.time() + 20
+    while state["chats"] < 2 and time.time() < deadline:
+        tui.pump(0.2)
+    deadline = time.time() + 20
+    while message.encode() not in bytes(tui.captured) and time.time() < deadline:
+        tui.pump(0.2)
+
+    session = root / ".mush" / "session.json"
+    socket_path = root / ".mush" / "mush.sock"
+    stored_before = session.read_text() if session.exists() else ""
+    socket_before = socket_path.exists()
+
+    os.kill(tui.proc.pid, signal.SIGTERM)
+    try:
+        exit_code = tui.proc.wait(timeout=10)
+    except subprocess.TimeoutExpired:
+        tui.proc.kill()
+        exit_code = None
+
+    # A bounded wait for the group: the kill of every job happens in `Drop`,
+    # which is before the process is gone, so this is a formality — and the
+    # thing the finding was about.
+    deadline = time.time() + 5
+    while time.time() < deadline and group_alive(job_pgid):
+        time.sleep(0.1)
+
+    stored = session.read_text() if session.exists() else ""
+    results = [
+        check(
+            "the debounce had not written the answer yet",
+            message not in stored_before,
+            f"{len(stored_before)} bytes in session.json before the signal",
+        ),
+        check("the socket was there to be cleaned up", socket_before),
+        check("the signal still exits cleanly", exit_code == 0, f"exit {exit_code}"),
+        check(
+            "the job's process group is gone",
+            not group_alive(job_pgid),
+            f"pgid {job_pgid} still holds {group_members(job_pgid)}",
+        ),
+        check("the marker was never created", not marker.exists()),
+        check("the exit flush wrote the answer", message in stored),
+        check("the attach socket is gone", not socket_path.exists()),
+    ]
+    if not all(results):
+        print(tui.tail())
+    # Reap anything the assertions found alive, so a failure does not leak the
+    # very ghost the finding is about.
+    if job_pgid is not None and group_alive(job_pgid):
+        try:
+            os.killpg(job_pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+    try:
+        listener.close()
+    except OSError:
+        pass
+    return all(results)
+
+
+def find_job_group(command: str) -> int:
+    """The pgid of a live `sh -c <command>`, or None while it is not up yet."""
+    wanted = "sh -c " + command
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                argv = handle.read().replace(b"\0", b" ").decode(errors="replace").strip()
+        except OSError:
+            continue
+        if argv == wanted:
+            return int(entry)
+    return None
+
+
+def group_members(pgid: int) -> list:
+    """Every live process in one group, as (pid, command)."""
+    members = []
+    for entry in os.listdir("/proc"):
+        if not entry.isdigit():
+            continue
+        try:
+            with open(f"/proc/{entry}/stat", "rb") as handle:
+                fields = handle.read().rsplit(b")", 1)[1].split()
+            if int(fields[2]) == pgid:
+                with open(f"/proc/{entry}/cmdline", "rb") as handle:
+                    members.append(handle.read().replace(b"\0", b" ").decode(errors="replace").strip())
+        except (OSError, IndexError, ValueError):
+            continue
+    return members
+
+
+def group_alive(pgid: int) -> bool:
+    return pgid is not None and bool(group_members(pgid))
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="mush end-to-end smoke tests")
     parser.add_argument("binary", nargs="?", default="target/debug/mush")
@@ -366,6 +553,7 @@ def main() -> int:
     parser.add_argument("--agent", action="store_true", help="run only the agent scenario")
     parser.add_argument("--resize", action="store_true", help="run only the resize scenario")
     parser.add_argument("--cancel", action="store_true", help="run only the cancel scenario")
+    parser.add_argument("--sigterm", action="store_true", help="run only the sigterm scenario")
     parser.add_argument("--lock", action="store_true", help="run only the lock scenario")
     args = parser.parse_args()
 
@@ -374,7 +562,7 @@ def main() -> int:
         print(f"binary not found: {binary}", file=sys.stderr)
         return 2
 
-    chosen = [args.agent, args.resize, args.cancel, args.lock]
+    chosen = [args.agent, args.resize, args.cancel, args.sigterm, args.lock]
     both = not any(chosen)
     base = pathlib.Path(args.workdir)
     passed = True
@@ -384,6 +572,8 @@ def main() -> int:
         passed &= scenario_resize(binary, base / "resize")
     if both or args.cancel:
         passed &= scenario_cancel(binary, base / "cancel")
+    if both or args.sigterm:
+        passed &= scenario_sigterm(binary, base / "sigterm")
     # Last, and not only because it is cheap: it needs the workspace to itself.
     if both or args.lock:
         passed &= scenario_lock(binary, base / "lock")

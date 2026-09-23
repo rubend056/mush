@@ -23,7 +23,13 @@ unicode-truncate.workspace = true
 # `flock(2)` for the one-mush-per-workspace lock. The workspace forbids
 # `unsafe`, so the syscall comes from a safe wrapper rather than a hand-written
 # `extern "C"`; rustix is already in the tree under tempfile and rustls.
-rustix = { version = "1", features = ["fs"] }
+rustix = { version = "1", features = ["fs", "process"] }
+# The signal road: a handler that only sets a flag the event loop reads, so a
+# killed mush ends through the same cleanup `Ctrl-Q` runs (finding E1). Not a
+# new crate in the build — crossterm already links `signal-hook` — and the road
+# `rustix` cannot offer safely: its `sigaction` is `unsafe`, `doc(hidden)` and
+# documented as unusable beside libc, and this workspace forbids `unsafe`.
+signal-hook = "0.3"
 # TLS so hosted https endpoints (e.g. DeepSeek) work; the HTTP client itself
 # stays hand-rolled and blocking.
 rustls = "0.23"
