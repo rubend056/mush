@@ -503,9 +503,12 @@ struct Selecting {
     /// `top` is: the frame publishes it as it paints, and the keys read it. It
     /// is the pane's width, not the terminal's (the painter caps it at
     /// `MAX_TRANSCRIPT`), so the boundary this measures is the boundary the
-    /// painter painted. `None` is a mode no pane has painted yet: no line is
-    /// then known hidden, and every source line is a stop — the reading that
-    /// cannot lose a line the pane would have shown.
+    /// painter painted. `None` is a mode no pane has painted yet — and the
+    /// state [`Chat::forget_select_measure`] leaves when the terminal changed
+    /// size between frames, because the pane *that* frame painted is not the
+    /// pane the next one will (finding PM5): either way no line is then known
+    /// hidden, and every source line is a stop — the reading that cannot lose
+    /// a line the pane would have shown.
     measure: Cell<Option<usize>>,
     /// The pane's window: which message row `top.0`'s chunk starts at, and how
     /// many rows of it the window drops (`top.1`).
@@ -1933,6 +1936,23 @@ impl Chat {
     /// clamp, the step and the copy all draw the fold's boundary the same way.
     fn measure(&self) -> Option<usize> {
         self.select.as_ref().and_then(|select| select.measure.get())
+    }
+
+    /// The terminal changed size between two frames: the width the last frame
+    /// painted is the *old* pane's, and the keys of the drain the resize
+    /// arrived in must not step by it (finding PM5).
+    ///
+    /// `App::set_term_size` calls this before it asks the coming frame's own
+    /// derivation to publish the new measure, so a key that arrives in the
+    /// same drain steps at the size about to be painted. When that frame
+    /// paints no transcript at all — a screen below the floor, or a pane with
+    /// no inner room — nothing republishes and the measure stays forgotten: a
+    /// step then walks source lines, the reading that cannot lose a line the
+    /// pane would have shown ([`Selecting::measure`]).
+    pub fn forget_select_measure(&mut self) {
+        if let Some(select) = self.select.as_mut() {
+            select.measure.set(None);
+        }
     }
 
     /// One message's stops at a measure, with the voice the pane paints it

@@ -46,6 +46,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::Sender;
 use ratatui::crossterm::event::KeyEvent;
+use ratatui::layout::Rect;
 
 use mush_core::config::{vision_capable, BYTES_PER_TOKEN};
 use mush_core::message::{Image, Message};
@@ -910,6 +911,16 @@ impl App {
     /// old measure and the border cut forty columns off every one of them, so
     /// the rest of a `/notes` report was unreachable until it was closed and
     /// reopened (finding D12).
+    ///
+    /// The select mode's measure is re-derived here too, and the reason is the
+    /// same shape: a key can arrive in the same drain as the resize (`main`
+    /// drains every queued event and paints once), and the mode's step reads
+    /// the width the *pane will paint* — not the width the last frame painted,
+    /// which is a different pane at a different size. One `↓` after a widening
+    /// stepped from the narrow pane's last line onto its `…`, the new frame
+    /// painted the cursor after eight lines, and `↑` could not walk back
+    /// (finding PM5). The coming frame's own derivation is the one road that
+    /// knows the new measure, so it is asked here.
     pub fn set_term_size(&mut self, width: u16, height: u16) {
         let rewrapped = self.term_width != width;
         self.term_width = width;
@@ -917,6 +928,14 @@ impl App {
         if rewrapped {
             self.rewrap_picker();
         }
+        // Void the measure the last frame published, then let the frame the
+        // next paint will build publish the new one: the derivation below is
+        // the same one the paint runs, so the keys and the rows cannot
+        // disagree about where the fold falls. A frame that paints no
+        // transcript publishes nothing, and the measure stays forgotten — the
+        // safe reading (`Chat::forget_select_measure`).
+        self.chat.forget_select_measure();
+        let _coming_frame = self.screen(Rect::new(0, 0, width, height));
     }
 
     /// Re-lay out the open popup for the terminal's new width.
@@ -11056,6 +11075,105 @@ mod tests {
         assert_eq!(app.focus, Focus::Chat);
         ctrl(&mut app, 'y');
         assert!(app.chat.selecting(), "the chat pane opens the mode");
+    }
+
+    /// The text of the rows one frame paints the select cursor on, for the
+    /// tests that read the mode through the frame rather than the state.
+    fn cursor_rows(screen: &Screen) -> Vec<String> {
+        let Screen::Panes(panes) = screen else {
+            return Vec::new();
+        };
+        let Some(transcript) = &panes.chat.transcript else {
+            return Vec::new();
+        };
+        let Some(select) = &transcript.select else {
+            return Vec::new();
+        };
+        let rows: Vec<String> = transcript
+            .lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        select.cursor.iter().map(|at| rows[*at].clone()).collect()
+    }
+
+    /// The audit's PM5: a resize and a key in the same drain stepped the cursor
+    /// at the measure the *last* frame painted while the frame painted at the
+    /// new size. A 30-line tool result whose rows wrap at a narrow pane has its
+    /// fold boundary at a different source line at a wide one, so one `↓` right
+    /// after the resize could leap the whole tail — and `↑` did not bring it
+    /// back, because backward from the `…` is the wide pane's last painted
+    /// line, not the line the human was on.
+    ///
+    /// The step now measures at the frame the drain is about to paint: a resize
+    /// voids the published measure in `App::set_term_size` and the coming
+    /// frame's own derivation publishes the new one before the key runs.
+    #[test]
+    fn a_resize_and_a_key_in_one_drain_step_at_the_new_measure() {
+        let (mut app, _rx) = test_app("resize-select");
+        let text = (1..=30)
+            .map(|line| format!("row{line:02} {}", "x".repeat(96)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.chat
+            .push_message(AgentId::ROOT, Message::tool("call-1", text));
+
+        // Frame one, at 40 columns: the paint publishes the measure, and the
+        // cursor is walked onto the second source line.
+        painted(&mut app, 40, 24);
+        assert!(
+            app.chat.start_select(AgentId::ROOT).is_none(),
+            "the mode is on"
+        );
+        app.chat.select_apply(AgentId::ROOT, SelectKey::First);
+        app.chat.select_apply(AgentId::ROOT, SelectKey::Move(1));
+        let at_40 = painted(&mut app, 40, 24).0;
+        assert!(
+            cursor_rows(&at_40).iter().any(|row| row.contains("row02")),
+            "the narrow pane paints the cursor on line 2: {:?}",
+            cursor_rows(&at_40)
+        );
+
+        // The resize and the key in one drain, the order `main`'s loop reads
+        // them: the Resize event first, then the key, then one paint.
+        app.set_term_size(120, 24);
+        app.chat.select_apply(AgentId::ROOT, SelectKey::Move(1));
+        let after = painted(&mut app, 120, 24).0;
+
+        // One `↓` is one source line down, and the wide pane paints it there.
+        assert!(
+            cursor_rows(&after).iter().any(|row| row.contains("row03")),
+            "one step lands on line 3: {:?}",
+            cursor_rows(&after)
+        );
+
+        // And `↑` returns: the step is reversible, which a `…` the cursor
+        // leapt onto is not (backward from it is the wide pane's last line).
+        app.chat.select_apply(AgentId::ROOT, SelectKey::Move(-1));
+        let back = painted(&mut app, 120, 24).0;
+        assert!(
+            cursor_rows(&back).iter().any(|row| row.contains("row02")),
+            "`↑` brings the cursor back to line 2: {:?}",
+            cursor_rows(&back)
+        );
+
+        // And the copy still takes the stop the pane paints the cursor on —
+        // the whole walk is pinned by `enter_copies_the_line_the_pane_painted_
+        // the_cursor_on` in `chat.rs`; this is the resize's own case.
+        let copied = app
+            .chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        assert!(
+            copied.text.starts_with("row02 "),
+            "the copy names the line the pane painted the cursor on: {:?}",
+            copied.text
+        );
     }
 
     /// A fold replaces the transcript under the select mode, and the mode must
