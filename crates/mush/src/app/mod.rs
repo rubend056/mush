@@ -1758,7 +1758,13 @@ impl App {
             return;
         };
         // Drop stale leftovers whose worktree no longer exists. Reaping takes
-        // the focus and the cursor off a ghost with them (finding B11).
+        // the focus and the cursor off a ghost with them (finding B11), and the
+        // reap's other half is here too: the node is gone from the tree, so
+        // every map keyed by its id goes with it — the transcript, the voices,
+        // the revision an attach client holds and the pane's notices — exactly
+        // as `reap_history`'s reap does. Without it a leftover reaped here kept
+        // an id-keyed entry in every `Chat` map for the life of the session
+        // (finding R16).
         let gone: Vec<AgentId> = self
             .tree
             .agents
@@ -1773,6 +1779,9 @@ impl App {
             .map(|node| node.id)
             .collect();
         self.tree.reap(&gone);
+        for id in &gone {
+            self.chat.forget(*id);
+        }
         // A name in mush's own branch namespace that [`git::worktree_id`]
         // refuses — `mush/x`, a hand-made name, or an id with no room above it
         // for the floor — is not a child's, and it is not another program's
@@ -2075,9 +2084,15 @@ impl App {
             self.save_session();
         }
         // A write that failed on the writer's thread has no caller to return
-        // to, so it is picked up here — the next tick after it happened.
+        // to, so it is picked up here — the next tick after it happened — and
+        // said the way every other failure is: the bar, the pane's notice, and
+        // the mark that makes the next save write it, so a full disk costs one
+        // snapshot rebuild per minute instead of the whole tail since the last
+        // write that landed, and `App::drop` — which flushes only while the
+        // session is dirty — still sends what the failed write owed (findings
+        // R2, R6).
         if let Some(error) = self.session_save.take_error() {
-            self.fail(format!("could not save session: {error}"));
+            self.session_save_failed(error);
         }
     }
 
@@ -2565,8 +2580,9 @@ impl App {
     /// owns because only it knows whether the bar is the place for this one.
     ///
     /// One door, so a new kind of failure cannot take two of the three and
-    /// forget the last: the run's own failure and a conversation that could not
-    /// be read are the same shape (refactor R19).
+    /// forget the last: the run's own failure, a conversation that could not be
+    /// read, and a session write that did not land are the same shape (refactor
+    /// R19, finding R6).
     fn fail_for(&mut self, id: AgentId, text: impl Into<String>, line: Option<String>) {
         let text = text.into();
         self.chat.note_error_for(id, text);
@@ -3396,6 +3412,12 @@ impl App {
                 // A new endpoint may host a different model with a different
                 // window; re-derive it unless the human stated one (finding A5).
                 let forgotten = self.switch_endpoint(&url);
+                // The endpoint is one of the fields the session stores, and the
+                // session outranks the home config on the next start
+                // (`config::resolve` reads it last), so the switch has to mark
+                // the session dirty or the next start reverts it (finding
+                // R19).
+                self.mark_session_dirty();
                 self.refresh_models();
                 let mut line = format!(
                     "endpoint: {} · {}",
@@ -3761,6 +3783,11 @@ impl App {
             return;
         };
         let forgotten = self.switch_provider(provider);
+        // What a provider writes is stored — its name, its endpoint and its
+        // model — and the session outranks the home config on the next start,
+        // so this has to mark the session dirty or the next start silently
+        // reverts the pick (finding R19).
+        self.mark_session_dirty();
         self.refresh_models();
         self.persist_user_config();
         let mut line = format!("provider: {} · {}", provider.name(), self.context_label());
@@ -3855,6 +3882,11 @@ impl App {
                 // A new model means a new documented window, unless the human
                 // stated one (finding A5).
                 self.cell.edit(|cfg| cfg.set_model(id));
+                // The model is stored, and the session outranks the home
+                // config on the next start: a pick that does not mark the
+                // session dirty is a pick the next start silently reverts
+                // (finding R19).
+                self.mark_session_dirty();
                 self.adopt_advertised_context();
                 self.persist_user_config();
                 self.say(format!(
@@ -3983,7 +4015,16 @@ impl App {
     /// what the human was reading. Written here, synchronously, for the one
     /// caller that must wait on its own copy — the clear that follows must not
     /// happen before the copy is safe ([`session::keep_previous`]).
+    ///
+    /// The store's lock gets the same gate every save passes
+    /// ([`SessionSave::store_is_mine`]): a mush whose lock's name was replaced
+    /// has no store to keep a copy *in*, and writing the copy anyway lands it in
+    /// the store the mush that now owns the workspace keeps its own
+    /// `.mush/session.json.previous` in — over the one its Ctrl-N warning points
+    /// at (finding R9). The refusal is handed back, so the key refuses the clear
+    /// and changes nothing.
     fn keep_cleared_conversation(&self) -> Result<(), String> {
+        self.session_save.store_is_mine()?;
         session::keep_previous(self.ws.root(), self.session_snapshot()).map(|_| ())
     }
 
@@ -4155,7 +4196,9 @@ impl App {
     /// streamed response must not rebuild a session, let alone write one. The
     /// mark is deliberately *not* moved by later changes — a stream that never
     /// pauses still reaches the file once per `SESSION_DEBOUNCE` instead of
-    /// being deferred until it stops.
+    /// being deferred until it stops — and a write that failed puts it back
+    /// where the failure is observed (`save_session`, `flush_session`), because
+    /// that is exactly the state the mark exists to describe (finding R2).
     fn mark_session_dirty(&mut self) {
         if self.session_dirty_at.is_none() {
             self.session_dirty_at = Some(Instant::now());
@@ -4169,6 +4212,11 @@ impl App {
     /// that cannot leave this thread — the conversation lives here — so it is
     /// paid once per `SESSION_DEBOUNCE` rather than once per streamed message,
     /// and never while a burst of them is being drained.
+    ///
+    /// The mark is cleared before the disk is known to have taken the snapshot,
+    /// because the write is on another thread; a failure re-sets it where the
+    /// tick reads the error, and the writer keeps the snapshot for a retry —
+    /// so the cleared mark is never the loss of the road (finding R2).
     fn save_session(&mut self) {
         self.session_dirty_at = None;
         let session = self.session_snapshot();
@@ -4182,13 +4230,19 @@ impl App {
     /// Nothing else waits, which is what keeps the wait off the message path: a
     /// streamed response is covered by the debounce and by the flush on the way
     /// out, so the most a crash can cost is the last `SESSION_DEBOUNCE` of chat.
+    ///
+    /// A flush that reports a failure — the deadline passed, the write failed,
+    /// the worker is gone — says it the way every other failure is said
+    /// (`session_save_failed`, which puts the mark back too): the write it
+    /// waited for did not land, the next debounce retries, and the exit flush
+    /// is not skipped for a road that was never paid (findings R2, R6).
     fn flush_session(&mut self) {
         self.session_dirty_at = None;
         let session = self.session_snapshot();
         self.session_save.save(session);
         self.session_save.flush();
         if let Some(error) = self.session_save.take_error() {
-            self.fail(format!("could not save session: {error}"));
+            self.session_save_failed(error);
         }
         // A save is a moment the state is being fixed; the repository is part
         // of that picture, so refresh it here rather than leaving the bar with
@@ -4197,6 +4251,21 @@ impl App {
         // debounced `save_session` — so this does not put a git process on the
         // message path.
         self.refresh_git();
+    }
+
+    /// A session write that did not land, said the way every other failure is.
+    ///
+    /// [`Self::fail_for`] takes the durable route — the root's pane notice, the
+    /// mark that makes the next save write it, and the bar's line — and the
+    /// frame is owed explicitly because this failure is raised from a tick: no
+    /// keystroke and no spinner beat marked one, so without it the line is set
+    /// and never painted, and the frame that is painted is the keystroke that
+    /// replaces the line. The human would read a stale workspace as saved
+    /// (finding R6).
+    fn session_save_failed(&mut self, error: String) {
+        let line = format!("could not save session: {error}");
+        self.fail_for(AgentId::ROOT, line.clone(), Some(line));
+        self.dirty_screen = true;
     }
 
     /// The conversation as it is stored: the root transcript, every subagent's,
@@ -5449,7 +5518,10 @@ impl Drop for App {
     /// (`main::take_signal_quit`) — costs nothing. This is what bounds a crash
     /// to `SESSION_DEBOUNCE` of streamed chat rather than to everything since
     /// the last boundary. A failure here is reported the usual way and then lost
-    /// with the status line: there is no screen left to read it on.
+    /// with the status line: there is no screen left to read it on. The writer
+    /// does not lose the road with it — the snapshot that failed stays with the
+    /// writer, and its own final drain, as this drop releases it, is one more
+    /// attempt (finding R2).
     fn drop(&mut self) {
         if self.session_dirty_at.is_some() {
             self.flush_session();
@@ -8050,7 +8122,7 @@ mod tests {
     #[test]
     fn a_restore_report_is_not_carried_into_the_next_session() {
         let root = repo("restore-report");
-        let stored = stored_with_rows(vec![
+        let mut stored = stored_with_rows(vec![
             (2, Some(0), "first", "the first row's line"),
             (2, Some(0), "second", "the second row's line"),
         ]);
@@ -12210,6 +12282,96 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// The failure must not consume the road it was on: a write that failed
+    /// did not put the conversation on disk, so the mark goes back on when the
+    /// tick reports it — and `App::drop`, which flushes only while the session
+    /// is dirty, still sends what the failed write owed (finding R2).
+    #[test]
+    fn a_failed_background_write_leaves_the_mark_for_the_exit_flush() {
+        use session_save::fake::Recorder;
+
+        let recorder = Recorder::new().fails("no space left on device");
+        let root = dir("failed-exit-flush");
+        let (mut app, _rx) = app_root(&root, None, recorder.clone());
+        streamed(&mut app, "lost");
+
+        age_session(&mut app, SESSION_DEBOUNCE);
+        app.tick(); // hands the snapshot over and clears the mark
+        app.tick(); // takes the failure
+        assert!(
+            app.session_dirty_at.is_some(),
+            "the failed write re-armed the mark, not just the bar line"
+        );
+
+        drop(app);
+        assert_eq!(
+            recorder.len(),
+            2,
+            "the exit flush went out: the debounce's hand-over and the drop's"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The same for a flush, the road whose whole promise is "this must not be
+    /// lost": a flush that reports a failure leaves the mark on, so the
+    /// debounce and the exit flush both still owe the write (finding R2). The
+    /// bar is not asserted here: this arm's own ack is said after the flush and
+    /// is what the human reads (IN12's road, not this one) — the *mark* is the
+    /// fact a failed flush owns.
+    #[test]
+    fn a_failed_flush_leaves_the_mark_for_the_next_road() {
+        use session_save::fake::Recorder;
+
+        let recorder = Recorder::new().fails("no space left on device");
+        let root = dir("failed-flush");
+        let (mut app, _rx) = app_root(&root, None, recorder);
+        // `/context` is one of the commands that must not be lost: its arm
+        // writes the workspace and flushes.
+        run(&mut app, "/context 32768");
+
+        assert!(
+            app.session_dirty_at.is_some(),
+            "the flush did not get the write, and the mark is still owed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The save failure is raised from a tick, where no keystroke and no
+    /// spinner beat marked a frame owed: it has to mark one itself, and it takes
+    /// the durable route every other failure takes — the bar's line, the pane's
+    /// notice (`/notes`), and the mark that makes the next save write it
+    /// (finding R6).
+    #[test]
+    fn a_save_failure_is_painted_and_kept_in_the_notes() {
+        use session_save::fake::Recorder;
+
+        let recorder = Recorder::new().fails("no space left on device");
+        let root = dir("failed-visible");
+        let (mut app, _rx) = app_root(&root, None, recorder);
+        streamed(&mut app, "lost");
+        age_session(&mut app, SESSION_DEBOUNCE);
+
+        // The failure is taken by the tick that hands the snapshot over (the
+        // fake answers the first poll; on a real writer it is the worker's
+        // error, taken by the tick after) — and that tick is the one that owes
+        // the frame, because on an idle app nothing else does.
+        app.dirty_screen = false;
+        app.tick();
+        assert!(app.dirty_screen, "the failure owes the frame that shows it");
+        assert_eq!(
+            app.status.as_ref().map(|status| status.kind),
+            Some(StatusKind::Error)
+        );
+        let stored = app.chat.stored_notices();
+        assert!(
+            stored
+                .iter()
+                .any(|notice| notice.text.contains("could not save session")),
+            "the failure is one a restart can hold: {stored:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// How long one frame costs on a session the size of a real one.
     ///
     /// `#[ignore]`d on purpose: the 16 ms budget is a property of an *idle* box,
@@ -14832,6 +14994,134 @@ mod tests {
             "and the bar names the provider that was picked: {}",
             text_of(&app)
         );
+    }
+
+    /// The snapshot a command's own choice left for the debounce: the app is
+    /// aged to the debounce and ticked, and the file the writer was handed is
+    /// read back. What a pick has to leave behind is a *stored* field, not a
+    /// mark — the session outranks the home config on the next start
+    /// (`config::resolve` reads it last), so only the file can prove the
+    /// choice survives (finding R19).
+    fn stored_after(label: &str, command: impl FnOnce(&mut App)) -> Arc<Session> {
+        let (mut app, recorder) = app_recording(label);
+        command(&mut app);
+        age_session(&mut app, SESSION_DEBOUNCE);
+        app.tick();
+        let saved = recorder.saved();
+        assert_eq!(
+            saved.len(),
+            1,
+            "the choice must reach the debounce: nothing was handed over"
+        );
+        saved[0].clone()
+    }
+
+    /// A model picked with `/model` is one of the fields the session stores —
+    /// and the session outranks the home config on the next start — so a pick
+    /// that does not mark the session dirty is a pick the next start silently
+    /// reverts (finding R19).
+    #[test]
+    fn a_picked_model_is_marked_for_the_session_file() {
+        isolate_user_config();
+        let stored = stored_after("picked-model", |app| {
+            app.update(Msg::Models {
+                endpoint: "http://127.0.0.1:1".to_string(),
+                models: vec![
+                    http::Model {
+                        id: "test-model".to_string(),
+                        context: None,
+                    },
+                    http::Model {
+                        id: "picked".to_string(),
+                        context: None,
+                    },
+                ],
+            });
+            run(app, "/model");
+            // The cursor opens on the model in use; the row below it is the pick.
+            app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        });
+        assert_eq!(
+            stored.model, "picked",
+            "the file carries the model that was picked"
+        );
+    }
+
+    /// The same for `/provider`: the name it writes is stored, and a provider
+    /// that keeps the endpoint (`custom`) is used here because one that owns an
+    /// endpoint would put a fetch on the real network — the change the session
+    /// has to carry is the name itself (finding R19).
+    #[test]
+    fn a_picked_provider_is_marked_for_the_session_file() {
+        isolate_user_config();
+        let stored = stored_after("picked-provider", |app| {
+            app.cell.edit(|cfg| cfg.provider = Provider::DeepSeek);
+            run(app, "/provider custom");
+        });
+        assert_eq!(
+            stored.provider, "custom",
+            "the file carries the provider that was picked"
+        );
+    }
+
+    /// And for `/url`: the endpoint is stored in the session, which the next
+    /// start reads before the home config, so pointing mush elsewhere has to
+    /// mark the session dirty or the next start reverts it (finding R19).
+    #[test]
+    fn a_new_endpoint_is_marked_for_the_session_file() {
+        isolate_user_config();
+        let stored = stored_after("picked-url", |app| {
+            run(app, "/url http://127.0.0.1:2");
+        });
+        assert_eq!(
+            stored.base_url, "http://127.0.0.1:2",
+            "the file carries the endpoint that was picked"
+        );
+    }
+
+    /// The lock-identity guard gates every store write, not only the session
+    /// save: a mush whose lock was replaced must not write its cleared
+    /// conversation into `.mush/session.json.previous` — that is the store a
+    /// second mush now owns, and the slot *its* Ctrl-N warning points at
+    /// (finding R9). The key has to refuse the clear instead.
+    #[test]
+    fn a_displaced_mush_does_not_write_the_previous_session() {
+        isolate_user_config();
+        let root = dir("displaced-ctrl-n");
+        mush_core::session::ensure_mush_dir(&root).unwrap();
+        let guard = crate::lock::acquire(&root).unwrap();
+        let writer = Arc::new(
+            session_save::Writer::new(root.to_path_buf(), Some(guard.identity()))
+                .expect("the worker starts"),
+        );
+        let (mut app, _rx) = app_root(&root, None, writer.clone());
+
+        // A conversation worth keeping, and a lock whose *name* is then
+        // replaced under this mush — the human's own `mv`, or a restore from a
+        // backup — leaving this flock on an orphaned inode while a second mush
+        // can lock the fresh file and own the store.
+        streamed(&mut app, "the conversation the key would keep");
+        let fresh = root.join(".mush/lock.new");
+        std::fs::write(&fresh, "0\n").unwrap();
+        std::fs::rename(&fresh, root.join(".mush/lock")).unwrap();
+
+        // Ctrl-N twice: the first press arms, the second keeps the
+        // conversation as `.mush/session.json.previous` and clears. The copy
+        // is the store write this test is about.
+        ctrl(&mut app, 'n');
+        ctrl(&mut app, 'n');
+
+        assert!(
+            !session::previous_session_path(&root).exists(),
+            "the displaced mush wrote the slot another window's Ctrl-N points at"
+        );
+        assert!(
+            text_of(&app).contains("nothing cleared"),
+            "and it said why the key refused: {}",
+            text_of(&app)
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A list fetched from the endpoint the human has since left must not land:
@@ -18466,6 +18756,49 @@ mod tests {
             AgentId::ROOT,
             "focus cannot point at a ghost"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A leftover whose checkout is gone is reaped by `discover_worktrees`, and
+    /// the reap has to drop the conversation's record of it too: the tick's own
+    /// reap (`reap_history`) drops the node, the transcript, the voices and the
+    /// notices together, and this road dropped only the node — so an agent that
+    /// no longer exists kept an id-keyed entry in every `Chat` map for the life
+    /// of the session (finding R16).
+    #[test]
+    fn a_reaped_leftover_drops_its_chat_record() {
+        use std::fs;
+
+        let root = repo("reaped-leftover");
+        // A stored leftover whose worktree is gone by the time the session is
+        // read: the file kept the row, git kept nothing.
+        let stored = Session {
+            model: "test-model".into(),
+            provider: "custom".into(),
+            messages: Vec::new(),
+            agents: vec![session::AgentSession {
+                id: 7,
+                depth: 1,
+                brief: "a leftover whose checkout is gone".into(),
+                branch: Some("mush/7".into()),
+                leftover: true,
+                messages: vec![Message::user("the leftover's transcript")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+        assert!(
+            !app.tree.agents.iter().any(|node| node.id == AgentId(7)),
+            "the pass reaped the leftover"
+        );
+        assert!(
+            app.chat.transcript(AgentId(7)).is_empty(),
+            "and its transcript went with it: {:?}",
+            app.chat.transcript(AgentId(7))
+        );
+        drop(app);
         let _ = fs::remove_dir_all(&root);
     }
 

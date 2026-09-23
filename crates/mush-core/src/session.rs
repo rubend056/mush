@@ -4,6 +4,7 @@
 //! one-line `.gitignore`. Opening a folder is therefore the only setup step.
 
 use std::fs;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -13,6 +14,23 @@ use crate::message::Message;
 
 pub const MUSH_DIR: &str = ".mush";
 pub const SESSION_FILE: &str = "session.json";
+
+/// The largest `.mush/session.json` mush will read whole, in bytes.
+///
+/// The store's own size is bounded by `CHILD_HISTORY × the fold trigger + the
+/// root` (`docs/findings.md` §8.28) — a number that moves with the model's
+/// window, not with a constant: ~10 MiB at 128k tokens, ~140 MiB at a million.
+/// This is that bound's outer margin rather than the bound itself. Past it the
+/// name is not a conversation any endpoint's window can plausibly produce, and
+/// reading one would be a memcpy whose only ending is the OOM killer — the read
+/// runs before the terminal is entered, so nothing on screen would say why.
+///
+/// It is a cap on the *read*, not a rule about what mush writes: a store past
+/// it reads as [`Stored::Unusable`], which is the road that sets the file aside
+/// as a `.bak` copy and starts a new conversation with the human told (finding
+/// IN3).
+pub const SESSION_READ_CAP: u64 = 256 * 1024 * 1024;
+
 /// The workspace lock's own name, under `.mush/`. The lock itself — the flock
 /// on this file and the rule that one mush holds it at a time — lives in the
 /// `mush` crate's `lock` module; the *name* lives here, with the store's other
@@ -75,8 +93,15 @@ pub fn session_path(root: &Path) -> PathBuf {
 /// rather than only when absent (finding C5): a hand edit, another tool, or a
 /// repository that ships its own `.mush/.gitignore` used to survive here, and
 /// the whole conversation was then one `git add -A` from the index. The file is
-/// one line and idempotent, so enforcing it costs one small write per start —
+/// one line and idempotent, so enforcing it costs one small write per call —
 /// and a sticky wrong one is a leak, which is the more expensive of the two.
+///
+/// Every road that creates the directory comes through here, not
+/// `create_dir_all`: a `.mush/` recreated mid-run — the human's `rm -rf .mush`,
+/// a `git clean -xfd` — is mush's directory again, and a write that recreated
+/// it without the ignore line would leave the conversation one `git add -A`
+/// from the index (finding R18). `Session::save` and [`keep_previous`] are the
+/// two writes that can find it missing.
 pub fn ensure_mush_dir(root: &Path) -> std::io::Result<()> {
     let dir = mushroom_dir(root);
     fs::create_dir_all(&dir)?;
@@ -116,9 +141,10 @@ pub fn keep_previous(root: &Path, mut session: Session) -> Result<PathBuf, Strin
     let to = previous_session_path(root);
     session.shed_images();
     let write = (|| -> std::io::Result<()> {
-        if let Some(parent) = to.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        // Through `ensure_mush_dir`, not `create_dir_all`: the directory this
+        // recreates has to come back with its ignore line, or the copy just
+        // kept is untracked work the next `git add -A` stages (finding R18).
+        ensure_mush_dir(root)?;
         let json = serde_json::to_vec_pretty(&session).map_err(std::io::Error::other)?;
         crate::workspace::atomic_write(&to, &json, crate::workspace::Fresh::Private)
     })();
@@ -307,9 +333,11 @@ pub enum Stored {
     Absent,
     /// The conversation, as it was left.
     Loaded(Session),
-    /// The file is there and cannot be used. The string is *why* — what serde
-    /// objected to, or the IO error — for the human who has to decide what to
-    /// do with the copy that [`keep_unreadable`] sets aside.
+    /// The file is there and cannot be used. The string is *why* — the shape
+    /// the name had (not a regular file), the size it had (past
+    /// [`SESSION_READ_CAP`]), what serde objected to, or the IO error — for the
+    /// human who has to decide what to do with the copy that [`keep_unreadable`]
+    /// sets aside.
     Unusable(String),
 }
 
@@ -324,6 +352,28 @@ impl std::fmt::Debug for Stored {
         }
     }
 }
+
+/// What a name that is not a regular file is, for the refusal a human reads:
+/// a link, a directory, a fifo, a socket, a device, or an answer that says so
+/// without inventing a kind.
+fn not_a_file(meta: &fs::Metadata) -> &'static str {
+    use std::os::unix::fs::FileTypeExt;
+    let kind = meta.file_type();
+    if kind.is_symlink() {
+        "a symlink"
+    } else if kind.is_dir() {
+        "a directory"
+    } else if kind.is_fifo() {
+        "a fifo"
+    } else if kind.is_socket() {
+        "a socket"
+    } else if kind.is_block_device() || kind.is_char_device() {
+        "a device"
+    } else {
+        "not a regular file"
+    }
+}
+
 /// The sentence a session mush could not set aside is told: the file the human
 /// has to go and find, then why it could not be moved.
 ///
@@ -365,14 +415,57 @@ impl Session {
     /// *unreadable* (see [`Stored`]). A caller that only wants the conversation,
     /// and has nothing to say about which of the two it read, wants
     /// [`Self::load`].
+    ///
+    /// The file is untrusted input, so the shape is decided before anything is
+    /// opened and the read is bounded (finding IN3):
+    ///
+    /// - the *shape* comes from `symlink_metadata` — the name itself, so a link
+    ///   is never followed to whatever it points at. A FIFO named as the store
+    ///   parks `open` until a writer appears, and this read runs before the
+    ///   terminal is entered: the whole start would wait with no frame and the
+    ///   workspace lock held. A symlink to `/dev/zero` — a shape git can commit
+    ///   — would read without bound;
+    /// - the *cap* comes from that same stat, before a byte is read: a blob is
+    ///   refused from its size instead of being loaded to find it out;
+    /// - the read is still bounded to [`SESSION_READ_CAP`] + 1 bytes, because a
+    ///   file can grow between the stat and the read — the same bound the
+    ///   workspace's own whole reads keep.
+    ///
+    /// Every refusal is [`Stored::Unusable`], which is the road that sets an
+    /// unusable store aside as a `.bak` copy rather than destroying it.
     pub fn read(root: &Path) -> Stored {
-        let bytes = match fs::read(session_path(root)) {
-            Ok(bytes) => bytes,
+        let path = session_path(root);
+        let meta = match fs::symlink_metadata(&path) {
+            Ok(meta) => meta,
             // No file is not a file mush cannot use: a workspace nobody has
             // opened yet must stay silent.
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Stored::Absent,
             Err(error) => return Stored::Unusable(format!("cannot read the file — {error}")),
         };
+        if !meta.is_file() {
+            return Stored::Unusable(format!(
+                "it is {} — the store is read only when the name is a regular file",
+                not_a_file(&meta)
+            ));
+        }
+        if meta.len() > SESSION_READ_CAP {
+            return Stored::Unusable(format!(
+                "it is {} bytes — past the {SESSION_READ_CAP} bytes mush will read whole",
+                meta.len()
+            ));
+        }
+        let mut bytes = Vec::new();
+        let read = fs::File::open(&path)
+            .and_then(|file| file.take(SESSION_READ_CAP + 1).read_to_end(&mut bytes));
+        if let Err(error) = read {
+            return Stored::Unusable(format!("cannot read the file — {error}"));
+        }
+        if bytes.len() as u64 > SESSION_READ_CAP {
+            return Stored::Unusable(format!(
+                "it grew past the {SESSION_READ_CAP} bytes mush will read whole while it was \
+                 being read"
+            ));
+        }
         match serde_json::from_slice(&bytes) {
             Ok(session) => Stored::Loaded(session),
             // The position serde names is what makes a hand edit findable, so
@@ -395,11 +488,13 @@ impl Session {
 
     /// Write the conversation to `<root>/.mush/session.json`.
     ///
-    /// Takes `self` by value because the caller is the writer thread's
-    /// snapshot: it handed over a conversation it will not read again (see
-    /// `session_save`), so the save can consume it instead of borrowing it
-    /// back. Same path, same fields, same format, still read by
-    /// [`Self::load`].
+    /// Borrows the value rather than consuming it: the caller is the writer
+    /// thread's snapshot, and a write that fails has to be retryable — the
+    /// conversation must still be there for the next attempt instead of being
+    /// freed with the failed one (finding R2). The borrow is mutable because
+    /// shedding image payloads is part of the save; the replacement is
+    /// idempotent, so a retry writes the same bytes the first attempt would
+    /// have. Same path, same fields, same format, still read by [`Self::load`].
     ///
     /// Image bytes are not written. Every message carrying one has its payload
     /// replaced, before serialization, by the placeholder that names its path
@@ -410,12 +505,14 @@ impl Session {
     /// the file again. [`Self::load`] therefore returns the placeholder and no
     /// images, and because the drop is idempotent a loaded session saved again
     /// cannot stack a second placeholder on the first one's text.
-    pub fn save(mut self, root: &Path) -> std::io::Result<()> {
+    pub fn save(&mut self, root: &Path) -> std::io::Result<()> {
         self.shed_images();
         let path = session_path(root);
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
+        // The directory comes back through `ensure_mush_dir`, the same door
+        // the start takes: a store written after a `git clean -xfd` (or
+        // `rm -rf .mush`) must recreate *mush's* directory, ignore line and
+        // all, not a plain one the next `git add -A` stages (finding R18).
+        ensure_mush_dir(root)?;
         // A serialization failure is an error like any other: the writer's
         // error channel two files away is where the human hears about it, and a
         // session replaced by `{}` would be a save reporting success.
@@ -446,6 +543,108 @@ mod tests {
     use super::*;
     use crate::message::Image;
     use crate::scratch::Scratch;
+
+    /// A FIFO at the store's name is refused from the name's own shape, never
+    /// opened: `open` on a FIFO with no writer *parks* until one appears, and
+    /// this read runs before the terminal is entered — so the whole start would
+    /// wait with no frame and the workspace lock held (finding IN3). The read
+    /// answers on its own, which is the assertion: a read that followed the
+    /// name would never send.
+    #[test]
+    fn a_fifo_named_as_the_store_is_refused_without_opening_it() {
+        let root = Scratch::new("session-fifo");
+        ensure_mush_dir(&root).unwrap();
+        let fifo = std::process::Command::new("mkfifo")
+            .arg(session_path(&root))
+            .status()
+            .expect("mkfifo runs");
+        assert!(fifo.success(), "the fixture needs a fifo");
+
+        let dir = root.path().to_path_buf();
+        let (done, waited) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(Session::read(&dir));
+        });
+        let read = waited
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap_or_else(|_| panic!("the read parked on the fifo — it opened the name"));
+        match read {
+            Stored::Unusable(reason) => assert!(
+                reason.contains("fifo") || reason.contains("regular file"),
+                "the refusal names the shape: {reason}"
+            ),
+            other => panic!("a fifo at the store's name must be refused, got {other:?}"),
+        }
+
+        // The road that follows a refusal is intact for this shape too: the
+        // name is moved aside (`rename` never opens it) and a fresh
+        // conversation can be written over the path.
+        let kept = keep_unreadable(&root).unwrap();
+        assert!(
+            !session_path(&root).exists(),
+            "the fifo is moved aside, not read"
+        );
+        saying("a fresh conversation").save(&root).unwrap();
+        assert!(matches!(Session::read(&root), Stored::Loaded(_)));
+        assert!(
+            std::os::unix::fs::FileTypeExt::is_fifo(
+                &fs::symlink_metadata(&kept).unwrap().file_type()
+            ),
+            "the copy set aside is the fifo itself, untouched"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A symlink at the store's name is refused, not followed: a repository can
+    /// commit `.mush/session.json` as a link, and a link to `/dev/zero` reads
+    /// without bound — the shape check is the *name* (`symlink_metadata`), so
+    /// however readable the target is, mush does not read through it (finding
+    /// IN3).
+    #[test]
+    fn a_symlinked_store_is_refused_not_followed() {
+        let root = Scratch::new("session-symlink");
+        ensure_mush_dir(&root).unwrap();
+        let target = root.join("elsewhere.json");
+        fs::write(&target, r#"{"model":"a-model","messages":[]}"#).unwrap();
+        std::os::unix::fs::symlink(&target, session_path(&root)).unwrap();
+
+        match Session::read(&root) {
+            Stored::Unusable(reason) => assert!(
+                reason.contains("symlink") || reason.contains("regular file"),
+                "the refusal names the shape: {reason}"
+            ),
+            other => panic!("a symlink must not be followed, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            r#"{"model":"a-model","messages":[]}"#,
+            "the file the link points at is untouched"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A regular file past [`SESSION_READ_CAP`] is refused from its size,
+    /// before a byte is read: the size is the fact the decision needs, and a
+    /// blob loaded to find it out is the OOM the cap exists to prevent
+    /// (finding IN3).
+    #[test]
+    fn a_store_past_the_cap_is_refused_from_its_size() {
+        let root = Scratch::new("session-cap");
+        ensure_mush_dir(&root).unwrap();
+        // Sparse, so the fixture costs no disk: it is the *size* the read
+        // decides from, and the bytes are never read.
+        let file = fs::File::create(session_path(&root)).unwrap();
+        file.set_len(SESSION_READ_CAP + 1).unwrap();
+
+        match Session::read(&root) {
+            Stored::Unusable(reason) => assert!(
+                reason.contains(&SESSION_READ_CAP.to_string()),
+                "the refusal is the cap's, not serde's: {reason}"
+            ),
+            other => panic!("a store past the cap must be refused, got {other:?}"),
+        }
+        let _ = fs::remove_dir_all(&root);
+    }
 
     /// An `absent` session and one mush *cannot read* are two different facts,
     /// and telling them apart is what stops the second from being silently
@@ -507,6 +706,36 @@ mod tests {
             fs::read_to_string(&kept).unwrap(),
             broken,
             "and the only copy of the old conversation is byte for byte what it was"
+        );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A `.mush/` recreated mid-run — `rm -rf .mush`, a `git clean -xfd` — is
+    /// mush's directory again, so the store's writes have to bring the ignore
+    /// line back with it: the same `ensure_mush_dir` the start takes is the one
+    /// the write roads take, so a conversation written after the directory was
+    /// recreated is not one `git add -A` from the index (finding R18).
+    #[test]
+    fn a_store_write_recreates_the_mush_dir_with_its_ignore_line() {
+        let root = Scratch::new("session-recreated");
+
+        // The save road: no `.mush/` exists at all, and the write is what
+        // creates it.
+        saying("hello").save(&root).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(MUSH_DIR).join(".gitignore")).unwrap(),
+            SELF_IGNORE,
+            "a save recreated .mush/ without its ignore line"
+        );
+
+        // The keep road: the directory is taken away mid-run, with the
+        // conversation still live in the window.
+        fs::remove_dir_all(root.join(MUSH_DIR)).unwrap();
+        keep_previous(&root, saying("the cleared conversation")).unwrap();
+        assert_eq!(
+            fs::read_to_string(root.join(MUSH_DIR).join(".gitignore")).unwrap(),
+            SELF_IGNORE,
+            "the kept copy recreated .mush/ without its ignore line"
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -654,7 +883,7 @@ mod tests {
         let root = Scratch::new("session2");
         ensure_mush_dir(&root).unwrap();
 
-        let session = Session {
+        let mut session = Session {
             model: "test".into(),
             provider: "custom".into(),
             base_url: "http://localhost:9".into(),
@@ -788,7 +1017,7 @@ mod tests {
             raw.len()
         );
 
-        let loaded = Session::load(&root).unwrap();
+        let mut loaded = Session::load(&root).unwrap();
         assert!(
             loaded.messages[0].images.is_empty(),
             "loading brings no bytes back"

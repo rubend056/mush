@@ -49,7 +49,7 @@
 //! scrolled away from the bottom.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use ratatui::style::{Color, Style};
@@ -1633,6 +1633,18 @@ impl Chat {
     /// this process can write, so they go in front and the oldest-first order
     /// of [`Self::notices_for`] holds without sorting.
     ///
+    /// The build is one pass over the rows, back to front: the newest row
+    /// about each agent is the one that survives, and reading the file in
+    /// reverse means the *first* row about an agent in that direction is it —
+    /// the `HashSet` is the one-per-agent rule, not a scan of what was kept so
+    /// far. The old shape ran a `retain` over the kept rows *per stored row*,
+    /// which is quadratic the moment a file holds a row per agent (a hand
+    /// edit, or a version that wrote them without the rule): 20k rows took
+    /// 20.3 s and 40k took 70.5 s in a debug build — minutes of a frameless
+    /// start from a store of a size the writer itself can produce (finding
+    /// IN3). The reversal puts the survivors back in the file's own order,
+    /// oldest first.
+    ///
     /// A stored report of a skipped row is the one line dropped on the way in:
     /// the open that reads the file re-derives it — or does not, if the file
     /// was fixed — and a line about a state the tree does not hold must not be
@@ -1643,7 +1655,8 @@ impl Chat {
     /// one.
     pub fn restore_notices(&mut self, stored: Vec<session::StoredNotice>) {
         let mut restored: Vec<Notice> = Vec::new();
-        for notice in stored {
+        let mut seen: HashSet<AgentId> = HashSet::new();
+        for notice in stored.into_iter().rev() {
             if is_restore_report(&notice.text) {
                 continue;
             }
@@ -1651,9 +1664,12 @@ impl Chat {
             // of them is current, exactly as two live ones would, and a file
             // written by hand (or by another version) is not a reason to paint
             // a pane that cannot be read.
-            restored.retain(|earlier| earlier.agent != AgentId(notice.agent));
+            let agent = AgentId(notice.agent);
+            if !seen.insert(agent) {
+                continue;
+            }
             restored.push(Notice {
-                agent: AgentId(notice.agent),
+                agent,
                 kind: NoticeKind::Error,
                 at: notice.at,
                 // A restored failure is one line, whatever it said before it was
@@ -1663,6 +1679,7 @@ impl Chat {
                 text: notice.text,
             });
         }
+        restored.reverse();
         self.notices.splice(0..0, restored);
     }
 
@@ -6079,6 +6096,96 @@ mod tests {
                 "{phase:?} must not paint a foot line"
             );
         }
+    }
+
+    /// The stored list is read back to front, and the survivors are its newest
+    /// row per agent, in the file's own order: earlier rows about an agent are
+    /// dropped, a row the load refuses is not a failure and does not count as
+    /// one, and the order is the one the foot reads (oldest first). One pass,
+    /// not a scan of the kept rows per stored row (finding IN3).
+    #[test]
+    fn a_stored_list_keeps_the_newest_row_per_agent_in_order() {
+        let mut chat = Chat::bare();
+        chat.restore_notices(vec![
+            session::StoredNotice {
+                agent: 1,
+                at: 1,
+                text: "old #1".into(),
+            },
+            session::StoredNotice {
+                agent: 2,
+                at: 2,
+                text: "old #2".into(),
+            },
+            session::StoredNotice {
+                agent: 1,
+                at: 3,
+                text: "new #1".into(),
+            },
+            // A reading of the file, not a fact about the workspace: it must
+            // neither be restored nor clear an earlier row about its agent.
+            session::StoredNotice {
+                agent: 2,
+                at: 4,
+                text: format!("{RESTORE_REPORT}a row this load refused"),
+            },
+            session::StoredNotice {
+                agent: 2,
+                at: 5,
+                text: "new #2".into(),
+            },
+        ]);
+
+        for (agent, newest) in [(1, "new #1"), (2, "new #2")] {
+            let texts: Vec<&str> = chat
+                .notices_for(AgentId(agent))
+                .map(|notice| notice.text.as_str())
+                .collect();
+            assert_eq!(
+                texts,
+                vec![newest],
+                "agent {agent}'s older rows are dropped"
+            );
+        }
+        let all: Vec<&str> = chat
+            .notices
+            .iter()
+            .map(|notice| notice.text.as_str())
+            .collect();
+        assert_eq!(all, vec!["new #1", "new #2"], "in the file's own order");
+    }
+
+    /// A stored list the size of a hostile file is one pass over the rows: 200k
+    /// rows about 200k agents restore in milliseconds here, where the old
+    /// `retain`-per-row shape needs half an hour in the same build (probe: 20k
+    /// rows 20.3 s, 40k rows 70.5 s — quadratic — and 127 ms / 216 ms after).
+    /// The bound is generous on purpose: this is a liveness guard, not a
+    /// performance budget, because the gap between the two shapes at this size
+    /// is minutes against milliseconds (finding IN3).
+    #[test]
+    fn restoring_a_store_sized_notice_list_is_one_pass() {
+        let stored: Vec<session::StoredNotice> = (0..200_000u64)
+            .map(|i| session::StoredNotice {
+                agent: i,
+                at: i,
+                text: format!("failure {i}"),
+            })
+            .collect();
+        let mut chat = Chat::bare();
+
+        let started = std::time::Instant::now();
+        chat.restore_notices(stored);
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            chat.notices_for(AgentId(199_999)).count(),
+            1,
+            "every row about a distinct agent survives"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(30),
+            "the restore took {elapsed:?} — a scan per row, not one pass"
+        );
     }
 
     /// The order is a decision and not an accident: a list of notices is a
