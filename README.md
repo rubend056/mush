@@ -176,9 +176,10 @@ wear — painted by the code's own row painter:
 is a row whose parent the history window has reaped (it is drawn under its
 nearest surviving ancestor — the root when none of its own survive — at that
 ancestor's depth plus one, dim, and the mark is what says its own parent is not
-the row it sits under), and `⚙N` counts the jobs on their owner's row. A running agent with children out wears
-**no** count of them: the children's own rows say they run, and the pane title's
-`N waiting` counts the agents at rest with work out. A row spends its columns on
+the row it sits under), and `⚙N` counts the jobs on their owner's row. A running
+agent with children out wears **no** count of them: the children's own rows say
+they run, and the pane title's `N waiting` counts the agents at rest with work
+out. A row spends its columns on
 state, then the branch and line delta (`mush/2 +8−0`), then the activity with its
 age (`edit_file src/lex.rs 12s`), then a short title derived from the brief
 (`lexer`); the pane title totals the tree (`agents · 1 working · 1 waiting · Σ
