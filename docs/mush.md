@@ -736,11 +736,15 @@ every turn until the run gave up".
 
 **News** is a failure, or a run mush itself stopped. It belongs to its run, not
 to a moment: a new one replaces the agent's old one (two failures for one agent
-would disagree about which is current), it is written to `.mush/session.json` so
-a restart still says what broke, and only the agent's next run replaces it. A
-stop is not a failure — the loop guard ends a model that kept repeating one call,
-and nothing the model did broke — so it is painted `⊘` in yellow, the same
-reading the row gives that agent, and it is one line with the guard's own notice.
+would disagree about which is current), and only the agent's next run replaces
+it. Only the *failure* half is written to `.mush/session.json`, so a restart
+still says what broke. A stop is not a failure — the loop guard ends a model that
+kept repeating one call, and nothing the model did broke — so it is painted `⊘`
+in yellow, the same reading the row gives that agent, and it is one line with the
+guard's own notice; nothing of it is stored as news, and what a restart reads
+instead is the run's stored status (`session::StoredStatus`) — a stop the human
+asked for comes back as the row's `Phase::Stopped`, the guard's stop as the error
+it ended with, never as a stored `!` line.
 
 The foot paints the notes under the transcript, oldest first, headed by a failure
 and capped: two rows for the notes and one for the count, so a busy agent cannot
