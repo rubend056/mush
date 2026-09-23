@@ -3456,6 +3456,11 @@ impl App {
                     line.push_str(&self.no_key_hint());
                 }
                 self.say(line);
+                // Said *before* the save, deliberately: the endpoint line is
+                // what the run now uses, and a failed save then replaces it
+                // with the one sentence a human has to act on — the order
+                // `/key` and the pickers do not need, because their acks *are*
+                // the promise about the file (finding IN12).
                 self.persist_user_config();
             }
             Command::ApiKey(None) => match &self.cell.ui().api_key {
@@ -3479,11 +3484,15 @@ impl App {
                 // one save a key may be written by, and its ack says where
                 // (finding C11).
                 self.key_stated = true;
-                self.persist_user_config();
-                self.say(format!(
-                    "api key set ({shown}…) — saved to {}",
-                    self.home_config.display()
-                ));
+                // The ack is a promise that the file holds the key, so it is
+                // only said for a write that landed: the failure keeps the one
+                // status slot `persist_user_config` put it in (finding IN12).
+                if self.persist_user_config() {
+                    self.say(format!(
+                        "api key set ({shown}…) — saved to {}",
+                        self.home_config.display()
+                    ));
+                }
             }
             Command::Models => {
                 // The count (or the lack of one) is said when the fetch
@@ -3562,7 +3571,16 @@ impl App {
     /// save keeps whatever key the file holds, while the fields it does own
     /// still land. A host change's `None` is a statement too, not silence
     /// (findings C6, D6).
-    fn persist_user_config(&mut self) {
+    ///
+    /// Returns whether the write landed, and *says* a failure here, in the one
+    /// status slot: a caller whose ack promises what the file holds —
+    /// `saved to …`, `provider: …`, `model: …` — must speak only on `true`.
+    /// `/key` said its ack after this had already failed, and the next line of
+    /// the same arm replaced the failure, so a human read that the key was on
+    /// disk when it lived only in the config cell — and the next start had
+    /// none (finding IN12). The failure names the file it could not reach, the
+    /// one thing a human needs to fix it.
+    fn persist_user_config(&mut self) -> bool {
         let user = UserConfig {
             api_key: self.cfg().api_key.clone(),
             provider: self.cfg().provider.name().to_string(),
@@ -3583,8 +3601,13 @@ impl App {
             KeyWrite::Keep
         };
         if let Err(error) = user.save_to(&self.home_config, key) {
-            self.fail(format!("could not save home config: {error}"));
+            self.fail(format!(
+                "could not save home config {}: {error}",
+                self.home_config.display()
+            ));
+            return false;
         }
+        true
     }
 
     /// Ask for a fresh model list without waiting for it.
@@ -3813,16 +3836,20 @@ impl App {
         // reverts the pick (finding R19).
         self.mark_session_dirty();
         self.refresh_models();
-        self.persist_user_config();
-        let mut line = format!("provider: {} · {}", provider.name(), self.context_label());
-        if forgotten {
-            // The model-list fetch above was the first request, and it went
-            // out without the key: the acknowledgement names what is missing
-            // and the road back (finding C6).
-            line.push_str(" · ");
-            line.push_str(&self.no_key_hint());
+        // The ack says what the cell now holds *and* that the file does; only
+        // the first half is true of a save that failed, whose own sentence is
+        // the one the slot must keep (finding IN12).
+        if self.persist_user_config() {
+            let mut line = format!("provider: {} · {}", provider.name(), self.context_label());
+            if forgotten {
+                // The model-list fetch above was the first request, and it went
+                // out without the key: the acknowledgement names what is missing
+                // and the road back (finding C6).
+                line.push_str(" · ");
+                line.push_str(&self.no_key_hint());
+            }
+            self.say(line);
         }
-        self.say(line);
     }
 
     /// The tail an ack gets when a host change took the key: what is missing
@@ -3912,12 +3939,16 @@ impl App {
                 // (finding R19).
                 self.mark_session_dirty();
                 self.adopt_advertised_context();
-                self.persist_user_config();
-                self.say(format!(
-                    "model: {} · {}",
-                    self.cfg().label(),
-                    self.context_label()
-                ));
+                // As for `/provider`: the ack's second clause is a promise
+                // about the file, so a failed write keeps its own line
+                // (finding IN12).
+                if self.persist_user_config() {
+                    self.say(format!(
+                        "model: {} · {}",
+                        self.cfg().label(),
+                        self.context_label()
+                    ));
+                }
             }
             PickerKind::Provider => self.apply_provider(id),
             // Nothing to apply: the list is a reading, and `key_picker` closes it
@@ -15748,6 +15779,79 @@ mod tests {
             text_of(&app)
         );
         let _ = std::fs::remove_dir_all(path.parent().unwrap());
+    }
+
+    /// The audit's IN12: `saved to …` is a promise about the file, and `/key`,
+    /// `/provider` and a picked model all said it after the save had failed.
+    /// The failure had one status slot and the ack took it, so the human read
+    /// that a key was on disk when it was only in the config cell — and the
+    /// next start had none.
+    ///
+    /// The write's own sentence now keeps the slot and names the file it could
+    /// not reach, and no ack follows it.
+    #[test]
+    fn a_save_that_failed_is_not_replaced_by_an_ack_that_says_saved() {
+        let (mut app, _rx) = test_app("save-failure");
+        // A path no save can write: even `create_dir_all` refuses it, because
+        // its parent is a file.
+        let dir = Scratch::new("blocked-home");
+        let blocked = dir.join("blocked");
+        std::fs::write(&blocked, "not a directory\n").unwrap();
+        let path = blocked.join("config.json");
+        app.home_config = path.clone();
+
+        // `/key`: the key reaches the cell — the run has it — but the file did
+        // not get it, and the line says so instead of `saved to …`.
+        run(&mut app, "/key sk-typed-0123456789");
+        let line = text_of(&app).to_string();
+        assert!(line.contains("could not save home config"), "{line}");
+        assert!(
+            line.contains(&path.display().to_string()),
+            "the failure names the file it could not reach: {line}"
+        );
+        assert!(
+            !line.contains("saved to") && !line.contains("api key set"),
+            "no ack replaced the failure: {line}"
+        );
+        assert_eq!(
+            app.cfg().api_key.as_deref(),
+            Some("sk-typed-0123456789"),
+            "the run still uses the key the cell holds"
+        );
+
+        // `/provider`: the same one slot and the same ack it must not get.
+        run(&mut app, "/provider custom");
+        let line = text_of(&app).to_string();
+        assert!(line.contains("could not save home config"), "{line}");
+        assert!(
+            !line.starts_with("provider:"),
+            "no ack replaced the failure: {line}"
+        );
+
+        // A picked model: the picker's ack is the third road that promises the
+        // file.
+        app.update(Msg::Models {
+            endpoint: "http://127.0.0.1:1".to_string(),
+            models: vec![
+                http::Model {
+                    id: "test-model".to_string(),
+                    context: None,
+                },
+                http::Model {
+                    id: "picked".to_string(),
+                    context: None,
+                },
+            ],
+        });
+        run(&mut app, "/model");
+        app.on_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        app.on_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        let line = text_of(&app).to_string();
+        assert!(line.contains("could not save home config"), "{line}");
+        assert!(
+            !line.starts_with("model:"),
+            "no ack replaced the failure: {line}"
+        );
     }
 
     /// `Enter` on a row says whose transcript the pane shows, and the brief it
