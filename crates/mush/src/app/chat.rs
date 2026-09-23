@@ -2578,19 +2578,34 @@ fn elsewhere(agent: AgentId, index: usize, message: &Message) -> Voice {
     }
 }
 
+/// What a line of mush's report grammar says after its `#N`/`#cN` head —
+/// `#1 done: wrote the parser` → `Some(" done: wrote the parser")` — or `None`
+/// for a line that is not one of mush's reports.
+fn report_tail(text: &str) -> Option<&str> {
+    let rest = text.strip_prefix('#')?;
+    let rest = rest.strip_prefix('c').unwrap_or(rest);
+    let digits = rest.chars().take_while(char::is_ascii_digit).count();
+    if digits == 0 {
+        return None;
+    }
+    let tail = &rest[digits..];
+    [" done:", " stopped:", " failed:", " cut off:"]
+        .iter()
+        .any(|head| tail.starts_with(head))
+        .then_some(tail)
+}
+
 /// Whether a line is one of mush's reports — `#1 done: …`, `#c2 stopped: …`,
 /// `#3 cut off: …` — written by the run loop, the job registry and the UI's own
 /// last-resort report with exactly this vocabulary.
 fn report(text: &str) -> bool {
-    let Some(rest) = text.strip_prefix('#') else {
-        return false;
-    };
-    let rest = rest.strip_prefix('c').unwrap_or(rest);
-    let digits = rest.chars().take_while(char::is_ascii_digit).count();
-    digits > 0
-        && [" done:", " stopped:", " failed:", " cut off:"]
-            .iter()
-            .any(|tail| rest[digits..].starts_with(tail))
+    report_tail(text).is_some()
+}
+
+/// Whether a report line is the one that says a run *failed* (`#3 failed: …`)
+/// — the report whose first row the fold may never give up.
+fn report_failed(text: &str) -> bool {
+    report_tail(text).is_some_and(|tail| tail.starts_with(" failed:"))
 }
 
 /// The kinds of multi-line block a conversation paints, one number each in
@@ -2606,6 +2621,14 @@ pub enum Kind {
     /// A tool call's result: a file dump — a diff, a test log, a shell
     /// transcript — read from its head and copied whole behind its `…`.
     Result,
+    /// Mush's own line written into a conversation ([`Voice::Mush`]): a child's
+    /// or a job's report (`#1 done: …`, `#c2 done: …`), a fold's carried
+    /// summary, the line that says the oldest turns were dropped.
+    Mush,
+    /// The words another agent addressed to this pane: the brief a child's
+    /// pane opens with ([`Voice::Brief`]) and a parent's steering after it
+    /// ([`Voice::Parent`]), which is the same words arriving later.
+    Brief,
     /// The model's own reasoning — the `Ctrl-T` block [`reasoning_rows`]
     /// paints.
     Reasoning,
@@ -2615,7 +2638,7 @@ impl Kind {
     /// How many kinds there are: the length of [`Fold`]'s table, so a new
     /// variant that is given a slot but not a table entry is a compile error,
     /// and one given a table entry but not a slot is too.
-    const COUNT: usize = 2;
+    const COUNT: usize = 4;
 
     /// This kind's own number in [`Fold`]'s table. No wildcard arm: a new kind
     /// cannot compile until it is given a slot here, and the slot is where its
@@ -2623,7 +2646,9 @@ impl Kind {
     fn slot(self) -> usize {
         match self {
             Kind::Result => 0,
-            Kind::Reasoning => 1,
+            Kind::Mush => 1,
+            Kind::Brief => 2,
+            Kind::Reasoning => 3,
         }
     }
 }
@@ -2639,22 +2664,22 @@ impl Kind {
 /// `Chat` holds the one a conversation paints through.
 ///
 /// The numbers are **per kind** because the kinds are read differently. A tool
-/// result is a dump: the human reads its head and copies the rest, and the pane
-/// exists to keep a long transcript scrollable — eight rows, the number the
-/// `"tool"` arm used to keep as a `const` of its own. Wrapping a block only as
-/// far as the fold is also why a long result stopped being most of a frame's
-/// cost on a long session (see [`wrap_text_capped`]). A reasoning block is the
-/// text the human pressed `Ctrl-T` to read, so its number is `usize::MAX`:
-/// shown whole today, with the slot in place because the setting the human
-/// already asked for is "one for child/tool calls and another for thinking rows
-/// shown".
+/// result, a report and a brief are dumps: the human reads their head and
+/// copies the rest, and the pane exists to keep a long transcript scrollable —
+/// eight rows, the number the `"tool"` arm used to keep as a `const` of its
+/// own. Wrapping a block only as far as the fold is also why a long result
+/// stopped being most of a frame's cost on a long session (see
+/// [`wrap_text_capped`]). A reasoning block is the text the human pressed
+/// `Ctrl-T` to read, so its number is `usize::MAX`: shown whole today, with the
+/// slot in place because the setting the human already asked for is "one for
+/// child/tool calls and another for thinking rows shown".
 ///
 /// A block that reports a **failure** is kept even where the fold would hide
 /// it: the failure is never what the fold gives up. The rule lives here, not in
 /// an arm and not in the handler of a key that changes a number, so a `0`-rows
-/// setting still paints a failed result's own `! error: …` row — the same rule
-/// the foot's cap already holds ("the failure is never the line the cap gives
-/// up").
+/// setting still paints a failed result's own `! error: …` row and a `#1
+/// failed: …` report's first row — the same rule the foot's cap already holds
+/// ("the failure is never the line the cap gives up").
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Fold {
     /// One number per kind, indexed by [`Kind::slot`].
@@ -2662,10 +2687,10 @@ pub struct Fold {
 }
 
 impl Fold {
-    /// The numbers a conversation opens with: eight rows for a result, and no
-    /// bound for the reasoning.
+    /// The numbers a conversation opens with: eight rows for a result, a
+    /// report or a brief, and no bound for the reasoning.
     pub const DEFAULT: Fold = Fold {
-        rows: [8, usize::MAX],
+        rows: [8, 8, 8, usize::MAX],
     };
 
     /// How many of `text`'s rows this fold lets a pane paint for `kind` — the
@@ -2694,12 +2719,30 @@ impl Fold {
 
 /// Whether a block of this kind reports a failure — the one thing the fold
 /// never gives up (see [`Fold`]'s own doc). The vocabulary is the kinds' own: a
-/// tool result fails when it opens with mush's `error:` prefix. A thought is
-/// nobody's failure to report.
+/// tool result fails when it opens with mush's `error:` prefix, and a mush line
+/// when it is a `#3 failed: …` report. A brief and a thought are nobody's
+/// failure to report.
 fn fails(kind: Kind, text: &str) -> bool {
     match kind {
         Kind::Result => text.trim_start().starts_with(FAILED),
-        Kind::Reasoning => false,
+        Kind::Mush => report_failed(text),
+        Kind::Brief | Kind::Reasoning => false,
+    }
+}
+
+/// Which kind of block a voice's lines are, or `None` for the human's own
+/// words.
+///
+/// The two exemptions from the fold are named here: the human's lines are
+/// theirs, however long, and the model's reply is the conversation's own text.
+/// Everything else a pane writes into a transcript is a block with a number.
+/// No wildcard arm: a new voice has to be classified here before the crate
+/// builds again.
+fn voice_kind(voice: Voice) -> Option<Kind> {
+    match voice {
+        Voice::Human => None,
+        Voice::Brief | Voice::Parent => Some(Kind::Brief),
+        Voice::Mush => Some(Kind::Mush),
     }
 }
 
@@ -2713,9 +2756,9 @@ fn elision(hidden: usize) -> String {
 /// The head of a folded block: the mark that leads its first row, and the
 /// styles its mark and its words are painted in.
 ///
-/// A tool result and a working note paint the whole row in one colour, while a
-/// voice colours only its mark and leaves the words plain ([`marked`]); the two
-/// styles are bundled here, so the painter takes them as one argument.
+/// One value because the two styles can differ: a tool result and a working
+/// note paint the whole row in one colour, while a voice colours only its mark
+/// and leaves the words plain ([`marked`]). Bundled, they are one argument.
 #[derive(Clone, Copy)]
 struct Head<'a> {
     mark: &'a str,
@@ -2730,6 +2773,16 @@ impl<'a> Head<'a> {
             mark,
             mark_style: style,
             body: style,
+        }
+    }
+
+    /// A mark in its speaker's own style, and the words in the pane's plain
+    /// one: the shape [`marked`] paints a voice's rows in.
+    fn spoken(mark: &'a str, style: Style) -> Self {
+        Self {
+            mark,
+            mark_style: style,
+            body: Style::default(),
         }
     }
 }
@@ -2849,20 +2902,38 @@ fn render_message(
             // Mush's own line in the conversation is marked like the other
             // lines mush writes into a pane, and `mark()` is the one spelling
             // of that mark as it is of every speaker's.
-            let (mark, style) = voice.unwrap_or(Voice::Human).mark();
+            let voice = voice.unwrap_or(Voice::Human);
+            let (mark, style) = voice.mark();
             // The mark is painted even for a message that is only an
             // attachment: the `▣` rows below are *what* was said, whoever said
             // it, and the mark is *who* said it. Without it, a picture the
             // human sent would read exactly like a dim line of mush's own.
-            mark_rows(
-                out,
-                &mut rows,
-                mark,
-                style,
-                message.text(),
-                width,
-                View::Plain,
-            );
+            match voice_kind(voice) {
+                // The human's own words: theirs, however long. The fold has no
+                // number for them ([`voice_kind`]).
+                None => mark_rows(
+                    out,
+                    &mut rows,
+                    mark,
+                    style,
+                    message.text(),
+                    width,
+                    View::Plain,
+                ),
+                // The blocks the fold exists for, each through its own kind:
+                // mush's own line about a child or a job, and the words another
+                // agent addressed to this pane — the brief a child's pane opens
+                // with, a parent's steering — which are read the same way.
+                Some(kind) => folded_marked(
+                    out,
+                    &mut rows,
+                    Head::spoken(mark, style),
+                    message.text(),
+                    width,
+                    kind,
+                    fold,
+                ),
+            }
             image_rows(out, message);
             rows.resize(out.len() - start, None);
             out.push(Line::from(""));
@@ -5326,12 +5397,59 @@ mod tests {
         }
     }
 
+    /// The human's ask: a child's or a job's report arriving in the parent's
+    /// conversation folds like a command's result, through the one [`Fold`] —
+    /// at most its number of rows, the `…` row saying how much is hidden — and
+    /// the select mode still hands out the report's own bytes.
+    ///
+    /// Before this, a report was a `user`-role line painted by `mark_rows`,
+    /// which has no cap at all: the 25-line report below painted 26 rows,
+    /// where the same text as a tool result painted ten (eight rows, the `…`,
+    /// the blank).
+    #[test]
+    fn a_childs_report_folds_like_a_commands_result() {
+        let report = (0..25)
+            .map(|n| format!("#1 done: line {n} of the report"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut chat = Chat::bare();
+        chat.push_message(AgentId::ROOT, Message::user(&report));
+
+        // Eight wrapped rows, the `…` that stands for the rest; the pane trims
+        // the blank that closes the message when the transcript ends there.
+        let painted = shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 20));
+        let mut want: Vec<String> = (0..8)
+            .map(|n| {
+                if n == 0 {
+                    format!("· #1 done: line {n} of the report")
+                } else {
+                    format!("  #1 done: line {n} of the report")
+                }
+            })
+            .collect();
+        want.push("  … +17 more lines".to_string());
+        assert_eq!(painted, want, "the report folds like a result");
+
+        // The cap is the pane's; the copy's is the text. `Ctrl-Y`'s `Enter`
+        // still hands out every byte of the report, the folded lines included.
+        chat.start_select(AgentId::ROOT);
+        chat.select_apply(AgentId::ROOT, SelectKey::Extend(-3 * keys::PAGE));
+        let copied = chat
+            .select_apply(AgentId::ROOT, SelectKey::Copy)
+            .expect("Enter copies");
+        assert_eq!(copied.text, report, "the report's own bytes, folded or not");
+        assert_eq!(
+            copied.line,
+            format!("copied 25 lines from your message — {} bytes", report.len())
+        );
+    }
+
     /// Every multi-line block a pane writes goes through the fold, each kind
-    /// with its own number: a tool result to eight rows, the reasoning to its
-    /// own slot, which is `usize::MAX` — shown whole, because that is the text
-    /// the human pressed `Ctrl-T` to read, and folded the day a setting lowers
-    /// the number. The report and the brief the `user` arm paints join this
-    /// list with that arm's own commit.
+    /// with its own number: a tool result, mush's own line about a child or a
+    /// job, and the brief a child's pane opens with to eight rows; the
+    /// reasoning to its own slot, which is `usize::MAX` — shown whole, because
+    /// that is the text the human pressed `Ctrl-T` to read, and folded the day
+    /// a setting lowers the number.
     ///
     /// A new kind is a compile-time question, not a silent omission: [`Kind`]'s
     /// table is exactly [`Kind::COUNT`] long and [`Kind::slot`] is a `match`
@@ -5344,23 +5462,32 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         let fold = Fold::DEFAULT;
-        assert_eq!(fold.shown(Kind::Result, &many), 8);
+        for kind in [Kind::Result, Kind::Mush, Kind::Brief] {
+            assert_eq!(fold.shown(kind, &many), 8, "{kind:?}");
+        }
         assert_eq!(
             fold.shown(Kind::Reasoning, &many),
             usize::MAX,
             "a thought is shown whole until a setting says otherwise"
         );
 
-        // A result paints eight rows and the `…` — ten rows with the blank.
+        // The result, the report and the brief each paint eight rows and the
+        // `…` — the same ten rows with the blank, whatever their mark.
         let result = message_rows(&Message::tool("call_1", &many), None, 60, true);
-        let rows = shown(&result);
-        assert_eq!(rows.len(), 10, "eight rows and the `…`: {rows:?}");
-        assert!(
-            rows[8].ends_with("… +17 more lines"),
-            "the ninth row names what is hidden: {rows:?}"
-        );
-        assert_eq!(rows[9], "", "and the blank closes the message");
-        assert_eq!(rows[0], "  line 0", "the result's own indent");
+        let report = message_rows(&Message::user(&many), Some(Voice::Mush), 60, true);
+        let brief = message_rows(&Message::user(&many), Some(Voice::Brief), 60, true);
+        for painted in [&result, &report, &brief] {
+            let rows = shown(painted);
+            assert_eq!(rows.len(), 10, "eight rows and the `…`: {rows:?}");
+            assert!(
+                rows[8].ends_with("… +17 more lines"),
+                "the ninth row names what is hidden: {rows:?}"
+            );
+            assert_eq!(rows[9], "", "and the blank closes the message");
+        }
+        assert_eq!(shown(&result)[0], "  line 0", "the result's own indent");
+        assert_eq!(shown(&report)[0], "· line 0", "mush's own mark");
+        assert_eq!(shown(&brief)[0], "brief › line 0", "the brief's mark");
 
         // The reasoning is whole today — every row, no `…`...
         let thought = thinking("", &many);
@@ -5389,10 +5516,10 @@ mod tests {
     /// it: the foot's cap already refuses to drop the failure row ("the failure
     /// is never the line the cap gives up"), and the fold holds the same rule —
     /// it lives on [`Fold`], not in an arm, so a `0`-rows setting still paints
-    /// the `! error: …` result's own row.
+    /// the `! error: …` result and the `#1 failed: …` report's own row.
     #[test]
     fn a_failure_is_never_what_the_fold_gives_up() {
-        let zero = Fold::DEFAULT.with(Kind::Result, 0);
+        let zero = Fold::DEFAULT.with(Kind::Result, 0).with(Kind::Mush, 0);
 
         // A failed result: the failure row stays, and the log it came with is
         // what the fold gives up.
@@ -5424,19 +5551,39 @@ mod tests {
             zero,
         ));
         assert_eq!(rows, vec!["  … +3 more lines".to_string(), String::new()]);
+
+        // And a child's failed report, painted through the pane the human
+        // reads: the fold rides on `Chat`, so this is the whole road.
+        let mut chat = Chat::bare();
+        chat.fold = zero;
+        chat.push_message(
+            AgentId::ROOT,
+            Message::user("#1 failed: no route to the endpoint\nthe run's own log"),
+        );
+        assert_eq!(
+            shown(&pane_rows(&chat, &pane(AgentId::ROOT), 60, 8)),
+            vec![
+                "· #1 failed: no route to the endpoint".to_string(),
+                "  … +1 more lines".to_string(),
+            ]
+        );
     }
 
     /// The two blocks the fold never touches, whatever it says: the human's own
     /// lines, because their words are theirs however long, and the model's
     /// reply, because it is the conversation's own text. A `0`-rows setting for
-    /// every kind the fold owns leaves both whole.
+    /// every other kind leaves both whole.
     #[test]
     fn the_humans_lines_and_the_reply_are_never_folded() {
         let many = (0..25)
             .map(|n| format!("line {n}"))
             .collect::<Vec<_>>()
             .join("\n");
-        let zero = Fold::DEFAULT.with(Kind::Result, 0).with(Kind::Reasoning, 0);
+        let zero = Fold::DEFAULT
+            .with(Kind::Result, 0)
+            .with(Kind::Mush, 0)
+            .with(Kind::Brief, 0)
+            .with(Kind::Reasoning, 0);
 
         let human = message_rows_under(&Message::user(&many), Some(Voice::Human), 60, true, zero);
         assert_eq!(
