@@ -1051,6 +1051,12 @@ ends with a demoable, tested artifact and no milestone depends on a later one,
 which is why stopping between them costs nothing: what is above is either built
 or nothing at all.
 
+**What comes next is not a roadmap.** From here mush changes when the human
+asks — a bug they hit, a thing they want, a sentence in this manual that is no
+longer true — and never because a plan says so. §11's open questions are
+questions the human may answer one day, not a queue; a reader who finds one of
+them should ask rather than build.
+
 ---
 
 ## 10. Testing
