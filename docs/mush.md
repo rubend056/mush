@@ -840,8 +840,9 @@ for the alert red, because a failure has to look the same wherever it is read.
 ```
 
 The API key is never stored here — it lives in the machine-global home config
-(`$MUSH_CONFIG`, else `~/.config/mush/config.json`), set with `/key` or
-`MUSH_API_KEY`.
+(`$MUSH_CONFIG`, else `~/.config/mush/config.json`). `/key` is the one road that
+writes it there; `MUSH_API_KEY` supplies one from the environment for the run,
+and no other save copies it into the file (finding C11).
 
 That file is meant to be hand-edited, and it documents itself. Every field is
 optional — `api_key`, `provider`, `base_url`, `model`, `context` (a stated
