@@ -371,11 +371,10 @@ may have been dropped rather than never said.";
 /// sentence is not the note and is left exactly where it stood (finding F3).
 ///
 /// A note the transcript already carries is *moved back* to its place rather
-/// than stacked, wherever the copy came from: the UI appends the line it is
-/// told to the end of its copy, and the actor's list is the one a request is
-/// built from, so a note sitting after the newest message would read as the
-/// newest thing said instead of as a statement about the front of the
-/// transcript ([`place_dropped_note`]).
+/// than stacked, wherever the copy came from: a copy can hold the note where an
+/// append left it, and a note sitting after the newest message would read as the
+/// newest thing said instead of as a statement about the front of the transcript
+/// ([`place_dropped_note`]).
 ///
 /// The return is the note on the call that first adds it — the actor emits that
 /// one, so the UI's copy learns the sentence exactly once — and `None` when
@@ -447,12 +446,14 @@ pub fn trim_history(messages: &mut Vec<Message>, budget: usize) -> Option<Messag
 /// Put a carried note back where the dropped turns were, instead of leaving it
 /// where a copy of the transcript left it.
 ///
-/// The UI's copy is the one that needs this: a line reaches it by an emitted
-/// [`Message`], which appends, so the human's copy holds the note at the end —
-/// while the actor's list is what a request is built from, and a note *after*
-/// the newest message reads as the newest thing said rather than as a statement
-/// about the front of the transcript. The note is told by [`is_dropped_note`]'s
-/// flag, and the flag is a fact a stored transcript keeps
+/// A note reaches a copy of the conversation by an *append* — the actor emits
+/// it and the pane puts what it is told at the end of its own record — while
+/// its place is the transcript's *front*: a note after the newest message reads
+/// as the newest thing said rather than as a statement about what the front
+/// lost (finding A18). This is the one spelling of that place, called by the
+/// pane that appends the line and by the actor's hand-over, so the pane's rows
+/// and the request's messages read the same transcript. The note is told by
+/// [`is_dropped_note`]'s flag, and the flag is a fact a stored transcript keeps
 /// ([`Message::note`](crate::message::Message::note)), so a copy read back from
 /// `.mush/session.json` is placed by this rule rather than left wherever the
 /// file held it. A transcript with no note is left exactly as it is; one
@@ -466,15 +467,23 @@ pub fn place_dropped_note(messages: &mut Vec<Message>) {
     insert_dropped_note(messages);
 }
 
-/// Where the dropped turns were: after the system prompt and the opening task,
-/// before the oldest turn that was kept — index 2 in the system+task shape a
-/// request has, and the end of a shorter one. One spelling, built by
-/// [`Message::note`](crate::message::Message::note), so the trim that places
-/// the note and the copy that puts it back cannot disagree about either the
-/// sentence or its provenance.
+/// Where the dropped turns were: after the *front* of the list — the system
+/// prompt, when one heads it, and the opening task after it — and before the
+/// oldest turn that was kept. The front is read off the list itself rather than
+/// assumed to be two messages wide, because the two copies of one conversation
+/// are not the same length: a request opens with the system prompt and the
+/// task, while the pane's copy carries the task and no prompt (a pane never
+/// paints the prompt), so the same call gives each copy the note's place —
+/// after the front — instead of one copy owning arithmetic the other has to
+/// repeat (finding A18). A list shorter than its front takes the note at the
+/// end, which is all "after the front" can mean there.
 fn insert_dropped_note(messages: &mut Vec<Message>) {
-    let at = 2.min(messages.len());
-    messages.insert(at, Message::note(DROPPED_TURNS_NOTE));
+    let front = 1 + usize::from(
+        messages
+            .first()
+            .is_some_and(|message| message.role == "system"),
+    );
+    messages.insert(front.min(messages.len()), Message::note(DROPPED_TURNS_NOTE));
 }
 
 /// Whether a message is the note [`trim_history`] leaves behind when it drops
@@ -905,6 +914,57 @@ mod tests {
         assert_eq!(note_count(&messages), 1, "one note, however many came back");
         assert_eq!(messages[2].text(), DROPPED_TURNS_NOTE);
         assert_eq!(messages[3].text(), "working");
+    }
+
+    /// The note's place is read off the list it is given, not assumed to be
+    /// index 2: the pane's copy of a conversation carries the opening task and
+    /// no system prompt (a pane never paints the prompt), and the same call
+    /// puts the note after the front in either shape — so the pane's rows and
+    /// the request's messages cannot disagree about where the note is (finding
+    /// A18).
+    #[test]
+    fn place_dropped_note_reads_the_front_off_the_list() {
+        // The request's shape: the prompt, the opening task, then the turns.
+        let mut request = vec![
+            Message::system("you are mush"),
+            Message::user("task"),
+            Message::assistant("working"),
+            Message::note(DROPPED_TURNS_NOTE),
+        ];
+        place_dropped_note(&mut request);
+        assert_eq!(request[1].text(), "task", "the prompt still heads it");
+        assert_eq!(request[2].text(), DROPPED_TURNS_NOTE);
+        assert_eq!(request[3].text(), "working");
+
+        // The pane's shape: the same conversation without the prompt.
+        let mut pane = vec![
+            Message::user("the brief"),
+            Message::assistant("working"),
+            Message::note(DROPPED_TURNS_NOTE),
+        ];
+        place_dropped_note(&mut pane);
+        assert_eq!(pane[0].text(), "the brief");
+        assert_eq!(
+            pane[1].text(),
+            DROPPED_TURNS_NOTE,
+            "after the front, before the oldest kept turn"
+        );
+        assert_eq!(pane[2].text(), "working");
+        assert_eq!(note_count(&pane), 1, "moved, not stacked");
+
+        // A list shorter than its front takes the note at the end, which is
+        // all "after the front" can mean there.
+        let mut lonely = vec![
+            Message::user("only line"),
+            Message::note(DROPPED_TURNS_NOTE),
+        ];
+        place_dropped_note(&mut lonely);
+        assert_eq!(lonely.len(), 2, "nothing was dropped or stacked");
+        assert_eq!(lonely[0].text(), "only line");
+        assert!(
+            is_dropped_note(&lonely[1]),
+            "the end is after the front here"
+        );
     }
 
     /// The note is told from a line by provenance and never by its text

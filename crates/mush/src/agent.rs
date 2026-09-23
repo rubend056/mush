@@ -2411,13 +2411,13 @@ fn fold_parked(
 /// travels in; one helper, so no door can repair differently from another.
 fn adopted(mut messages: Vec<Message>) -> Vec<Message> {
     repair_tool_pairs(&mut messages);
-    // The copy can also carry the dropped-turns note — the UI puts what it is
-    // told at the end, a stored copy holds it where its own trim left it. The
-    // actor's list is what a request is built from, so the note goes back where
-    // the dropped turns were before anything reads it — the fold included,
-    // whose own request must carry the sentence where the model expects a
-    // statement about the transcript's front
-    // (`mush_core::transcript::place_dropped_note`).
+    // The copy can also carry the dropped-turns note: a session file another
+    // version wrote may hold it after the newest line, and this hand-over is
+    // the door a copy the actor did not build comes through. The actor's list
+    // is what a request is built from, so the note goes back where the dropped
+    // turns were before anything reads it — the fold included, whose own
+    // request must carry the sentence where the model expects a statement about
+    // the transcript's front (`mush_core::transcript::place_dropped_note`).
     place_dropped_note(&mut messages);
     messages
 }
