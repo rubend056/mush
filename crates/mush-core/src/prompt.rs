@@ -163,8 +163,9 @@ pub fn tool_schemas() -> Vec<Value> {
         tool(
             ToolName::EditFile,
             "Replace exact text in one file: every edit lands or none do, so prefer one call for \
-             multi-part changes. A missing `old_string` is refused; a non-unique one is refused \
-             unless `replace_all` is set.",
+             multi-part changes. Applied to the file as read: a concurrent change is lost. A \
+             missing `old_string` is refused; a non-unique one is refused unless \
+             `replace_all` is set.",
             json!({
                 "type": "object",
                 "properties": {

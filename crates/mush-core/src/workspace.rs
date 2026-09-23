@@ -2295,6 +2295,38 @@ mod tests {
         assert!(!ws.resolve("src/missing.rs").unwrap().exists());
     }
 
+    /// The edit road is read → transform → write, and the write is the whole
+    /// file: a change another writer lands between the two is lost, silently
+    /// (finding B16). This is the audit's staged window, kept as the fact the
+    /// tool's description and [`crate::tools::edit_text_many`]'s doc now
+    /// state — the decision is to name the loss, not to compare-and-swap it
+    /// away.
+    #[test]
+    fn an_edit_written_from_a_stale_read_loses_the_other_writers_change() {
+        let ws = temp_workspace("edit-stale-read");
+        fs::write(ws.root().join("f.txt"), "line one\n").unwrap();
+
+        // What the model reads before it decides on an edit ...
+        let read = ws.read_file("f.txt").unwrap();
+        // ... and what another writer — a sibling agent in the same checkout,
+        // or the human's own editor — lands before the model's write.
+        fs::write(ws.root().join("f.txt"), "line one\nline 2\n").unwrap();
+
+        let edits = [crate::tools::Edit {
+            old: "line one".to_string(),
+            new: "LINE ONE".to_string(),
+            replace_all: false,
+        }];
+        let updated = crate::tools::edit_text_many(&read, &edits, "f.txt").unwrap();
+        ws.write_file("f.txt", &updated).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(ws.root().join("f.txt")).unwrap(),
+            "LINE ONE\n",
+            "the sibling's line is gone: the write was the file as it was read"
+        );
+    }
+
     /// The bytes of a "png" for a paste test: the magic number is the whole of
     /// what [`image_mime`] reads, and the padding lets a test craft one past
     /// the cap without holding a real picture.

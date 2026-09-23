@@ -272,6 +272,16 @@ pub fn edit_text(
 /// `Ok` cannot leave a file half-changed. Applying them here rather than as
 /// separate tool calls also makes the batch one round trip instead of one per
 /// edit, and guarantees the edits see each other's results in the order given.
+///
+/// The `current` transformed here is the text the caller *read*, never the file:
+/// the write that follows is unconditional and whole, so a change another writer
+/// landed between the caller's read and its write is lost, silently, and the
+/// file stays valid (finding B16). That is the decision rather than a window
+/// this function could close: the read and the write are the caller's two calls,
+/// and a compare-and-swap would take the file's stat compared across both — the
+/// caller's, not a transform's. The sentence the model reads is `edit_file`'s
+/// description, and it says what happens: a file that may have moved wants a
+/// fresh read.
 pub fn edit_text_many(current: &str, edits: &[Edit], rel: &str) -> Result<String, String> {
     let mut text = current.to_string();
     for (index, edit) in edits.iter().enumerate() {
