@@ -288,9 +288,18 @@ pub fn branch_name(id: u64) -> String {
 /// The number is deliberately above the window of children a reaped session
 /// keeps: the cap bounds what a run leaves on disk, and it must never be the
 /// thing that refuses a delegation the history could still hold. It counts
-/// checkouts that are **not landable** — the ones no sweep will take — so a
-/// worktree whose work is already merged, or one whose run committed nothing
-/// and left no path a commit cannot keep, never spends a slot on its way out.
+/// checkouts that are **not landable against `HEAD`** — the question
+/// [`unlandable`] can ask from here — so a worktree whose work is already
+/// merged, or one whose run committed nothing and left no path a commit cannot
+/// keep, never spends a slot on its way out.
+///
+/// That question is the repo-wide half of the sweep's, not the sweep's own:
+/// the sweep measures a nested child against the branch its parent holds, so a
+/// child merged only into its parent's branch is counted here although the
+/// sweep would take it. The facts that would close the gap — each node's base
+/// and fork — live in the UI's tree, which the spawn road cannot reach; until
+/// it can, the refusal says which question was asked rather than claiming the
+/// worktrees are unmerged (finding F7).
 ///
 /// Ignored work does spend one, and that is the price of finding F1's rule: a
 /// child that merely compiled has a `target/` no commit can keep, so its
@@ -821,8 +830,8 @@ pub fn isolated_ids(dir: &Path) -> Option<Vec<u64>> {
     Some(ids)
 }
 
-/// The isolated worktrees that exist and are **not** landable: what
-/// [`MAX_WORKTREES`] counts.
+/// The isolated worktrees that exist and are **not** landable against `HEAD`:
+/// what [`MAX_WORKTREES`] counts.
 ///
 /// A landable worktree is one the next sweep takes, so it must not be what
 /// refuses a spawn — the cap exists to turn today's failure, a `git worktree add`
@@ -830,6 +839,16 @@ pub fn isolated_ids(dir: &Path) -> Option<Vec<u64>> {
 /// clear (finding H17). Read-only, so a caller may ask without changing the
 /// repository, and it answers with nothing when git cannot answer at all: a
 /// count that cannot be taken is not a hundred worktrees, it is no answer.
+///
+/// What it asks is every worktree against `HEAD` with no fork revision, while
+/// the sweep that takes worktrees asks each node against the branch its own
+/// parent holds and with the fork it was created at (`App::reclaim_worktrees`).
+/// A nested child merged only into its parent's branch is therefore counted here
+/// although the sweep would take it, and the worktree is *reported*, not refused
+/// for it: [`MAX_WORKTREES`] and the spawn road's refusal say which question was
+/// asked rather than claiming the branch is unmerged (finding F7). The facts
+/// that would make the two questions one — each node's base and fork — live in
+/// the UI's tree, not on this side of the door.
 pub fn unlandable(root: &Path) -> Vec<u64> {
     let Some(worktrees) = worktrees(root) else {
         return Vec::new();
