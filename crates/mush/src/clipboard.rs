@@ -5,12 +5,14 @@
 //! dependency mush does not want to pay for a screenshot: the programs every
 //! desktop already ships carry the clipboard both ways — wayland's `wl-paste`
 //! and `wl-copy`, X11's `xclip`, macOS's `pngpaste` and `pbcopy` — and shelling
-//! out to them is what a human does by hand. Which one exists is discovered by
-//! trying them, because a program that is not installed fails to spawn
-//! instantly and costs nothing to ask. Every one of them is started without
-//! mush's secrets ([`mush_core::secrets::scrub`]): a clipboard tool does not
-//! talk to the provider, and the credential is not in the environment it is
-//! handed (finding C1).
+//! out to them is what a human does by hand. Windows's `clip` joins them on the
+//! write road alone: it takes the text on stdin and reads nothing back, so a
+//! Windows paste is not a road this module carries. Which one exists is
+//! discovered by trying them, because a program that is not installed fails to
+//! spawn instantly and costs nothing to ask. Every one of them is started
+//! without mush's secrets ([`mush_core::secrets::scrub`]): a clipboard tool
+//! does not talk to the provider, and the credential is not in the environment
+//! it is handed (finding C1).
 //!
 //! This module lives in the binary crate, not in `mush-core`: it is a
 //! subprocess and the clipboard is a machine facility, and `mush-core` is
@@ -348,7 +350,7 @@ fn saved(ws: &Workspace, drained: Drained) -> Result<Option<Image>, String> {
 // The write road's primitive, bound by `App::write_clipboard`'s default: the
 // select mode's `Enter` reaches the writers through this function. The value
 // seam exists so a test can press that key without writing the human's real
-// clipboard, or depending on which of the three writers the machine has on
+// clipboard, or depending on which of the four writers the machine has on
 // `PATH`.
 pub fn write_text(text: &str) -> Result<(), String> {
     run_writers(writers(), text, Instant::now() + DEADLINE)
@@ -361,7 +363,7 @@ fn run_writers(
     text: &str,
     deadline: Instant,
 ) -> Result<(), String> {
-    // Shared with the thread that writes it, so a text handed to three writers
+    // Shared with the thread that writes it, so a text handed to four writers
     // is copied once, and never once per poll.
     let text: Arc<str> = Arc::from(text);
     let mut ran = false;
@@ -378,7 +380,7 @@ fn run_writers(
                 ran = true;
                 stalled = Some(program);
                 // The deadline is shared — one wait for the whole sequence, so
-                // three writers cannot each spend two seconds of a frozen
+                // four writers cannot each spend two seconds of a frozen
                 // keyboard — so the writers after a stall have no time left.
                 break;
             }
@@ -406,12 +408,12 @@ fn run_writers(
 
 /// Every way this writes a clipboard, in the order it tries them: wayland's
 /// `wl-copy`, then X11's `xclip` with the clipboard selection in, then macOS's
-/// `pbcopy`. All three take the text on stdin, so the two that have nothing else
-/// to say take no arguments at all.
+/// `pbcopy`, then Windows's `clip`. All four take the text on stdin, so the
+/// three that have nothing else to say take no arguments at all.
 ///
 /// The order is not a guess at the session: a program of the wrong display
 /// server fails just as fast as a missing one (no `$WAYLAND_DISPLAY`, no X
-/// display), so trying all of them is how this stays one code path on three
+/// display), so trying all of them is how this stays one code path on four
 /// platforms. `wl-copy` is passed no flag where `wl-paste` is passed
 /// `--no-newline`: `-n` on the write side is `--trim-newline`, which drops a
 /// trailing newline the human put there ([`write_text`]). Nor is a type asked
@@ -426,6 +428,8 @@ fn writers() -> Vec<(&'static str, Vec<String>)> {
             vec!["-selection".into(), "clipboard".into(), "-i".into()],
         ),
         ("pbcopy", Vec::new()),
+        // Windows's own: `clip` takes the text on stdin and sets the clipboard.
+        ("clip", Vec::new()),
     ]
 }
 
@@ -1007,13 +1011,14 @@ mod tests {
         }
     }
 
-    /// The writer list is the three platforms' tools in the order the module
+    /// The writer list is the four platforms' tools in the order the module
     /// documents, with `xclip` told which selection to put the text in: a binding
     /// dropped here is a platform that silently stops accepting text. `wl-copy`
     /// takes no flags where `wl-paste` takes `--no-newline`, because `-n` on this
-    /// side would trim a trailing newline that is the human's.
+    /// side would trim a trailing newline that is the human's, and `pbcopy` and
+    /// Windows's `clip` take no flags at all.
     #[test]
-    fn the_writers_are_the_three_programs_in_the_documented_order() {
+    fn the_writers_are_the_four_programs_in_the_documented_order() {
         assert_eq!(
             writers(),
             vec![
@@ -1027,6 +1032,7 @@ mod tests {
                     ],
                 ),
                 ("pbcopy", Vec::new()),
+                ("clip", Vec::new()),
             ],
             "the writers, in order"
         );
