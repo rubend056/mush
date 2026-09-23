@@ -839,6 +839,38 @@ H16 by `8c1a860`, **which was then reverted on the human's decision**
   attribute's polarity or refuse a `not(...)` wrapper; the script's own
   docstring already says “when in doubt, a file stays in prod” — this is the one
   doubt it does not read.
+- **H77** — ⬜ open, a crafted reply line can stall a frame, measured by
+  `de86ba3` (§8.106): a 34,000-character braid of emphasis markers took **4.4 s
+  before** the nesting change and **5.7 s after** it, and crafted 20k–80k-char
+  nesting families completed without stack overflow, so no cap was added. The
+  cost lives in `span`/`close` — the pre-existing scan — not in what the wave
+  added, and it is latent: a model (or a crafted message) that writes such a
+  line costs the frame that paints it seconds instead of milliseconds. No fix is
+  owed now; the home of one would be `text.rs`'s `close`/`span` or the pane's
+  parse boundary.
+- **H78** — ⬜ open, the table rule's admitted over-read, recorded by `84a6b2a`
+  (§8.106): `is_row` is `line.contains('|')`, so a header that also begins `> `
+  or `- ` and holds a `|` is read as a table's header — the rule is written down
+  (“the delimiter row under it can be explained no other way”) — but no fixture
+  covers the `> | a | b |` shape beyond the doc sentence. Belongs in `text.rs`:
+  a test that pins the reading as the decision it is, or a recognition rule that
+  leaves another block's header alone.
+- **H79** — ⬜ open, the pty scenarios do not wipe their workdir, hit by the root
+  at `f46859f` (§8.105–§8.106's gate): `scripts/smoke.py`'s `Tui` only `mkdir`s
+  the workspace it is given, and the sigterm scenario's precondition is `message
+  not in stored_before` for a *constant* sentence — so a second run in the same
+  fixture directory fails “the debounce had not written the answer yet” while
+  the tree is fine (the `session.json` it read held the previous run's answer;
+  the debounce is a minute, `SESSION_DEBOUNCE`, `app/mod.rs:475`). The root's
+  own fix was a fresh `mktemp -d` per run. Belongs in `scripts/smoke.py` — start
+  from an empty workspace or refuse a dirty one — for the script's owner.
+- **H80** — ⬜ open, a layout judgement left for a human's eye, made by `84a6b2a`
+  (§8.106): a table paints at most `width.div_ceil(4)` columns, at least one
+  (each column costs four pane columns: its cell plus the ` │ ` before it), so
+  on a narrow pane a many-column table folds to one column and wraps tall rather
+  than scrolling. The child called it honest; a ruling could keep the cap or
+  spend the pane's width on fewer, wider columns. The code's home is `text.rs`'s
+  `table`; it is a judgement, not a defect, and no test is owed until a ruling.
 
 `docs/refactor.md` §11 is the ledger: its older queue is closed except `R6`
 (judged and left on purpose), and the four blind duplication passes of §8.70
@@ -9385,6 +9417,10 @@ expected `the reply ended inside its chunked body` and got `Connection reset by
   another suite's load, since the test passes alone (0.4 s) and the same suite's
   next run is green. Named here rather than chased; it is the same class as the
   standing wall-clock shape below.
+- `machine::tests::a_command_that_left_its_process_group_is_outside_cleanup` —
+  **⬜ open, wave 2's load flake (`f46859f`, §8.106).** That gate saw it red
+  once under the loaded workspace suite and green alone; carried here as that
+  gate carried it, named rather than chased.
 
 **The standing shapes, unchanged.**
 `a_frame_fits_in_a_60fps_budget_on_a_long_transcript` is `#[ignore]`d because the
@@ -9774,4 +9810,318 @@ costs (a pty, an emulator, a second keyboard mode, 4–8 crates) is also what it
 loses (a box of bytes with no phases, no tool calls, no token count and no
 useful cancel). The probe's report, not a section here, is where its measurements
 live: with the milestone parked there is nothing left for them to decide.
+
+---
+
+## 8.105 The select cursor's step up keeps its own row on the pane (the human's report, `db93527`, merged `a6de2cb`)
+
+A live report from the human — *"in selection mode after Ctrl Y when going up
+the conversation it won't scroll properly at certain points (vs going down
+where it does)"* — measured, fixed at its source, and pinned by two tests that
+fail on the parent tree. One commit, `crates/mush/src/app/chat.rs` only
+(+309/−72). What follows is the commit's own body and its merge's, re-read
+against the tree at `f46859f`.
+
+**The shape it found.** `cursor_row` was a free function that asked the window
+for "the nearest painted row of the cursor's own message" — `rposition(stop <=
+cursor)` then `position(stop >= cursor)` — and answered with whatever row that
+found. After any placement the window's first rows are the cursor's own message,
+so a step *up* inside that message has every one of its rows at or below the
+cursor's stop: the rposition found nothing and the position found the window's
+**top row**, a *neighbouring* stop's row. `select_body` read "the cursor is
+shown", kept the window where it stood, and `select_rows` painted the cursor on
+the wrong line — while `Enter`/`SelectKey::Copy` copy the *stop* (`Chat::copy`
+reads `Stops::span`), so the human could copy a line the pane never showed them.
+The mirror step down was already closed by the `cut` guard — a cursor below the
+window's last row lies in the message the height cut, and `cut` refuses to
+answer — which is the asymmetry the report names ("vs going down where it
+does").
+
+**Measured, then fixed — before → after** (the probe, deleted; the after is
+pinned by the tests below):
+
+- up-walk: of the 17 presses that moved the cursor, **8 painted the wrong row**
+  → **0**. Press 7: the cursor stood on `(3, Line(1))` while the pane painted it
+  on message 3 line 2's row and the window top stayed `(3, 2)`; `Enter` would
+  have copied `m3 second`, and the row the pane painted read `m3 third`.
+- down-walk: 22 presses, **1 wrong** → **0** — the frozen window cost the first
+  step back down (cursor `(0, Line(1))` painted on line 2's row, top stayed
+  `(0, 2)`).
+- the window top walking up: frozen at `(3,3)`→`(3,2)` then stuck → it moves on
+  every step that leaves it — `(3,3) (3,2) (3,1) (3,0) (2,2) (2,1) (2,0)
+  (1,2) …`.
+
+**The fix.** `cursor_row` is now a `Chat` method that decides "is the cursor in
+this window" from the window's own top and the row where the pane would
+**place** the cursor's stop — `first_row`: its own first row, or, for a stop the
+message paints no row for, the nearest painted stop before it, or the message's
+first row. A window whose top begins after that place is not showing the cursor,
+whatever row it carries, and the frame places the window again. The nearest-row
+fallback survives, and survives only where it is honest: a stop the message
+paints no row for at all — a reply's fence line inside a block that has a body
+(D14) — has no row to be outside the window, so it still paints on the nearest
+painted row of its own message, and the copy still reads the stop. `select_body`
+hands the frame the row it decided and `select_rows` paints *that* row, so the
+paint and the copy cannot answer differently. Doc comments rewritten:
+`cursor_row` (its new home), `select_body`, `select_rows`, `SelectRows::cursor`.
+
+**Tests, both red on the parent tree at press 7.**
+`a_cursor_walking_up_keeps_its_own_row_on_the_pane` walks every press of a full
+walk up and back down a transcript taller than the pane: the painted rows are
+the cursor's own stop's, first word and last, and the window never moves the
+wrong way nor freezes with the cursor off it.
+`enter_copies_the_line_the_pane_painted_the_cursor_on` enters every depth of
+that walk for real: the clipboard holds the line the last painted row showed.
+The `walk_lines()` helper builds the six three-line replies the walk reads.
+`cargo test -p mush app::chat` at this base reports 96 passed: the module had 89
+`#[test]`s before the wave, 91 at this merge (the two above), and wave 2's five
+tests in the same module bring it here.
+
+**What it deliberately did not do:** the `cut` guard and the down direction's
+shape are left as they were; the nearest-row fallback is not deleted, only
+narrowed to the one shape where it is honest; no file outside `app/chat.rs`
+changed.
+
+**Branch gate (the merge's own):** 894 + 282 tests (4 ignored), clippy, fmt,
+census, build, rustdoc, and the three pty scenarios; one red run on the
+documented `lock::tests::a_write_cannot_replace_the_workspace_lock` flake,
+green alone.
+
+---
+
+## 8.106 The markdown view grows: six facts, and one invariant moves (`1daa258`, `b59d745`, `2f88921`, `cd7fdfe`, `de86ba3`, `84a6b2a`, merged `f46859f`)
+
+Six commits, one fact each, in `crates/mush-core/src/text.rs` and
+`crates/mush/src/app/chat.rs` (+1,440/−82; the app's production half is
+`reply_style` learning two styles, and the rest there is tests). No `wrap_text`
+change, no dependencies, no sessions. What follows is the commits' own bodies,
+re-read against the tree at `f46859f`.
+
+**A rule is a row across the pane (`1daa258`).** A line whose first non-space
+text is three or more `-`, `*` or `_` and nothing else (spaces between allowed)
+is a horizontal rule: the view paints one `─` row in a new `RunStyle::Rule`,
+built at the pane's own width and wrapped like any other run, so it is one row
+of exactly `width` columns — the narrowest pane included (checked 1..=8). The
+source line's own characters are scaffolding, like a heading's `#`s: what the
+line says is "a break", and keeping `---` would show the spelling instead of
+the break. The character must be the same all the way across (`- * -` is prose,
+not a break) and two markers are never a rule (`--`, `**`, `- -`). The rule is
+checked before every other block rule, because it is the one that would
+otherwise be read as something else: `* * *` is a bullet whose item is `* *` by
+the list rule, and CommonMark reads it as a break. Two rulings written down
+beside the code, each with a test: `---` directly under a paragraph is
+CommonMark's *setext heading* and this view reads it as a **rule** — `Title`
+stays a paragraph and the `---` is a rule across the pane — and the rule's row
+is dimmed in the app (`reply_style`). Fixture that moved:
+`a_run_of_a_marker_is_all_or_nothing` gave up `"***"`, `"****"` and `"******"`
+from its "nothing but markers is text" list (before: text `***`; after: a `─`
+row).
+
+**A quote paints a dim bar (`b59d745`).** A line whose first non-space text is
+`>` paints the `>` and the one space that may follow it as `│ ` in a new
+`RunStyle::Quote` (dim in the app); the quoted words keep their own runs, so a
+`**bold**` inside a quote is still read. Why a bar and not the `>`: in a coding
+tool a `>` at the head of a line reads as a shell redirect, and a quote is not a
+command. Each decision is written down beside the code with a test: `>text` is
+the same quote as `> text` (the space is the marker's separator, not a word);
+the source's own indentation is kept — `  > x` paints `  │ x` — because an
+indented `> ` is a quote inside a list item and moving it to column 0 would move
+it out of the item it belongs to; a second `>` is the quoter's own character —
+`> > x` paints `│ > x`, not two bars, because a bar for the inner one would be
+a nesting there is no layout for; and `>` alone (or `> `) is a row with the bar
+and nothing after it. No fixture moved — no existing reply carried a quote —
+and the module doc's "not a rule" list loses block quotes.
+
+**A task list paints a box (`2f88921`).** A `- `/`* `/`+ ` item whose own text
+begins `[ ]`, `[x]` or `[X]` and a space paints the checkbox as `☐`/`☑` in
+`RunStyle::Bullet` — the marker's own style — because two brackets and the space
+between them say what one box says in one column. Everything that is not a
+checkbox is text exactly as typed, and one test pins all of it: `- []` (no
+state), `- [y]` (not a state this view knows), `- [ ]`/`- [ ] `/`- [x]`
+(nothing after the box), `- [ ]x` (no space after `]`), `[ ] no marker` (a box
+needs its list marker) and `1. [ ] ordered` (ordered items say where they sit,
+not what they are). `☐` and `☑` are pinned one column wide
+(`UnicodeWidthStr::width == 1`), because the pane's width arithmetic counts
+columns. Fixture that moved: the task item's runs — the marker run now carries
+the space a continuation hangs under, so
+`[("-",Bullet),(" ",Plain),("☐",Bullet),(" todo",Plain)]` became
+`[("- ",Bullet),("☐ ",Bullet),("todo",Plain)]`.
+
+**The wrap hangs under the item's own text, and B14 moves (`cd7fdfe`).** A list
+item's continuation rows now hang under the item's own text: the item's wrap is
+`wrap_text` of the text the rules left after the marker, at the columns the
+marker leaves, with the marker's own width as a left margin on every row after
+the first.
+
+```text
+before (40 columns):
+
+    - a bullet whose text is long enough to wrap
+    over here
+
+after:
+
+    - a bullet whose text is long enough to
+      wrap over here
+```
+
+The same margin arithmetic serves `1. ` (three columns), `10. ` (four), a task
+item's `- ☐ ` (four: the box is part of the margin) and a quote's `│ ` (two,
+plus the source's own indentation — `  │ ` is four). `block` now returns a
+`Block { marker, content }` and `wrap_block` is the one place the margin is
+applied. **An invariant moved.** "The wrap is the plain wrapper's wrap,
+exactly" (B14) was true of the rows because a marker was just text in front of
+the line; with a margin, the rows of a marked line are no longer `wrap_text` of
+the line, so the paragraph now says what the code does: the wrap is still
+`wrap_text`'s — the same break points, the same tab stop, the same tail on every
+break — applied to the text the rules left after the marker, at the columns the
+marker leaves, with the marker's own width as a margin on every continuation
+row. A marker that leaves no column for the text (as wide as the pane, or wider)
+and a glyph wider than the columns a margin left are not margins: both fall back
+to the plain wrapper's wrap of marker and text together, which keeps every
+character and keeps every row inside the width. The old B14 test
+(`a_plain_message_wraps_exactly_like_wrap_text`) still holds for every line
+without a marker, and did not move. `a_wrapped_item_hangs_under_its_own_text`
+pins both halves — the continuation equals `wrap_text` of the item's text at
+`width - margin` one margin over, for widths 6..=40, with literal pins for
+`1.`/`10.`/task/quote and indented quote rows; and no row outgrows the width at
+1..=12 columns for six kinds of line, the `99. ` marker wider than the pane
+included. Moved fixture: `a_markdown_reply_never_paints_past_the_pane` now
+trims each row's leading layout instead of stripping the mark's columns, every
+assertion standing.
+
+**Emphasis nests (`de86ba3`).** A span's content is read by the same scanner,
+so a strong run may hold an emphasis run and an emphasis run a strong one:
+`**a *b* c**` paints strong `a `, emphasis `b`, strong ` c`, where it was one
+strong run of `a *b* c` with the inner asterisks painted as text;
+`*a**a**a*` became `[("a",Emphasis),("a",Strong),("a",Emphasis)]`; and a code
+span inside strong reads as code (`**read `main.rs` now**` keeps `main.rs` a
+code run, backticks read rather than painted). The runs stay a flat `Vec<Run>`
+and one run wears one style, so nesting on a terminal is *adjacent* runs with
+the inner style attached — the inner style is the one the writer meant, and one
+character cannot wear two. **A deliberate deviation from the brief, reasoned in
+the module doc and the commit body:** `***x***` stays **one** `Strong` span,
+not strong-inside-emphasis — "a run is spent whole" and the same brief's
+must-survive fixtures (`***a**` is `Strong("a")`, `*a**` is text) require it,
+and the nested reading would paint the same characters as bold alone. What still
+holds, and is pinned again in `emphasis_nests_and_shows_as_adjacent_runs`: a run
+of a marker is spent whole (`***bold***`, `****x****`, `**a***`, `***a**`), an
+unclosed marker inside a span is text (`**a *b**` is one strong `a *b`), `*a**`
+is the four characters it is, and a code span's own text is never parsed
+(`**a `*b*` c**` keeps `*b*` as code). No existing test's expectation moved.
+The wave measured the nested scanner's cost on crafted input (a probe, deleted)
+and left it as finding H77 below: a 34k-char braid of emphasis markers took
+**4.4 s before** this change and **5.7 s after**, and crafted 20k–80k-char
+nesting families completed without stack overflow, so no cap was added.
+
+**Tables: the view's first block-level rule (`84a6b2a`).** A row whose next line
+is a *delimiter row* (every cell `:?-+:?`) is a header; the lines after the
+delimiter that still look like rows (they hold a `|` and are not a fence) are
+the body; the first line that does not ends the table. `markdown_walk` buffers
+the block and paints it whole, because a column's width is a fact about the
+whole block. The recognition rules, word for word in the module doc: a row with
+no delimiter under it is text, and a delimiter row with no row above it is text;
+a delimiter row that is itself a rule — a bare `---` under `Title` — is the
+**rule** the rule sentence promises, so the setext note stays true; the header
+says how many columns there are, and a delimiter that names fewer leaves the
+rest left-aligned. A header that could also be read as another block — a line
+that begins `> ` or `- ` and holds a `|` — is read as the table, because "the
+delimiter row under it can be explained no other way"; no fixture covers that
+shape beyond the doc sentence, which is finding H78 below.
+
+Fit, always — no "only when it fits" road: the columns fill the pane exactly
+(the cells' widths plus the ` │ ` between them sum to `width`), a cell wraps
+inside its own column with the module's own `wrap_runs`, and nothing is dropped
+— a short row pads with empty cells, a long row folds its extra cells into the
+last column joined by the `|` the source separated them with, and a pane too
+narrow for the table's columns folds them the same way, one level up (eight
+columns at a four-column pane is a test). Alignment comes from the delimiter row
+(`:---` left, `:---:` center, `---:` right, `---` left) and the padding spaces
+are the whole of it. A `|` inside a `` `code span` `` and a `\|` are not
+boundaries; the escaping backslash is scaffolding and the cell paints the `|` it
+protected. The column count is capped at `ceil(width/4)` — the four pane columns
+a column costs, its cell plus the ` │ ` before it — at least one, so on a narrow
+pane a many-column table folds to one column and wraps tall: the child called
+that honest and left it for a human's eye (H80 below).
+
+The two invariants, still exact. `markdown_row_counts` has one entry per source
+line and the delimiter row paints **0** — the `─┼─` separator is counted with
+the **header** line — a header or body row that wrapped into four counts 4, and
+the total is still exactly the number of painted rows (finding D14, re-pinned
+and not moved); the pane's stop map and the selection ride on that map exactly
+as before, and the selection still copies the *source* bytes. No vocabulary word
+was invented for the cells: a cell is inline runs through the existing scanner
+(`**bold**` in a cell is a strong run), the bar between columns is plain layout,
+and the separator wears `RunStyle::Rule`, whose doc now names both the rule and
+the table line. Tests (text.rs): `a_table_is_painted_at_the_panes_own_width` (a
+two-column table, all three alignments across the alignment test, the exact
+painted rows and the `[2, 0, 1, 1]` map), `a_tables_alignment_is_the_delimiter_rows`,
+`a_wrapped_cell_stays_inside_its_column` (six painted rows, `[5, 0, 1]`),
+`a_pipe_that_is_text_is_not_a_cell_boundary` (the code-span pipe and the escaped
+pipe, runs included), `a_ragged_table_row_keeps_every_cell`,
+`a_row_without_a_delimiter_is_text`, and `a_table_never_outgrows_the_pane`. And
+through the real pane (chat.rs), `a_table_is_painted_through_the_pane` paints
+`| name | age |` at 20 columns as `mush › name  │   age` / `──────┼──────` /
+`ana   │     3`, checks the separator's dim, and paints it again through
+`painted()` with the stop map beside the rows — the `debug_assert` that the map
+and the paint cannot drift.
+
+**What the wave deliberately did not do.** No `wrap_text` change, no dependency,
+no session fact; the view stays deliberately not a document renderer — no
+paragraph reflow, no nested lists, no HTML — and every new rule keeps every
+word, leaves the copy road alone, and paints a marker it cannot spend whole as
+the text it is. The branch gates were the workspace suite plus clippy, fmt,
+census, build, rustdoc and the three pty scenarios (`84a6b2a`'s own body records
+1,191 tests and the three scenarios passing).
+
+---
+
+## 8.107 The census at `f46859f`, the rows this pass opens, and its gates
+
+**The census and its method.** `python3 scripts/census.py` at this pass's base
+prints **TOTAL 94,342 · blank 5,293 · comment 26,692 · tests 41,761 · prod
+20,596**, the test-module span 54,382 (this pass's reading, on the tree this
+section is written in). §8.103/§8.104 read their base `fd074cc` at 92,747 ·
+5,252 · 26,162 · 41,039 · 20,294 — the same reading as `260ff11`, because the
+only commits between are docs — so the two waves are **+1,595**: blank +41,
+comment +530, tests +722, prod +302. Every commit in `fd074cc..f46859f` that
+touches `crates/` belongs to one of the two waves, and `scripts/` is untouched.
+
+**The rows this pass opens.** Four, all open, none a wave's fix: **H77** the
+crafted marker braid (4.4 s → 5.7 s; 20k–80k-char nesting families complete, so
+no cap), **H78** `is_row`'s `line.contains('|')` reading a `> `/`- ` header as
+a table's (the rule written down, no fixture), **H79** the pty scenarios'
+workdir (a second run in one fixture directory fails a precondition while the
+tree is fine), and **H80** the table's `ceil(width/4)` column cap, left for a
+human's eye. §8.102's flake list also gains wave 2's load flake,
+`machine::tests::a_command_that_left_its_process_group_is_outside_cleanup`.
+
+**This pass's gates.** On a clean tree (`docs/findings.md`'s append,
+`docs/mush.md`'s two paragraphs and `docs/refactor.md`'s one sentence are the
+only changes), every pipeline under `set -o pipefail`:
+
+- `cargo fmt --all -- --check` — pass.
+- `cargo build --workspace` — pass.
+- `cargo clippy --all-targets -- -D warnings` — pass.
+- `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --document-private-items` —
+  pass, exit 0.
+- `cargo test --workspace` — 899 passed + 4 ignored (`mush`) and 294 passed
+  (`mush-core`), 0 doc-tests, 0 failed, exit 0; green on the first run.
+- `python3 scripts/census.py` — the totals above.
+- the three endpoint-free pty scenarios, one at a time, each in its own fresh
+  fixture directory under `/tmp` — `python3 scripts/smoke.py target/debug/mush
+  "$(mktemp -d)/resize" --resize`, likewise `--cancel` and `--sigterm`: the
+  resize redrew 4,809 bytes with no keypress and still took a key, the cancel
+  freed the agent in 0.93 s over exactly two chats, and the sigterm's eight
+  checks passed — the job's group gone, the exit flush writing the answer the
+  debounce had not, the socket gone.
+
+The pass's own suite run hit no flake. The waves' gates did: wave 1's ran red
+once on the documented `lock::tests::a_write_cannot_replace_the_workspace_lock`
+(green alone), and wave 2's re-ran that lock flake and
+`machine::tests::a_command_that_left_its_process_group_is_outside_cleanup`
+green — both names on §8.102's list, the machine one added by this pass.
+
+This pass changes no line under `crates/` or `scripts/`: every number above is
+a command's output or a commit's own body re-read at this base.
 

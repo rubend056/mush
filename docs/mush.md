@@ -453,17 +453,24 @@ lines mush writes. And the text itself is untrusted: a model reply, a tool resul
 and a tool call's arguments are defanged before they are painted, so an
 `ESC ]0; …` in them cannot rename the terminal window and a `CSI 2J` cannot
 repaint the frame they are drawn on. A model's *reply* is read one more way: each
-source line is parsed as a small, line-local, additive markdown view —
-`**strong**`, `*emphasis*`/`_emphasis_`, `` `code` ``, `~~strike~~`, one to three
-`#` headings, list markers kept, fenced code, links as `text (url)` — and painted
-in the reply's styles, with only the scaffolding a view does not read (a
-heading's `#`s, a fence's two lines) left unpainted. It is deliberately not a
-document renderer — no reflow, tables, block quotes, nested lists or HTML — and
-it changes no bytes: tool results and `run_command` output, the human's own
-lines, briefs, notices and the model's reasoning rows are painted raw, so a `#`
-there is a comment and an `*` a glob. What the copy road hands another program
-is the *source* lines of a reply, never the painted screen. Both rules live in
-`crates/mush-core/src/text.rs` (`sanitize`, `markdown_rows`).
+source line is parsed as a small, additive markdown view — line-local except for
+a table, whose columns are a fact about the whole block and which the walk reads
+and paints as a block — `**strong**`, `*emphasis*`/`_emphasis_` (a span's
+content is read again, so emphasis nests), `` `code` ``, `~~strike~~`, one to
+three `#` headings, list markers kept with a wrapped row hung under the item's
+own text, `> ` painted as a `│ ` bar, `[ ]`/`[x]` as `☐`/`☑`, three or more
+`-`/`*`/`_` as a rule across the pane, fenced code, links as `text (url)`, and
+tables — the delimiter row names each column's alignment and the cells share the
+pane's width exactly, wrapping inside their columns — and painted in the reply's
+styles, with only the scaffolding a view does not read (a heading's `#`s, a
+quote's `>`, a checkbox's brackets, a table's pipes and delimiter row, a fence's
+two lines) left unpainted. It is deliberately not a document renderer — no
+paragraph reflow, no nested lists, no HTML — and it changes no bytes: tool
+results and `run_command` output, the human's own lines, briefs, notices and the
+model's reasoning rows are painted raw, so a `#` there is a comment and an `*` a
+glob. What the copy road hands another program is the *source* lines of a reply,
+never the painted screen. Both rules live in `crates/mush-core/src/text.rs`
+(`sanitize`, `markdown_rows`).
 
 `Ctrl-Y` is that copy road. mush never captures the mouse, so the terminal owns
 selection and a drag is a rectangle of screen cells; the mode is a cursor over
@@ -922,7 +929,7 @@ mush/
       provider.rs    the provider table: a vendor's endpoint, models and defaults
       secrets.rs     the secrets mush holds, and why a process it starts never inherits one
       session.rs     `.mush/` creation and conversation persistence
-      text.rs        display-column arithmetic and the line-local markdown view
+      text.rs        display-column arithmetic and the markdown view (line-local, except a table, read as a block)
       tools.rs       tool names, argument helpers, exact-match edit semantics
       transcript.rs  pairing, repair, trimming and the compaction trigger
       userconfig.rs  the machine-global config file (where the API key lives)
