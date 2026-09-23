@@ -426,8 +426,14 @@ impl Cli {
         match response.reply {
             attach::Reply::Err(error) => Err(error.describe()),
             attach::Reply::Ok(body) => match &self {
-                Cli::Read { .. } => print_lines(&body),
-                Cli::Agents { .. } => print_agents(&body),
+                Cli::Read { .. } => {
+                    print!("{}", lines_text(&body)?);
+                    Ok(())
+                }
+                Cli::Agents { .. } => {
+                    print!("{}", agents_text(&body)?);
+                    Ok(())
+                }
                 Cli::Focus { .. } | Cli::Edit { .. } => Ok(()),
             },
         }
@@ -462,19 +468,36 @@ fn parse_id(value: &str, command: &str) -> Result<u64, String> {
 /// newline in it (a pasted brief, a tool result) is still one line on the wire,
 /// and printing it raw made it read as two — under one index — with no way for
 /// anything downstream to tell continuation from a new line (finding A3).
+///
+/// It is also the terminal door for everything these two printers emit: the
+/// text defangs first, through [`mush_core::text::sanitize`] — the one door
+/// every terminal-bound string in this tree goes through — and then escapes
+/// what is left onto one line. Without the first half, a stored session (a
+/// hand-editable file) or a roster row (a title, a branch, an endpoint-chosen
+/// name) could put `ESC ]0;PWNED BEL` on the human's terminal and rename its
+/// window, which is the one road in the tree that did not go through
+/// `sanitize` (finding C8). The tab `sanitize` keeps is still escaped, because
+/// these rows are tab-separated columns.
 fn escape_line(text: &str) -> String {
-    text.replace('\\', "\\\\")
+    mush_core::text::sanitize(text)
+        .replace('\\', "\\\\")
         .replace('\n', "\\n")
         .replace('\r', "\\r")
         .replace('\t', "\\t")
 }
 
-/// `read`: the transcript lines, one per line as `index<TAB>text`.
-fn print_lines(body: &Value) -> Result<(), String> {
+/// `read`: the transcript lines, one per line as `index<TAB>text`, as the text
+/// a client prints.
+///
+/// Split from the `print!` so a test can read the bytes a real `mush read`
+/// would put on a terminal — the seam the C8 pin needs to say what *reaches*
+/// the terminal rather than that nothing panicked.
+fn lines_text(body: &Value) -> Result<String, String> {
+    let mut out = String::new();
     for line in attach::Transcript::read(body)?.lines {
-        println!("{}\t{}", line.line, escape_line(&line.text));
+        out.push_str(&format!("{}\t{}\n", line.line, escape_line(&line.text)));
     }
-    Ok(())
+    Ok(out)
 }
 
 /// `agents`: the roster the tree paints, one row per line, tab-separated:
@@ -484,24 +507,31 @@ fn print_lines(body: &Value) -> Result<(), String> {
 /// The body is read as [`attach::Roster`] rather than fished key by key: a key
 /// the producer renamed used to leave this printer writing an empty column
 /// forever, with nothing failing (finding R23).
-fn print_agents(body: &Value) -> Result<(), String> {
+///
+/// Every string column is data the model, the endpoint or a path on disk chose
+/// — the audit's C8 names title, activity and branch — so every one of them
+/// goes through [`escape_line`], the one door this command has.
+fn agents_text(body: &Value) -> Result<String, String> {
+    let mut out = String::new();
     for node in attach::Roster::read(body)?.agents {
-        println!(
-            "{id}\t{parent}\t{phase}\t{activity}\t{title}\t{branch}\t{worktree}\t{children}",
+        let parent = node
+            .parent
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let activity = node.activity.unwrap_or_default();
+        let branch = node.branch.unwrap_or_default();
+        out.push_str(&format!(
+            "{id}\t{parent}\t{phase}\t{activity}\t{title}\t{branch}\t{worktree}\t{children}\n",
             id = node.id,
-            parent = node
-                .parent
-                .map(|id| id.to_string())
-                .unwrap_or_else(|| "-".to_string()),
-            phase = node.phase,
-            activity = node.activity.unwrap_or_default(),
-            title = node.title,
-            branch = node.branch.unwrap_or_default(),
-            worktree = node.worktree,
+            phase = escape_line(&node.phase),
+            activity = escape_line(&activity),
+            title = escape_line(&node.title),
+            branch = escape_line(&branch),
+            worktree = escape_line(&node.worktree),
             children = node.children_working,
-        );
+        ));
     }
-    Ok(())
+    Ok(out)
 }
 
 fn print_help() {
@@ -547,11 +577,11 @@ fn help_text() -> String {
          \x20   -y, --yes          Pre-approve this session's work. Recorded only: mush asks\n\
          \x20                      nothing yet, so this changes no behaviour today\n\
          \x20   --print-config     Print the resolved config (endpoint, provider, the stored\n\
-         \x20                      session, model, window and whether it was stated,\n\
-         \x20                      temperature, reasoning effort and thinking mode, reply-cap\n\
-         \x20                      size and name, the schemas it reserves and the history\n\
-         \x20                      budget they leave, key masked, auto-approve and theme)\n\
-         \x20                      and exit 0\n\n\
+         \x20                      session, model and whether it can see, window and whether\n\
+         \x20                      it was stated, temperature, reasoning effort and thinking\n\
+         \x20                      mode, reply-cap size and name, the schemas it reserves and\n\
+         \x20                      the history budget they leave, key masked, auto-approve\n\
+         \x20                      and theme) and exit 0\n\n\
          KEYS:\n{keys}\n\n\
          COMMANDS (type in the chat):\n\
          {commands}\n\
@@ -720,6 +750,24 @@ fn describe(
     } else {
         mush_core::text::sanitize(&config.model)
     };
+    // The image gate: whether the model in force may be sent a picture is the
+    // one *capability* a request can be refused for, and it lives only in the
+    // provider table — a human pasting a screenshot at a custom endpoint used
+    // to learn it from the refusal, having spent the gesture (finding C12).
+    // The answer comes from the same function the three gate sites ask
+    // (`mush_core::provider::vision_capable`), so the dump cannot advertise a
+    // picture the run would refuse, and the model it names is the one the gate
+    // reads, defanged the way the model row defangs it.
+    let vision = if mush_core::provider::vision_capable(&config.model) {
+        "yes — image parts are sent".to_string()
+    } else if config.model.is_empty() {
+        "no — no model yet".to_string()
+    } else {
+        format!(
+            "no — the table does not document image parts for {}",
+            mush_core::text::sanitize(&config.model)
+        )
+    };
     // The window is the one fact whose *source* matters, and a number can come
     // by four roads: the human, mush's own table, the endpoint's model list, the
     // endpoint's refusal. Each is named in words by [`WindowSource::words`],
@@ -778,6 +826,9 @@ fn describe(
         // window may all have come from this layer.
         ("session".to_string(), session_layer),
         ("model".to_string(), model),
+        // Under the model it is a fact about: the gate's answer and the id it
+        // was asked about cannot be read as being about two different models.
+        ("vision".to_string(), vision),
         (
             "window".to_string(),
             format!("{} tokens ({window})", config.context_tokens),
@@ -1668,6 +1719,53 @@ mod tests {
         assert_eq!(field("thinking"), "on (the provider's default)");
     }
 
+    /// The dump answers the image gate, not only the request knobs: whether
+    /// the model in force may be sent a picture is the one *capability* a
+    /// request can be refused for, and it lived only in the provider table —
+    /// a human pasting a screenshot learned it by spending the gesture
+    /// (finding C12). The answer is read through the same function the gate
+    /// asks, so the dump cannot promise an image the run would drop.
+    #[test]
+    fn the_dump_answers_the_image_gate() {
+        let vision = |model: &str| {
+            let cfg = Config::new("http://host:1", model, None);
+            describe(
+                &cfg,
+                false,
+                &session::Stored::Absent,
+                &[],
+                None,
+                &theme::Theme::default(),
+            )
+            .into_iter()
+            .find(|(field, _)| field == "vision")
+            .map(|(_, value)| value)
+            .unwrap_or_else(|| panic!("no `vision` row for `{model}`"))
+        };
+        // The table's one row that documents vision, and a model it does not
+        // name: both directions of the gate the request will meet.
+        assert_eq!(
+            vision("deepseek-flash"),
+            "yes \u{2014} image parts are sent"
+        );
+        assert_eq!(
+            vision("deepseek-v4-pro"),
+            "no \u{2014} the table does not document image parts for deepseek-v4-pro"
+        );
+        assert_eq!(vision(""), "no \u{2014} no model yet");
+        // The row's model is the one the gate reads, and it is defanged like
+        // the model row: an endpoint-chosen id on its way to a terminal.
+        assert_eq!(
+            vision("vendor/deepseek-flash"),
+            "yes \u{2014} image parts are sent",
+            "the gate strips a prefix; the dump asks the same function"
+        );
+        // `--help` names the row, so a human knows the dump answers the
+        // question before they paste.
+        let help = help_text();
+        assert!(help.contains("whether it can see"), "{help}");
+    }
+
     /// The theme row says what a window would look like: the hue, the form the
     /// terminal would paint it in, and whether the workspace path or
     /// `MUSH_THEME` chose it. The fixed palette says it is fixed, rather than
@@ -2155,6 +2253,71 @@ mod tests {
             "a real backslash stays visible"
         );
         assert!(!escape_line("x\ny").contains('\n'));
+        // And it is the terminal door: a control sequence does not ride
+        // through the escaping (finding C8).
+        let defanged = escape_line("look: \x1b]0;PWNED\x07 done");
+        assert!(
+            !defanged.contains('\x1b') && !defanged.contains('\x07'),
+            "{defanged:?}"
+        );
+        assert!(
+            defanged.contains("look:") && defanged.contains("done"),
+            "{defanged:?}"
+        );
+    }
+
+    /// The attach printers are the terminal door for what they print: the text
+    /// a `read` row and a roster column carry is chosen by a model, an endpoint
+    /// or a hand-edited file, and neither printer may let a control sequence
+    /// through to the human's terminal — `ESC ]0;x BEL` renames the window of
+    /// the shell that ran `mush read`, which is the one road in the tree that
+    /// did not go through `text::sanitize` (finding C8).
+    ///
+    /// Both bodies are printed into a `String` — the bytes the real `print!`
+    /// would put on a terminal — so the pin is what reaches the terminal, not
+    /// that nothing panicked.
+    #[test]
+    fn the_read_and_agents_printers_emit_no_control_sequence() {
+        let osc = "\x1b]0;PWNED\x07";
+        let read = serde_json::json!({
+            "lines": [
+                { "line": 0, "text": format!("look: {osc} done") },
+                // A tab is still escaped: these rows are TSV, and sanitize
+                // deliberately keeps a tab for the wrappers.
+                { "line": 1, "text": "a\tb" },
+            ]
+        });
+        let out = lines_text(&read).unwrap();
+        assert!(!out.contains('\x1b') && !out.contains('\x07'), "{out:?}");
+        assert!(
+            out.contains("look:") && out.contains("done"),
+            "the words stay: {out:?}"
+        );
+        assert!(out.contains("a\\tb"), "the TSV escape survives: {out:?}");
+
+        let roster = serde_json::json!({
+            "agents": [{
+                "id": 2,
+                "parent": 0,
+                "phase": "idle",
+                "activity": format!("{osc}busy"),
+                "title": format!("t{osc}"),
+                "branch": format!("b{osc}"),
+                "worktree": format!("/w{osc}"),
+                "children_working": 0,
+            }]
+        });
+        let out = agents_text(&roster).unwrap();
+        assert!(!out.contains('\x1b') && !out.contains('\x07'), "{out:?}");
+        assert!(
+            out.contains("idle") && out.contains("busy") && out.contains("/w"),
+            "the words stay: {out:?}"
+        );
+        assert_eq!(
+            out.matches('\t').count(),
+            7,
+            "still eight TSV columns: {out:?}"
+        );
     }
 
     /// The subcommands parse before anything else: a directory, the flag forms

@@ -33,8 +33,9 @@ tests, builds).\n\
 const MACHINE: &str = "\
 The machine is shared (CPU, ports, /tmp — a worktree isolates files, nothing else):\n\
 - A long command detaches into a job instead of dying: run_command answers \"[still running — detached \
-as #c2; …]\" and the command keeps its own process group. The tools' schemas say what starts one, and \
-what reads, waits on or stops it.\n\
+as #c2; …]\" and the command keeps its own process group — one that writes past the output limit is the \
+exception, killed rather than detached, and the result says so. The tools' schemas say what starts one, \
+and what reads, waits on or stops it.\n\
 - exclusive=true owns the machine for timing- or port-sensitive work (a benchmark, a profiler, a fixed \
 port): a sibling's command queues behind it and is refused if the lock outlasts that (`#N holds \
 the machine`) — and then a subagent's `wait` is the road back: it blocks until the machine is free \
@@ -164,8 +165,7 @@ pub fn tool_schemas() -> Vec<Value> {
             ToolName::EditFile,
             "Replace exact text in one file: every edit lands or none do, so prefer one call for \
              multi-part changes. Applied to the file as read: a concurrent change is lost. A \
-             missing `old_string` is refused; a non-unique one is refused unless \
-             `replace_all` is set.",
+             missing `old_string` is refused; a non-unique one only with `replace_all`.",
             json!({
                 "type": "object",
                 "properties": {
@@ -191,7 +191,7 @@ pub fn tool_schemas() -> Vec<Value> {
             ToolName::ReadFile,
             "Read a workspace file, or look at an image. Text is a window — `offset`/`limit` are \
              lines (default: from line 1, as many as fit) and the cut says what it left; a png, \
-             jpeg, gif or webp comes back as the image itself. Works while another agent holds \
+             jpeg, gif or webp comes back as the image. Works while another agent holds \
              the machine.",
             json!({
                 "type": "object",
@@ -205,8 +205,8 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::WriteFile,
-            "Create or replace a workspace file, creating parent directories. Answers with one line: \
-             what was written and what it replaced. For changes to a file that exists, edit_file.",
+            "Create or replace a workspace file, parent directories included. Answers in one line: \
+             what was written and what it replaced. For a change to an existing file: edit_file.",
             json!({
                 "type": "object",
                 "properties": {
@@ -243,14 +243,15 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::RunCommand,
-            "Run a shell command in the workspace root. A result too big for the context window \
-             is cut, and the cut says how to read on.",
+            "Run a shell command. A command that writes past 8 MiB of output is killed and its \
+             result says so; the road on is a narrower command. A result too big for the context \
+             window is cut, and the cut says how to read on.",
             json!({
                 "type": "object",
                 "properties": {
                     "command": { "type": "string", "description": "Sh command." },
-                    "detach": { "type": "boolean", "description": "Return at once; it keeps running as a job (a server, a watch) and you are told when it finishes. A command that outlives 60s detaches by itself; a job is killed after 4h." },
-                    "exclusive": { "type": "boolean", "description": "Own the machine while it runs: benchmarks, profiling, a fixed port. Siblings are refused, not interleaved." }
+                    "detach": { "type": "boolean", "description": "Return at once; it keeps running as a job (a server, a watch) and you are told when it finishes. One that outlives 60s detaches by itself; a job is killed after 4h." },
+                    "exclusive": { "type": "boolean", "description": "Own the machine while it runs: siblings are refused, not interleaved." }
                 },
                 "required": ["command"]
             }),
@@ -263,7 +264,7 @@ pub fn tool_schemas() -> Vec<Value> {
                 "properties": {
                     "brief": { "type": "string" },
                     "title": { "type": "string", "description": "A 3 word, one-line description of the brief." },
-                    "base": { "type": "string", "description": "Branch, tag or commit; resolved in this agent's workspace, so `HEAD` is this agent's own HEAD. Without one: this workspace." }
+                    "base": { "type": "string", "description": "Branch, tag or commit, resolved in this agent's workspace (`HEAD` is this agent's own). Without one: this workspace." }
                 },
                 "required": ["brief"]
             }),
@@ -277,7 +278,7 @@ pub fn tool_schemas() -> Vec<Value> {
         ),
         tool(
             ToolName::Control,
-            "Stop or message one thing you own: a child agent (`2`) or a job (`c2`), as status names it. \
+            "Stop or message one thing you own: a child (`2`) or a job (`c2`), as status names it. \
              `message` is agent-only \u{2014} it steers a child, resuming one at rest, and needs `text`. \
              Stopping a child is not finishing: it keeps its context and work.",
             json!({
@@ -297,8 +298,8 @@ pub fn tool_schemas() -> Vec<Value> {
              line. With `on`, wait for that one thing only \u{2014} the rest keeps running \u{2014} though a \
              result you have not read still ends the wait. A result nobody has read is handed over \
              first, whatever the machine is doing; otherwise a subagent's wait also waits while another \
-             agent holds the machine, which is how a command refused with `#N holds the machine` is \
-             retried. Returns at once when you have nothing to wait for \u{2014} nothing of yours running \
+             agent holds the machine, which is the road a refused command is retried by. Returns at \
+             once when you have nothing to wait for \u{2014} nothing of yours running \
              or unread, and no other agent holding the machine; gives up after 10 minutes, naming what \
              still runs; a message to you ends the wait early and says so.",
             json!({
@@ -381,6 +382,39 @@ mod tests {
             assert!(names.contains(&kept), "a leaf loses {kept}");
         }
         assert!(!names.contains(&"spawn_agent"), "{names:?}");
+    }
+
+    /// `run_command` says what the code does with a command that writes past
+    /// the output limit: it is *killed*, and the result says so. The schema
+    /// used to describe a cut — which is what happens to a result too big for
+    /// the *window*, and not what happens at the limit — so the model planned
+    /// on reading on from a dead command's first bytes (finding F4).
+    ///
+    /// The machine block every agent reads says the same exception beside the
+    /// detach it is the exception to, because "detaches into a job instead of
+    /// dying" was the rule the kill violated.
+    ///
+    /// The figure is spelled here rather than read from `jobs::CMD_OUTPUT_LIMIT`:
+    /// `mush` depends on this crate and not the other way round, so the schema
+    /// cannot name that constant. The test pins the words, and a change to the
+    /// limit has to change them here.
+    #[test]
+    fn the_command_schema_names_the_output_kill() {
+        let run_command = tool_schemas()
+            .into_iter()
+            .find(|schema| schema["function"]["name"] == "run_command")
+            .expect("run_command has a schema");
+        let description = run_command["function"]["description"].as_str().unwrap();
+        assert!(description.contains("killed"), "{description}");
+        assert!(description.contains("8 MiB"), "{description}");
+        assert!(
+            description.contains("narrower"),
+            "the road on is named: {description}"
+        );
+        // The machine block does not claim a command never dies: the one road
+        // that kills it is stated beside the detach it is the exception to.
+        assert!(MACHINE.contains("killed"), "{MACHINE}");
+        assert!(MACHINE.contains("output limit"), "{MACHINE}");
     }
 
     /// The root's schemas must fit the tokens `Config::history_budget`

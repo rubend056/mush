@@ -45,6 +45,7 @@ use ratatui::crossterm::event::KeyEvent;
 
 use mush_core::config::{vision_capable, BYTES_PER_TOKEN};
 use mush_core::message::{Image, Message};
+use mush_core::userconfig::KeyWrite;
 use mush_core::{
     git, prompt, session, text::mask_key, userconfig, Config, Provider, Session, UserConfig,
     Workspace,
@@ -613,6 +614,23 @@ pub struct App {
     /// The endpoint, the model, the key and the context window: the copy the
     /// screen reads and the cell every actor reads, in one owner.
     pub cell: ConfigCell,
+    /// Whether `/key` stated the key in force *in this run*: the one road a
+    /// save may write a key by, because it is the road where the human says
+    /// "this key is for the file". A key that came from `MUSH_API_KEY` — or
+    /// from the home config itself — is not stated here, so a save an
+    /// unrelated command triggers leaves the file's own key alone (finding
+    /// C11).
+    key_stated: bool,
+    /// Where [`Self::persist_user_config`] writes the home config. The real
+    /// value is [`userconfig::config_path`] — the machine-global file every
+    /// mush on this machine shares — and the field is here so a test can
+    /// point the write at a throwaway path: the fact C11 is about is which key
+    /// reaches the *file*, and a test reading the human's own config (or one
+    /// process-wide `MUSH_CONFIG` path shared by every test in this binary)
+    /// would be reading every test's writes. It is also the one place the
+    /// `/key` acks read their destination from, so the line and the write
+    /// cannot name two paths.
+    home_config: std::path::PathBuf,
     pub focus: Focus,
     /// Whether the zen view is on: the focused pane takes the whole screen
     /// (`Ctrl-F`).
@@ -824,6 +842,8 @@ impl App {
         let mut app = Self {
             ws,
             cell,
+            key_stated: false,
+            home_config: userconfig::config_path(),
             focus: Focus::Chat,
             zen: false,
             chat: Chat::new(system, messages),
@@ -3140,7 +3160,7 @@ impl App {
                 // a secret (finding A1).
                 None => self.say(format!(
                     "no api key — /key <secret> sets one (saved to {})",
-                    userconfig::config_path().display()
+                    self.home_config.display()
                 )),
             },
             Command::ApiKey(Some(secret)) => {
@@ -3148,10 +3168,14 @@ impl App {
                 // the config now holds, and only its head is ever printed.
                 let shown = mask_key(&secret);
                 self.cell.edit(|cfg| cfg.api_key = Some(secret));
+                // `/key` is where the human states a key *for the file*: the
+                // one save a key may be written by, and its ack says where
+                // (finding C11).
+                self.key_stated = true;
                 self.persist_user_config();
                 self.say(format!(
                     "api key set ({shown}…) — saved to {}",
-                    userconfig::config_path().display()
+                    self.home_config.display()
                 ));
             }
             Command::Models => {
@@ -3217,9 +3241,20 @@ impl App {
     /// endpoint defaults) survive restarts. Never writes to the workspace.
     ///
     /// The key is saved *with* the endpoint it is for: a save that follows a
-    /// switch which moved the host states `api_key: None`, and `save_to` treats
+    /// switch which moved the host states `api_key: None`, and the write treats
     /// that as a statement, so the old host's key is not merged forward to the
     /// new one (findings C6, D6).
+    ///
+    /// The key is also saved only when it is the human's to write. The key
+    /// this function can see is the *resolved* one, and `/url`, `/model` and
+    /// `/provider` are commands whose acks say nothing about a file: a key the
+    /// human supplied for one run through `MUSH_API_KEY` — the README's own
+    /// road for a key they did not want in one — was written to disk by any of
+    /// them, in a file that outlives the run (finding C11). Only `/key` states
+    /// a key *for the file*, and its ack says `saved to <path>`; every other
+    /// save keeps whatever key the file holds, while the fields it does own
+    /// still land. A host change's `None` is a statement too, not silence
+    /// (findings C6, D6).
     fn persist_user_config(&mut self) {
         let user = UserConfig {
             api_key: self.cfg().api_key.clone(),
@@ -3231,7 +3266,16 @@ impl App {
             // the file already holds.
             ..UserConfig::default()
         };
-        if let Err(error) = user.save() {
+        // A key is written when the human stated one, or when the statement is
+        // "none" — the absence a host change left, which must reach the file
+        // or the old host's key would be re-homed by the next start. An env
+        // key in force is neither: the file keeps its own.
+        let key = if self.key_stated || self.cfg().api_key.is_none() {
+            KeyWrite::Stated
+        } else {
+            KeyWrite::Keep
+        };
+        if let Err(error) = user.save_to(&self.home_config, key) {
             self.fail(format!("could not save home config: {error}"));
         }
     }
@@ -3476,7 +3520,7 @@ impl App {
     fn no_key_hint(&self) -> String {
         format!(
             "no api key for this endpoint — /key <secret> sets one (saved to {})",
-            userconfig::config_path().display()
+            self.home_config.display()
         )
     }
 
@@ -14091,9 +14135,74 @@ mod tests {
             text_of(&app),
             format!(
                 "no api key — /key <secret> sets one (saved to {})",
-                userconfig::config_path().display()
+                app.home_config.display()
             )
         );
+    }
+
+    /// The audit's C11: `persist_user_config` wrote the *resolved* key, so a
+    /// key the human supplied for one run through `MUSH_API_KEY` — the
+    /// README's own road for a key they did not want in a file — was written
+    /// to disk by any later `/url`, `/model` or `/provider`, a command whose
+    /// ack says nothing about a file. The file outlives the run. The write now
+    /// leaves the file's own key alone unless `/key` stated one, and `/key`
+    /// still writes it and says where.
+    #[test]
+    fn an_unrelated_command_does_not_move_an_environment_key_into_the_home_config() {
+        let (mut app, _rx) = test_app("env-key-stays-out");
+        let path = std::env::temp_dir().join(format!(
+            "mush-app-env-key-{}/config.json",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        app.home_config = path.clone();
+
+        // The file's own key for the endpoint in force, and a key the run got
+        // from the environment: both are in play, and a `/url` may write only
+        // the file's.
+        let endpoint = app.cfg().base_url.clone();
+        UserConfig {
+            api_key: Some("sk-file-0123456789".into()),
+            base_url: endpoint.clone(),
+            ..UserConfig::default()
+        }
+        .save_to(&path, KeyWrite::Stated)
+        .unwrap();
+        app.cell
+            .edit(|cfg| cfg.api_key = Some("sk-env-0123456789".into()));
+
+        run(&mut app, &format!("/url {endpoint}"));
+        let saved = UserConfig::load_from(&path).config;
+        assert_eq!(
+            saved.api_key.as_deref(),
+            Some("sk-file-0123456789"),
+            "the environment's key did not reach the file"
+        );
+        assert_eq!(saved.base_url, endpoint, "the command's own field landed");
+        // The line the human reads promises nothing about a file, because
+        // nothing was written to one.
+        let line = text_of(&app);
+        assert!(
+            !line.contains("api key") && !line.contains("saved to"),
+            "{line}"
+        );
+
+        // `/key` is the road where the human states a key *for the file*: it
+        // writes it, and the ack names where.
+        run(&mut app, "/key sk-typed-0123456789");
+        let saved = UserConfig::load_from(&path).config;
+        assert_eq!(
+            saved.api_key.as_deref(),
+            Some("sk-typed-0123456789"),
+            "a stated key is written"
+        );
+        assert!(
+            text_of(&app).contains(&format!("saved to {}", path.display())),
+            "{}",
+            text_of(&app)
+        );
+        let _ = std::fs::remove_dir_all(path.parent().unwrap());
     }
 
     /// `Enter` on a row says whose transcript the pane shows, and the brief it
