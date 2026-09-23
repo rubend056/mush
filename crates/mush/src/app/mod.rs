@@ -1733,7 +1733,13 @@ impl App {
             return;
         };
         // Drop stale leftovers whose worktree no longer exists. Reaping takes
-        // the focus and the cursor off a ghost with them (finding B11).
+        // the focus and the cursor off a ghost with them (finding B11), and the
+        // reap's other half is here too: the node is gone from the tree, so
+        // every map keyed by its id goes with it — the transcript, the voices,
+        // the revision an attach client holds and the pane's notices — exactly
+        // as `reap_history`'s reap does. Without it a leftover reaped here kept
+        // an id-keyed entry in every `Chat` map for the life of the session
+        // (finding R16).
         let gone: Vec<AgentId> = self
             .tree
             .agents
@@ -1748,6 +1754,9 @@ impl App {
             .map(|node| node.id)
             .collect();
         self.tree.reap(&gone);
+        for id in &gone {
+            self.chat.forget(*id);
+        }
         // A name in mush's own branch namespace that [`git::worktree_id`]
         // refuses — `mush/x`, a hand-made name, or an id with no room above it
         // for the floor — is not a child's, and it is not another program's
@@ -18581,6 +18590,49 @@ mod tests {
             AgentId::ROOT,
             "focus cannot point at a ghost"
         );
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    /// A leftover whose checkout is gone is reaped by `discover_worktrees`, and
+    /// the reap has to drop the conversation's record of it too: the tick's own
+    /// reap (`reap_history`) drops the node, the transcript, the voices and the
+    /// notices together, and this road dropped only the node — so an agent that
+    /// no longer exists kept an id-keyed entry in every `Chat` map for the life
+    /// of the session (finding R16).
+    #[test]
+    fn a_reaped_leftover_drops_its_chat_record() {
+        use std::fs;
+
+        let root = repo("reaped-leftover");
+        // A stored leftover whose worktree is gone by the time the session is
+        // read: the file kept the row, git kept nothing.
+        let stored = Session {
+            model: "test-model".into(),
+            provider: "custom".into(),
+            messages: Vec::new(),
+            agents: vec![session::AgentSession {
+                id: 7,
+                depth: 1,
+                brief: "a leftover whose checkout is gone".into(),
+                branch: Some("mush/7".into()),
+                leftover: true,
+                messages: vec![Message::user("the leftover's transcript")],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+        assert!(
+            !app.tree.agents.iter().any(|node| node.id == AgentId(7)),
+            "the pass reaped the leftover"
+        );
+        assert!(
+            app.chat.transcript(AgentId(7)).is_empty(),
+            "and its transcript went with it: {:?}",
+            app.chat.transcript(AgentId(7))
+        );
+        drop(app);
         let _ = fs::remove_dir_all(&root);
     }
 
