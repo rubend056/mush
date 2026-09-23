@@ -2051,14 +2051,14 @@ impl App {
         }
         // A write that failed on the writer's thread has no caller to return
         // to, so it is picked up here — the next tick after it happened — and
-        // the mark goes back on: the write did not put the conversation on
-        // disk, and `App::drop` flushes only while the session is dirty. The
-        // debounce pays the retry, so a full disk costs one snapshot rebuild
-        // per minute instead of the whole tail since the last write that
-        // landed (finding R2).
+        // said the way every other failure is: the bar, the pane's notice, and
+        // the mark that makes the next save write it, so a full disk costs one
+        // snapshot rebuild per minute instead of the whole tail since the last
+        // write that landed, and `App::drop` — which flushes only while the
+        // session is dirty — still sends what the failed write owed (findings
+        // R2, R6).
         if let Some(error) = self.session_save.take_error() {
-            self.mark_session_dirty();
-            self.fail(format!("could not save session: {error}"));
+            self.session_save_failed(error);
         }
     }
 
@@ -2546,8 +2546,9 @@ impl App {
     /// owns because only it knows whether the bar is the place for this one.
     ///
     /// One door, so a new kind of failure cannot take two of the three and
-    /// forget the last: the run's own failure and a conversation that could not
-    /// be read are the same shape (refactor R19).
+    /// forget the last: the run's own failure, a conversation that could not be
+    /// read, and a session write that did not land are the same shape (refactor
+    /// R19, finding R6).
     fn fail_for(&mut self, id: AgentId, text: impl Into<String>, line: Option<String>) {
         let text = text.into();
         self.chat.note_error_for(id, text);
@@ -4188,17 +4189,17 @@ impl App {
     /// out, so the most a crash can cost is the last `SESSION_DEBOUNCE` of chat.
     ///
     /// A flush that reports a failure — the deadline passed, the write failed,
-    /// the worker is gone — re-sets the mark instead of leaving it cleared: the
-    /// write it waited for did not land, the next debounce retries, and the exit
-    /// flush is not skipped for a road that was never paid (finding R2).
+    /// the worker is gone — says it the way every other failure is said
+    /// (`session_save_failed`, which puts the mark back too): the write it
+    /// waited for did not land, the next debounce retries, and the exit flush
+    /// is not skipped for a road that was never paid (findings R2, R6).
     fn flush_session(&mut self) {
         self.session_dirty_at = None;
         let session = self.session_snapshot();
         self.session_save.save(session);
         self.session_save.flush();
         if let Some(error) = self.session_save.take_error() {
-            self.mark_session_dirty();
-            self.fail(format!("could not save session: {error}"));
+            self.session_save_failed(error);
         }
         // A save is a moment the state is being fixed; the repository is part
         // of that picture, so refresh it here rather than leaving the bar with
@@ -4207,6 +4208,21 @@ impl App {
         // debounced `save_session` — so this does not put a git process on the
         // message path.
         self.refresh_git();
+    }
+
+    /// A session write that did not land, said the way every other failure is.
+    ///
+    /// [`Self::fail_for`] takes the durable route — the root's pane notice, the
+    /// mark that makes the next save write it, and the bar's line — and the
+    /// frame is owed explicitly because this failure is raised from a tick: no
+    /// keystroke and no spinner beat marked one, so without it the line is set
+    /// and never painted, and the frame that is painted is the keystroke that
+    /// replaces the line. The human would read a stale workspace as saved
+    /// (finding R6).
+    fn session_save_failed(&mut self, error: String) {
+        let line = format!("could not save session: {error}");
+        self.fail_for(AgentId::ROOT, line.clone(), Some(line));
+        self.dirty_screen = true;
     }
 
     /// The conversation as it is stored: the root transcript, every subagent's,
@@ -12187,6 +12203,42 @@ mod tests {
         assert!(
             app.session_dirty_at.is_some(),
             "the flush did not get the write, and the mark is still owed"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The save failure is raised from a tick, where no keystroke and no
+    /// spinner beat marked a frame owed: it has to mark one itself, and it takes
+    /// the durable route every other failure takes — the bar's line, the pane's
+    /// notice (`/notes`), and the mark that makes the next save write it
+    /// (finding R6).
+    #[test]
+    fn a_save_failure_is_painted_and_kept_in_the_notes() {
+        use session_save::fake::Recorder;
+
+        let recorder = Recorder::new().fails("no space left on device");
+        let root = dir("failed-visible");
+        let (mut app, _rx) = app_root(&root, None, recorder);
+        streamed(&mut app, "lost");
+        age_session(&mut app, SESSION_DEBOUNCE);
+
+        // The failure is taken by the tick that hands the snapshot over (the
+        // fake answers the first poll; on a real writer it is the worker's
+        // error, taken by the tick after) — and that tick is the one that owes
+        // the frame, because on an idle app nothing else does.
+        app.dirty_screen = false;
+        app.tick();
+        assert!(app.dirty_screen, "the failure owes the frame that shows it");
+        assert_eq!(
+            app.status.as_ref().map(|status| status.kind),
+            Some(StatusKind::Error)
+        );
+        let stored = app.chat.stored_notices();
+        assert!(
+            stored
+                .iter()
+                .any(|notice| notice.text.contains("could not save session")),
+            "the failure is one a restart can hold: {stored:?}"
         );
         let _ = std::fs::remove_dir_all(&root);
     }
