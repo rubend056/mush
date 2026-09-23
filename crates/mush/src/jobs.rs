@@ -1351,7 +1351,7 @@ impl Registry {
     /// lock held by an agent whose row is gone is a lock nobody can clear
     /// ([`Registry::kill`], finding E4).
     pub fn kill_owned(&self, owner: u64) {
-        self.kill(Some(owner));
+        let _ = self.kill(Some(owner));
     }
 
     /// Stop everything, and raise the quit fence before the walk.
@@ -1369,9 +1369,13 @@ impl Registry {
     /// so the walk and admission cannot interleave. This is what quitting mush
     /// runs; Ctrl-N goes through [`Registry::kill_owned`], which must not
     /// fence, because the workspace is not being left.
-    pub fn kill_all(&self) {
+    ///
+    /// What a kill could not finish is returned, one sentence each, because the
+    /// caller is the exit road and the human is the reader who must not get a
+    /// silent kill (findings E6, R4).
+    pub fn kill_all(&self) -> Vec<String> {
         self.begin_quit();
-        self.kill(None);
+        self.kill(None)
     }
 
     /// Raise the quit fence: from here on every launch is refused under the same
@@ -1402,6 +1406,14 @@ impl Registry {
     /// walked only `jobs` would be a second, weaker rule, and the foreground
     /// half is exactly what the weaker rule misses (finding S4).
     ///
+    /// What a kill could not finish comes back with it — a process group the
+    /// signal did not reach (finding E6), a leader that did not end within the
+    /// reap's deadline (finding R4) — because the quit road's reader is the
+    /// human, whom a silent kill would leave believing the machine was clean.
+    /// A kill aimed at one owner returns them too; [`Registry::kill_owned`]'s
+    /// callers drop them, since that owner already reads the same sentences in
+    /// the completion line its watcher builds.
+    ///
     /// The holder record is the third thing the owner's kill reaches, and the
     /// only road that can: `release_machine` is the holder's own and a panicking
     /// actor never runs it, `Registry::stop` refuses any other caller, and the
@@ -1410,18 +1422,21 @@ impl Registry {
     /// holds anything; its watch thread's `finish` would clear it a moment later
     /// anyway, and a sibling queued behind the lock must not wait for a thread
     /// it is killing.
-    fn kill(&self, owner: Option<u64>) {
+    fn kill(&self, owner: Option<u64>) -> Vec<String> {
+        let mut unfinished = Vec::new();
         // `map_or`, not `is_none_or`: the workspace declares Rust 1.74, where
         // the latter does not exist yet (clippy's msrv lint keeps this honest).
         for (holder, live) in self.foregrounds() {
             if owner.map_or(true, |owner| owner == holder) {
                 live.kill();
+                unfinished.extend(live.kill_failure());
             }
         }
         for record in self.jobs() {
             if owner.map_or(true, |owner| owner == record.owner) {
                 if let State::Running(live) = &record.state {
                     live.kill();
+                    unfinished.extend(live.kill_failure());
                 }
             }
         }
@@ -1431,6 +1446,7 @@ impl Registry {
                 inner.holder = None;
             }
         }
+        unfinished
     }
 
     /// Bounded on its own terms, windows first: they share [`STATUS_WINDOW`], so
@@ -1565,7 +1581,11 @@ impl Drop for Registry {
     /// the ones finding S4 is about — outside a drop that is meant to be
     /// everything it *can* reach.
     fn drop(&mut self) {
-        self.kill(None);
+        // The reason a kill could not finish one of these has no reader left:
+        // the registry is going with the tree, and the job's own completion has
+        // already carried it where that owner reads. Walking is all that is
+        // owed.
+        let _ = self.kill(None);
     }
 }
 
@@ -2524,6 +2544,30 @@ mod tests {
             *seen.lock().unwrap(),
             Some(true),
             "the launch fence must be up when the walk reaches the job"
+        );
+    }
+
+    /// A kill that could not finish is handed back (findings E6, R4): the walk
+    /// returns the sentence so the exit road can say it after the terminal is
+    /// back, instead of leaving the human to believe a machine is clean because
+    /// nothing was printed.
+    #[test]
+    fn the_walk_hands_back_what_a_kill_could_not_finish() {
+        let (registry, _events, _clock) = registry();
+        let machine = Arc::new(
+            ScriptedMachine::new()
+                .runs(Script::hangs().kill_fails("could not signal the process group 7: EIO")),
+        );
+        let (_id, _rx) = launch(&registry, &machine, 7);
+        let notes = registry.kill_all();
+        assert_eq!(
+            notes.len(),
+            1,
+            "one sentence for one unfinished kill: {notes:?}"
+        );
+        assert!(
+            notes[0].contains("could not signal the process group 7"),
+            "{notes:?}"
         );
     }
 

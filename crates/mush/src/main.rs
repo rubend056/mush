@@ -1148,7 +1148,17 @@ fn run() -> Result<(), Box<dyn Error>> {
         app.set_term_size(size.width, size.height);
     }
     let result = event_loop(&mut guard.terminal, &mut app, &rx, &theme);
+    // The terminal and the socket go back where they always did; the exit road
+    // — the flush, the actors' endings, the quit fence and the kill walk, the
+    // writer's thread — runs here, with the human's own shell able to read what
+    // it says. Every step of that road is bounded ([`App::shutdown`]), and a
+    // bound that expires comes back as a sentence, printed to stderr here
+    // (finding R4): mush leaves, and it leaves saying what it could not finish.
     drop(guard);
+    drop(_attach);
+    for note in app.shutdown() {
+        eprintln!("mush: {note}");
+    }
     result
 }
 
