@@ -78,6 +78,19 @@ pub trait SessionSave: Send + Sync {
     /// thread has no caller to return to, and swallowing it would let a
     /// workspace mush cannot write to look saved. `None` when nothing failed.
     fn take_error(&self) -> Option<String>;
+
+    /// Whether the store is still this mush's, asked before a store write that
+    /// does not go through the worker.
+    ///
+    /// The worker gates its own saves with the lock's identity, and that gate
+    /// has to cover *every* store write, or a mush whose lock's name was
+    /// replaced — the human's `mv`, a restore from a backup — still writes the
+    /// road that does not pass through the worker: the `.mush/session.json.previous`
+    /// copy Ctrl-N keeps, which is the slot the window that now owns the store
+    /// points its own warning at (finding R9). `Ok(())` when the lock's name
+    /// still leads to the locked inode, or when there is no lock to ask (a
+    /// writer built without one — a test, or a road that never took one).
+    fn store_is_mine(&self) -> Result<(), String>;
 }
 
 /// The real seam: one writer thread, the newest snapshot, and the one a failed
@@ -127,6 +140,18 @@ impl Inner {
         let message = message.into();
         *self.failed.lock().unwrap() = Some(message.clone());
         message
+    }
+
+    /// The lock's verdict on the store: whether the name still leads to the
+    /// inode this process locked, or `Ok(())` when there is no lock to ask. One
+    /// spelling for the two writers that need it — the worker before every save
+    /// it makes, and [`SessionSave::store_is_mine`] for a write that does not go
+    /// through the worker — so the two gates cannot disagree.
+    fn store_is_mine(&self) -> Result<(), String> {
+        match &self.lock {
+            Some(identity) => identity.still_mine(),
+            None => Ok(()),
+        }
     }
 }
 
@@ -278,6 +303,10 @@ impl SessionSave for Writer {
     fn take_error(&self) -> Option<String> {
         self.inner.failed.lock().unwrap().take()
     }
+
+    fn store_is_mine(&self) -> Result<(), String> {
+        self.inner.store_is_mine()
+    }
 }
 
 impl Writer {
@@ -423,7 +452,7 @@ fn attempt(inner: &Inner, mut session: Session) -> Option<Session> {
     // the damage the lock exists to prevent, so a save that cannot prove the
     // store is still this mush's writes nothing and leaves the refusal where the
     // UI's tick reads it.
-    if let Some(Err(why)) = inner.lock.as_ref().map(lock::Identity::still_mine) {
+    if let Err(why) = inner.store_is_mine() {
         *inner.failed.lock().unwrap() = Some(why);
         // The refusal is not a bad moment on a disk that may recover: the name
         // has a different inode behind it for good, so a retry would be an
@@ -497,6 +526,12 @@ pub(crate) mod fake {
 
         fn take_error(&self) -> Option<String> {
             self.failure.lock().unwrap().take()
+        }
+
+        /// The recorder has no lock: every store it writes is its own, which
+        /// is what a test that does not set one up means.
+        fn store_is_mine(&self) -> Result<(), String> {
+            Ok(())
         }
     }
 }

@@ -3981,7 +3981,16 @@ impl App {
     /// what the human was reading. Written here, synchronously, for the one
     /// caller that must wait on its own copy — the clear that follows must not
     /// happen before the copy is safe ([`session::keep_previous`]).
+    ///
+    /// The store's lock gets the same gate every save passes
+    /// ([`SessionSave::store_is_mine`]): a mush whose lock's name was replaced
+    /// has no store to keep a copy *in*, and writing the copy anyway lands it in
+    /// the store the mush that now owns the workspace keeps its own
+    /// `.mush/session.json.previous` in — over the one its Ctrl-N warning points
+    /// at (finding R9). The refusal is handed back, so the key refuses the clear
+    /// and changes nothing.
     fn keep_cleared_conversation(&self) -> Result<(), String> {
+        self.session_save.store_is_mine()?;
         session::keep_previous(self.ws.root(), self.session_snapshot()).map(|_| ())
     }
 
@@ -14894,6 +14903,50 @@ mod tests {
             stored.base_url, "http://127.0.0.1:2",
             "the file carries the endpoint that was picked"
         );
+    }
+
+    /// The lock-identity guard gates every store write, not only the session
+    /// save: a mush whose lock was replaced must not write its cleared
+    /// conversation into `.mush/session.json.previous` — that is the store a
+    /// second mush now owns, and the slot *its* Ctrl-N warning points at
+    /// (finding R9). The key has to refuse the clear instead.
+    #[test]
+    fn a_displaced_mush_does_not_write_the_previous_session() {
+        isolate_user_config();
+        let root = dir("displaced-ctrl-n");
+        mush_core::session::ensure_mush_dir(&root).unwrap();
+        let guard = crate::lock::acquire(&root).unwrap();
+        let writer = Arc::new(
+            session_save::Writer::new(root.to_path_buf(), Some(guard.identity()))
+                .expect("the worker starts"),
+        );
+        let (mut app, _rx) = app_root(&root, None, writer.clone());
+
+        // A conversation worth keeping, and a lock whose *name* is then
+        // replaced under this mush — the human's own `mv`, or a restore from a
+        // backup — leaving this flock on an orphaned inode while a second mush
+        // can lock the fresh file and own the store.
+        streamed(&mut app, "the conversation the key would keep");
+        let fresh = root.join(".mush/lock.new");
+        std::fs::write(&fresh, "0\n").unwrap();
+        std::fs::rename(&fresh, root.join(".mush/lock")).unwrap();
+
+        // Ctrl-N twice: the first press arms, the second keeps the
+        // conversation as `.mush/session.json.previous` and clears. The copy
+        // is the store write this test is about.
+        ctrl(&mut app, 'n');
+        ctrl(&mut app, 'n');
+
+        assert!(
+            !session::previous_session_path(&root).exists(),
+            "the displaced mush wrote the slot another window's Ctrl-N points at"
+        );
+        assert!(
+            text_of(&app).contains("nothing cleared"),
+            "and it said why the key refused: {}",
+            text_of(&app)
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A list fetched from the endpoint the human has since left must not land:
