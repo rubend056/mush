@@ -299,15 +299,23 @@ pub struct Workspace {
 }
 
 /// What a search found: the matching lines, whether the cap cut the list short,
-/// and how many files it never opened (binary, or past [`SEARCH_FILE_CAP`]).
+/// how many files it never opened (binary, or past [`SEARCH_FILE_CAP`]), and
+/// how many it found whose name cannot travel on the model's road
+/// ([`Workspace::name_for_model`]: a line break in the name, bytes that are
+/// not UTF-8, or ends `resolve` would trim).
 ///
 /// The third field is the one that keeps "no match" honest. A model reads a
 /// miss as "the symbol does not exist", so a search that skipped a file must
 /// say so — the count is what the tool tells it instead of a false negative.
+/// The fourth is the same honesty for the *name*: a match line is prefixed
+/// with the path, and a path the model cannot pass back to `read_file` is a
+/// dead end, so such files are not searched and are counted instead — the same
+/// reason [`Workspace::list_files`] leaves them out (finding B9).
 pub struct Matches {
     pub matches: Vec<String>,
     pub more: bool,
     pub skipped: usize,
+    pub unnamed: usize,
 }
 
 /// What a bounded line count of a whole file can say, from
@@ -418,12 +426,54 @@ impl Workspace {
         }
     }
 
-    /// Workspace-relative display path for an absolute path.
+    /// Workspace-relative display path for an absolute path: the name the
+    /// filesystem holds, with a path outside the root left whole (a real path
+    /// must not be rewritten into a relative one that means something else).
+    ///
+    /// Nothing here folds a `\` into `/`. On this box `\` is an ordinary
+    /// byte of a file's name, and the fold made a name that no road can open
+    /// again: a file named `a\b.txt` listed as `a/b.txt`, and a model's
+    /// `read_file` on the listed name answered "No such file or directory" —
+    /// the listing handed over a path the listing could not open (finding B9).
+    /// A name is bytes, not display. The roads that *hand names over* go
+    /// through [`Self::name_for_model`] instead, which refuses a name that
+    /// cannot travel as itself; this one is infallible because its callers show
+    /// a path rather than give one back, and so it may decode lossily.
     pub fn rel(&self, path: &Path) -> String {
         path.strip_prefix(&self.root)
             .unwrap_or(path)
             .to_string_lossy()
-            .replace('\\', "/")
+            .into_owned()
+    }
+
+    /// The name a *model road* hands back for a real path, or `None` when the
+    /// name cannot travel as itself.
+    ///
+    /// The listing and the search are data roads: what they report is what the
+    /// model passes back to `read_file`, so a reported name must be one the
+    /// tools open again — [`Self::resolve`] has to return the same path. Three
+    /// shapes cannot:
+    ///
+    /// - a name that is not valid UTF-8: [`Self::rel`]'s lossy decode would
+    ///   hand over U+FFFD where the file holds a byte, and the name would name
+    ///   nothing;
+    /// - a name holding `\n` or `\r`: a listing is one name per line, so it
+    ///   would read as two entries, neither of them the file (B9's second
+    ///   half);
+    /// - a name whose ends [`str::trim`] would change: `resolve` trims the path
+    ///   it is given, so a leading or trailing space (or NBSP, or any other
+    ///   whitespace) is a byte the model's own road cannot carry — handing it
+    ///   over would name a different file, or none.
+    ///
+    /// `None` is not a silent loss: the road counts what it could not name and
+    /// the tool layer says how many and which road reaches them
+    /// (`run_command`: `ls -b`, `rg`).
+    fn name_for_model(&self, path: &Path) -> Option<String> {
+        let name = path.strip_prefix(&self.root).unwrap_or(path).to_str()?;
+        if name.trim() != name || name.contains(['\n', '\r']) {
+            return None;
+        }
+        Some(name.to_string())
     }
 
     /// Read a text file whole, for the one road that writes back what it reads:
@@ -999,9 +1049,11 @@ impl Workspace {
     }
 
     /// Every file under `rel` (default the workspace root), workspace-relative
-    /// and sorted, with the first `limit` and whether there were more. Build and
-    /// VCS directories are skipped ([`SKIP_DIRS`]); a symlinked directory is not
-    /// followed, so a listing cannot leave the workspace.
+    /// and sorted, with the first `limit`, whether there were more, and how
+    /// many files the walk found whose name cannot travel on the model's road
+    /// ([`Self::name_for_model`]). Build and VCS directories are skipped
+    /// ([`SKIP_DIRS`]); a symlinked directory is not followed, so a listing
+    /// cannot leave the workspace.
     ///
     /// That claim is why the name is checked for real before the walk
     /// ([`Self::real_path`]): `out -> /tmp/elsewhere` is a name inside the root
@@ -1009,7 +1061,18 @@ impl Workspace {
     /// runs on the name the model gave, so a link to a *file* inside the root
     /// answers about that file under the name it was asked about, while a link
     /// to a directory is left alone like every other symlinked directory.
-    pub fn list_files(&self, rel: &str, limit: usize) -> Result<(Vec<String>, bool), String> {
+    ///
+    /// The third value is why the listing does not hand over a name it cannot
+    /// open again: a name holding a line break reads as two entries, and a name
+    /// `resolve` would trim names a different file — both are counted instead
+    /// of reported, and the tool layer says how many and where they can be
+    /// reached (finding B9). The listing's own shape must not make a file
+    /// unreachable, or hand one over that is not there.
+    pub fn list_files(
+        &self,
+        rel: &str,
+        limit: usize,
+    ) -> Result<(Vec<String>, bool, usize), String> {
         let start = self.resolve(rel)?;
         self.real_path(&start, rel)?;
         // "Empty" and "not there" are different facts, and a listing that
@@ -1019,14 +1082,18 @@ impl Workspace {
             return Err(format!("no such path: `{rel}`"));
         }
         let mut found = Vec::new();
+        let mut unnamed = 0usize;
         self.walk(&start, &mut |path: &Path| {
-            found.push(self.rel(path));
+            match self.name_for_model(path) {
+                Some(name) => found.push(name),
+                None => unnamed += 1,
+            }
             true
         });
         found.sort();
         let truncated = found.len() > limit;
         found.truncate(limit);
-        Ok((found, truncated))
+        Ok((found, truncated, unnamed))
     }
 
     /// Every line under `rel` containing `pattern` — a literal string, not a
@@ -1058,7 +1125,11 @@ impl Workspace {
     ///
     /// What it skipped is counted and travels back with the matches
     /// ([`Matches::skipped`]): a search that says "no match" while it never
-    /// opened a file is a false negative a model will act on.
+    /// opened a file is a false negative a model will act on. Files whose name
+    /// cannot travel on the model's road ([`Self::name_for_model`]) are not
+    /// opened either, and are counted the same way ([`Matches::unnamed`]) — a
+    /// match line is prefixed with the path, and a path the model cannot pass
+    /// back to `read_file` would be a dead end (finding B9).
     ///
     /// Like the listing, the name is checked for real before the walk
     /// ([`Self::real_path`]): a link inside the root cannot make the search
@@ -1087,7 +1158,14 @@ impl Workspace {
         let mut matches = Vec::new();
         let mut more = false;
         let mut skipped = 0usize;
+        let mut unnamed = 0usize;
         self.walk(&start, &mut |path: &Path| {
+            // The name is needed before the file is opened: it is the match
+            // line's prefix, and a name that cannot travel is not searched.
+            let Some(name) = self.name_for_model(path) else {
+                unnamed += 1;
+                return true;
+            };
             let Ok(meta) = fs::metadata(path) else {
                 skipped += 1;
                 return true;
@@ -1118,12 +1196,7 @@ impl Workspace {
                     more = true;
                     return false;
                 }
-                matches.push(format!(
-                    "{}:{}: {}",
-                    self.rel(path),
-                    number + 1,
-                    match_line(line)
-                ));
+                matches.push(format!("{}:{}: {}", name, number + 1, match_line(line)));
             }
             true
         });
@@ -1131,6 +1204,7 @@ impl Workspace {
             matches,
             more,
             skipped,
+            unnamed,
         })
     }
 
@@ -1936,10 +2010,72 @@ mod tests {
             ws.rel(&ws.root().join(".mush/session.json.bak.2")),
             ".mush/session.json.bak.2"
         );
-        // And the rule folds `\` to `/`: a path built on Windows, or a name a
-        // model wrote, reads with the one separator — which the second rule
-        // did not do.
-        assert_eq!(ws.rel(&ws.root().join("a\\b")), "a/b");
+        // And a name's `\` stays the name's: on this box it is an ordinary
+        // byte, and folding it into `/` named a path that does not exist
+        // (finding B9).
+        assert_eq!(ws.rel(&ws.root().join("a\\b")), "a\\b");
+    }
+
+    /// A path a tool hands the model is a path the tool opens again: a name is
+    /// bytes, not display. A file named `a\b.txt` lists as `a\b.txt` — the old
+    /// fold into `a/b.txt` named a file that does not exist — and a name that
+    /// cannot travel *as itself* (a line break, bytes that are not UTF-8, ends
+    /// `resolve` would trim) is not handed over as a path at all, because the
+    /// listing's own shape would read it as two entries or as a different file:
+    /// it is counted instead, for the tool layer to say so. A search names the
+    /// same file the same way (finding B9).
+    #[test]
+    fn a_listed_path_can_be_opened_again() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let ws = temp_workspace("listed-name");
+        fs::write(ws.root().join(r"a\b.txt"), "the real file\n").unwrap();
+        fs::write(ws.root().join("a\nb.txt"), "the newline file\n").unwrap();
+        fs::write(
+            ws.root().join(std::ffi::OsStr::from_bytes(b"caf\xe9.txt")),
+            "latin name\n",
+        )
+        .unwrap();
+        fs::write(ws.root().join("trailing "), "trailing space\n").unwrap();
+
+        let (listed, truncated, unnamed) = ws.list_files("", 100).unwrap();
+        assert_eq!(
+            listed,
+            vec![r"a\b.txt".to_string()],
+            "the backslash is a name byte, not a separator"
+        );
+        assert!(!truncated);
+        assert_eq!(unnamed, 3, "the names that cannot travel are counted");
+        for name in &listed {
+            assert_eq!(
+                ws.read_file(name).unwrap(),
+                fs::read_to_string(ws.root().join(name)).unwrap(),
+                "every listed path opens the file it named"
+            );
+        }
+
+        // The search names the file the same way, and its path opens too. The
+        // three unnameable files are counted, not reported under a name that
+        // opens something else (or nothing).
+        let found = ws.search("the real file", "", false, 10).unwrap();
+        assert_eq!(found.matches, vec![r"a\b.txt:1: the real file".to_string()]);
+        assert_eq!(found.unnamed, 3);
+        let named = found.matches[0].split(':').next().unwrap();
+        assert_eq!(ws.read_file(named).unwrap(), "the real file\n");
+
+        // A search that never looked into the newline-named file is not a
+        // silent miss, and a directory of only such names is not "no files".
+        let found = ws.search("the newline file", "", false, 10).unwrap();
+        assert!(found.matches.is_empty());
+        assert_eq!(found.unnamed, 3);
+        let dir = ws.root().join("only");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("x\ny"), "no pattern\n").unwrap();
+        let (files, _, unnamed) = ws.list_files("only", 100).unwrap();
+        assert!(files.is_empty());
+        assert_eq!(unnamed, 1, "the listing says it left one name out");
+
+        let _ = fs::remove_dir_all(ws.root());
     }
 
     #[test]

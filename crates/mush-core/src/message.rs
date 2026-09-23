@@ -477,10 +477,23 @@ fn placeholder(image: &Image) -> String {
     // `image/png` prints as `png`: the mime already leads with the fact that
     // this is an image, and the sentence has room for one noun.
     let format = image.mime.strip_prefix("image/").unwrap_or(&image.mime);
-    format!(
-        "[image: {} ({format}) — bytes dropped to save room; read the file again if you need them]",
-        one_line(&image.path)
-    )
+    let name = one_line(&image.path);
+    if name == image.path {
+        format!(
+            "[image: {name} ({format}) — bytes dropped to save room; read the file again if you \
+             need them]"
+        )
+    } else {
+        // The spelling above is a mark, not the name: a break in the name, an
+        // escape sequence inside it, a byte the painter drops — the model
+        // cannot pass the shown line back to `read_file` and reach the file,
+        // so the placeholder must not say it can (finding B9). The shell is
+        // the road that still reaches it.
+        format!(
+            "[image: {name} ({format}; the name cannot travel as a path) — bytes dropped to save \
+             room; run_command (`ls -b`) reaches the file if you need it]"
+        )
+    }
 }
 
 /// The one-line spelling of a path that goes into a line which must stay one
@@ -492,10 +505,14 @@ fn placeholder(image: &Image) -> String {
 /// splits on it — and a placeholder is not wrapped but shaped: a newline in a
 /// path (legal on Linux) would otherwise put a line of its own into the model's
 /// view of the transcript, where the placeholder is a stand-in for bytes and
-/// not a message of its own. The break is escaped as the two characters `\n`
-/// rather than dropped, so the path stays readable enough to open the file
-/// again; a lone `\r` [`crate::text::sanitize`] already marks as `␍`, which is
-/// one line as well.
+/// not a message of its own. The break is spelled as the two characters `\n`
+/// rather than dropped, and a lone `\r` [`crate::text::sanitize`] already marks
+/// as `␍`, which is one line as well.
+///
+/// That spelling is a *mark*, not the name: it is not a path `read_file` can
+/// open, and no spelling of one can be, because a listing's line and a tool
+/// argument are one line by construction. So [`placeholder`] says so and names
+/// the shell road instead of inviting a read that would fail (finding B9).
 fn one_line(path: &str) -> String {
     crate::text::sanitize(path).replace('\n', "\\n")
 }
@@ -1201,9 +1218,10 @@ mod tests {
     /// The placeholder is one line whatever the path holds. A newline is legal
     /// in a Linux path, and before the path was sanitized it put a line of its
     /// own into the transcript — the placeholder is a stand-in for bytes, and a
-    /// line is the whole of its shape. The break is escaped rather than
-    /// dropped: `\n` is the two characters a model undoes to name the file
-    /// again, so the path stays readable enough to open the file.
+    /// line is the whole of its shape. The break is spelled `\n`, and because
+    /// that spelling is a mark and not the name, the placeholder does not
+    /// invite a read that would fail: the shell is the road to a name the tools
+    /// cannot carry (finding B9).
     #[test]
     fn a_dropped_image_whose_path_holds_a_newline_still_leaves_one_line() {
         let mut message = Message::user("look");
@@ -1221,8 +1239,16 @@ mod tests {
             "the message's own line, then one placeholder line: {text:?}"
         );
         assert!(
-            text.contains(r"[image: shots/a\nb.png (png) — bytes dropped"),
-            "the escaped path is still readable: {text:?}"
+            text.contains(r"[image: shots/a\nb.png (png; the name cannot travel as a path)"),
+            "the escaped name is marked as a mark, not a path: {text:?}"
+        );
+        assert!(
+            !text.contains("read the file again"),
+            "the model is not sent to a path that does not exist: {text:?}"
+        );
+        assert!(
+            text.contains("run_command (`ls -b`)"),
+            "the road that reaches it is named: {text:?}"
         );
     }
 
