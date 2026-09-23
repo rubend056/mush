@@ -14,11 +14,12 @@
 //! actor announced, and [`ConfigHandle::learn_context`], which is an actor
 //! adopting what the endpoint said. Both run the one policy in [`believable`],
 //! against the copy in force, and the UI's plain copy is then read back from
-//! the shared cell *whatever the answer* — taken, both hold the new number;
-//! refused, both hold the window in force — so a learn decision cannot leave
-//! the two apart. (Finding D21: the UI used to judge an announced number
-//! against its own frame-cached copy, so a handle that had already learned a
-//! smaller window left the UI refusing a number that was already in force.)
+//! the shared cell *whatever the answer* — the number and the road it came
+//! by — taken, both hold the new window; refused, both hold the window in
+//! force — so a learn decision cannot leave the two apart. (Finding D21: the
+//! UI used to judge an announced number against its own frame-cached copy, so a
+//! handle that had already learned a smaller window left the UI refusing a
+//! number that was already in force.)
 //!
 //! The handle takes the announcement as an argument
 //! ([`ConfigHandle::learn_context`]) and calls it exactly when the number
@@ -33,6 +34,7 @@
 
 use std::sync::{Arc, Mutex};
 
+pub use mush_core::config::WindowSource;
 use mush_core::Config;
 
 /// What a request fails with when another thread panicked while holding the
@@ -40,27 +42,24 @@ use mush_core::Config;
 /// thing about the same failure.
 const POISONED: &str = "shared configuration poisoned";
 
-/// Where a window mush did not get from the human came from.
-///
-/// A number means the same thing whoever said it; how far it is to be trusted
-/// does not. `/v1/models` states the window as a field, so it is taken as
-/// given; a *complaint* is prose mush parses out of a refusal body, so it has
-/// to look plausible against the window in use as well — otherwise a rate-limit
-/// body would teach mush that the endpoint has ten tokens (finding A3).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum WindowSource {
-    /// The endpoint's model list named it for the model in use.
-    Advertised,
-    /// The endpoint named it in a refusal.
-    Complaint,
-}
-
 /// Whether a window from `source` is worth adopting, against the one in use.
 ///
 /// The one policy both faces of the cell run, so the UI cannot accept a number
-/// an actor refused, or the other way round.
+/// an actor refused, or the other way round. A number means the same thing
+/// whoever said it; how far it is to be trusted does not: `/v1/models` states
+/// the window as a field, so it is taken as given; a *complaint* is prose mush
+/// parses out of a refusal body, so it has to look plausible against the window
+/// in use as well — otherwise a rate-limit body would teach mush that the
+/// endpoint has ten tokens (finding A3).
+///
+/// The other two roads are not learnable numbers at all. `Stated` is the
+/// human's own: it outranks discovery, and a caller that already holds it has
+/// nothing to adopt. `Table` is mush's own assumption filling a silence — the
+/// number [`Config::rederive_context`] writes — not a fact an endpoint taught,
+/// so no learn call carries it.
 fn believable(in_use: usize, tokens: usize, source: WindowSource) -> bool {
     match source {
+        WindowSource::Stated | WindowSource::Table => false,
         WindowSource::Advertised => true,
         // A complaint is only taken when it shrinks the window without
         // collapsing it.
@@ -128,10 +127,11 @@ impl ConfigCell {
     ///
     /// The judgement and the write happen in the shared cell — the copy every
     /// request is built from — and the UI's own copy is then read back from it
-    /// whatever the answer. Judging against the frame-cached copy instead was a
-    /// strand: an actor's handle can have learned a window the UI has not heard
-    /// about yet, and the UI then refused a number that was already in force
-    /// (finding D21).
+    /// whatever the answer, the road included: the mark the meter paints is a
+    /// fact about the number in force, so it cannot lag it. Judging against the
+    /// frame-cached copy instead was a strand: an actor's handle can have
+    /// learned a window the UI has not heard about yet, and the UI then refused
+    /// a number that was already in force (finding D21).
     ///
     /// Returns whether anything changed. A window the human stated is never
     /// touched, and an implausible complaint is refused — by the shared cell as
@@ -148,6 +148,7 @@ impl ConfigCell {
         // decision of either side.
         if let Ok(cfg) = self.shared.config() {
             self.ui.context_tokens = cfg.context_tokens;
+            self.ui.context_source = cfg.context_source;
         }
         learned
     }
@@ -232,7 +233,7 @@ impl ConfigHandle {
         if !believable(shared.context_tokens, tokens, source) {
             return Ok(false);
         }
-        Ok(shared.adopt_context(tokens))
+        Ok(shared.adopt_context(tokens, source))
     }
 
     /// Copy a whole configuration in. Private on purpose: the only writer of a
@@ -307,6 +308,12 @@ mod tests {
         );
         assert_eq!(cell.ui().context_tokens, 64_000);
         assert_eq!(cell.handle().config().unwrap().context_tokens, 64_000);
+        assert_eq!(cell.ui().context_source, WindowSource::Advertised);
+        assert_eq!(
+            cell.handle().config().unwrap().context_source,
+            WindowSource::Advertised,
+            "the road travels with the number, on both sides"
+        );
         assert!(
             !cell.learn_context(64_000, WindowSource::Advertised),
             "learning the number twice changes nothing"
@@ -355,6 +362,7 @@ mod tests {
         assert!(!cell.learn_context(16_000, WindowSource::Complaint));
         assert_eq!(cell.ui().context_tokens, 32_768);
         assert_eq!(cell.handle().config().unwrap().context_tokens, 32_768);
+        assert_eq!(cell.ui().context_source, WindowSource::Stated);
     }
 
     /// The trust policy is one function, and it is the shape a complaint is
@@ -374,6 +382,14 @@ mod tests {
         assert!(
             believable(128_000, 10, WindowSource::Advertised),
             "a model list is a field, not prose: it is taken as stated (and clamped)"
+        );
+        assert!(
+            !believable(128_000, 200_000, WindowSource::Stated),
+            "the human's own number is not a learnable one"
+        );
+        assert!(
+            !believable(128_000, 200_000, WindowSource::Table),
+            "mush's own assumption is not a fact an endpoint taught"
         );
     }
 

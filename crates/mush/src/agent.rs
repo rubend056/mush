@@ -2795,7 +2795,7 @@ fn run_loop(
                 // would collapse the window by more than 8x is refused: a
                 // rate-limit body must not teach mush that the endpoint has ten
                 // tokens (finding A3).
-                if !learned_context && !cfg.context_explicit {
+                if !learned_context && !cfg.context_explicit() {
                     if let Some(tokens) = parse_context_hint(&detail) {
                         // The cell decides whether the number is worth taking
                         // (a plausible one, and never over a window the human

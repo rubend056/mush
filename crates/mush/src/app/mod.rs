@@ -676,6 +676,33 @@ pub struct App {
     spin_at: Instant,
 }
 
+/// How one road a window came by is painted in the `ctx` line. Each mark is one
+/// display column, so the meter keeps its width at 80×24 where a word would be
+/// clipped; the words live in `--print-config` (see `describe` in `main.rs`),
+/// which has the room.
+///
+/// The vocabulary, one road at a time:
+///
+/// - `Stated` paints nothing: the human's own number needs no mark, and
+///   [`App::context_label`] still says `(set)`.
+/// - `Table` paints `~`: mush's documented model table, or the provider's
+///   general fallback — the historical mark for "assumed".
+/// - `Advertised` paints `≈`: the endpoint's model list named it.
+/// - `Complaint` paints `≤`: the endpoint named it in a refusal, and the cell
+///   only takes a complaint that shrinks the window, so "no larger than" is
+///   exact.
+///
+/// One function, so [`App::context_label`] and [`App::context_meter`] cannot
+/// disagree about the road they are painting.
+pub(crate) fn window_mark(source: WindowSource) -> &'static str {
+    match source {
+        WindowSource::Stated => "",
+        WindowSource::Table => "~",
+        WindowSource::Advertised => "≈",
+        WindowSource::Complaint => "≤",
+    }
+}
+
 impl App {
     /// The configuration every screen reads: the UI's copy of the cell.
     pub fn cfg(&self) -> &Config {
@@ -2067,13 +2094,19 @@ impl App {
         }
     }
 
-    /// `500k`, `8192`, `1M` — one glance, no counting zeroes.
+    /// `500k`, `8192`, `1M` — one glance, no counting zeroes — with the mark of
+    /// the road the window came by ([`window_mark`]): a stated window says
+    /// `(set)`, and an assumed or learned one keeps its mark. Two sessions on
+    /// one config painted `~1M` and `~500k`, and nothing could say which road
+    /// each number had taken — the `~` meant only "the human stated none" (the
+    /// human's live finding).
     pub fn context_label(&self) -> String {
         let spelling = tokens_label(self.cfg().context_tokens);
-        if self.cfg().context_explicit {
+        let mark = window_mark(self.cfg().context_source);
+        if mark.is_empty() {
             format!("ctx {spelling} (set)")
         } else {
-            format!("ctx ~{spelling}")
+            format!("ctx {mark}{spelling}")
         }
     }
 
@@ -2091,8 +2124,11 @@ impl App {
     /// normal operation: on the 8 K default the fold fires at ≈3.7k of the
     /// budget, which the old meter read as 45 % — so `full` never happened,
     /// and the human had no way to see a fold or a cut coming (the audit's
-    /// finding). The window keeps its own number, with the `~` that says it is
-    /// the assumed one, so what the budget is a reserve off stays visible.
+    /// finding). The window keeps its own number, with the mark of the road it
+    /// came by ([`window_mark`]): `~8k` assumed from the model table, `≈8k`
+    /// advertised by the endpoint's model list, `≤8k` named in a refusal, and
+    /// no mark on the human's own number — so what the budget is a reserve off
+    /// stays visible, and which road the number took is part of it.
     ///
     /// At the budget and past it there is no longer a fraction to print: a
     /// learned window can be smaller than the transcript already held, so the
@@ -2104,7 +2140,7 @@ impl App {
         let used = self
             .chat
             .used_weight_for(self.tree.focused, self.cfg().history_budget());
-        let mark = if self.cfg().context_explicit { "" } else { "~" };
+        let mark = window_mark(self.cfg().context_source);
         let used_label = tokens_label(used / BYTES_PER_TOKEN);
         let budget_label = tokens_label(budget / BYTES_PER_TOKEN);
         let fold_label = tokens_label(fold / BYTES_PER_TOKEN);
@@ -3745,7 +3781,7 @@ impl App {
             // one is re-read next time, so it cannot go stale.
             context: self
                 .cfg()
-                .context_explicit
+                .context_explicit()
                 .then_some(self.cfg().context_tokens),
             messages: self
                 .chat
@@ -10207,7 +10243,7 @@ mod tests {
             cfg.rederive_context();
         });
         assert_eq!(app.cfg().context_tokens, 120_000, "the shipped default");
-        assert!(!app.cfg().context_explicit);
+        assert!(!app.cfg().context_explicit());
 
         app.chat.insert("hello");
         app.send_message();
@@ -12631,6 +12667,36 @@ mod tests {
         );
     }
 
+    /// The window's mark is per road, not one `~` for every number the human
+    /// did not state: `~` for mush's model table, `≈` for the endpoint's model
+    /// list, `≤` for the endpoint's refusal, and none for the human's own. Two
+    /// sessions on one config painted `~1M` and `~500k`, and the single mark
+    /// could not say which road each number had taken (the human's live
+    /// finding).
+    #[test]
+    fn the_meter_marks_each_road_a_window_came_by() {
+        let (mut app, _rx) = test_app("meter-roads");
+        for (source, mark) in [
+            (WindowSource::Table, "~"),
+            (WindowSource::Advertised, "≈"),
+            (WindowSource::Complaint, "≤"),
+        ] {
+            assert_eq!(window_mark(source), mark, "{source:?}");
+            app.cell.edit(|cfg| cfg.context_source = source);
+            let meter = app.context_meter();
+            assert!(
+                meter.ends_with(&format!("{mark}{}", tokens_label(app.cfg().context_tokens))),
+                "{source:?}: {meter}"
+            );
+        }
+
+        // The human's own number is the unmarked one: it needs no explanation.
+        app.cell.edit(|cfg| cfg.set_context(32_768));
+        let stated = app.context_meter();
+        assert!(!stated.contains('~'), "{stated}");
+        assert!(stated.ends_with(&tokens_label(32_768)), "{stated}");
+    }
+
     /// A window an actor learned reaches the UI's cell, through the event that
     /// announced it — not as a mutex write the UI never hears about (finding
     /// B7). The bar and the tool caps read one number, and the
@@ -12660,7 +12726,7 @@ mod tests {
             "the bar and the caps read the learned window"
         );
         assert!(
-            !app.cfg().context_explicit,
+            !app.cfg().context_explicit(),
             "and they still read it as learned, not as the human's"
         );
         assert_eq!(
