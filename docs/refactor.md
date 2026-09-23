@@ -582,11 +582,14 @@ The rule the waves have settled into, so it is not re-derived each time:
 
 The review that follows every integration onto `master` (§10.3) reports the same
 fact, rule or shape written more than once, ranked by (net lines × confidence) ÷
-risk. This is the one ledger of what those reviews have found: a row per item,
+risk. This is the one ledger of the duplication queue's decisions: a row per item,
 what it costs, and — while it is open — the risk the fix removes and the test
-that would protect it. The reviews themselves are the subsections below, kept for
-their evidence: what each measured, which bugs it injected, and which semantic
-changes it proved byte-identical.
+that would protect it. The queue's evidence is the record's, not this ledger's:
+`findings.md` §8.51 carries the six blind audits and their findings, §8.70 the
+four duplication passes that read the tree blind, each pointing back at the rows
+here. The reviews' own subsections below are kept for their evidence: what each
+measured, which bugs it injected, and which semantic changes it proved
+byte-identical.
 
 How to read a row. `Net` is the fix's size — the measured delta for a landed row,
 the review's estimate for an open one. `Status` names the commit that landed a
