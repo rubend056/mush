@@ -36,6 +36,7 @@ pub use tree::{AgentNode, AgentTree, Compacting, ConversationId, Existing, Lande
 // id-taking modules do not each learn a new one.
 pub use crate::ids::AgentId;
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -311,6 +312,96 @@ fn ended_on_an_answer(messages: &[Message]) -> bool {
         messages.last(),
         Some(message) if message.role == "assistant" && message.tool_calls().is_empty()
     )
+}
+
+/// The ids among a stored file's links whose parent chain leads back to the row
+/// itself: a loop, the one link shape the tree cannot hold.
+///
+/// A row whose parent *is* in the tree is not an orphan — `parent_gone` is
+/// false and the row is painted under a parent, not at the top level — so a loop
+/// would leave [`AgentTree::painted_depth`] walking it forever. A row that hangs
+/// *off* a loop is not in one: its chain ends at the loop, and it restores as
+/// the orphan a refused parent leaves it. Each id is walked once across the
+/// whole map, so a file naming a great many rows costs one pass over their
+/// links, not one walk per row.
+fn parent_cycles(links: &HashMap<u64, Option<u64>>) -> HashSet<u64> {
+    let mut cyclic: HashSet<u64> = HashSet::new();
+    // Every id whose chain has been walked to an end (or into a loop): decided,
+    // and never walked again.
+    let mut walked: HashSet<u64> = HashSet::new();
+    for &start in links.keys() {
+        if walked.contains(&start) {
+            continue;
+        }
+        let mut path = vec![start];
+        let mut seen: HashSet<u64> = HashSet::from([start]);
+        let mut cursor = start;
+        let loop_head = loop {
+            let Some(parent) = links.get(&cursor).copied().flatten() else {
+                // The chain ends at an id the file does not name: a dangling
+                // parent is an orphan, not a loop.
+                break None;
+            };
+            if walked.contains(&parent) {
+                // Decided before: either a chain that ends or a loop this path
+                // only leads into. Either way this row is not itself in one.
+                break None;
+            }
+            if !seen.insert(parent) {
+                break Some(parent);
+            }
+            path.push(parent);
+            cursor = parent;
+        };
+        if let Some(head) = loop_head {
+            // From the id where the loop closed onward, every one is in it.
+            cyclic.extend(path.iter().skip_while(|&&id| id != head).copied());
+        }
+        walked.extend(path);
+    }
+    cyclic
+}
+
+/// How much of the file each held row hangs under: one more than its parent's
+/// number, or one for a row the file gives no held parent.
+///
+/// A parent's number is always smaller than its child's, so sorting the rows by
+/// it (stably) puts every parent before its children while leaving rows the file
+/// already had in order where they were. `held` has no loop in it
+/// ([`parent_cycles`] refused those rows), so each walk up ends; each row is
+/// walked once, whichever order the map hands the starts out in.
+fn chain_depths(links: &HashMap<u64, Option<u64>>, held: &HashSet<u64>) -> HashMap<u64, usize> {
+    let mut depths: HashMap<u64, usize> = HashMap::new();
+    for &start in held {
+        if depths.contains_key(&start) {
+            continue;
+        }
+        // The row itself first, then its ancestors, until one has a number or
+        // the file names a parent it does not hold.
+        let mut chain = Vec::new();
+        let mut cursor = start;
+        let base = loop {
+            if let Some(&depth) = depths.get(&cursor) {
+                break depth;
+            }
+            chain.push(cursor);
+            match links
+                .get(&cursor)
+                .copied()
+                .flatten()
+                .filter(|parent| held.contains(parent))
+            {
+                Some(parent) => cursor = parent,
+                None => break 0,
+            }
+        };
+        let mut depth = base;
+        for id in chain.into_iter().rev() {
+            depth += 1;
+            depths.insert(id, depth);
+        }
+    }
+    depths
 }
 
 /// What a restored row's phase and summary mean in the books' vocabulary: the
@@ -902,25 +993,52 @@ impl App {
         app
     }
 
-    /// Decide which of a stored file's rows the tree can hold, and spend every
-    /// id the file names, before one of them is registered.
+    /// Decide which of a stored file's rows the tree can hold, in the order it
+    /// can hold them, and spend every id the file names, before one of them is
+    /// registered.
     ///
     /// A session file is hand-editable, and a repository can still commit one —
     /// an ignore rule does not untrack a tracked file — so its rows are not
     /// trusted. A stored id has to be a *child's*: nonzero (0 is
     /// [`AgentId::ROOT`]), not already taken by the root or by a row accepted
-    /// before it, reachable from the root through the file's own parent links (a
-    /// dangling parent or a cycle has no chain to the root), and one the id
-    /// counter can be kept above — the floor [`AgentTree::reserve_agents`]
-    /// exists to keep (finding B1) — so a `u64::MAX` row, which has nothing
-    /// above it, is refused too. Trusting the file instead registered a `0` row
-    /// *as the root*: its transcript replaced the root's conversation on screen
-    /// and its mailbox replaced the root's actor, and a `u64::MAX` row panicked
-    /// the debug build at `agent.id + 1` (finding C9).
+    /// before it, and one the id counter can be kept above — the floor
+    /// [`AgentTree::reserve_agents`] exists to keep (finding B1) — so a
+    /// `u64::MAX` row, which has nothing above it, is refused too. Trusting the
+    /// file instead registered a `0` row *as the root*: its transcript replaced
+    /// the root's conversation on screen and its mailbox replaced the root's
+    /// actor, and a `u64::MAX` row panicked the debug build at `agent.id + 1`
+    /// (finding C9).
+    ///
+    /// A parent link the file does not follow through is *not* a reason to
+    /// refuse a row. The tree holds a node whose parent is not in it as the
+    /// orphan it is — [`AgentTree::parent_gone`] is the fact, `⚮` the mark —
+    /// and the stored parent stays named, because that link is what the fact is
+    /// read from. The file gets the same reading, so a row whose parent it does
+    /// not name — the history window reaped it in an earlier session, a hand
+    /// edit cut the link, an older writer wrote the child first — comes back
+    /// whole: same row, same stored parent id, transcript and result-unread mark
+    /// included. A row whose link is `None` is a top-level row the file wrote,
+    /// and comes back as one: no link was lost, so `⚮` is not its mark
+    /// ([`AgentTree::parent_gone`]'s rule, not an exception here). The one link
+    /// shape still refused is a *cycle*: a row whose parent chain leads back to
+    /// it would make the painted walk round forever, and a row whose parent is
+    /// itself is no more paintable than a longer loop. A row that merely hangs
+    /// off a cycle is not in one; it restores as the orphan a refused parent
+    /// leaves it.
+    ///
+    /// The rows come back parents first. [`Self::restore_agents`] reads a
+    /// child's parent mailbox *before* it revives the child, so a child woven in
+    /// while its parent is still pending gets a dead channel — the intended
+    /// shape for a parent the tree does not hold at all, and the wrong one for a
+    /// merely out-of-order file: the child's completion would never reach its
+    /// parent's books, and a `wait` on that parent would burn its whole cap
+    /// (§8.39). The file is in spawn order in practice; the stable sort by how
+    /// much of the file a row hangs under makes the restore not depend on that,
+    /// and leaves the file's own order alone wherever it was already fine.
     ///
     /// Every row the file names raises the floor before it is judged — refused
     /// rows included, because the repository may hold a `mush/<id>` branch or a
-    /// `.mush/wt/<id>` worktree whatever the row said. The reservation is
+    /// `.mush/wt/<id>` checkout whatever the row said. The reservation is
     /// saturated, and skipped where it saturates: a row at the ceiling has no
     /// floor above it, and pinning the counter there would hand the next draw a
     /// number it cannot pass. One bad row is refused and reported; the rows
@@ -930,39 +1048,70 @@ impl App {
         stored: Vec<session::AgentSession>,
     ) -> (Vec<session::AgentSession>, Vec<String>) {
         let file = self.ws.rel(&session::session_path(self.ws.root()));
-        // The ids whose parent chain reaches the root: the root's own, plus
-        // every row accepted below. A row whose parent is in here is a child the
-        // restore can attach; one whose parent is not would need its parent
-        // registered first, which the file's spawn order should have done.
-        let mut reachable: HashSet<u64> = HashSet::from([AgentId::ROOT.0]);
-        let mut accepted = Vec::new();
-        let mut refused = Vec::new();
-        for agent in stored {
+        for agent in &stored {
             let floor = agent.id.saturating_add(1);
             if floor > agent.id {
                 self.tree.reserve_agents(floor);
             }
-            let why = if agent.id == AgentId::ROOT.0 {
-                "it holds the root's id"
-            } else if agent.id == u64::MAX {
-                "the counter cannot be kept above its id"
-            } else if reachable.contains(&agent.id) {
-                "its id is already taken"
-            } else if !agent
-                .parent
-                .is_some_and(|parent| reachable.contains(&parent))
-            {
-                "its parent chain does not reach the root"
-            } else {
-                reachable.insert(agent.id);
-                accepted.push(agent);
-                continue;
-            };
-            refused.push(format!(
-                "could not restore agent #{} in {file} — {why}; the row was skipped",
-                agent.id
-            ));
         }
+        // The file's own links: the first row of each id, and the parent that id
+        // names. Read whole before any row is judged, because a chain has to be
+        // walkable to its end — or around its loop — before the rows that draw
+        // it are registered. The first row of a repeated id is the one that
+        // counts, because only the second is refused as a duplicate.
+        let mut links: HashMap<u64, Option<u64>> = HashMap::new();
+        // Why each row cannot come back, by position: two rows of one id are two
+        // rows, and only the second one is a duplicate.
+        let mut refused: Vec<Option<&'static str>> = vec![None; stored.len()];
+        for (index, agent) in stored.iter().enumerate() {
+            refused[index] = if agent.id == AgentId::ROOT.0 {
+                Some("it holds the root's id")
+            } else if agent.id == u64::MAX {
+                Some("the counter cannot be kept above its id")
+            } else {
+                match links.entry(agent.id) {
+                    Entry::Vacant(slot) => {
+                        slot.insert(agent.parent);
+                        None
+                    }
+                    // The first row of an id is the one that counts (see above).
+                    Entry::Occupied(_) => Some("its id is already taken"),
+                }
+            };
+        }
+        let cyclic = parent_cycles(&links);
+        for (index, agent) in stored.iter().enumerate() {
+            if refused[index].is_none() && cyclic.contains(&agent.id) {
+                refused[index] = Some("its parent link leads back to the row");
+            }
+        }
+        let skipped: Vec<(u64, &'static str)> = refused
+            .iter()
+            .enumerate()
+            .filter_map(|(index, why)| why.map(|why| (stored[index].id, why)))
+            .collect();
+        // The rows the tree can hold, parents before children: a stable sort by
+        // how much of the file a row hangs under, so every row the file already
+        // had in order keeps its place.
+        let held: HashSet<u64> = links
+            .keys()
+            .copied()
+            .filter(|id| !cyclic.contains(id))
+            .collect();
+        let depths = chain_depths(&links, &held);
+        let mut accepted: Vec<session::AgentSession> = stored
+            .into_iter()
+            .enumerate()
+            .filter(|(index, _)| refused[*index].is_none())
+            .map(|(_, agent)| agent)
+            .collect();
+        accepted.sort_by_key(|agent| depths[&agent.id]);
+        let refused = skipped
+            .into_iter()
+            .map(|(id, why)| {
+                format!("could not restore agent #{id} in {file} — {why}; the row was skipped")
+            })
+            .collect();
         (accepted, refused)
     }
 
@@ -972,6 +1121,12 @@ impl App {
     ///
     /// A restored agent whose worktree is gone continues in the main checkout,
     /// which is where its work ended up once it was merged.
+    ///
+    /// The rows arrive parents first and whole ([`Self::vet_stored_agents`]): a
+    /// child's completion reaches the parent's books because the parent's actor
+    /// exists by then, and a row whose parent the file does not name comes back
+    /// as the orphan it is — same stored link, so the mark `⚮` reads is true,
+    /// with its transcript and its unread mark.
     fn restore_agents(&mut self, stored: Vec<session::AgentSession>) {
         if stored.is_empty() {
             return;
@@ -1082,13 +1237,16 @@ impl App {
                     // reported into a dead channel left a `wait` burning its
                     // whole cap under a row that said `✓` (§8.39).
                     //
-                    // The mailbox is read here, before the revive, because the
-                    // file is in spawn order: a parent is registered the
-                    // moment its own actor is built, so a nested child's parent
-                    // is in the tree by the time this runs. A parent with no
-                    // actor of its own — a worktree found on disk — has none to
-                    // give, and the child gets a dead mailbox whose failed
-                    // sends the UI delivers instead.
+                    // The mailbox is read here, before the revive, because
+                    // `vet_stored_agents` hands the rows back parents first: a
+                    // parent is registered the moment its own actor is built,
+                    // so a nested child's parent is in the tree by the time
+                    // this runs, whether or not the file happened to write it
+                    // first. A parent with no actor of its own — a leftover
+                    // worktree found on disk — has none to give, and neither
+                    // has a parent the tree does not hold at all: an orphan
+                    // reports to an id, and the mailbox it finds missing is the
+                    // same absence, whose failed sends the UI delivers instead.
                     //
                     // What does *not* change is that no run starts: `revive`
                     // ends in `start(_, _, false)`, and a restart is not a
@@ -1209,9 +1367,10 @@ impl App {
     /// the rows back.
     ///
     /// One message per child, and not one moment earlier: a parent is revived
-    /// before its children are (the file is in spawn order), so there is no
-    /// point during the restore at which the tree holds the rows its books need
-    /// — the root included, whose children came back from the file too.
+    /// before its children are ([`Self::vet_stored_agents`] hands the rows back
+    /// parents first), so there is no point during the restore at which the tree
+    /// holds the rows its books need — the root included, whose children came
+    /// back from the file too.
     fn seed_children(&self) {
         for (parent, tx) in self.tree.agent_tx.iter() {
             self.seed_parent(*parent, tx);
@@ -7244,6 +7403,54 @@ mod tests {
         let _ = std::fs::remove_dir_all(&root);
     }
 
+    /// A stored row whose `parent` is `None` is kept too: the file names a
+    /// row, so the restore plants it, and the tree reads the missing link for
+    /// what it is — nothing was lost, so `⚮` is not this row's mark. The
+    /// discovery road then finds the id already on screen and leaves the row
+    /// where it is.
+    ///
+    /// The row is mush's own record of a leftover worktree found on disk, which
+    /// is the shape the file actually carries: `parent: None` because mush never
+    /// spawned it, `leftover: true` so the row still reads as the work it is.
+    #[test]
+    fn a_stored_row_with_no_parent_is_kept() {
+        let root = repo("stored-parentless");
+        isolated_work(&root, 7, "port the parser module");
+        let mut stored = stored_with_rows(Vec::new());
+        stored.agents.push(session::AgentSession {
+            id: 7,
+            parent: None,
+            depth: 1,
+            brief: "the leftover's own row".into(),
+            title: None,
+            branch: Some(git::branch_name(7)),
+            status: session::StoredStatus::Done,
+            landed: None,
+            leftover: true,
+            summary: Some("last run finished".into()),
+            result_unread: false,
+            messages: Vec::new(),
+        });
+        let (mut app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+        let node = app.tree.node(AgentId(7)).expect("the row came back");
+        assert!(node.leftover, "and it is still the work it was found as");
+        assert!(
+            !app.tree.parent_gone(node),
+            "no link was lost — `None` is not a reaped parent"
+        );
+        assert!(
+            app.chat.notices_for(AgentId::ROOT).next().is_none(),
+            "and no line is said about it"
+        );
+        let painted = screen(&mut app, 80, 30).join("\n");
+        assert!(
+            !painted.contains("could not restore"),
+            "nothing was skipped, so nothing is reported: {painted}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
     /// `reclaim_isolated` runs on the human's key, against a tree whose actors
     /// were only *told* to stop — so a node can still be running in its
     /// worktree when the pass goes looking. The sweep's live-tree guard must
@@ -7428,6 +7635,194 @@ mod tests {
                 .collect(),
             notices: Vec::new(),
         }
+    }
+
+    /// The human's own shape: a stored file whose rows name parents it does not
+    /// hold — the history window reaped them in an earlier session. Every row
+    /// comes back, as the orphan it is: the stored parent stays named, so the
+    /// tree reads the link as gone ([`AgentTree::parent_gone`]) and the row
+    /// wears the mark that says so. Nothing is said about any of them: no row
+    /// was refused, so there is no report.
+    #[test]
+    fn a_stored_row_whose_parent_is_gone_restores_as_the_orphan_it_is() {
+        let root = repo("restored-orphans");
+        let mut stored = stored_with_rows(vec![
+            (103, Some(99), "row 103", "line 103"),
+            (104, Some(99), "row 104", "line 104"),
+            (105, Some(101), "row 105", "line 105"),
+            (106, Some(101), "row 106", "line 106"),
+            (107, Some(101), "row 107", "line 107"),
+            (108, Some(100), "row 108", "line 108"),
+            (109, Some(100), "row 109", "line 109"),
+            (110, Some(0), "an ordinary root child", "line 110"),
+            (111, Some(110), "its child", "line 111"),
+        ]);
+        // One orphan's result was unread when the file was written: the mark
+        // comes back with the row, because the parent it is owed to is as gone
+        // as the row's link (finding H1).
+        stored.agents[0].result_unread = true;
+        let (mut app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+        assert_eq!(app.tree.agents.len(), 10, "the root and every stored row");
+        for (id, parent) in [
+            (103, 99),
+            (104, 99),
+            (105, 101),
+            (106, 101),
+            (107, 101),
+            (108, 100),
+            (109, 100),
+        ] {
+            let node = app.tree.node(AgentId(id)).expect("the row came back");
+            assert_eq!(
+                node.parent,
+                Some(AgentId(parent)),
+                "#{id} still names the parent the file named — `None` would pass \
+                 it off as a child of the root"
+            );
+            assert!(app.tree.parent_gone(node), "#{id} is an orphan");
+            assert_eq!(
+                app.chat.transcript(AgentId(id))[0].text(),
+                format!("line {id}"),
+                "and its transcript is where the previous session left it"
+            );
+        }
+        assert!(app.tree.node(AgentId(103)).unwrap().result_unread);
+        // The rows the file did link keep their parent: an orphan does not drag
+        // the rest of the tree down with it.
+        let child = app.tree.node(AgentId(110)).unwrap();
+        assert!(!app.tree.parent_gone(child));
+        assert_eq!(app.tree.painted_depth(child), 1);
+
+        // What the human reads, through the frame: every orphan's row wears the
+        // tree's own mark for the link it lost — and #103 the `✉` of the read it
+        // is still owed. The row's *place* is not this test's to pin: where an
+        // orphan hangs is the pane's rule (`⚮` is the fact here).
+        let rows = screen(&mut app, 80, 30);
+        for id in 103..=109 {
+            let row = rows
+                .iter()
+                .find(|row| row.contains(&format!("#{id} ")))
+                .unwrap_or_else(|| panic!("the row for #{id} is painted"));
+            assert!(row.contains('⚮'), "#{id} wears the mark: {row:?}");
+        }
+        let orphan = rows
+            .iter()
+            .find(|row| row.contains("#103 "))
+            .expect("the row is painted");
+        assert!(
+            orphan.contains("✉"),
+            "and the result nobody read is still owed: {orphan:?}"
+        );
+
+        // Nothing is said: no row was refused, and a restored orphan is not
+        // news — the mark on its row is.
+        assert!(
+            app.chat.notices_for(AgentId::ROOT).next().is_none(),
+            "no line about rows that came back"
+        );
+        let painted = rows.join("\n");
+        assert!(
+            !painted.contains("could not restore"),
+            "and nothing was skipped: {painted}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The file's own order is not a promise: a row may name a parent the file
+    /// writes after it. The restore registers parents first
+    /// (`App::vet_stored_agents`), because `agent::revive` reads the parent's
+    /// mailbox at the moment it builds the child — a child revived first gets a
+    /// dead channel, and its completion then has to travel through the UI
+    /// instead of straight into its parent's books.
+    ///
+    /// Nothing here drains the UI's own channel, so the only road a completion
+    /// can take is the mailbox the restore wired: the child's `✓` starts its
+    /// parent's run, and the parent's `✓` then reaches the scripted root.
+    #[test]
+    fn a_row_restored_before_its_parent_still_reports_to_it() {
+        let root = repo("restored-out-of-order");
+        let port = say_endpoint("ported the parser");
+        let scripted = Arc::new(Scripted::new().says("noted"));
+        let mut stored = stored_with_one_child();
+        stored.agents.insert(
+            0,
+            session::AgentSession {
+                id: 3,
+                parent: Some(2),
+                depth: 2,
+                brief: "port the lexer".into(),
+                title: None,
+                branch: None,
+                status: session::StoredStatus::Done,
+                landed: None,
+                leftover: false,
+                summary: Some("lexed it".into()),
+                result_unread: false,
+                messages: vec![Message::user("port the lexer"), Message::assistant("lexed")],
+            },
+        );
+        let (mut app, _rx) = app_with_scripted_root_at(
+            &root,
+            Some(stored),
+            scripted.clone(),
+            &format!("http://127.0.0.1:{port}"),
+        );
+        assert!(
+            app.tree.focus(AgentId(3)),
+            "the out-of-order child is a row"
+        );
+        app.deliver("one more thing".into(), Vec::new())
+            .expect("the child's actor takes the human's words");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let walked = || scripted.asked().iter().any(|ask| ask.saw("#2 done:"));
+        while !walked() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let asked = scripted.asked();
+        assert!(
+            walked(),
+            "the child's completion must reach the parent the file named, and the \
+             parent's the root: {:?}",
+            asked
+                .last()
+                .map(|ask| ask.messages.iter().map(Message::text).collect::<Vec<_>>())
+        );
+        assert!(
+            !asked.iter().any(|ask| ask.saw("#3 done:")),
+            "and the child's report stops at its parent, never the root"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// A loop in the file's own links is the one shape the tree cannot paint: a
+    /// parent that *is* in the tree is not an orphan, so nothing breaks the
+    /// loop — `AgentTree::painted_depth` walks the parent links, and these two
+    /// point at each other. The rows in the loop are refused; a row hanging
+    /// *off* the loop is not in one — its chain ends at a refused row — and
+    /// comes back as the orphan that refusal leaves it.
+    #[test]
+    fn a_parent_link_that_leads_back_to_the_row_is_refused() {
+        let root = repo("restored-cycle");
+        let stored = stored_with_rows(vec![
+            (5, Some(6), "five", "line 5"),
+            (6, Some(5), "six", "line 6"),
+            (7, Some(5), "seven", "line 7"),
+        ]);
+        let (app, _rx) = app_root(&root, Some(stored), session_save::fake::Recorder::new());
+
+        assert!(app.tree.node(AgentId(5)).is_none(), "the loop is not a row");
+        assert!(app.tree.node(AgentId(6)).is_none());
+        let seven = app
+            .tree
+            .node(AgentId(7))
+            .expect("the row hanging off the loop is kept");
+        assert!(
+            app.tree.parent_gone(seven),
+            "and it is the orphan its refused parent leaves it"
+        );
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     /// A stored row's id is not trusted: `0` is the root's, and registering a
@@ -8193,12 +8588,11 @@ mod tests {
     }
 
     /// The revive order, pinned, because the wiring at the restore door reads
-    /// `tree.agent_tx` *while* the loop is still building it: the file is in
-    /// spawn order (`App::session_snapshot` walks the tree, and a parent's row is
-    /// pushed before any child it spawns) and every revived actor's mailbox is
-    /// registered the moment it is built (`AgentTree::register`), so a nested
-    /// child's parent is there to be read — the whole tree is wired, not just the
-    /// root's own children.
+    /// `tree.agent_tx` *while* the loop is still building it: the restore lays
+    /// the rows out parents first (`App::vet_stored_agents`), and every revived
+    /// actor's mailbox is registered the moment it is built
+    /// (`AgentTree::register`), so a nested child's parent is there to be read
+    /// — the whole tree is wired, not just the root's own children.
     ///
     /// The chain is what says so, and it is two hops that only exist because
     /// each one was woken: the grandchild's completion starts its parent's run,

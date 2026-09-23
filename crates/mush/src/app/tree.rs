@@ -1665,7 +1665,9 @@ impl AgentTree {
     /// hold, the root included: `#2` under `#0` is a root child, not an
     /// orphan. The history window is the live road into this state
     /// ([`Self::past_history`]: it drops the oldest children and a node does
-    /// not inherit its parent's age), and the row is where it has to be said.
+    /// not inherit its parent's age), and a restart reads the same state
+    /// straight out of a session file whose rows name a parent it does not
+    /// have (`App::vet_stored_agents`); the row is where it has to be said.
     pub fn parent_gone(&self, node: &AgentNode) -> bool {
         node.parent.is_some_and(|parent| !self.has(parent))
     }
