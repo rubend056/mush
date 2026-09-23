@@ -1163,6 +1163,26 @@ impl App {
         self.git_at.map(|at| at.elapsed())
     }
 
+    /// Whether agent `id` holds its worktree right now: its own run or one of
+    /// its jobs is out ([`Self::in_flight`]), or a busy child or unread result
+    /// will wake it into that directory — the sweep's guard, asked as a question
+    /// about one id, because `reclaim_isolated` runs on the human's key, where
+    /// [`Self::refresh_git`]'s walk has not run. An id with no node holds
+    /// nothing: a leftover discovered on disk has no actor to pull a directory
+    /// out from under.
+    fn worktree_in_use(&self, id: AgentId) -> bool {
+        let Some(node) = self.tree.node(id) else {
+            return false;
+        };
+        if self.in_flight(node) {
+            return true;
+        }
+        self.tree
+            .agents
+            .iter()
+            .any(|child| child.parent == Some(id) && (child.phase.is_busy() || child.result_unread))
+    }
+
     /// Reclaim every `mush/<id>` the repository still names — checkout or
     /// not — and reserve the numbers of the ones the sweep keeps.
     ///
@@ -1184,6 +1204,17 @@ impl App {
     fn reclaim_isolated(&mut self) {
         let root = self.ws.root().to_path_buf();
         for id in git::isolated_ids(&root).unwrap_or_default() {
+            // A worktree a node is using right now is not this pass's to take:
+            // the pass runs on the human's key, against a tree whose actors were
+            // only *told* to stop, so a life can still be inside the directory —
+            // its own run, its job, or the wake a child's result is about to
+            // bring it. The ordinary sweep refuses those already; without the
+            // same guard here the removal happens anyway, the next write
+            // recreates the path as a plain directory inside the human's
+            // checkout, and the run's end would commit there (finding F8).
+            if self.worktree_in_use(AgentId(id)) {
+                continue;
+            }
             match git::reclaim(&root, id, "HEAD", None) {
                 git::Reclaimed::Removed {
                     branch_kept,
@@ -6042,6 +6073,71 @@ mod tests {
         assert!(node.leftover);
         assert_eq!(node.branch.as_deref(), Some("mush/3"));
         assert_eq!(node.phase, Phase::Done, "the subject says it finished");
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// `reclaim_isolated` runs on the human's key, against a tree whose actors
+    /// were only *told* to stop — so a node can still be running in its
+    /// worktree when the pass goes looking. The sweep's live-tree guard must
+    /// hold there too: a directory pulled out from under a live agent is
+    /// recreated as a plain path by the next write, and the run's end would
+    /// then commit inside the human's checkout (finding F8).
+    #[test]
+    fn ctrl_n_never_reclaims_a_worktree_a_live_node_holds() {
+        let root = repo("ctrl-n-live");
+        let (mut app, _rx) = app_and_rx(root.clone());
+
+        // A worktree whose branch adds nothing to HEAD and whose checkout is
+        // clean: exactly the state the isolated pass takes.
+        let held = git::worktree_path(&root, 1);
+        git(
+            &root,
+            &[
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                &git::branch_name(1),
+                held.to_str().unwrap(),
+                "HEAD",
+            ],
+        );
+        let (tx, _child_rx) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.insert(Spawn {
+            id: AgentId(1),
+            parent: AgentId::ROOT,
+            brief: "work in here".into(),
+            depth: 1,
+            branch: Some(git::branch_name(1)),
+            fork: None,
+            cmd: tx,
+        });
+        // The node is thinking: a run is in that directory right now.
+        app.reclaim_isolated();
+        assert!(held.exists(), "a running agent keeps its worktree");
+        assert!(
+            git::resolve(&root, &git::branch_name(1)).is_some(),
+            "and its branch"
+        );
+
+        // The other half of the guard: a node at rest whose child is running is
+        // about to be woken into its worktree, and that wake is a run in this
+        // directory too.
+        app.tree.finish(AgentId(1), Some("done".into()));
+        app.tree.result_read(AgentId(1));
+        let (tx2, _rx2) = crossbeam_channel::unbounded::<AgentMsg>();
+        app.tree.insert(Spawn {
+            id: AgentId(2),
+            parent: AgentId(1),
+            brief: "the child".into(),
+            depth: 2,
+            branch: None,
+            fork: None,
+            cmd: tx2,
+        });
+        app.reclaim_isolated();
+        assert!(held.exists(), "a parent about to be woken keeps it too");
+        assert!(git::resolve(&root, &git::branch_name(1)).is_some());
         let _ = std::fs::remove_dir_all(&root);
     }
 
