@@ -28,6 +28,9 @@ pub use chat::{Chat, Pane, Rank, SelectRows};
 #[cfg(test)]
 pub use chat::Painted;
 pub use screen::{AgentRow, AgentsPane, BarPane, ChatPane, PickerPane, Screen};
+// The one rule that drops a cell whole when a line does not fit: the bar's
+// idle hint is built and cut in the painter, which takes it from here (PM2).
+pub(crate) use screen::elide;
 pub use settings::{ConfigCell, ConfigHandle, WindowSource};
 pub use tree::{AgentNode, AgentTree, Compacting, ConversationId, Existing, Landed, Phase, Spawn};
 
@@ -211,11 +214,15 @@ impl Picker {
     /// rather than to the painter because it is the same fact as the title: what
     /// this list is for. A long list is paged the same way the transcript is,
     /// so `PgUp`/`PgDn` are named beside `j`/`k`.
+    ///
+    /// The sentence is 38 columns because the popup's inner row is 38 at the
+    /// 40-column floor (`picker_width(40)` is `PICKER_MIN_WIDTH`, less the two
+    /// border columns) and the painter paints it whole: the old 44-column
+    /// spelling lost the tail to the renderer at that size, and the tail is
+    /// what says `Esc` cancels (PM2).
     pub fn hint(&self) -> &'static str {
         match self.kind {
-            PickerKind::Model | PickerKind::Provider => {
-                " j/k or PgUp/PgDn · Enter pick · Esc cancel "
-            }
+            PickerKind::Model | PickerKind::Provider => " j/k · PgUp/PgDn · Enter · Esc cancel ",
             PickerKind::Notes | PickerKind::Help => " j/k or PgUp/PgDn scrolls · Esc closes ",
         }
     }
@@ -13163,6 +13170,61 @@ mod tests {
         );
     }
 
+    /// PM2: at the 40-column floor two fixed sentences overflowed the rows
+    /// they are painted in — the picker's hint (44 columns into the popup's
+    /// 38-column inner row) and the bar's idle line (` agents `, a space and a
+    /// 62-column hint into 40) — and the renderer cut each tail mid-word:
+    /// `…Enter pick · Esc c` and ` agents Tab cycles panes · /help lis`. No
+    /// test read either tail. The picker's sentence now fits 38 whole, Esc's
+    /// own verb included; the bar's idle hint is cut by the house rule, clause
+    /// by clause, so 40 columns paint `Tab cycles panes` — never a half-clause
+    /// — and the sample frame's 100 columns still paint every clause.
+    #[test]
+    fn the_hints_paint_what_fits_at_the_40_column_floor() {
+        // The picker's hint: the popup's last inner row at the floor is the
+        // 38-column sentence itself, tail and all.
+        let (mut app, _rx) = test_app("floor-picker-hint");
+        app.models = vec![
+            http::Model {
+                id: "test-model".to_string(),
+                context: Some(500_000),
+            },
+            http::Model {
+                id: "deepseek-chat".to_string(),
+                context: Some(128_000),
+            },
+        ];
+        app.open_model_picker();
+        let popup = shot(&mut app, 40, 10);
+        assert!(
+            popup
+                .text()
+                .contains(" j/k · PgUp/PgDn · Enter · Esc cancel "),
+            "the picker's whole hint fits its row: {}",
+            popup.text()
+        );
+
+        // The bar's idle row, same floor: clauses go whole. The focus is the
+        // chat pane, so the badge is ` chat ` (the agents badge is two columns
+        // wider, and the first clause fits under either).
+        let (mut app, _rx) = test_app("floor-bar-hint");
+        let floor = shot(&mut app, 40, 10);
+        assert_eq!(
+            floor.rows().last().cloned().unwrap_or_default(),
+            " chat  Tab cycles panes",
+            "40 columns paint the clauses that fit, never half of one"
+        );
+
+        // A wide bar is unchanged: the sample frame's 100 columns paint the
+        // whole sentence the front page's block carries.
+        let wide = shot(&mut app, 100, 28);
+        assert!(
+            wide.text().contains("Ctrl-P picks a model"),
+            "every clause is back on a wide bar: {}",
+            wide.text()
+        );
+    }
+
     /// V2: the size tiers are a fact about the layout, and nothing pinned the
     /// boundaries — a column or a row moved and every test stayed green. Below
     /// 80 columns or below 20 rows the panes stack; at 80×20 they sit side by
@@ -16998,7 +17060,7 @@ mod tests {
             words: vec![
                 " models · Enter picks ",
                 "• test-model · 500k",
-                "j/k or PgUp/PgDn",
+                "j/k · PgUp/PgDn",
             ],
             roomy: vec!["deepseek-chat · 128k"],
             absent: Vec::new(),
@@ -17570,7 +17632,7 @@ mod tests {
                 "the current model is marked at {width}×{height}: {text}"
             );
             assert!(
-                text.contains("j/k or PgUp/PgDn"),
+                text.contains("j/k · PgUp/PgDn"),
                 "and the keys are named at {width}×{height}: {text}"
             );
             shot.assert_shape("an open /model picker", width, height);

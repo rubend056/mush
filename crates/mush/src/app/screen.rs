@@ -930,21 +930,22 @@ fn facts_line(app: &App, width: usize) -> String {
 }
 
 /// Drop cells from the right until the line fits: one rule for every line that
-/// is built this way — the two panes' titles and the facts under them — and the
-/// one home of it (finding D9).
+/// is built this way — the two panes' titles, the facts under them, and the
+/// bar's idle hint — and the one home of it (finding D9).
 ///
 /// A cell goes whole, because a clause cut mid-number (`Σ +324 −`, `2 waitin`)
-/// is a count that is not the count. The first cell is never given up, and
-/// `floor` is what is painted when even it does not fit: the pane keeps its own
-/// name, and the facts line keeps the `⌂` cell that says which tree the screen
-/// is about. `prefix` opens every kept line, so the separator *inside* the line
+/// is a count that is not the count, and a hint cut mid-word names no key. The
+/// first cell is never given up, and `floor` is what is painted when even it
+/// does not fit: the pane keeps its own name, the facts line keeps the `⌂` cell
+/// that says which tree the screen is about, and the hint keeps its first
+/// clause. `prefix` opens every kept line, so the separator *inside* the line
 /// (` · `, ` │ `) and the one joining it to what precedes are each said once.
 ///
 /// The conversation pane's title is built by the same rule rather than painted
 /// as it stands: `Chat::painted` hands its clauses here, so the chat's title
 /// cannot be the one title on screen a painter cuts mid-word at the border
 /// (finding D11).
-pub(super) fn elide(
+pub(crate) fn elide(
     cells: &[String],
     separator: &str,
     prefix: &str,

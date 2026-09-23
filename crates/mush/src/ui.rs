@@ -26,13 +26,17 @@ use unicode_width::UnicodeWidthStr;
 use mush_core::text::fit_row;
 
 use crate::app::{
-    AgentRow, AgentsPane, BarPane, ChatPane, Focus, PickerPane, Rank, Screen, SelectRows,
+    elide, AgentRow, AgentsPane, BarPane, ChatPane, Focus, PickerPane, Rank, Screen, SelectRows,
 };
 use crate::theme::Theme;
 
 /// The idle bar hint, when there is nothing to report. The commands it names
 /// are checked against `app::commands::COMMANDS` by a test there, so the bar
 /// cannot advertise a command the parser does not have (finding B2).
+///
+/// It is clauses joined by ` · `, and the painter paints as many of them as
+/// fit the row it has (`idle_hint`), each clause whole: a hint that loses its
+/// tail to the renderer mid-word is not the sentence the keys do (PM2).
 pub(crate) const HINT: &str = "Tab cycles panes · /help lists commands · Ctrl-P picks a model";
 
 pub(crate) fn dim() -> Style {
@@ -463,9 +467,15 @@ fn draw_status(frame: &mut Frame, pane: &BarPane, focus: Focus, theme: &Theme) {
         Focus::Agents => "agents",
         Focus::Chat => "chat",
     };
+    // The idle hint is the one word on this row that can be wider than the
+    // row: it gets the columns the badge and the space after it leave (PM2).
+    let idle;
     let (message, style) = match &pane.word {
         Some((rank, text)) => (text.as_str(), rank_style(*rank, theme)),
-        None => (HINT, dim()),
+        None => {
+            idle = idle_hint(pane.area.width.saturating_sub(badge.len() as u16 + 3) as usize);
+            (idle.as_str(), dim())
+        }
     };
     let line = Line::from(vec![
         Span::styled(
@@ -483,6 +493,21 @@ fn draw_status(frame: &mut Frame, pane: &BarPane, focus: Focus, theme: &Theme) {
             rows[1],
         );
     }
+}
+
+/// The idle hint, cut to the columns the bar's badge leaves it.
+///
+/// [`HINT`]'s clauses are dropped whole from the right by [`elide`] — the one
+/// rule the panes' titles and the facts line are cut by (finding D9) — because
+/// a hint cut mid-word names no key at all: at the 40-column floor the old
+/// ` agents Tab cycles panes · /help lis` lost its tail to the renderer, and
+/// the clause that fits (`Tab cycles panes`) is the honest line. A terminal
+/// wide enough for the whole sentence keeps every clause; the sample frame on
+/// the front page is painted at 100 columns and is one (PM2).
+fn idle_hint(columns: usize) -> String {
+    let cells: Vec<String> = HINT.split(" · ").map(str::to_string).collect();
+    let floor = cells[0].clone();
+    elide(&cells, " · ", "", &floor, columns)
 }
 
 #[cfg(test)]
