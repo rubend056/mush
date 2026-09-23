@@ -7677,10 +7677,9 @@ which is why the fact has to be said in the row.
 
 The row now says it. `⚮` (U+26AE, `DIVORCE SYMBOL`) is the one symbol Unicode
 has for a severed pair, and here the severed pair is the parent link. It rides
-the head, right
-after the id it qualifies — the head is the one field `fit_row` never gives up
-(R1: the title yields first), which is where a mark that must survive the 80×24
-floor has to sit — and it costs one column, the arithmetic
+the head, right after the id it qualifies — the head is the one field `fit_row`
+never gives up (R1: the title yields first), which is where a mark that must
+survive the 80×24 floor has to sit — and it costs one column, the arithmetic
 `every_row_mark_is_one_column` pins for every mark a row can wear, `⚮` counted
 beside `▶`, `⏸`, `✉`, `⚙` and `⚠`.
 
