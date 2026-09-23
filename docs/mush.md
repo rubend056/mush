@@ -932,8 +932,11 @@ file I/O on its own thread. A child given a
 `base` gets its own git worktree (`.mush/wt/<id>`, branch `mush/<id>`) forked
 from that ref, resolved in the spawning agent's own workspace — so `HEAD` in a
 base is that agent's `HEAD`, not the application root's; without one it shares
-the spawning agent's workspace, and only one shared child may run at a time. A
-`base` git cannot resolve is a *failed delegation* —
+the spawning agent's workspace, and only one shared child may run there at a
+time. That count is the directory's live writers, asked across the whole tree —
+not one parent's books — and the spawner is never counted against itself, so a
+shared child may still delegate into the tree its own run is in. A `base` git
+cannot resolve is a *failed delegation* —
 `cannot start from <ref>` — refused before anything is created, never a child
 that quietly runs somewhere else.
 
